@@ -29,7 +29,9 @@ async function signRequest(method, path, body = '') {
 async function revolutRequest(method, path) {
   const headers = await signRequest(method, path);
   const response = await fetch(`${BASE_URL}${path}`, { method, headers });
-  return response.json();
+  const text = await response.text();
+  console.log('Revolut API response:', response.status, text);
+  return JSON.parse(text);
 }
 
 const app = express();
