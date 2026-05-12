@@ -10,13 +10,13 @@ const BASE_URL = 'https://revx.revolut.com/api/1.0';
 
 async function revolutRequest(method, path) {
   const timestamp = Date.now().toString();
-  const message = `${timestamp}${method}${path}`;
+  const message = `${timestamp}${method}/api/1.0${path}`;
   const privateKeyPem = PRIVATE_KEY.replace(/\\n/g, '\n');
   console.log('Key starts with:', privateKeyPem.substring(0, 30));
   const pk = createPrivateKey({ key: privateKeyPem, format: 'pem', type: 'pkcs8' });
   const signature = sign(null, Buffer.from(message, 'utf8'), { key: pk, dsaEncoding: 'ieee-p1363' });
   const headers = {
-    'X-Revx-Api-Key': API_KEY,
+    'X-Revx-API-Key': API_KEY,
     'X-Revx-Timestamp': timestamp,
     'X-Revx-Signature': signature.toString('base64'),
     'Content-Type': 'application/json'
