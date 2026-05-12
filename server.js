@@ -53,13 +53,7 @@ async function checkPortfolio() {
     const balances = await revolutRequest('GET', '/balances');
 
     // Get all tickers in one call
-    // Try different possible ticker endpoints
-    let tickerResponse = await revolutRequest('GET', '/crypto-exchange/tickers');
-    console.log('Ticker response 1:', JSON.stringify(tickerResponse).substring(0, 100));
-    if (tickerResponse.message && tickerResponse.message.includes('not found')) {
-      tickerResponse = await revolutRequest('GET', '/tickers');
-      console.log('Ticker response 2:', JSON.stringify(tickerResponse).substring(0, 100));
-    }
+    const tickerResponse = await revolutRequest('GET', '/tickers');
     console.log('Got tickers response:', JSON.stringify(tickerResponse).substring(0, 300));
 
     // Build price map - handle both array and {data: [...]} formats
