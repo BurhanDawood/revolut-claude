@@ -53,19 +53,23 @@ async function checkPortfolio() {
     const balances = await revolutRequest('GET', '/balances');
 
     // Get all tickers in one call
-    const tickers = await revolutRequest('GET', '/market/tickers');
-    console.log('Got tickers, count:', Array.isArray(tickers) ? tickers.length : 'not array', JSON.stringify(tickers).substring(0, 200));
+    const tickerResponse = await revolutRequest('GET', '/market/tickers');
+    console.log('Got tickers response:', JSON.stringify(tickerResponse).substring(0, 300));
 
-    // Build price map from tickers
+    // Build price map - handle both array and {data: [...]} formats
     const priceMap = {};
-    if (Array.isArray(tickers)) {
-      for (const ticker of tickers) {
-        if (ticker.symbol) {
-          const price = parseFloat(ticker.last_price || ticker.ask || ticker.bid || ticker.price);
-          if (price) priceMap[ticker.symbol] = price;
+    const tickerList = Array.isArray(tickerResponse) ? tickerResponse : (tickerResponse.data || []);
+    for (const ticker of tickerList) {
+      if (ticker.symbol) {
+        const price = parseFloat(ticker.last_price || ticker.mid || ticker.ask || ticker.bid);
+        if (price) {
+          // Store with both formats: BTC/USD and BTC-USD
+          priceMap[ticker.symbol] = price;
+          priceMap[ticker.symbol.replace('/', '-')] = price;
         }
       }
     }
+    console.log('Price map size:', Object.keys(priceMap).length);
 
     console.log('Price map sample:', JSON.stringify(Object.entries(priceMap).slice(0, 3)));
 
