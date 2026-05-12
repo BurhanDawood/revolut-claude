@@ -14,9 +14,8 @@ async function revolutRequest(method, path) {
   const privateKeyPem = PRIVATE_KEY.replace(/\\n/g, '\n');
   console.log('Key starts with:', privateKeyPem.substring(0, 30));
   console.log('Key ends with:', privateKeyPem.substring(privateKeyPem.length - 30));
-  const privateKey = createPrivateKey(privateKeyPem);
-  const privateKey = createPrivateKey(privateKeyPem);
-  const signature = sign(null, Buffer.from(message), privateKey);
+  const pk = createPrivateKey(privateKeyPem);
+  const signature = sign(null, Buffer.from(message), pk);
   const headers = {
     'X-Revx-Api-Key': API_KEY,
     'X-Revx-Timestamp': timestamp,
@@ -47,33 +46,4 @@ function createMcpServer() {
   });
 
   server.tool('get_prices', 'Get current crypto prices',
-    { symbol: z.string().describe('Trading pair e.g. BTC-USD') },
-    async ({ symbol }) => {
-      const data = await revolutRequest('GET', `/market/tickers/${symbol}`);
-      return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
-    }
-  );
-
-  server.tool('get_orders', 'Get your open orders', {}, async () => {
-    const data = await revolutRequest('GET', '/orders/active');
-    return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
-  });
-
-  return server;
-}
-
-app.post('/mcp', async (req, res) => {
-  console.log('MCP request received');
-  const server = createMcpServer();
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: undefined,
-  });
-  await server.connect(transport);
-  await transport.handleRequest(req, res, req.body);
-  await server.close();
-});
-
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+    { symbol: z.st
