@@ -14,14 +14,12 @@ async function revolutRequest(method, path) {
   const privateKeyPem = PRIVATE_KEY.replace(/\\n/g, '\n');
   const privateKey = createPrivateKey(privateKeyPem);
   const signature = sign(null, Buffer.from(message), privateKey);
-  
   const headers = {
     'X-Revx-Api-Key': API_KEY,
     'X-Revx-Timestamp': timestamp,
     'X-Revx-Signature': signature.toString('base64'),
     'Content-Type': 'application/json'
   };
-
   console.log('Calling Revolut:', method, path);
   const response = await fetch(`${BASE_URL}${path}`, { method, headers });
   const text = await response.text();
@@ -32,7 +30,7 @@ async function revolutRequest(method, path) {
 const app = express();
 
 app.use((req, res, next) => {
-  console.log('Incoming request:', req.method, req.url);
+  console.log('Request:', req.method, req.url);
   next();
 });
 
@@ -57,18 +55,13 @@ app.get('/sse', async (req, res) => {
 
   server.tool('get_orders', 'Get your open orders', {}, async () => {
     const data = await revolutRequest('GET', '/orders/active');
-    return { content: [{ type: 'text', text: JSON.stringify(data, null,2) }] };
-  });
-
-  server.tool('get_orders', 'Get your open orders', {}, async () => {
-    const data = await revolutRequest('GET', '/orders/active');
     return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
   });
 
   const transport = new SSEServerTransport('/message', res);
   sessions[transport.sessionId] = transport;
   console.log('Session created:', transport.sessionId);
-  
+
   res.on('close', () => {
     console.log('Session closed:', transport.sessionId);
     delete sessions[transport.sessionId];
@@ -79,7 +72,7 @@ app.get('/sse', async (req, res) => {
 
 app.post('/message', express.raw({ type: '*/*' }), async (req, res) => {
   const sessionId = req.query.sessionId;
-  console.log('Message received for session:', sessionId);
+  console.log('Message for session:', sessionId);
   const transport = sessions[sessionId];
   if (transport) {
     await transport.handlePostMessage(req, res);
