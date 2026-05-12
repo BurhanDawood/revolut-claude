@@ -9,9 +9,10 @@ const PRIVATE_KEY = process.env.REVOLUTX_PRIVATE_KEY;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const BASE_URL = 'https://revx.revolut.com/api/1.0';
-const CHECK_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
-const ALERT_INTERVAL_MS = 60 * 1000; // 1 minute
-const PUMP_THRESHOLD = 0.20; // 20%
+const CHECK_INTERVAL_MS = 5 * 60 * 1000;
+const ALERT_INTERVAL_MS = 60 * 1000;
+const PUMP_THRESHOLD = 0.20;
+const SKIP_CURRENCIES = ['USD', 'USDT', 'USDC', 'EUR', 'GBP'];
 
 async function revolutRequest(method, path) {
   const timestamp = Date.now().toString();
@@ -37,10 +38,9 @@ async function sendTelegram(message) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: message, parse_mode: 'HTML' })
   });
-  console.log('Telegram sent:', message);
+  console.log('Telegram sent:', message.substring(0, 50));
 }
 
-// Track baseline prices and active alerts
 const basePrices = {};
 const activeAlerts = {};
 const lastBalances = {};
@@ -48,18 +48,41 @@ const lastBalances = {};
 async function checkPortfolio() {
   try {
     console.log('Checking portfolio...');
-    console.log('Fetching balances...');
+
+    // Get all balances
     const balances = await revolutRequest('GET', '/balances');
-    console.log('Balances received:', JSON.stringify(balances));
+
+    // Get all tickers in one call
+    const tickers = await revolutRequest('GET', '/market/tickers');
+    console.log('Got tickers, count:', Array.isArray(tickers) ? tickers.length : 'not array', JSON.stringify(tickers).substring(0, 200));
+
+    // Build price map from tickers
+    const priceMap = {};
+    if (Array.isArray(tickers)) {
+      for (const ticker of tickers) {
+        if (ticker.symbol) {
+          const price = parseFloat(ticker.last_price || ticker.ask || ticker.bid || ticker.price);
+          if (price) priceMap[ticker.symbol] = price;
+        }
+      }
+    }
+
+    console.log('Price map sample:', JSON.stringify(Object.entries(priceMap).slice(0, 3)));
 
     for (const asset of balances) {
-      if (!asset.currency || parseFloat(asset.available) <= 0) continue;
-      if (asset.currency === 'USD' || asset.currency === 'USDT' || asset.currency === 'USDC') continue;
+      if (!asset.currency || SKIP_CURRENCIES.includes(asset.currency)) continue;
+      const available = parseFloat(asset.available);
+      if (available <= 0) continue;
 
       const symbol = `${asset.currency}-USD`;
-      const available = parseFloat(asset.available);
+      const currentPrice = priceMap[symbol];
 
-      // Check if position was sold (balance went down significantly)
+      if (!currentPrice) {
+        console.log(`No price available for ${symbol}`);
+        continue;
+      }
+
+      // Check if position was sold
       if (activeAlerts[symbol] && lastBalances[symbol] && available < lastBalances[symbol] * 0.9) {
         console.log(`Position reduced for ${symbol}, stopping alerts`);
         clearInterval(activeAlerts[symbol]);
@@ -70,45 +93,29 @@ async function checkPortfolio() {
 
       lastBalances[symbol] = available;
 
-      // Get current price
-      try {
-        console.log(`Fetching price for ${symbol}...`);
-        const ticker = await revolutRequest('GET', `/market/tickers/${symbol}`);
-        console.log(`Ticker for ${symbol}:`, JSON.stringify(ticker));
-        const currentPrice = parseFloat(ticker.last_price || ticker.ask || ticker.bid);
-        if (!currentPrice) {
-          console.log(`No price found for ${symbol}`);
-          continue;
-        }
+      // Set baseline if not set
+      if (!basePrices[symbol]) {
+        basePrices[symbol] = currentPrice;
+        console.log(`Baseline set for ${symbol}: $${currentPrice}`);
+        continue;
+      }
 
-        // Set baseline if not set
-        if (!basePrices[symbol]) {
-          basePrices[symbol] = currentPrice;
-          console.log(`Baseline set for ${symbol}: $${currentPrice}`);
-          continue;
-        }
+      const change = (currentPrice - basePrices[symbol]) / basePrices[symbol];
+      console.log(`${symbol}: $${currentPrice} (${(change * 100).toFixed(1)}% from baseline)`);
 
-        const change = (currentPrice - basePrices[symbol]) / basePrices[symbol];
-        console.log(`${symbol}: $${currentPrice} (${(change * 100).toFixed(1)}% from baseline)`);
+      // Trigger alert if pumping
+      if (change >= PUMP_THRESHOLD && !activeAlerts[symbol]) {
+        const pct = (change * 100).toFixed(1);
+        const alertMessage = `🚀 <b>${symbol} is pumping!</b>\n\nUp <b>${pct}%</b> from $${basePrices[symbol].toFixed(4)} → $${currentPrice.toFixed(4)}\n\nYou hold: ${available} ${asset.currency}\nLog into Revolut X to act!`;
+        await sendTelegram(alertMessage);
 
-        // Trigger alert if pumping and not already alerting
-        if (change >= PUMP_THRESHOLD && !activeAlerts[symbol]) {
-          const pct = (change * 100).toFixed(1);
-          const alertMessage = `🚀 <b>${symbol} is pumping!</b>\n\nUp <b>${pct}%</b> from $${basePrices[symbol].toFixed(2)} → $${currentPrice.toFixed(2)}\n\nYou hold: ${available} ${asset.currency}\nLog into Revolut X to act!`;
-
-          await sendTelegram(alertMessage);
-
-          // Keep alerting every minute until position changes
-          activeAlerts[symbol] = setInterval(async () => {
-            await sendTelegram(`⚠️ <b>REMINDER: ${symbol} still up ${pct}%!</b>\n\nCurrent price: $${currentPrice.toFixed(2)}\nYou hold: ${available} ${asset.currency}`);
-          }, ALERT_INTERVAL_MS);
-        }
-      } catch (e) {
-    console.log('Portfolio check error:', e.message, e.stack);
-  }
+        activeAlerts[symbol] = setInterval(async () => {
+          await sendTelegram(`⚠️ <b>REMINDER: ${symbol} still up ${pct}%!</b>\n\nCurrent price: $${currentPrice.toFixed(4)}\nYou hold: ${available} ${asset.currency}`);
+        }, ALERT_INTERVAL_MS);
+      }
     }
   } catch (e) {
-    console.log('Portfolio check error:', e.message);
+    console.log('Portfolio check error:', e.message, e.stack);
   }
 }
 
@@ -133,8 +140,9 @@ function createMcpServer() {
   server.tool('get_prices', 'Get current crypto prices',
     { symbol: z.string().describe('Trading pair e.g. BTC-USD') },
     async ({ symbol }) => {
-      const data = await revolutRequest('GET', `/market/tickers/${symbol}`);
-      return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+      const data = await revolutRequest('GET', '/market/tickers');
+      const ticker = Array.isArray(data) ? data.find(t => t.symbol === symbol) : data;
+      return { content: [{ type: 'text', text: JSON.stringify(ticker || data, null, 2) }] };
     }
   );
 
