@@ -1,6 +1,6 @@
 import express from 'express';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
 import { createPrivateKey, sign } from 'crypto';
 
@@ -28,16 +28,14 @@ async function revolutRequest(method, path) {
 }
 
 const app = express();
+app.use(express.json());
 
 app.use((req, res, next) => {
   console.log('Request:', req.method, req.url);
   next();
 });
 
-const sessions = {};
-
-app.get('/sse', async (req, res) => {
-  console.log('New SSE connection');
+function createMcpServer() {
   const server = new McpServer({ name: 'revolut-x', version: '1.0.0' });
 
   server.tool('get_balances', 'Get Revolut X account balances', {}, async () => {
@@ -58,28 +56,18 @@ app.get('/sse', async (req, res) => {
     return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
   });
 
-  const transport = new SSEServerTransport('/message', res);
-  sessions[transport.sessionId] = transport;
-  console.log('Session created:', transport.sessionId);
+  return server;
+}
 
-  res.on('close', () => {
-    console.log('Session closed:', transport.sessionId);
-    delete sessions[transport.sessionId];
+app.post('/mcp', async (req, res) => {
+  console.log('MCP request received');
+  const server = createMcpServer();
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: undefined,
   });
-
   await server.connect(transport);
-});
-
-app.post('/message', express.raw({ type: '*/*' }), async (req, res) => {
-  const sessionId = req.query.sessionId;
-  console.log('Message for session:', sessionId);
-  const transport = sessions[sessionId];
-  if (transport) {
-    await transport.handlePostMessage(req, res);
-  } else {
-    console.log('Session not found:', sessionId);
-    res.status(404).send('Session not found');
-  }
+  await transport.handleRequest(req, res, req.body);
+  await server.close();
 });
 
 const PORT = process.env.PORT || 8080;
