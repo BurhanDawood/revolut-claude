@@ -57,4 +57,39 @@ app.get('/sse', async (req, res) => {
 
   server.tool('get_orders', 'Get your open orders', {}, async () => {
     const data = await revolutRequest('GET', '/orders/active');
-    return { content: [{ type: 'text', text: JSON.stringify(data, null,
+    return { content: [{ type: 'text', text: JSON.stringify(data, null,2) }] };
+  });
+
+  server.tool('get_orders', 'Get your open orders', {}, async () => {
+    const data = await revolutRequest('GET', '/orders/active');
+    return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+  });
+
+  const transport = new SSEServerTransport('/message', res);
+  sessions[transport.sessionId] = transport;
+  console.log('Session created:', transport.sessionId);
+  
+  res.on('close', () => {
+    console.log('Session closed:', transport.sessionId);
+    delete sessions[transport.sessionId];
+  });
+
+  await server.connect(transport);
+});
+
+app.post('/message', express.raw({ type: '*/*' }), async (req, res) => {
+  const sessionId = req.query.sessionId;
+  console.log('Message received for session:', sessionId);
+  const transport = sessions[sessionId];
+  if (transport) {
+    await transport.handlePostMessage(req, res);
+  } else {
+    console.log('Session not found:', sessionId);
+    res.status(404).send('Session not found');
+  }
+});
+
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
