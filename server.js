@@ -13,7 +13,6 @@ async function revolutRequest(method, path) {
   const message = `${timestamp}${method}${path}`;
   const privateKeyPem = PRIVATE_KEY.replace(/\\n/g, '\n');
   console.log('Key starts with:', privateKeyPem.substring(0, 30));
-  console.log('Key ends with:', privateKeyPem.substring(privateKeyPem.length - 30));
   const pk = createPrivateKey(privateKeyPem);
   const signature = sign(null, Buffer.from(message), pk);
   const headers = {
@@ -39,12 +38,10 @@ app.use((req, res, next) => {
 
 function createMcpServer() {
   const server = new McpServer({ name: 'revolut-x', version: '1.0.0' });
-
   server.tool('get_balances', 'Get Revolut X account balances', {}, async () => {
     const data = await revolutRequest('GET', '/accounts');
     return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
   });
-
   server.tool('get_prices', 'Get current crypto prices',
     { symbol: z.string().describe('Trading pair e.g. BTC-USD') },
     async ({ symbol }) => {
@@ -52,12 +49,10 @@ function createMcpServer() {
       return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
     }
   );
-
   server.tool('get_orders', 'Get your open orders', {}, async () => {
     const data = await revolutRequest('GET', '/orders/active');
     return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
   });
-
   return server;
 }
 
