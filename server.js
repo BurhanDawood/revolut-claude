@@ -12,6 +12,9 @@ async function revolutRequest(method, path) {
   const timestamp = Date.now().toString();
   const message = `${timestamp}${method}${path}`;
   const privateKeyPem = PRIVATE_KEY.replace(/\\n/g, '\n');
+  console.log('Key starts with:', privateKeyPem.substring(0, 30));
+  console.log('Key ends with:', privateKeyPem.substring(privateKeyPem.length - 30));
+  const privateKey = createPrivateKey(privateKeyPem);
   const privateKey = createPrivateKey(privateKeyPem);
   const signature = sign(null, Buffer.from(message), privateKey);
   const headers = {
