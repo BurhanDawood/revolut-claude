@@ -48,7 +48,9 @@ const lastBalances = {};
 async function checkPortfolio() {
   try {
     console.log('Checking portfolio...');
+    console.log('Fetching balances...');
     const balances = await revolutRequest('GET', '/balances');
+    console.log('Balances received:', JSON.stringify(balances));
 
     for (const asset of balances) {
       if (!asset.currency || parseFloat(asset.available) <= 0) continue;
