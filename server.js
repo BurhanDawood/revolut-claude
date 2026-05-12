@@ -72,9 +72,14 @@ async function checkPortfolio() {
 
       // Get current price
       try {
+        console.log(`Fetching price for ${symbol}...`);
         const ticker = await revolutRequest('GET', `/market/tickers/${symbol}`);
+        console.log(`Ticker for ${symbol}:`, JSON.stringify(ticker));
         const currentPrice = parseFloat(ticker.last_price || ticker.ask || ticker.bid);
-        if (!currentPrice) continue;
+        if (!currentPrice) {
+          console.log(`No price found for ${symbol}`);
+          continue;
+        }
 
         // Set baseline if not set
         if (!basePrices[symbol]) {
