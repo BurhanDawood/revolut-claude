@@ -13,8 +13,8 @@ async function revolutRequest(method, path) {
   const message = `${timestamp}${method}${path}`;
   const privateKeyPem = PRIVATE_KEY.replace(/\\n/g, '\n');
   console.log('Key starts with:', privateKeyPem.substring(0, 30));
-  const pk = createPrivateKey(privateKeyPem);
-  const signature = sign(null, Buffer.from(message), pk);
+  const pk = createPrivateKey({ key: privateKeyPem, format: 'pem', type: 'pkcs8' });
+  const signature = sign(null, Buffer.from(message, 'utf8'), { key: pk, dsaEncoding: 'ieee-p1363' });
   const headers = {
     'X-Revx-Api-Key': API_KEY,
     'X-Revx-Timestamp': timestamp,
