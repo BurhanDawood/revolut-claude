@@ -8,32 +8,41 @@ const API_KEY = process.env.REVOLUTX_API_KEY;
 const PRIVATE_KEY = process.env.REVOLUTX_PRIVATE_KEY;
 const BASE_URL = 'https://revx.revolut.com/api/1.0';
 
-async function signRequest(method, path, body = '') {
+async function revolutRequest(method, path) {
   const timestamp = Date.now().toString();
-  const message = `${timestamp}${method}${path}${body}`;
+  const message = `${timestamp}${method}${path}`;
   const privateKeyPem = PRIVATE_KEY.replace(/\\n/g, '\n');
   const privateKey = createPrivateKey(privateKeyPem);
   const signature = sign(null, Buffer.from(message), privateKey);
-  return {
+  
+  const headers = {
     'X-Revx-Api-Key': API_KEY,
     'X-Revx-Timestamp': timestamp,
     'X-Revx-Signature': signature.toString('base64'),
     'Content-Type': 'application/json'
   };
-}
 
-async function revolutRequest(method, path) {
-  const headers = await signRequest(method, path);
+  console.log('Calling Revolut:', method, path);
   const response = await fetch(`${BASE_URL}${path}`, { method, headers });
   const text = await response.text();
-  console.log('Revolut API response:', response.status, text);
+  console.log('Revolut response:', response.status, text);
   return JSON.parse(text);
 }
 
-function createServer() {
+const app = express();
+
+app.use((req, res, next) => {
+  console.log('Incoming request:', req.method, req.url);
+  next();
+});
+
+const sessions = {};
+
+app.get('/sse', async (req, res) => {
+  console.log('New SSE connection');
   const server = new McpServer({ name: 'revolut-x', version: '1.0.0' });
 
-  server.tool('get_balances', 'Get your Revolut X account balances', {}, async () => {
+  server.tool('get_balances', 'Get Revolut X account balances', {}, async () => {
     const data = await revolutRequest('GET', '/accounts');
     return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
   });
@@ -48,36 +57,4 @@ function createServer() {
 
   server.tool('get_orders', 'Get your open orders', {}, async () => {
     const data = await revolutRequest('GET', '/orders/active');
-    return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
-  });
-
-  return server;
-}
-
-const app = express();
-const transports = {};
-
-app.get('/sse', async (req, res) => {
-  const transport = new SSEServerTransport('/message', res);
-  transports[transport.sessionId] = transport;
-  const server = createServer();
-  await server.connect(transport);
-  res.on('close', () => {
-    delete transports[transport.sessionId];
-  });
-});
-
-app.post('/message', express.raw({ type: '*/*' }), async (req, res) => {
-  const sessionId = req.query.sessionId;
-  const transport = transports[sessionId];
-  if (transport) {
-    await transport.handlePostMessage(req, res);
-  } else {
-    res.status(404).send('Session not found');
-  }
-});
-
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-  console.log(`Revolut Claude MCP server running on port ${PORT}`);
-});
+    return { content: [{ type: 'text', text: JSON.stringify(data, null,
