@@ -39,7 +39,7 @@ app.use((req, res, next) => {
 function createMcpServer() {
   const server = new McpServer({ name: 'revolut-x', version: '1.0.0' });
   server.tool('get_balances', 'Get Revolut X account balances', {}, async () => {
-    const data = await revolutRequest('GET', '/accounts');
+    const data = await revolutRequest('GET', '/balances');
     return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
   });
   server.tool('get_prices', 'Get current crypto prices',
