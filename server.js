@@ -97,8 +97,8 @@ async function checkPortfolio() {
           }, ALERT_INTERVAL_MS);
         }
       } catch (e) {
-        console.log(`Could not get price for ${symbol}:`, e.message);
-      }
+    console.log('Portfolio check error:', e.message, e.stack);
+  }
     }
   } catch (e) {
     console.log('Portfolio check error:', e.message);
