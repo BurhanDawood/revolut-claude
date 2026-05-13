@@ -207,16 +207,6 @@ app.get('/api/balances', async (req, res) => {
   }
 });
 
-// GET /api/trades — temporary test endpoint for order history
-app.get('/api/trades', async (req, res) => {
-  try {
-    const data = await revolutRequest('GET', '/orders/history');
-    res.json(data);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
 // POST /api/acknowledge/:symbol — stop alerts for a coin
 app.post('/api/acknowledge/:symbol', async (req, res) => {
   const symbol = req.params.symbol.toUpperCase();
