@@ -142,11 +142,11 @@ setTimeout(async () => {
 }, 5000);
 
 const app = express();
+app.use(cors());
+app.use(express.json());
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 app.use(express.static(join(__dirname, 'public')));
-app.use(cors());
-app.use(express.json());
 
 // CORS middleware
 app.use((req, res, next) => {
@@ -276,6 +276,11 @@ app.post('/mcp', async (req, res) => {
   await server.connect(transport);
   await transport.handleRequest(req, res, req.body);
   await server.close();
+});
+
+
+app.get('/', (req, res) => {
+  res.sendFile(join(__dirname, 'public', 'dashboard.html'));
 });
 
 const PORT = process.env.PORT || 8080;
