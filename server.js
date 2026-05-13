@@ -4,6 +4,8 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
 import { createPrivateKey, sign } from 'crypto';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
 
 const API_KEY = process.env.REVOLUTX_API_KEY;
 const PRIVATE_KEY = process.env.REVOLUTX_PRIVATE_KEY;
@@ -140,6 +142,9 @@ setTimeout(async () => {
 }, 5000);
 
 const app = express();
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+app.use(express.static(join(__dirname, 'public')));
 app.use(cors());
 app.use(express.json());
 

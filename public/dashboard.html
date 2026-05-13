@@ -1,0 +1,622 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Revolut X Dashboard</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0d0d0d;
+      --surface: #1a1a1a;
+      --surface2: #242424;
+      --accent: #00ffc8;
+      --accent-dim: rgba(0, 255, 200, 0.15);
+      --text: #e8e8e8;
+      --text-muted: #888;
+      --danger: #ff4d6a;
+      --warn: #ffaa00;
+      --radius: 12px;
+      --gap: 16px;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      font-size: 15px;
+      line-height: 1.5;
+      min-height: 100vh;
+      padding: 16px;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 20px;
+    }
+
+    header h1 {
+      font-size: 1.1rem;
+      font-weight: 600;
+      color: var(--accent);
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }
+
+    #last-updated {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+    }
+
+    .status-bar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 0.75rem;
+      color: var(--text-muted);
+    }
+
+    .spinner {
+      display: none;
+      width: 12px;
+      height: 12px;
+      border: 2px solid var(--text-muted);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+    }
+    .spinner.active { display: inline-block; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .error-banner {
+      display: none;
+      background: rgba(255, 77, 106, 0.1);
+      border: 1px solid var(--danger);
+      border-radius: var(--radius);
+      padding: 10px 14px;
+      font-size: 0.85rem;
+      color: var(--danger);
+      margin-bottom: 16px;
+    }
+    .error-banner.visible { display: block; }
+
+    .card {
+      background: var(--surface);
+      border-radius: var(--radius);
+      padding: 18px;
+      margin-bottom: var(--gap);
+    }
+
+    .card-title {
+      font-size: 0.7rem;
+      font-weight: 700;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--text-muted);
+      margin-bottom: 14px;
+    }
+
+    /* Portfolio Value */
+    #portfolio-value {
+      font-size: clamp(2rem, 8vw, 3.5rem);
+      font-weight: 700;
+      color: var(--accent);
+      letter-spacing: -0.02em;
+    }
+
+    /* Holdings table */
+    .holdings-list {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .holding-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 10px 12px;
+      background: var(--surface2);
+      border-radius: 8px;
+    }
+
+    .holding-left {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .coin-icon {
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      background: var(--accent-dim);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 0.65rem;
+      font-weight: 700;
+      color: var(--accent);
+      flex-shrink: 0;
+    }
+
+    .coin-symbol {
+      font-weight: 600;
+      font-size: 0.95rem;
+    }
+
+    .coin-price {
+      font-size: 0.78rem;
+      color: var(--text-muted);
+    }
+
+    .coin-value {
+      font-weight: 600;
+      font-size: 0.95rem;
+      text-align: right;
+    }
+
+    /* Alerts */
+    .alerts-list {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .alert-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 10px 12px;
+      background: rgba(255, 170, 0, 0.07);
+      border: 1px solid rgba(255, 170, 0, 0.25);
+      border-radius: 8px;
+    }
+
+    .alert-symbol {
+      font-weight: 600;
+      color: var(--warn);
+    }
+
+    .empty-state {
+      color: var(--text-muted);
+      font-size: 0.875rem;
+      text-align: center;
+      padding: 12px 0;
+    }
+
+    /* Buttons */
+    button {
+      cursor: pointer;
+      border: none;
+      border-radius: 8px;
+      font-family: inherit;
+      font-weight: 600;
+      transition: opacity 0.15s, transform 0.1s;
+    }
+    button:active { transform: scale(0.96); }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    .btn-accent {
+      background: var(--accent);
+      color: #0d0d0d;
+      padding: 9px 18px;
+      font-size: 0.875rem;
+      min-height: 40px;
+    }
+    .btn-accent:hover:not(:disabled) { opacity: 0.88; }
+
+    .btn-outline {
+      background: transparent;
+      color: var(--accent);
+      border: 1px solid var(--accent);
+      padding: 7px 14px;
+      font-size: 0.8rem;
+      min-height: 36px;
+    }
+    .btn-outline:hover:not(:disabled) { background: var(--accent-dim); }
+
+    .btn-danger-outline {
+      background: transparent;
+      color: var(--danger);
+      border: 1px solid var(--danger);
+      padding: 7px 14px;
+      font-size: 0.8rem;
+      min-height: 36px;
+    }
+    .btn-danger-outline:hover:not(:disabled) { background: rgba(255, 77, 106, 0.1); }
+
+    /* Monitoring controls */
+    .controls-row {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      flex-wrap: wrap;
+    }
+
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 12px;
+      border-radius: 20px;
+      font-size: 0.78rem;
+      font-weight: 600;
+    }
+    .status-pill.running {
+      background: rgba(0, 255, 200, 0.1);
+      color: var(--accent);
+    }
+    .status-pill.paused {
+      background: rgba(255, 170, 0, 0.1);
+      color: var(--warn);
+    }
+    .status-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+    }
+    .status-pill.running .status-dot { background: var(--accent); }
+    .status-pill.paused .status-dot { background: var(--warn); }
+
+    /* Thresholds */
+    .threshold-list {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .threshold-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      padding: 10px 12px;
+      background: var(--surface2);
+      border-radius: 8px;
+    }
+
+    .threshold-symbol {
+      font-weight: 600;
+      min-width: 70px;
+      font-size: 0.9rem;
+    }
+
+    .threshold-label {
+      font-size: 0.78rem;
+      color: var(--text-muted);
+      flex: 1;
+    }
+
+    .threshold-input-wrap {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .threshold-input {
+      background: var(--surface);
+      border: 1px solid #333;
+      border-radius: 6px;
+      color: var(--text);
+      font-family: inherit;
+      font-size: 0.875rem;
+      padding: 7px 10px;
+      width: 80px;
+      text-align: right;
+      min-height: 36px;
+    }
+    .threshold-input:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+
+    .pct-label {
+      color: var(--text-muted);
+      font-size: 0.8rem;
+    }
+
+    .toast {
+      position: fixed;
+      bottom: 20px;
+      left: 50%;
+      transform: translateX(-50%) translateY(80px);
+      background: var(--surface2);
+      border: 1px solid #333;
+      color: var(--text);
+      padding: 10px 20px;
+      border-radius: 8px;
+      font-size: 0.85rem;
+      transition: transform 0.25s ease;
+      z-index: 999;
+      white-space: nowrap;
+    }
+    .toast.show { transform: translateX(-50%) translateY(0); }
+    .toast.success { border-color: var(--accent); color: var(--accent); }
+    .toast.error { border-color: var(--danger); color: var(--danger); }
+
+    @media (max-width: 480px) {
+      body { padding: 12px; }
+      .card { padding: 14px; }
+      .threshold-row { flex-direction: column; align-items: flex-start; }
+      .threshold-input-wrap { width: 100%; }
+      .threshold-input { flex: 1; width: auto; }
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>⚡ Revolut X</h1>
+  <div class="status-bar">
+    <div class="spinner" id="spinner"></div>
+    <span id="last-updated">Loading…</span>
+  </div>
+</header>
+
+<div class="error-banner" id="error-banner"></div>
+
+<!-- Portfolio Value -->
+<div class="card">
+  <div class="card-title">Portfolio Value</div>
+  <div id="portfolio-value">—</div>
+</div>
+
+<!-- Holdings -->
+<div class="card">
+  <div class="card-title">Holdings</div>
+  <div class="holdings-list" id="holdings-list">
+    <div class="empty-state">Loading…</div>
+  </div>
+</div>
+
+<!-- Active Alerts -->
+<div class="card">
+  <div class="card-title">Active Alerts</div>
+  <div class="alerts-list" id="alerts-list">
+    <div class="empty-state">None</div>
+  </div>
+</div>
+
+<!-- Monitoring Controls -->
+<div class="card">
+  <div class="card-title">Monitoring Controls</div>
+  <div class="controls-row">
+    <div class="status-pill running" id="monitor-status-pill">
+      <div class="status-dot"></div>
+      <span id="monitor-status-text">Running</span>
+    </div>
+    <button class="btn-accent" id="pause-resume-btn" onclick="toggleMonitoring()">Pause</button>
+  </div>
+</div>
+
+<!-- Thresholds -->
+<div class="card">
+  <div class="card-title">Alert Thresholds</div>
+  <div class="threshold-list" id="threshold-list">
+    <div class="empty-state">Loading…</div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+  const BASE = window.location.origin;
+  const REFRESH_MS = 5 * 60 * 1000;
+
+  let balancesData = [];
+  let statusData = {};
+
+  // ── Helpers ──────────────────────────────────────────────────────────────
+
+  function fmt(usd) {
+    if (usd == null) return '—';
+    return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(usd);
+  }
+
+  function fmtPrice(p) {
+    if (p == null) return '—';
+    if (p >= 1000) return '$' + p.toLocaleString('en-US', { maximumFractionDigits: 2 });
+    if (p >= 1) return '$' + p.toFixed(4);
+    return '$' + p.toFixed(6);
+  }
+
+  function setLoading(on) {
+    document.getElementById('spinner').classList.toggle('active', on);
+  }
+
+  function showError(msg) {
+    const el = document.getElementById('error-banner');
+    if (msg) { el.textContent = msg; el.classList.add('visible'); }
+    else { el.classList.remove('visible'); }
+  }
+
+  function showToast(msg, type = '') {
+    const t = document.getElementById('toast');
+    t.textContent = msg;
+    t.className = 'toast show' + (type ? ' ' + type : '');
+    clearTimeout(t._timer);
+    t._timer = setTimeout(() => { t.className = 'toast'; }, 2800);
+  }
+
+  async function apiFetch(method, path, body) {
+    const opts = { method, headers: { 'Content-Type': 'application/json' } };
+    if (body !== undefined) opts.body = JSON.stringify(body);
+    const res = await fetch(BASE + path, opts);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+  }
+
+  // ── Render ───────────────────────────────────────────────────────────────
+
+  function renderHoldings(balances) {
+    const el = document.getElementById('holdings-list');
+    if (!balances || balances.length === 0) {
+      el.innerHTML = '<div class="empty-state">No holdings found.</div>';
+      return;
+    }
+    const sorted = [...balances].sort((a, b) => (b.valueUSD || 0) - (a.valueUSD || 0));
+    el.innerHTML = sorted.map(h => `
+      <div class="holding-row">
+        <div class="holding-left">
+          <div class="coin-icon">${h.currency.slice(0, 3)}</div>
+          <div>
+            <div class="coin-symbol">${h.currency}</div>
+            <div class="coin-price">${fmtPrice(h.price)}</div>
+          </div>
+        </div>
+        <div class="coin-value">${fmt(h.valueUSD)}</div>
+      </div>
+    `).join('');
+  }
+
+  function renderAlerts(activeAlerts) {
+    const el = document.getElementById('alerts-list');
+    const symbols = Object.keys(activeAlerts || {});
+    if (symbols.length === 0) {
+      el.innerHTML = '<div class="empty-state">No active alerts 🎉</div>';
+      return;
+    }
+    el.innerHTML = symbols.map(sym => `
+      <div class="alert-row">
+        <span class="alert-symbol">🚀 ${sym}</span>
+        <button class="btn-danger-outline" onclick="acknowledge('${sym}')">Acknowledge</button>
+      </div>
+    `).join('');
+  }
+
+  function renderMonitorStatus(paused) {
+    const pill = document.getElementById('monitor-status-pill');
+    const text = document.getElementById('monitor-status-text');
+    const btn = document.getElementById('pause-resume-btn');
+    if (paused) {
+      pill.className = 'status-pill paused';
+      text.textContent = 'Paused';
+      btn.textContent = 'Resume';
+    } else {
+      pill.className = 'status-pill running';
+      text.textContent = 'Running';
+      btn.textContent = 'Pause';
+    }
+  }
+
+  function renderThresholds(balances, status) {
+    const el = document.getElementById('threshold-list');
+    const coins = (balances || []).filter(b => !['USD','USDT','USDC','EUR','GBP'].includes(b.currency));
+    if (coins.length === 0) {
+      el.innerHTML = '<div class="empty-state">No coins to configure.</div>';
+      return;
+    }
+    const defaultPct = ((status.defaultThreshold || 0.20) * 100).toFixed(0);
+    el.innerHTML = coins.map(h => {
+      const sym = h.symbol || `${h.currency}-USD`;
+      const custom = status.customThresholds && status.customThresholds[sym] !== undefined;
+      const currentPct = custom
+        ? (status.customThresholds[sym] * 100).toFixed(0)
+        : defaultPct;
+      const labelText = custom ? 'custom' : 'default';
+      return `
+        <div class="threshold-row">
+          <div class="threshold-symbol">${h.currency}</div>
+          <div class="threshold-label">${sym} &middot; <em>${labelText}</em></div>
+          <div class="threshold-input-wrap">
+            <input class="threshold-input" type="number" id="thresh-${h.currency}"
+              value="${currentPct}" min="1" max="999" step="1" />
+            <span class="pct-label">%</span>
+            <button class="btn-outline" onclick="setThreshold('${sym}', '${h.currency}')">Set</button>
+          </div>
+        </div>
+      `;
+    }).join('');
+  }
+
+  // ── API Actions ───────────────────────────────────────────────────────────
+
+  async function acknowledge(symbol) {
+    try {
+      await apiFetch('POST', `/api/acknowledge/${symbol}`);
+      showToast(`Acknowledged ${symbol}`, 'success');
+      await refreshStatus();
+    } catch (e) {
+      showToast('Failed: ' + e.message, 'error');
+    }
+  }
+
+  async function toggleMonitoring() {
+    const btn = document.getElementById('pause-resume-btn');
+    btn.disabled = true;
+    try {
+      const paused = statusData.paused;
+      await apiFetch('POST', paused ? '/api/resume' : '/api/pause');
+      showToast(paused ? 'Monitoring resumed' : 'Monitoring paused', 'success');
+      await refreshStatus();
+    } catch (e) {
+      showToast('Failed: ' + e.message, 'error');
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  async function setThreshold(symbol, currency) {
+    const input = document.getElementById(`thresh-${currency}`);
+    const pct = parseFloat(input.value);
+    if (!pct || pct <= 0) { showToast('Enter a valid % > 0', 'error'); return; }
+    try {
+      await apiFetch('POST', `/api/threshold/${symbol}`, { threshold: pct / 100 });
+      showToast(`Threshold for ${symbol} set to ${pct}%`, 'success');
+      await refreshStatus();
+    } catch (e) {
+      showToast('Failed: ' + e.message, 'error');
+    }
+  }
+
+  // ── Data Fetching ─────────────────────────────────────────────────────────
+
+  async function refreshBalances() {
+    const data = await apiFetch('GET', '/api/balances');
+    balancesData = data.balances || [];
+    document.getElementById('portfolio-value').textContent = fmt(data.totalUSD);
+    renderHoldings(balancesData);
+    return balancesData;
+  }
+
+  async function refreshStatus() {
+    const data = await apiFetch('GET', '/api/status');
+    statusData = data;
+    renderAlerts(data.activeAlerts);
+    renderMonitorStatus(data.paused);
+    renderThresholds(balancesData, data);
+    return data;
+  }
+
+  async function refreshAll() {
+    setLoading(true);
+    showError('');
+    try {
+      await refreshBalances();
+      await refreshStatus();
+      const now = new Date();
+      document.getElementById('last-updated').textContent =
+        'Updated ' + now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    } catch (e) {
+      showError('Failed to load data: ' + e.message + '. Is the server running?');
+      document.getElementById('last-updated').textContent = 'Update failed';
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // ── Init ──────────────────────────────────────────────────────────────────
+
+  refreshAll();
+  setInterval(refreshAll, REFRESH_MS);
+</script>
+</body>
+</html>
