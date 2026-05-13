@@ -44,8 +44,15 @@ async function sendTelegram(message) {
 const basePrices = {};
 const activeAlerts = {};
 const lastBalances = {};
+const customThresholds = {};
+let monitoringPaused = false;
+let monitoringInterval = null;
 
 async function checkPortfolio() {
+  if (monitoringPaused) {
+    console.log('Monitoring paused, skipping check.');
+    return;
+  }
   try {
     console.log('Checking portfolio...');
 
@@ -108,7 +115,8 @@ async function checkPortfolio() {
       console.log(`${symbol}: $${currentPrice} (${(change * 100).toFixed(1)}% from baseline)`);
 
       // Trigger alert if pumping
-      if (change >= PUMP_THRESHOLD && !activeAlerts[symbol]) {
+      const threshold = customThresholds[symbol] !== undefined ? customThresholds[symbol] : PUMP_THRESHOLD;
+      if (change >= threshold && !activeAlerts[symbol]) {
         const pct = (change * 100).toFixed(1);
         const alertMessage = `🚀 <b>${symbol} is pumping!</b>\n\nUp <b>${pct}%</b> from $${basePrices[symbol].toFixed(4)} → $${currentPrice.toFixed(4)}\n\nYou hold: ${available} ${asset.currency}\nLog into Revolut X to act!`;
         await sendTelegram(alertMessage);
@@ -127,11 +135,108 @@ async function checkPortfolio() {
 setTimeout(async () => {
   await sendTelegram('🤖 Revolut X monitor started! Checking your portfolio every 5 minutes.');
   await checkPortfolio();
-  setInterval(checkPortfolio, CHECK_INTERVAL_MS);
+  monitoringInterval = setInterval(checkPortfolio, CHECK_INTERVAL_MS);
 }, 5000);
 
 const app = express();
 app.use(express.json());
+
+// CORS middleware
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(204);
+  }
+  next();
+});
+
+// GET /api/status — monitoring status, active alerts, baseline prices
+app.get('/api/status', (req, res) => {
+  const alerts = {};
+  for (const symbol of Object.keys(activeAlerts)) {
+    alerts[symbol] = { alerting: true };
+  }
+  res.json({
+    paused: monitoringPaused,
+    activeAlerts: alerts,
+    basePrices,
+    customThresholds,
+    defaultThreshold: PUMP_THRESHOLD
+  });
+});
+
+// GET /api/balances — balances with prices and total portfolio value
+app.get('/api/balances', async (req, res) => {
+  try {
+    const balances = await revolutRequest('GET', '/balances');
+    const tickerResponse = await revolutRequest('GET', '/tickers');
+    const tickerList = Array.isArray(tickerResponse) ? tickerResponse : (tickerResponse.data || []);
+    const priceMap = {};
+    for (const ticker of tickerList) {
+      if (ticker.symbol) {
+        const price = parseFloat(ticker.last_price || ticker.mid || ticker.ask || ticker.bid);
+        if (price) {
+          priceMap[ticker.symbol] = price;
+          priceMap[ticker.symbol.replace('/', '-')] = price;
+        }
+      }
+    }
+    let totalUSD = 0;
+    const result = [];
+    for (const asset of balances) {
+      const available = parseFloat(asset.available);
+      if (!asset.currency || available <= 0) continue;
+      const symbol = `${asset.currency}-USD`;
+      const price = SKIP_CURRENCIES.includes(asset.currency) ? 1 : (priceMap[symbol] || null);
+      const valueUSD = price ? available * price : null;
+      if (valueUSD) totalUSD += valueUSD;
+      result.push({ currency: asset.currency, available, price, valueUSD, symbol });
+    }
+    res.json({ balances: result, totalUSD });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/acknowledge/:symbol — stop alerts for a coin
+app.post('/api/acknowledge/:symbol', async (req, res) => {
+  const symbol = req.params.symbol.toUpperCase();
+  if (activeAlerts[symbol]) {
+    clearInterval(activeAlerts[symbol]);
+    delete activeAlerts[symbol];
+    await sendTelegram(`🔕 Alerts acknowledged for ${symbol} via dashboard.`);
+    res.json({ ok: true, message: `Alerts stopped for ${symbol}` });
+  } else {
+    res.json({ ok: false, message: `No active alert for ${symbol}` });
+  }
+});
+
+// POST /api/pause — pause all monitoring
+app.post('/api/pause', async (req, res) => {
+  monitoringPaused = true;
+  await sendTelegram('⏸️ Portfolio monitoring paused via dashboard.');
+  res.json({ ok: true, paused: true });
+});
+
+// POST /api/resume — resume monitoring
+app.post('/api/resume', async (req, res) => {
+  monitoringPaused = false;
+  await sendTelegram('▶️ Portfolio monitoring resumed via dashboard.');
+  res.json({ ok: true, paused: false });
+});
+
+// POST /api/threshold/:symbol — set per-coin alert threshold
+app.post('/api/threshold/:symbol', (req, res) => {
+  const symbol = req.params.symbol.toUpperCase();
+  const { threshold } = req.body;
+  if (typeof threshold !== 'number' || threshold <= 0) {
+    return res.status(400).json({ error: 'threshold must be a positive number (e.g. 0.15 for 15%)' });
+  }
+  customThresholds[symbol] = threshold;
+  res.json({ ok: true, symbol, threshold });
+});
 
 function createMcpServer() {
   const server = new McpServer({ name: 'revolut-x', version: '1.0.0' });
