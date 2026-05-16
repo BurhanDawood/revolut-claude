@@ -431,18 +431,32 @@ app.post('/telegram-webhook', async (req, res) => {
           `Active alerts (coins currently above threshold): ${Object.keys(activeAlerts).join(', ') || 'none'}\n\n` +
           `Answer the user's questions about their portfolio, crypto market conditions, and trading decisions. Be concise since this is a Telegram message.`;
 
-        const aiResponse = await anthropic.messages.create({
+        const claudePromise = anthropic.messages.create({
           model: 'claude-opus-4-5',
-          max_tokens: 1024,
+          max_tokens: 2000,
           system: systemPrompt,
-          messages: [{ role: 'user', content: rawText }]
+          messages: [{ role: 'user', content: rawText }],
+          tools: [{
+            type: "web_search_20250305",
+            name: "web_search"
+          }]
         });
+        const timeoutPromise = new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('timeout')), 55000)
+        );
+        const response = await Promise.race([claudePromise, timeoutPromise]);
 
-        const reply = aiResponse.content[0].text;
+        // Extract the last text block (web_search may produce tool_use blocks before the final text)
+        const lastTextBlock = [...response.content].reverse().find(b => b.type === 'text');
+        const reply = lastTextBlock ? lastTextBlock.text : '(no response)';
         await sendReply(reply);
       } catch (err) {
         console.error('Claude AI error:', err.message);
-        await sendReply('❌ Error getting AI response: ' + err.message);
+        if (err.message === 'timeout') {
+          await sendReply('⏱️ That analysis is taking too long. Try asking something more specific or break it into smaller questions.');
+        } else {
+          await sendReply('❌ Error getting AI response: ' + err.message);
+        }
       }
     })();
 
