@@ -372,7 +372,24 @@ app.post('/telegram-webhook', async (req, res) => {
       return res.status(200).json({ ok: true });
     }
 
+    // --- Command: set alert COIN NUMBER% ---
+    const setAlertMatch = rawText.match(/^set\s+alert\s+([A-Za-z]+)\s+([\d.]+)%?$/i);
+    if (setAlertMatch) {
+      const coinBase = setAlertMatch[1].toUpperCase();
+      const symbol = coinBase.endsWith('-USD') ? coinBase : `${coinBase}-USD`;
+      const threshold = parseFloat(setAlertMatch[2]) / 100;
+      const oldThreshold = customThresholds[symbol] ?? PUMP_THRESHOLD;
+      customThresholds[symbol] = threshold;
+      const oldPct = (oldThreshold * 100).toFixed(1);
+      const newPct = (threshold * 100).toFixed(1);
+      await sendReply(`✅ Alert set for ${symbol} at ${newPct}% - saved to your server. Previous threshold was ${oldPct}%, now changed to ${newPct}%.`);
+      return res.status(200).json({ ok: true });
+    }
+
     // --- Free-form message → Claude AI (async, fire-and-forget) ---
+
+    // Capture user message for use inside the async closure
+    const userMessage = rawText;
 
     // 1. Immediately send acknowledgment to Telegram
     await sendReply('🔍 Researching... give me a moment.');
@@ -449,7 +466,25 @@ app.post('/telegram-webhook', async (req, res) => {
         // Extract the last text block (web_search may produce tool_use blocks before the final text)
         const lastTextBlock = [...response.content].reverse().find(b => b.type === 'text');
         const reply = lastTextBlock ? lastTextBlock.text : '(no response)';
-        await sendReply(reply);
+
+        // Intent detection: did the user want to set an alert?
+        const alertIntentRegex = /(?:alert\s+(?:me\s+)?when|notify\s+(?:me\s+)?when|set\s+alert|set\s+threshold)\s+([A-Za-z]+(?:-USD)?)\s+(?:(?:hits?|reaches?|goes?\s+(?:above|below|up|down))\s+)?(\d+(?:\.\d+)?)\s*%/i;
+        const intentMatch = userMessage.match(alertIntentRegex);
+
+        if (intentMatch) {
+          const coinBase = intentMatch[1].toUpperCase();
+          const symbol = coinBase.endsWith('-USD') ? coinBase : `${coinBase}-USD`;
+          const threshold = parseFloat(intentMatch[2]) / 100;
+          const oldThreshold = customThresholds[symbol] ?? PUMP_THRESHOLD;
+          customThresholds[symbol] = threshold;
+          const oldPct = (oldThreshold * 100).toFixed(1);
+          const newPct = (threshold * 100).toFixed(1);
+          // Send the AI response first, then confirmation
+          await sendReply(reply);
+          await sendReply(`✅ Alert set for ${symbol} at ${newPct}% - saved to your server. Previous threshold was ${oldPct}%, now changed to ${newPct}%.`);
+        } else {
+          await sendReply(reply);
+        }
       } catch (err) {
         console.error('Claude AI error:', err.message);
         if (err.message === 'timeout') {
