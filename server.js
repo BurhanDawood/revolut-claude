@@ -384,20 +384,57 @@ app.post('/telegram-webhook', async (req, res) => {
     // Non-blocking — runs after response is sent
     (async () => {
       try {
-        const balancesContext = Object.entries(lastBalances)
-          .map(([sym, qty]) => `${sym}: ${qty}`)
-          .join(', ') || 'No balance data available';
+        // Fetch fresh balances and prices directly via internal functions
+        const balances = await revolutRequest('GET', '/balances');
+        const tickerResponse = await revolutRequest('GET', '/tickers');
+        const tickerList = Array.isArray(tickerResponse) ? tickerResponse : (tickerResponse.data || []);
 
-        const basePricesContext = Object.entries(basePrices)
-          .map(([sym, price]) => `${sym}: $${price}`)
-          .join(', ') || 'No baseline data available';
+        // Build price map
+        const priceMap = {};
+        for (const ticker of tickerList) {
+          if (ticker.symbol) {
+            const price = parseFloat(ticker.last_price || ticker.mid || ticker.ask || ticker.bid);
+            if (price) {
+              priceMap[ticker.symbol] = price;
+              priceMap[ticker.symbol.replace('/', '-')] = price;
+            }
+          }
+        }
 
-        const activeAlertsContext = Object.keys(activeAlerts).join(', ') || 'None';
+        // Compute holdings with USD values
+        const holdings = [];
+        for (const asset of balances) {
+          const available = parseFloat(asset.available);
+          if (!asset.currency || available <= 0) continue;
+          const symbol = `${asset.currency}-USD`;
+          const isStable = SKIP_CURRENCIES.includes(asset.currency);
+          const price = isStable ? 1 : (priceMap[symbol] || null);
+          if (!price) continue;
+          const valueUSD = available * price;
+          holdings.push({ symbol, available, price, valueUSD });
+        }
+
+        // Sort by USD value descending
+        holdings.sort((a, b) => b.valueUSD - a.valueUSD);
+
+        // Format as numbered list
+        const holdingsList = holdings.length
+          ? holdings.map((h, i) =>
+              `${i + 1}. ${h.symbol}: ${h.available} tokens @ $${h.price.toFixed(2)} = $${h.valueUSD.toFixed(2)} USD`
+            ).join('\n')
+          : 'No holdings data available';
+
+        const systemPrompt =
+          `You are an AI crypto trading assistant. Use ONLY the holdings data provided below. Do not recalculate or estimate prices. The values shown are live and accurate.\n\n` +
+          `Here are the user's current holdings sorted by USD value (already calculated):\n${holdingsList}\n\n` +
+          `Current baseline prices (set when monitoring started): ${JSON.stringify(basePrices)}\n` +
+          `Active alerts (coins currently above threshold): ${Object.keys(activeAlerts).join(', ') || 'none'}\n\n` +
+          `Answer the user's questions about their portfolio, crypto market conditions, and trading decisions. Be concise since this is a Telegram message.`;
 
         const aiResponse = await anthropic.messages.create({
           model: 'claude-opus-4-5',
           max_tokens: 1024,
-          system: `You are an AI crypto trading assistant with access to the user's Revolut X portfolio. The user's current holdings are: ${balancesContext}. Current baseline prices are: ${basePricesContext}. Active alerts are: ${activeAlertsContext}. Answer the user's questions about their portfolio, crypto market conditions, and trading decisions. Be concise since this is a Telegram message.`,
+          system: systemPrompt,
           messages: [{ role: 'user', content: rawText }]
         });
 
