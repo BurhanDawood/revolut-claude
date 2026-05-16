@@ -6,6 +6,7 @@ import { z } from 'zod';
 import { createPrivateKey, sign } from 'crypto';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
+import mysql from 'mysql2/promise';
 
 const API_KEY = process.env.REVOLUTX_API_KEY;
 const PRIVATE_KEY = process.env.REVOLUTX_PRIVATE_KEY;
@@ -50,6 +51,26 @@ const lastBalances = {};
 const customThresholds = {};
 let monitoringPaused = false;
 let monitoringInterval = null;
+
+const db = await mysql.createConnection({
+  host: process.env.DB_HOST,
+  port: parseInt(process.env.DB_PORT || '3306'),
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_NAME
+});
+
+await db.execute(`CREATE TABLE IF NOT EXISTS baselines (
+  symbol VARCHAR(50) PRIMARY KEY,
+  price DECIMAL(20,10) NOT NULL,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+)`);
+
+const [rows] = await db.execute('SELECT symbol, price FROM baselines');
+for (const row of rows) {
+  basePrices[row.symbol] = parseFloat(row.price);
+}
+console.log(`Loaded ${rows.length} baselines from database`);
 
 async function checkPortfolio() {
   if (monitoringPaused) {
@@ -111,6 +132,10 @@ async function checkPortfolio() {
       if (!basePrices[symbol]) {
         basePrices[symbol] = currentPrice;
         console.log(`Baseline set for ${symbol}: $${currentPrice}`);
+        await db.execute(
+          'INSERT INTO baselines (symbol, price) VALUES (?, ?) ON DUPLICATE KEY UPDATE price = VALUES(price)',
+          [symbol, currentPrice]
+        );
         continue;
       }
 
