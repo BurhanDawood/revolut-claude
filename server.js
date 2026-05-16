@@ -392,19 +392,33 @@ app.post('/telegram-webhook', async (req, res) => {
       return res.status(200).json({ ok: true });
     }
 
-    // --- Command: set alert COIN NUMBER% ---
-    const setAlertMatch = rawText.match(/^set\s+alert\s+([A-Za-z]+)\s+([\d.]+)%?$/i);
-    if (setAlertMatch) {
-      const coinBase = setAlertMatch[1].toUpperCase();
-      const symbol = coinBase.endsWith('-USD') ? coinBase : `${coinBase}-USD`;
-      const threshold = parseFloat(setAlertMatch[2]) / 100;
-      const oldThreshold = customThresholds[symbol] ?? PUMP_THRESHOLD;
-      customThresholds[symbol] = threshold;
-      const oldPct = (oldThreshold * 100).toFixed(1);
-      const newPct = (threshold * 100).toFixed(1);
-      await sendReply(`✅ Alert set for ${symbol} at ${newPct}% - saved to your server. Previous threshold was ${oldPct}%, now changed to ${newPct}%.`);
-      return res.status(200).json({ ok: true });
+    // --- Extended alert intent patterns — handle BEFORE Claude ---
+    const alertPatterns = [
+      // "alert me when CC increases 1%", "notify me when CC pumps 5%", "alert me when CC hits 1%"
+      /(?:alert\s+me\s+when|notify\s+me\s+when|alert\s+when)\s+([A-Za-z]+)\s+(?:increases?|pumps?|hits?|goes?\s+up|moves?\s+up|rises?|reaches?)\s+([\d.]+)\s*%/i,
+      // "set alert CC 1%", "set threshold CC 1%", "alert CC 1%"
+      /(?:set\s+alert|set\s+threshold|alert)\s+([A-Za-z]+)\s+([\d.]+)\s*%/i,
+      // "CC alert at 1%"
+      /([A-Za-z]+)\s+alert\s+(?:at\s+)?([\d.]+)\s*%/i,
+    ];
+
+    let alertHandled = false;
+    for (const pattern of alertPatterns) {
+      const m = rawText.match(pattern);
+      if (m) {
+        const coinBase = m[1].toUpperCase();
+        const symbol = coinBase.endsWith('-USD') ? coinBase : `${coinBase}-USD`;
+        const threshold = parseFloat(m[2]) / 100;
+        const oldThreshold = customThresholds[symbol] ?? PUMP_THRESHOLD;
+        customThresholds[symbol] = threshold;
+        const oldPct = (oldThreshold * 100).toFixed(1);
+        const newPct = (threshold * 100).toFixed(1);
+        await sendReply(`✅ Alert set for ${symbol} at ${newPct}% - saved to your server. Previous threshold was ${oldPct}%, now changed to ${newPct}%.`);
+        alertHandled = true;
+        break;
+      }
     }
+    if (alertHandled) return res.status(200).json({ ok: true });
 
     // --- Free-form message → Claude AI (async, fire-and-forget) ---
 
@@ -513,24 +527,35 @@ app.post('/telegram-webhook', async (req, res) => {
         // Clean up old rows (keep last 20 per chat)
         await db.execute('DELETE FROM conversation_history WHERE chat_id = ? AND id NOT IN (SELECT id FROM (SELECT id FROM conversation_history WHERE chat_id = ? ORDER BY created_at DESC LIMIT 20) t)', [chatId, chatId]);
 
-        // Intent detection: did the user want to set an alert?
-        const alertIntentRegex = /(?:alert\s+(?:me\s+)?when|notify\s+(?:me\s+)?when|set\s+alert|set\s+threshold)\s+([A-Za-z]+(?:-USD)?)\s+(?:(?:hits?|reaches?|goes?\s+(?:above|below|up|down))\s+)?(\d+(?:\.\d+)?)\s*%/i;
-        const intentMatch = userMessage.match(alertIntentRegex);
+        // Check if Claude's response implies it set a threshold — actually execute it
+        const claudeAlertPatterns = [
+          /(?:alert(?:ing)?\s+you|set\s+(?:up\s+)?(?:an?\s+)?alert|creat(?:ed?)?\s+(?:an?\s+)?alert|threshold\s+set|notify\s+you|notification\s+set)\s+.*?([A-Za-z]{2,10}(?:-USD)?)\s+.*?([\d.]+)\s*%/i,
+          /([A-Za-z]{2,10}(?:-USD)?)\s+.*?(?:alert|threshold|notification)\s+.*?([\d.]+)\s*%/i,
+          /threshold.*?([A-Za-z]{2,10}(?:-USD)?)\s+.*?([\d.]+)\s*%/i,
+        ];
 
-        if (intentMatch) {
-          const coinBase = intentMatch[1].toUpperCase();
-          const symbol = coinBase.endsWith('-USD') ? coinBase : `${coinBase}-USD`;
-          const threshold = parseFloat(intentMatch[2]) / 100;
-          const oldThreshold = customThresholds[symbol] ?? PUMP_THRESHOLD;
-          customThresholds[symbol] = threshold;
-          const oldPct = (oldThreshold * 100).toFixed(1);
-          const newPct = (threshold * 100).toFixed(1);
-          // Send the AI response first, then confirmation
-          await sendReply(reply);
-          await sendReply(`✅ Alert set for ${symbol} at ${newPct}% - saved to your server. Previous threshold was ${oldPct}%, now changed to ${newPct}%.`);
-        } else {
-          await sendReply(reply);
+        let actionTaken = null;
+        for (const pattern of claudeAlertPatterns) {
+          const m = reply.match(pattern);
+          if (m) {
+            const coinBase = m[1].toUpperCase();
+            // Skip common false positives
+            if (['THE', 'FOR', 'AND', 'YOU', 'SET', 'GET', 'HAS', 'ARE'].includes(coinBase)) continue;
+            const symbol = coinBase.endsWith('-USD') ? coinBase : `${coinBase}-USD`;
+            const threshold = parseFloat(m[2]) / 100;
+            if (threshold > 0 && threshold <= 1) { // sanity check: 0–100%
+              const oldThreshold = customThresholds[symbol] ?? PUMP_THRESHOLD;
+              customThresholds[symbol] = threshold;
+              const newPct = (threshold * 100).toFixed(1);
+              const oldPct = (oldThreshold * 100).toFixed(1);
+              actionTaken = `\n\n✅ Actually saved to server - ${symbol} threshold changed to ${newPct}% (was ${oldPct}%)`;
+            }
+            break;
+          }
         }
+
+        // Send reply (with action confirmation appended if applicable)
+        await sendReply(reply + (actionTaken || ''));
       } catch (err) {
         console.error('Claude AI error:', err.message);
         if (err.message === 'timeout') {
