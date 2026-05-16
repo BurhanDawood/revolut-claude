@@ -456,34 +456,36 @@ app.post('/telegram-webhook', async (req, res) => {
       return res.status(200).json({ ok: true });
     }
 
-    // --- Multi-coin threshold scanner — handle BEFORE Claude ---
-    // Handles: "Set CC to 5% and HYPE to 3%"
-    //          "Set CC threshold to 5% and Hype threshold to 5%"
-    //          "CC 5% HYPE 3%"
-    //          "alert me when CC hits 2% and BTC hits 1%"
-    //          "set CC threshold to 5% and HYPE threshold to 5%"
-    const multiCoinPattern = /\b([A-Za-z]{2,10})\s+(?:threshold\s+)?(?:to\s+|at\s+|alert\s+(?:at\s+)?)?(?:[\w\s]+?\s+)?([\d.]+)\s*%/gi;
+    // Simple multi-coin scanner: find ALL [COIN] [NUMBER]% pairs in the message
+    // Pattern: 2-10 letter word followed by a number and %
+    // e.g. "CC 5%" "HYPE 3%" "BTC 2.5%"
+    const coinPctPattern = /\b([A-Za-z]{2,10})\b\s*(?:threshold\s*(?:to|at|=)?\s*|to\s+|at\s+|=\s*)?([\d.]+)\s*%/gi;
+    const skipWords = new Set(['SET', 'AND', 'THE', 'FOR', 'ALL', 'GET', 'PUT', 'LET', 'CAN', 'ARE', 'NOT', 'BUT', 'USE', 'NEW', 'OLD', 'ANY', 'TWO', 'ONE', 'HIT', 'TOP', 'LOW', 'MAX', 'MIN']);
 
-    const pairs = [];
-    let match;
-    while ((match = multiCoinPattern.exec(rawText)) !== null) {
-      const coinBase = match[1].toUpperCase();
-      // Skip common English words that aren't coins
-      const skipWords = ['SET', 'AND', 'THE', 'FOR', 'ALL', 'GET', 'PUT', 'LET', 'CAN', 'ARE', 'NOT', 'BUT', 'USE', 'NEW', 'OLD', 'ANY', 'TWO', 'ONE'];
-      if (skipWords.includes(coinBase)) continue;
-      const symbol = coinBase.endsWith('-USD') ? coinBase : `${coinBase}-USD`;
-      const pct = parseFloat(match[2]);
+    const thresholdPairs = [];
+    let m;
+    coinPctPattern.lastIndex = 0; // reset before use
+    while ((m = coinPctPattern.exec(rawText)) !== null) {
+      const coinBase = m[1].toUpperCase();
+      if (skipWords.has(coinBase)) continue;
+      const pct = parseFloat(m[2]);
       if (pct > 0 && pct <= 100) {
-        pairs.push({ symbol, threshold: pct / 100 });
+        thresholdPairs.push({ symbol: coinBase.endsWith('-USD') ? coinBase : `${coinBase}-USD`, threshold: pct / 100 });
       }
     }
 
-    if (pairs.length > 0) {
+    // Only treat as threshold-setting if message contains threshold intent keywords
+    const hasThresholdIntent = /\b(?:set|alert|threshold|notify|percent|%)\b/i.test(rawText);
+
+    if (thresholdPairs.length > 0 && hasThresholdIntent) {
       const confirmations = [];
-      for (const { symbol, threshold } of pairs) {
+      for (const { symbol, threshold } of thresholdPairs) {
+        console.log('EXECUTING threshold for:', symbol, (threshold * 100).toFixed(1) + '%');
+        // Call the EXACT same function used for single-coin:
         const { oldThreshold } = await setThreshold(symbol, threshold);
         const newPct = (threshold * 100).toFixed(1);
-        confirmations.push(`✅ ${symbol} set to ${newPct}% - saved`);
+        const oldPct = (oldThreshold * 100).toFixed(1);
+        confirmations.push(`✅ ${symbol} set to ${newPct}% (was ${oldPct}%) - saved to server`);
       }
       await sendReply(confirmations.join('\n'));
       return res.status(200).json({ ok: true });
