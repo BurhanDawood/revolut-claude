@@ -48,6 +48,48 @@ async function sendTelegram(message) {
   console.log('Telegram sent:', message.substring(0, 50));
 }
 
+async function sendTelegramMessage(chatId, text) {
+  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+  await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML' })
+  });
+}
+
+async function sendTelegramMessageSafe(chatId, text) {
+  const MAX_LENGTH = 4000;
+  if (text.length <= MAX_LENGTH) {
+    return sendTelegramMessage(chatId, text);
+  }
+
+  // Split at natural break points: paragraph > newline > sentence > space
+  const chunks = [];
+  let remaining = text;
+  while (remaining.length > MAX_LENGTH) {
+    let splitAt = -1;
+    // Try paragraph break
+    splitAt = remaining.lastIndexOf('\n\n', MAX_LENGTH);
+    // Try single newline
+    if (splitAt < MAX_LENGTH * 0.5) splitAt = remaining.lastIndexOf('\n', MAX_LENGTH);
+    // Try sentence end
+    if (splitAt < MAX_LENGTH * 0.5) splitAt = remaining.lastIndexOf('. ', MAX_LENGTH);
+    // Try space
+    if (splitAt < MAX_LENGTH * 0.5) splitAt = remaining.lastIndexOf(' ', MAX_LENGTH);
+    // Hard cut as last resort
+    if (splitAt <= 0) splitAt = MAX_LENGTH;
+
+    chunks.push(remaining.slice(0, splitAt).trim());
+    remaining = remaining.slice(splitAt).trim();
+  }
+  if (remaining.length > 0) chunks.push(remaining);
+
+  for (const chunk of chunks) {
+    await sendTelegramMessage(chatId, chunk);
+    await new Promise(resolve => setTimeout(resolve, 500));
+  }
+}
+
 const basePrices = {};
 const activeAlerts = {};
 const lastBalances = {};
@@ -624,8 +666,8 @@ app.post('/telegram-webhook', async (req, res) => {
           }
         }
 
-        // Send reply (with action confirmation appended if applicable)
-        await sendReply(reply + (actionTaken || ''));
+        // Send Claude's reply via safe chunked sender (handles long responses)
+        await sendTelegramMessageSafe(chatId, reply + (actionTaken || ''));
       } catch (err) {
         console.error('Claude AI error:', err.message);
         if (err.message === 'timeout') {
