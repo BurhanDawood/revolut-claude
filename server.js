@@ -60,6 +60,14 @@ async function setThreshold(symbol, threshold) {
   const oldThreshold = customThresholds[symbol] ?? PUMP_THRESHOLD;
   customThresholds[symbol] = threshold;
 
+  // Persist threshold to database so it survives server restarts
+  // Note: no delete path exists currently; if one is added later, also run:
+  // await db.execute('DELETE FROM custom_thresholds WHERE symbol = ?', [symbol]);
+  await db.execute(
+    'INSERT INTO custom_thresholds (symbol, threshold) VALUES (?, ?) ON DUPLICATE KEY UPDATE threshold = VALUES(threshold)',
+    [symbol, threshold]
+  );
+
   // Cancel any active alert interval for this coin
   if (activeAlerts[symbol]) {
     clearInterval(activeAlerts[symbol]);
@@ -123,6 +131,12 @@ await db.execute(`CREATE TABLE IF NOT EXISTS conversation_history (
   INDEX idx_chat_id (chat_id)
 )`);
 
+await db.execute(`CREATE TABLE IF NOT EXISTS custom_thresholds (
+  symbol VARCHAR(50) PRIMARY KEY,
+  threshold DECIMAL(10,6) NOT NULL,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+)`);
+
 const [rows] = await db.execute('SELECT symbol, price FROM baselines');
 for (const row of rows) {
   basePrices[row.symbol] = parseFloat(row.price);
@@ -138,6 +152,12 @@ for (const row of histRows) {
   conversationHistory.get(id).unshift({ role: row.role, content: row.content });
 }
 console.log(`Loaded conversation history for ${conversationHistory.size} chat(s)`);
+
+const [thresholdRows] = await db.execute('SELECT symbol, threshold FROM custom_thresholds');
+for (const row of thresholdRows) {
+  customThresholds[row.symbol] = parseFloat(row.threshold);
+}
+console.log(`Loaded ${thresholdRows.length} custom thresholds from database`);
 
 async function checkPortfolio() {
   if (monitoringPaused) {
