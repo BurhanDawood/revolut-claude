@@ -313,11 +313,11 @@ app.get('/', (req, res) => {
 
 // POST /telegram-webhook — handle incoming Telegram messages
 app.post('/telegram-webhook', async (req, res) => {
-  res.sendStatus(200); // Always ack Telegram immediately to prevent retries
-
   try {
     const message = req.body.message;
-    if (!message || !message.text) return;
+    if (!message || !message.text) {
+      return res.status(200).json({ ok: true });
+    }
 
     const chatId = message.chat.id;
     const rawText = message.text.trim();
@@ -343,21 +343,21 @@ app.post('/telegram-webhook', async (req, res) => {
       } else {
         await sendReply('✅ No active alerts to acknowledge.');
       }
-      return;
+      return res.status(200).json({ ok: true });
     }
 
     // --- Command: pause ---
     if (commandText === 'pause') {
       monitoringPaused = true;
       await sendReply('⏸ Monitoring paused');
-      return;
+      return res.status(200).json({ ok: true });
     }
 
     // --- Command: resume ---
     if (commandText === 'resume') {
       monitoringPaused = false;
       await sendReply('▶️ Monitoring resumed');
-      return;
+      return res.status(200).json({ ok: true });
     }
 
     // --- Command: status ---
@@ -369,42 +369,51 @@ app.post('/telegram-webhook', async (req, res) => {
         `Active alerts: ${alertedSymbols.length}\n` +
         (alertedSymbols.length ? `Alerted symbols: ${alertedSymbols.join(', ')}` : 'No active alerts');
       await sendReply(statusMsg);
-      return;
+      return res.status(200).json({ ok: true });
     }
 
-    // --- Free-form message → Claude AI ---
-    const balancesContext = Object.entries(lastBalances)
-      .map(([sym, qty]) => `${sym}: ${qty}`)
-      .join(', ') || 'No balance data available';
+    // --- Free-form message → Claude AI (async, fire-and-forget) ---
 
-    const basePricesContext = Object.entries(basePrices)
-      .map(([sym, price]) => `${sym}: $${price}`)
-      .join(', ') || 'No baseline data available';
+    // 1. Immediately send acknowledgment to Telegram
+    await sendReply('🔍 Researching... give me a moment.');
 
-    const activeAlertsContext = Object.keys(activeAlerts).join(', ') || 'None';
+    // 2. Immediately return 200 to Telegram so it doesn't timeout
+    res.status(200).json({ ok: true });
 
-    const aiResponse = await anthropic.messages.create({
-      model: 'claude-opus-4-5',
-      max_tokens: 1024,
-      system: `You are an AI crypto trading assistant with access to the user's Revolut X portfolio. The user's current holdings are: ${balancesContext}. Current baseline prices are: ${basePricesContext}. Active alerts are: ${activeAlertsContext}. Answer the user's questions about their portfolio, crypto market conditions, and trading decisions. Be concise since this is a Telegram message.`,
-      messages: [{ role: 'user', content: rawText }]
-    });
+    // 3. Continue processing the Claude API call asynchronously AFTER responding
+    // Non-blocking — runs after response is sent
+    (async () => {
+      try {
+        const balancesContext = Object.entries(lastBalances)
+          .map(([sym, qty]) => `${sym}: ${qty}`)
+          .join(', ') || 'No balance data available';
 
-    const reply = aiResponse.content[0].text;
-    await sendReply(reply);
+        const basePricesContext = Object.entries(basePrices)
+          .map(([sym, price]) => `${sym}: $${price}`)
+          .join(', ') || 'No baseline data available';
+
+        const activeAlertsContext = Object.keys(activeAlerts).join(', ') || 'None';
+
+        const aiResponse = await anthropic.messages.create({
+          model: 'claude-opus-4-5',
+          max_tokens: 1024,
+          system: `You are an AI crypto trading assistant with access to the user's Revolut X portfolio. The user's current holdings are: ${balancesContext}. Current baseline prices are: ${basePricesContext}. Active alerts are: ${activeAlertsContext}. Answer the user's questions about their portfolio, crypto market conditions, and trading decisions. Be concise since this is a Telegram message.`,
+          messages: [{ role: 'user', content: rawText }]
+        });
+
+        const reply = aiResponse.content[0].text;
+        await sendReply(reply);
+      } catch (err) {
+        console.error('Claude AI error:', err.message);
+        await sendReply('❌ Error getting AI response: ' + err.message);
+      }
+    })();
+
   } catch (err) {
     console.error('Telegram webhook error:', err.message);
-    try {
-      const chatId = req.body?.message?.chat?.id;
-      if (chatId) {
-        const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-        await fetch(url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ chat_id: chatId, text: `⚠️ Error: ${err.message}` })
-        });
-      }
-    } catch (_) {}
+    if (!res.headersSent) {
+      res.status(200).json({ ok: true });
+    }
   }
 });
 
