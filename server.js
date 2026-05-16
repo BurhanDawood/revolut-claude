@@ -54,6 +54,7 @@ const lastBalances = {};
 const customThresholds = {};
 let monitoringPaused = false;
 let monitoringInterval = null;
+const conversationHistory = new Map(); // chatId -> [{role, content}]
 
 const db = await mysql.createConnection({
   host: process.env.DB_HOST,
@@ -69,11 +70,30 @@ await db.execute(`CREATE TABLE IF NOT EXISTS baselines (
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 )`);
 
+await db.execute(`CREATE TABLE IF NOT EXISTS conversation_history (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  chat_id BIGINT NOT NULL,
+  role VARCHAR(10) NOT NULL,
+  content TEXT NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_chat_id (chat_id)
+)`);
+
 const [rows] = await db.execute('SELECT symbol, price FROM baselines');
 for (const row of rows) {
   basePrices[row.symbol] = parseFloat(row.price);
 }
 console.log(`Loaded ${rows.length} baselines from database`);
+
+const [histRows] = await db.execute(
+  'SELECT chat_id, role, content FROM (SELECT chat_id, role, content, ROW_NUMBER() OVER (PARTITION BY chat_id ORDER BY created_at DESC) as rn FROM conversation_history) ranked WHERE rn <= 20 ORDER BY rn DESC'
+);
+for (const row of histRows) {
+  const id = row.chat_id.toString();
+  if (!conversationHistory.has(id)) conversationHistory.set(id, []);
+  conversationHistory.get(id).unshift({ role: row.role, content: row.content });
+}
+console.log(`Loaded conversation history for ${conversationHistory.size} chat(s)`);
 
 async function checkPortfolio() {
   if (monitoringPaused) {
@@ -448,11 +468,20 @@ app.post('/telegram-webhook', async (req, res) => {
           `Active alerts (coins currently above threshold): ${Object.keys(activeAlerts).join(', ') || 'none'}\n\n` +
           `Answer the user's questions about their portfolio, crypto market conditions, and trading decisions. Be concise since this is a Telegram message.`;
 
+        const chatIdStr = chatId.toString();
+        const history = conversationHistory.get(chatIdStr) || [];
+
+        // Build messages array: history + current user message
+        const messages = [
+          ...history,
+          { role: 'user', content: userMessage }
+        ];
+
         const claudePromise = anthropic.messages.create({
           model: 'claude-opus-4-5',
           max_tokens: 2000,
           system: systemPrompt,
-          messages: [{ role: 'user', content: rawText }],
+          messages,
           tools: [{
             type: "web_search_20250305",
             name: "web_search"
@@ -466,6 +495,23 @@ app.post('/telegram-webhook', async (req, res) => {
         // Extract the last text block (web_search may produce tool_use blocks before the final text)
         const lastTextBlock = [...response.content].reverse().find(b => b.type === 'text');
         const reply = lastTextBlock ? lastTextBlock.text : '(no response)';
+
+        // Update in-memory history
+        const updatedHistory = [
+          ...history,
+          { role: 'user', content: userMessage },
+          { role: 'assistant', content: reply }
+        ];
+        // Keep last 10 exchanges (20 messages)
+        const trimmed = updatedHistory.slice(-20);
+        conversationHistory.set(chatIdStr, trimmed);
+
+        // Persist to DB
+        await db.execute('INSERT INTO conversation_history (chat_id, role, content) VALUES (?, ?, ?)', [chatId, 'user', userMessage]);
+        await db.execute('INSERT INTO conversation_history (chat_id, role, content) VALUES (?, ?, ?)', [chatId, 'assistant', reply]);
+
+        // Clean up old rows (keep last 20 per chat)
+        await db.execute('DELETE FROM conversation_history WHERE chat_id = ? AND id NOT IN (SELECT id FROM (SELECT id FROM conversation_history WHERE chat_id = ? ORDER BY created_at DESC LIMIT 20) t)', [chatId, chatId]);
 
         // Intent detection: did the user want to set an alert?
         const alertIntentRegex = /(?:alert\s+(?:me\s+)?when|notify\s+(?:me\s+)?when|set\s+alert|set\s+threshold)\s+([A-Za-z]+(?:-USD)?)\s+(?:(?:hits?|reaches?|goes?\s+(?:above|below|up|down))\s+)?(\d+(?:\.\d+)?)\s*%/i;
