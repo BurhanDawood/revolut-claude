@@ -456,32 +456,38 @@ app.post('/telegram-webhook', async (req, res) => {
       return res.status(200).json({ ok: true });
     }
 
-    // --- Extended alert intent patterns — handle BEFORE Claude ---
-    const alertPatterns = [
-      // "alert me when CC increases 1%", "notify me when CC pumps 5%", "alert me when CC hits 1%"
-      /(?:alert\s+me\s+when|notify\s+me\s+when|alert\s+when)\s+([A-Za-z]+)\s+(?:increases?|pumps?|hits?|goes?\s+up|moves?\s+up|rises?|reaches?)\s+([\d.]+)\s*%/i,
-      // "set alert CC 1%", "set threshold CC 1%", "alert CC 1%"
-      /(?:set\s+alert|set\s+threshold|alert)\s+([A-Za-z]+)\s+([\d.]+)\s*%/i,
-      // "CC alert at 1%"
-      /([A-Za-z]+)\s+alert\s+(?:at\s+)?([\d.]+)\s*%/i,
-    ];
+    // --- Multi-coin threshold scanner — handle BEFORE Claude ---
+    // Handles: "Set CC to 5% and HYPE to 3%"
+    //          "Set CC threshold to 5% and Hype threshold to 5%"
+    //          "CC 5% HYPE 3%"
+    //          "alert me when CC hits 2% and BTC hits 1%"
+    //          "set CC threshold to 5% and HYPE threshold to 5%"
+    const multiCoinPattern = /\b([A-Za-z]{2,10})\s+(?:threshold\s+)?(?:to\s+|at\s+|alert\s+(?:at\s+)?)?(?:[\w\s]+?\s+)?([\d.]+)\s*%/gi;
 
-    let alertHandled = false;
-    for (const pattern of alertPatterns) {
-      const m = rawText.match(pattern);
-      if (m) {
-        const coinBase = m[1].toUpperCase();
-        const symbol = coinBase.endsWith('-USD') ? coinBase : `${coinBase}-USD`;
-        const threshold = parseFloat(m[2]) / 100;
-        const { oldThreshold, newThreshold } = await setThreshold(symbol, threshold);
-        const oldPct = (oldThreshold * 100).toFixed(1);
-        const newPct = (newThreshold * 100).toFixed(1);
-        await sendReply(`✅ Alert set for ${symbol} at ${newPct}%. Old alert cancelled and monitoring restarted fresh from current price. (Previous threshold: ${oldPct}%)`);
-        alertHandled = true;
-        break;
+    const pairs = [];
+    let match;
+    while ((match = multiCoinPattern.exec(rawText)) !== null) {
+      const coinBase = match[1].toUpperCase();
+      // Skip common English words that aren't coins
+      const skipWords = ['SET', 'AND', 'THE', 'FOR', 'ALL', 'GET', 'PUT', 'LET', 'CAN', 'ARE', 'NOT', 'BUT', 'USE', 'NEW', 'OLD', 'ANY', 'TWO', 'ONE'];
+      if (skipWords.includes(coinBase)) continue;
+      const symbol = coinBase.endsWith('-USD') ? coinBase : `${coinBase}-USD`;
+      const pct = parseFloat(match[2]);
+      if (pct > 0 && pct <= 100) {
+        pairs.push({ symbol, threshold: pct / 100 });
       }
     }
-    if (alertHandled) return res.status(200).json({ ok: true });
+
+    if (pairs.length > 0) {
+      const confirmations = [];
+      for (const { symbol, threshold } of pairs) {
+        const { oldThreshold } = await setThreshold(symbol, threshold);
+        const newPct = (threshold * 100).toFixed(1);
+        confirmations.push(`✅ ${symbol} set to ${newPct}% - saved`);
+      }
+      await sendReply(confirmations.join('\n'));
+      return res.status(200).json({ ok: true });
+    }
 
     // --- Free-form message → Claude AI (async, fire-and-forget) ---
 
