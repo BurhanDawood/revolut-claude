@@ -7,6 +7,9 @@ import { createPrivateKey, sign } from 'crypto';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import mysql from 'mysql2/promise';
+import Anthropic from '@anthropic-ai/sdk';
+
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 const API_KEY = process.env.REVOLUTX_API_KEY;
 const PRIVATE_KEY = process.env.REVOLUTX_PRIVATE_KEY;
@@ -306,6 +309,112 @@ app.post('/mcp', async (req, res) => {
 
 app.get('/', (req, res) => {
   res.sendFile(join(__dirname, 'public', 'dashboard.html'));
+});
+
+// POST /telegram-webhook — handle incoming Telegram messages
+app.post('/telegram-webhook', async (req, res) => {
+  res.sendStatus(200); // Always ack Telegram immediately to prevent retries
+
+  try {
+    const message = req.body.message;
+    if (!message || !message.text) return;
+
+    const chatId = message.chat.id;
+    const rawText = message.text.trim();
+    // Normalise: strip leading slash, lowercase
+    const commandText = rawText.startsWith('/') ? rawText.slice(1).toLowerCase() : rawText.toLowerCase();
+
+    const sendReply = async (text) => {
+      const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+      await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML' })
+      });
+    };
+
+    // --- Command: acknowledge / ack ---
+    if (commandText === 'acknowledge' || commandText === 'ack') {
+      const symbol = Object.keys(activeAlerts)[0];
+      if (symbol) {
+        clearInterval(activeAlerts[symbol]);
+        delete activeAlerts[symbol];
+        await sendReply(`✅ Acknowledged ${symbol}`);
+      } else {
+        await sendReply('✅ No active alerts to acknowledge.');
+      }
+      return;
+    }
+
+    // --- Command: pause ---
+    if (commandText === 'pause') {
+      monitoringPaused = true;
+      await sendReply('⏸ Monitoring paused');
+      return;
+    }
+
+    // --- Command: resume ---
+    if (commandText === 'resume') {
+      monitoringPaused = false;
+      await sendReply('▶️ Monitoring resumed');
+      return;
+    }
+
+    // --- Command: status ---
+    if (commandText === 'status') {
+      const alertedSymbols = Object.keys(activeAlerts);
+      const statusMsg =
+        `<b>Monitor Status</b>\n` +
+        `Paused: ${monitoringPaused ? 'Yes' : 'No'}\n` +
+        `Active alerts: ${alertedSymbols.length}\n` +
+        (alertedSymbols.length ? `Alerted symbols: ${alertedSymbols.join(', ')}` : 'No active alerts');
+      await sendReply(statusMsg);
+      return;
+    }
+
+    // --- Free-form message → Claude AI ---
+    const balancesContext = Object.entries(lastBalances)
+      .map(([sym, qty]) => `${sym}: ${qty}`)
+      .join(', ') || 'No balance data available';
+
+    const basePricesContext = Object.entries(basePrices)
+      .map(([sym, price]) => `${sym}: $${price}`)
+      .join(', ') || 'No baseline data available';
+
+    const activeAlertsContext = Object.keys(activeAlerts).join(', ') || 'None';
+
+    const aiResponse = await anthropic.messages.create({
+      model: 'claude-opus-4-5',
+      max_tokens: 1024,
+      system: `You are an AI crypto trading assistant with access to the user's Revolut X portfolio. The user's current holdings are: ${balancesContext}. Current baseline prices are: ${basePricesContext}. Active alerts are: ${activeAlertsContext}. Answer the user's questions about their portfolio, crypto market conditions, and trading decisions. Be concise since this is a Telegram message.`,
+      messages: [{ role: 'user', content: rawText }]
+    });
+
+    const reply = aiResponse.content[0].text;
+    await sendReply(reply);
+  } catch (err) {
+    console.error('Telegram webhook error:', err.message);
+    try {
+      const chatId = req.body?.message?.chat?.id;
+      if (chatId) {
+        const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+        await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chat_id: chatId, text: `⚠️ Error: ${err.message}` })
+        });
+      }
+    } catch (_) {}
+  }
+});
+
+// GET /telegram-setup — register the webhook URL with Telegram
+app.get('/telegram-setup', async (req, res) => {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  const webhookUrl = 'https://revolut-claude-production.up.railway.app/telegram-webhook';
+  const response = await fetch(`https://api.telegram.org/bot${token}/setWebhook?url=${webhookUrl}`);
+  const data = await response.json();
+  res.json(data);
 });
 
 const PORT = process.env.PORT || 8080;
