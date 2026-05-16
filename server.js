@@ -56,6 +56,50 @@ let monitoringPaused = false;
 let monitoringInterval = null;
 const conversationHistory = new Map(); // chatId -> [{role, content}]
 
+async function setThreshold(symbol, threshold) {
+  const oldThreshold = customThresholds[symbol] ?? PUMP_THRESHOLD;
+  customThresholds[symbol] = threshold;
+
+  // Cancel any active alert interval for this coin
+  if (activeAlerts[symbol]) {
+    clearInterval(activeAlerts[symbol]);
+    delete activeAlerts[symbol];
+  }
+
+  // Reset baseline to current price so monitoring restarts fresh
+  try {
+    const tickerResponse = await revolutRequest('GET', '/tickers');
+    const tickerList = Array.isArray(tickerResponse) ? tickerResponse : (tickerResponse.data || []);
+    const priceMap = {};
+    for (const ticker of tickerList) {
+      if (ticker.symbol) {
+        const price = parseFloat(ticker.last_price || ticker.mid || ticker.ask || ticker.bid);
+        if (price) {
+          priceMap[ticker.symbol] = price;
+          priceMap[ticker.symbol.replace('/', '-')] = price;
+        }
+      }
+    }
+    const currentPrice = priceMap[symbol];
+    if (currentPrice) {
+      basePrices[symbol] = currentPrice;
+      try {
+        await db.execute(
+          'INSERT INTO baselines (symbol, price) VALUES (?, ?) ON DUPLICATE KEY UPDATE price = VALUES(price)',
+          [symbol, currentPrice]
+        );
+      } catch (err) { /* ignore */ }
+    } else {
+      delete basePrices[symbol];
+    }
+  } catch (err) {
+    // If price fetch fails, delete baseline so checkPortfolio will re-set it on next run
+    delete basePrices[symbol];
+  }
+
+  return { oldThreshold, newThreshold: threshold };
+}
+
 const db = await mysql.createConnection({
   host: process.env.DB_HOST,
   port: parseInt(process.env.DB_PORT || '3306'),
@@ -283,14 +327,14 @@ app.post('/api/resume', async (req, res) => {
 });
 
 // POST /api/threshold/:symbol — set per-coin alert threshold
-app.post('/api/threshold/:symbol', (req, res) => {
+app.post('/api/threshold/:symbol', async (req, res) => {
   const symbol = req.params.symbol.toUpperCase();
   const { threshold } = req.body;
   if (typeof threshold !== 'number' || threshold <= 0) {
     return res.status(400).json({ error: 'threshold must be a positive number (e.g. 0.15 for 15%)' });
   }
-  customThresholds[symbol] = threshold;
-  res.json({ ok: true, symbol, threshold });
+  const { oldThreshold, newThreshold } = await setThreshold(symbol, threshold);
+  res.json({ ok: true, symbol, threshold: newThreshold, oldThreshold, message: 'Old alert cancelled and monitoring restarted fresh from current price.' });
 });
 
 function createMcpServer() {
@@ -409,11 +453,10 @@ app.post('/telegram-webhook', async (req, res) => {
         const coinBase = m[1].toUpperCase();
         const symbol = coinBase.endsWith('-USD') ? coinBase : `${coinBase}-USD`;
         const threshold = parseFloat(m[2]) / 100;
-        const oldThreshold = customThresholds[symbol] ?? PUMP_THRESHOLD;
-        customThresholds[symbol] = threshold;
+        const { oldThreshold, newThreshold } = await setThreshold(symbol, threshold);
         const oldPct = (oldThreshold * 100).toFixed(1);
-        const newPct = (threshold * 100).toFixed(1);
-        await sendReply(`✅ Alert set for ${symbol} at ${newPct}% - saved to your server. Previous threshold was ${oldPct}%, now changed to ${newPct}%.`);
+        const newPct = (newThreshold * 100).toFixed(1);
+        await sendReply(`✅ Alert set for ${symbol} at ${newPct}%. Old alert cancelled and monitoring restarted fresh from current price. (Previous threshold: ${oldPct}%)`);
         alertHandled = true;
         break;
       }
@@ -544,11 +587,10 @@ app.post('/telegram-webhook', async (req, res) => {
             const symbol = coinBase.endsWith('-USD') ? coinBase : `${coinBase}-USD`;
             const threshold = parseFloat(m[2]) / 100;
             if (threshold > 0 && threshold <= 1) { // sanity check: 0–100%
-              const oldThreshold = customThresholds[symbol] ?? PUMP_THRESHOLD;
-              customThresholds[symbol] = threshold;
-              const newPct = (threshold * 100).toFixed(1);
+              const { oldThreshold, newThreshold } = await setThreshold(symbol, threshold);
+              const newPct = (newThreshold * 100).toFixed(1);
               const oldPct = (oldThreshold * 100).toFixed(1);
-              actionTaken = `\n\n✅ Actually saved to server - ${symbol} threshold changed to ${newPct}% (was ${oldPct}%)`;
+              actionTaken = `\n\n✅ Actually saved to server - ${symbol} threshold changed to ${newPct}% (was ${oldPct}%). Old alert cancelled and monitoring restarted fresh from current price.`;
             }
             break;
           }
