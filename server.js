@@ -686,25 +686,41 @@ app.post('/telegram-webhook', async (req, res) => {
       return res.status(200).json({ ok: true });
     }
 
-    // --- Fixed target detection: "COIN X% from current price" / "alert when COIN rises X%" ---
-    const fixedTargetIntent = /\bfrom\s+current|\bfixed\s+(?:target|alert)\b/i.test(rawText);
+    // --- Fixed target detection: "Set CC alert at X% from current price" etc ---
+    const fixedTargetIntent = /\bfrom\s+current\b|\bfixed\s+(?:target|alert)\b/i.test(rawText);
     if (fixedTargetIntent) {
-      const fixedMatch = rawText.match(/\b([A-Za-z]{2,10})\b.*?([\d.]+)\s*%/i);
-      if (fixedMatch) {
-        const coinBase = fixedMatch[1].toUpperCase();
-        if (!SKIP_WORDS.has(coinBase)) {
-          const symbol = coinBase.endsWith('-USD') ? coinBase : `${coinBase}-USD`;
-          const thresholdPct = parseFloat(fixedMatch[2]);
-          if (thresholdPct > 0 && thresholdPct <= 100) {
-            try {
-              const { anchorPrice, targetPrice } = await setFixedTarget(symbol, thresholdPct);
-              await sendReply(`✅ <b>${symbol} fixed target set!</b>\nAnchor: $${anchorPrice.toFixed(4)} | Target: $${targetPrice.toFixed(4)} (+${thresholdPct}%)\nI'll alert you when ${symbol} hits $${targetPrice.toFixed(4)} — permanently stored.`);
-            } catch (e) {
-              await sendReply(`❌ Could not set fixed target for ${symbol}: ${e.message}`);
-            }
-            return res.status(200).json({ ok: true });
-          }
+      // Extract coin using specific patterns (most specific first)
+      let ftCoinBase = null;
+
+      // Pattern 1: "set [COIN] alert" — most reliable, coin sits between "set" and "alert"
+      const setAlertMatch = rawText.match(/\bset\s+([A-Za-z]{2,10})\s+alert\b/i);
+      if (setAlertMatch) ftCoinBase = setAlertMatch[1].toUpperCase();
+
+      // Pattern 2: "when [COIN] rises/hits/reaches/goes up"
+      if (!ftCoinBase) {
+        const whenCoinMatch = rawText.match(/\bwhen\s+([A-Za-z]{2,10})\s+(?:rises?|hits?|reaches?|goes?\s+up)\b/i);
+        if (whenCoinMatch) ftCoinBase = whenCoinMatch[1].toUpperCase();
+      }
+
+      // Pattern 3: "[COIN] alert" or "[COIN] fixed target"
+      if (!ftCoinBase) {
+        const coinAlertMatch = rawText.match(/\b([A-Za-z]{2,10})\s+(?:alert|fixed\s+target)\b/i);
+        if (coinAlertMatch) ftCoinBase = coinAlertMatch[1].toUpperCase();
+      }
+
+      // Extract percentage (first number followed by %)
+      const pctMatch = rawText.match(/([\d.]+)\s*%/);
+      const thresholdPct = pctMatch ? parseFloat(pctMatch[1]) : null;
+
+      if (ftCoinBase && !SKIP_WORDS.has(ftCoinBase) && thresholdPct && thresholdPct > 0 && thresholdPct <= 100) {
+        const symbol = ftCoinBase.endsWith('-USD') ? ftCoinBase : `${ftCoinBase}-USD`;
+        try {
+          const { anchorPrice, targetPrice } = await setFixedTarget(symbol, thresholdPct);
+          await sendReply(`✅ ${symbol} fixed target set!\nAnchor: $${anchorPrice.toFixed(4)} | Target: $${targetPrice.toFixed(4)} (+${thresholdPct}%)\nI'll alert you when ${symbol} hits $${targetPrice.toFixed(4)} — permanently stored.`);
+        } catch (e) {
+          await sendReply(`❌ Could not set fixed target for ${symbol}: ${e.message}`);
         }
+        return res.status(200).json({ ok: true });
       }
     }
 
