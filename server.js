@@ -57,39 +57,22 @@ async function sendTelegramMessage(chatId, text) {
   });
 }
 
-async function sendTelegramChunked(chatId, text) {
-  const sendTelegram = async (msg) => { await sendTelegramMessage(chatId, msg); };
+async function sendTelegramSingle(chatId, text) {
   const maxLen = 3800;
-
-  if (text.length <= maxLen) {
-    await new Promise(r => setTimeout(r, 2000));
-    await sendTelegram(text);
-    return;
+  let msg = text;
+  if (msg.length > maxLen) {
+    // Truncate at the last complete sentence before maxLen
+    const truncated = msg.substring(0, maxLen);
+    const lastSentence = Math.max(
+      truncated.lastIndexOf('. '),
+      truncated.lastIndexOf('.\n'),
+      truncated.lastIndexOf('! '),
+      truncated.lastIndexOf('? ')
+    );
+    msg = lastSentence > 0 ? truncated.substring(0, lastSentence + 1) + '...' : truncated + '...';
+    console.log('Response truncated from', text.length, 'to', msg.length, 'chars');
   }
-
-  const chunks = [];
-  let remaining = text.trim();
-
-  while (remaining.length > 0) {
-    if (remaining.length <= maxLen) {
-      chunks.push(remaining);
-      break;
-    }
-    let splitAt = remaining.lastIndexOf('\n\n', maxLen);
-    if (splitAt === -1) splitAt = remaining.lastIndexOf('\n', maxLen);
-    if (splitAt === -1) splitAt = maxLen;
-    chunks.push(remaining.substring(0, splitAt).trim());
-    remaining = remaining.substring(splitAt).trim();
-  }
-
-  console.log('Sending', chunks.length, 'chunks, total length:', text.length);
-
-  for (let i = 0; i < chunks.length; i++) {
-    const prefix = i > 0 ? '📄 **(continued...)**\n\n' : '';
-    await sendTelegram(prefix + chunks[i]);
-    console.log('Sent chunk', i + 1, 'of', chunks.length);
-    await new Promise(r => setTimeout(r, 3000));
-  }
+  await sendTelegramMessage(chatId, msg);
 }
 
 const basePrices = {};
@@ -636,20 +619,18 @@ app.post('/telegram-webhook', async (req, res) => {
 
         const claudePromise = anthropic.messages.create({
           model: 'claude-sonnet-4-5',
-          max_tokens: 4000,
+          max_tokens: 2000,
           tools: [{
             type: "web_search_20250305",
             name: "web_search"
           }],
           system: `You are an expert AI crypto trading analyst and advisor. You have access to the user's live Revolut X portfolio data provided below. When answering questions:
 - Search the web for current news, prices and market conditions
-- Give detailed technical and fundamental analysis
 - Reference specific coins from the user's portfolio
 - Give actionable insights and specific recommendations
-- Format responses clearly with headers and bullet points
-- Be thorough and comprehensive - never give one-line answers
 - Always consider macro conditions, Bitcoin dominance, and market sentiment
-- Not financial advice disclaimer at the end
+
+IMPORTANT: Keep your total response under 3500 characters. Be concise and punchy. Use short bullet points. No long paragraphs. Lead with the most important information. Skip lengthy disclaimers - one line at the end is enough. Prioritize: current status, key catalysts, price targets, recommendation. Cut anything that isn't essential.
 
 ${holdingsList}
 
@@ -719,8 +700,8 @@ Active alerts (coins currently above threshold): ${Object.keys(activeAlerts).joi
           }
         }
 
-        // Send Claude's reply via safe chunked sender (handles long responses)
-        await sendTelegramChunked(chatId, reply + (actionTaken || ''));
+        // Send Claude's reply as a single message (truncated if over 3800 chars)
+        await sendTelegramSingle(chatId, reply + (actionTaken || ''));
       } catch (err) {
         console.error('Claude AI error:', err.message);
         if (err.message === 'timeout') {
