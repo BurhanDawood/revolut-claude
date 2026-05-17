@@ -57,43 +57,41 @@ async function sendTelegramMessage(chatId, text) {
   });
 }
 
-async function sendTelegramMessageSafe(chatId, text) {
-  const MAX_LENGTH = 3800;
-  console.log(`Telegram response: ${text.length} chars`);
+async function sendTelegramChunked(chatId, fullText) {
+  const maxLen = 3800;
 
-  if (text.length <= MAX_LENGTH) {
-    return sendTelegramMessage(chatId, text);
+  const sendTelegram = async (text) => {
+    await sendTelegramMessage(chatId, text);
+  };
+
+  if (fullText.length <= maxLen) {
+    await sendTelegram(fullText);
+    return;
   }
 
-  // Split into chunks at natural break points
-  const chunks = [];
-  let remaining = text;
+  console.log(`Telegram response: ${fullText.length} chars — splitting by paragraph`);
 
-  while (remaining.length > MAX_LENGTH) {
-    // Try to split at double newline (paragraph break)
-    let splitAt = remaining.lastIndexOf('\n\n', MAX_LENGTH);
-    // Fall back to single newline
-    if (splitAt < MAX_LENGTH * 0.5) splitAt = remaining.lastIndexOf('\n', MAX_LENGTH);
-    // Fall back to space
-    if (splitAt < MAX_LENGTH * 0.5) splitAt = remaining.lastIndexOf(' ', MAX_LENGTH);
-    // Hard cut as last resort
-    if (splitAt <= 0) splitAt = MAX_LENGTH;
+  // Split into chunks at paragraph boundaries
+  const paragraphs = fullText.split('\n\n');
+  let currentChunk = '';
+  let chunkNumber = 1;
 
-    chunks.push(remaining.slice(0, splitAt).trim());
-    remaining = remaining.slice(splitAt).trim();
+  for (const paragraph of paragraphs) {
+    if (currentChunk && (currentChunk + '\n\n' + paragraph).length > maxLen) {
+      await sendTelegram(currentChunk);
+      chunkNumber++;
+      await new Promise(r => setTimeout(r, 1500));
+      currentChunk = '📄 **(continued...)**\n\n' + paragraph;
+    } else {
+      currentChunk = currentChunk ? currentChunk + '\n\n' + paragraph : paragraph;
+    }
   }
-  if (remaining.length > 0) chunks.push(remaining);
 
-  console.log(`Splitting into ${chunks.length} chunks`);
-
-  // Send first chunk as-is
-  await sendTelegramMessage(chatId, chunks[0]);
-
-  // Send subsequent chunks with header and delay
-  for (let i = 1; i < chunks.length; i++) {
-    await new Promise(resolve => setTimeout(resolve, 1000));
-    await sendTelegramMessage(chatId, '📄 (continued...)\n\n' + chunks[i]);
+  if (currentChunk) {
+    await sendTelegram(currentChunk);
   }
+
+  console.log(`Sent ${chunkNumber} chunks`);
 }
 
 const basePrices = {};
@@ -696,7 +694,7 @@ Active alerts (coins currently above threshold): ${Object.keys(activeAlerts).joi
         }
 
         // Send Claude's reply via safe chunked sender (handles long responses)
-        await sendTelegramMessageSafe(chatId, reply + (actionTaken || ''));
+        await sendTelegramChunked(chatId, reply + (actionTaken || ''));
       } catch (err) {
         console.error('Claude AI error:', err.message);
         if (err.message === 'timeout') {
