@@ -102,7 +102,10 @@ async function sendTelegramChunked(chatId, fullText) {
         currentChunk = candidate;
       }
     }
-    if (currentChunk) chunks.push(currentChunk);
+    if (currentChunk && currentChunk.trim().length > 0) {
+      chunks.push(currentChunk);
+      console.log('Added FINAL chunk to array, length:', currentChunk.length);
+    }
   }
 
   // Safety fallback
@@ -119,6 +122,9 @@ async function sendTelegramChunked(chatId, fullText) {
   for (let i = 0; i < chunks.length; i++) {
     const chunkNum = i + 1;
     const text = i === 0 ? chunks[i] : '📄 **(continued...)**\n\n' + chunks[i];
+    if (i === chunks.length - 1) {
+      console.log('Sending FINAL chunk', chunkNum, 'of', chunks.length, ', length:', text.length);
+    }
     console.log(`[Telegram] Sending chunk ${chunkNum} of ${chunks.length}, length: ${text.length}`);
     await sendTelegramMessage(chatId, text);
     if (i < chunks.length - 1) {
@@ -126,7 +132,7 @@ async function sendTelegramChunked(chatId, fullText) {
     }
   }
 
-  console.log('[Telegram] All chunks sent');
+  console.log('ALL chunks sent successfully. Total:', chunks.length);
 }
 
 const basePrices = {};
