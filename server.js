@@ -1307,6 +1307,12 @@ Active alerts (coins currently above threshold): ${Object.keys(activeAlerts).joi
   }
 });
 
+// GET /api/test-briefing — trigger morning briefing immediately (temporary test endpoint)
+app.get('/api/test-briefing', async (req, res) => {
+  res.json({ ok: true, message: 'Morning briefing triggered — check Telegram.' });
+  sendMorningBriefing();
+});
+
 // GET /telegram-setup — register the webhook URL with Telegram
 app.get('/telegram-setup', async (req, res) => {
   const token = process.env.TELEGRAM_BOT_TOKEN;
