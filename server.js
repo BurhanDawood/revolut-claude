@@ -60,12 +60,14 @@ async function sendTelegramMessage(chatId, text) {
 async function sendTelegramChunked(chatId, fullText) {
   const maxLen = 3800;
 
-  const sendTelegram = async (text) => {
+  const sendTelegram = async (text, chunkNum) => {
+    console.log('Sending chunk', chunkNum, 'length:', text.length);
     await sendTelegramMessage(chatId, text);
   };
 
   if (fullText.length <= maxLen) {
-    await sendTelegram(fullText);
+    await new Promise(r => setTimeout(r, 2000));
+    await sendTelegram(fullText, 1);
     return;
   }
 
@@ -75,10 +77,12 @@ async function sendTelegramChunked(chatId, fullText) {
   const paragraphs = fullText.split('\n\n');
   let currentChunk = '';
   let chunkNumber = 1;
+  let firstChunk = true;
 
   for (const paragraph of paragraphs) {
     if (currentChunk && (currentChunk + '\n\n' + paragraph).length > maxLen) {
-      await sendTelegram(currentChunk);
+      if (firstChunk) { await new Promise(r => setTimeout(r, 2000)); firstChunk = false; }
+      await sendTelegram(currentChunk, chunkNumber);
       chunkNumber++;
       await new Promise(r => setTimeout(r, 1500));
       currentChunk = '📄 **(continued...)**\n\n' + paragraph;
@@ -88,7 +92,8 @@ async function sendTelegramChunked(chatId, fullText) {
   }
 
   if (currentChunk) {
-    await sendTelegram(currentChunk);
+    if (firstChunk) { await new Promise(r => setTimeout(r, 2000)); firstChunk = false; }
+    await sendTelegram(currentChunk, chunkNumber);
   }
 
   console.log(`Sent ${chunkNumber} chunks`);
