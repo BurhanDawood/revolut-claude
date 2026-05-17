@@ -605,14 +605,27 @@ app.post('/telegram-webhook', async (req, res) => {
         ];
 
         const claudePromise = anthropic.messages.create({
-          model: 'claude-opus-4-5',
-          max_tokens: 2000,
-          system: systemPrompt,
-          messages,
+          model: 'claude-sonnet-4-20250514',
+          max_tokens: 4000,
           tools: [{
             type: "web_search_20250305",
             name: "web_search"
-          }]
+          }],
+          system: `You are an expert AI crypto trading analyst and advisor. You have access to the user's live Revolut X portfolio data provided below. When answering questions:
+- Search the web for current news, prices and market conditions
+- Give detailed technical and fundamental analysis
+- Reference specific coins from the user's portfolio
+- Give actionable insights and specific recommendations
+- Format responses clearly with headers and bullet points
+- Be thorough and comprehensive - never give one-line answers
+- Always consider macro conditions, Bitcoin dominance, and market sentiment
+- Not financial advice disclaimer at the end
+
+${holdingsList}
+
+Current baseline prices (set when monitoring started): ${JSON.stringify(basePrices)}
+Active alerts (coins currently above threshold): ${Object.keys(activeAlerts).join(', ') || 'none'}`,
+          messages,
         });
         const timeoutPromise = new Promise((_, reject) =>
           setTimeout(() => reject(new Error('timeout')), 55000)
