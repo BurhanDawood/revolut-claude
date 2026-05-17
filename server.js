@@ -611,15 +611,34 @@ app.post('/telegram-webhook', async (req, res) => {
         const chatIdStr = chatId.toString();
         const history = conversationHistory.get(chatIdStr) || [];
 
+        // Prepend strict format instructions to every user message
+        const formattedMessage = `STRICT INSTRUCTIONS: Respond in EXACTLY this format, total under 2000 characters, no exceptions:
+
+📊 [COIN] ANALYSIS
+Current: $X.XX | Entry: $X.XX | P&L: +/-X.X%
+
+⚡ TODAY: [max 2 sentences]
+📰 CATALYST: [max 2 sentences]
+
+🎯 TARGETS:
+- Now: $X-X (+X%)
+- July: $X-X (+X%)
+- Oct: $X-X (+X%)
+
+✅ VERDICT: [HOLD/BUY/SELL] - [1 sentence]
+⚠️ RISK: [1 sentence]
+
+USER MESSAGE: ${userMessage}`;
+
         // Build messages array: history + current user message
         const messages = [
           ...history,
-          { role: 'user', content: userMessage }
+          { role: 'user', content: formattedMessage }
         ];
 
         const claudePromise = anthropic.messages.create({
           model: 'claude-sonnet-4-5',
-          max_tokens: 2000,
+          max_tokens: 1000,
           tools: [{
             type: "web_search_20250305",
             name: "web_search"
