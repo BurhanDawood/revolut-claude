@@ -625,6 +625,7 @@ async function checkMacroNews() {
 
     const lastTextBlock = [...claudeResponse.content].reverse().find(b => b.type === 'text');
     const analysis = lastTextBlock ? lastTextBlock.text.trim() : '✅ NO SIGNIFICANT ALERTS';
+    console.log('Claude macro response:', analysis.substring(0, 300));
 
     // STEP 5: Only send if MACRO ALERT and not a duplicate in last 6 hours
     if (!analysis.includes('🚨 MACRO ALERT')) {
