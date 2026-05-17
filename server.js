@@ -90,11 +90,9 @@ async function sendTelegramChunked(chatId, text) {
 
   for (let i = 0; i < chunks.length; i++) {
     const prefix = i > 0 ? '📄 **(continued...)**\n\n' : '';
+    await new Promise(r => setTimeout(r, 3000));
     console.log('Sending chunk', i + 1, 'of', chunks.length, 'length:', chunks[i].length);
     await sendTelegram(prefix + chunks[i]);
-    if (i < chunks.length - 1) {
-      await new Promise(r => setTimeout(r, 2000));
-    }
   }
 
   console.log('All chunks sent successfully');
@@ -646,6 +644,7 @@ Active alerts (coins currently above threshold): ${Object.keys(activeAlerts).joi
         stillResearchingTimer = setTimeout(async () => {
           try {
             await sendTelegramMessage(chatId, '⏳ Still researching, almost there...');
+            await new Promise(r => setTimeout(r, 2000));
           } catch (e) { /* ignore */ }
         }, 30000);
 
