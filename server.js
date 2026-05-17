@@ -108,6 +108,7 @@ const priceTargets = new Map(); // symbol -> { anchorPrice, thresholdPct, target
 const entryPrices = new Map(); // symbol -> number (DB-backed, persists across restarts)
 let monitoringPaused = false;
 let briefingInProgress = false;
+let lastClaudeCallTime = 0;
 let monitoringInterval = null;
 const conversationHistory = new Map(); // chatId -> [{role, content}]
 
@@ -606,7 +607,11 @@ async function checkMacroNews() {
     }
     console.log('Macro check:', new Date().toISOString(), '- Keywords found:', foundKeywords.slice(0, 8).join(', '));
 
-    // STEP 4: Call Claude API for impact analysis (only reached if keywords found)
+    // STEP 4: Call Claude API for impact analysis (only reached if keywords found, max once per 2 hours)
+    if (Date.now() - lastClaudeCallTime < 2 * 60 * 60 * 1000) {
+      console.log('Macro check:', new Date().toISOString(), '- Keywords found: true - Claude rate limited (last call', Math.round((Date.now() - lastClaudeCallTime) / 60000), 'min ago)');
+      return;
+    }
     const holdingsList = significantHoldings
       .map(h => `${h.coin} ($${h.valueUSD.toFixed(0)} — ${h.narrative})`)
       .join(', ');
@@ -623,6 +628,7 @@ async function checkMacroNews() {
       }]
     });
 
+    lastClaudeCallTime = Date.now();
     const lastTextBlock = [...claudeResponse.content].reverse().find(b => b.type === 'text');
     const analysis = lastTextBlock ? lastTextBlock.text.trim() : '✅ NO SIGNIFICANT ALERTS';
     console.log('Claude macro response:', analysis.substring(0, 300));
@@ -822,8 +828,8 @@ cron.schedule('0 0 * * *', recordDailyPrices, { timezone: 'Europe/London' });
 // Send morning briefing at 9:00 AM every day (UK time)
 cron.schedule('0 9 * * *', sendMorningBriefing, { timezone: 'Europe/London' });
 
-// Check macro news every 2 hours (UK time)
-cron.schedule('0 */2 * * *', checkMacroNews, { timezone: 'Europe/London' });
+// Check macro news every 5 minutes — free RSS + keyword scan; Claude called at most once per 2h
+cron.schedule('*/5 * * * *', checkMacroNews, { timezone: 'Europe/London' });
 
 console.log('Cron jobs scheduled: midnight price recording + 9 AM morning briefing + every-2h macro news (Europe/London)');
 
