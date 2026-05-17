@@ -58,23 +58,23 @@ async function sendTelegramMessage(chatId, text) {
 }
 
 async function sendTelegramMessageSafe(chatId, text) {
-  const MAX_LENGTH = 4000;
+  const MAX_LENGTH = 3800;
+  console.log(`Telegram response: ${text.length} chars`);
+
   if (text.length <= MAX_LENGTH) {
     return sendTelegramMessage(chatId, text);
   }
 
-  // Split at natural break points: paragraph > newline > sentence > space
+  // Split into chunks at natural break points
   const chunks = [];
   let remaining = text;
+
   while (remaining.length > MAX_LENGTH) {
-    let splitAt = -1;
-    // Try paragraph break
-    splitAt = remaining.lastIndexOf('\n\n', MAX_LENGTH);
-    // Try single newline
+    // Try to split at double newline (paragraph break)
+    let splitAt = remaining.lastIndexOf('\n\n', MAX_LENGTH);
+    // Fall back to single newline
     if (splitAt < MAX_LENGTH * 0.5) splitAt = remaining.lastIndexOf('\n', MAX_LENGTH);
-    // Try sentence end
-    if (splitAt < MAX_LENGTH * 0.5) splitAt = remaining.lastIndexOf('. ', MAX_LENGTH);
-    // Try space
+    // Fall back to space
     if (splitAt < MAX_LENGTH * 0.5) splitAt = remaining.lastIndexOf(' ', MAX_LENGTH);
     // Hard cut as last resort
     if (splitAt <= 0) splitAt = MAX_LENGTH;
@@ -84,9 +84,15 @@ async function sendTelegramMessageSafe(chatId, text) {
   }
   if (remaining.length > 0) chunks.push(remaining);
 
-  for (const chunk of chunks) {
-    await sendTelegramMessage(chatId, chunk);
-    await new Promise(resolve => setTimeout(resolve, 500));
+  console.log(`Splitting into ${chunks.length} chunks`);
+
+  // Send first chunk as-is
+  await sendTelegramMessage(chatId, chunks[0]);
+
+  // Send subsequent chunks with header and delay
+  for (let i = 1; i < chunks.length; i++) {
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    await sendTelegramMessage(chatId, '📄 (continued...)\n\n' + chunks[i]);
   }
 }
 
