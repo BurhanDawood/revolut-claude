@@ -93,7 +93,7 @@ const activeFixedAlerts = {}; // symbol -> intervalId for fixed price target ale
 const lastBalances = {};
 const customThresholds = {};
 const priceTargets = new Map(); // symbol -> { anchorPrice, thresholdPct, targetPrice, entryPrice }
-const entryPrices = new Map(); // symbol -> number (in-memory only, resets on restart)
+const entryPrices = new Map(); // symbol -> number (DB-backed, persists across restarts)
 let monitoringPaused = false;
 let monitoringInterval = null;
 const conversationHistory = new Map(); // chatId -> [{role, content}]
@@ -189,6 +189,12 @@ await db.execute(`CREATE TABLE IF NOT EXISTS price_targets (
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 )`);
 
+await db.execute(`CREATE TABLE IF NOT EXISTS entry_prices (
+  symbol VARCHAR(50) PRIMARY KEY,
+  entry_price DECIMAL(20,10) NOT NULL,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+)`);
+
 const [rows] = await db.execute('SELECT symbol, price FROM baselines');
 for (const row of rows) {
   basePrices[row.symbol] = parseFloat(row.price);
@@ -221,6 +227,12 @@ for (const row of ptRows) {
   });
 }
 console.log(`Loaded ${ptRows.length} price targets from database`);
+
+const [epRows] = await db.execute('SELECT symbol, entry_price FROM entry_prices');
+for (const row of epRows) {
+  entryPrices.set(row.symbol, parseFloat(row.entry_price));
+}
+console.log(`Loaded ${epRows.length} entry prices from database`);
 
 async function getQuickAiRecommendation(symbol, changePct, currentPrice) {
   try {
@@ -263,6 +275,19 @@ async function setFixedTarget(symbol, thresholdPct) {
   const existing = priceTargets.get(symbol) || {};
   priceTargets.set(symbol, { ...existing, anchorPrice, thresholdPct, targetPrice });
   return { anchorPrice, thresholdPct, targetPrice };
+}
+
+async function getCurrentPrice(symbol) {
+  try {
+    const tickerResponse = await revolutRequest('GET', '/tickers');
+    const tickerList = Array.isArray(tickerResponse) ? tickerResponse : (tickerResponse.data || []);
+    for (const ticker of tickerList) {
+      if (!ticker.symbol) continue;
+      const price = parseFloat(ticker.last_price || ticker.mid || ticker.ask || ticker.bid);
+      if (price && (ticker.symbol === symbol || ticker.symbol.replace('/', '-') === symbol)) return price;
+    }
+  } catch (e) { /* ignore */ }
+  return null;
 }
 
 async function checkPortfolio() {
@@ -489,6 +514,87 @@ app.post('/api/threshold/:symbol', async (req, res) => {
   res.json({ ok: true, symbol, threshold: newThreshold, oldThreshold, message: 'Old alert cancelled and monitoring restarted fresh from current price.' });
 });
 
+// GET /api/targets — all fixed price targets
+app.get('/api/targets', (req, res) => {
+  const out = {};
+  for (const [symbol, t] of priceTargets) {
+    out[symbol] = { anchorPrice: t.anchorPrice, thresholdPct: t.thresholdPct, targetPrice: t.targetPrice, entryPrice: t.entryPrice || null };
+  }
+  res.json(out);
+});
+
+// POST /api/targets/:symbol — set or update fixed price target
+app.post('/api/targets/:symbol', async (req, res) => {
+  const symbol = req.params.symbol.toUpperCase();
+  const { threshold_pct, anchor_price } = req.body;
+  if (!threshold_pct || threshold_pct <= 0) return res.status(400).json({ error: 'threshold_pct required and must be > 0' });
+  try {
+    if (anchor_price) {
+      // Explicit anchor provided
+      const targetPrice = anchor_price * (1 + threshold_pct / 100);
+      await db.execute(
+        'INSERT INTO price_targets (symbol, anchor_price, threshold_pct, target_price) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE anchor_price = VALUES(anchor_price), threshold_pct = VALUES(threshold_pct), target_price = VALUES(target_price), updated_at = CURRENT_TIMESTAMP',
+        [symbol, anchor_price, threshold_pct, targetPrice]
+      );
+      const existing = priceTargets.get(symbol) || {};
+      priceTargets.set(symbol, { ...existing, anchorPrice: anchor_price, thresholdPct: threshold_pct, targetPrice });
+      if (activeFixedAlerts[symbol]) { clearInterval(activeFixedAlerts[symbol]); delete activeFixedAlerts[symbol]; }
+      return res.json({ ok: true, symbol, anchorPrice: anchor_price, targetPrice, thresholdPct: threshold_pct });
+    } else if (priceTargets.has(symbol)) {
+      // Use existing anchor, update threshold
+      const existing = priceTargets.get(symbol);
+      const targetPrice = existing.anchorPrice * (1 + threshold_pct / 100);
+      await db.execute(
+        'INSERT INTO price_targets (symbol, anchor_price, threshold_pct, target_price) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE threshold_pct = VALUES(threshold_pct), target_price = VALUES(target_price), updated_at = CURRENT_TIMESTAMP',
+        [symbol, existing.anchorPrice, threshold_pct, targetPrice]
+      );
+      priceTargets.set(symbol, { ...existing, thresholdPct: threshold_pct, targetPrice });
+      if (activeFixedAlerts[symbol]) { clearInterval(activeFixedAlerts[symbol]); delete activeFixedAlerts[symbol]; }
+      return res.json({ ok: true, symbol, anchorPrice: existing.anchorPrice, targetPrice, thresholdPct: threshold_pct });
+    } else {
+      // No anchor — fetch current price
+      const { anchorPrice, targetPrice } = await setFixedTarget(symbol, threshold_pct);
+      return res.json({ ok: true, symbol, anchorPrice, targetPrice, thresholdPct: threshold_pct });
+    }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// DELETE /api/targets/:symbol — remove fixed price target
+app.delete('/api/targets/:symbol', async (req, res) => {
+  const symbol = req.params.symbol.toUpperCase();
+  await db.execute('DELETE FROM price_targets WHERE symbol = ?', [symbol]);
+  priceTargets.delete(symbol);
+  if (activeFixedAlerts[symbol]) { clearInterval(activeFixedAlerts[symbol]); delete activeFixedAlerts[symbol]; }
+  res.json({ ok: true, symbol });
+});
+
+// GET /api/entryprices — all average entry prices
+app.get('/api/entryprices', (req, res) => {
+  const out = {};
+  for (const [sym, price] of entryPrices) out[sym] = price;
+  res.json(out);
+});
+
+// POST /api/entryprices/:symbol — set average entry price
+app.post('/api/entryprices/:symbol', async (req, res) => {
+  const symbol = req.params.symbol.toUpperCase();
+  const { entry_price } = req.body;
+  if (!entry_price || entry_price <= 0) return res.status(400).json({ error: 'entry_price must be > 0' });
+  entryPrices.set(symbol, entry_price);
+  await db.execute(
+    'INSERT INTO entry_prices (symbol, entry_price) VALUES (?, ?) ON DUPLICATE KEY UPDATE entry_price = VALUES(entry_price)',
+    [symbol, entry_price]
+  );
+  res.json({ ok: true, symbol, entry_price });
+});
+
+// GET /api/thresholds — all custom daily thresholds
+app.get('/api/thresholds', (req, res) => {
+  res.json({ customThresholds, defaultThreshold: PUMP_THRESHOLD });
+});
+
 // GET /api/tradehistory — probe Revolut X API paths for position/entry price data
 app.get('/api/tradehistory', async (req, res) => {
   const endpoints = [
@@ -682,7 +788,15 @@ app.post('/telegram-webhook', async (req, res) => {
       const symbol = `${coinBase}-USD`;
       const price = parseFloat(entryMatch[2]);
       entryPrices.set(symbol, price);
-      await sendReply(`✅ Entry price for ${symbol} set to $${price} (stored in memory — resets on server restart)`);
+      await db.execute(
+        'INSERT INTO entry_prices (symbol, entry_price) VALUES (?, ?) ON DUPLICATE KEY UPDATE entry_price = VALUES(entry_price)',
+        [symbol, price]
+      );
+      const currentPrice = await getCurrentPrice(symbol);
+      const plStr = currentPrice
+        ? ` Current price $${currentPrice.toFixed(4)} = ${((currentPrice - price) / price * 100).toFixed(1)}% from your entry.`
+        : '';
+      await sendReply(`✅ ${symbol} average entry updated to $${price}.${plStr}`);
       return res.status(200).json({ ok: true });
     }
 
@@ -724,21 +838,51 @@ app.post('/telegram-webhook', async (req, res) => {
       }
     }
 
-    // --- Command: threshold [COIN] [N]% → update fixed target from same anchor (if fixed target exists) ---
-    const fixedThresholdMatch = commandText.match(/^threshold\s+([a-z]{2,10})\s+([\d.]+)%?$/);
-    if (fixedThresholdMatch && priceTargets.has(`${fixedThresholdMatch[1].toUpperCase()}-USD`)) {
-      const coinBase = fixedThresholdMatch[1].toUpperCase();
+    // --- Command: daily [COIN] [N]% → update daily baseline threshold ---
+    const dailyMatch = commandText.match(/^daily\s+([a-z]{2,10})\s+([\d.]+)%?$/);
+    if (dailyMatch) {
+      const coinBase = dailyMatch[1].toUpperCase();
       const symbol = `${coinBase}-USD`;
-      const thresholdPct = parseFloat(fixedThresholdMatch[2]);
+      const thresholdPct = parseFloat(dailyMatch[2]);
+      if (thresholdPct <= 0 || thresholdPct > 100) {
+        await sendReply(`❌ Invalid percentage. Use e.g. 'daily CC 5%'`);
+        return res.status(200).json({ ok: true });
+      }
+      await setThreshold(symbol, thresholdPct / 100);
+      await sendReply(`✅ ${symbol} daily alert updated to ${thresholdPct}%. You'll be alerted when ${coinBase} pumps ${thresholdPct}% from daily baseline.`);
+      return res.status(200).json({ ok: true });
+    }
+
+    // --- Command: target [COIN] [N]% → update fixed price target threshold from same anchor ---
+    const targetCmdMatch = commandText.match(/^target\s+([a-z]{2,10})\s+([\d.]+)%?$/);
+    if (targetCmdMatch) {
+      const coinBase = targetCmdMatch[1].toUpperCase();
+      const symbol = `${coinBase}-USD`;
+      const thresholdPct = parseFloat(targetCmdMatch[2]);
+      if (thresholdPct <= 0 || thresholdPct > 500) {
+        await sendReply(`❌ Invalid percentage. Use e.g. 'target CC 5%'`);
+        return res.status(200).json({ ok: true });
+      }
       const existing = priceTargets.get(symbol);
-      const newTargetPrice = existing.anchorPrice * (1 + thresholdPct / 100);
-      if (activeFixedAlerts[symbol]) { clearInterval(activeFixedAlerts[symbol]); delete activeFixedAlerts[symbol]; }
-      await db.execute(
-        'INSERT INTO price_targets (symbol, anchor_price, threshold_pct, target_price) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE threshold_pct = VALUES(threshold_pct), target_price = VALUES(target_price), updated_at = CURRENT_TIMESTAMP',
-        [symbol, existing.anchorPrice, thresholdPct, newTargetPrice]
-      );
-      priceTargets.set(symbol, { ...existing, thresholdPct, targetPrice: newTargetPrice });
-      await sendReply(`✅ <b>${symbol} fixed target updated!</b>\nAnchor: $${existing.anchorPrice.toFixed(4)} | New target: $${newTargetPrice.toFixed(4)} (+${thresholdPct}%)`);
+      if (existing) {
+        // Update threshold from same anchor
+        const newTargetPrice = existing.anchorPrice * (1 + thresholdPct / 100);
+        if (activeFixedAlerts[symbol]) { clearInterval(activeFixedAlerts[symbol]); delete activeFixedAlerts[symbol]; }
+        await db.execute(
+          'INSERT INTO price_targets (symbol, anchor_price, threshold_pct, target_price) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE threshold_pct = VALUES(threshold_pct), target_price = VALUES(target_price), updated_at = CURRENT_TIMESTAMP',
+          [symbol, existing.anchorPrice, thresholdPct, newTargetPrice]
+        );
+        priceTargets.set(symbol, { ...existing, thresholdPct, targetPrice: newTargetPrice });
+        await sendReply(`✅ ${symbol} fixed target updated to ${thresholdPct}%. New target: $${newTargetPrice.toFixed(4)} from anchor $${existing.anchorPrice.toFixed(4)}`);
+      } else {
+        // No existing anchor — create new fixed target from current price
+        try {
+          const { anchorPrice, targetPrice } = await setFixedTarget(symbol, thresholdPct);
+          await sendReply(`✅ ${symbol} fixed target set to ${thresholdPct}%. Anchor: $${anchorPrice.toFixed(4)} | Target: $${targetPrice.toFixed(4)}`);
+        } catch (e) {
+          await sendReply(`❌ Could not set target for ${symbol}: ${e.message}`);
+        }
+      }
       return res.status(200).json({ ok: true });
     }
 

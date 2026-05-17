@@ -270,36 +270,48 @@
     .threshold-list {
       display: flex;
       flex-direction: column;
-      gap: 10px;
+      gap: 12px;
     }
 
-    .threshold-row {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      flex-wrap: wrap;
-      padding: 10px 12px;
+    .threshold-card {
       background: var(--surface2);
-      border-radius: 8px;
+      border-radius: 10px;
+      padding: 14px;
     }
 
-    .threshold-symbol {
-      font-weight: 600;
-      min-width: 70px;
-      font-size: 0.9rem;
+    .threshold-coin-header {
+      font-weight: 700;
+      font-size: 0.95rem;
+      color: var(--accent);
+      margin-bottom: 10px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid #2e2e2e;
     }
 
-    .threshold-label {
-      font-size: 0.78rem;
-      color: var(--text-muted);
-      flex: 1;
-    }
-
-    .threshold-input-wrap {
+    .ctrl-row {
       display: flex;
       align-items: center;
       gap: 8px;
+      flex-wrap: wrap;
+      padding: 7px 0;
+      border-bottom: 1px solid #242424;
     }
+    .ctrl-row:last-child { border-bottom: none; }
+
+    .ctrl-label {
+      font-size: 0.75rem;
+      font-weight: 600;
+      min-width: 96px;
+      color: var(--text-muted);
+    }
+
+    .ctrl-info {
+      font-size: 0.78rem;
+      color: var(--text);
+      flex: 1;
+      min-width: 100px;
+    }
+    .ctrl-info.muted { color: var(--text-muted); font-style: italic; }
 
     .threshold-input {
       background: var(--surface);
@@ -307,11 +319,11 @@
       border-radius: 6px;
       color: var(--text);
       font-family: inherit;
-      font-size: 0.875rem;
-      padding: 7px 10px;
+      font-size: 0.85rem;
+      padding: 6px 8px;
       width: 80px;
       text-align: right;
-      min-height: 36px;
+      min-height: 34px;
     }
     .threshold-input:focus {
       outline: none;
@@ -322,6 +334,9 @@
       color: var(--text-muted);
       font-size: 0.8rem;
     }
+
+    .pnl-positive { color: #00ffc8; }
+    .pnl-negative { color: var(--danger); }
 
     .toast {
       position: fixed;
@@ -413,6 +428,8 @@
 
   let balancesData = [];
   let statusData = {};
+  let targetsData = {};
+  let entryPricesData = {};
 
   // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -507,7 +524,7 @@
     }
   }
 
-  function renderThresholds(balances, status) {
+  function renderThresholds(balances, status, targets, entries) {
     const el = document.getElementById('threshold-list');
     const coins = (balances || []).filter(b => !['USD','USDT','USDC','EUR','GBP'].includes(b.currency));
     if (coins.length === 0) {
@@ -515,25 +532,77 @@
       return;
     }
     const defaultPct = ((status.defaultThreshold || 0.20) * 100).toFixed(0);
+
     el.innerHTML = coins.map(h => {
       const sym = h.symbol || `${h.currency}-USD`;
+      const coin = h.currency;
+
+      // ── Daily threshold ──
       const custom = status.customThresholds && status.customThresholds[sym] !== undefined;
-      const currentPct = custom
-        ? (status.customThresholds[sym] * 100).toFixed(0)
-        : defaultPct;
-      const labelText = custom ? 'custom' : 'default';
-      return `
-        <div class="threshold-row">
-          <div class="threshold-symbol">${h.currency}</div>
-          <div class="threshold-label">${sym} &middot; <em>${labelText}</em></div>
-          <div class="threshold-input-wrap">
-            <input class="threshold-input" type="number" id="thresh-${h.currency}"
-              value="${currentPct}" min="1" max="999" step="1" />
+      const dailyPct = custom ? (status.customThresholds[sym] * 100).toFixed(1) : defaultPct;
+      const dailyInfo = custom ? `${dailyPct}% (custom)` : `${dailyPct}% (default)`;
+
+      // ── Fixed target ──
+      const tgt = targets[sym];
+      let targetSection;
+      if (tgt) {
+        targetSection = `
+          <div class="ctrl-row">
+            <span class="ctrl-label">🎯 Fixed Target</span>
+            <span class="ctrl-info">${fmtPrice(tgt.anchorPrice)} + ${tgt.thresholdPct}% = ${fmtPrice(tgt.targetPrice)}</span>
+            <input class="threshold-input" type="number" id="ftpct-${coin}" value="${tgt.thresholdPct}" min="0.1" max="500" step="0.1" style="width:70px" />
             <span class="pct-label">%</span>
-            <button class="btn-outline" onclick="setThreshold('${sym}', '${h.currency}')">Set</button>
+            <button class="btn-outline" onclick="updateTarget('${sym}','${coin}')">Update</button>
+            <button class="btn-danger-outline" onclick="removeTarget('${sym}')">Remove</button>
+          </div>`;
+      } else {
+        targetSection = `
+          <div class="ctrl-row">
+            <span class="ctrl-label">🎯 Fixed Target</span>
+            <span class="ctrl-info muted">Not set</span>
+            <input class="threshold-input" type="number" id="ftpct-${coin}" placeholder="%" min="0.1" max="500" step="0.1" style="width:70px" />
+            <span class="pct-label">% from now</span>
+            <button class="btn-outline" onclick="setTarget('${sym}','${coin}')">Set Target</button>
+          </div>`;
+      }
+
+      // ── Avg entry ──
+      const entry = entries[sym];
+      let entrySection;
+      if (entry) {
+        const pnl = h.price ? ((h.price - entry) / entry * 100) : null;
+        const pnlClass = pnl != null ? (pnl >= 0 ? 'pnl-positive' : 'pnl-negative') : '';
+        const pnlStr = pnl != null ? `<span class="${pnlClass}">${pnl >= 0 ? '+' : ''}${pnl.toFixed(1)}% ${pnl >= 0 ? '🟢' : '🔴'}</span>` : '';
+        entrySection = `
+          <div class="ctrl-row">
+            <span class="ctrl-label">📍 Avg Entry</span>
+            <span class="ctrl-info">Entry: ${fmtPrice(entry)} → Now: ${fmtPrice(h.price)} ${pnlStr}</span>
+            <input class="threshold-input" type="number" id="entry-${coin}" value="${entry}" min="0.000001" step="any" style="width:90px" />
+            <button class="btn-outline" onclick="setEntryPrice('${sym}','${coin}')">Update</button>
+          </div>`;
+      } else {
+        entrySection = `
+          <div class="ctrl-row">
+            <span class="ctrl-label">📍 Avg Entry</span>
+            <span class="ctrl-info muted">Not set</span>
+            <input class="threshold-input" type="number" id="entry-${coin}" placeholder="$0.00" min="0.000001" step="any" style="width:90px" />
+            <button class="btn-outline" onclick="setEntryPrice('${sym}','${coin}')">Set</button>
+          </div>`;
+      }
+
+      return `
+        <div class="threshold-card">
+          <div class="threshold-coin-header">${coin}</div>
+          <div class="ctrl-row">
+            <span class="ctrl-label">📅 Daily Alert</span>
+            <span class="ctrl-info muted">${dailyInfo}</span>
+            <input class="threshold-input" type="number" id="thresh-${coin}" value="${dailyPct}" min="1" max="999" step="0.5" style="width:70px" />
+            <span class="pct-label">%</span>
+            <button class="btn-outline" onclick="setThreshold('${sym}','${coin}')">Set</button>
           </div>
-        </div>
-      `;
+          ${targetSection}
+          ${entrySection}
+        </div>`;
     }).join('');
   }
 
@@ -564,14 +633,63 @@
     }
   }
 
-  async function setThreshold(symbol, currency) {
-    const input = document.getElementById(`thresh-${currency}`);
-    const pct = parseFloat(input.value);
+  async function setThreshold(symbol, coin) {
+    const pct = parseFloat(document.getElementById(`thresh-${coin}`).value);
     if (!pct || pct <= 0) { showToast('Enter a valid % > 0', 'error'); return; }
     try {
       await apiFetch('POST', `/api/threshold/${symbol}`, { threshold: pct / 100 });
-      showToast(`Threshold for ${symbol} set to ${pct}%`, 'success');
+      showToast(`${symbol} daily alert set to ${pct}%`, 'success');
       await refreshStatus();
+    } catch (e) {
+      showToast('Failed: ' + e.message, 'error');
+    }
+  }
+
+  async function setTarget(symbol, coin) {
+    const pct = parseFloat(document.getElementById(`ftpct-${coin}`).value);
+    if (!pct || pct <= 0) { showToast('Enter a valid % > 0', 'error'); return; }
+    try {
+      await apiFetch('POST', `/api/targets/${symbol}`, { threshold_pct: pct });
+      showToast(`${symbol} fixed target set to +${pct}% from current price`, 'success');
+      targetsData = await apiFetch('GET', '/api/targets');
+      renderThresholds(balancesData, statusData, targetsData, entryPricesData);
+    } catch (e) {
+      showToast('Failed: ' + e.message, 'error');
+    }
+  }
+
+  async function updateTarget(symbol, coin) {
+    const pct = parseFloat(document.getElementById(`ftpct-${coin}`).value);
+    if (!pct || pct <= 0) { showToast('Enter a valid % > 0', 'error'); return; }
+    try {
+      await apiFetch('POST', `/api/targets/${symbol}`, { threshold_pct: pct });
+      showToast(`${symbol} fixed target updated to ${pct}%`, 'success');
+      targetsData = await apiFetch('GET', '/api/targets');
+      renderThresholds(balancesData, statusData, targetsData, entryPricesData);
+    } catch (e) {
+      showToast('Failed: ' + e.message, 'error');
+    }
+  }
+
+  async function removeTarget(symbol) {
+    try {
+      await apiFetch('DELETE', `/api/targets/${symbol}`);
+      showToast(`${symbol} fixed target removed`, 'success');
+      targetsData = await apiFetch('GET', '/api/targets');
+      renderThresholds(balancesData, statusData, targetsData, entryPricesData);
+    } catch (e) {
+      showToast('Failed: ' + e.message, 'error');
+    }
+  }
+
+  async function setEntryPrice(symbol, coin) {
+    const price = parseFloat(document.getElementById(`entry-${coin}`).value);
+    if (!price || price <= 0) { showToast('Enter a valid price > 0', 'error'); return; }
+    try {
+      await apiFetch('POST', `/api/entryprices/${symbol}`, { entry_price: price });
+      showToast(`${symbol} entry price set to $${price}`, 'success');
+      entryPricesData = await apiFetch('GET', '/api/entryprices');
+      renderThresholds(balancesData, statusData, targetsData, entryPricesData);
     } catch (e) {
       showToast('Failed: ' + e.message, 'error');
     }
@@ -592,7 +710,7 @@
     statusData = data;
     renderAlerts(data.activeAlerts);
     renderMonitorStatus(data.paused);
-    renderThresholds(balancesData, data);
+    renderThresholds(balancesData, statusData, targetsData, entryPricesData);
     return data;
   }
 
@@ -601,7 +719,17 @@
     showError('');
     try {
       await refreshBalances();
-      await refreshStatus();
+      const [status, targets, entries] = await Promise.all([
+        apiFetch('GET', '/api/status'),
+        apiFetch('GET', '/api/targets'),
+        apiFetch('GET', '/api/entryprices'),
+      ]);
+      statusData = status;
+      targetsData = targets;
+      entryPricesData = entries;
+      renderAlerts(status.activeAlerts);
+      renderMonitorStatus(status.paused);
+      renderThresholds(balancesData, statusData, targetsData, entryPricesData);
       const now = new Date();
       document.getElementById('last-updated').textContent =
         'Updated ' + now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
