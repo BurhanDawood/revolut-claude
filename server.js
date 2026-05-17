@@ -1633,28 +1633,101 @@ app.post('/telegram-webhook', async (req, res) => {
       pendingJournalState.delete(chatIdStr);
     }
 
-    // --- Auto-trade context replies: "[COIN] reason [text], [emotion]" or "[COIN] skip" ---
-    const tradeContextMatch = commandText.match(/^([a-z]{2,10})\s+reason\s+(.+),\s*(confident|uncertain|fomo|fearful|neutral)$/i);
-    const tradeSkipMatch = commandText.match(/^([a-z]{2,10})\s+skip$/i);
-    if (tradeContextMatch || tradeSkipMatch) {
-      const coinBase = (tradeContextMatch || tradeSkipMatch)[1].toUpperCase();
-      const symbol = `${coinBase}-USD`;
-      const pending = pendingTradeContext.get(symbol);
-      if (pending) {
-        clearTimeout(pending.timeoutHandle);
-        pendingTradeContext.delete(symbol);
-        if (tradeContextMatch) {
-          const reasoning = tradeContextMatch[2].trim();
-          const emotion = tradeContextMatch[3].toLowerCase();
-          await db.execute(
-            'UPDATE trading_journal SET reasoning = ?, emotion = ? WHERE id = ?',
-            [reasoning, emotion, pending.journalId]
-          );
-          await updateLearningModel().catch(() => {});
-          await sendReply(`✅ Journal updated for ${coinBase} — reasoning and emotion saved. Learning model updated.`);
-        } else {
-          await sendReply(`✅ ${coinBase} trade logged without details.`);
+    // --- Auto-trade context: natural language replies when any trade is pending ---
+    if (pendingTradeContext.size > 0) {
+      const EMOTION_WORDS = ['confident', 'uncertain', 'fomo', 'fearful', 'neutral'];
+      const lowerMsg = commandText.toLowerCase();
+
+      // Find which pending coins are mentioned (or referenced) in this message
+      const matchedPending = [];
+      for (const [symbol, pending] of pendingTradeContext) {
+        const coinBase = symbol.replace('-USD', '').toLowerCase();
+        // Check explicit "[COIN] skip"
+        if (lowerMsg === `${coinBase} skip` || lowerMsg === `skip ${coinBase}`) {
+          matchedPending.push({ symbol, pending, skip: true });
+        } else if (lowerMsg.includes(coinBase)) {
+          matchedPending.push({ symbol, pending, skip: false });
         }
+      }
+
+      // If only one trade pending and message doesn't explicitly mention other coins,
+      // treat ANY non-command message as context for that trade
+      if (matchedPending.length === 0 && pendingTradeContext.size === 1) {
+        const [[symbol, pending]] = pendingTradeContext;
+        // Only intercept if message isn't a recognised command
+        const isKnownCommand = /^(pause|resume|status|acknowledge|ack|sell|buy|entry|daily|target|journal|my stats|learning|holding|bought|sold|i prefer)/i.test(commandText);
+        if (!isKnownCommand) {
+          matchedPending.push({ symbol, pending, skip: false });
+        }
+      }
+
+      if (matchedPending.length > 0) {
+        // Extract emotion from full message (first emotion word wins)
+        const foundEmotion = EMOTION_WORDS.find(e => lowerMsg.includes(e)) || null;
+
+        // Build reasoning: strip coin names and emotion words from message
+        let reasoning = rawText;
+        for (const { symbol } of matchedPending) {
+          reasoning = reasoning.replace(new RegExp(symbol.replace('-USD', ''), 'gi'), '').trim();
+        }
+        for (const e of EMOTION_WORDS) {
+          reasoning = reasoning.replace(new RegExp(`\\b${e}\\b`, 'gi'), '').trim();
+        }
+        reasoning = reasoning.replace(/[,\s]+$/, '').replace(/^[,\s]+/, '').trim() || 'no reason provided';
+
+        const confirmLines = [];
+        let anyUpdated = false;
+
+        for (const { symbol, pending, skip } of matchedPending) {
+          const coinBase = symbol.replace('-USD', '');
+          clearTimeout(pending.timeoutHandle);
+          pendingTradeContext.delete(symbol);
+
+          if (skip) {
+            confirmLines.push(`• ${coinBase}: logged without details`);
+          } else if (!foundEmotion) {
+            // Save reasoning but ask for emotion
+            await db.execute('UPDATE trading_journal SET reasoning = ? WHERE id = ?', [reasoning, pending.journalId]);
+            // Re-add to pending with step to collect emotion
+            const newTimeout = setTimeout(async () => {
+              await db.execute(
+                'UPDATE trading_journal SET emotion = ? WHERE id = ? AND (emotion IS NULL OR emotion = ?)',
+                ['neutral', pending.journalId, 'pending']
+              );
+              pendingTradeContext.delete(symbol);
+              await sendTelegram(`⏰ <b>${coinBase}</b> trade auto-logged without emotion.`);
+              await updateLearningModel().catch(() => {});
+            }, 5 * 60 * 1000); // shorter 5-min timeout for just the emotion
+            pendingTradeContext.set(symbol, { ...pending, timeoutHandle: newTimeout });
+            confirmLines.push(`• ${coinBase}: reasoning saved — how are you feeling? confident / uncertain / fomo / fearful / neutral`);
+            anyUpdated = true;
+            continue;
+          } else {
+            await db.execute(
+              'UPDATE trading_journal SET reasoning = ?, emotion = ? WHERE id = ?',
+              [reasoning, foundEmotion, pending.journalId]
+            );
+            // Fetch action for confirmation line
+            const [rows] = await db.execute('SELECT action, outcome_pnl FROM trading_journal WHERE id = ?', [pending.journalId]);
+            const row = rows[0];
+            const actionStr = row ? row.action : 'trade';
+            const pnlStr = row && row.outcome_pnl != null
+              ? ` (${parseFloat(row.outcome_pnl) >= 0 ? '+' : ''}${parseFloat(row.outcome_pnl).toFixed(1)}%)`
+              : '';
+            const resultEmoji = row && row.outcome_pnl != null ? (parseFloat(row.outcome_pnl) >= 0 ? '✅' : '❌') : '📝';
+            confirmLines.push(`• ${coinBase}: ${actionStr}${pnlStr} — ${foundEmotion} ${resultEmoji}`);
+            anyUpdated = true;
+          }
+        }
+
+        if (anyUpdated) await updateLearningModel().catch(() => {});
+
+        const needsEmotion = matchedPending.some(m => !m.skip && !foundEmotion);
+        const confirmMsg = needsEmotion
+          ? `📝 <b>Context saved:</b>\n${confirmLines.join('\n')}`
+          : `✅ <b>Journal saved:</b>\n${confirmLines.join('\n')}${anyUpdated ? '\nLearning model updated 🧠' : ''}`;
+
+        await sendReply(confirmMsg);
         return res.status(200).json({ ok: true });
       }
     }
