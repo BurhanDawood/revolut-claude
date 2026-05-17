@@ -109,6 +109,8 @@ const entryPrices = new Map(); // symbol -> number (DB-backed, persists across r
 let monitoringPaused = false;
 let briefingInProgress = false;
 let lastClaudeCallTime = 0;
+let learningModelCache = ''; // updated by updateLearningModel()
+const pendingJournalState = new Map(); // chatId -> { journalId, step: 'emotion'|'followed', hasClaudeRec, claudeRec, symbol }
 let monitoringInterval = null;
 const conversationHistory = new Map(); // chatId -> [{role, content}]
 
@@ -224,6 +226,66 @@ await db.execute(`CREATE TABLE IF NOT EXISTS macro_alerts_sent (
   INDEX idx_hash_sent (alert_hash, sent_at)
 )`);
 
+await db.execute(`CREATE TABLE IF NOT EXISTS trading_journal (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  symbol VARCHAR(20) NOT NULL,
+  action VARCHAR(10) NOT NULL,
+  price DECIMAL(20,10),
+  quantity DECIMAL(20,10),
+  value_usd DECIMAL(20,4),
+  reasoning TEXT,
+  emotion VARCHAR(20),
+  claude_recommendation VARCHAR(20),
+  claude_reasoning TEXT,
+  followed_recommendation TINYINT(1),
+  outcome VARCHAR(20),
+  outcome_price DECIMAL(20,10),
+  outcome_pnl DECIMAL(10,4),
+  outcome_notes TEXT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  INDEX idx_symbol (symbol),
+  INDEX idx_action (action),
+  INDEX idx_created (created_at)
+)`);
+
+await db.execute(`CREATE TABLE IF NOT EXISTS trader_profile (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  preference_key VARCHAR(100) UNIQUE NOT NULL,
+  preference_value TEXT NOT NULL,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+)`);
+
+await db.execute(`CREATE TABLE IF NOT EXISTS analysis_history (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  symbol VARCHAR(20),
+  analysis_type VARCHAR(50),
+  price_at_analysis DECIMAL(20,10),
+  recommendation VARCHAR(20),
+  target_price DECIMAL(20,10),
+  claude_summary TEXT,
+  user_action_taken VARCHAR(20),
+  action_price DECIMAL(20,10),
+  outcome VARCHAR(20),
+  outcome_pnl DECIMAL(10,4),
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_symbol (symbol),
+  INDEX idx_created (created_at)
+)`);
+
+await db.execute(`CREATE TABLE IF NOT EXISTS recommendation_performance (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  recommendation_type VARCHAR(20),
+  coin_type VARCHAR(30),
+  market_condition VARCHAR(30),
+  was_correct TINYINT(1),
+  pnl_result DECIMAL(10,4),
+  setup_description TEXT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_rec_type (recommendation_type),
+  INDEX idx_created (created_at)
+)`);
+
 // Add direction column to price_targets if it doesn't exist
 try {
   await db.execute(`ALTER TABLE price_targets ADD COLUMN direction VARCHAR(4) NOT NULL DEFAULT 'up'`);
@@ -271,6 +333,8 @@ for (const row of epRows) {
   entryPrices.set(row.symbol, parseFloat(row.entry_price));
 }
 console.log(`Loaded ${epRows.length} entry prices from database`);
+
+updateLearningModel().catch(() => {});
 
 async function getQuickAiRecommendation(symbol, changePct, currentPrice, direction = 'up') {
   try {
@@ -516,6 +580,147 @@ Keep total response under 900 characters.`
     await sendTelegram(`❌ Morning briefing failed: ${e.message}`);
   } finally {
     briefingInProgress = false;
+  }
+}
+
+async function updateLearningModel() {
+  try {
+    const [trades] = await db.execute(
+      'SELECT * FROM trading_journal WHERE outcome IS NOT NULL AND outcome_pnl IS NOT NULL ORDER BY created_at DESC LIMIT 200'
+    );
+    if (trades.length < 3) {
+      learningModelCache = '';
+      return '';
+    }
+
+    const wins = trades.filter(t => parseFloat(t.outcome_pnl) > 0).length;
+    const overallWinRate = Math.round((wins / trades.length) * 100);
+
+    // Stats by action
+    const byAction = {};
+    for (const t of trades) {
+      const a = t.action;
+      if (!byAction[a]) byAction[a] = { wins: 0, total: 0 };
+      byAction[a].total++;
+      if (parseFloat(t.outcome_pnl) > 0) byAction[a].wins++;
+    }
+    const actionLines = Object.entries(byAction).map(([action, s]) =>
+      `- ${action.toUpperCase()} trades: ${Math.round(s.wins / s.total * 100)}% win rate (${s.wins}/${s.total} trades)`
+    );
+
+    // Stats by coin category
+    const categories = {
+      institutional: ['CC', 'LINK'],
+      defi: ['HYPE', 'ENA', 'AAVE'],
+      layer1: ['SOL', 'AVAX', 'NEAR', 'ADA'],
+      meme: ['MOG', 'BONK', 'TURBO'],
+    };
+    const catLines = [];
+    for (const [cat, coins] of Object.entries(categories)) {
+      const catTrades = trades.filter(t => coins.some(c => t.symbol.startsWith(c)));
+      if (catTrades.length === 0) continue;
+      const catWins = catTrades.filter(t => parseFloat(t.outcome_pnl) > 0).length;
+      catLines.push(`- ${cat.charAt(0).toUpperCase() + cat.slice(1)} coins: ${Math.round(catWins / catTrades.length * 100)}% win rate`);
+    }
+
+    // Stats by emotion
+    const byEmotion = {};
+    for (const t of trades) {
+      if (!t.emotion) continue;
+      if (!byEmotion[t.emotion]) byEmotion[t.emotion] = { wins: 0, total: 0 };
+      byEmotion[t.emotion].total++;
+      if (parseFloat(t.outcome_pnl) > 0) byEmotion[t.emotion].wins++;
+    }
+    const emotionLines = Object.entries(byEmotion).map(([emo, s]) =>
+      `- Trading when ${emo}: ${Math.round(s.wins / s.total * 100)}% win rate (${s.total} trades)`
+    );
+
+    // Followed vs ignored recommendation win rates
+    const followed = trades.filter(t => t.followed_recommendation === 1);
+    const ignored = trades.filter(t => t.followed_recommendation === 0);
+    const followedWinRate = followed.length > 0 ? Math.round(followed.filter(t => parseFloat(t.outcome_pnl) > 0).length / followed.length * 100) : null;
+    const ignoredWinRate = ignored.length > 0 ? Math.round(ignored.filter(t => parseFloat(t.outcome_pnl) > 0).length / ignored.length * 100) : null;
+
+    let summary = `LEARNING FROM PAST PERFORMANCE (${trades.length} completed trades, ${overallWinRate}% win rate):\n`;
+    summary += actionLines.join('\n') + '\n';
+    if (catLines.length) summary += catLines.join('\n') + '\n';
+    if (emotionLines.length) summary += emotionLines.join('\n') + '\n';
+    if (followedWinRate !== null) summary += `- Followed Claude's advice: ${followedWinRate}% win rate (${followed.length} trades)\n`;
+    if (ignoredWinRate !== null) summary += `- Ignored Claude's advice: ${ignoredWinRate}% win rate (${ignored.length} trades)\n`;
+
+    learningModelCache = summary.trim();
+    return learningModelCache;
+  } catch (e) {
+    console.error('updateLearningModel error:', e.message);
+    return '';
+  }
+}
+
+async function getLearningContext() {
+  try {
+    const [recentTrades] = await db.execute(
+      'SELECT * FROM trading_journal ORDER BY created_at DESC LIMIT 10'
+    );
+    const [profileRows] = await db.execute('SELECT preference_key, preference_value FROM trader_profile');
+    const [completedTrades] = await db.execute(
+      'SELECT outcome_pnl FROM trading_journal WHERE outcome_pnl IS NOT NULL'
+    );
+
+    if (recentTrades.length === 0 && profileRows.length === 0 && completedTrades.length === 0) return '';
+
+    let context = '\n\n--- BRYAN\'S TRADING HISTORY ---\n';
+
+    if (recentTrades.length > 0) {
+      context += 'Bryan\'s recent trades:\n';
+      for (const t of recentTrades) {
+        const coin = t.symbol.replace('-USD', '');
+        const followed = t.followed_recommendation === 1 ? 'followed' : t.followed_recommendation === 0 ? 'ignored' : 'N/A';
+        const claudeNote = t.claude_recommendation ? `, Claude said ${t.claude_recommendation}, Bryan ${followed}` : '';
+        const pnlStr = t.outcome_pnl != null ? ` — ${parseFloat(t.outcome_pnl) >= 0 ? '+' : ''}${parseFloat(t.outcome_pnl).toFixed(1)}% ${parseFloat(t.outcome_pnl) >= 0 ? '✅' : '❌'}` : ' — pending';
+        context += `• ${t.action} ${coin} at $${parseFloat(t.price || 0).toFixed(4)}${claudeNote}${pnlStr}\n`;
+      }
+    }
+
+    if (profileRows.length > 0) {
+      context += 'Bryan\'s trading style:\n';
+      for (const p of profileRows) {
+        context += `• ${p.preference_value}\n`;
+      }
+    }
+
+    if (learningModelCache) {
+      context += `What works for Bryan:\n${learningModelCache}\n`;
+    }
+
+    if (completedTrades.length > 0) {
+      const profits = completedTrades.filter(t => parseFloat(t.outcome_pnl) > 0);
+      const losses = completedTrades.filter(t => parseFloat(t.outcome_pnl) <= 0);
+      const winRate = Math.round(profits.length / completedTrades.length * 100);
+      const avgProfit = profits.length > 0 ? (profits.reduce((s, t) => s + parseFloat(t.outcome_pnl), 0) / profits.length).toFixed(1) : 0;
+      const avgLoss = losses.length > 0 ? (losses.reduce((s, t) => s + parseFloat(t.outcome_pnl), 0) / losses.length).toFixed(1) : 0;
+      context += `Bryan's track record:\n• Win rate: ${winRate}% | Avg profit: +${avgProfit}% | Avg loss: ${avgLoss}%\n`;
+    }
+
+    return context;
+  } catch (e) {
+    console.error('getLearningContext error:', e.message);
+    return '';
+  }
+}
+
+async function getAutomationReadiness(symbol, action) {
+  try {
+    const [trades] = await db.execute(
+      'SELECT outcome_pnl FROM trading_journal WHERE symbol = ? AND action = ? AND outcome_pnl IS NOT NULL',
+      [symbol, action]
+    );
+    if (trades.length < 10) return null;
+    const wins = trades.filter(t => parseFloat(t.outcome_pnl) > 0).length;
+    const winRate = Math.round(wins / trades.length * 100);
+    if (winRate < 75) return null;
+    return { ready: true, winRate, sampleSize: trades.length };
+  } catch (e) {
+    return null;
   }
 }
 
@@ -784,7 +989,9 @@ async function checkPortfolio() {
           ? `\nEntry: $${entryPrice.toFixed(4)} | P&L: +${((currentPrice - entryPrice) / entryPrice * 100).toFixed(1)}%`
           : '';
         const replyMenu = `\n\nReply:\n'sell ${coinBase}' - get sell advice\n'buy more ${coinBase}' - get buy advice\n'analyse ${coinBase}' - full analysis\n'acknowledge ${coinBase}' - stop alerts\n'threshold ${coinBase} 15%' - change threshold\n'entry ${coinBase} 0.147' - correct my entry`;
-        const alertMessage = `🎯 <b>${symbol} FIXED TARGET HIT!</b>\n\nAnchor: $${target.anchorPrice.toFixed(4)} → Now $${currentPrice.toFixed(4)} (+${changePct.toFixed(1)}%)${entryLine}\n\n⚡ RECOMMENDATION: ${aiRec}${replyMenu}`;
+        const autoReady = await getAutomationReadiness(symbol, 'buy');
+        const autoLine = autoReady ? `\n\n⚡ AUTO-READY: This setup has worked ${autoReady.winRate}% of the time (${autoReady.sampleSize} trades). Could be automated.` : '';
+        const alertMessage = `🎯 <b>${symbol} FIXED TARGET HIT!</b>\n\nAnchor: $${target.anchorPrice.toFixed(4)} → Now $${currentPrice.toFixed(4)} (+${changePct.toFixed(1)}%)${entryLine}\n\n⚡ RECOMMENDATION: ${aiRec}${replyMenu}${autoLine}`;
         await sendTelegram(alertMessage);
 
         activeFixedAlerts[symbol] = setInterval(async () => {
@@ -802,7 +1009,9 @@ async function checkPortfolio() {
           ? `\nEntry: $${entryPrice.toFixed(4)} | P&L: ${plPct}%`
           : '';
         const replyMenu = `\n\nReply:\n'buy more ${coinBase}' - get buy the dip advice\n'sell ${coinBase}' - get sell advice\n'analyse ${coinBase}' - full analysis\n'acknowledge ${coinBase}' - stop alerts`;
-        const alertMessage = `📉 <b>${symbol} FIXED FLOOR HIT!</b>\n\nAnchor: $${target.anchorPrice.toFixed(4)} → Now $${currentPrice.toFixed(4)} (${changePct.toFixed(1)}%)${entryLine}\n\n⚡ RECOMMENDATION: ${aiRec}${replyMenu}`;
+        const autoReady = await getAutomationReadiness(symbol, 'sell');
+        const autoLine = autoReady ? `\n\n⚡ AUTO-READY: This setup has worked ${autoReady.winRate}% of the time (${autoReady.sampleSize} trades). Could be automated.` : '';
+        const alertMessage = `📉 <b>${symbol} FIXED FLOOR HIT!</b>\n\nAnchor: $${target.anchorPrice.toFixed(4)} → Now $${currentPrice.toFixed(4)} (${changePct.toFixed(1)}%)${entryLine}\n\n⚡ RECOMMENDATION: ${aiRec}${replyMenu}${autoLine}`;
         await sendTelegram(alertMessage);
 
         activeFixedAlerts[symbol] = setInterval(async () => {
@@ -993,6 +1202,145 @@ app.delete('/api/targets/:symbol', async (req, res) => {
   res.json({ ok: true, symbol });
 });
 
+// GET /api/journal/stats — compute stats from trading_journal
+app.get('/api/journal/stats', async (req, res) => {
+  try {
+    const [all] = await db.execute('SELECT * FROM trading_journal');
+    const completed = all.filter(t => t.outcome_pnl != null);
+    const total_trades = all.length;
+    const wins = completed.filter(t => parseFloat(t.outcome_pnl) > 0);
+    const losses = completed.filter(t => parseFloat(t.outcome_pnl) <= 0);
+    const win_rate = completed.length > 0 ? Math.round(wins.length / completed.length * 100) : 0;
+    const avg_profit = wins.length > 0 ? (wins.reduce((s, t) => s + parseFloat(t.outcome_pnl), 0) / wins.length).toFixed(1) : 0;
+    const avg_loss = losses.length > 0 ? (losses.reduce((s, t) => s + parseFloat(t.outcome_pnl), 0) / losses.length).toFixed(1) : 0;
+    const best_trade = completed.length > 0 ? completed.reduce((a, b) => parseFloat(a.outcome_pnl) > parseFloat(b.outcome_pnl) ? a : b) : null;
+    const worst_trade = completed.length > 0 ? completed.reduce((a, b) => parseFloat(a.outcome_pnl) < parseFloat(b.outcome_pnl) ? a : b) : null;
+    const coinCounts = {};
+    for (const t of all) { coinCounts[t.symbol] = (coinCounts[t.symbol] || 0) + 1; }
+    const most_traded = Object.entries(coinCounts).sort((a, b) => b[1] - a[1])[0]?.[0] || null;
+    const byEmotion = {};
+    for (const t of completed) {
+      if (!t.emotion) continue;
+      if (!byEmotion[t.emotion]) byEmotion[t.emotion] = { wins: 0, total: 0 };
+      byEmotion[t.emotion].total++;
+      if (parseFloat(t.outcome_pnl) > 0) byEmotion[t.emotion].wins++;
+    }
+    const followed = completed.filter(t => t.followed_recommendation === 1);
+    const ignored = completed.filter(t => t.followed_recommendation === 0);
+    const followed_win_rate = followed.length > 0 ? Math.round(followed.filter(t => parseFloat(t.outcome_pnl) > 0).length / followed.length * 100) : null;
+    const ignored_win_rate = ignored.length > 0 ? Math.round(ignored.filter(t => parseFloat(t.outcome_pnl) > 0).length / ignored.length * 100) : null;
+    res.json({
+      total_trades, win_rate, avg_profit: parseFloat(avg_profit), avg_loss: parseFloat(avg_loss),
+      best_trade: best_trade ? { symbol: best_trade.symbol, pnl: parseFloat(best_trade.outcome_pnl) } : null,
+      worst_trade: worst_trade ? { symbol: worst_trade.symbol, pnl: parseFloat(worst_trade.outcome_pnl) } : null,
+      most_traded,
+      emotion_stats: byEmotion,
+      recommendation_accuracy: { followed_win_rate, ignored_win_rate, followed_count: followed.length, ignored_count: ignored.length }
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/journal — newest first, limit 50
+app.get('/api/journal', async (req, res) => {
+  try {
+    const [rows] = await db.execute('SELECT * FROM trading_journal ORDER BY created_at DESC LIMIT 50');
+    res.json(rows);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/journal/entry — add a new journal entry
+app.post('/api/journal/entry', async (req, res) => {
+  try {
+    const { symbol, action, price, quantity, reasoning, emotion, claude_recommendation, followed_recommendation } = req.body;
+    if (!symbol || !action) return res.status(400).json({ error: 'symbol and action required' });
+    const sym = symbol.toUpperCase().includes('-USD') ? symbol.toUpperCase() : `${symbol.toUpperCase()}-USD`;
+    const value_usd = price && quantity ? parseFloat(price) * parseFloat(quantity) : null;
+    const [result] = await db.execute(
+      'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, claude_recommendation, followed_recommendation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [sym, action, price || null, quantity || null, value_usd, reasoning || null, emotion || null, claude_recommendation || null, followed_recommendation != null ? (followed_recommendation ? 1 : 0) : null]
+    );
+    const [rows] = await db.execute('SELECT * FROM trading_journal WHERE id = ?', [result.insertId]);
+    res.json(rows[0]);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/journal/:symbol — last 20 entries for that symbol (must be after /api/journal/stats and /api/journal)
+app.get('/api/journal/:symbol', async (req, res) => {
+  try {
+    const sym = req.params.symbol.toUpperCase().includes('-USD') ? req.params.symbol.toUpperCase() : `${req.params.symbol.toUpperCase()}-USD`;
+    const [rows] = await db.execute('SELECT * FROM trading_journal WHERE symbol = ? ORDER BY created_at DESC LIMIT 20', [sym]);
+    res.json(rows);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/journal/:id/outcome — log outcome for a journal entry
+app.post('/api/journal/:id/outcome', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const { outcome_price, outcome, outcome_notes } = req.body;
+    const [existing] = await db.execute('SELECT * FROM trading_journal WHERE id = ?', [id]);
+    if (existing.length === 0) return res.status(404).json({ error: 'Entry not found' });
+    const entry = existing[0];
+    let outcome_pnl = null;
+    if (outcome_price && entry.price) {
+      outcome_pnl = ((parseFloat(outcome_price) - parseFloat(entry.price)) / parseFloat(entry.price)) * 100;
+      if (entry.action === 'sell') outcome_pnl = -outcome_pnl; // selling at lower = profit if short
+    }
+    const outcomeLabel = outcome || (outcome_pnl != null ? (outcome_pnl > 0 ? 'profit' : 'loss') : null);
+    await db.execute(
+      'UPDATE trading_journal SET outcome_price = ?, outcome_pnl = ?, outcome = ?, outcome_notes = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+      [outcome_price || null, outcome_pnl, outcomeLabel, outcome_notes || null, id]
+    );
+    await updateLearningModel().catch(() => {});
+    const [rows] = await db.execute('SELECT * FROM trading_journal WHERE id = ?', [id]);
+    res.json(rows[0]);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/profile — all trader profile preferences
+app.get('/api/profile', async (req, res) => {
+  try {
+    const [rows] = await db.execute('SELECT * FROM trader_profile ORDER BY updated_at DESC');
+    res.json(rows);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/profile — upsert a preference
+app.post('/api/profile', async (req, res) => {
+  try {
+    const { key, value } = req.body;
+    if (!key || !value) return res.status(400).json({ error: 'key and value required' });
+    await db.execute(
+      'INSERT INTO trader_profile (preference_key, preference_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE preference_value = VALUES(preference_value), updated_at = CURRENT_TIMESTAMP',
+      [key, value]
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/learning — return the learning model cache
+app.get('/api/learning', async (req, res) => {
+  try {
+    res.json({ summary: learningModelCache, updatedAt: new Date().toISOString() });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // GET /api/entryprices — all average entry prices
 app.get('/api/entryprices', (req, res) => {
   const out = {};
@@ -1104,6 +1452,39 @@ app.post('/telegram-webhook', async (req, res) => {
         body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML' })
       });
     };
+
+    // --- Pending journal state handler (emotion / followed flow) ---
+    const chatIdStr = chatId.toString();
+    if (pendingJournalState.has(chatIdStr)) {
+      const pendingState = pendingJournalState.get(chatIdStr);
+      if (pendingState.step === 'emotion') {
+        const emotionMatch = commandText.match(/^(confident|uncertain|fomo|fearful|neutral)$/);
+        if (emotionMatch) {
+          const emotion = emotionMatch[1];
+          await db.execute('UPDATE trading_journal SET emotion = ? WHERE id = ?', [emotion, pendingState.journalId]);
+          if (pendingState.hasClaudeRec) {
+            pendingState.step = 'followed';
+            pendingJournalState.set(chatIdStr, pendingState);
+            await sendReply(`Did you follow Claude's <b>${pendingState.claudeRec}</b> recommendation? Reply: yes / no`);
+          } else {
+            pendingJournalState.delete(chatIdStr);
+            await sendReply('✅ Journal entry complete.');
+          }
+          return res.status(200).json({ ok: true });
+        }
+      } else if (pendingState.step === 'followed') {
+        const followedMatch = commandText.match(/^(yes|no)$/);
+        if (followedMatch) {
+          const followed = followedMatch[1] === 'yes' ? 1 : 0;
+          await db.execute('UPDATE trading_journal SET followed_recommendation = ? WHERE id = ?', [followed, pendingState.journalId]);
+          pendingJournalState.delete(chatIdStr);
+          await sendReply('✅ Journal entry complete.');
+          return res.status(200).json({ ok: true });
+        }
+      }
+      // Non-matching reply — clear pending state and continue processing normally
+      pendingJournalState.delete(chatIdStr);
+    }
 
     // --- Command: acknowledge [COIN] or acknowledge/ack (generic) ---
     const ackMatch = commandText.match(/^(?:acknowledge|ack)(?:\s+([a-z0-9]{2,10}))?$/);
@@ -1354,6 +1735,162 @@ app.post('/telegram-webhook', async (req, res) => {
       return res.status(200).json({ ok: true });
     }
 
+    // --- Command: bought COIN PRICE [QTY] ---
+    const boughtMatch = commandText.match(/^bought\s+([a-z]{2,10})\s+([\d.]+)(?:\s+([\d.]+))?$/i);
+    if (boughtMatch) {
+      const coinBase = boughtMatch[1].toUpperCase();
+      const symbol = `${coinBase}-USD`;
+      const price = parseFloat(boughtMatch[2]);
+      const qty = boughtMatch[3] ? parseFloat(boughtMatch[3]) : null;
+      const value_usd = qty ? price * qty : null;
+      // Check analysis_history for recent rec (< 7 days)
+      const [recentAna] = await db.execute(
+        'SELECT recommendation, claude_summary FROM analysis_history WHERE symbol = ? AND created_at > DATE_SUB(NOW(), INTERVAL 7 DAY) ORDER BY created_at DESC LIMIT 1',
+        [symbol]
+      );
+      const hasClaudeRec = recentAna.length > 0;
+      const claudeRec = hasClaudeRec ? recentAna[0].recommendation : null;
+      const [result] = await db.execute(
+        'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, claude_recommendation, claude_reasoning) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        [symbol, 'buy', price, qty, value_usd, claudeRec, hasClaudeRec ? recentAna[0].claude_summary?.substring(0, 300) : null]
+      );
+      const journalId = result.insertId;
+      pendingJournalState.set(chatIdStr, { journalId, step: 'emotion', hasClaudeRec, claudeRec, symbol });
+      const qtyStr = qty ? `${qty} ` : '';
+      const valStr = value_usd ? ` ($${value_usd.toFixed(2)})` : '';
+      await sendReply(`📝 Logged: Bought ${qtyStr}${coinBase} at $${price}${valStr}.\n\nEmotion? Reply: confident / uncertain / fomo / fearful / neutral`);
+      return res.status(200).json({ ok: true });
+    }
+
+    // --- Command: sold COIN PRICE [QTY] ---
+    const soldMatch = commandText.match(/^sold\s+([a-z]{2,10})\s+([\d.]+)(?:\s+([\d.]+))?$/i);
+    if (soldMatch) {
+      const coinBase = soldMatch[1].toUpperCase();
+      const symbol = `${coinBase}-USD`;
+      const salePrice = parseFloat(soldMatch[2]);
+      const qty = soldMatch[3] ? parseFloat(soldMatch[3]) : null;
+      const value_usd = qty ? salePrice * qty : null;
+      const [result] = await db.execute(
+        'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd) VALUES (?, ?, ?, ?, ?)',
+        [symbol, 'sell', salePrice, qty, value_usd]
+      );
+      const journalId = result.insertId;
+      // Find most recent buy for same symbol with no outcome
+      const [recentBuy] = await db.execute(
+        'SELECT id, price FROM trading_journal WHERE symbol = ? AND action = ? AND outcome IS NULL AND id != ? ORDER BY created_at DESC LIMIT 1',
+        [symbol, 'buy', journalId]
+      );
+      let pnlLine = '';
+      if (recentBuy.length > 0) {
+        const buyEntry = recentBuy[0];
+        const buyPrice = parseFloat(buyEntry.price);
+        const pnl = ((salePrice - buyPrice) / buyPrice) * 100;
+        const outcomeLabel = pnl > 0 ? 'profit' : 'loss';
+        await db.execute(
+          'UPDATE trading_journal SET outcome_price = ?, outcome_pnl = ?, outcome = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+          [salePrice, pnl, outcomeLabel, buyEntry.id]
+        );
+        await updateLearningModel().catch(() => {});
+        pnlLine = `\nP&L vs last buy: ${pnl >= 0 ? '+' : ''}${pnl.toFixed(1)}% ${pnl >= 0 ? '✅' : '❌'}`;
+      }
+      pendingJournalState.set(chatIdStr, { journalId, step: 'emotion', hasClaudeRec: false, claudeRec: null, symbol });
+      const qtyStr = qty ? `${qty} ` : '';
+      await sendReply(`📝 Logged: Sold ${qtyStr}${coinBase} at $${salePrice}.${pnlLine}\n\nEmotion? Reply: confident / uncertain / fomo / fearful / neutral`);
+      return res.status(200).json({ ok: true });
+    }
+
+    // --- Command: holding COIN ---
+    const holdingMatch = commandText.match(/^holding\s+([a-z]{2,10})$/i);
+    if (holdingMatch) {
+      const coinBase = holdingMatch[1].toUpperCase();
+      const symbol = `${coinBase}-USD`;
+      const currentPrice = await getCurrentPrice(symbol);
+      await db.execute(
+        'INSERT INTO trading_journal (symbol, action, price) VALUES (?, ?, ?)',
+        [symbol, 'hold', currentPrice]
+      );
+      const priceStr = currentPrice ? `$${currentPrice.toFixed(4)}` : 'unknown price';
+      await sendReply(`📝 Hold logged for ${coinBase} at current price ${priceStr}`);
+      return res.status(200).json({ ok: true });
+    }
+
+    // --- Command: journal [COIN] ---
+    const journalMatch = commandText.match(/^journal(?:\s+([a-z]{2,10}))?$/i);
+    if (journalMatch) {
+      let rows;
+      if (journalMatch[1]) {
+        const coinBase = journalMatch[1].toUpperCase();
+        const symbol = `${coinBase}-USD`;
+        [rows] = await db.execute(
+          'SELECT * FROM trading_journal WHERE symbol = ? ORDER BY created_at DESC LIMIT 5',
+          [symbol]
+        );
+      } else {
+        [rows] = await db.execute('SELECT * FROM trading_journal ORDER BY created_at DESC LIMIT 5');
+      }
+      if (rows.length === 0) {
+        await sendReply('📓 No journal entries yet. Log trades with "bought COIN PRICE" or "sold COIN PRICE".');
+      } else {
+        const lines = rows.map(t => {
+          const coin = t.symbol.replace('-USD', '');
+          const emo = t.emotion || '—';
+          const outcome = t.outcome_pnl != null ? `${parseFloat(t.outcome_pnl) >= 0 ? '+' : ''}${parseFloat(t.outcome_pnl).toFixed(1)}%` : 'pending';
+          return `• ${t.action.toUpperCase()} ${coin} @ $${parseFloat(t.price || 0).toFixed(4)} | ${emo} | ${outcome}`;
+        }).join('\n');
+        await sendReply(`📓 <b>Recent Journal Entries:</b>\n${lines}`);
+      }
+      return res.status(200).json({ ok: true });
+    }
+
+    // --- Command: my stats ---
+    if (commandText === 'my stats') {
+      const [all] = await db.execute('SELECT * FROM trading_journal');
+      const completed = all.filter(t => t.outcome_pnl != null);
+      if (completed.length === 0) {
+        await sendReply('📊 No completed trades yet. Log outcomes with the journal commands.');
+        return res.status(200).json({ ok: true });
+      }
+      const wins = completed.filter(t => parseFloat(t.outcome_pnl) > 0);
+      const losses = completed.filter(t => parseFloat(t.outcome_pnl) <= 0);
+      const winRate = Math.round(wins.length / completed.length * 100);
+      const avgProfit = wins.length > 0 ? (wins.reduce((s, t) => s + parseFloat(t.outcome_pnl), 0) / wins.length).toFixed(1) : 0;
+      const avgLoss = losses.length > 0 ? (losses.reduce((s, t) => s + parseFloat(t.outcome_pnl), 0) / losses.length).toFixed(1) : 0;
+      const best = completed.reduce((a, b) => parseFloat(a.outcome_pnl) > parseFloat(b.outcome_pnl) ? a : b);
+      const worst = completed.reduce((a, b) => parseFloat(a.outcome_pnl) < parseFloat(b.outcome_pnl) ? a : b);
+      const followed = completed.filter(t => t.followed_recommendation === 1);
+      const ignored = completed.filter(t => t.followed_recommendation === 0);
+      const followedWR = followed.length > 0 ? Math.round(followed.filter(t => parseFloat(t.outcome_pnl) > 0).length / followed.length * 100) : null;
+      const ignoredWR = ignored.length > 0 ? Math.round(ignored.filter(t => parseFloat(t.outcome_pnl) > 0).length / ignored.length * 100) : null;
+      let msg = `📊 <b>YOUR TRADING STATS</b>\nTotal trades: ${all.length}\nWin rate: ${winRate}%\nAvg profit: +${avgProfit}%\nAvg loss: ${avgLoss}%\nBest: +${parseFloat(best.outcome_pnl).toFixed(1)}% on ${best.symbol.replace('-USD','')}\nWorst: ${parseFloat(worst.outcome_pnl).toFixed(1)}% on ${worst.symbol.replace('-USD','')}`;
+      if (followedWR !== null) msg += `\nFollowed Claude: ${followedWR}% win rate (${followed.length} trades)`;
+      if (ignoredWR !== null) msg += `\nIgnored Claude: ${ignoredWR}% win rate (${ignored.length} trades)`;
+      await sendReply(msg);
+      return res.status(200).json({ ok: true });
+    }
+
+    // --- Command: learning ---
+    if (commandText === 'learning') {
+      if (learningModelCache) {
+        await sendReply(`🧠 <b>Learning Model:</b>\n${learningModelCache}`);
+      } else {
+        await sendReply('No learning data yet — log some trades with outcomes first.');
+      }
+      return res.status(200).json({ ok: true });
+    }
+
+    // --- Command: i prefer TEXT ---
+    const preferMatch = commandText.match(/^i prefer\s+(.+)$/i);
+    if (preferMatch) {
+      const prefText = preferMatch[1].trim();
+      const key = `pref_${Date.now()}`;
+      await db.execute(
+        'INSERT INTO trader_profile (preference_key, preference_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE preference_value = VALUES(preference_value)',
+        [key, prefText]
+      );
+      await sendReply(`✅ Saved to your trader profile: '${prefText}'`);
+      return res.status(200).json({ ok: true });
+    }
+
     // --- Free-form message → Claude AI (async, fire-and-forget) ---
 
     // Capture user message for use inside the async closure
@@ -1410,6 +1947,8 @@ app.post('/telegram-webhook', async (req, res) => {
             ).join('\n')
           : 'No holdings data available';
 
+        const learningContext = await getLearningContext();
+
         const systemPrompt =
           `You are an AI crypto trading assistant. Use ONLY the holdings data provided below. Do not recalculate or estimate prices. The values shown are live and accurate.\n\n` +
           `Here are the user's current holdings sorted by USD value (already calculated):\n${holdingsList}\n\n` +
@@ -1447,7 +1986,7 @@ app.post('/telegram-webhook', async (req, res) => {
 ${holdingsList}
 
 Current baseline prices (set when monitoring started): ${JSON.stringify(basePrices)}
-Active alerts (coins currently above threshold): ${Object.keys(activeAlerts).join(', ') || 'none'}`,
+Active alerts (coins currently above threshold): ${Object.keys(activeAlerts).join(', ') || 'none'}${learningContext}`,
           messages,
         });
         const timeoutPromise = new Promise((_, reject) =>
@@ -1468,6 +2007,25 @@ Active alerts (coins currently above threshold): ${Object.keys(activeAlerts).joi
         // Extract the last text block (web_search may produce tool_use blocks before the final text)
         const lastTextBlock = [...response.content].reverse().find(b => b.type === 'text');
         const reply = lastTextBlock ? lastTextBlock.text : '(no response)';
+
+        // Extract recommendation from Claude's reply and save to analysis_history
+        try {
+          const recMatch = reply.match(/\*\*(HOLD|SELL|BUY MORE|BUY|REDUCE|ADD)\*\*/i) || reply.match(/^(HOLD|SELL|BUY MORE|BUY|REDUCE|ADD)\b/im);
+          if (recMatch) {
+            const rec = recMatch[1].toUpperCase();
+            const coinInMsg = userMessage.match(/\b([A-Z]{2,10})\b/);
+            const coinBase = coinInMsg ? coinInMsg[1] : null;
+            const symbol = coinBase && !SKIP_WORDS.has(coinBase) ? `${coinBase}-USD` : null;
+            if (symbol) {
+              const priceNow = await getCurrentPrice(symbol).catch(() => null);
+              const summary = reply.substring(0, 500);
+              await db.execute(
+                'INSERT INTO analysis_history (symbol, analysis_type, price_at_analysis, recommendation, claude_summary) VALUES (?, ?, ?, ?, ?)',
+                [symbol, 'telegram_analysis', priceNow, rec, summary]
+              ).catch(() => {});
+            }
+          }
+        } catch (e) { /* ignore */ }
 
         // Update in-memory history
         const updatedHistory = [

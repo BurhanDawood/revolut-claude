@@ -37,7 +37,7 @@
       justify-content: space-between;
       flex-wrap: wrap;
       gap: 8px;
-      margin-bottom: 20px;
+      margin-bottom: 16px;
     }
 
     header h1 {
@@ -233,6 +233,12 @@
     }
     .btn-danger-outline:hover:not(:disabled) { background: rgba(255, 77, 106, 0.1); }
 
+    .btn-sm {
+      padding: 5px 10px;
+      font-size: 0.75rem;
+      min-height: 28px;
+    }
+
     /* Monitoring controls */
     .controls-row {
       display: flex;
@@ -357,6 +363,63 @@
     .toast.success { border-color: var(--accent); color: var(--accent); }
     .toast.error { border-color: var(--danger); color: var(--danger); }
 
+    /* ── Tabs ─────────────────────────────────────────────────────────────── */
+    .tab-nav { display: flex; gap: 4px; margin-bottom: 16px; }
+    .tab-btn { background: var(--surface); color: var(--text-muted); border: none; padding: 8px 18px; border-radius: 8px; font-size: 0.85rem; font-weight: 600; cursor: pointer; }
+    .tab-btn.active { background: var(--accent); color: #0d0d0d; }
+    .tab-content { display: none; }
+    .tab-content.active { display: block; }
+
+    /* ── Journal stats row ────────────────────────────────────────────────── */
+    .j-stats-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 16px; }
+    @media(max-width:600px) { .j-stats-row { grid-template-columns: repeat(2,1fr); } }
+    .j-stat-card { background: var(--surface); border-radius: var(--radius); padding: 14px; text-align: center; }
+    .j-stat-label { font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-muted); margin-bottom: 6px; }
+    .j-stat-value { font-size: 1.6rem; font-weight: 700; color: var(--accent); }
+
+    /* ── Journal entries ──────────────────────────────────────────────────── */
+    .journal-entry { background: var(--surface2); border-radius: 10px; padding: 12px 14px; margin-bottom: 10px; }
+    .je-header { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+    .je-action { padding: 2px 8px; border-radius: 4px; font-size: 0.72rem; font-weight: 700; text-transform: uppercase; }
+    .je-action.buy { background: rgba(0,255,200,0.15); color: var(--accent); }
+    .je-action.sell { background: rgba(255,77,106,0.15); color: var(--danger); }
+    .je-action.hold, .je-action.add, .je-action.reduce { background: rgba(255,170,0,0.12); color: var(--warn); }
+    .je-coin { font-weight: 700; font-size: 0.95rem; }
+    .je-price { color: var(--text-muted); font-size: 0.82rem; }
+    .je-emotion { font-size: 0.72rem; color: var(--text-muted); padding: 2px 7px; border: 1px solid #333; border-radius: 20px; }
+    .je-pnl { font-size: 0.82rem; font-weight: 600; }
+    .je-pnl.pos { color: var(--accent); }
+    .je-pnl.neg { color: var(--danger); }
+
+    /* ── Outcome form ─────────────────────────────────────────────────────── */
+    .outcome-form { display: none; margin-top: 10px; padding-top: 10px; border-top: 1px solid #2e2e2e; }
+    .outcome-form.open { display: block; }
+    .outcome-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+
+    /* ── Emotion buttons ──────────────────────────────────────────────────── */
+    .emotion-group { display: flex; gap: 6px; flex-wrap: wrap; }
+    .emotion-btn { background: var(--surface2); color: var(--text-muted); border: 1px solid #333; padding: 5px 11px; border-radius: 20px; font-size: 0.78rem; cursor: pointer; }
+    .emotion-btn.selected { border-color: var(--accent); color: var(--accent); background: var(--accent-dim); }
+
+    /* ── Action toggle ────────────────────────────────────────────────────── */
+    .action-group { display: flex; gap: 4px; flex-wrap: wrap; }
+    .action-btn { background: var(--surface2); color: var(--text-muted); border: 1px solid #333; padding: 6px 12px; border-radius: 8px; font-size: 0.8rem; cursor: pointer; }
+    .action-btn.selected { border-color: var(--accent); color: var(--accent); background: var(--accent-dim); }
+
+    /* ── Form fields ──────────────────────────────────────────────────────── */
+    .form-row { display: flex; flex-direction: column; gap: 5px; margin-bottom: 12px; }
+    .form-label { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-muted); }
+    .form-input { background: var(--surface2); border: 1px solid #333; border-radius: 8px; color: var(--text); font-family: inherit; font-size: 0.88rem; padding: 8px 10px; width: 100%; }
+    .form-input:focus { outline: none; border-color: var(--accent); }
+    .form-textarea { min-height: 60px; resize: vertical; }
+
+    /* ── Profile list ─────────────────────────────────────────────────────── */
+    .profile-item { display: flex; justify-content: space-between; align-items: center; padding: 7px 0; border-bottom: 1px solid #222; font-size: 0.85rem; }
+    .profile-item:last-child { border-bottom: none; }
+
+    /* ── Learning model text ──────────────────────────────────────────────── */
+    .learning-text { font-size: 0.85rem; line-height: 1.7; color: var(--text); white-space: pre-wrap; }
+
     @media (max-width: 480px) {
       body { padding: 12px; }
       .card { padding: 14px; }
@@ -376,49 +439,169 @@
   </div>
 </header>
 
+<!-- Tab navigation -->
+<nav class="tab-nav">
+  <button class="tab-btn active" onclick="switchTab('portfolio')">Portfolio</button>
+  <button class="tab-btn" onclick="switchTab('journal')">📓 Journal</button>
+</nav>
+
 <div class="error-banner" id="error-banner"></div>
 
-<!-- Portfolio Value -->
-<div class="card">
-  <div class="card-title">Portfolio Value</div>
-  <div id="portfolio-value">—</div>
-</div>
+<!-- ════════════════════════════════════ PORTFOLIO TAB ═══════════════════ -->
+<div id="tab-portfolio" class="tab-content active">
 
-<!-- Holdings -->
-<div class="card">
-  <div class="card-title">Holdings</div>
-  <div class="holdings-list" id="holdings-list">
-    <div class="empty-state">Loading…</div>
+  <!-- Portfolio Value -->
+  <div class="card">
+    <div class="card-title">Portfolio Value</div>
+    <div id="portfolio-value">—</div>
   </div>
-</div>
 
-<!-- Active Alerts -->
-<div class="card">
-  <div class="card-title">Active Alerts</div>
-  <div class="alerts-list" id="alerts-list">
-    <div class="empty-state">None</div>
-  </div>
-</div>
-
-<!-- Monitoring Controls -->
-<div class="card">
-  <div class="card-title">Monitoring Controls</div>
-  <div class="controls-row">
-    <div class="status-pill running" id="monitor-status-pill">
-      <div class="status-dot"></div>
-      <span id="monitor-status-text">Running</span>
+  <!-- Holdings -->
+  <div class="card">
+    <div class="card-title">Holdings</div>
+    <div class="holdings-list" id="holdings-list">
+      <div class="empty-state">Loading…</div>
     </div>
-    <button class="btn-accent" id="pause-resume-btn" onclick="toggleMonitoring()">Pause</button>
   </div>
-</div>
 
-<!-- Thresholds -->
-<div class="card">
-  <div class="card-title">Alert Thresholds</div>
-  <div class="threshold-list" id="threshold-list">
-    <div class="empty-state">Loading…</div>
+  <!-- Active Alerts -->
+  <div class="card">
+    <div class="card-title">Active Alerts</div>
+    <div class="alerts-list" id="alerts-list">
+      <div class="empty-state">None</div>
+    </div>
   </div>
-</div>
+
+  <!-- Monitoring Controls -->
+  <div class="card">
+    <div class="card-title">Monitoring Controls</div>
+    <div class="controls-row">
+      <div class="status-pill running" id="monitor-status-pill">
+        <div class="status-dot"></div>
+        <span id="monitor-status-text">Running</span>
+      </div>
+      <button class="btn-accent" id="pause-resume-btn" onclick="toggleMonitoring()">Pause</button>
+    </div>
+  </div>
+
+  <!-- Thresholds -->
+  <div class="card">
+    <div class="card-title">Alert Thresholds</div>
+    <div class="threshold-list" id="threshold-list">
+      <div class="empty-state">Loading…</div>
+    </div>
+  </div>
+
+</div><!-- /tab-portfolio -->
+
+<!-- ════════════════════════════════════ JOURNAL TAB ════════════════════ -->
+<div id="tab-journal" class="tab-content">
+
+  <!-- Stats row -->
+  <div class="j-stats-row">
+    <div class="j-stat-card">
+      <div class="j-stat-label">Win Rate</div>
+      <div class="j-stat-value" id="j-win-rate">—</div>
+    </div>
+    <div class="j-stat-card">
+      <div class="j-stat-label">Total Trades</div>
+      <div class="j-stat-value" id="j-total-trades">—</div>
+    </div>
+    <div class="j-stat-card">
+      <div class="j-stat-label">Avg Profit</div>
+      <div class="j-stat-value" id="j-avg-profit" style="color:var(--accent)">—</div>
+    </div>
+    <div class="j-stat-card">
+      <div class="j-stat-label">Claude Accuracy</div>
+      <div class="j-stat-value" id="j-claude-acc">—</div>
+    </div>
+  </div>
+
+  <!-- Learning Model -->
+  <div class="card">
+    <div class="card-title">🧠 Learning Model</div>
+    <div class="learning-text" id="learning-text">Loading…</div>
+  </div>
+
+  <!-- Add Trade form -->
+  <div class="card">
+    <div class="card-title">Log a Trade</div>
+
+    <div class="form-row">
+      <label class="form-label">Coin</label>
+      <input class="form-input" type="text" id="j-coin" placeholder="CC, SOL, HYPE…" maxlength="10" />
+    </div>
+
+    <div class="form-row">
+      <label class="form-label">Action</label>
+      <div class="action-group" id="j-action-group">
+        <button class="action-btn" onclick="selectAction('buy')">Buy</button>
+        <button class="action-btn" onclick="selectAction('sell')">Sell</button>
+        <button class="action-btn" onclick="selectAction('hold')">Hold</button>
+        <button class="action-btn" onclick="selectAction('add')">Add</button>
+        <button class="action-btn" onclick="selectAction('reduce')">Reduce</button>
+      </div>
+    </div>
+
+    <div class="form-row">
+      <label class="form-label">Price (USD)</label>
+      <input class="form-input" type="number" id="j-price" placeholder="0.00" step="any" min="0" />
+    </div>
+
+    <div class="form-row">
+      <label class="form-label">Quantity (optional)</label>
+      <input class="form-input" type="number" id="j-qty" placeholder="0" step="any" min="0" />
+    </div>
+
+    <div class="form-row">
+      <label class="form-label">Reasoning (optional)</label>
+      <textarea class="form-input form-textarea" id="j-reasoning" placeholder="Why this trade?"></textarea>
+    </div>
+
+    <div class="form-row">
+      <label class="form-label">Emotion</label>
+      <div class="emotion-group" id="j-emotion-group">
+        <button class="emotion-btn" onclick="selectEmotion('confident')">Confident</button>
+        <button class="emotion-btn" onclick="selectEmotion('uncertain')">Uncertain</button>
+        <button class="emotion-btn" onclick="selectEmotion('fomo')">FOMO</button>
+        <button class="emotion-btn" onclick="selectEmotion('fearful')">Fearful</button>
+        <button class="emotion-btn" onclick="selectEmotion('neutral')">Neutral</button>
+      </div>
+    </div>
+
+    <div class="form-row">
+      <label class="form-label">Followed Claude's Recommendation?</label>
+      <div class="action-group" id="j-followed-group">
+        <button class="action-btn" onclick="selectFollowed('yes')">Yes</button>
+        <button class="action-btn" onclick="selectFollowed('no')">No</button>
+        <button class="action-btn selected" onclick="selectFollowed('na')">N/A</button>
+      </div>
+    </div>
+
+    <button class="btn-accent" onclick="submitJournalEntry()">Log Trade</button>
+  </div>
+
+  <!-- Journal entries -->
+  <div class="card">
+    <div class="card-title">Recent Trades</div>
+    <div id="journal-entries-list">
+      <div class="empty-state">Loading…</div>
+    </div>
+  </div>
+
+  <!-- Trader Profile -->
+  <div class="card">
+    <div class="card-title">Trader Profile</div>
+    <div id="profile-list">
+      <div class="empty-state">No preferences saved yet.</div>
+    </div>
+    <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;">
+      <input class="form-input" type="text" id="pref-input" placeholder="e.g. I prefer swing trading over day trading" style="flex:1;min-width:180px;" />
+      <button class="btn-outline" onclick="addPreference()">Add</button>
+    </div>
+  </div>
+
+</div><!-- /tab-journal -->
 
 <div class="toast" id="toast"></div>
 
@@ -430,6 +613,8 @@
   let statusData = {};
   let targetsData = {};
   let entryPricesData = {};
+
+  window.journalLoaded = false;
 
   // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -471,7 +656,24 @@
     return res.json();
   }
 
-  // ── Render ───────────────────────────────────────────────────────────────
+  // ── Tab switching ─────────────────────────────────────────────────────────
+
+  function switchTab(tab) {
+    document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+    document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+    document.getElementById('tab-' + tab).classList.add('active');
+    event.currentTarget.classList.add('active');
+
+    if (tab === 'journal' && !window.journalLoaded) {
+      window.journalLoaded = true;
+      loadJournalStats();
+      loadLearning();
+      loadJournal();
+      loadProfile();
+    }
+  }
+
+  // ── Portfolio Render ──────────────────────────────────────────────────────
 
   function renderHoldings(balances) {
     const el = document.getElementById('holdings-list');
@@ -606,7 +808,7 @@
     }).join('');
   }
 
-  // ── API Actions ───────────────────────────────────────────────────────────
+  // ── Portfolio API Actions ──────────────────────────────────────────────────
 
   async function acknowledge(symbol) {
     try {
@@ -695,7 +897,7 @@
     }
   }
 
-  // ── Data Fetching ─────────────────────────────────────────────────────────
+  // ── Portfolio Data Fetching ───────────────────────────────────────────────
 
   async function refreshBalances() {
     const data = await apiFetch('GET', '/api/balances');
@@ -738,6 +940,217 @@
       document.getElementById('last-updated').textContent = 'Update failed';
     } finally {
       setLoading(false);
+    }
+  }
+
+  // ── Journal Form State ────────────────────────────────────────────────────
+
+  let selectedAction = null;
+  let selectedEmotion = null;
+  let selectedFollowed = 'na';
+
+  function selectAction(action) {
+    selectedAction = action;
+    document.querySelectorAll('#j-action-group .action-btn').forEach(btn => {
+      btn.classList.toggle('selected', btn.textContent.toLowerCase() === action);
+    });
+  }
+
+  function selectEmotion(emotion) {
+    selectedEmotion = emotion;
+    document.querySelectorAll('#j-emotion-group .emotion-btn').forEach(btn => {
+      btn.classList.toggle('selected', btn.textContent.toLowerCase() === emotion);
+    });
+  }
+
+  function selectFollowed(val) {
+    selectedFollowed = val;
+    document.querySelectorAll('#j-followed-group .action-btn').forEach(btn => {
+      btn.classList.toggle('selected', btn.textContent.toLowerCase() === val);
+    });
+  }
+
+  // ── Journal Functions ─────────────────────────────────────────────────────
+
+  async function loadJournalStats() {
+    try {
+      const stats = await apiFetch('GET', '/api/journal/stats');
+      const winRateEl = document.getElementById('j-win-rate');
+      winRateEl.textContent = stats.win_rate != null ? stats.win_rate + '%' : '—';
+      winRateEl.style.color = stats.win_rate >= 50 ? 'var(--accent)' : 'var(--danger)';
+      document.getElementById('j-total-trades').textContent = stats.total_trades ?? '—';
+      const profitEl = document.getElementById('j-avg-profit');
+      profitEl.textContent = stats.avg_profit != null ? '+' + stats.avg_profit + '%' : '—';
+      const accEl = document.getElementById('j-claude-acc');
+      const fw = stats.recommendation_accuracy?.followed_win_rate;
+      accEl.textContent = fw != null ? fw + '%' : '—';
+    } catch (e) {
+      console.error('loadJournalStats:', e.message);
+    }
+  }
+
+  async function loadLearning() {
+    try {
+      const data = await apiFetch('GET', '/api/learning');
+      const el = document.getElementById('learning-text');
+      if (data.summary) {
+        el.textContent = data.summary;
+      } else {
+        el.textContent = 'No learning data yet — log some trades with outcomes first.';
+        el.style.color = 'var(--text-muted)';
+      }
+    } catch (e) {
+      document.getElementById('learning-text').textContent = 'Failed to load learning model.';
+    }
+  }
+
+  async function loadJournal() {
+    try {
+      const entries = await apiFetch('GET', '/api/journal');
+      renderJournalEntries(entries);
+    } catch (e) {
+      document.getElementById('journal-entries-list').innerHTML = '<div class="empty-state">Failed to load journal.</div>';
+    }
+  }
+
+  function renderJournalEntries(entries) {
+    const el = document.getElementById('journal-entries-list');
+    if (!entries || entries.length === 0) {
+      el.innerHTML = '<div class="empty-state">No trades logged yet. Use the form above or Telegram commands.</div>';
+      return;
+    }
+    el.innerHTML = entries.map(e => {
+      const coin = e.symbol ? e.symbol.replace('-USD', '') : '?';
+      const actionClass = (e.action || 'hold').toLowerCase();
+      const price = e.price ? '$' + parseFloat(e.price).toFixed(4) : '—';
+      const emotion = e.emotion ? `<span class="je-emotion">${e.emotion}</span>` : '';
+      let pnlBadge = '';
+      if (e.outcome_pnl != null) {
+        const pnl = parseFloat(e.outcome_pnl);
+        pnlBadge = `<span class="je-pnl ${pnl >= 0 ? 'pos' : 'neg'}">${pnl >= 0 ? '+' : ''}${pnl.toFixed(1)}%</span>`;
+      }
+      const outcomeBtn = e.outcome == null
+        ? `<button class="btn-outline btn-sm" onclick="toggleOutcomeForm(${e.id})">Log Outcome</button>`
+        : `<span style="font-size:0.75rem;color:var(--text-muted)">${e.outcome}</span>`;
+      const date = e.created_at ? new Date(e.created_at).toLocaleDateString() : '';
+      return `
+        <div class="journal-entry" id="je-${e.id}">
+          <div class="je-header">
+            <span class="je-action ${actionClass}">${e.action || '?'}</span>
+            <span class="je-coin">${coin}</span>
+            <span class="je-price">${price}</span>
+            ${emotion}
+            ${pnlBadge}
+            <span style="margin-left:auto;font-size:0.72rem;color:var(--text-muted)">${date}</span>
+            ${outcomeBtn}
+          </div>
+          ${e.reasoning ? `<div style="font-size:0.8rem;color:var(--text-muted);margin-top:4px">${e.reasoning}</div>` : ''}
+          <div class="outcome-form" id="outcome-form-${e.id}">
+            <div class="outcome-row">
+              <input class="form-input" type="number" id="op-${e.id}" placeholder="Exit price" step="any" min="0" style="width:130px" />
+              <select class="form-input" id="oo-${e.id}" style="width:130px">
+                <option value="">Outcome…</option>
+                <option value="profit">Profit</option>
+                <option value="loss">Loss</option>
+                <option value="break-even">Break-even</option>
+              </select>
+              <input class="form-input" type="text" id="on-${e.id}" placeholder="Notes (optional)" style="flex:1;min-width:120px" />
+              <button class="btn-accent btn-sm" onclick="logOutcome(${e.id})">Save</button>
+            </div>
+          </div>
+        </div>`;
+    }).join('');
+  }
+
+  function toggleOutcomeForm(id) {
+    const form = document.getElementById('outcome-form-' + id);
+    form.classList.toggle('open');
+  }
+
+  async function logOutcome(id) {
+    const outcomePrice = parseFloat(document.getElementById('op-' + id).value);
+    const outcome = document.getElementById('oo-' + id).value;
+    const notes = document.getElementById('on-' + id).value;
+    if (!outcomePrice || outcomePrice <= 0) { showToast('Enter a valid exit price', 'error'); return; }
+    try {
+      await apiFetch('POST', `/api/journal/${id}/outcome`, { outcome_price: outcomePrice, outcome, outcome_notes: notes });
+      showToast('Outcome saved!', 'success');
+      await loadJournal();
+      await loadJournalStats();
+      await loadLearning();
+    } catch (e) {
+      showToast('Failed: ' + e.message, 'error');
+    }
+  }
+
+  async function submitJournalEntry() {
+    const coin = document.getElementById('j-coin').value.trim().toUpperCase();
+    if (!coin) { showToast('Enter a coin symbol', 'error'); return; }
+    if (!selectedAction) { showToast('Select an action', 'error'); return; }
+    const price = parseFloat(document.getElementById('j-price').value) || null;
+    const qty = parseFloat(document.getElementById('j-qty').value) || null;
+    const reasoning = document.getElementById('j-reasoning').value.trim() || null;
+    const followed = selectedFollowed === 'yes' ? true : selectedFollowed === 'no' ? false : null;
+    try {
+      await apiFetch('POST', '/api/journal/entry', {
+        symbol: coin,
+        action: selectedAction,
+        price,
+        quantity: qty,
+        reasoning,
+        emotion: selectedEmotion,
+        followed_recommendation: followed
+      });
+      showToast('Trade logged!', 'success');
+      // Reset form
+      document.getElementById('j-coin').value = '';
+      document.getElementById('j-price').value = '';
+      document.getElementById('j-qty').value = '';
+      document.getElementById('j-reasoning').value = '';
+      selectedAction = null;
+      selectedEmotion = null;
+      selectedFollowed = 'na';
+      document.querySelectorAll('.action-btn, .emotion-btn').forEach(b => b.classList.remove('selected'));
+      document.querySelectorAll('#j-followed-group .action-btn').forEach(btn => {
+        btn.classList.toggle('selected', btn.textContent.toLowerCase() === 'na');
+      });
+      await loadJournal();
+      await loadJournalStats();
+    } catch (e) {
+      showToast('Failed: ' + e.message, 'error');
+    }
+  }
+
+  // ── Profile Functions ─────────────────────────────────────────────────────
+
+  async function loadProfile() {
+    try {
+      const rows = await apiFetch('GET', '/api/profile');
+      const el = document.getElementById('profile-list');
+      if (!rows || rows.length === 0) {
+        el.innerHTML = '<div class="empty-state">No preferences saved yet.</div>';
+        return;
+      }
+      el.innerHTML = rows.map(r => `
+        <div class="profile-item">
+          <span>${r.preference_value}</span>
+        </div>
+      `).join('');
+    } catch (e) {
+      console.error('loadProfile:', e.message);
+    }
+  }
+
+  async function addPreference() {
+    const val = document.getElementById('pref-input').value.trim();
+    if (!val) { showToast('Enter a preference', 'error'); return; }
+    try {
+      await apiFetch('POST', '/api/profile', { key: 'pref_' + Date.now(), value: val });
+      document.getElementById('pref-input').value = '';
+      showToast('Preference saved!', 'success');
+      await loadProfile();
+    } catch (e) {
+      showToast('Failed: ' + e.message, 'error');
     }
   }
 
