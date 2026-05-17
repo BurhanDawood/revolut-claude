@@ -547,6 +547,7 @@ app.post('/telegram-webhook', async (req, res) => {
     // 3. Continue processing the Claude API call asynchronously AFTER responding
     // Non-blocking — runs after response is sent
     (async () => {
+      let stillResearchingTimer;
       try {
         // Fetch fresh balances and prices directly via internal functions
         const balances = await revolutRequest('GET', '/balances');
@@ -628,9 +629,18 @@ Active alerts (coins currently above threshold): ${Object.keys(activeAlerts).joi
           messages,
         });
         const timeoutPromise = new Promise((_, reject) =>
-          setTimeout(() => reject(new Error('timeout')), 55000)
+          setTimeout(() => reject(new Error('timeout')), 110000)
         );
+
+        // Send a follow-up message after 30 seconds if still processing
+        stillResearchingTimer = setTimeout(async () => {
+          try {
+            await sendTelegramMessage(chatId, '⏳ Still researching, almost there...');
+          } catch (e) { /* ignore */ }
+        }, 30000);
+
         const response = await Promise.race([claudePromise, timeoutPromise]);
+        clearTimeout(stillResearchingTimer);
 
         // Extract the last text block (web_search may produce tool_use blocks before the final text)
         const lastTextBlock = [...response.content].reverse().find(b => b.type === 'text');
