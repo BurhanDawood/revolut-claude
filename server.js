@@ -111,6 +111,9 @@ let briefingInProgress = false;
 let lastClaudeCallTime = 0;
 let learningModelCache = ''; // updated by updateLearningModel()
 const pendingJournalState = new Map(); // chatId -> { journalId, step: 'emotion'|'followed', hasClaudeRec, claudeRec, symbol }
+const pendingTradeContext = new Map(); // symbol -> { journalId, detectedAt, timeoutHandle }
+const previousBalances = new Map(); // symbol -> quantity (DB-backed)
+let portfolioCheckCount = 0; // skip trade detection on first check (baseline establishment)
 let monitoringInterval = null;
 const conversationHistory = new Map(); // chatId -> [{role, content}]
 
@@ -217,6 +220,12 @@ await db.execute(`CREATE TABLE IF NOT EXISTS price_history (
   price DECIMAL(20,10) NOT NULL,
   recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   INDEX idx_symbol_recorded (symbol, recorded_at)
+)`);
+
+await db.execute(`CREATE TABLE IF NOT EXISTS balance_snapshots (
+  symbol VARCHAR(50) PRIMARY KEY,
+  quantity DECIMAL(20,10) NOT NULL,
+  recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 )`);
 
 await db.execute(`CREATE TABLE IF NOT EXISTS macro_alerts_sent (
@@ -333,6 +342,12 @@ for (const row of epRows) {
   entryPrices.set(row.symbol, parseFloat(row.entry_price));
 }
 console.log(`Loaded ${epRows.length} entry prices from database`);
+
+const [snapRows] = await db.execute('SELECT symbol, quantity FROM balance_snapshots');
+for (const row of snapRows) {
+  previousBalances.set(row.symbol, parseFloat(row.quantity));
+}
+console.log(`Loaded ${snapRows.length} balance snapshots from database`);
 
 updateLearningModel().catch(() => {});
 
@@ -873,12 +888,99 @@ async function checkMacroNews() {
   console.log('Macro check:', new Date().toISOString(), '- Keywords found:', keywordsFound, '- Alert sent:', alertSent);
 }
 
+async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
+  try {
+    const coinBase = symbol.replace('-USD', '');
+    const absQty = Math.abs(qtyChange);
+    const valueUsd = absQty * price;
+
+    // Debounce: if same symbol detected within 10 minutes, skip
+    const existing = pendingTradeContext.get(symbol);
+    if (existing && (Date.now() - existing.detectedAt) < 10 * 60 * 1000) {
+      console.log(`Trade detection debounced for ${symbol} (within 10 min window)`);
+      return;
+    }
+
+    // Look up most recent Claude recommendation for this coin
+    let claudeRec = null;
+    try {
+      const [recRows] = await db.execute(
+        'SELECT recommendation FROM analysis_history WHERE symbol = ? AND created_at > DATE_SUB(NOW(), INTERVAL 7 DAY) ORDER BY created_at DESC LIMIT 1',
+        [symbol]
+      );
+      if (recRows.length > 0) claudeRec = recRows[0].recommendation;
+    } catch (e) { /* ignore */ }
+
+    // Insert journal entry
+    const [result] = await db.execute(
+      'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, claude_recommendation) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      [symbol, action, price, absQty, valueUsd, 'auto-detected', 'pending', claudeRec]
+    );
+    const journalId = result.insertId;
+
+    // If sell: try to find most recent buy and calculate P&L
+    let pnlLine = '';
+    if (action === 'sell') {
+      try {
+        const [buyRows] = await db.execute(
+          'SELECT id, price FROM trading_journal WHERE symbol = ? AND action = ? AND outcome IS NULL ORDER BY created_at DESC LIMIT 1',
+          [symbol, 'buy']
+        );
+        if (buyRows.length > 0) {
+          const buyPrice = parseFloat(buyRows[0].price);
+          const pnl = ((price - buyPrice) / buyPrice) * 100;
+          const outcomeLabel = pnl >= 0 ? 'profit' : 'loss';
+          await db.execute(
+            'UPDATE trading_journal SET outcome_price = ?, outcome_pnl = ?, outcome = ? WHERE id = ?',
+            [price, pnl.toFixed(4), outcomeLabel, buyRows[0].id]
+          );
+          pnlLine = `\nP&L vs last buy: ${pnl >= 0 ? '+' : ''}${pnl.toFixed(1)}% ${pnl >= 0 ? '✅' : '❌'}`;
+          await updateLearningModel().catch(() => {});
+        }
+      } catch (e) { /* ignore */ }
+    }
+
+    // Send Telegram notification asking for context
+    const actionLabel = action === 'buy' ? 'BOUGHT' : action === 'sell' ? 'SOLD' : action.toUpperCase();
+    const recLine = claudeRec ? `\n📊 Last Claude rec: ${claudeRec}` : '';
+    const msg =
+      `📝 <b>TRADE DETECTED — ${symbol}</b>\n` +
+      `Action: ${actionLabel} ~${absQty.toFixed(4)} tokens at $${price.toFixed(4)} ($${valueUsd.toFixed(2)})${pnlLine}${recLine}\n\n` +
+      `Quick questions while it's fresh:\n` +
+      `1️⃣ Why did you make this trade?\n` +
+      `2️⃣ Feeling: confident / uncertain / fomo / fearful / neutral\n\n` +
+      `Reply: '<b>${coinBase.toLowerCase()} reason [why], [emotion]</b>'\n` +
+      `Or: '<b>${coinBase.toLowerCase()} skip</b>' to log without details\n\n` +
+      `⏰ Will auto-log in 30 minutes if no reply.`;
+    await sendTelegram(msg);
+
+    // Set 30-minute timeout to auto-complete
+    const timeoutHandle = setTimeout(async () => {
+      try {
+        await db.execute(
+          'UPDATE trading_journal SET reasoning = ?, emotion = ? WHERE id = ? AND reasoning = ?',
+          ['no reason provided', 'neutral', journalId, 'auto-detected']
+        );
+        pendingTradeContext.delete(symbol);
+        await sendTelegram(`⏰ <b>${symbol}</b> trade auto-logged without context.`);
+        await updateLearningModel().catch(() => {});
+      } catch (e) { /* ignore */ }
+    }, 30 * 60 * 1000);
+
+    pendingTradeContext.set(symbol, { journalId, detectedAt: Date.now(), timeoutHandle });
+    console.log(`Auto-logged trade: ${symbol} ${action} ${absQty.toFixed(4)} @ $${price.toFixed(4)}`);
+  } catch (e) {
+    console.error('autoLogTrade error:', e.message);
+  }
+}
+
 async function checkPortfolio() {
   if (monitoringPaused) {
     console.log('Monitoring paused, skipping check.');
     return;
   }
   try {
+    portfolioCheckCount++;
     console.log('Checking portfolio...');
 
     // Get all balances
@@ -929,6 +1031,31 @@ async function checkPortfolio() {
 
       lastBalances[symbol] = available;
 
+      // ── Auto trade detection ──────────────────────────────────────────────
+      if (portfolioCheckCount > 1) { // skip first check (baseline establishment)
+        const prevQty = previousBalances.get(symbol);
+        if (prevQty !== undefined && prevQty > 0) {
+          const qtyChange = available - prevQty;
+          const changePct = (qtyChange / prevQty) * 100;
+          if (Math.abs(changePct) >= 1) { // ignore dust < 1%
+            const action = qtyChange > 0 ? 'buy' : 'sell';
+            console.log(`Balance change detected: ${symbol} from ${prevQty} to ${available} action: ${action} (${changePct.toFixed(1)}%)`);
+            autoLogTrade(symbol, action, currentPrice, qtyChange, available).catch(e => console.error('autoLogTrade failed:', e.message));
+          }
+        } else if (prevQty === undefined && available > 0) {
+          // New coin appearing
+          console.log(`Balance change detected: ${symbol} from 0 to ${available} action: buy (new position)`);
+          autoLogTrade(symbol, 'buy', currentPrice, available, available).catch(e => console.error('autoLogTrade failed:', e.message));
+        }
+      }
+      // Update snapshot
+      previousBalances.set(symbol, available);
+      await db.execute(
+        'INSERT INTO balance_snapshots (symbol, quantity) VALUES (?, ?) ON DUPLICATE KEY UPDATE quantity = VALUES(quantity)',
+        [symbol, available]
+      );
+      // ─────────────────────────────────────────────────────────────────────
+
       // Set baseline if not set
       if (!basePrices[symbol]) {
         basePrices[symbol] = currentPrice;
@@ -970,6 +1097,26 @@ async function checkPortfolio() {
         activeDropAlerts[symbol] = setInterval(async () => {
           await sendTelegram(`⚠️ <b>REMINDER: ${symbol} DROP ALERT still active!</b>\n\nStill down ${pct}% from baseline\nReply 'acknowledge ${coinBase}' to stop`);
         }, ALERT_INTERVAL_MS);
+      }
+    }
+
+    // Detect full exits (coin was in previousBalances but not in current balances)
+    if (portfolioCheckCount > 1) {
+      const currentSymbols = new Set(
+        balances
+          .filter(a => a.currency && !SKIP_CURRENCIES.includes(a.currency) && parseFloat(a.available) > 0)
+          .map(a => `${a.currency}-USD`)
+      );
+      for (const [sym, prevQty] of previousBalances) {
+        if (!currentSymbols.has(sym) && prevQty > 0) {
+          const exitPrice = priceMap[sym];
+          if (exitPrice) {
+            console.log(`Balance change detected: ${sym} from ${prevQty} to 0 action: sell (full exit)`);
+            autoLogTrade(sym, 'sell', exitPrice, -prevQty, 0).catch(e => console.error('autoLogTrade failed:', e.message));
+          }
+          previousBalances.delete(sym);
+          await db.execute('DELETE FROM balance_snapshots WHERE symbol = ?', [sym]).catch(() => {});
+        }
       }
     }
 
@@ -1484,6 +1631,32 @@ app.post('/telegram-webhook', async (req, res) => {
       }
       // Non-matching reply — clear pending state and continue processing normally
       pendingJournalState.delete(chatIdStr);
+    }
+
+    // --- Auto-trade context replies: "[COIN] reason [text], [emotion]" or "[COIN] skip" ---
+    const tradeContextMatch = commandText.match(/^([a-z]{2,10})\s+reason\s+(.+),\s*(confident|uncertain|fomo|fearful|neutral)$/i);
+    const tradeSkipMatch = commandText.match(/^([a-z]{2,10})\s+skip$/i);
+    if (tradeContextMatch || tradeSkipMatch) {
+      const coinBase = (tradeContextMatch || tradeSkipMatch)[1].toUpperCase();
+      const symbol = `${coinBase}-USD`;
+      const pending = pendingTradeContext.get(symbol);
+      if (pending) {
+        clearTimeout(pending.timeoutHandle);
+        pendingTradeContext.delete(symbol);
+        if (tradeContextMatch) {
+          const reasoning = tradeContextMatch[2].trim();
+          const emotion = tradeContextMatch[3].toLowerCase();
+          await db.execute(
+            'UPDATE trading_journal SET reasoning = ?, emotion = ? WHERE id = ?',
+            [reasoning, emotion, pending.journalId]
+          );
+          await updateLearningModel().catch(() => {});
+          await sendReply(`✅ Journal updated for ${coinBase} — reasoning and emotion saved. Learning model updated.`);
+        } else {
+          await sendReply(`✅ ${coinBase} trade logged without details.`);
+        }
+        return res.status(200).json({ ok: true });
+      }
     }
 
     // --- Command: acknowledge [COIN] or acknowledge/ack (generic) ---
