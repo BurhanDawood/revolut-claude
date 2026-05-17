@@ -8,6 +8,7 @@ import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import mysql from 'mysql2/promise';
 import Anthropic from '@anthropic-ai/sdk';
+import cron from 'node-cron';
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
@@ -89,7 +90,8 @@ async function sendTelegramChunked(chatId, text) {
 
 const basePrices = {};
 const activeAlerts = {};
-const activeFixedAlerts = {}; // symbol -> intervalId for fixed price target alerts
+const activeFixedAlerts = {}; // symbol -> intervalId for fixed price target alerts (up direction)
+const activeDropAlerts = {}; // symbol -> intervalId for fixed floor alerts (down direction)
 const lastBalances = {};
 const customThresholds = {};
 const priceTargets = new Map(); // symbol -> { anchorPrice, thresholdPct, targetPrice, entryPrice }
@@ -195,6 +197,22 @@ await db.execute(`CREATE TABLE IF NOT EXISTS entry_prices (
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 )`);
 
+await db.execute(`CREATE TABLE IF NOT EXISTS price_history (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  symbol VARCHAR(50) NOT NULL,
+  price DECIMAL(20,10) NOT NULL,
+  recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_symbol_recorded (symbol, recorded_at)
+)`);
+
+// Add direction column to price_targets if it doesn't exist
+try {
+  await db.execute(`ALTER TABLE price_targets ADD COLUMN direction VARCHAR(4) NOT NULL DEFAULT 'up'`);
+  console.log('Added direction column to price_targets');
+} catch (e) {
+  // Column already exists — ignore
+}
+
 const [rows] = await db.execute('SELECT symbol, price FROM baselines');
 for (const row of rows) {
   basePrices[row.symbol] = parseFloat(row.price);
@@ -217,13 +235,14 @@ for (const row of thresholdRows) {
 }
 console.log(`Loaded ${thresholdRows.length} custom thresholds from database`);
 
-const [ptRows] = await db.execute('SELECT symbol, anchor_price, threshold_pct, target_price, entry_price FROM price_targets');
+const [ptRows] = await db.execute('SELECT symbol, anchor_price, threshold_pct, target_price, entry_price, direction FROM price_targets');
 for (const row of ptRows) {
   priceTargets.set(row.symbol, {
     anchorPrice: parseFloat(row.anchor_price),
     thresholdPct: parseFloat(row.threshold_pct),
     targetPrice: parseFloat(row.target_price),
-    entryPrice: row.entry_price ? parseFloat(row.entry_price) : null
+    entryPrice: row.entry_price ? parseFloat(row.entry_price) : null,
+    direction: row.direction || 'up'
   });
 }
 console.log(`Loaded ${ptRows.length} price targets from database`);
@@ -234,14 +253,20 @@ for (const row of epRows) {
 }
 console.log(`Loaded ${epRows.length} entry prices from database`);
 
-async function getQuickAiRecommendation(symbol, changePct, currentPrice) {
+async function getQuickAiRecommendation(symbol, changePct, currentPrice, direction = 'up') {
   try {
+    const dirText = direction === 'down'
+      ? `down ${Math.abs(changePct).toFixed(1)}% to $${currentPrice.toFixed(4)}`
+      : `up ${changePct.toFixed(1)}% to $${currentPrice.toFixed(4)}`;
+    const actionOptions = direction === 'down'
+      ? 'HOLD, BUY THE DIP, or SELL'
+      : 'HOLD, SELL, or BUY MORE';
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-5',
       max_tokens: 150,
       messages: [{
         role: 'user',
-        content: `In 2-3 sentences max, give a quick trading recommendation for ${symbol} which is up ${changePct.toFixed(1)}% to $${currentPrice.toFixed(4)}. Consider current market conditions. Start with HOLD, SELL, or BUY MORE in bold.`
+        content: `In 2-3 sentences max, give a quick trading recommendation for ${symbol} which is ${dirText}. Consider current market conditions. Start with ${actionOptions} in bold.`
       }]
     });
     const textBlock = response.content.find(b => b.type === 'text');
@@ -252,7 +277,7 @@ async function getQuickAiRecommendation(symbol, changePct, currentPrice) {
   }
 }
 
-async function setFixedTarget(symbol, thresholdPct) {
+async function setFixedTarget(symbol, thresholdPct, direction = 'up') {
   const tickerResponse = await revolutRequest('GET', '/tickers');
   const tickerList = Array.isArray(tickerResponse) ? tickerResponse : (tickerResponse.data || []);
   const priceMap = {};
@@ -267,14 +292,17 @@ async function setFixedTarget(symbol, thresholdPct) {
   }
   const anchorPrice = priceMap[symbol];
   if (!anchorPrice) throw new Error(`No price available for ${symbol}`);
-  const targetPrice = anchorPrice * (1 + thresholdPct / 100);
+  // For 'up': target is above anchor. For 'down': floor is below anchor.
+  const targetPrice = direction === 'down'
+    ? anchorPrice * (1 - thresholdPct / 100)
+    : anchorPrice * (1 + thresholdPct / 100);
   await db.execute(
-    'INSERT INTO price_targets (symbol, anchor_price, threshold_pct, target_price) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE anchor_price = VALUES(anchor_price), threshold_pct = VALUES(threshold_pct), target_price = VALUES(target_price), updated_at = CURRENT_TIMESTAMP',
-    [symbol, anchorPrice, thresholdPct, targetPrice]
+    'INSERT INTO price_targets (symbol, anchor_price, threshold_pct, target_price, direction) VALUES (?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE anchor_price = VALUES(anchor_price), threshold_pct = VALUES(threshold_pct), target_price = VALUES(target_price), direction = VALUES(direction), updated_at = CURRENT_TIMESTAMP',
+    [symbol, anchorPrice, thresholdPct, targetPrice, direction]
   );
   const existing = priceTargets.get(symbol) || {};
-  priceTargets.set(symbol, { ...existing, anchorPrice, thresholdPct, targetPrice });
-  return { anchorPrice, thresholdPct, targetPrice };
+  priceTargets.set(symbol, { ...existing, anchorPrice, thresholdPct, targetPrice, direction });
+  return { anchorPrice, thresholdPct, targetPrice, direction };
 }
 
 async function getCurrentPrice(symbol) {
@@ -288,6 +316,134 @@ async function getCurrentPrice(symbol) {
     }
   } catch (e) { /* ignore */ }
   return null;
+}
+
+async function recordDailyPrices() {
+  try {
+    console.log('Recording daily prices for price_history...');
+    const balances = await revolutRequest('GET', '/balances');
+    const tickerResponse = await revolutRequest('GET', '/tickers');
+    const tickerList = Array.isArray(tickerResponse) ? tickerResponse : (tickerResponse.data || []);
+    const priceMap = {};
+    for (const ticker of tickerList) {
+      if (ticker.symbol) {
+        const price = parseFloat(ticker.last_price || ticker.mid || ticker.ask || ticker.bid);
+        if (price) {
+          priceMap[ticker.symbol] = price;
+          priceMap[ticker.symbol.replace('/', '-')] = price;
+        }
+      }
+    }
+    for (const asset of balances) {
+      if (!asset.currency || SKIP_CURRENCIES.includes(asset.currency)) continue;
+      const available = parseFloat(asset.available);
+      if (available <= 0) continue;
+      const symbol = `${asset.currency}-USD`;
+      const price = priceMap[symbol];
+      if (!price) continue;
+      await db.execute('INSERT INTO price_history (symbol, price) VALUES (?, ?)', [symbol, price]);
+    }
+    console.log('Daily prices recorded.');
+  } catch (e) {
+    console.error('recordDailyPrices error:', e.message);
+  }
+}
+
+async function sendMorningBriefing() {
+  try {
+    console.log('Sending morning briefing...');
+    const balances = await revolutRequest('GET', '/balances');
+    const tickerResponse = await revolutRequest('GET', '/tickers');
+    const tickerList = Array.isArray(tickerResponse) ? tickerResponse : (tickerResponse.data || []);
+    const priceMap = {};
+    for (const ticker of tickerList) {
+      if (ticker.symbol) {
+        const price = parseFloat(ticker.last_price || ticker.mid || ticker.ask || ticker.bid);
+        if (price) {
+          priceMap[ticker.symbol] = price;
+          priceMap[ticker.symbol.replace('/', '-')] = price;
+        }
+      }
+    }
+
+    // Build holdings with overnight change
+    const holdings = [];
+    let totalUSD = 0;
+    for (const asset of balances) {
+      if (!asset.currency || SKIP_CURRENCIES.includes(asset.currency)) continue;
+      const available = parseFloat(asset.available);
+      if (available <= 0) continue;
+      const symbol = `${asset.currency}-USD`;
+      const price = priceMap[symbol];
+      if (!price) continue;
+      const valueUSD = available * price;
+      totalUSD += valueUSD;
+
+      // Find yesterday's midnight price
+      let overnightChange = null;
+      try {
+        const [histRows] = await db.execute(
+          'SELECT price FROM price_history WHERE symbol = ? ORDER BY recorded_at DESC LIMIT 1',
+          [symbol]
+        );
+        if (histRows.length > 0) {
+          const prevPrice = parseFloat(histRows[0].price);
+          overnightChange = ((price - prevPrice) / prevPrice) * 100;
+        }
+      } catch (e) { /* ignore */ }
+
+      const entryPrice = entryPrices.get(symbol);
+      const plPct = entryPrice ? ((price - entryPrice) / entryPrice) * 100 : null;
+
+      holdings.push({ symbol, available, price, valueUSD, overnightChange, plPct });
+    }
+    holdings.sort((a, b) => b.valueUSD - a.valueUSD);
+
+    // Format portfolio summary for Claude
+    const portfolioSummary = holdings.map(h => {
+      const overnightStr = h.overnightChange !== null
+        ? ` (overnight: ${h.overnightChange >= 0 ? '+' : ''}${h.overnightChange.toFixed(1)}%)`
+        : '';
+      const plStr = h.plPct !== null
+        ? ` | P&L from entry: ${h.plPct >= 0 ? '+' : ''}${h.plPct.toFixed(1)}%`
+        : '';
+      return `${h.symbol}: ${h.available} tokens @ $${h.price.toFixed(4)} = $${h.valueUSD.toFixed(2)}${overnightStr}${plStr}`;
+    }).join('\n');
+
+    // Get AI market briefing
+    const dateStr = new Date().toLocaleDateString('en-GB', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', timeZone: 'Europe/London' });
+    const claudeResponse = await anthropic.messages.create({
+      model: 'claude-sonnet-4-5',
+      max_tokens: 1500,
+      tools: [{ type: "web_search_20250305", name: "web_search" }],
+      messages: [{
+        role: 'user',
+        content: `Good morning! Give me a concise daily crypto briefing for my portfolio. Search for current market conditions, Bitcoin price, and any major news. My portfolio:\n\n${portfolioSummary}\n\nTotal: $${totalUSD.toFixed(2)}\n\nProvide: 1) Market overview (BTC/ETH sentiment, 2-3 sentences), 2) Top movers in my portfolio, 3) Key news or risks to watch today, 4) One sentence action recommendation. Keep it under 800 words.`
+      }]
+    });
+
+    const lastTextBlock = [...claudeResponse.content].reverse().find(b => b.type === 'text');
+    const aiInsights = lastTextBlock ? lastTextBlock.text : 'Market data unavailable.';
+
+    // Build header
+    const header = `🌅 <b>GOOD MORNING BRYAN — DAILY PORTFOLIO BRIEFING</b>\n📅 ${dateStr} | ⏰ 9:00 AM\n\n💼 <b>Portfolio: $${totalUSD.toFixed(2)}</b>\n\n`;
+
+    // Build holdings table
+    const holdingsTable = holdings.map(h => {
+      const arrow = h.overnightChange === null ? '➡️' : h.overnightChange >= 0 ? '📈' : '📉';
+      const overnightStr = h.overnightChange !== null
+        ? ` ${h.overnightChange >= 0 ? '+' : ''}${h.overnightChange.toFixed(1)}%`
+        : '';
+      return `${arrow} <b>${h.symbol}</b>: $${h.price.toFixed(4)}${overnightStr} | $${h.valueUSD.toFixed(0)}`;
+    }).join('\n');
+
+    const fullMessage = `${header}${holdingsTable}\n\n${aiInsights}`;
+    await sendTelegramChunked(TELEGRAM_CHAT_ID, fullMessage);
+    console.log('Morning briefing sent.');
+  } catch (e) {
+    console.error('sendMorningBriefing error:', e.message);
+    await sendTelegram(`❌ Morning briefing failed: ${e.message}`);
+  }
 }
 
 async function checkPortfolio() {
@@ -365,7 +521,7 @@ async function checkPortfolio() {
       if (change >= threshold && !activeAlerts[symbol]) {
         const pct = (change * 100).toFixed(1);
         const coinBase = asset.currency;
-        const aiRec = await getQuickAiRecommendation(symbol, change * 100, currentPrice);
+        const aiRec = await getQuickAiRecommendation(symbol, change * 100, currentPrice, 'up');
         const replyMenu = `\n\nReply:\n'sell ${coinBase}' - get sell advice\n'buy more ${coinBase}' - get buy advice\n'analyse ${coinBase}' - full analysis\n'acknowledge ${coinBase}' - stop alerts`;
         const alertMessage = `📈 <b>${symbol} DAILY PUMP ALERT</b>\n\nBaseline: $${basePrices[symbol].toFixed(4)} → Now $${currentPrice.toFixed(4)} (+${pct}%)\nYou hold: ${available} ${coinBase}\n\n⚡ RECOMMENDATION: ${aiRec}${replyMenu}`;
         await sendTelegram(alertMessage);
@@ -374,17 +530,33 @@ async function checkPortfolio() {
           await sendTelegram(`⚠️ <b>REMINDER: ${symbol} DAILY PUMP ALERT still active!</b>\n\nStill up ${pct}% from baseline\nReply 'acknowledge ${coinBase}' to stop`);
         }, ALERT_INTERVAL_MS);
       }
+
+      // Trigger baseline drop alert
+      if (change <= -threshold && !activeDropAlerts[symbol]) {
+        const pct = (Math.abs(change) * 100).toFixed(1);
+        const coinBase = asset.currency;
+        const aiRec = await getQuickAiRecommendation(symbol, change * 100, currentPrice, 'down');
+        const replyMenu = `\n\nReply:\n'buy more ${coinBase}' - get buy the dip advice\n'sell ${coinBase}' - get sell advice\n'analyse ${coinBase}' - full analysis\n'acknowledge ${coinBase}' - stop alerts`;
+        const alertMessage = `📉 <b>${symbol} DROP ALERT!</b>\n\nBaseline: $${basePrices[symbol].toFixed(4)} → Now $${currentPrice.toFixed(4)} (-${pct}%)\nYou hold: ${available} ${coinBase}\n\n⚡ RECOMMENDATION: ${aiRec}${replyMenu}`;
+        await sendTelegram(alertMessage);
+
+        activeDropAlerts[symbol] = setInterval(async () => {
+          await sendTelegram(`⚠️ <b>REMINDER: ${symbol} DROP ALERT still active!</b>\n\nStill down ${pct}% from baseline\nReply 'acknowledge ${coinBase}' to stop`);
+        }, ALERT_INTERVAL_MS);
+      }
     }
 
-    // Check fixed price targets
+    // Check fixed price targets (direction-aware)
     for (const [symbol, target] of priceTargets) {
       const currentPrice = priceMap[symbol];
       if (!currentPrice) continue;
 
-      if (currentPrice >= target.targetPrice && !activeFixedAlerts[symbol]) {
+      const direction = target.direction || 'up';
+
+      if (direction === 'up' && currentPrice >= target.targetPrice && !activeFixedAlerts[symbol]) {
         const changePct = ((currentPrice - target.anchorPrice) / target.anchorPrice) * 100;
         const coinBase = symbol.replace('-USD', '');
-        const aiRec = await getQuickAiRecommendation(symbol, changePct, currentPrice);
+        const aiRec = await getQuickAiRecommendation(symbol, changePct, currentPrice, 'up');
         const entryPrice = entryPrices.get(symbol) || target.entryPrice;
         const entryLine = entryPrice
           ? `\nEntry: $${entryPrice.toFixed(4)} | P&L: +${((currentPrice - entryPrice) / entryPrice * 100).toFixed(1)}%`
@@ -395,6 +567,24 @@ async function checkPortfolio() {
 
         activeFixedAlerts[symbol] = setInterval(async () => {
           await sendTelegram(`⚠️ <b>REMINDER: ${symbol} FIXED TARGET STILL ACTIVE!</b>\n\nTarget: $${target.targetPrice.toFixed(4)} | Now: $${currentPrice.toFixed(4)}\nReply 'acknowledge ${coinBase}' to stop`);
+        }, ALERT_INTERVAL_MS);
+      }
+
+      if (direction === 'down' && currentPrice <= target.targetPrice && !activeFixedAlerts[symbol]) {
+        const changePct = ((currentPrice - target.anchorPrice) / target.anchorPrice) * 100;
+        const coinBase = symbol.replace('-USD', '');
+        const aiRec = await getQuickAiRecommendation(symbol, changePct, currentPrice, 'down');
+        const entryPrice = entryPrices.get(symbol) || target.entryPrice;
+        const plPct = entryPrice ? ((currentPrice - entryPrice) / entryPrice * 100).toFixed(1) : null;
+        const entryLine = plPct !== null
+          ? `\nEntry: $${entryPrice.toFixed(4)} | P&L: ${plPct}%`
+          : '';
+        const replyMenu = `\n\nReply:\n'buy more ${coinBase}' - get buy the dip advice\n'sell ${coinBase}' - get sell advice\n'analyse ${coinBase}' - full analysis\n'acknowledge ${coinBase}' - stop alerts`;
+        const alertMessage = `📉 <b>${symbol} FIXED FLOOR HIT!</b>\n\nAnchor: $${target.anchorPrice.toFixed(4)} → Now $${currentPrice.toFixed(4)} (${changePct.toFixed(1)}%)${entryLine}\n\n⚡ RECOMMENDATION: ${aiRec}${replyMenu}`;
+        await sendTelegram(alertMessage);
+
+        activeFixedAlerts[symbol] = setInterval(async () => {
+          await sendTelegram(`⚠️ <b>REMINDER: ${symbol} FIXED FLOOR STILL ACTIVE!</b>\n\nFloor: $${target.targetPrice.toFixed(4)} | Now: $${currentPrice.toFixed(4)}\nReply 'acknowledge ${coinBase}' to stop`);
         }, ALERT_INTERVAL_MS);
       }
     }
@@ -409,6 +599,14 @@ setTimeout(async () => {
   await checkPortfolio();
   monitoringInterval = setInterval(checkPortfolio, CHECK_INTERVAL_MS);
 }, 5000);
+
+// Record prices at midnight every day (UK time)
+cron.schedule('0 0 * * *', recordDailyPrices, { timezone: 'Europe/London' });
+
+// Send morning briefing at 9:00 AM every day (UK time)
+cron.schedule('0 9 * * *', sendMorningBriefing, { timezone: 'Europe/London' });
+
+console.log('Cron jobs scheduled: midnight price recording + 9 AM morning briefing (Europe/London)');
 
 const app = express();
 app.use(cors());
@@ -689,15 +887,18 @@ app.post('/telegram-webhook', async (req, res) => {
         const coinBase = ackMatch[1].toUpperCase();
         const symbol = `${coinBase}-USD`;
         const stopped = [];
-        if (activeAlerts[symbol]) { clearInterval(activeAlerts[symbol]); delete activeAlerts[symbol]; stopped.push('baseline alert'); }
+        if (activeAlerts[symbol]) { clearInterval(activeAlerts[symbol]); delete activeAlerts[symbol]; stopped.push('daily pump alert'); }
+        if (activeDropAlerts[symbol]) { clearInterval(activeDropAlerts[symbol]); delete activeDropAlerts[symbol]; stopped.push('daily drop alert'); }
         if (activeFixedAlerts[symbol]) { clearInterval(activeFixedAlerts[symbol]); delete activeFixedAlerts[symbol]; stopped.push('fixed target alert'); }
         await sendReply(stopped.length ? `✅ ${symbol}: stopped ${stopped.join(' + ')}` : `✅ No active alerts for ${symbol}`);
       } else {
         const baseSymbol = Object.keys(activeAlerts)[0];
+        const dropSymbol = Object.keys(activeDropAlerts)[0];
         const fixedSymbol = Object.keys(activeFixedAlerts)[0];
-        const symbol = baseSymbol || fixedSymbol;
+        const symbol = baseSymbol || dropSymbol || fixedSymbol;
         if (symbol) {
           if (activeAlerts[symbol]) { clearInterval(activeAlerts[symbol]); delete activeAlerts[symbol]; }
+          if (activeDropAlerts[symbol]) { clearInterval(activeDropAlerts[symbol]); delete activeDropAlerts[symbol]; }
           if (activeFixedAlerts[symbol]) { clearInterval(activeFixedAlerts[symbol]); delete activeFixedAlerts[symbol]; }
           await sendReply(`✅ Acknowledged ${symbol}`);
         } else {
@@ -801,7 +1002,7 @@ app.post('/telegram-webhook', async (req, res) => {
     }
 
     // --- Fixed target detection: "Set CC alert at X% from current price" etc ---
-    const fixedTargetIntent = /\bfrom\s+current\b|\bfixed\s+(?:target|alert)\b/i.test(rawText);
+    const fixedTargetIntent = /\bfrom\s+current\b|\bfixed\s+(?:target|alert|floor)\b/i.test(rawText);
     if (fixedTargetIntent) {
       // Extract coin using specific patterns (most specific first)
       let ftCoinBase = null;
@@ -810,17 +1011,21 @@ app.post('/telegram-webhook', async (req, res) => {
       const setAlertMatch = rawText.match(/\bset\s+([A-Za-z]{2,10})\s+alert\b/i);
       if (setAlertMatch) ftCoinBase = setAlertMatch[1].toUpperCase();
 
-      // Pattern 2: "when [COIN] rises/hits/reaches/goes up"
+      // Pattern 2: "when [COIN] rises/drops/falls/hits/reaches/goes up/goes down"
       if (!ftCoinBase) {
-        const whenCoinMatch = rawText.match(/\bwhen\s+([A-Za-z]{2,10})\s+(?:rises?|hits?|reaches?|goes?\s+up)\b/i);
+        const whenCoinMatch = rawText.match(/\bwhen\s+([A-Za-z]{2,10})\s+(?:rises?|drops?|falls?|hits?|reaches?|goes?\s+(?:up|down))\b/i);
         if (whenCoinMatch) ftCoinBase = whenCoinMatch[1].toUpperCase();
       }
 
-      // Pattern 3: "[COIN] alert" or "[COIN] fixed target"
+      // Pattern 3: "[COIN] alert", "[COIN] fixed target", or "[COIN] fixed floor"
       if (!ftCoinBase) {
-        const coinAlertMatch = rawText.match(/\b([A-Za-z]{2,10})\s+(?:alert|fixed\s+target)\b/i);
+        const coinAlertMatch = rawText.match(/\b([A-Za-z]{2,10})\s+(?:alert|fixed\s+(?:target|floor))\b/i);
         if (coinAlertMatch) ftCoinBase = coinAlertMatch[1].toUpperCase();
       }
+
+      // Determine direction: 'down' if drop/fall/floor keywords present, otherwise 'up'
+      const isDropDirection = /\b(?:drops?|falls?|floor|below|down)\b/i.test(rawText);
+      const ftDirection = isDropDirection ? 'down' : 'up';
 
       // Extract percentage (first number followed by %)
       const pctMatch = rawText.match(/([\d.]+)\s*%/);
@@ -829,10 +1034,13 @@ app.post('/telegram-webhook', async (req, res) => {
       if (ftCoinBase && !SKIP_WORDS.has(ftCoinBase) && thresholdPct && thresholdPct > 0 && thresholdPct <= 100) {
         const symbol = ftCoinBase.endsWith('-USD') ? ftCoinBase : `${ftCoinBase}-USD`;
         try {
-          const { anchorPrice, targetPrice } = await setFixedTarget(symbol, thresholdPct);
-          await sendReply(`✅ ${symbol} fixed target set!\nAnchor: $${anchorPrice.toFixed(4)} | Target: $${targetPrice.toFixed(4)} (+${thresholdPct}%)\nI'll alert you when ${symbol} hits $${targetPrice.toFixed(4)} — permanently stored.`);
+          const { anchorPrice, targetPrice, direction } = await setFixedTarget(symbol, thresholdPct, ftDirection);
+          const dirLabel = direction === 'down' ? 'floor' : 'target';
+          const dirSign = direction === 'down' ? '-' : '+';
+          const dirEmoji = direction === 'down' ? '📉' : '🎯';
+          await sendReply(`${dirEmoji} ${symbol} fixed ${dirLabel} set!\nAnchor: $${anchorPrice.toFixed(4)} | ${dirLabel.charAt(0).toUpperCase() + dirLabel.slice(1)}: $${targetPrice.toFixed(4)} (${dirSign}${thresholdPct}%)\nI'll alert you when ${symbol} ${direction === 'down' ? 'drops to' : 'hits'} $${targetPrice.toFixed(4)} — permanently stored.`);
         } catch (e) {
-          await sendReply(`❌ Could not set fixed target for ${symbol}: ${e.message}`);
+          await sendReply(`❌ Could not set fixed ${ftDirection === 'down' ? 'floor' : 'target'} for ${symbol}: ${e.message}`);
         }
         return res.status(200).json({ ok: true });
       }
