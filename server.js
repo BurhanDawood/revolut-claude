@@ -60,43 +60,73 @@ async function sendTelegramMessage(chatId, text) {
 async function sendTelegramChunked(chatId, fullText) {
   const maxLen = 3800;
 
-  const sendTelegram = async (text, chunkNum) => {
-    console.log('Sending chunk', chunkNum, 'length:', text.length);
-    await sendTelegramMessage(chatId, text);
-  };
+  // Log full response length upfront
+  console.log(`[Telegram] Full response length: ${fullText.length} chars`);
+  console.log(`[Telegram] First 200 chars: ${fullText.slice(0, 200).replace(/\n/g, '\\n')}`);
 
-  if (fullText.length <= maxLen) {
-    await new Promise(r => setTimeout(r, 2000));
-    await sendTelegram(fullText, 1);
+  // Safety check
+  if (!fullText || fullText.trim().length === 0) {
+    console.log('[Telegram] Empty response, skipping send');
     return;
   }
 
-  console.log(`Telegram response: ${fullText.length} chars — splitting by paragraph`);
+  // Build ALL chunks first before sending any
+  const chunks = [];
 
-  // Split into chunks at paragraph boundaries
-  const paragraphs = fullText.split('\n\n');
-  let currentChunk = '';
-  let chunkNumber = 1;
-  let firstChunk = true;
+  if (fullText.length <= maxLen) {
+    chunks.push(fullText);
+  } else {
+    const paragraphs = fullText.split('\n\n');
+    let currentChunk = '';
 
-  for (const paragraph of paragraphs) {
-    if (currentChunk && (currentChunk + '\n\n' + paragraph).length > maxLen) {
-      if (firstChunk) { await new Promise(r => setTimeout(r, 2000)); firstChunk = false; }
-      await sendTelegram(currentChunk, chunkNumber);
-      chunkNumber++;
+    for (const paragraph of paragraphs) {
+      const candidate = currentChunk ? currentChunk + '\n\n' + paragraph : paragraph;
+      if (candidate.length > maxLen) {
+        if (currentChunk) {
+          chunks.push(currentChunk);
+          currentChunk = paragraph;
+        } else {
+          // Single paragraph too long — split by newline
+          const lines = paragraph.split('\n');
+          for (const line of lines) {
+            const lineCand = currentChunk ? currentChunk + '\n' + line : line;
+            if (lineCand.length > maxLen) {
+              if (currentChunk) chunks.push(currentChunk);
+              currentChunk = line;
+            } else {
+              currentChunk = lineCand;
+            }
+          }
+        }
+      } else {
+        currentChunk = candidate;
+      }
+    }
+    if (currentChunk) chunks.push(currentChunk);
+  }
+
+  // Safety fallback
+  if (chunks.length === 0) {
+    console.log('[Telegram] Chunks array empty — sending full text as fallback');
+    await sendTelegramMessage(chatId, fullText.slice(0, maxLen));
+    return;
+  }
+
+  console.log(`[Telegram] Built ${chunks.length} chunk(s)`);
+  console.log(`[Telegram] Chunk 1 first 200 chars: ${chunks[0].slice(0, 200).replace(/\n/g, '\\n')}`);
+
+  // Send all chunks
+  for (let i = 0; i < chunks.length; i++) {
+    const chunkNum = i + 1;
+    const text = i === 0 ? chunks[i] : '📄 **(continued...)**\n\n' + chunks[i];
+    console.log(`[Telegram] Sending chunk ${chunkNum} of ${chunks.length}, length: ${text.length}`);
+    await sendTelegramMessage(chatId, text);
+    if (i < chunks.length - 1) {
       await new Promise(r => setTimeout(r, 1500));
-      currentChunk = '📄 **(continued...)**\n\n' + paragraph;
-    } else {
-      currentChunk = currentChunk ? currentChunk + '\n\n' + paragraph : paragraph;
     }
   }
 
-  if (currentChunk) {
-    if (firstChunk) { await new Promise(r => setTimeout(r, 2000)); firstChunk = false; }
-    await sendTelegram(currentChunk, chunkNumber);
-  }
-
-  console.log(`Sent ${chunkNumber} chunks`);
+  console.log('[Telegram] All chunks sent');
 }
 
 const basePrices = {};
