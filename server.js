@@ -59,43 +59,29 @@ async function sendTelegramMessage(chatId, text) {
 
 async function sendTelegramChunked(chatId, text) {
   const maxLen = 3800;
-
-  const sendTelegram = async (msg) => {
-    await sendTelegramMessage(chatId, msg);
-  };
-
-  if (text.length <= maxLen) {
-    await sendTelegram(text);
-    return;
-  }
-
   const chunks = [];
-  let remaining = text;
+  let remaining = text.trim();
 
   while (remaining.length > 0) {
     if (remaining.length <= maxLen) {
       chunks.push(remaining);
       break;
     }
-
     let splitAt = remaining.lastIndexOf('\n\n', maxLen);
     if (splitAt === -1) splitAt = remaining.lastIndexOf('\n', maxLen);
     if (splitAt === -1) splitAt = maxLen;
-
-    chunks.push(remaining.substring(0, splitAt));
+    chunks.push(remaining.substring(0, splitAt).trim());
     remaining = remaining.substring(splitAt).trim();
   }
 
-  console.log('Total chunks to send:', chunks.length);
+  console.log('Total chunks:', chunks.length, 'First chunk starts:', chunks[0]?.substring(0, 50));
 
   for (let i = 0; i < chunks.length; i++) {
     const prefix = i > 0 ? '📄 **(continued...)**\n\n' : '';
-    await new Promise(r => setTimeout(r, 3000));
-    console.log('Sending chunk', i + 1, 'of', chunks.length, 'length:', chunks[i].length);
-    await sendTelegram(prefix + chunks[i]);
+    await new Promise(r => setTimeout(r, 4000));
+    await sendTelegramMessage(chatId, prefix + chunks[i]);
+    console.log('Sent chunk', i + 1, 'of', chunks.length);
   }
-
-  console.log('All chunks sent successfully');
 }
 
 const basePrices = {};
