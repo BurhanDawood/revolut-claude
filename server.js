@@ -97,6 +97,7 @@ const customThresholds = {};
 const priceTargets = new Map(); // symbol -> { anchorPrice, thresholdPct, targetPrice, entryPrice }
 const entryPrices = new Map(); // symbol -> number (DB-backed, persists across restarts)
 let monitoringPaused = false;
+let briefingInProgress = false;
 let monitoringInterval = null;
 const conversationHistory = new Map(); // chatId -> [{role, content}]
 
@@ -350,6 +351,11 @@ async function recordDailyPrices() {
 }
 
 async function sendMorningBriefing() {
+  if (briefingInProgress) {
+    console.log('Briefing already in progress, skipping.');
+    return;
+  }
+  briefingInProgress = true;
   try {
     console.log('Sending morning briefing...');
     const balances = await revolutRequest('GET', '/balances');
@@ -366,7 +372,7 @@ async function sendMorningBriefing() {
       }
     }
 
-    // Build holdings with overnight change
+    // Build holdings sorted by USD value
     const holdings = [];
     let totalUSD = 0;
     for (const asset of balances) {
@@ -379,7 +385,7 @@ async function sendMorningBriefing() {
       const valueUSD = available * price;
       totalUSD += valueUSD;
 
-      // Find yesterday's midnight price
+      // Overnight change from price_history
       let overnightChange = null;
       try {
         const [histRows] = await db.execute(
@@ -387,62 +393,111 @@ async function sendMorningBriefing() {
           [symbol]
         );
         if (histRows.length > 0) {
-          const prevPrice = parseFloat(histRows[0].price);
-          overnightChange = ((price - prevPrice) / prevPrice) * 100;
+          overnightChange = ((price - parseFloat(histRows[0].price)) / parseFloat(histRows[0].price)) * 100;
         }
       } catch (e) { /* ignore */ }
 
       const entryPrice = entryPrices.get(symbol);
       const plPct = entryPrice ? ((price - entryPrice) / entryPrice) * 100 : null;
 
-      holdings.push({ symbol, available, price, valueUSD, overnightChange, plPct });
+      holdings.push({ symbol, coin: asset.currency, available, price, valueUSD, overnightChange, plPct });
     }
     holdings.sort((a, b) => b.valueUSD - a.valueUSD);
 
-    // Format portfolio summary for Claude
-    const portfolioSummary = holdings.map(h => {
+    const totalPct = totalUSD > 0 ? 100 : 0;
+
+    // Build top holdings block (medals for top 3, numbers for rest, top 8 max)
+    const medals = ['🥇', '🥈', '🥉'];
+    const topHoldings = holdings.slice(0, 8).map((h, i) => {
+      const rank = i < 3 ? medals[i] : `${i + 1}.`;
+      const pct = ((h.valueUSD / totalUSD) * 100).toFixed(0);
       const overnightStr = h.overnightChange !== null
-        ? ` (overnight: ${h.overnightChange >= 0 ? '+' : ''}${h.overnightChange.toFixed(1)}%)`
+        ? ` (${h.overnightChange >= 0 ? '+' : ''}${h.overnightChange.toFixed(1)}% overnight)`
         : '';
-      const plStr = h.plPct !== null
-        ? ` | P&L from entry: ${h.plPct >= 0 ? '+' : ''}${h.plPct.toFixed(1)}%`
-        : '';
-      return `${h.symbol}: ${h.available} tokens @ $${h.price.toFixed(4)} = $${h.valueUSD.toFixed(2)}${overnightStr}${plStr}`;
+      return `${rank} ${h.coin} $${h.price.toFixed(4)} — $${h.valueUSD.toFixed(0)} (${pct}%)${overnightStr}`;
     }).join('\n');
 
-    // Get AI market briefing
-    const dateStr = new Date().toLocaleDateString('en-GB', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', timeZone: 'Europe/London' });
+    // Check any coins approaching thresholds
+    const alertsToWatch = [];
+    for (const h of holdings) {
+      const threshold = customThresholds[h.symbol] !== undefined ? customThresholds[h.symbol] : PUMP_THRESHOLD;
+      if (basePrices[h.symbol]) {
+        const change = (h.price - basePrices[h.symbol]) / basePrices[h.symbol];
+        const pctOfThreshold = change / threshold;
+        if (pctOfThreshold >= 0.7 && !activeAlerts[h.symbol]) {
+          alertsToWatch.push(`${h.coin}: ${(change * 100).toFixed(1)}% move (alert at ${(threshold * 100).toFixed(0)}%)`);
+        }
+      }
+      // Check fixed targets
+      const target = priceTargets.get(h.symbol);
+      if (target) {
+        const distPct = Math.abs((h.price - target.targetPrice) / target.targetPrice) * 100;
+        if (distPct <= 5) {
+          const dir = target.direction === 'down' ? 'floor' : 'target';
+          alertsToWatch.push(`${h.coin}: within ${distPct.toFixed(1)}% of fixed ${dir} $${target.targetPrice.toFixed(4)}`);
+        }
+      }
+    }
+    const alertsBlock = alertsToWatch.length > 0
+      ? alertsToWatch.join('\n')
+      : 'No coins approaching alert thresholds.';
+
+    // Build data context for Claude — compact for token efficiency
+    const portfolioContext = holdings.slice(0, 10).map(h => {
+      const overnight = h.overnightChange !== null ? ` overnight:${h.overnightChange.toFixed(1)}%` : '';
+      const pl = h.plPct !== null ? ` P&L:${h.plPct.toFixed(1)}%` : '';
+      return `${h.coin} $${h.price.toFixed(4)} $${h.valueUSD.toFixed(0)}${overnight}${pl}`;
+    }).join(', ');
+
+    const dateStr = new Date().toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', timeZone: 'Europe/London' });
+
+    // Ask Claude for market conditions, news, and recommendations only
     const claudeResponse = await anthropic.messages.create({
       model: 'claude-sonnet-4-5',
-      max_tokens: 1500,
+      max_tokens: 800,
       tools: [{ type: "web_search_20250305", name: "web_search" }],
       messages: [{
         role: 'user',
-        content: `Good morning! Give me a concise daily crypto briefing for my portfolio. Search for current market conditions, Bitcoin price, and any major news. My portfolio:\n\n${portfolioSummary}\n\nTotal: $${totalUSD.toFixed(2)}\n\nProvide: 1) Market overview (BTC/ETH sentiment, 2-3 sentences), 2) Top movers in my portfolio, 3) Key news or risks to watch today, 4) One sentence action recommendation. Keep it under 800 words.`
+        content: `You are writing a morning crypto briefing for Bryan. Search for current BTC price, market conditions, and top crypto news from today. His portfolio (top holdings): ${portfolioContext}. Total: $${totalUSD.toFixed(0)}.
+
+Reply with EXACTLY this format and nothing else — no preamble, no sign-off:
+
+🌍 MARKET CONDITIONS:
+[2-3 sentences on BTC price right now, overall sentiment, key level to watch]
+
+📰 KEY NEWS:
+• [Most important crypto news item today]
+• [Second important news item]
+• [Third news item if relevant]
+
+⚡ TODAY'S RECOMMENDATIONS:
+1. [Specific action for his top holding by value]
+2. [Specific action for second holding]
+3. [BTC key watch level or macro point]
+
+Keep total response under 900 characters.`
       }]
     });
 
     const lastTextBlock = [...claudeResponse.content].reverse().find(b => b.type === 'text');
-    const aiInsights = lastTextBlock ? lastTextBlock.text : 'Market data unavailable.';
+    const aiSection = lastTextBlock ? lastTextBlock.text.trim() : '🌍 Market data unavailable.';
 
-    // Build header
-    const header = `🌅 <b>GOOD MORNING BRYAN — DAILY PORTFOLIO BRIEFING</b>\n📅 ${dateStr} | ⏰ 9:00 AM\n\n💼 <b>Portfolio: $${totalUSD.toFixed(2)}</b>\n\n`;
+    // Assemble final message
+    const fullMessage =
+      `🌅 <b>GOOD MORNING BRYAN!</b>\n` +
+      `📅 ${dateStr} | Portfolio: <b>$${totalUSD.toFixed(0)}</b>\n\n` +
+      `📊 <b>TOP HOLDINGS TODAY:</b>\n${topHoldings}\n\n` +
+      `${aiSection}\n\n` +
+      `🚨 <b>ALERTS TO WATCH:</b>\n${alertsBlock}`;
 
-    // Build holdings table
-    const holdingsTable = holdings.map(h => {
-      const arrow = h.overnightChange === null ? '➡️' : h.overnightChange >= 0 ? '📈' : '📉';
-      const overnightStr = h.overnightChange !== null
-        ? ` ${h.overnightChange >= 0 ? '+' : ''}${h.overnightChange.toFixed(1)}%`
-        : '';
-      return `${arrow} <b>${h.symbol}</b>: $${h.price.toFixed(4)}${overnightStr} | $${h.valueUSD.toFixed(0)}`;
-    }).join('\n');
-
-    const fullMessage = `${header}${holdingsTable}\n\n${aiInsights}`;
-    await sendTelegramChunked(TELEGRAM_CHAT_ID, fullMessage);
-    console.log('Morning briefing sent.');
+    // Send as single message (target <3500 chars)
+    await sendTelegram(fullMessage);
+    console.log('Morning briefing sent. Length:', fullMessage.length);
   } catch (e) {
     console.error('sendMorningBriefing error:', e.message);
     await sendTelegram(`❌ Morning briefing failed: ${e.message}`);
+  } finally {
+    briefingInProgress = false;
   }
 }
 
@@ -1305,12 +1360,6 @@ Active alerts (coins currently above threshold): ${Object.keys(activeAlerts).joi
       res.status(200).json({ ok: true });
     }
   }
-});
-
-// GET /api/test-briefing — trigger morning briefing immediately (temporary test endpoint)
-app.get('/api/test-briefing', async (req, res) => {
-  res.json({ ok: true, message: 'Morning briefing triggered — check Telegram.' });
-  sendMorningBriefing();
 });
 
 // GET /telegram-setup — register the webhook URL with Telegram
