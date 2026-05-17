@@ -407,6 +407,33 @@ app.post('/api/threshold/:symbol', async (req, res) => {
   res.json({ ok: true, symbol, threshold: newThreshold, oldThreshold, message: 'Old alert cancelled and monitoring restarted fresh from current price.' });
 });
 
+// GET /api/tradehistory — probe Revolut X API paths for position/entry price data
+app.get('/api/tradehistory', async (req, res) => {
+  const endpoints = [
+    '/positions',
+    '/portfolio',
+    '/portfolio/positions',
+    '/accounts/positions',
+    '/balances/positions',
+  ];
+
+  const results = {};
+
+  for (const path of endpoints) {
+    try {
+      console.log(`[tradehistory] Trying GET ${path}`);
+      const data = await revolutRequest('GET', path);
+      console.log(`[tradehistory] ${path} response:`, JSON.stringify(data).slice(0, 500));
+      results[path] = { success: true, data };
+    } catch (err) {
+      console.log(`[tradehistory] ${path} error:`, err.message);
+      results[path] = { success: false, error: err.message };
+    }
+  }
+
+  res.json(results);
+});
+
 function createMcpServer() {
   const server = new McpServer({ name: 'revolut-x', version: '1.0.0' });
 
