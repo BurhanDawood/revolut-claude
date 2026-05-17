@@ -3,7 +3,7 @@ import cors from 'cors';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
-import { createPrivateKey, sign } from 'crypto';
+import { createPrivateKey, sign, createHash } from 'crypto';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import mysql from 'mysql2/promise';
@@ -21,6 +21,16 @@ const CHECK_INTERVAL_MS = 5 * 60 * 1000;
 const ALERT_INTERVAL_MS = 60 * 1000;
 const PUMP_THRESHOLD = 0.20;
 const SKIP_CURRENCIES = ['USD', 'USDT', 'USDC', 'EUR', 'GBP'];
+const COIN_NARRATIVES = {
+  'SOL':  'Solana ecosystem, DeFi, NFTs',
+  'HYPE': 'DeFi, perpetual trading',
+  'CC':   'Canton Network, institutional blockchain, DTCC, tokenization, RWA',
+  'ENA':  'Ethena, synthetic dollar, DeFi',
+  'LINK': 'Chainlink, oracles, DeFi',
+  'NEAR': 'NEAR Protocol, AI, blockchain',
+  'BTC':  'Bitcoin, digital gold, macro',
+  'ETH':  'Ethereum, smart contracts, DeFi',
+};
 const SKIP_WORDS = new Set(['SET', 'AND', 'THE', 'FOR', 'ALL', 'GET', 'PUT', 'LET', 'CAN', 'ARE', 'NOT', 'BUT', 'USE', 'NEW', 'OLD', 'ANY', 'TWO', 'ONE', 'HIT', 'TOP', 'LOW', 'MAX', 'MIN', 'NOW', 'BUY', 'FROM']);
 
 async function revolutRequest(method, path) {
@@ -204,6 +214,13 @@ await db.execute(`CREATE TABLE IF NOT EXISTS price_history (
   price DECIMAL(20,10) NOT NULL,
   recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   INDEX idx_symbol_recorded (symbol, recorded_at)
+)`);
+
+await db.execute(`CREATE TABLE IF NOT EXISTS macro_alerts_sent (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  alert_hash VARCHAR(64) NOT NULL,
+  sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_hash_sent (alert_hash, sent_at)
 )`);
 
 // Add direction column to price_targets if it doesn't exist
@@ -501,6 +518,149 @@ Keep total response under 900 characters.`
   }
 }
 
+async function checkMacroNews() {
+  let keywordsFound = false;
+  let alertSent = false;
+  try {
+    console.log('Macro check:', new Date().toISOString(), '- Starting...');
+
+    // STEP 1: Identify significant holdings (> $300 USD)
+    const balances = await revolutRequest('GET', '/balances');
+    const tickerResponse = await revolutRequest('GET', '/tickers');
+    const tickerList = Array.isArray(tickerResponse) ? tickerResponse : (tickerResponse.data || []);
+    const priceMap = {};
+    for (const ticker of tickerList) {
+      if (ticker.symbol) {
+        const price = parseFloat(ticker.last_price || ticker.mid || ticker.ask || ticker.bid);
+        if (price) {
+          priceMap[ticker.symbol] = price;
+          priceMap[ticker.symbol.replace('/', '-')] = price;
+        }
+      }
+    }
+    const significantHoldings = [];
+    for (const asset of balances) {
+      if (!asset.currency || SKIP_CURRENCIES.includes(asset.currency)) continue;
+      const available = parseFloat(asset.available);
+      if (available <= 0) continue;
+      const symbol = `${asset.currency}-USD`;
+      const price = priceMap[symbol];
+      if (!price) continue;
+      const valueUSD = available * price;
+      if (valueUSD < 300) continue;
+      const narrative = COIN_NARRATIVES[asset.currency] || `${asset.currency} cryptocurrency`;
+      significantHoldings.push({ coin: asset.currency, symbol, available, price, valueUSD, narrative });
+    }
+    significantHoldings.sort((a, b) => b.valueUSD - a.valueUSD);
+
+    if (significantHoldings.length === 0) {
+      console.log('Macro check:', new Date().toISOString(), '- No significant holdings, skipping.');
+      return;
+    }
+
+    // STEP 2: Fetch free news RSS (no API cost)
+    const rssUrls = [
+      'https://cointelegraph.com/rss',
+      'https://www.coindesk.com/arc/outboundfeeds/rss/',
+    ];
+    let rawNewsText = '';
+    for (const url of rssUrls) {
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 8000);
+        const response = await fetch(url, { signal: controller.signal });
+        clearTimeout(timeoutId);
+        if (response.ok) {
+          const xml = await response.text();
+          // Extract CDATA and plain text from <title> and <description> tags
+          const extract = (tag) => [...xml.matchAll(new RegExp(`<${tag}>(?:<!\\[CDATA\\[([\\s\\S]*?)\\]\\]>|([^<]*?))</${tag}>`, 'g'))]
+            .map(m => (m[1] || m[2] || '').trim())
+            .filter(Boolean);
+          rawNewsText += extract('title').join(' ') + ' ' + extract('description').join(' ') + ' ';
+        }
+      } catch (e) {
+        console.log('RSS fetch failed for', url, '-', e.message);
+      }
+    }
+
+    if (!rawNewsText.trim()) {
+      console.log('Macro check:', new Date().toISOString(), '- Keywords found: false - Alert sent: false (no news fetched)');
+      return;
+    }
+
+    // STEP 3: Keyword check — FREE, no Claude API
+    const HIGH_IMPACT_KEYWORDS = [
+      'war', 'invasion', 'military', 'sanctions', 'conflict',
+      'sec', 'ban', 'regulation', 'legislation', 'congress', 'senate', 'clarity act',
+      'fed rate', 'interest rate', 'inflation', 'recession', 'tariff',
+      'hack', 'exploit', 'crash', 'rally', 'etf', 'institutional'
+    ];
+    const coinKeywords = significantHoldings.map(h => h.coin.toLowerCase());
+    const lowerNews = rawNewsText.toLowerCase();
+    const foundKeywords = [...HIGH_IMPACT_KEYWORDS, ...coinKeywords].filter(kw => lowerNews.includes(kw));
+    keywordsFound = foundKeywords.length > 0;
+
+    if (!keywordsFound) {
+      console.log('Macro check:', new Date().toISOString(), '- Keywords found: false - Alert sent: false');
+      return;
+    }
+    console.log('Macro check:', new Date().toISOString(), '- Keywords found:', foundKeywords.slice(0, 8).join(', '));
+
+    // STEP 4: Call Claude API for impact analysis (only reached if keywords found)
+    const holdingsList = significantHoldings
+      .map(h => `${h.coin} ($${h.valueUSD.toFixed(0)} — ${h.narrative})`)
+      .join(', ');
+    const newsSnippet = rawNewsText.substring(0, 1500);
+    const totalSignificant = significantHoldings.reduce((s, h) => s + h.valueUSD, 0);
+
+    const claudeResponse = await anthropic.messages.create({
+      model: 'claude-sonnet-4-5',
+      max_tokens: 600,
+      tools: [{ type: "web_search_20250305", name: "web_search" }],
+      messages: [{
+        role: 'user',
+        content: `The user holds these crypto assets worth over $300: ${holdingsList}. Total: $${totalSignificant.toFixed(0)}.\n\nRSS headlines just fetched (scan for relevance): ${newsSnippet}\n\nSearch for the latest news on: ${foundKeywords.slice(0, 5).join(', ')}.\n\nAnalyse if any current news could significantly impact the user's holdings. Rate each affected coin HIGH/MEDIUM/LOW. Only report HIGH or MEDIUM impacts.\n\nStart your response with EXACTLY one of:\n🚨 MACRO ALERT\n✅ NO SIGNIFICANT ALERTS\n\nIf alert, for each issue:\n- What happened\n- Which coins affected and direction (bullish/bearish)\n- Recommended action (1 sentence)\n- Urgency: act now / watch / FYI\n\nKeep total response under 1800 characters.`
+      }]
+    });
+
+    const lastTextBlock = [...claudeResponse.content].reverse().find(b => b.type === 'text');
+    const analysis = lastTextBlock ? lastTextBlock.text.trim() : '✅ NO SIGNIFICANT ALERTS';
+
+    // STEP 5: Only send if MACRO ALERT and not a duplicate in last 6 hours
+    if (!analysis.includes('🚨 MACRO ALERT')) {
+      console.log('Macro check:', new Date().toISOString(), '- Keywords found: true - Alert sent: false (no significant alert from Claude)');
+      return;
+    }
+
+    const alertHash = createHash('sha256').update(analysis.substring(0, 200)).digest('hex');
+    const [existingRows] = await db.execute(
+      'SELECT id FROM macro_alerts_sent WHERE alert_hash = ? AND sent_at > DATE_SUB(NOW(), INTERVAL 6 HOUR)',
+      [alertHash]
+    );
+    if (existingRows.length > 0) {
+      console.log('Macro check:', new Date().toISOString(), '- Duplicate suppressed (hash:', alertHash.substring(0, 8) + ')');
+      return;
+    }
+
+    // Build affected holdings lines (coins mentioned in Claude's analysis)
+    const affectedLines = significantHoldings
+      .filter(h => analysis.toUpperCase().includes(h.coin.toUpperCase()))
+      .map(h => `• ${h.coin}: $${h.valueUSD.toFixed(0)}`);
+    const affectedSection = affectedLines.length > 0
+      ? `\n\n💼 <b>Your affected holdings:</b>\n${affectedLines.join('\n')}\n\nReply 'analyse [COIN]' for deeper analysis`
+      : '';
+
+    const telegramMessage = `🌍 <b>MACRO ALERT — PORTFOLIO IMPACT DETECTED</b>\n\n${analysis}${affectedSection}`;
+    await sendTelegram(telegramMessage);
+    await db.execute('INSERT INTO macro_alerts_sent (alert_hash) VALUES (?)', [alertHash]);
+    alertSent = true;
+
+  } catch (e) {
+    console.error('checkMacroNews error:', e.message);
+  }
+  console.log('Macro check:', new Date().toISOString(), '- Keywords found:', keywordsFound, '- Alert sent:', alertSent);
+}
+
 async function checkPortfolio() {
   if (monitoringPaused) {
     console.log('Monitoring paused, skipping check.');
@@ -661,7 +821,10 @@ cron.schedule('0 0 * * *', recordDailyPrices, { timezone: 'Europe/London' });
 // Send morning briefing at 9:00 AM every day (UK time)
 cron.schedule('0 9 * * *', sendMorningBriefing, { timezone: 'Europe/London' });
 
-console.log('Cron jobs scheduled: midnight price recording + 9 AM morning briefing (Europe/London)');
+// Check macro news every 2 hours (UK time)
+cron.schedule('0 */2 * * *', checkMacroNews, { timezone: 'Europe/London' });
+
+console.log('Cron jobs scheduled: midnight price recording + 9 AM morning briefing + every-2h macro news (Europe/London)');
 
 const app = express();
 app.use(cors());
@@ -1360,6 +1523,12 @@ Active alerts (coins currently above threshold): ${Object.keys(activeAlerts).joi
       res.status(200).json({ ok: true });
     }
   }
+});
+
+// GET /api/test-macro — trigger macro news check immediately (temporary test endpoint)
+app.get('/api/test-macro', async (req, res) => {
+  res.json({ ok: true, message: 'Macro news check triggered — watch Railway logs and Telegram.' });
+  checkMacroNews();
 });
 
 // GET /telegram-setup — register the webhook URL with Telegram
