@@ -57,22 +57,33 @@ async function sendTelegramMessage(chatId, text) {
   });
 }
 
-async function sendTelegramSingle(chatId, text) {
+async function sendTelegramChunked(chatId, text) {
   const maxLen = 3800;
-  let msg = text;
-  if (msg.length > maxLen) {
-    // Truncate at the last complete sentence before maxLen
-    const truncated = msg.substring(0, maxLen);
-    const lastSentence = Math.max(
-      truncated.lastIndexOf('. '),
-      truncated.lastIndexOf('.\n'),
-      truncated.lastIndexOf('! '),
-      truncated.lastIndexOf('? ')
-    );
-    msg = lastSentence > 0 ? truncated.substring(0, lastSentence + 1) + '...' : truncated + '...';
-    console.log('Response truncated from', text.length, 'to', msg.length, 'chars');
+  const chunks = [];
+  let remaining = text.trim();
+
+  while (remaining.length > 0) {
+    if (remaining.length <= maxLen) {
+      chunks.push(remaining);
+      break;
+    }
+    let splitAt = remaining.lastIndexOf('\n\n', maxLen);
+    if (splitAt === -1) splitAt = remaining.lastIndexOf('\n', maxLen);
+    if (splitAt === -1) splitAt = maxLen;
+    chunks.push(remaining.substring(0, splitAt).trim());
+    remaining = remaining.substring(splitAt).trim();
   }
-  await sendTelegramMessage(chatId, msg);
+
+  console.log('Sending', chunks.length, 'chunk(s), total length:', text.length);
+
+  for (let i = 0; i < chunks.length; i++) {
+    const prefix = i > 0 ? '📄 **(continued...)**\n\n' : '';
+    await sendTelegramMessage(chatId, prefix + chunks[i]);
+    console.log('Sent chunk', i + 1, 'of', chunks.length);
+    if (i < chunks.length - 1) {
+      await new Promise(r => setTimeout(r, 3000));
+    }
+  }
 }
 
 const basePrices = {};
@@ -611,59 +622,29 @@ app.post('/telegram-webhook', async (req, res) => {
         const chatIdStr = chatId.toString();
         const history = conversationHistory.get(chatIdStr) || [];
 
-        // Prepend strict format instructions to every user message
-        const formattedMessage = `STRICT INSTRUCTIONS: Respond in EXACTLY this format, total under 2000 characters, no exceptions:
-
-📊 [COIN] ANALYSIS
-Current: $X.XX | Entry: $X.XX | P&L: +/-X.X%
-
-⚡ TODAY: [max 2 sentences]
-📰 CATALYST: [max 2 sentences]
-
-🎯 TARGETS:
-- Now: $X-X (+X%)
-- July: $X-X (+X%)
-- Oct: $X-X (+X%)
-
-✅ VERDICT: [HOLD/BUY/SELL] - [1 sentence]
-⚠️ RISK: [1 sentence]
-
-USER MESSAGE: ${userMessage}`;
-
         // Build messages array: history + current user message
         const messages = [
           ...history,
-          { role: 'user', content: formattedMessage }
+          { role: 'user', content: userMessage }
         ];
 
         const claudePromise = anthropic.messages.create({
           model: 'claude-sonnet-4-5',
-          max_tokens: 1000,
+          max_tokens: 4000,
           tools: [{
             type: "web_search_20250305",
             name: "web_search"
           }],
-          system: `You are an expert AI crypto trading analyst and advisor. You have access to the user's live Revolut X portfolio data provided below. Search the web for current news, prices and market conditions before answering.
-
-When asked for crypto analysis, you MUST follow this EXACT format and nothing else. Total response must be under 2500 characters:
-
-📊 [COIN] ANALYSIS
-Current: $X.XX | Your entry: $X.XX | P&L: +/-X.X%
-
-⚡ TODAY: [2-3 sentences max on why it's moving today]
-
-📰 KEY CATALYST: [1-2 sentences on the biggest upcoming catalyst]
-
-🎯 TARGETS:
-- Short-term: $X.XX (+X%)
-- Medium-term: $X.XX (+X%)
-- Long-term: $X.XX (+X%)
-
-✅ RECOMMENDATION: [BUY/HOLD/SELL] - [1 sentence reason]
-
-⚠️ MAIN RISK: [1 sentence]
-
-Do NOT deviate from this format. Do NOT add extra sections.
+          system: `You are an expert AI crypto trading analyst and advisor. You have access to the user's live Revolut X portfolio data provided below. When answering questions:
+- Search the web for current news, prices and market conditions
+- Give detailed technical and fundamental analysis
+- Reference specific coins from the user's portfolio
+- Give actionable insights and specific recommendations
+- Format responses clearly with headers and bullet points
+- Be thorough and comprehensive
+- Always consider macro conditions, Bitcoin dominance, and market sentiment
+- Keep responses under 4000 characters total
+- End with a one line disclaimer only
 
 ${holdingsList}
 
@@ -733,8 +714,8 @@ Active alerts (coins currently above threshold): ${Object.keys(activeAlerts).joi
           }
         }
 
-        // Send Claude's reply as a single message (truncated if over 3800 chars)
-        await sendTelegramSingle(chatId, reply + (actionTaken || ''));
+        // Send Claude's reply, chunked at paragraph boundaries if over 3800 chars
+        await sendTelegramChunked(chatId, reply + (actionTaken || ''));
       } catch (err) {
         console.error('Claude AI error:', err.message);
         if (err.message === 'timeout') {
