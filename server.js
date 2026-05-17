@@ -20,6 +20,7 @@ const CHECK_INTERVAL_MS = 5 * 60 * 1000;
 const ALERT_INTERVAL_MS = 60 * 1000;
 const PUMP_THRESHOLD = 0.20;
 const SKIP_CURRENCIES = ['USD', 'USDT', 'USDC', 'EUR', 'GBP'];
+const SKIP_WORDS = new Set(['SET', 'AND', 'THE', 'FOR', 'ALL', 'GET', 'PUT', 'LET', 'CAN', 'ARE', 'NOT', 'BUT', 'USE', 'NEW', 'OLD', 'ANY', 'TWO', 'ONE', 'HIT', 'TOP', 'LOW', 'MAX', 'MIN', 'NOW', 'BUY', 'FROM']);
 
 async function revolutRequest(method, path) {
   const timestamp = Date.now().toString();
@@ -88,8 +89,11 @@ async function sendTelegramChunked(chatId, text) {
 
 const basePrices = {};
 const activeAlerts = {};
+const activeFixedAlerts = {}; // symbol -> intervalId for fixed price target alerts
 const lastBalances = {};
 const customThresholds = {};
+const priceTargets = new Map(); // symbol -> { anchorPrice, thresholdPct, targetPrice, entryPrice }
+const entryPrices = new Map(); // symbol -> number (in-memory only, resets on restart)
 let monitoringPaused = false;
 let monitoringInterval = null;
 const conversationHistory = new Map(); // chatId -> [{role, content}]
@@ -175,6 +179,16 @@ await db.execute(`CREATE TABLE IF NOT EXISTS custom_thresholds (
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 )`);
 
+await db.execute(`CREATE TABLE IF NOT EXISTS price_targets (
+  symbol VARCHAR(50) PRIMARY KEY,
+  anchor_price DECIMAL(20,10) NOT NULL,
+  threshold_pct DECIMAL(10,4) NOT NULL,
+  target_price DECIMAL(20,10) NOT NULL,
+  entry_price DECIMAL(20,10),
+  set_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+)`);
+
 const [rows] = await db.execute('SELECT symbol, price FROM baselines');
 for (const row of rows) {
   basePrices[row.symbol] = parseFloat(row.price);
@@ -196,6 +210,60 @@ for (const row of thresholdRows) {
   customThresholds[row.symbol] = parseFloat(row.threshold);
 }
 console.log(`Loaded ${thresholdRows.length} custom thresholds from database`);
+
+const [ptRows] = await db.execute('SELECT symbol, anchor_price, threshold_pct, target_price, entry_price FROM price_targets');
+for (const row of ptRows) {
+  priceTargets.set(row.symbol, {
+    anchorPrice: parseFloat(row.anchor_price),
+    thresholdPct: parseFloat(row.threshold_pct),
+    targetPrice: parseFloat(row.target_price),
+    entryPrice: row.entry_price ? parseFloat(row.entry_price) : null
+  });
+}
+console.log(`Loaded ${ptRows.length} price targets from database`);
+
+async function getQuickAiRecommendation(symbol, changePct, currentPrice) {
+  try {
+    const response = await anthropic.messages.create({
+      model: 'claude-sonnet-4-5',
+      max_tokens: 150,
+      messages: [{
+        role: 'user',
+        content: `In 2-3 sentences max, give a quick trading recommendation for ${symbol} which is up ${changePct.toFixed(1)}% to $${currentPrice.toFixed(4)}. Consider current market conditions. Start with HOLD, SELL, or BUY MORE in bold.`
+      }]
+    });
+    const textBlock = response.content.find(b => b.type === 'text');
+    return textBlock ? textBlock.text : 'HOLD - Monitor the situation closely.';
+  } catch (e) {
+    console.error('Quick AI recommendation error:', e.message);
+    return 'HOLD - Monitor the situation closely.';
+  }
+}
+
+async function setFixedTarget(symbol, thresholdPct) {
+  const tickerResponse = await revolutRequest('GET', '/tickers');
+  const tickerList = Array.isArray(tickerResponse) ? tickerResponse : (tickerResponse.data || []);
+  const priceMap = {};
+  for (const ticker of tickerList) {
+    if (ticker.symbol) {
+      const price = parseFloat(ticker.last_price || ticker.mid || ticker.ask || ticker.bid);
+      if (price) {
+        priceMap[ticker.symbol] = price;
+        priceMap[ticker.symbol.replace('/', '-')] = price;
+      }
+    }
+  }
+  const anchorPrice = priceMap[symbol];
+  if (!anchorPrice) throw new Error(`No price available for ${symbol}`);
+  const targetPrice = anchorPrice * (1 + thresholdPct / 100);
+  await db.execute(
+    'INSERT INTO price_targets (symbol, anchor_price, threshold_pct, target_price) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE anchor_price = VALUES(anchor_price), threshold_pct = VALUES(threshold_pct), target_price = VALUES(target_price), updated_at = CURRENT_TIMESTAMP',
+    [symbol, anchorPrice, thresholdPct, targetPrice]
+  );
+  const existing = priceTargets.get(symbol) || {};
+  priceTargets.set(symbol, { ...existing, anchorPrice, thresholdPct, targetPrice });
+  return { anchorPrice, thresholdPct, targetPrice };
+}
 
 async function checkPortfolio() {
   if (monitoringPaused) {
@@ -267,15 +335,41 @@ async function checkPortfolio() {
       const change = (currentPrice - basePrices[symbol]) / basePrices[symbol];
       console.log(`${symbol}: $${currentPrice} (${(change * 100).toFixed(1)}% from baseline)`);
 
-      // Trigger alert if pumping
+      // Trigger baseline alert if pumping
       const threshold = customThresholds[symbol] !== undefined ? customThresholds[symbol] : PUMP_THRESHOLD;
       if (change >= threshold && !activeAlerts[symbol]) {
         const pct = (change * 100).toFixed(1);
-        const alertMessage = `🚀 <b>${symbol} is pumping!</b>\n\nUp <b>${pct}%</b> from $${basePrices[symbol].toFixed(4)} → $${currentPrice.toFixed(4)}\n\nYou hold: ${available} ${asset.currency}\nLog into Revolut X to act!`;
+        const coinBase = asset.currency;
+        const aiRec = await getQuickAiRecommendation(symbol, change * 100, currentPrice);
+        const replyMenu = `\n\nReply:\n'sell ${coinBase}' - get sell advice\n'buy more ${coinBase}' - get buy advice\n'analyse ${coinBase}' - full analysis\n'acknowledge ${coinBase}' - stop alerts`;
+        const alertMessage = `📈 <b>${symbol} DAILY PUMP ALERT</b>\n\nBaseline: $${basePrices[symbol].toFixed(4)} → Now $${currentPrice.toFixed(4)} (+${pct}%)\nYou hold: ${available} ${coinBase}\n\n⚡ RECOMMENDATION: ${aiRec}${replyMenu}`;
         await sendTelegram(alertMessage);
 
         activeAlerts[symbol] = setInterval(async () => {
-          await sendTelegram(`⚠️ <b>REMINDER: ${symbol} still up ${pct}%!</b>\n\nCurrent price: $${currentPrice.toFixed(4)}\nYou hold: ${available} ${asset.currency}`);
+          await sendTelegram(`⚠️ <b>REMINDER: ${symbol} DAILY PUMP ALERT still active!</b>\n\nStill up ${pct}% from baseline\nReply 'acknowledge ${coinBase}' to stop`);
+        }, ALERT_INTERVAL_MS);
+      }
+    }
+
+    // Check fixed price targets
+    for (const [symbol, target] of priceTargets) {
+      const currentPrice = priceMap[symbol];
+      if (!currentPrice) continue;
+
+      if (currentPrice >= target.targetPrice && !activeFixedAlerts[symbol]) {
+        const changePct = ((currentPrice - target.anchorPrice) / target.anchorPrice) * 100;
+        const coinBase = symbol.replace('-USD', '');
+        const aiRec = await getQuickAiRecommendation(symbol, changePct, currentPrice);
+        const entryPrice = entryPrices.get(symbol) || target.entryPrice;
+        const entryLine = entryPrice
+          ? `\nEntry: $${entryPrice.toFixed(4)} | P&L: +${((currentPrice - entryPrice) / entryPrice * 100).toFixed(1)}%`
+          : '';
+        const replyMenu = `\n\nReply:\n'sell ${coinBase}' - get sell advice\n'buy more ${coinBase}' - get buy advice\n'analyse ${coinBase}' - full analysis\n'acknowledge ${coinBase}' - stop alerts\n'threshold ${coinBase} 15%' - change threshold\n'entry ${coinBase} 0.147' - correct my entry`;
+        const alertMessage = `🎯 <b>${symbol} FIXED TARGET HIT!</b>\n\nAnchor: $${target.anchorPrice.toFixed(4)} → Now $${currentPrice.toFixed(4)} (+${changePct.toFixed(1)}%)${entryLine}\n\n⚡ RECOMMENDATION: ${aiRec}${replyMenu}`;
+        await sendTelegram(alertMessage);
+
+        activeFixedAlerts[symbol] = setInterval(async () => {
+          await sendTelegram(`⚠️ <b>REMINDER: ${symbol} FIXED TARGET STILL ACTIVE!</b>\n\nTarget: $${target.targetPrice.toFixed(4)} | Now: $${currentPrice.toFixed(4)}\nReply 'acknowledge ${coinBase}' to stop`);
         }, ALERT_INTERVAL_MS);
       }
     }
@@ -482,15 +576,27 @@ app.post('/telegram-webhook', async (req, res) => {
       });
     };
 
-    // --- Command: acknowledge / ack ---
-    if (commandText === 'acknowledge' || commandText === 'ack') {
-      const symbol = Object.keys(activeAlerts)[0];
-      if (symbol) {
-        clearInterval(activeAlerts[symbol]);
-        delete activeAlerts[symbol];
-        await sendReply(`✅ Acknowledged ${symbol}`);
+    // --- Command: acknowledge [COIN] or acknowledge/ack (generic) ---
+    const ackMatch = commandText.match(/^(?:acknowledge|ack)(?:\s+([a-z0-9]{2,10}))?$/);
+    if (ackMatch) {
+      if (ackMatch[1]) {
+        const coinBase = ackMatch[1].toUpperCase();
+        const symbol = `${coinBase}-USD`;
+        const stopped = [];
+        if (activeAlerts[symbol]) { clearInterval(activeAlerts[symbol]); delete activeAlerts[symbol]; stopped.push('baseline alert'); }
+        if (activeFixedAlerts[symbol]) { clearInterval(activeFixedAlerts[symbol]); delete activeFixedAlerts[symbol]; stopped.push('fixed target alert'); }
+        await sendReply(stopped.length ? `✅ ${symbol}: stopped ${stopped.join(' + ')}` : `✅ No active alerts for ${symbol}`);
       } else {
-        await sendReply('✅ No active alerts to acknowledge.');
+        const baseSymbol = Object.keys(activeAlerts)[0];
+        const fixedSymbol = Object.keys(activeFixedAlerts)[0];
+        const symbol = baseSymbol || fixedSymbol;
+        if (symbol) {
+          if (activeAlerts[symbol]) { clearInterval(activeAlerts[symbol]); delete activeAlerts[symbol]; }
+          if (activeFixedAlerts[symbol]) { clearInterval(activeFixedAlerts[symbol]); delete activeFixedAlerts[symbol]; }
+          await sendReply(`✅ Acknowledged ${symbol}`);
+        } else {
+          await sendReply('✅ No active alerts to acknowledge.');
+        }
       }
       return res.status(200).json({ ok: true });
     }
@@ -521,11 +627,110 @@ app.post('/telegram-webhook', async (req, res) => {
       return res.status(200).json({ ok: true });
     }
 
+    // --- Command: sell [COIN] ---
+    const sellMatch = commandText.match(/^sell\s+([a-z]{2,10})$/);
+    if (sellMatch) {
+      const coinBase = sellMatch[1].toUpperCase();
+      const symbol = `${coinBase}-USD`;
+      await sendReply('🔍 Getting sell advice...');
+      res.status(200).json({ ok: true });
+      (async () => {
+        try {
+          const response = await anthropic.messages.create({
+            model: 'claude-sonnet-4-5',
+            max_tokens: 600,
+            tools: [{ type: "web_search_20250305", name: "web_search" }],
+            messages: [{ role: 'user', content: `Give specific, actionable sell advice for ${symbol}. Search for current price and market conditions. Should I sell now or wait? Give a clear recommendation with 1-2 price levels to target. Under 300 words.` }]
+          });
+          const textBlock = [...response.content].reverse().find(b => b.type === 'text');
+          await sendTelegramMessage(chatId, textBlock ? textBlock.text : 'Unable to generate sell advice.');
+        } catch (e) {
+          await sendTelegramMessage(chatId, '❌ Error: ' + e.message);
+        }
+      })();
+      return;
+    }
+
+    // --- Command: buy more [COIN] ---
+    const buyMatch = commandText.match(/^buy\s+more\s+([a-z]{2,10})$/);
+    if (buyMatch) {
+      const coinBase = buyMatch[1].toUpperCase();
+      const symbol = `${coinBase}-USD`;
+      await sendReply('🔍 Getting buy advice...');
+      res.status(200).json({ ok: true });
+      (async () => {
+        try {
+          const response = await anthropic.messages.create({
+            model: 'claude-sonnet-4-5',
+            max_tokens: 600,
+            tools: [{ type: "web_search_20250305", name: "web_search" }],
+            messages: [{ role: 'user', content: `Give specific, actionable advice on buying more ${symbol}. Search for current price and market conditions. Is now a good DCA entry? What's the risk/reward? Under 300 words.` }]
+          });
+          const textBlock = [...response.content].reverse().find(b => b.type === 'text');
+          await sendTelegramMessage(chatId, textBlock ? textBlock.text : 'Unable to generate buy advice.');
+        } catch (e) {
+          await sendTelegramMessage(chatId, '❌ Error: ' + e.message);
+        }
+      })();
+      return;
+    }
+
+    // --- Command: entry [COIN] [PRICE] ---
+    const entryMatch = commandText.match(/^entry\s+([a-z]{2,10})\s+([\d.]+)$/);
+    if (entryMatch) {
+      const coinBase = entryMatch[1].toUpperCase();
+      const symbol = `${coinBase}-USD`;
+      const price = parseFloat(entryMatch[2]);
+      entryPrices.set(symbol, price);
+      await sendReply(`✅ Entry price for ${symbol} set to $${price} (stored in memory — resets on server restart)`);
+      return res.status(200).json({ ok: true });
+    }
+
+    // --- Fixed target detection: "COIN X% from current price" / "alert when COIN rises X%" ---
+    const fixedTargetIntent = /\bfrom\s+current|\bfixed\s+(?:target|alert)\b/i.test(rawText);
+    if (fixedTargetIntent) {
+      const fixedMatch = rawText.match(/\b([A-Za-z]{2,10})\b.*?([\d.]+)\s*%/i);
+      if (fixedMatch) {
+        const coinBase = fixedMatch[1].toUpperCase();
+        if (!SKIP_WORDS.has(coinBase)) {
+          const symbol = coinBase.endsWith('-USD') ? coinBase : `${coinBase}-USD`;
+          const thresholdPct = parseFloat(fixedMatch[2]);
+          if (thresholdPct > 0 && thresholdPct <= 100) {
+            try {
+              const { anchorPrice, targetPrice } = await setFixedTarget(symbol, thresholdPct);
+              await sendReply(`✅ <b>${symbol} fixed target set!</b>\nAnchor: $${anchorPrice.toFixed(4)} | Target: $${targetPrice.toFixed(4)} (+${thresholdPct}%)\nI'll alert you when ${symbol} hits $${targetPrice.toFixed(4)} — permanently stored.`);
+            } catch (e) {
+              await sendReply(`❌ Could not set fixed target for ${symbol}: ${e.message}`);
+            }
+            return res.status(200).json({ ok: true });
+          }
+        }
+      }
+    }
+
+    // --- Command: threshold [COIN] [N]% → update fixed target from same anchor (if fixed target exists) ---
+    const fixedThresholdMatch = commandText.match(/^threshold\s+([a-z]{2,10})\s+([\d.]+)%?$/);
+    if (fixedThresholdMatch && priceTargets.has(`${fixedThresholdMatch[1].toUpperCase()}-USD`)) {
+      const coinBase = fixedThresholdMatch[1].toUpperCase();
+      const symbol = `${coinBase}-USD`;
+      const thresholdPct = parseFloat(fixedThresholdMatch[2]);
+      const existing = priceTargets.get(symbol);
+      const newTargetPrice = existing.anchorPrice * (1 + thresholdPct / 100);
+      if (activeFixedAlerts[symbol]) { clearInterval(activeFixedAlerts[symbol]); delete activeFixedAlerts[symbol]; }
+      await db.execute(
+        'INSERT INTO price_targets (symbol, anchor_price, threshold_pct, target_price) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE threshold_pct = VALUES(threshold_pct), target_price = VALUES(target_price), updated_at = CURRENT_TIMESTAMP',
+        [symbol, existing.anchorPrice, thresholdPct, newTargetPrice]
+      );
+      priceTargets.set(symbol, { ...existing, thresholdPct, targetPrice: newTargetPrice });
+      await sendReply(`✅ <b>${symbol} fixed target updated!</b>\nAnchor: $${existing.anchorPrice.toFixed(4)} | New target: $${newTargetPrice.toFixed(4)} (+${thresholdPct}%)`);
+      return res.status(200).json({ ok: true });
+    }
+
     // Simple multi-coin scanner: find ALL [COIN] [NUMBER]% pairs in the message
     // Pattern: 2-10 letter word followed by a number and %
     // e.g. "CC 5%" "HYPE 3%" "BTC 2.5%"
     const coinPctPattern = /\b([A-Za-z]{2,10})\b\s*(?:threshold\s*(?:to|at|=)?\s*|to\s+|at\s+|=\s*)?([\d.]+)\s*%/gi;
-    const skipWords = new Set(['SET', 'AND', 'THE', 'FOR', 'ALL', 'GET', 'PUT', 'LET', 'CAN', 'ARE', 'NOT', 'BUT', 'USE', 'NEW', 'OLD', 'ANY', 'TWO', 'ONE', 'HIT', 'TOP', 'LOW', 'MAX', 'MIN']);
+    const skipWords = SKIP_WORDS;
 
     const thresholdPairs = [];
     let m;
