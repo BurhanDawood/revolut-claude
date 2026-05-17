@@ -1526,12 +1526,6 @@ Active alerts (coins currently above threshold): ${Object.keys(activeAlerts).joi
   }
 });
 
-// GET /api/test-macro — trigger macro news check immediately (temporary test endpoint)
-app.get('/api/test-macro', async (req, res) => {
-  res.json({ ok: true, message: 'Macro news check triggered — watch Railway logs and Telegram.' });
-  checkMacroNews();
-});
-
 // GET /telegram-setup — register the webhook URL with Telegram
 app.get('/telegram-setup', async (req, res) => {
   const token = process.env.TELEGRAM_BOT_TOKEN;
