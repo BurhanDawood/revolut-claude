@@ -62,14 +62,25 @@ async function sendTelegram(message) {
 
 async function sendTelegramMessage(chatId, text) {
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-  await fetch(url, {
+  const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML' })
   });
+  const data = await res.json();
+  return data.result?.message_id || null;
 }
 
-async function sendTelegramChunked(chatId, text) {
+async function editTelegramMessage(chatId, messageId, text) {
+  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageText`;
+  await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: chatId, message_id: messageId, text, parse_mode: 'HTML' })
+  });
+}
+
+async function sendTelegramChunked(chatId, text, messageId = null) {
   // Split on major markdown section headers so the intro is never lost
   const sections = text.split(/(?=\n## |\n### )/);
 
@@ -90,9 +101,15 @@ async function sendTelegramChunked(chatId, text) {
   console.log('First chunk starts:', chunks[0]?.substring(0, 100));
 
   for (let i = 0; i < chunks.length; i++) {
-    const prefix = i > 0 ? '📄 *(continued)*\n\n' : '';
-    await sendTelegramMessage(chatId, prefix + chunks[i]);
-    console.log('Sent chunk', i + 1, 'of', chunks.length);
+    if (i === 0 && messageId) {
+      // Edit the status message in-place with the first chunk
+      await editTelegramMessage(chatId, messageId, chunks[0]);
+      console.log('Edited status message with chunk 1 of', chunks.length);
+    } else {
+      const prefix = i > 0 ? '📄 *(continued)*\n\n' : '';
+      await sendTelegramMessage(chatId, prefix + chunks[i]);
+      console.log('Sent chunk', i + 1, 'of', chunks.length);
+    }
     if (i < chunks.length - 1) {
       await new Promise(r => setTimeout(r, 2000));
     }
@@ -2143,8 +2160,8 @@ app.post('/telegram-webhook', async (req, res) => {
     // Capture user message for use inside the async closure
     const userMessage = rawText;
 
-    // 1. Immediately send acknowledgment to Telegram
-    await sendReply('🔍 Researching... give me a moment.');
+    // 1. Immediately send acknowledgment to Telegram and capture message_id for editing
+    const statusMsgId = await sendTelegramMessage(chatId, '🔍 Researching... give me a moment.');
 
     // 2. Immediately return 200 to Telegram so it doesn't timeout
     res.status(200).json({ ok: true });
@@ -2240,13 +2257,12 @@ Active alerts (coins currently above threshold): ${Object.keys(activeAlerts).joi
           setTimeout(() => reject(new Error('timeout')), 110000)
         );
 
-        // Send a follow-up message after 30 seconds if still processing
+        // Edit the status message after 15 seconds if still processing
         stillResearchingTimer = setTimeout(async () => {
           try {
-            await sendTelegramMessage(chatId, '⏳ Still researching, almost there...');
-            await new Promise(r => setTimeout(r, 2000));
+            await editTelegramMessage(chatId, statusMsgId, '⏳ Still researching, almost there...');
           } catch (e) { /* ignore */ }
-        }, 30000);
+        }, 15000);
 
         const response = await Promise.race([claudePromise, timeoutPromise]);
         clearTimeout(stillResearchingTimer);
@@ -2317,14 +2333,18 @@ Active alerts (coins currently above threshold): ${Object.keys(activeAlerts).joi
           }
         }
 
-        // Send Claude's reply, chunked at paragraph boundaries if over 3800 chars
-        await sendTelegramChunked(chatId, reply + (actionTaken || ''));
+        // Send Claude's reply — edits the status message for chunk 1, new messages for subsequent chunks
+        await sendTelegramChunked(chatId, reply + (actionTaken || ''), statusMsgId);
       } catch (err) {
         console.error('Claude AI error:', err.message);
-        if (err.message === 'timeout') {
-          await sendReply('⏱️ That analysis is taking too long. Try asking something more specific or break it into smaller questions.');
+        clearTimeout(stillResearchingTimer);
+        const errMsg = err.message === 'timeout'
+          ? '⏱️ That analysis is taking too long. Try asking something more specific or break it into smaller questions.'
+          : '❌ Error getting AI response: ' + err.message;
+        if (statusMsgId) {
+          await editTelegramMessage(chatId, statusMsgId, errMsg).catch(() => sendTelegramMessage(chatId, errMsg));
         } else {
-          await sendReply('❌ Error getting AI response: ' + err.message);
+          await sendTelegramMessage(chatId, errMsg);
         }
       }
     })();
