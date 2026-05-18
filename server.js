@@ -570,7 +570,7 @@ async function sendMorningBriefing() {
     // Ask Claude for market conditions, news, and recommendations only
     const claudeResponse = await anthropic.messages.create({
       model: 'claude-sonnet-4-5',
-      max_tokens: 800,
+      max_tokens: 1000,
       tools: [{ type: "web_search_20250305", name: "web_search" }],
       messages: [{
         role: 'user',
@@ -591,7 +591,7 @@ Reply with EXACTLY this format and nothing else — no preamble, no sign-off:
 2. [Specific action for second holding]
 3. [BTC key watch level or macro point]
 
-Keep total response under 900 characters.`
+CRITICAL: Your entire response must be under 3000 characters. Be very concise. Use short bullet points. Maximum 2-3 words per bullet. No long explanations.`
       }]
     });
 
