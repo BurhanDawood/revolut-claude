@@ -1181,7 +1181,12 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
 // ── Intention Tracking ───────────────────────────────────────────────────────
 
 function detectIntention(text) {
+  const trimmed = text.trim();
   return (
+    /[\u{1F44D}\u{1F44E}\u{1F44D}\u{1F44D}\u{1F44D}\u{1F44D}]/u.test(text) ||  // 👍 any skin tone variant
+    /\u{1F919}/u.test(text) ||  // 🤙
+    /✅/.test(text) ||
+    /^(?:yes|agreed|ok will do|sounds good|perfect|great|makes sense)\.?$/i.test(trimmed) ||
     /\bi'?(?:ll|m going to|m gonna)\s+(?:hold|buy|sell|follow|keep|add|reduce|stay)/i.test(text) ||
     /\bwill\s+(?:hold|buy|sell|follow|keep|add|reduce|stay)/i.test(text) ||
     /\bgood\s+advice\b/i.test(text) ||
@@ -2753,13 +2758,15 @@ app.post('/telegram-webhook', async (req, res) => {
             }
           }
 
+          const isSimpleAgreement = /[\u{1F44D}\u{1F919}]/u.test(rawText) || /✅/.test(rawText) ||
+            /^(?:yes|agreed|ok will do|sounds good|perfect|great|makes sense)\.?$/i.test(rawText.trim());
           const coinStr = targetCoins.join(' and ');
-          const priceStr = Object.entries(prices).map(([c, p]) => `${c} $${p.toFixed(4)}`).join(' | ');
-          await sendReply(
-            `✅ Got it Bryan — logged that you're ${action === 'HOLD' ? 'holding' : action === 'BUY' ? 'buying' : action === 'SELL' ? 'selling' : action.toLowerCase() + 'ing'} ${coinStr}.\n` +
-            `I'll check back in 7 days to see how this plays out and update your learning model.\n` +
-            (priceStr ? `Current prices locked: ${priceStr}` : '')
-          );
+          const bulletPrices = Object.entries(prices).map(([c, p]) => `• ${c}: $${p.toFixed(4)}`).join('\n');
+          const actionVerb = action === 'HOLD' ? 'holding' : action === 'BUY' ? 'buying' : action === 'SELL' ? 'selling' : action.toLowerCase() + 'ing';
+          const confirmMsg = isSimpleAgreement
+            ? `✅ Got it Bryan — logged that you're following the advice!\nPrices locked in for tracking:\n${bulletPrices}\nI'll check back in 7 days to see how it plays out 📊`
+            : `✅ Got it Bryan — logged that you're ${actionVerb} ${coinStr}.\nPrices locked in for tracking:\n${bulletPrices}\nI'll check back in 7 days to see how this plays out and update your learning model.`;
+          await sendReply(confirmMsg);
           return res.status(200).json({ ok: true });
         } catch (e) {
           console.error('Intention logging error:', e.message);
