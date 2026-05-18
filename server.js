@@ -125,6 +125,7 @@ const previousBalances = new Map(); // symbol -> quantity (DB-backed)
 let portfolioCheckCount = 0; // skip trade detection on first check (baseline establishment)
 let monitoringInterval = null;
 const conversationHistory = new Map(); // chatId -> [{role, content}]
+const lastRecommendationContext = new Map(); // chatId -> { coins, action, prices, timestamp }
 
 async function setThreshold(symbol, threshold) {
   const oldThreshold = customThresholds[symbol] ?? PUMP_THRESHOLD;
@@ -312,6 +313,22 @@ await db.execute(`CREATE TABLE IF NOT EXISTS rebalancing_history (
   total_unrealised_loss_usd DECIMAL(20,10),
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   INDEX idx_created (created_at)
+)`);
+
+await db.execute(`CREATE TABLE IF NOT EXISTS intention_tracking (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  symbols VARCHAR(200) NOT NULL,
+  recommendation VARCHAR(50) NOT NULL,
+  prices_at_intention TEXT NOT NULL,
+  intention_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  check_date_1 TIMESTAMP NULL,
+  check_date_2 TIMESTAMP NULL,
+  outcome_1 TEXT NULL,
+  outcome_2 TEXT NULL,
+  overall_outcome VARCHAR(20) NULL,
+  pnl_result DECIMAL(20,6) NULL,
+  INDEX idx_intention_date (intention_date),
+  INDEX idx_outcomes (check_date_1, check_date_2)
 )`);
 
 // Add direction column to price_targets if it doesn't exist
@@ -710,6 +727,21 @@ async function updateLearningModel() {
     if (followedWinRate !== null) summary += `- Followed Claude's advice: ${followedWinRate}% win rate (${followed.length} trades)\n`;
     if (ignoredWinRate !== null) summary += `- Ignored Claude's advice: ${ignoredWinRate}% win rate (${ignored.length} trades)\n`;
 
+    // Intention tracking accuracy
+    try {
+      const [allIntentions] = await db.execute('SELECT * FROM intention_tracking');
+      const completed = allIntentions.filter(i => i.pnl_result != null);
+      if (allIntentions.length > 0) {
+        summary += `- Commitments logged: ${allIntentions.length} (${completed.length} with outcomes)\n`;
+        if (completed.length > 0) {
+          const profitable = completed.filter(i => parseFloat(i.pnl_result) > 0);
+          const intentionAccuracy = Math.round(profitable.length / completed.length * 100);
+          const avgPnl = (completed.reduce((s, i) => s + parseFloat(i.pnl_result), 0) / completed.length).toFixed(1);
+          summary += `- Advice accuracy when followed: ${intentionAccuracy}% profitable | Avg P&L: ${avgPnl >= 0 ? '+' : ''}${avgPnl}%\n`;
+        }
+      }
+    } catch (e) { /* ignore */ }
+
     learningModelCache = summary.trim();
     return learningModelCache;
   } catch (e) {
@@ -761,6 +793,22 @@ async function getLearningContext() {
       const avgProfit = profits.length > 0 ? (profits.reduce((s, t) => s + parseFloat(t.outcome_pnl), 0) / profits.length).toFixed(1) : 0;
       const avgLoss = losses.length > 0 ? (losses.reduce((s, t) => s + parseFloat(t.outcome_pnl), 0) / losses.length).toFixed(1) : 0;
       context += `Bryan's track record:\n• Win rate: ${winRate}% | Avg profit: +${avgProfit}% | Avg loss: ${avgLoss}%\n`;
+    }
+
+    // Recent trading intentions
+    const [intentions] = await db.execute(
+      'SELECT * FROM intention_tracking ORDER BY intention_date DESC LIMIT 5'
+    );
+    if (intentions.length > 0) {
+      context += 'Recent trading intentions Bryan committed to:\n';
+      for (const intent of intentions) {
+        const prices = JSON.parse(intent.prices_at_intention || '{}');
+        const priceStr = Object.entries(prices).map(([c, p]) => `${c} $${parseFloat(p).toFixed(4)}`).join(', ');
+        const statusStr = intent.overall_outcome ? `— outcome: ${intent.overall_outcome}` :
+          intent.check_date_1 ? '— 7-day checked, 30-day pending' : '— 7-day check pending';
+        const dateStr = new Date(intent.intention_date).toLocaleDateString('en-GB', { month: 'short', day: 'numeric' });
+        context += `• ${dateStr}: Decided to ${intent.recommendation} ${intent.symbols} (${priceStr}) ${statusStr}\n`;
+      }
     }
 
     return context;
@@ -1127,6 +1175,127 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
     console.log(`Auto-logged trade: ${symbol} ${action} ${absQty.toFixed(4)} @ $${price.toFixed(4)}`);
   } catch (e) {
     console.error('autoLogTrade error:', e.message);
+  }
+}
+
+// ── Intention Tracking ───────────────────────────────────────────────────────
+
+function detectIntention(text) {
+  return (
+    /\bi'?(?:ll|m going to|m gonna)\s+(?:hold|buy|sell|follow|keep|add|reduce|stay)/i.test(text) ||
+    /\bwill\s+(?:hold|buy|sell|follow|keep|add|reduce|stay)/i.test(text) ||
+    /\bgood\s+advice\b/i.test(text) ||
+    /\bmakes?\s+sense\b/i.test(text) ||
+    /\bi\s+agree\b/i.test(text) ||
+    /\bgoing\s+to\s+follow\b/i.test(text) ||
+    /\bfollowing\s+(?:your|that|this|claude'?s?)\s+advice\b/i.test(text) ||
+    /\bholding\s+(?:both|all|it|them)\b/i.test(text) ||
+    /\bwill\s+follow\s+(?:that|this|your)\b/i.test(text)
+  );
+}
+
+function extractIntentionDetails(text) {
+  let action = 'HOLD';
+  if (/\b(?:sell|selling)\b/i.test(text)) action = 'SELL';
+  else if (/\b(?:buy|buying|add|adding)\b/i.test(text)) action = 'BUY';
+  else if (/\b(?:reduce|reducing)\b/i.test(text)) action = 'REDUCE';
+
+  const coins = [];
+  for (const m of text.matchAll(/\b([A-Z]{2,10})\b/g)) {
+    if (!SKIP_WORDS.has(m[1]) && !['USD', 'USDT', 'USDC', 'EUR', 'GBP'].includes(m[1])) {
+      coins.push(m[1]);
+    }
+  }
+  return { action, coins: [...new Set(coins)] };
+}
+
+async function checkIntentionOutcomes() {
+  try {
+    const now = new Date();
+
+    // 7-day check
+    const [sevenDay] = await db.execute(
+      'SELECT * FROM intention_tracking WHERE check_date_1 IS NULL AND intention_date < DATE_SUB(NOW(), INTERVAL 7 DAY)'
+    );
+    for (const intent of sevenDay) {
+      try {
+        const coins = intent.symbols.split(',').map(s => s.trim());
+        const prices = JSON.parse(intent.prices_at_intention);
+        const lines = [];
+        let totalPnl = 0, count = 0;
+
+        for (const coin of coins) {
+          const currentPrice = await getCurrentPrice(`${coin}-USD`).catch(() => null);
+          if (!currentPrice || !prices[coin]) continue;
+          const pnlPct = ((currentPrice - prices[coin]) / prices[coin]) * 100;
+          totalPnl += pnlPct;
+          count++;
+          const emoji = pnlPct >= 0 ? '✅' : '❌';
+          lines.push(`${coin}: $${parseFloat(prices[coin]).toFixed(4)} → $${currentPrice.toFixed(4)} (${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%) ${emoji}`);
+        }
+
+        const avgPnl = count > 0 ? totalPnl / count : 0;
+        const outcomeText = lines.join('\n');
+        const wasGood = avgPnl > 0;
+
+        await db.execute(
+          'UPDATE intention_tracking SET check_date_1 = NOW(), outcome_1 = ?, pnl_result = ? WHERE id = ?',
+          [outcomeText, avgPnl.toFixed(4), intent.id]
+        );
+
+        const tailMsg = wasGood
+          ? `Following Claude's advice was the right call! 🎉\nLearning model updated.`
+          : `This one didn't play out as hoped. Learning model updated — every data point helps.`;
+
+        await sendTelegram(
+          `📊 <b>ADVICE FOLLOW-UP — 7 days ago you decided to ${intent.recommendation} ${coins.join(' & ')}</b>\n` +
+          `${outcomeText}\n\n${tailMsg}`
+        );
+        await updateLearningModel().catch(() => {});
+      } catch (e) { console.error('7-day intention check error:', e.message); }
+    }
+
+    // 30-day check
+    const [thirtyDay] = await db.execute(
+      'SELECT * FROM intention_tracking WHERE check_date_2 IS NULL AND check_date_1 IS NOT NULL AND intention_date < DATE_SUB(NOW(), INTERVAL 30 DAY)'
+    );
+    for (const intent of thirtyDay) {
+      try {
+        const coins = intent.symbols.split(',').map(s => s.trim());
+        const prices = JSON.parse(intent.prices_at_intention);
+        const lines = [];
+        let totalPnl = 0, count = 0;
+
+        for (const coin of coins) {
+          const currentPrice = await getCurrentPrice(`${coin}-USD`).catch(() => null);
+          if (!currentPrice || !prices[coin]) continue;
+          const pnlPct = ((currentPrice - prices[coin]) / prices[coin]) * 100;
+          totalPnl += pnlPct;
+          count++;
+          const emoji = pnlPct >= 0 ? '✅' : '❌';
+          lines.push(`${coin}: $${parseFloat(prices[coin]).toFixed(4)} → $${currentPrice.toFixed(4)} (${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%) ${emoji}`);
+        }
+
+        const avgPnl = count > 0 ? totalPnl / count : 0;
+        const outcomeText = lines.join('\n');
+        const overallOutcome = avgPnl > 2 ? 'profit' : avgPnl < -2 ? 'loss' : 'breakeven';
+
+        await db.execute(
+          'UPDATE intention_tracking SET check_date_2 = NOW(), outcome_2 = ?, overall_outcome = ? WHERE id = ?',
+          [outcomeText, overallOutcome, intent.id]
+        );
+
+        await sendTelegram(
+          `📊 <b>30-DAY FOLLOW-UP — ${intent.recommendation} ${coins.join(' & ')}</b>\n` +
+          `${outcomeText}\n\n` +
+          `Overall: <b>${overallOutcome.toUpperCase()}</b> (avg ${avgPnl >= 0 ? '+' : ''}${avgPnl.toFixed(1)}%)\n` +
+          `Learning model updated 🧠`
+        );
+        await updateLearningModel().catch(() => {});
+      } catch (e) { console.error('30-day intention check error:', e.message); }
+    }
+  } catch (e) {
+    console.error('checkIntentionOutcomes error:', e.message);
   }
 }
 
@@ -1499,7 +1668,10 @@ cron.schedule('5 9 * * 1', async () => {
   }
 }, { timezone: 'Europe/London' });
 
-console.log('Cron jobs scheduled: midnight price recording + 9 AM morning briefing + every-2h macro news + Monday 9:05 rebalancing check (Europe/London)');
+// Daily intention outcome checks — 10 AM, checks for 7-day and 30-day pending follow-ups
+cron.schedule('0 10 * * *', checkIntentionOutcomes, { timezone: 'Europe/London' });
+
+console.log('Cron jobs scheduled: midnight price recording + 9 AM morning briefing + every-2h macro news + Monday 9:05 rebalancing check + 10 AM intention outcomes (Europe/London)');
 
 const app = express();
 app.use(cors());
@@ -2548,6 +2720,54 @@ app.post('/telegram-webhook', async (req, res) => {
       return;
     }
 
+    // --- Intention detection: user commits to following advice ---
+    if (detectIntention(rawText)) {
+      const { action, coins } = extractIntentionDetails(rawText);
+
+      // Fall back to last recommendation context if no coins in message
+      let targetCoins = coins;
+      const lastRec = lastRecommendationContext.get(chatIdStr);
+      if (targetCoins.length === 0 && lastRec && (Date.now() - lastRec.timestamp) < 30 * 60 * 1000) {
+        targetCoins = lastRec.coins;
+      }
+
+      if (targetCoins.length > 0) {
+        try {
+          const prices = {};
+          for (const coin of targetCoins) {
+            const p = await getCurrentPrice(`${coin}-USD`).catch(() => null);
+            if (p) prices[coin] = p;
+          }
+
+          await db.execute(
+            'INSERT INTO intention_tracking (symbols, recommendation, prices_at_intention) VALUES (?, ?, ?)',
+            [targetCoins.join(','), action, JSON.stringify(prices)]
+          ).catch(() => {});
+
+          for (const coin of targetCoins) {
+            if (prices[coin]) {
+              await db.execute(
+                'INSERT INTO analysis_history (symbol, analysis_type, price_at_analysis, recommendation, user_action_taken) VALUES (?, ?, ?, ?, ?)',
+                [`${coin}-USD`, 'intention_logged', prices[coin], action, 'intends_to_follow']
+              ).catch(() => {});
+            }
+          }
+
+          const coinStr = targetCoins.join(' and ');
+          const priceStr = Object.entries(prices).map(([c, p]) => `${c} $${p.toFixed(4)}`).join(' | ');
+          await sendReply(
+            `✅ Got it Bryan — logged that you're ${action === 'HOLD' ? 'holding' : action === 'BUY' ? 'buying' : action === 'SELL' ? 'selling' : action.toLowerCase() + 'ing'} ${coinStr}.\n` +
+            `I'll check back in 7 days to see how this plays out and update your learning model.\n` +
+            (priceStr ? `Current prices locked: ${priceStr}` : '')
+          );
+          return res.status(200).json({ ok: true });
+        } catch (e) {
+          console.error('Intention logging error:', e.message);
+          // Fall through to Claude if logging fails
+        }
+      }
+    }
+
     // --- Command: i prefer TEXT ---
     const preferMatch = commandText.match(/^i prefer\s+(.+)$/i);
     if (preferMatch) {
@@ -2717,6 +2937,17 @@ Active alerts (coins currently above threshold): ${Object.keys(activeAlerts).joi
         // Extract the last text block (web_search may produce tool_use blocks before the final text)
         const lastTextBlock = [...response.content].reverse().find(b => b.type === 'text');
         const reply = lastTextBlock ? lastTextBlock.text : '(no response)';
+
+        // Update last recommendation context for intention tracking
+        try {
+          const recCoins = holdings.filter(h => reply.toUpperCase().includes(h.symbol.replace('-USD', ''))).map(h => h.symbol.replace('-USD', ''));
+          const recActionMatch = reply.match(/\*\*(HOLD|SELL|BUY MORE|BUY|REDUCE|ADD)\*\*/i) || reply.match(/\b(HOLD|SELL|BUY|REDUCE|ADD)\b/i);
+          lastRecommendationContext.set(chatIdStr, {
+            coins: recCoins.length > 0 ? recCoins : [],
+            action: recActionMatch ? recActionMatch[1].toUpperCase() : 'HOLD',
+            timestamp: Date.now()
+          });
+        } catch (e) { /* ignore */ }
 
         // Extract recommendation from Claude's reply and save to analysis_history
         try {
