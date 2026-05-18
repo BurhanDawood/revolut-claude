@@ -357,6 +357,37 @@
     .pnl-positive { color: #00ffc8; }
     .pnl-negative { color: var(--danger); }
 
+    /* ── Unrealised P&L colour coding ────────────────────────────────────────── */
+    .upnl-profit     { color: #00ffc8; }
+    .upnl-small-loss { color: #ffaa00; }   /* 0 – –20% */
+    .upnl-loss       { color: #ff7800; }   /* –20 – –50% */
+    .upnl-severe     { color: var(--danger); } /* < –50% */
+
+    /* P&L line on top-5 cards */
+    .hc-pnl-line {
+      font-size: 0.75rem; margin-top: 5px;
+      padding: 4px 8px; border-radius: 5px;
+      background: rgba(255,255,255,0.04);
+      display: inline-block;
+    }
+
+    /* P&L summary box under capital bar */
+    .pnl-summary-bar {
+      background: var(--surface); border-radius: var(--radius);
+      padding: 12px 18px; margin-bottom: var(--gap);
+      display: grid; grid-template-columns: repeat(4,1fr); gap: 8px;
+    }
+    @media(max-width:560px) { .pnl-summary-bar { grid-template-columns: repeat(2,1fr); } }
+    .pnl-sum-stat { text-align: center; }
+    .pnl-sum-label { font-size: 0.62rem; text-transform: uppercase; letter-spacing: 0.07em; color: var(--text-muted); margin-bottom: 3px; }
+    .pnl-sum-value { font-size: 0.92rem; font-weight: 700; }
+
+    /* Quick entry inline form */
+    .entry-inline {
+      display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+      font-size: 0.78rem; color: var(--text-muted); margin-top: 4px;
+    }
+
     /* Capital P&L header */
     .capital-bar {
       background: var(--surface);
@@ -578,6 +609,26 @@
     <div class="cap-stat">
       <div class="cap-stat-label">To Break Even</div>
       <div class="cap-stat-value break-even" id="cap-breakeven">—</div>
+    </div>
+  </div>
+
+  <!-- P&L Summary Bar -->
+  <div class="pnl-summary-bar" id="pnl-summary-bar" style="display:none">
+    <div class="pnl-sum-stat">
+      <div class="pnl-sum-label">Tracked Coins</div>
+      <div class="pnl-sum-value" id="pnl-tracked">—</div>
+    </div>
+    <div class="pnl-sum-stat">
+      <div class="pnl-sum-label">🟢 In Profit</div>
+      <div class="pnl-sum-value upnl-profit" id="pnl-winners">—</div>
+    </div>
+    <div class="pnl-sum-stat">
+      <div class="pnl-sum-label">🔴 In Loss</div>
+      <div class="pnl-sum-value upnl-severe" id="pnl-losers">—</div>
+    </div>
+    <div class="pnl-sum-stat">
+      <div class="pnl-sum-label">Total Unrealised</div>
+      <div class="pnl-sum-value" id="pnl-total-unreal">—</div>
     </div>
   </div>
 
@@ -903,6 +954,14 @@
     return `<span class="overnight-badge ${cls}">${sign}${pct.toFixed(1)}% overnight</span>`;
   }
 
+  function pnlClass(pct) {
+    if (pct == null) return '';
+    if (pct >= 0)    return 'upnl-profit';
+    if (pct > -20)   return 'upnl-small-loss';
+    if (pct > -50)   return 'upnl-loss';
+    return 'upnl-severe';
+  }
+
   function topHoldingCardHtml(h, index, totalValue) {
     const pct   = totalValue > 0 ? (h.valueUSD / totalValue * 100).toFixed(1) : '0';
     const sym   = h.symbol || `${h.currency}-USD`;
@@ -910,6 +969,9 @@
     const overnight = h.overnightChangePct != null
       ? `<span class="overnight-badge ${h.overnightChangePct >= 0 ? 'pos' : 'neg'}">${h.overnightChangePct >= 0 ? '+' : ''}${h.overnightChangePct.toFixed(1)}% overnight</span>`
       : '';
+    const pnlLine = (h.entryPrice != null && h.unrealisedPnlPct != null)
+      ? `<div class="hc-pnl-line ${pnlClass(h.unrealisedPnlPct)}">Entry: ${fmtPrice(h.entryPrice)} | Now: ${fmtPrice(price)} | ${h.unrealisedPnlPct >= 0 ? '+' : ''}${h.unrealisedPnlPct.toFixed(1)}% (${h.unrealisedPnlUsd >= 0 ? '+' : ''}${fmt(h.unrealisedPnlUsd)}) ${h.unrealisedPnlPct >= 0 ? '🟢' : '🔴'}</div>`
+      : `<div class="entry-inline"><span style="color:var(--text-muted);font-size:0.75rem">No entry set</span> <button class="btn-outline btn-sm" onclick="showQuickEntry('${h.currency}')">Set entry</button><div class="alert-inline" id="quick-entry-${h.currency}" style="display:none"><input type="number" id="qe-input-${h.currency}" placeholder="Entry $" step="any" class="threshold-input" style="width:90px"><button class="btn-accent btn-sm" onclick="submitQuickEntry('${sym}','${h.currency}')">SET</button><button class="btn-outline btn-sm" onclick="hideQuickEntry('${h.currency}')">✕</button></div></div>`;
     return `
       <div class="hc-top">
         <div class="hc-main">
@@ -927,6 +989,7 @@
             ${overnight}
           </div>
         </div>
+        ${pnlLine}
         <div class="hc-actions">
           <button class="btn-outline btn-sm" onclick="showSetAlert('${sym}','${h.currency}',${price})">🔔 Set Alert</button>
           <div class="alert-inline" id="alert-inline-${h.currency}" style="display:none">
@@ -940,9 +1003,14 @@
   }
 
   function otherHoldingRowHtml(h) {
+    const sym = h.symbol || `${h.currency}-USD`;
     const overnight = h.overnightChangePct != null
       ? `<span class="overnight-badge ${h.overnightChangePct >= 0 ? 'pos' : 'neg'}">${h.overnightChangePct >= 0 ? '+' : ''}${h.overnightChangePct.toFixed(1)}%</span>`
       : '';
+    const pnlBadge = (h.entryPrice != null && h.unrealisedPnlPct != null)
+      ? `<span class="${pnlClass(h.unrealisedPnlPct)}" style="font-size:0.78rem;font-weight:600">${h.unrealisedPnlPct >= 0 ? '+' : ''}${h.unrealisedPnlPct.toFixed(1)}%</span>`
+      : `<button class="btn-outline btn-sm" style="font-size:0.7rem;padding:2px 6px" onclick="showQuickEntry('${h.currency}')">Set entry</button>`;
+    const quickEntryForm = `<div class="alert-inline" id="quick-entry-${h.currency}" style="display:none;padding:6px 0"><input type="number" id="qe-input-${h.currency}" placeholder="Entry $" step="any" class="threshold-input" style="width:90px"><button class="btn-accent btn-sm" onclick="submitQuickEntry('${sym}','${h.currency}')">SET</button><button class="btn-outline btn-sm" onclick="hideQuickEntry('${h.currency}')">✕</button></div>`;
     return `
       <div class="holding-row">
         <div class="holding-left">
@@ -952,17 +1020,22 @@
             <div class="coin-price">${fmtPrice(h.price)}</div>
           </div>
         </div>
-        <div style="display:flex;align-items:center;gap:8px">
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
           <div class="coin-value">${fmt(h.valueUSD)}</div>
           ${overnight}
+          ${pnlBadge}
         </div>
-      </div>`;
+      </div>
+      ${quickEntryForm}`;
   }
 
   function dustHoldingRowHtml(h) {
     const sym   = h.symbol || `${h.currency}-USD`;
     const price = h.price || 0;
     const qty   = (h.available || 0).toLocaleString('en-US', { maximumFractionDigits: 0 });
+    const pnlBit = (h.entryPrice != null && h.unrealisedPnlPct != null)
+      ? `<span class="${pnlClass(h.unrealisedPnlPct)}" style="font-size:0.75rem">${h.unrealisedPnlPct >= 0 ? '+' : ''}${h.unrealisedPnlPct.toFixed(1)}%</span>`
+      : '';
     return `
       <div class="holding-row" style="opacity:0.75">
         <div class="holding-left">
@@ -974,6 +1047,7 @@
         </div>
         <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
           <div class="coin-value" style="color:var(--text-muted);font-size:0.85rem">${fmt(h.valueUSD)}</div>
+          ${pnlBit}
           <button class="btn-outline btn-sm" title="Set buy alert" onclick="showDustAlert('${sym}','${h.currency}',${price})">🔔</button>
           <button class="btn-outline btn-sm" title="Research" onclick="researchDust('${h.currency}')">🔍</button>
         </div>
@@ -1119,6 +1193,46 @@
       beEl.textContent = '✅ In profit';
       beEl.className = 'cap-stat-value pnl-pos';
     }
+  }
+
+  function renderPnlSummary(balances) {
+    const bar = document.getElementById('pnl-summary-bar');
+    if (!bar) return;
+    const tracked = (balances || []).filter(h => h.unrealisedPnlPct != null && !STABLE_COINS.includes(h.currency));
+    if (tracked.length === 0) { bar.style.display = 'none'; return; }
+    bar.style.display = '';
+    const winners   = tracked.filter(h => h.unrealisedPnlPct >= 0);
+    const losers    = tracked.filter(h => h.unrealisedPnlPct < 0);
+    const totalUSD  = tracked.reduce((s, h) => s + (h.unrealisedPnlUsd || 0), 0);
+    document.getElementById('pnl-tracked').textContent       = tracked.length;
+    document.getElementById('pnl-winners').textContent       = winners.length;
+    document.getElementById('pnl-losers').textContent        = losers.length;
+    const totalEl = document.getElementById('pnl-total-unreal');
+    totalEl.textContent = `${totalUSD >= 0 ? '+' : ''}${fmt(totalUSD)}`;
+    totalEl.className   = 'pnl-sum-value ' + (totalUSD >= 0 ? 'upnl-profit' : 'upnl-severe');
+  }
+
+  function showQuickEntry(coinBase) {
+    const el = document.getElementById(`quick-entry-${coinBase}`);
+    if (el) el.style.display = 'flex';
+  }
+  function hideQuickEntry(coinBase) {
+    const el = document.getElementById(`quick-entry-${coinBase}`);
+    if (el) el.style.display = 'none';
+  }
+  async function submitQuickEntry(sym, coinBase) {
+    const input = document.getElementById(`qe-input-${coinBase}`);
+    const val = parseFloat(input ? input.value : '');
+    if (!val || val <= 0) { showToast('Enter a valid price > 0', 'error'); return; }
+    try {
+      await apiFetch('POST', `/api/entryprices/${sym}`, { entry_price: val });
+      entryPricesData = await apiFetch('GET', '/api/entryprices').catch(() => entryPricesData);
+      hideQuickEntry(coinBase);
+      showToast(`✅ Entry price for ${coinBase} set to $${val}`, 'success');
+      balancesData = (await apiFetch('GET', '/api/balances').catch(() => ({ balances: balancesData }))).balances || balancesData;
+      renderHoldings(balancesData);
+      renderPnlSummary(balancesData);
+    } catch(e) { showToast('Failed: ' + e.message, 'error'); }
   }
 
   function renderAlerts(activeAlerts) {
@@ -1329,6 +1443,7 @@
     balancesData = data.balances || [];
     document.getElementById('portfolio-value').textContent = fmt(data.totalUSD);
     renderHoldings(balancesData);
+    renderPnlSummary(balancesData);
     return balancesData;
   }
 
@@ -1359,6 +1474,7 @@
       renderMonitorStatus(status.paused);
       renderThresholds(balancesData, statusData, targetsData, entryPricesData);
       if (capital) renderCapitalBar(capital);
+      renderPnlSummary(balancesData);
       const now = new Date();
       document.getElementById('last-updated').textContent =
         'Updated ' + now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });

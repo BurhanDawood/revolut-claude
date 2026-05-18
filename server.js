@@ -1852,7 +1852,10 @@ app.get('/api/balances', async (req, res) => {
       if (valueUSD) totalUSD += valueUSD;
       const prevPrice = histMap[symbol] || null;
       const overnightChangePct = (price && prevPrice) ? ((price - prevPrice) / prevPrice * 100) : null;
-      result.push({ currency: asset.currency, available, price, valueUSD, symbol, overnightChangePct });
+      const entryPrice = (!SKIP_CURRENCIES.includes(asset.currency)) ? (entryPrices.get(symbol) || null) : null;
+      const unrealisedPnlPct = (entryPrice && price) ? ((price - entryPrice) / entryPrice * 100) : null;
+      const unrealisedPnlUsd = (entryPrice && price) ? ((price - entryPrice) * available) : null;
+      result.push({ currency: asset.currency, available, price, valueUSD, symbol, overnightChangePct, entryPrice, unrealisedPnlPct, unrealisedPnlUsd });
     }
     res.json({ balances: result, totalUSD });
   } catch (e) {
@@ -3048,6 +3051,53 @@ app.post('/telegram-webhook', async (req, res) => {
           // Fall through to Claude if logging fails
         }
       }
+    }
+
+    // --- Command: my pnl — unrealised P&L summary ---
+    if (/^my pnl$/i.test(commandText)) {
+      try {
+        const balances = await revolutRequest('GET', '/balances');
+        const tickerResponse = await revolutRequest('GET', '/tickers');
+        const tickerList = Array.isArray(tickerResponse) ? tickerResponse : (tickerResponse.data || []);
+        const priceMap = {};
+        for (const t of tickerList) {
+          if (t.symbol) {
+            const p = parseFloat(t.last_price || t.mid || t.ask || t.bid);
+            if (p) { priceMap[t.symbol] = p; priceMap[t.symbol.replace('/', '-')] = p; }
+          }
+        }
+        const winners = [], losers = [], noEntry = [];
+        let totalPnlUsd = 0;
+        for (const asset of balances) {
+          if (!asset.currency || SKIP_CURRENCIES.includes(asset.currency)) continue;
+          const qty = parseFloat(asset.available);
+          if (qty <= 0) continue;
+          const sym = `${asset.currency}-USD`;
+          const price = priceMap[sym];
+          if (!price) continue;
+          const entry = entryPrices.get(sym);
+          if (!entry) { noEntry.push(asset.currency); continue; }
+          const pnlPct = ((price - entry) / entry * 100);
+          const pnlUsd = (price - entry) * qty;
+          totalPnlUsd += pnlUsd;
+          const sign = pnlPct >= 0 ? '+' : '';
+          const line = `• ${asset.currency}: ${sign}${pnlPct.toFixed(1)}% (${pnlUsd >= 0 ? '+' : ''}$${Math.abs(pnlUsd).toFixed(2)})`;
+          (pnlPct >= 0 ? winners : losers).push({ line, pnlPct });
+        }
+        winners.sort((a, b) => b.pnlPct - a.pnlPct);
+        losers.sort((a, b) => a.pnlPct - b.pnlPct);
+        const totalSign = totalPnlUsd >= 0 ? '+' : '';
+        const pnlMsg =
+          `📊 <b>UNREALISED P&L SUMMARY</b>\n\n` +
+          (winners.length ? `🟢 <b>In profit (${winners.length}):</b>\n${winners.map(w => w.line).join('\n')}\n\n` : '') +
+          (losers.length ? `🔴 <b>In loss (${losers.length}):</b>\n${losers.map(l => l.line).join('\n')}\n\n` : '') +
+          `⚪ No entry set: ${noEntry.length} coins\n` +
+          `💰 Total unrealised (tracked): ${totalSign}$${Math.abs(totalPnlUsd).toFixed(2)}`;
+        await sendReply(pnlMsg);
+      } catch (e) {
+        await sendReply(`❌ Failed to get P&L: ${e.message}`);
+      }
+      return res.status(200).json({ ok: true });
     }
 
     // --- Command: i prefer TEXT ---
