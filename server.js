@@ -80,39 +80,30 @@ async function editTelegramMessage(chatId, messageId, text) {
   });
 }
 
-async function sendTelegramChunked(chatId, text, messageId = null) {
-  // Split on major markdown section headers so the intro is never lost
-  const sections = text.split(/(?=\n## |\n### )/);
-
+async function sendTelegramChunked(text) {
+  const maxLen = 3800;
   const chunks = [];
-  let currentChunk = '';
+  let remaining = text.trim();
 
-  for (const section of sections) {
-    if ((currentChunk + section).length > 3500) {
-      if (currentChunk.trim()) chunks.push(currentChunk.trim());
-      currentChunk = section;
-    } else {
-      currentChunk += section;
+  while (remaining.length > 0) {
+    if (remaining.length <= maxLen) {
+      chunks.push(remaining);
+      break;
     }
+    let splitAt = remaining.lastIndexOf('\n\n', maxLen);
+    if (splitAt === -1) splitAt = remaining.lastIndexOf('\n', maxLen);
+    if (splitAt === -1) splitAt = maxLen;
+    chunks.push(remaining.substring(0, splitAt).trim());
+    remaining = remaining.substring(splitAt).trim();
   }
-  if (currentChunk.trim()) chunks.push(currentChunk.trim());
 
-  console.log('Sending', chunks.length, 'chunks');
-  console.log('First chunk starts:', chunks[0]?.substring(0, 100));
+  console.log('Total chunks:', chunks.length, 'First 100 chars:', chunks[0]?.substring(0, 100));
 
   for (let i = 0; i < chunks.length; i++) {
-    if (i === 0 && messageId) {
-      // Edit the status message in-place with the first chunk
-      await editTelegramMessage(chatId, messageId, chunks[0]);
-      console.log('Edited status message with chunk 1 of', chunks.length);
-    } else {
-      const prefix = i > 0 ? '📄 *(continued)*\n\n' : '';
-      await sendTelegramMessage(chatId, prefix + chunks[i]);
-      console.log('Sent chunk', i + 1, 'of', chunks.length);
-    }
-    if (i < chunks.length - 1) {
-      await new Promise(r => setTimeout(r, 2000));
-    }
+    const prefix = i > 0 ? '📄 **(continued...)**\n\n' : '';
+    await sendTelegram(prefix + chunks[i]);
+    console.log('Sent chunk', i + 1, 'of', chunks.length);
+    await new Promise(r => setTimeout(r, 3000));
   }
 }
 
@@ -619,7 +610,7 @@ Keep total response under 900 characters.`
 async function updateLearningModel() {
   try {
     const [trades] = await db.execute(
-      'SELECT * FROM trading_journal WHERE outcome IS NOT NULL AND outcome_pnl IS NOT NULL ORDER BY created_at DESC LIMIT 200'
+      "SELECT * FROM trading_journal WHERE outcome IS NOT NULL AND outcome_pnl IS NOT NULL AND action != 'payment' ORDER BY created_at DESC LIMIT 200"
     );
     if (trades.length < 3) {
       learningModelCache = '';
@@ -692,11 +683,11 @@ async function updateLearningModel() {
 async function getLearningContext() {
   try {
     const [recentTrades] = await db.execute(
-      'SELECT * FROM trading_journal ORDER BY created_at DESC LIMIT 10'
+      "SELECT * FROM trading_journal WHERE action != 'payment' ORDER BY created_at DESC LIMIT 10"
     );
     const [profileRows] = await db.execute('SELECT preference_key, preference_value FROM trader_profile');
     const [completedTrades] = await db.execute(
-      'SELECT outcome_pnl FROM trading_journal WHERE outcome_pnl IS NOT NULL'
+      "SELECT outcome_pnl FROM trading_journal WHERE outcome_pnl IS NOT NULL AND action != 'payment'"
     );
 
     if (recentTrades.length === 0 && profileRows.length === 0 && completedTrades.length === 0) return '';
@@ -968,7 +959,8 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
       `1️⃣ Why did you make this trade?\n` +
       `2️⃣ Feeling: confident / uncertain / fomo / fearful / neutral\n\n` +
       `Reply: '<b>${coinBase.toLowerCase()} reason [why], [emotion]</b>'\n` +
-      `Or: '<b>${coinBase.toLowerCase()} skip</b>' to log without details\n\n` +
+      `Or: '<b>${coinBase.toLowerCase()} skip</b>' to log without details\n` +
+      `Or: '<b>${coinBase.toLowerCase()} payment</b>' to log as a payment (excluded from stats)\n\n` +
       `⏰ Will auto-log in 30 minutes if no reply.`;
     await sendTelegram(msg);
 
@@ -1370,7 +1362,7 @@ app.delete('/api/targets/:symbol', async (req, res) => {
 // GET /api/journal/stats — compute stats from trading_journal
 app.get('/api/journal/stats', async (req, res) => {
   try {
-    const [all] = await db.execute('SELECT * FROM trading_journal');
+    const [all] = await db.execute("SELECT * FROM trading_journal WHERE action != 'payment'");
     const completed = all.filter(t => t.outcome_pnl != null);
     const total_trades = all.length;
     const wins = completed.filter(t => parseFloat(t.outcome_pnl) > 0);
@@ -1677,6 +1669,22 @@ app.post('/telegram-webhook', async (req, res) => {
         if (!isKnownCommand) {
           matchedPending.push({ symbol, pending, skip: false });
         }
+      }
+
+      // --- Payment detection: "[coin] payment" ---
+      const paymentMatch = matchedPending.find(m => lowerMsg.includes('payment'));
+      if (paymentMatch) {
+        const { symbol, pending } = paymentMatch;
+        const coinBase = symbol.replace('-USD', '');
+        clearTimeout(pending.timeoutHandle);
+        pendingTradeContext.delete(symbol);
+        await db.execute(
+          'UPDATE trading_journal SET action = ?, reasoning = ?, emotion = ?, notes = ? WHERE id = ?',
+          ['payment', 'Revolut payment made using this asset', 'neutral', 'excluded_from_stats', pending.journalId]
+        );
+        await updateLearningModel().catch(() => {});
+        await sendReply(`✅ <b>${coinBase}</b> logged as payment — excluded from trading stats`);
+        return res.status(200).json({ ok: true });
       }
 
       if (matchedPending.length > 0) {
@@ -2160,10 +2168,11 @@ app.post('/telegram-webhook', async (req, res) => {
     // Capture user message for use inside the async closure
     const userMessage = rawText;
 
-    // 1. Immediately send acknowledgment to Telegram and capture message_id for editing
-    const statusMsgId = await sendTelegramMessage(chatId, '🔍 Researching... give me a moment.');
+    // 1. Send acknowledgment then wait briefly so it arrives before Claude processing starts
+    await sendReply('🔍 Researching... give me a moment.');
+    await new Promise(r => setTimeout(r, 2000));
 
-    // 2. Immediately return 200 to Telegram so it doesn't timeout
+    // 2. Return 200 to Telegram
     res.status(200).json({ ok: true });
 
     // 3. Continue processing the Claude API call asynchronously AFTER responding
@@ -2241,11 +2250,27 @@ app.post('/telegram-webhook', async (req, res) => {
 - Give detailed technical and fundamental analysis
 - Reference specific coins from the user's portfolio
 - Give actionable insights and specific recommendations
-- Format responses clearly with headers and bullet points
+- ALWAYS start your response with a 1-2 line plain-text summary of your key conclusion BEFORE any headers or bullet points
+- Format the rest of the response clearly with headers and bullet points
 - Be thorough and comprehensive
 - Always consider macro conditions, Bitcoin dominance, and market sentiment
 - Keep responses under 4000 characters total
 - End with a one line disclaimer only
+
+IMPORTANT TRADER CONTEXT:
+- Bryan's portfolio is approximately 50% down from historical highs due to bear market conditions and past trading decisions
+- Many individual positions are down 50-80% from entry
+- Bryan's PRIMARY GOAL is portfolio recovery and becoming a more disciplined trader
+- Bryan is learning to be a better swing trader — buying dips and selling pumps
+- Some balance changes detected are Revolut payments (asset used to make purchases) not trading decisions
+- When giving advice, always consider recovery strategy not just short term gains
+- Encourage disciplined trading habits and risk management
+- Be honest about positions that may not recover and suggest better opportunities
+- Celebrate good trading decisions to reinforce positive patterns
+- For positions down 50%+: acknowledge the loss honestly and advise whether to cut or hold for recovery
+- For positions doing well (CC, HYPE, LINK): emphasise protecting and growing these gains
+- Always consider overall portfolio recovery in recommendations
+- Suggest position sizing that protects the recovering portfolio
 
 ${holdingsList}
 
@@ -2257,12 +2282,12 @@ Active alerts (coins currently above threshold): ${Object.keys(activeAlerts).joi
           setTimeout(() => reject(new Error('timeout')), 110000)
         );
 
-        // Edit the status message after 15 seconds if still processing
+        // Send follow-up after 20 seconds if still processing
         stillResearchingTimer = setTimeout(async () => {
           try {
-            await editTelegramMessage(chatId, statusMsgId, '⏳ Still researching, almost there...');
+            await sendReply('⏳ Still researching, almost there...');
           } catch (e) { /* ignore */ }
-        }, 15000);
+        }, 20000);
 
         const response = await Promise.race([claudePromise, timeoutPromise]);
         clearTimeout(stillResearchingTimer);
@@ -2333,18 +2358,16 @@ Active alerts (coins currently above threshold): ${Object.keys(activeAlerts).joi
           }
         }
 
-        // Send Claude's reply — edits the status message for chunk 1, new messages for subsequent chunks
-        await sendTelegramChunked(chatId, reply + (actionTaken || ''), statusMsgId);
+        // 3s gap after status message so chunks don't collide with it
+        await new Promise(r => setTimeout(r, 3000));
+        await sendTelegramChunked(reply + (actionTaken || ''));
       } catch (err) {
         console.error('Claude AI error:', err.message);
         clearTimeout(stillResearchingTimer);
-        const errMsg = err.message === 'timeout'
-          ? '⏱️ That analysis is taking too long. Try asking something more specific or break it into smaller questions.'
-          : '❌ Error getting AI response: ' + err.message;
-        if (statusMsgId) {
-          await editTelegramMessage(chatId, statusMsgId, errMsg).catch(() => sendTelegramMessage(chatId, errMsg));
+        if (err.message === 'timeout') {
+          await sendReply('⏱️ That analysis is taking too long. Try asking something more specific or break it into smaller questions.');
         } else {
-          await sendTelegramMessage(chatId, errMsg);
+          await sendReply('❌ Error getting AI response: ' + err.message);
         }
       }
     })();
@@ -2365,6 +2388,24 @@ app.get('/telegram-setup', async (req, res) => {
   const data = await response.json();
   res.json(data);
 });
+
+// Seed default trader profile entries if not already set
+const TRADER_PROFILE_DEFAULTS = [
+  { key: 'goal',      value: 'Recover portfolio losses and become a disciplined profitable swing trader' },
+  { key: 'situation', value: 'Portfolio approximately 50% down from historical highs' },
+  { key: 'style',     value: 'Swing trader - buy dips sell pumps' },
+  { key: 'weakness',  value: 'Past trading decisions led to significant losses - working to improve discipline' },
+  { key: 'strength',  value: 'Good instincts on institutional plays like CC and LINK' },
+];
+(async () => {
+  for (const { key, value } of TRADER_PROFILE_DEFAULTS) {
+    await db.execute(
+      'INSERT INTO trader_profile (preference_key, preference_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE preference_key = preference_key',
+      [key, value]
+    ).catch(() => {});
+  }
+  console.log('Trader profile defaults seeded.');
+})();
 
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
