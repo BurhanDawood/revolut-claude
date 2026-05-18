@@ -109,58 +109,71 @@
       letter-spacing: -0.02em;
     }
 
-    /* Holdings table */
-    .holdings-list {
-      display: flex;
-      flex-direction: column;
-      gap: 10px;
-    }
+    /* ── Holdings list container ────────────────────────────────────────────── */
+    .holdings-list { display: flex; flex-direction: column; gap: 10px; }
 
-    .holding-row {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 10px;
-      padding: 10px 12px;
-      background: var(--surface2);
-      border-radius: 8px;
-    }
-
-    .holding-left {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-    }
-
+    /* ── Shared coin icon ────────────────────────────────────────────────────── */
     .coin-icon {
-      width: 32px;
-      height: 32px;
-      border-radius: 50%;
+      width: 34px; height: 34px; border-radius: 50%;
       background: var(--accent-dim);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-size: 0.65rem;
-      font-weight: 700;
-      color: var(--accent);
-      flex-shrink: 0;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 0.62rem; font-weight: 700; color: var(--accent); flex-shrink: 0;
+    }
+    .coin-symbol { font-weight: 600; font-size: 0.95rem; }
+    .coin-price  { font-size: 0.75rem; color: var(--text-muted); }
+    .coin-value  { font-weight: 600; font-size: 0.95rem; text-align: right; }
+
+    /* ── Top-5 highlight cards ──────────────────────────────────────────────── */
+    .hc-top {
+      background: var(--surface2);
+      border-radius: 10px;
+      padding: 12px 14px;
+      border-left: 3px solid var(--accent);
+    }
+    .hc-main {
+      display: flex; align-items: center;
+      justify-content: space-between; gap: 10px;
+    }
+    .hc-left  { display: flex; align-items: center; gap: 10px; }
+    .hc-medal { font-size: 1.1rem; line-height: 1; min-width: 22px; }
+    .hc-right { text-align: right; }
+    .hc-value { font-weight: 700; font-size: 1.05rem; color: var(--accent); }
+    .hc-portfolio-pct { font-size: 0.72rem; color: var(--text-muted); }
+    .hc-actions {
+      display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+      margin-top: 8px; padding-top: 8px;
+      border-top: 1px solid rgba(255,255,255,0.05);
     }
 
-    .coin-symbol {
-      font-weight: 600;
-      font-size: 0.95rem;
+    /* ── Overnight badge ─────────────────────────────────────────────────────── */
+    .overnight-badge {
+      display: inline-block; font-size: 0.72rem; font-weight: 600;
+      padding: 2px 7px; border-radius: 4px;
+    }
+    .overnight-badge.pos { background: rgba(0,255,200,0.12); color: var(--accent); }
+    .overnight-badge.neg { background: rgba(255,77,106,0.12); color: var(--danger); }
+
+    /* ── Inline alert form ───────────────────────────────────────────────────── */
+    .alert-inline {
+      display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+      font-size: 0.8rem; color: var(--text-muted);
     }
 
-    .coin-price {
-      font-size: 0.78rem;
-      color: var(--text-muted);
+    /* ── Other holdings row ──────────────────────────────────────────────────── */
+    .holding-row {
+      display: flex; align-items: center;
+      justify-content: space-between; gap: 10px;
+      padding: 10px 12px; background: var(--surface2); border-radius: 8px;
     }
+    .holding-left { display: flex; align-items: center; gap: 10px; }
 
-    .coin-value {
-      font-weight: 600;
-      font-size: 0.95rem;
-      text-align: right;
+    /* ── Dust link / toggle ──────────────────────────────────────────────────── */
+    .dust-link {
+      background: none; border: none; color: var(--text-muted);
+      font-size: 0.8rem; cursor: pointer; text-decoration: underline;
+      padding: 4px 0; font-family: inherit;
     }
+    .dust-link:hover { color: var(--accent); }
 
     /* Alerts */
     .alerts-list {
@@ -363,42 +376,26 @@
     .cap-stat-value.pnl-pos { color: var(--accent); }
     .cap-stat-value.break-even { color: var(--warn); font-size: 0.95rem; }
 
-    /* Holdings toggle */
+    /* ── Section toggle button ───────────────────────────────────────────────── */
     .holdings-toggle-btn {
-      width: 100%;
-      background: var(--surface2);
-      color: var(--accent);
-      border: 1px solid rgba(0, 255, 200, 0.2);
-      border-radius: 8px;
-      padding: 10px 16px;
-      font-size: 0.82rem;
-      font-weight: 600;
-      text-align: left;
-      margin-top: 12px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      cursor: pointer;
-      transition: background 0.15s, border-color 0.15s;
-      letter-spacing: 0.01em;
+      width: 100%; background: var(--surface2); color: var(--accent);
+      border: 1px solid rgba(0,255,200,0.2); border-radius: 8px;
+      padding: 10px 16px; font-size: 0.82rem; font-weight: 600;
+      text-align: left; margin-top: 12px;
+      display: flex; align-items: center; justify-content: space-between;
+      cursor: pointer; transition: background 0.15s, border-color 0.15s;
     }
     .holdings-toggle-btn:hover { background: var(--accent-dim); border-color: var(--accent); }
     .holdings-toggle-btn:active { transform: scale(0.99); }
 
     .holdings-full-list {
-      overflow: hidden;
-      max-height: 0;
-      transition: max-height 0.4s ease;
+      overflow: hidden; max-height: 0; transition: max-height 0.4s ease;
     }
     .holdings-full-list.expanded {
-      max-height: 8000px;
-      transition: max-height 0.6s ease;
+      max-height: 8000px; transition: max-height 0.6s ease;
     }
     .holdings-full-list-inner {
-      padding-top: 10px;
-      display: flex;
-      flex-direction: column;
-      gap: 10px;
+      padding-top: 10px; display: flex; flex-direction: column; gap: 10px;
     }
 
     .toast {
@@ -893,17 +890,100 @@
 
   // ── Portfolio Render ──────────────────────────────────────────────────────
 
-  function holdingRowHtml(h) {
+  // ── Holdings rendering ────────────────────────────────────────────────────
+
+  const DUST_USD = 5;
+  const MEDALS = ['🥇','🥈','🥉','4️⃣','5️⃣'];
+  const STABLE_COINS = ['USD','USDT','USDC','EUR','GBP'];
+
+  function overnightBadge(pct) {
+    if (pct == null) return '';
+    const sign = pct >= 0 ? '+' : '';
+    const cls  = pct >= 0 ? 'pos' : 'neg';
+    return `<span class="overnight-badge ${cls}">${sign}${pct.toFixed(1)}% overnight</span>`;
+  }
+
+  function topHoldingCardHtml(h, index, totalValue) {
+    const pct   = totalValue > 0 ? (h.valueUSD / totalValue * 100).toFixed(1) : '0';
+    const sym   = h.symbol || `${h.currency}-USD`;
+    const price = h.price || 0;
+    const overnight = h.overnightChangePct != null
+      ? `<span class="overnight-badge ${h.overnightChangePct >= 0 ? 'pos' : 'neg'}">${h.overnightChangePct >= 0 ? '+' : ''}${h.overnightChangePct.toFixed(1)}% overnight</span>`
+      : '';
+    return `
+      <div class="hc-top">
+        <div class="hc-main">
+          <div class="hc-left">
+            <span class="hc-medal">${MEDALS[index]}</span>
+            <div class="coin-icon">${h.currency.slice(0,3)}</div>
+            <div>
+              <div class="coin-symbol">${h.currency}</div>
+              <div class="coin-price">${fmtPrice(price)}</div>
+            </div>
+          </div>
+          <div class="hc-right">
+            <div class="hc-value">${fmt(h.valueUSD)}</div>
+            <div class="hc-portfolio-pct">${pct}% of portfolio</div>
+            ${overnight}
+          </div>
+        </div>
+        <div class="hc-actions">
+          <button class="btn-outline btn-sm" onclick="showSetAlert('${sym}','${h.currency}',${price})">🔔 Set Alert</button>
+          <div class="alert-inline" id="alert-inline-${h.currency}" style="display:none">
+            <input type="number" id="alert-pct-${h.currency}" value="10" min="1" max="1000" step="0.5" class="threshold-input" style="width:65px">
+            <span>% from now</span>
+            <button class="btn-accent btn-sm" onclick="submitSetAlert('${sym}','${h.currency}',${price})">Set</button>
+            <button class="btn-outline btn-sm" onclick="hideSetAlert('${h.currency}')">✕</button>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  function otherHoldingRowHtml(h) {
+    const overnight = h.overnightChangePct != null
+      ? `<span class="overnight-badge ${h.overnightChangePct >= 0 ? 'pos' : 'neg'}">${h.overnightChangePct >= 0 ? '+' : ''}${h.overnightChangePct.toFixed(1)}%</span>`
+      : '';
     return `
       <div class="holding-row">
         <div class="holding-left">
-          <div class="coin-icon">${h.currency.slice(0, 3)}</div>
+          <div class="coin-icon">${h.currency.slice(0,3)}</div>
           <div>
             <div class="coin-symbol">${h.currency}</div>
             <div class="coin-price">${fmtPrice(h.price)}</div>
           </div>
         </div>
-        <div class="coin-value">${fmt(h.valueUSD)}</div>
+        <div style="display:flex;align-items:center;gap:8px">
+          <div class="coin-value">${fmt(h.valueUSD)}</div>
+          ${overnight}
+        </div>
+      </div>`;
+  }
+
+  function dustHoldingRowHtml(h) {
+    const sym   = h.symbol || `${h.currency}-USD`;
+    const price = h.price || 0;
+    const qty   = (h.available || 0).toLocaleString('en-US', { maximumFractionDigits: 0 });
+    return `
+      <div class="holding-row" style="opacity:0.75">
+        <div class="holding-left">
+          <div class="coin-icon" style="background:rgba(136,136,136,0.1);color:var(--text-muted)">${h.currency.slice(0,3)}</div>
+          <div>
+            <div class="coin-symbol" style="font-size:0.85rem">${h.currency}</div>
+            <div class="coin-price">${fmtPrice(price)} × ${qty}</div>
+          </div>
+        </div>
+        <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+          <div class="coin-value" style="color:var(--text-muted);font-size:0.85rem">${fmt(h.valueUSD)}</div>
+          <button class="btn-outline btn-sm" title="Set buy alert" onclick="showDustAlert('${sym}','${h.currency}',${price})">🔔</button>
+          <button class="btn-outline btn-sm" title="Research" onclick="researchDust('${h.currency}')">🔍</button>
+        </div>
+      </div>
+      <div class="alert-inline" id="dust-alert-${h.currency}" style="display:none;padding:8px 12px;background:var(--surface2);border-radius:8px;margin-top:-6px;margin-bottom:4px">
+        <span>Alert when ${h.currency} rises</span>
+        <input type="number" id="dust-pct-${h.currency}" value="20" min="1" max="10000" step="1" class="threshold-input" style="width:65px">
+        <span>% from now</span>
+        <button class="btn-accent btn-sm" onclick="submitDustAlert('${sym}','${h.currency}',${price})">Set</button>
+        <button class="btn-outline btn-sm" onclick="hideDustAlert('${h.currency}')">✕</button>
       </div>`;
   }
 
@@ -913,41 +993,112 @@
       el.innerHTML = '<div class="empty-state">No holdings found.</div>';
       return;
     }
-    const sorted = [...balances].sort((a, b) => (b.valueUSD || 0) - (a.valueUSD || 0));
-    const top3 = sorted.slice(0, 3);
-    const rest  = sorted.slice(3);
 
-    // Read stored preference — default collapsed
-    let isExpanded = false;
-    try { isExpanded = localStorage.getItem('holdingsExpanded') === 'true'; } catch(e) {}
+    const coins = balances
+      .filter(h => h.valueUSD != null && !STABLE_COINS.includes(h.currency))
+      .sort((a, b) => (b.valueUSD || 0) - (a.valueUSD || 0));
 
-    const arrowLabel = isExpanded ? '▲ Hide' : '▼ Show';
-    const expandedClass = isExpanded ? ' expanded' : '';
+    const significant = coins.filter(h => (h.valueUSD || 0) >= DUST_USD);
+    const dust        = coins.filter(h => (h.valueUSD || 0) <  DUST_USD);
+    const top5        = significant.slice(0, 5);
+    const others      = significant.slice(5);
+    const totalValue  = significant.reduce((s, h) => s + (h.valueUSD || 0), 0);
 
-    el.innerHTML = `
-      <div class="holdings-top3">${top3.map(holdingRowHtml).join('')}</div>
-      ${rest.length > 0 ? `
-        <button class="holdings-toggle-btn" onclick="toggleHoldingsList()" id="holdings-toggle">
-          <span>📋 All Holdings (${sorted.length} assets)</span>
-          <span id="holdings-toggle-arrow">${arrowLabel}</span>
+    let othersExpanded = false, dustExpanded = false;
+    try { othersExpanded = localStorage.getItem('holdingsOthersExpanded') === 'true'; } catch(e) {}
+    try { dustExpanded   = localStorage.getItem('holdingsDustExpanded')   === 'true'; } catch(e) {}
+
+    const top5Html = top5.map((h, i) => topHoldingCardHtml(h, i, totalValue)).join('');
+
+    const othersHtml = others.length > 0 ? `
+      <button class="holdings-toggle-btn" onclick="toggleOtherHoldings()" id="others-toggle">
+        <span>📋 Other Holdings (${others.length} assets)</span>
+        <span id="others-toggle-arrow">${othersExpanded ? '▲ Hide' : '▼ Show'}</span>
+      </button>
+      <div class="holdings-full-list${othersExpanded ? ' expanded' : ''}" id="holdings-others-list">
+        <div class="holdings-full-list-inner">${others.map(otherHoldingRowHtml).join('')}</div>
+      </div>` : '';
+
+    const dustHtml = dust.length > 0 ? `
+      <div style="margin-top:14px;text-align:center">
+        <button class="dust-link" onclick="toggleDustSection()">
+          🔍 View dust positions (${dust.length} coins) <span id="dust-toggle-arrow">${dustExpanded ? '▲' : '▼'}</span>
         </button>
-        <div class="holdings-full-list${expandedClass}" id="holdings-full-list">
-          <div class="holdings-full-list-inner">
-            ${rest.map(holdingRowHtml).join('')}
-          </div>
-        </div>
-      ` : ''}
-    `;
+      </div>
+      <div class="holdings-full-list${dustExpanded ? ' expanded' : ''}" id="holdings-dust-list">
+        <div class="holdings-full-list-inner">${dust.map(dustHoldingRowHtml).join('')}</div>
+      </div>` : '';
+
+    el.innerHTML = top5Html + othersHtml + dustHtml;
   }
 
-  function toggleHoldingsList() {
-    const list = document.getElementById('holdings-full-list');
-    const arrow = document.getElementById('holdings-toggle-arrow');
+  // ── Holdings toggle handlers ──────────────────────────────────────────────
+
+  function toggleOtherHoldings() {
+    const list  = document.getElementById('holdings-others-list');
+    const arrow = document.getElementById('others-toggle-arrow');
     if (!list) return;
     const expanding = !list.classList.contains('expanded');
     list.classList.toggle('expanded', expanding);
     if (arrow) arrow.textContent = expanding ? '▲ Hide' : '▼ Show';
-    try { localStorage.setItem('holdingsExpanded', String(expanding)); } catch(e) {}
+    try { localStorage.setItem('holdingsOthersExpanded', String(expanding)); } catch(e) {}
+  }
+
+  function toggleDustSection() {
+    const list  = document.getElementById('holdings-dust-list');
+    const arrow = document.getElementById('dust-toggle-arrow');
+    if (!list) return;
+    const expanding = !list.classList.contains('expanded');
+    list.classList.toggle('expanded', expanding);
+    if (arrow) arrow.textContent = expanding ? '▲' : '▼';
+    try { localStorage.setItem('holdingsDustExpanded', String(expanding)); } catch(e) {}
+  }
+
+  // ── Alert inline controls ─────────────────────────────────────────────────
+
+  function showSetAlert(sym, coinBase, price) {
+    document.getElementById(`alert-inline-${coinBase}`).style.display = 'flex';
+  }
+  function hideSetAlert(coinBase) {
+    document.getElementById(`alert-inline-${coinBase}`).style.display = 'none';
+  }
+  async function submitSetAlert(sym, coinBase, currentPrice) {
+    const pct = parseFloat(document.getElementById(`alert-pct-${coinBase}`).value);
+    if (!pct || pct <= 0) { showToast('Enter a valid % > 0', 'error'); return; }
+    try {
+      await apiFetch('POST', `/api/targets/${sym}`, { threshold_pct: pct });
+      hideSetAlert(coinBase);
+      const target = (currentPrice * (1 + pct / 100));
+      showToast(`✅ Alert set for ${coinBase} — up ${pct}% → ${fmtPrice(target)}`, 'success');
+      targetsData = await apiFetch('GET', '/api/targets').catch(() => targetsData);
+    } catch (e) { showToast('Failed: ' + e.message, 'error'); }
+  }
+
+  function showDustAlert(sym, coinBase, price) {
+    document.getElementById(`dust-alert-${coinBase}`).style.display = 'flex';
+  }
+  function hideDustAlert(coinBase) {
+    document.getElementById(`dust-alert-${coinBase}`).style.display = 'none';
+  }
+  async function submitDustAlert(sym, coinBase, currentPrice) {
+    const pct = parseFloat(document.getElementById(`dust-pct-${coinBase}`).value);
+    if (!pct || pct <= 0) { showToast('Enter a valid %', 'error'); return; }
+    try {
+      await apiFetch('POST', `/api/targets/${sym}`, { threshold_pct: pct });
+      hideDustAlert(coinBase);
+      const target = currentPrice * (1 + pct / 100);
+      showToast(`✅ Alert set for ${coinBase} — up ${pct}% from ${fmtPrice(currentPrice)} → ${fmtPrice(target)}`, 'success');
+      targetsData = await apiFetch('GET', '/api/targets').catch(() => targetsData);
+    } catch (e) { showToast('Failed: ' + e.message, 'error'); }
+  }
+
+  async function researchDust(coinBase) {
+    try {
+      await apiFetch('POST', '/api/research-dust', { coin: coinBase });
+      showToast(`📊 Research on ${coinBase} sent to Telegram`, 'success');
+    } catch(e) {
+      showToast(`Type "research ${coinBase}" in Telegram`, '');
+    }
   }
 
   function renderCapitalBar(cap) {

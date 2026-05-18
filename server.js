@@ -1681,15 +1681,36 @@ async function checkPortfolio() {
       if (direction === 'up' && currentPrice >= target.targetPrice && !activeFixedAlerts[symbol]) {
         const changePct = ((currentPrice - target.anchorPrice) / target.anchorPrice) * 100;
         const coinBase = symbol.replace('-USD', '');
+
+        // Check if this is a dust coin (balance < $5)
+        const assetBalance = balances.find(a => a.currency === coinBase);
+        const assetQty = assetBalance ? parseFloat(assetBalance.available) : 0;
+        const assetValueUSD = assetQty * currentPrice;
+        const isDustCoin = assetValueUSD > 0 && assetValueUSD < 5;
+
         const aiRec = await getQuickAiRecommendation(symbol, changePct, currentPrice, 'up');
+        const priceStr = currentPrice < 0.001 ? currentPrice.toFixed(8) : currentPrice.toFixed(4);
+        const anchorStr = target.anchorPrice < 0.001 ? target.anchorPrice.toFixed(8) : target.anchorPrice.toFixed(4);
         const entryPrice = entryPrices.get(symbol) || target.entryPrice;
-        const entryLine = entryPrice
+        const entryLine = entryPrice && !isDustCoin
           ? `\nEntry: $${entryPrice.toFixed(4)} | P&L: +${((currentPrice - entryPrice) / entryPrice * 100).toFixed(1)}%`
           : '';
-        const replyMenu = `\n\nReply:\n'sell ${coinBase}' - get sell advice\n'buy more ${coinBase}' - get buy advice\n'analyse ${coinBase}' - full analysis\n'acknowledge ${coinBase}' - stop alerts\n'threshold ${coinBase} 15%' - change threshold\n'entry ${coinBase} 0.147' - correct my entry`;
-        const autoReady = await getAutomationReadiness(symbol, 'buy');
-        const autoLine = autoReady ? `\n\n⚡ AUTO-READY: This setup has worked ${autoReady.winRate}% of the time (${autoReady.sampleSize} trades). Could be automated.` : '';
-        const alertMessage = `🎯 <b>${symbol} FIXED TARGET HIT!</b>\n\nAnchor: $${target.anchorPrice.toFixed(4)} → Now $${currentPrice.toFixed(4)} (+${changePct.toFixed(1)}%)${entryLine}\n\n⚡ RECOMMENDATION: ${aiRec}${replyMenu}${autoLine}`;
+
+        let alertMessage;
+        if (isDustCoin) {
+          const newValueStr = `$${assetValueUSD.toFixed(2)}`;
+          alertMessage =
+            `🔍 <b>DUST COIN ALERT — ${coinBase}</b>\n` +
+            `Up ${changePct.toFixed(1)}% from your watch price!\n` +
+            `Current: $${priceStr} | Watch set at: $${anchorStr}\n` +
+            `You hold: ${assetQty.toLocaleString('en-US', { maximumFractionDigits: 0 })} ${coinBase} = ${newValueStr} at current price\n\n` +
+            `💡 Worth buying more? Reply 'analyse ${coinBase}' for full research`;
+        } else {
+          const replyMenu = `\n\nReply:\n'sell ${coinBase}' - get sell advice\n'buy more ${coinBase}' - get buy advice\n'analyse ${coinBase}' - full analysis\n'acknowledge ${coinBase}' - stop alerts\n'threshold ${coinBase} 15%' - change threshold`;
+          const autoReady = await getAutomationReadiness(symbol, 'buy');
+          const autoLine = autoReady ? `\n\n⚡ AUTO-READY: This setup has worked ${autoReady.winRate}% of the time (${autoReady.sampleSize} trades). Could be automated.` : '';
+          alertMessage = `🎯 <b>${symbol} FIXED TARGET HIT!</b>\n\nAnchor: $${anchorStr} → Now $${priceStr} (+${changePct.toFixed(1)}%)${entryLine}\n\n⚡ RECOMMENDATION: ${aiRec}${replyMenu}${autoLine}`;
+        }
         await sendTelegram(alertMessage);
 
         activeFixedAlerts[symbol] = setInterval(async () => {
@@ -1794,7 +1815,7 @@ app.get('/api/status', (req, res) => {
   });
 });
 
-// GET /api/balances — balances with prices and total portfolio value
+// GET /api/balances — balances with prices, overnight change, and total portfolio value
 app.get('/api/balances', async (req, res) => {
   try {
     const balances = await revolutRequest('GET', '/balances');
@@ -1810,6 +1831,16 @@ app.get('/api/balances', async (req, res) => {
         }
       }
     }
+
+    // Load most recent price_history record per symbol for overnight change
+    let histMap = {};
+    try {
+      const [histRows] = await db.execute(
+        'SELECT symbol, price FROM (SELECT symbol, price, ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY recorded_at DESC) rn FROM price_history) ranked WHERE rn = 1'
+      );
+      for (const r of histRows) histMap[r.symbol] = parseFloat(r.price);
+    } catch (e) { /* ignore — overnight change optional */ }
+
     let totalUSD = 0;
     const result = [];
     for (const asset of balances) {
@@ -1819,7 +1850,9 @@ app.get('/api/balances', async (req, res) => {
       const price = SKIP_CURRENCIES.includes(asset.currency) ? 1 : (priceMap[symbol] || null);
       const valueUSD = price ? available * price : null;
       if (valueUSD) totalUSD += valueUSD;
-      result.push({ currency: asset.currency, available, price, valueUSD, symbol });
+      const prevPrice = histMap[symbol] || null;
+      const overnightChangePct = (price && prevPrice) ? ((price - prevPrice) / prevPrice * 100) : null;
+      result.push({ currency: asset.currency, available, price, valueUSD, symbol, overnightChangePct });
     }
     res.json({ balances: result, totalUSD });
   } catch (e) {
@@ -2216,6 +2249,30 @@ app.post('/api/rebalancing', async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// POST /api/research-dust — trigger Claude analysis of a dust coin via Telegram
+app.post('/api/research-dust', async (req, res) => {
+  const coin = (req.body?.coin || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  if (!coin) return res.status(400).json({ error: 'coin required' });
+  res.json({ ok: true });
+  (async () => {
+    try {
+      await sendTelegram(`🔍 Researching dust coin <b>${coin}</b>...`);
+      const price = await getCurrentPrice(`${coin}-USD`).catch(() => null);
+      const priceStr = price ? `current price $${price.toFixed(8)}` : 'price not available';
+      const response = await anthropic.messages.create({
+        model: 'claude-sonnet-4-5',
+        max_tokens: 600,
+        tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+        messages: [{ role: 'user', content: `Research ${coin} crypto (${priceStr}). Bryan holds a small dust position. Search for: current project status, recent news, team activity, any upcoming catalysts. Give a clear verdict: ACCUMULATE / HOLD / DUMP. Under 400 words.` }]
+      });
+      const textBlock = [...response.content].reverse().find(b => b.type === 'text');
+      await sendTelegram(`🔍 <b>DUST RESEARCH — ${coin}</b>\n\n${textBlock ? textBlock.text : 'Research unavailable.'}`);
+    } catch (e) {
+      await sendTelegram(`❌ Research failed for ${coin}: ${e.message}`);
+    }
+  })();
 });
 
 // GET /api/capital — current invested capital and P&L summary
@@ -2867,6 +2924,52 @@ app.post('/telegram-webhook', async (req, res) => {
         await sendReply('No learning data yet — log some trades with outcomes first.');
       }
       return res.status(200).json({ ok: true });
+    }
+
+    // --- Command: watch COIN X% — set dust coin alert ---
+    const watchMatch = commandText.match(/^watch\s+([a-z0-9]{2,12})\s+([\d.]+)%?$/i);
+    if (watchMatch) {
+      const coinBase = watchMatch[1].toUpperCase();
+      const pct = parseFloat(watchMatch[2]);
+      const symbol = `${coinBase}-USD`;
+      try {
+        const { anchorPrice, targetPrice } = await setFixedTarget(symbol, pct, 'up');
+        await sendReply(
+          `✅ Alert set for <b>${coinBase}</b> — will notify when up ${pct}% from current price\n` +
+          `📍 Watch price: ${anchorPrice < 0.001 ? anchorPrice.toFixed(8) : anchorPrice.toFixed(4)}\n` +
+          `🎯 Target: ${targetPrice < 0.001 ? targetPrice.toFixed(8) : targetPrice.toFixed(4)}`
+        );
+      } catch (e) {
+        await sendReply(`❌ Failed to set watch for ${coinBase}: ${e.message}`);
+      }
+      return res.status(200).json({ ok: true });
+    }
+
+    // --- Command: research COIN — Claude analysis of any coin ---
+    const researchMatch = commandText.match(/^research\s+([a-z0-9]{2,12})$/i);
+    if (researchMatch) {
+      const coinBase = researchMatch[1].toUpperCase();
+      const symbol = `${coinBase}-USD`;
+      await sendReply(`🔍 Researching <b>${coinBase}</b>... give me a moment.`);
+      await new Promise(r => setTimeout(r, 1500));
+      res.status(200).json({ ok: true });
+      (async () => {
+        try {
+          const price = await getCurrentPrice(symbol).catch(() => null);
+          const priceStr = price ? `current price $${price < 0.001 ? price.toFixed(8) : price.toFixed(4)}` : '';
+          const response = await anthropic.messages.create({
+            model: 'claude-sonnet-4-5',
+            max_tokens: 700,
+            tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+            messages: [{ role: 'user', content: `Research ${coinBase} crypto ${priceStr}. Bryan may hold a dust position. Search for: project fundamentals, team, recent news, tokenomics, upcoming catalysts, any red flags. Give a clear verdict: ACCUMULATE / HOLD / DUMP with reasoning. Under 450 words.` }]
+          });
+          const textBlock = [...response.content].reverse().find(b => b.type === 'text');
+          await sendTelegram(`🔍 <b>RESEARCH — ${coinBase}</b>\n\n${textBlock ? textBlock.text : 'Research unavailable.'}`);
+        } catch (e) {
+          await sendTelegram(`❌ Research failed for ${coinBase}: ${e.message}`);
+        }
+      })();
+      return;
     }
 
     // --- Command: rebalance [COIN] or "rebalancing analysis" ---
