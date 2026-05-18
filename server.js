@@ -126,6 +126,7 @@ let portfolioCheckCount = 0; // skip trade detection on first check (baseline es
 let monitoringInterval = null;
 const conversationHistory = new Map(); // chatId -> [{role, content}]
 const lastRecommendationContext = new Map(); // chatId -> { coins, action, prices, timestamp }
+let totalInvestedCapital = 20600; // loaded from DB on startup
 
 async function setThreshold(symbol, threshold) {
   const oldThreshold = customThresholds[symbol] ?? PUMP_THRESHOLD;
@@ -331,6 +332,13 @@ await db.execute(`CREATE TABLE IF NOT EXISTS intention_tracking (
   INDEX idx_outcomes (check_date_1, check_date_2)
 )`);
 
+await db.execute(`CREATE TABLE IF NOT EXISTS invested_capital (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  total_invested DECIMAL(20,10) NOT NULL,
+  note VARCHAR(200),
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)`);
+
 // Add direction column to price_targets if it doesn't exist
 try {
   await db.execute(`ALTER TABLE price_targets ADD COLUMN direction VARCHAR(4) NOT NULL DEFAULT 'up'`);
@@ -385,7 +393,73 @@ for (const row of snapRows) {
 }
 console.log(`Loaded ${snapRows.length} balance snapshots from database`);
 
+// Load invested capital — insert initial record on first run
+try {
+  const [capRows] = await db.execute('SELECT total_invested FROM invested_capital ORDER BY id DESC LIMIT 1');
+  if (capRows.length > 0) {
+    totalInvestedCapital = parseFloat(capRows[0].total_invested);
+    console.log(`Loaded invested capital: $${totalInvestedCapital}`);
+  } else {
+    await db.execute('INSERT INTO invested_capital (total_invested, note) VALUES (?, ?)', [20600, 'Initial figure set May 2026']);
+    totalInvestedCapital = 20600;
+    console.log('Inserted initial invested capital: $20600');
+  }
+} catch (e) {
+  console.error('Failed to load invested capital:', e.message);
+}
+
 updateLearningModel().catch(() => {});
+
+// ── Invested Capital Helpers ──────────────────────────────────────────────────
+
+function getCapitalSummary(portfolioValue) {
+  const invested = totalInvestedCapital;
+  const pnl = portfolioValue - invested;
+  const pnlPct = invested > 0 ? (pnl / invested * 100) : 0;
+  const breakEvenPct = portfolioValue > 0 && pnl < 0 ? ((invested - portfolioValue) / portfolioValue * 100) : 0;
+  return { invested, portfolioValue, pnl, pnlPct, breakEvenPct };
+}
+
+async function updateInvestedCapital(newTotal, note) {
+  totalInvestedCapital = newTotal;
+  await db.execute('INSERT INTO invested_capital (total_invested, note) VALUES (?, ?)', [newTotal, note || null]);
+}
+
+function fmtCapitalConfirm(cap, portfolioValue) {
+  const pnlSign = cap.pnl >= 0 ? '+' : '';
+  const breakEvenStr = cap.pnl < 0
+    ? `\n📈 Need +${cap.breakEvenPct.toFixed(1)}% to break even`
+    : `\n✅ Portfolio is +${Math.abs(cap.pnlPct).toFixed(1)}% above cost basis`;
+  return `✅ Invested capital updated:\n` +
+    `💰 Total Invested: $${cap.invested.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}\n` +
+    `📊 Current Portfolio: $${portfolioValue.toFixed(0)}\n` +
+    `📉 P&L: ${pnlSign}$${Math.abs(cap.pnl).toFixed(0)} (${pnlSign}${cap.pnlPct.toFixed(1)}%)` +
+    breakEvenStr;
+}
+
+async function getCurrentPortfolioValue() {
+  try {
+    const balances = await revolutRequest('GET', '/balances');
+    const tickerResponse = await revolutRequest('GET', '/tickers');
+    const tickerList = Array.isArray(tickerResponse) ? tickerResponse : (tickerResponse.data || []);
+    const priceMap = {};
+    for (const t of tickerList) {
+      if (t.symbol) {
+        const p = parseFloat(t.last_price || t.mid || t.ask || t.bid);
+        if (p) { priceMap[t.symbol] = p; priceMap[t.symbol.replace('/', '-')] = p; }
+      }
+    }
+    let total = 0;
+    for (const asset of balances) {
+      if (!asset.currency || SKIP_CURRENCIES.includes(asset.currency)) continue;
+      const qty = parseFloat(asset.available);
+      if (qty <= 0) continue;
+      const price = priceMap[`${asset.currency}-USD`];
+      if (price) total += qty * price;
+    }
+    return total;
+  } catch (e) { return 0; }
+}
 
 async function getQuickAiRecommendation(symbol, changePct, currentPrice, direction = 'up') {
   try {
@@ -643,10 +717,19 @@ CRITICAL: Your entire response must be under 3000 characters. Be very concise. U
       }
     } catch (e) { /* ignore — don't break briefing */ }
 
+    // Capital P&L summary line
+    let capitalLine = '';
+    try {
+      const cap = getCapitalSummary(totalUSD);
+      const pnlSign = cap.pnl >= 0 ? '+' : '';
+      const breakEvenStr = cap.pnl < 0 ? ` | Need +${cap.breakEvenPct.toFixed(1)}% to break even` : '';
+      capitalLine = `\n💰 Invested: $${cap.invested.toLocaleString()} | Current: $${totalUSD.toFixed(0)} | P&L: ${pnlSign}$${Math.abs(cap.pnl).toFixed(0)} (${pnlSign}${cap.pnlPct.toFixed(1)}%)${breakEvenStr}`;
+    } catch (e) { /* ignore */ }
+
     // Assemble final message
     const fullMessage =
       `🌅 <b>GOOD MORNING BRYAN!</b>\n` +
-      `📅 ${dateStr} | Portfolio: <b>$${totalUSD.toFixed(0)}</b>\n\n` +
+      `📅 ${dateStr} | Portfolio: <b>$${totalUSD.toFixed(0)}</b>${capitalLine}\n\n` +
       `📊 <b>TOP HOLDINGS TODAY:</b>\n${topHoldings}\n\n` +
       `${aiSection}${recentOutcomesBlock}${weeklyPnlBlock}\n\n` +
       `🚨 <b>ALERTS TO WATCH:</b>\n${alertsBlock}`;
@@ -2135,6 +2218,36 @@ app.post('/api/rebalancing', async (req, res) => {
   }
 });
 
+// GET /api/capital — current invested capital and P&L summary
+app.get('/api/capital', async (req, res) => {
+  try {
+    const portfolioValue = await getCurrentPortfolioValue();
+    const cap = getCapitalSummary(portfolioValue);
+    res.json({ ...cap, success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/capital — update invested capital
+app.post('/api/capital', async (req, res) => {
+  try {
+    const { amount, type, note } = req.body;
+    if (!amount || !type) return res.status(400).json({ error: 'amount and type required' });
+    let newTotal;
+    if (type === 'deposit') newTotal = totalInvestedCapital + parseFloat(amount);
+    else if (type === 'withdrawal') newTotal = totalInvestedCapital - parseFloat(amount);
+    else if (type === 'set') newTotal = parseFloat(amount);
+    else return res.status(400).json({ error: 'type must be deposit, withdrawal, or set' });
+    await updateInvestedCapital(newTotal, note || `${type} $${amount}`);
+    const portfolioValue = await getCurrentPortfolioValue();
+    const cap = getCapitalSummary(portfolioValue);
+    res.json({ ...cap, success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // POST /telegram-webhook — handle incoming Telegram messages
 app.post('/telegram-webhook', async (req, res) => {
   try {
@@ -2218,8 +2331,12 @@ app.post('/telegram-webhook', async (req, res) => {
         }
       }
 
-      // --- Payment detection: "[coin] payment" ---
-      const paymentMatch = matchedPending.find(m => lowerMsg.includes('payment'));
+      // --- Payment detection: "[coin] payment" or plain English phrases ---
+      const isPaymentMsg = lowerMsg.includes('payment') ||
+        /that was a payment|used for payment|revolut payment/i.test(lowerMsg);
+      const paymentMatch = isPaymentMsg
+        ? (matchedPending.find(m => lowerMsg.includes(m.symbol.replace('-USD', '').toLowerCase())) || matchedPending[0])
+        : null;
       if (paymentMatch) {
         const { symbol, pending } = paymentMatch;
         const coinBase = symbol.replace('-USD', '');
@@ -2230,7 +2347,31 @@ app.post('/telegram-webhook', async (req, res) => {
           ['payment', 'Revolut payment made using this asset', 'neutral', 'excluded_from_stats', pending.journalId]
         );
         await updateLearningModel().catch(() => {});
-        await sendReply(`✅ <b>${coinBase}</b> logged as payment — excluded from trading stats`);
+
+        // Deduct payment value from invested capital
+        try {
+          const [jRows] = await db.execute('SELECT value_usd FROM trading_journal WHERE id = ?', [pending.journalId]);
+          const paymentValueUsd = jRows[0]?.value_usd ? Math.abs(parseFloat(jRows[0].value_usd)) : null;
+          if (paymentValueUsd && paymentValueUsd > 0) {
+            const prevInvested = totalInvestedCapital;
+            const newTotal = totalInvestedCapital - paymentValueUsd;
+            await updateInvestedCapital(newTotal, `Payment deduction: ${coinBase} -$${paymentValueUsd.toFixed(2)}`);
+            const portfolioValue = await getCurrentPortfolioValue();
+            const cap = getCapitalSummary(portfolioValue);
+            const pnlSign = cap.pnl >= 0 ? '+' : '';
+            await sendReply(
+              `✅ <b>${coinBase}</b> payment logged — $${paymentValueUsd.toFixed(2)} deducted from invested capital\n` +
+              `💰 Previous invested: $${prevInvested.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}\n` +
+              `💰 Updated invested: $${newTotal.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}\n` +
+              `📊 Current portfolio: $${portfolioValue.toFixed(0)}\n` +
+              `📉 P&L: ${pnlSign}$${Math.abs(cap.pnl).toFixed(0)} (${pnlSign}${cap.pnlPct.toFixed(1)}%)`
+            );
+          } else {
+            await sendReply(`✅ <b>${coinBase}</b> logged as payment — excluded from trading stats`);
+          }
+        } catch (e) {
+          await sendReply(`✅ <b>${coinBase}</b> logged as payment — excluded from trading stats`);
+        }
         return res.status(200).json({ ok: true });
       }
 
@@ -2301,6 +2442,37 @@ app.post('/telegram-webhook', async (req, res) => {
           : `✅ <b>Journal saved:</b>\n${confirmLines.join('\n')}${anyUpdated ? '\nLearning model updated 🧠' : ''}`;
 
         await sendReply(confirmMsg);
+        return res.status(200).json({ ok: true });
+      }
+    }
+
+    // --- Commands: invested capital tracking ---
+    const depositMatch = commandText.match(/^(?:i )?deposited?\s+\$?([\d,]+(?:\.\d+)?)/i);
+    const withdrawalMatch = commandText.match(/^(?:i )?withdrew?\s+\$?([\d,]+(?:\.\d+)?)/i);
+    const setCapitalMatch = commandText.match(/^(?:total invested(?:\s+(?:is|=))?\s+|invested capital(?:\s+(?:is|=))?\s+)\$?([\d,]+(?:\.\d+)?)/i);
+
+    if (depositMatch || withdrawalMatch || setCapitalMatch) {
+      try {
+        let newTotal, note, changeAmt;
+        if (depositMatch) {
+          changeAmt = parseFloat(depositMatch[1].replace(/,/g, ''));
+          newTotal = totalInvestedCapital + changeAmt;
+          note = `Deposit +$${changeAmt}`;
+        } else if (withdrawalMatch) {
+          changeAmt = parseFloat(withdrawalMatch[1].replace(/,/g, ''));
+          newTotal = totalInvestedCapital - changeAmt;
+          note = `Withdrawal -$${changeAmt}`;
+        } else {
+          newTotal = parseFloat(setCapitalMatch[1].replace(/,/g, ''));
+          note = `Manual set to $${newTotal}`;
+        }
+        await updateInvestedCapital(newTotal, note);
+        const portfolioValue = await getCurrentPortfolioValue();
+        const cap = getCapitalSummary(portfolioValue);
+        await sendReply(fmtCapitalConfirm(cap, portfolioValue));
+        return res.status(200).json({ ok: true });
+      } catch (e) {
+        await sendReply(`❌ Failed to update capital: ${e.message}`);
         return res.status(200).json({ ok: true });
       }
     }
@@ -2838,6 +3010,9 @@ app.post('/telegram-webhook', async (req, res) => {
         // Sort by USD value descending
         holdings.sort((a, b) => b.valueUSD - a.valueUSD);
 
+        // Compute total USD value for capital context
+        const totalUSD = holdings.reduce((s, h) => s + h.valueUSD, 0);
+
         // Format as numbered list
         const holdingsList = holdings.length
           ? holdings.map((h, i) =>
@@ -2907,6 +3082,11 @@ app.post('/telegram-webhook', async (req, res) => {
 - End with a one line disclaimer only
 
 IMPORTANT TRADER CONTEXT:
+- Bryan's total invested capital: $${totalInvestedCapital.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+- Current portfolio value: $${totalUSD > 0 ? totalUSD.toFixed(2) : 'see holdings above'}
+- Real P&L: $${(totalUSD - totalInvestedCapital).toFixed(2)} (${totalUSD > 0 ? (((totalUSD - totalInvestedCapital) / totalInvestedCapital) * 100).toFixed(1) : '?'}%)
+- Recovery target: +${totalUSD > 0 && totalUSD < totalInvestedCapital ? (((totalInvestedCapital - totalUSD) / totalUSD) * 100).toFixed(1) : '0'}% needed to break even
+- This context is CRITICAL for all recommendations — always reference real P&L not just price movements
 - Bryan's portfolio is approximately 50% down from historical highs due to bear market conditions and past trading decisions
 - Many individual positions are down 50-80% from entry
 - Bryan's PRIMARY GOAL is portfolio recovery and becoming a more disciplined trader

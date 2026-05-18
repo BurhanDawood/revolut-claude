@@ -344,6 +344,63 @@
     .pnl-positive { color: #00ffc8; }
     .pnl-negative { color: var(--danger); }
 
+    /* Capital P&L header */
+    .capital-bar {
+      background: var(--surface);
+      border-radius: var(--radius);
+      padding: 14px 18px;
+      margin-bottom: var(--gap);
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 12px;
+      align-items: center;
+    }
+    @media(max-width:560px) { .capital-bar { grid-template-columns: repeat(2,1fr); } }
+    .cap-stat { text-align: center; }
+    .cap-stat-label { font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-muted); margin-bottom: 3px; }
+    .cap-stat-value { font-size: 1.05rem; font-weight: 700; }
+    .cap-stat-value.pnl-neg { color: var(--danger); }
+    .cap-stat-value.pnl-pos { color: var(--accent); }
+    .cap-stat-value.break-even { color: var(--warn); font-size: 0.95rem; }
+
+    /* Holdings toggle */
+    .holdings-toggle-btn {
+      width: 100%;
+      background: var(--surface2);
+      color: var(--accent);
+      border: 1px solid rgba(0, 255, 200, 0.2);
+      border-radius: 8px;
+      padding: 10px 16px;
+      font-size: 0.82rem;
+      font-weight: 600;
+      text-align: left;
+      margin-top: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      cursor: pointer;
+      transition: background 0.15s, border-color 0.15s;
+      letter-spacing: 0.01em;
+    }
+    .holdings-toggle-btn:hover { background: var(--accent-dim); border-color: var(--accent); }
+    .holdings-toggle-btn:active { transform: scale(0.99); }
+
+    .holdings-full-list {
+      overflow: hidden;
+      max-height: 0;
+      transition: max-height 0.4s ease;
+    }
+    .holdings-full-list.expanded {
+      max-height: 8000px;
+      transition: max-height 0.6s ease;
+    }
+    .holdings-full-list-inner {
+      padding-top: 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
     .toast {
       position: fixed;
       bottom: 20px;
@@ -505,6 +562,26 @@
   <div class="card">
     <div class="card-title">Portfolio Value</div>
     <div id="portfolio-value">—</div>
+  </div>
+
+  <!-- Capital P&L Bar -->
+  <div class="capital-bar" id="capital-bar" style="display:none">
+    <div class="cap-stat">
+      <div class="cap-stat-label">Invested</div>
+      <div class="cap-stat-value" id="cap-invested">—</div>
+    </div>
+    <div class="cap-stat">
+      <div class="cap-stat-label">Current</div>
+      <div class="cap-stat-value" id="cap-current">—</div>
+    </div>
+    <div class="cap-stat">
+      <div class="cap-stat-label">Total P&L</div>
+      <div class="cap-stat-value" id="cap-pnl">—</div>
+    </div>
+    <div class="cap-stat">
+      <div class="cap-stat-label">To Break Even</div>
+      <div class="cap-stat-value break-even" id="cap-breakeven">—</div>
+    </div>
   </div>
 
   <!-- Holdings -->
@@ -816,14 +893,8 @@
 
   // ── Portfolio Render ──────────────────────────────────────────────────────
 
-  function renderHoldings(balances) {
-    const el = document.getElementById('holdings-list');
-    if (!balances || balances.length === 0) {
-      el.innerHTML = '<div class="empty-state">No holdings found.</div>';
-      return;
-    }
-    const sorted = [...balances].sort((a, b) => (b.valueUSD || 0) - (a.valueUSD || 0));
-    el.innerHTML = sorted.map(h => `
+  function holdingRowHtml(h) {
+    return `
       <div class="holding-row">
         <div class="holding-left">
           <div class="coin-icon">${h.currency.slice(0, 3)}</div>
@@ -833,8 +904,70 @@
           </div>
         </div>
         <div class="coin-value">${fmt(h.valueUSD)}</div>
-      </div>
-    `).join('');
+      </div>`;
+  }
+
+  function renderHoldings(balances) {
+    const el = document.getElementById('holdings-list');
+    if (!balances || balances.length === 0) {
+      el.innerHTML = '<div class="empty-state">No holdings found.</div>';
+      return;
+    }
+    const sorted = [...balances].sort((a, b) => (b.valueUSD || 0) - (a.valueUSD || 0));
+    const top3 = sorted.slice(0, 3);
+    const rest  = sorted.slice(3);
+
+    // Read stored preference — default collapsed
+    let isExpanded = false;
+    try { isExpanded = localStorage.getItem('holdingsExpanded') === 'true'; } catch(e) {}
+
+    const arrowLabel = isExpanded ? '▲ Hide' : '▼ Show';
+    const expandedClass = isExpanded ? ' expanded' : '';
+
+    el.innerHTML = `
+      <div class="holdings-top3">${top3.map(holdingRowHtml).join('')}</div>
+      ${rest.length > 0 ? `
+        <button class="holdings-toggle-btn" onclick="toggleHoldingsList()" id="holdings-toggle">
+          <span>📋 All Holdings (${sorted.length} assets)</span>
+          <span id="holdings-toggle-arrow">${arrowLabel}</span>
+        </button>
+        <div class="holdings-full-list${expandedClass}" id="holdings-full-list">
+          <div class="holdings-full-list-inner">
+            ${rest.map(holdingRowHtml).join('')}
+          </div>
+        </div>
+      ` : ''}
+    `;
+  }
+
+  function toggleHoldingsList() {
+    const list = document.getElementById('holdings-full-list');
+    const arrow = document.getElementById('holdings-toggle-arrow');
+    if (!list) return;
+    const expanding = !list.classList.contains('expanded');
+    list.classList.toggle('expanded', expanding);
+    if (arrow) arrow.textContent = expanding ? '▲ Hide' : '▼ Show';
+    try { localStorage.setItem('holdingsExpanded', String(expanding)); } catch(e) {}
+  }
+
+  function renderCapitalBar(cap) {
+    if (!cap || cap.invested == null) return;
+    const bar = document.getElementById('capital-bar');
+    bar.style.display = '';
+    document.getElementById('cap-invested').textContent = fmt(cap.invested);
+    document.getElementById('cap-current').textContent = fmt(cap.portfolioValue);
+    const pnlEl = document.getElementById('cap-pnl');
+    const pnlSign = cap.pnl >= 0 ? '+' : '';
+    pnlEl.textContent = `${pnlSign}${fmt(cap.pnl)} (${pnlSign}${cap.pnlPct.toFixed(1)}%)`;
+    pnlEl.className = 'cap-stat-value ' + (cap.pnl >= 0 ? 'pnl-pos' : 'pnl-neg');
+    const beEl = document.getElementById('cap-breakeven');
+    if (cap.pnl < 0) {
+      beEl.textContent = `+${cap.breakEvenPct.toFixed(1)}%`;
+      beEl.className = 'cap-stat-value break-even';
+    } else {
+      beEl.textContent = '✅ In profit';
+      beEl.className = 'cap-stat-value pnl-pos';
+    }
   }
 
   function renderAlerts(activeAlerts) {
@@ -1062,10 +1195,11 @@
     showError('');
     try {
       await refreshBalances();
-      const [status, targets, entries] = await Promise.all([
+      const [status, targets, entries, capital] = await Promise.all([
         apiFetch('GET', '/api/status'),
         apiFetch('GET', '/api/targets'),
         apiFetch('GET', '/api/entryprices'),
+        apiFetch('GET', '/api/capital').catch(() => null),
       ]);
       statusData = status;
       targetsData = targets;
@@ -1073,6 +1207,7 @@
       renderAlerts(status.activeAlerts);
       renderMonitorStatus(status.paused);
       renderThresholds(balancesData, statusData, targetsData, entryPricesData);
+      if (capital) renderCapitalBar(capital);
       const now = new Date();
       document.getElementById('last-updated').textContent =
         'Updated ' + now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
