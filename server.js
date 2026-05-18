@@ -70,30 +70,31 @@ async function sendTelegramMessage(chatId, text) {
 }
 
 async function sendTelegramChunked(chatId, text) {
-  const maxLen = 3800;
+  // Split on major markdown section headers so the intro is never lost
+  const sections = text.split(/(?=\n## |\n### )/);
+
   const chunks = [];
-  let remaining = text.trim();
+  let currentChunk = '';
 
-  while (remaining.length > 0) {
-    if (remaining.length <= maxLen) {
-      chunks.push(remaining);
-      break;
+  for (const section of sections) {
+    if ((currentChunk + section).length > 3500) {
+      if (currentChunk.trim()) chunks.push(currentChunk.trim());
+      currentChunk = section;
+    } else {
+      currentChunk += section;
     }
-    let splitAt = remaining.lastIndexOf('\n\n', maxLen);
-    if (splitAt === -1) splitAt = remaining.lastIndexOf('\n', maxLen);
-    if (splitAt === -1) splitAt = maxLen;
-    chunks.push(remaining.substring(0, splitAt).trim());
-    remaining = remaining.substring(splitAt).trim();
   }
+  if (currentChunk.trim()) chunks.push(currentChunk.trim());
 
-  console.log('Sending', chunks.length, 'chunk(s), total length:', text.length);
+  console.log('Sending', chunks.length, 'chunks');
+  console.log('First chunk starts:', chunks[0]?.substring(0, 100));
 
   for (let i = 0; i < chunks.length; i++) {
-    const prefix = i > 0 ? '📄 **(continued...)**\n\n' : '';
+    const prefix = i > 0 ? '📄 *(continued)*\n\n' : '';
     await sendTelegramMessage(chatId, prefix + chunks[i]);
     console.log('Sent chunk', i + 1, 'of', chunks.length);
     if (i < chunks.length - 1) {
-      await new Promise(r => setTimeout(r, 3000));
+      await new Promise(r => setTimeout(r, 2000));
     }
   }
 }
