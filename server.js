@@ -588,12 +588,40 @@ Keep total response under 900 characters.`
     const lastTextBlock = [...claudeResponse.content].reverse().find(b => b.type === 'text');
     const aiSection = lastTextBlock ? lastTextBlock.text.trim() : '🌍 Market data unavailable.';
 
+    // Recent outcomes (last 24h) and weekly P&L
+    let recentOutcomesBlock = '';
+    let weeklyPnlBlock = '';
+    try {
+      const [recentOutcomes] = await db.execute(
+        "SELECT symbol, outcome, outcome_pnl, outcome_notes FROM trading_journal WHERE outcome IS NOT NULL AND action != 'payment' AND updated_at > DATE_SUB(NOW(), INTERVAL 24 HOUR) ORDER BY updated_at DESC LIMIT 5"
+      );
+      if (recentOutcomes.length > 0) {
+        const outcomeLines = recentOutcomes.map(t => {
+          const coin = t.symbol.replace('-USD', '');
+          const pnl = t.outcome_pnl != null ? ` ${parseFloat(t.outcome_pnl) >= 0 ? '+' : ''}${parseFloat(t.outcome_pnl).toFixed(1)}%` : '';
+          const emoji = t.outcome === 'profit' || t.outcome === 'partial_profit' ? '✅' : t.outcome === 'loss' || t.outcome === 'partial_loss' ? '❌' : '⚖️';
+          return `${emoji} ${coin}:${pnl} (${t.outcome || 'recorded'})`;
+        }).join('\n');
+        recentOutcomesBlock = `\n\n📈 <b>YESTERDAY'S OUTCOMES:</b>\n${outcomeLines}`;
+      }
+
+      const [weekTrades] = await db.execute(
+        "SELECT outcome_pnl FROM trading_journal WHERE outcome IS NOT NULL AND outcome_pnl IS NOT NULL AND action != 'payment' AND updated_at > DATE_SUB(NOW(), INTERVAL 7 DAY)"
+      );
+      if (weekTrades.length > 0) {
+        const wins = weekTrades.filter(t => parseFloat(t.outcome_pnl) > 0);
+        const totalPnl = weekTrades.reduce((s, t) => s + parseFloat(t.outcome_pnl), 0);
+        const weekWinRate = Math.round(wins.length / weekTrades.length * 100);
+        weeklyPnlBlock = `\n\n📊 <b>THIS WEEK:</b> ${weekTrades.length} trades | Win rate: ${weekWinRate}% | Avg P&L: ${totalPnl >= 0 ? '+' : ''}${(totalPnl / weekTrades.length).toFixed(1)}%`;
+      }
+    } catch (e) { /* ignore — don't break briefing */ }
+
     // Assemble final message
     const fullMessage =
       `🌅 <b>GOOD MORNING BRYAN!</b>\n` +
       `📅 ${dateStr} | Portfolio: <b>$${totalUSD.toFixed(0)}</b>\n\n` +
       `📊 <b>TOP HOLDINGS TODAY:</b>\n${topHoldings}\n\n` +
-      `${aiSection}\n\n` +
+      `${aiSection}${recentOutcomesBlock}${weeklyPnlBlock}\n\n` +
       `🚨 <b>ALERTS TO WATCH:</b>\n${alertsBlock}`;
 
     // Send as single message (target <3500 chars)
@@ -897,6 +925,104 @@ async function checkMacroNews() {
   console.log('Macro check:', new Date().toISOString(), '- Keywords found:', keywordsFound, '- Alert sent:', alertSent);
 }
 
+async function recordTradeOutcome(symbol, sellPrice, sellQty, currentQty) {
+  try {
+    const coinBase = symbol.replace('-USD', '');
+
+    // Find most recent open BUY entry
+    const [buyRows] = await db.execute(
+      "SELECT * FROM trading_journal WHERE symbol = ? AND action = 'buy' AND outcome IS NULL ORDER BY created_at DESC LIMIT 1",
+      [symbol]
+    );
+    if (buyRows.length === 0) return null;
+
+    const buy = buyRows[0];
+    const buyPrice = parseFloat(buy.price);
+    const buyQty = parseFloat(buy.quantity || sellQty);
+
+    const pnlPct = ((sellPrice - buyPrice) / buyPrice) * 100;
+
+    // Partial exit: balance still exists and sold < 95% of original buy qty
+    const isPartial = currentQty > 0.001 && sellQty < buyQty * 0.95;
+
+    // Dollar P&L on the portion sold
+    const soldValue = sellQty * sellPrice;
+    const costBasis = sellQty * buyPrice;
+    const dollarPnl = soldValue - costBasis;
+
+    // Hold duration
+    const buyDate = new Date(buy.created_at);
+    const durationMs = Date.now() - buyDate.getTime();
+    const durationDays = Math.floor(durationMs / (1000 * 60 * 60 * 24));
+    const durationHours = Math.floor((durationMs % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
+    const durationStr = durationDays > 0
+      ? `${durationDays} day${durationDays !== 1 ? 's' : ''}`
+      : `${durationHours} hour${durationHours !== 1 ? 's' : ''}`;
+
+    let outcome, outcomeNotes;
+    if (isPartial) {
+      outcome = pnlPct >= 0 ? 'partial_profit' : 'partial_loss';
+      outcomeNotes = `Partial exit: sold ${sellQty.toFixed(4)} tokens at $${sellPrice.toFixed(4)} (${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%)`;
+    } else if (Math.abs(pnlPct) <= 0.5) {
+      outcome = 'breakeven';
+      outcomeNotes = `Breakeven exit after ${durationStr}`;
+    } else {
+      outcome = pnlPct > 0 ? 'profit' : 'loss';
+      outcomeNotes = `Full exit: ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}% over ${durationStr}`;
+    }
+
+    // Update the BUY journal entry
+    await db.execute(
+      'UPDATE trading_journal SET outcome = ?, outcome_price = ?, outcome_pnl = ?, outcome_notes = ? WHERE id = ?',
+      [outcome, sellPrice, pnlPct.toFixed(4), outcomeNotes, buy.id]
+    );
+
+    await updateLearningModel().catch(() => {});
+
+    // Build rich Telegram notification
+    const pnlSign = pnlPct >= 0 ? '+' : '';
+    const dollarSign = dollarPnl >= 0 ? '+' : '';
+    const dollarStr = `${dollarSign}$${Math.abs(dollarPnl).toFixed(2)}`;
+    const buyPriceStr = `$${buyPrice.toFixed(4)}`;
+    const sellPriceStr = `$${sellPrice.toFixed(4)}`;
+    let msg;
+
+    if (isPartial) {
+      const label = pnlPct >= 0 ? '💰 PARTIAL PROFIT' : '📉 PARTIAL LOSS';
+      msg = `📊 <b>PARTIAL EXIT RECORDED — ${coinBase}</b>\n` +
+        `${label}: ${pnlSign}${pnlPct.toFixed(1)}%\n` +
+        `Sold ${sellQty.toFixed(4)} tokens at ${sellPriceStr} (bought at ${buyPriceStr})\n` +
+        `Gain on this portion: ${dollarStr}\n` +
+        `Remaining position: still open\n\n` +
+        `🧠 Learning model updated`;
+    } else if (outcome === 'breakeven') {
+      msg = `📊 <b>TRADE OUTCOME RECORDED — ${coinBase}</b>\n` +
+        `⚖️ BREAKEVEN: ${pnlSign}${pnlPct.toFixed(1)}%\n` +
+        `Bought: ${buyPriceStr} → Sold: ${sellPriceStr}\n` +
+        `Net: ${dollarStr} | Duration: ${durationStr}\n\n` +
+        `🧠 Learning model updated`;
+    } else if (outcome === 'profit') {
+      msg = `🎉 <b>TRADE OUTCOME RECORDED — ${coinBase}</b>\n` +
+        `✅ PROFIT: ${pnlSign}${pnlPct.toFixed(1)}%\n` +
+        `Bought: ${buyPriceStr} → Sold: ${sellPriceStr}\n` +
+        `Gain: ${dollarStr} | Duration: ${durationStr}\n\n` +
+        `🧠 Learning model updated — this adds to your win rate!`;
+    } else {
+      msg = `📊 <b>TRADE OUTCOME RECORDED — ${coinBase}</b>\n` +
+        `❌ LOSS: ${pnlSign}${pnlPct.toFixed(1)}%\n` +
+        `Bought: ${buyPriceStr} → Sold: ${sellPriceStr}\n` +
+        `Loss: ${dollarStr} | Duration: ${durationStr}\n\n` +
+        `🧠 Learning updated — recording what didn't work helps improve future recommendations.`;
+    }
+
+    await sendTelegram(msg);
+    return { outcome, pnlPct, dollarPnl, durationStr };
+  } catch (e) {
+    console.error('recordTradeOutcome error:', e.message);
+    return null;
+  }
+}
+
 async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
   try {
     const coinBase = symbol.replace('-USD', '');
@@ -927,24 +1053,33 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
     );
     const journalId = result.insertId;
 
-    // If sell: try to find most recent buy and calculate P&L
+    // If sell: record outcome with full P&L notification
     let pnlLine = '';
     if (action === 'sell') {
+      const result = await recordTradeOutcome(symbol, price, absQty, currentQty);
+      if (result) {
+        pnlLine = `\nP&L: ${result.pnlPct >= 0 ? '+' : ''}${result.pnlPct.toFixed(1)}% ${result.pnlPct >= 0 ? '✅' : '❌'}`;
+      }
+    }
+
+    // If buy: detect re-entry (previous sell with outcome exists)
+    let reentryNote = '';
+    if (action === 'buy') {
       try {
-        const [buyRows] = await db.execute(
-          'SELECT id, price FROM trading_journal WHERE symbol = ? AND action = ? AND outcome IS NULL ORDER BY created_at DESC LIMIT 1',
-          [symbol, 'buy']
+        const [prevSell] = await db.execute(
+          "SELECT action, outcome, outcome_pnl FROM trading_journal WHERE symbol = ? AND action = 'sell' AND outcome IS NOT NULL ORDER BY created_at DESC LIMIT 1",
+          [symbol]
         );
-        if (buyRows.length > 0) {
-          const buyPrice = parseFloat(buyRows[0].price);
-          const pnl = ((price - buyPrice) / buyPrice) * 100;
-          const outcomeLabel = pnl >= 0 ? 'profit' : 'loss';
+        if (prevSell.length > 0) {
+          const prev = prevSell[0];
+          const prevOutcome = prev.outcome_pnl != null
+            ? `${parseFloat(prev.outcome_pnl) >= 0 ? 'profit' : 'loss'} (${parseFloat(prev.outcome_pnl) >= 0 ? '+' : ''}${parseFloat(prev.outcome_pnl).toFixed(1)}%)`
+            : prev.outcome || 'previous position';
           await db.execute(
-            'UPDATE trading_journal SET outcome_price = ?, outcome_pnl = ?, outcome = ? WHERE id = ?',
-            [price, pnl.toFixed(4), outcomeLabel, buyRows[0].id]
+            'UPDATE trading_journal SET outcome_notes = ? WHERE id = ?',
+            [`Re-entry after ${prevOutcome}`, journalId]
           );
-          pnlLine = `\nP&L vs last buy: ${pnl >= 0 ? '+' : ''}${pnl.toFixed(1)}% ${pnl >= 0 ? '✅' : '❌'}`;
-          await updateLearningModel().catch(() => {});
+          reentryNote = `\n♻️ Re-entry after ${prevOutcome}`;
         }
       } catch (e) { /* ignore */ }
     }
@@ -952,9 +1087,10 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
     // Send Telegram notification asking for context
     const actionLabel = action === 'buy' ? 'BOUGHT' : action === 'sell' ? 'SOLD' : action.toUpperCase();
     const recLine = claudeRec ? `\n📊 Last Claude rec: ${claudeRec}` : '';
+    const reentryLine = reentryNote || '';
     const msg =
       `📝 <b>TRADE DETECTED — ${symbol}</b>\n` +
-      `Action: ${actionLabel} ~${absQty.toFixed(4)} tokens at $${price.toFixed(4)} ($${valueUsd.toFixed(2)})${pnlLine}${recLine}\n\n` +
+      `Action: ${actionLabel} ~${absQty.toFixed(4)} tokens at $${price.toFixed(4)} ($${valueUsd.toFixed(2)})${pnlLine}${recLine}${reentryLine}\n\n` +
       `Quick questions while it's fresh:\n` +
       `1️⃣ Why did you make this trade?\n` +
       `2️⃣ Feeling: confident / uncertain / fomo / fearful / neutral\n\n` +
@@ -1386,13 +1522,36 @@ app.get('/api/journal/stats', async (req, res) => {
     const ignored = completed.filter(t => t.followed_recommendation === 0);
     const followed_win_rate = followed.length > 0 ? Math.round(followed.filter(t => parseFloat(t.outcome_pnl) > 0).length / followed.length * 100) : null;
     const ignored_win_rate = ignored.length > 0 ? Math.round(ignored.filter(t => parseFloat(t.outcome_pnl) > 0).length / ignored.length * 100) : null;
+
+    // Auto-detected outcomes count
+    const auto_detected_outcomes = completed.filter(t => t.reasoning === 'auto-detected').length;
+
+    // Payment count
+    const [paymentRows] = await db.execute("SELECT COUNT(*) as cnt FROM trading_journal WHERE action = 'payment'");
+    const payment_count = parseInt(paymentRows[0].cnt);
+
+    // Average hold time (hours) for winners vs losers — based on created_at vs updated_at
+    const holdHours = (t) => {
+      const created = new Date(t.created_at).getTime();
+      const updated = new Date(t.updated_at).getTime();
+      return (updated - created) / (1000 * 60 * 60);
+    };
+    const winHours = wins.map(holdHours).filter(h => h > 0);
+    const lossHours = losses.map(holdHours).filter(h => h > 0);
+    const avg_hold_time_winners_hours = winHours.length > 0 ? Math.round(winHours.reduce((s, h) => s + h, 0) / winHours.length) : null;
+    const avg_hold_time_losers_hours = lossHours.length > 0 ? Math.round(lossHours.reduce((s, h) => s + h, 0) / lossHours.length) : null;
+
     res.json({
       total_trades, win_rate, avg_profit: parseFloat(avg_profit), avg_loss: parseFloat(avg_loss),
       best_trade: best_trade ? { symbol: best_trade.symbol, pnl: parseFloat(best_trade.outcome_pnl) } : null,
       worst_trade: worst_trade ? { symbol: worst_trade.symbol, pnl: parseFloat(worst_trade.outcome_pnl) } : null,
       most_traded,
       emotion_stats: byEmotion,
-      recommendation_accuracy: { followed_win_rate, ignored_win_rate, followed_count: followed.length, ignored_count: ignored.length }
+      recommendation_accuracy: { followed_win_rate, ignored_win_rate, followed_count: followed.length, ignored_count: ignored.length },
+      auto_detected_outcomes,
+      payment_count,
+      avg_hold_time_winners_hours,
+      avg_hold_time_losers_hours
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
