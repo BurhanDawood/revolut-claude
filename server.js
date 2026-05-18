@@ -304,6 +304,16 @@ await db.execute(`CREATE TABLE IF NOT EXISTS recommendation_performance (
   INDEX idx_created (created_at)
 )`);
 
+await db.execute(`CREATE TABLE IF NOT EXISTS rebalancing_history (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  analysis TEXT NOT NULL,
+  symbol VARCHAR(20) NULL,
+  total_value_usd DECIMAL(20,10),
+  total_unrealised_loss_usd DECIMAL(20,10),
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_created (created_at)
+)`);
+
 // Add direction column to price_targets if it doesn't exist
 try {
   await db.execute(`ALTER TABLE price_targets ADD COLUMN direction VARCHAR(4) NOT NULL DEFAULT 'up'`);
@@ -1120,6 +1130,144 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
   }
 }
 
+// ── Portfolio Rebalancing Analysis ───────────────────────────────────────────
+
+async function buildPositions() {
+  const balances = await revolutRequest('GET', '/balances');
+  const tickerResponse = await revolutRequest('GET', '/tickers');
+  const tickerList = Array.isArray(tickerResponse) ? tickerResponse : (tickerResponse.data || []);
+  const priceMap = {};
+  for (const t of tickerList) {
+    if (t.symbol) {
+      const p = parseFloat(t.last_price || t.mid || t.ask || t.bid);
+      if (p) { priceMap[t.symbol] = p; priceMap[t.symbol.replace('/', '-')] = p; }
+    }
+  }
+  const [entryRows] = await db.execute('SELECT symbol, entry_price FROM entry_prices');
+  const entryMap = {};
+  for (const r of entryRows) entryMap[r.symbol] = parseFloat(r.entry_price);
+
+  const positions = [];
+  let totalValue = 0, totalLoss = 0;
+
+  for (const asset of balances) {
+    if (!asset.currency || SKIP_CURRENCIES.includes(asset.currency)) continue;
+    const available = parseFloat(asset.available);
+    if (available <= 0.0001) continue;
+    const symbol = `${asset.currency}-USD`;
+    const price = priceMap[symbol];
+    if (!price) continue;
+    const currentValue = available * price;
+    totalValue += currentValue;
+    const entryPrice = entryMap[symbol] || null;
+
+    let unrealisedPnlPct = null, unrealisedPnlUsd = null, recoveryNeededPct = null, category = 'no_entry';
+    if (entryPrice) {
+      unrealisedPnlPct = ((price - entryPrice) / entryPrice) * 100;
+      unrealisedPnlUsd = currentValue - (available * entryPrice);
+      recoveryNeededPct = entryPrice > price ? ((entryPrice - price) / price) * 100 : 0;
+      if (unrealisedPnlPct >= 0) category = 'winning';
+      else if (unrealisedPnlPct > -20) category = 'small_loss';
+      else if (unrealisedPnlPct > -50) category = 'moderate_loss';
+      else category = 'severe_loss';
+      if (unrealisedPnlUsd < 0) totalLoss += unrealisedPnlUsd;
+    }
+    positions.push({ symbol, coin: asset.currency, available, price, currentValue, entryPrice, unrealisedPnlPct, unrealisedPnlUsd, recoveryNeededPct, category });
+  }
+
+  positions.sort((a, b) => (a.unrealisedPnlPct ?? 0) - (b.unrealisedPnlPct ?? 0));
+  return { positions, totalValue, totalLoss };
+}
+
+async function analyzePortfolioRebalancing(symbolFilter = null) {
+  try {
+    const { positions, totalValue, totalLoss } = await buildPositions();
+    const analysisPositions = symbolFilter
+      ? positions.filter(p => p.symbol === symbolFilter || p.coin.toUpperCase() === symbolFilter.toUpperCase())
+      : positions;
+
+    if (analysisPositions.length === 0) return { analysis: 'No matching positions with entry prices set.', positions, totalValue, totalLoss };
+
+    const positionLines = analysisPositions.map(p => {
+      const ep = p.entryPrice ? `Entry: $${p.entryPrice.toFixed(6)}` : 'Entry: not set';
+      const pnl = p.unrealisedPnlPct != null ? ` | P&L: ${p.unrealisedPnlPct >= 0 ? '+' : ''}${p.unrealisedPnlPct.toFixed(1)}% ($${(p.unrealisedPnlUsd || 0).toFixed(2)})` : '';
+      const rec = p.recoveryNeededPct > 0 ? ` | Needs ${p.recoveryNeededPct.toFixed(1)}% rise to break even` : '';
+      return `• ${p.coin}: ${p.available.toFixed(4)} tokens @ $${p.price.toFixed(6)} = $${p.currentValue.toFixed(2)} | ${ep}${pnl}${rec} [${p.category}]`;
+    }).join('\n');
+
+    const isSingleCoin = symbolFilter != null;
+    const prompt = isSingleCoin
+      ? `Bryan is analysing whether to hold or cut his ${analysisPositions[0]?.coin} position.
+
+Position details:
+${positionLines}
+
+Bryan's overall portfolio is ~50% down from highs. His primary goal is recovery.
+
+Give a specific, honest recommendation for this position:
+1. HOLD or CUT LOSS — be direct
+2. Why — fundamentals, catalyst, recovery timeline
+3. If CUT: where to redeploy the capital
+4. If HOLD: what price target / catalyst to watch
+5. Opportunity cost — is capital better elsewhere?
+
+Be concise and actionable. No disclaimer needed.`
+      : `Bryan is recovering from a bear market with ~50% portfolio loss.
+
+His current portfolio with entry prices and unrealised P&L:
+${positionLines}
+
+Total portfolio value: $${totalValue.toFixed(2)}
+Total unrealised loss: $${Math.abs(totalLoss).toFixed(2)} (${((Math.abs(totalLoss) / totalValue) * 100).toFixed(1)}% of portfolio)
+
+Bryan's goal is portfolio recovery. Provide a clear rebalancing plan:
+
+## HOLD — Worth holding for recovery
+List coins with strong fundamentals and realistic recovery catalysts.
+
+## CUT LOSS — Consider selling
+List coins where capital is better deployed elsewhere. Be honest — some positions may not recover.
+
+## REDEPLOY — Where to put freed capital
+Consider Bryan's existing winners (CC, HYPE, LINK) and overall balance.
+
+## REBALANCING PLAN — Specific steps
+- Priority sells (what to sell first and why)
+- Where to add (what to buy with freed capital)
+- Target allocations after rebalancing
+- Expected recovery timeline
+
+## KEY INSIGHTS
+- Any positions at risk of not recovering
+- Tax consideration: selling at loss can offset future gains
+- Most important action to take this week
+
+Be honest, direct and actionable.`;
+
+    const claudeResponse = await anthropic.messages.create({
+      model: 'claude-sonnet-4-5',
+      max_tokens: isSingleCoin ? 1500 : 3500,
+      tools: [{ type: "web_search_20250305", name: "web_search" }],
+      messages: [{ role: 'user', content: prompt }]
+    });
+
+    const lastTextBlock = [...claudeResponse.content].reverse().find(b => b.type === 'text');
+    const analysis = lastTextBlock ? lastTextBlock.text.trim() : 'Analysis unavailable.';
+
+    if (!isSingleCoin) {
+      await db.execute(
+        'INSERT INTO rebalancing_history (analysis, symbol, total_value_usd, total_unrealised_loss_usd) VALUES (?, ?, ?, ?)',
+        [analysis, null, totalValue, totalLoss]
+      ).catch(() => {});
+    }
+
+    return { analysis, positions, totalValue, totalLoss };
+  } catch (e) {
+    console.error('analyzePortfolioRebalancing error:', e.message);
+    throw e;
+  }
+}
+
 async function checkPortfolio() {
   if (monitoringPaused) {
     console.log('Monitoring paused, skipping check.');
@@ -1333,7 +1481,25 @@ cron.schedule('0 9 * * *', sendMorningBriefing, { timezone: 'Europe/London' });
 // Check macro news every 5 minutes — free RSS + keyword scan; Claude called at most once per 2h
 cron.schedule('*/5 * * * *', checkMacroNews, { timezone: 'Europe/London' });
 
-console.log('Cron jobs scheduled: midnight price recording + 9 AM morning briefing + every-2h macro news (Europe/London)');
+// Weekly rebalancing reminder — every Monday at 9:05 AM (after morning briefing)
+cron.schedule('5 9 * * 1', async () => {
+  try {
+    const { positions } = await buildPositions();
+    const severelyDown = positions.filter(p => p.category === 'severe_loss');
+    if (severelyDown.length > 0) {
+      const coinList = severelyDown.map(p => `${p.coin} (${p.unrealisedPnlPct.toFixed(0)}%)`).join(', ');
+      await sendTelegram(
+        `📊 <b>WEEKLY REBALANCING CHECK</b>\n\n` +
+        `You have <b>${severelyDown.length}</b> position${severelyDown.length > 1 ? 's' : ''} down more than 50%:\n${coinList}\n\n` +
+        `Reply <b>'rebalance'</b> for full analysis and recommendations.`
+      );
+    }
+  } catch (e) {
+    console.error('Weekly rebalancing check error:', e.message);
+  }
+}, { timezone: 'Europe/London' });
+
+console.log('Cron jobs scheduled: midnight price recording + 9 AM morning briefing + every-2h macro news + Monday 9:05 rebalancing check (Europe/London)');
 
 const app = express();
 app.use(cors());
@@ -1747,6 +1913,51 @@ app.get('/', (req, res) => {
   res.sendFile(join(__dirname, 'public', 'dashboard.html'));
 });
 
+// GET /api/rebalancing/positions — live portfolio positions with P&L
+app.get('/api/rebalancing/positions', async (req, res) => {
+  try {
+    const { positions, totalValue, totalLoss } = await buildPositions();
+    const summary = {
+      totalValue,
+      totalLoss,
+      totalLossPct: totalValue > 0 ? (Math.abs(totalLoss) / totalValue) * 100 : 0,
+      categoryCount: {
+        winning: positions.filter(p => p.category === 'winning').length,
+        small_loss: positions.filter(p => p.category === 'small_loss').length,
+        moderate_loss: positions.filter(p => p.category === 'moderate_loss').length,
+        severe_loss: positions.filter(p => p.category === 'severe_loss').length,
+        no_entry: positions.filter(p => p.category === 'no_entry').length,
+      }
+    };
+    res.json({ positions, summary });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/rebalancing/latest — last stored analysis
+app.get('/api/rebalancing/latest', async (req, res) => {
+  try {
+    const [rows] = await db.execute(
+      'SELECT * FROM rebalancing_history WHERE symbol IS NULL ORDER BY created_at DESC LIMIT 1'
+    );
+    res.json(rows[0] || null);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/rebalancing — trigger new full analysis
+app.post('/api/rebalancing', async (req, res) => {
+  try {
+    const symbol = req.body?.symbol || null;
+    const result = await analyzePortfolioRebalancing(symbol);
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // POST /telegram-webhook — handle incoming Telegram messages
 app.post('/telegram-webhook', async (req, res) => {
   try {
@@ -1824,7 +2035,7 @@ app.post('/telegram-webhook', async (req, res) => {
       if (matchedPending.length === 0 && pendingTradeContext.size === 1) {
         const [[symbol, pending]] = pendingTradeContext;
         // Only intercept if message isn't a recognised command
-        const isKnownCommand = /^(pause|resume|status|acknowledge|ack|sell|buy|entry|daily|target|journal|my stats|learning|holding|bought|sold|i prefer)/i.test(commandText);
+        const isKnownCommand = /^(pause|resume|status|acknowledge|ack|sell|buy|entry|daily|target|journal|my stats|learning|holding|bought|sold|i prefer|rebalance|rebalancing)/i.test(commandText);
         if (!isKnownCommand) {
           matchedPending.push({ symbol, pending, skip: false });
         }
@@ -2309,6 +2520,34 @@ app.post('/telegram-webhook', async (req, res) => {
       return res.status(200).json({ ok: true });
     }
 
+    // --- Command: rebalance [COIN] or "rebalancing analysis" ---
+    const rebalanceSingleMatch = commandText.match(/^rebalance\s+([a-z0-9]{2,10})$/i);
+    const rebalanceFullMatch = /^rebalanc(?:e|ing)(?:\s+analysis)?$/i.test(commandText);
+
+    if (rebalanceSingleMatch || rebalanceFullMatch) {
+      const coinArg = rebalanceSingleMatch ? rebalanceSingleMatch[1].toUpperCase() : null;
+      await sendReply(coinArg
+        ? `🔍 Analysing your <b>${coinArg}</b> position… give me a moment.`
+        : '🔍 Running full portfolio rebalancing analysis… this may take 30-60 seconds.'
+      );
+      await new Promise(r => setTimeout(r, 2000));
+      res.status(200).json({ ok: true });
+
+      (async () => {
+        try {
+          const symbolFilter = coinArg ? `${coinArg}-USD` : null;
+          const result = await analyzePortfolioRebalancing(symbolFilter);
+          const header = coinArg
+            ? `📊 <b>POSITION ANALYSIS — ${coinArg}</b>\n\n`
+            : `📊 <b>PORTFOLIO REBALANCING ANALYSIS</b>\n💼 Total Value: $${result.totalValue.toFixed(0)} | Unrealised Loss: $${Math.abs(result.totalLoss).toFixed(0)}\n\n`;
+          await sendTelegramChunked(header + result.analysis);
+        } catch (e) {
+          await sendReply('❌ Rebalancing analysis failed: ' + e.message);
+        }
+      })();
+      return;
+    }
+
     // --- Command: i prefer TEXT ---
     const preferMatch = commandText.match(/^i prefer\s+(.+)$/i);
     if (preferMatch) {
@@ -2381,6 +2620,30 @@ app.post('/telegram-webhook', async (req, res) => {
 
         const learningContext = await getLearningContext();
 
+        // Build P&L context from entry prices for recovery-aware advice
+        let recoveryContext = '';
+        try {
+          const [epRows] = await db.execute('SELECT symbol, entry_price FROM entry_prices');
+          const epMap = {};
+          for (const r of epRows) epMap[r.symbol] = parseFloat(r.entry_price);
+          const pnlLines = holdings
+            .filter(h => epMap[h.symbol])
+            .map(h => {
+              const ep = epMap[h.symbol];
+              const pnlPct = ((h.price - ep) / ep * 100).toFixed(1);
+              const needed = ep > h.price ? ((ep - h.price) / h.price * 100).toFixed(1) : '0';
+              return `• ${h.symbol}: entry $${ep.toFixed(6)} → now $${h.price.toFixed(6)} = ${pnlPct >= 0 ? '+' : ''}${pnlPct}% (needs ${needed}% rise to break even)`;
+            })
+            .sort((a, b) => {
+              const getN = s => parseFloat(s.match(/([-\d.]+)%/)?.[1] || '0');
+              return getN(a) - getN(b);
+            })
+            .slice(0, 10);
+          if (pnlLines.length > 0) {
+            recoveryContext = `\n\nPORTFOLIO RECOVERY CONTEXT:\nBryan has many positions with significant unrealised losses from the bear market.\nPositions with entry prices set (sorted worst first):\n${pnlLines.join('\n')}\n\nWhen giving ANY recommendation, always consider:\n1. Does this help Bryan's overall recovery goal?\n2. Is the capital better deployed elsewhere?\n3. Is the recovery timeline realistic for this coin?\n4. What is the opportunity cost of holding vs redeploying?`;
+          }
+        } catch (e) { /* ignore — don't break Claude call */ }
+
         const systemPrompt =
           `You are an AI crypto trading assistant. Use ONLY the holdings data provided below. Do not recalculate or estimate prices. The values shown are live and accurate.\n\n` +
           `Here are the user's current holdings sorted by USD value (already calculated):\n${holdingsList}\n\n` +
@@ -2434,7 +2697,7 @@ IMPORTANT TRADER CONTEXT:
 ${holdingsList}
 
 Current baseline prices (set when monitoring started): ${JSON.stringify(basePrices)}
-Active alerts (coins currently above threshold): ${Object.keys(activeAlerts).join(', ') || 'none'}${learningContext}`,
+Active alerts (coins currently above threshold): ${Object.keys(activeAlerts).join(', ') || 'none'}${learningContext}${recoveryContext}`,
           messages,
         });
         const timeoutPromise = new Promise((_, reject) =>

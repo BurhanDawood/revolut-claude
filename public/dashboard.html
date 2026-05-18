@@ -427,6 +427,56 @@
       .threshold-input-wrap { width: 100%; }
       .threshold-input { flex: 1; width: auto; }
     }
+
+    /* ── Rebalancing tab ──────────────────────────────────────────────────── */
+    .health-grid { display: grid; grid-template-columns: auto 1fr; gap: 20px; align-items: center; margin-bottom: 4px; }
+    @media(max-width:500px) { .health-grid { grid-template-columns: 1fr; } }
+
+    .health-legend { display: flex; flex-direction: column; gap: 8px; }
+    .legend-item { display: flex; align-items: center; gap: 8px; font-size: 0.82rem; }
+    .legend-dot { width: 12px; height: 12px; border-radius: 3px; flex-shrink: 0; }
+
+    .rb-summary-row { display: grid; grid-template-columns: repeat(3,1fr); gap: 10px; margin-top: 14px; }
+    @media(max-width:500px) { .rb-summary-row { grid-template-columns: repeat(2,1fr); } }
+    .rb-stat { background: var(--surface2); border-radius: 8px; padding: 12px; text-align: center; }
+    .rb-stat-label { font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-muted); margin-bottom: 4px; }
+    .rb-stat-value { font-size: 1.25rem; font-weight: 700; }
+
+    /* Position table */
+    .rb-table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+    .rb-table th { text-align: left; padding: 8px 10px; font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.07em; color: var(--text-muted); border-bottom: 1px solid #2e2e2e; white-space: nowrap; }
+    .rb-table td { padding: 9px 10px; border-bottom: 1px solid #1e1e1e; vertical-align: middle; }
+    .rb-table tr:last-child td { border-bottom: none; }
+    .rb-table tr:hover td { background: rgba(255,255,255,0.02); }
+
+    .cat-badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.68rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; }
+    .cat-badge.winning    { background: rgba(0,255,200,0.15); color: var(--accent); }
+    .cat-badge.small_loss { background: rgba(255,200,0,0.15); color: #ffcc00; }
+    .cat-badge.moderate_loss { background: rgba(255,120,0,0.15); color: #ff7800; }
+    .cat-badge.severe_loss   { background: rgba(255,77,106,0.18); color: var(--danger); }
+    .cat-badge.no_entry      { background: rgba(136,136,136,0.15); color: var(--text-muted); }
+
+    .verdict-badge { display: inline-block; padding: 3px 9px; border-radius: 4px; font-size: 0.72rem; font-weight: 700; cursor: pointer; transition: opacity 0.15s; }
+    .verdict-badge:hover { opacity: 0.8; }
+    .verdict-badge.HOLD  { background: rgba(0,255,200,0.15); color: var(--accent); border: 1px solid var(--accent); }
+    .verdict-badge.WATCH { background: rgba(255,170,0,0.15); color: var(--warn); border: 1px solid var(--warn); }
+    .verdict-badge.CUT   { background: rgba(255,77,106,0.15); color: var(--danger); border: 1px solid var(--danger); }
+
+    /* Analysis panel */
+    .analysis-text { font-size: 0.83rem; line-height: 1.75; color: var(--text); white-space: pre-wrap; max-height: 420px; overflow-y: auto; }
+    .analysis-meta { font-size: 0.72rem; color: var(--text-muted); margin-bottom: 10px; }
+
+    /* Capital calculator */
+    .cap-row { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid #1e1e1e; font-size: 0.85rem; }
+    .cap-row:last-child { border-bottom: none; }
+    .cap-row label { flex: 1; display: flex; align-items: center; gap: 8px; cursor: pointer; }
+    .cap-row input[type=checkbox] { accent-color: var(--accent); width: 15px; height: 15px; flex-shrink: 0; }
+    .cap-coin { font-weight: 600; min-width: 45px; }
+    .cap-value { color: var(--text-muted); font-size: 0.78rem; }
+    .cap-pnl { font-size: 0.78rem; font-weight: 600; }
+    .freed-total { background: var(--accent-dim); border: 1px solid var(--accent); border-radius: 8px; padding: 12px 16px; margin-top: 14px; display: flex; justify-content: space-between; align-items: center; }
+    .freed-label { font-size: 0.75rem; text-transform: uppercase; color: var(--accent); font-weight: 700; letter-spacing: 0.06em; }
+    .freed-amount { font-size: 1.4rem; font-weight: 700; color: var(--accent); }
   </style>
 </head>
 <body>
@@ -443,6 +493,7 @@
 <nav class="tab-nav">
   <button class="tab-btn active" onclick="switchTab('portfolio')">Portfolio</button>
   <button class="tab-btn" onclick="switchTab('journal')">📓 Journal</button>
+  <button class="tab-btn" onclick="switchTab('rebalancing')">📊 Rebalancing</button>
 </nav>
 
 <div class="error-banner" id="error-banner"></div>
@@ -603,6 +654,92 @@
 
 </div><!-- /tab-journal -->
 
+<!-- ══════════════════════════════════ REBALANCING TAB ═══════════════════ -->
+<div id="tab-rebalancing" class="tab-content">
+
+  <!-- Health Overview -->
+  <div class="card">
+    <div class="card-title">Portfolio Health</div>
+    <div class="health-grid">
+      <canvas id="health-donut" width="130" height="130"></canvas>
+      <div>
+        <div class="health-legend">
+          <div class="legend-item"><div class="legend-dot" style="background:#00ffc8"></div><span id="leg-winning">Winning — 0</span></div>
+          <div class="legend-item"><div class="legend-dot" style="background:#ffcc00"></div><span id="leg-small">Small loss (0–20%) — 0</span></div>
+          <div class="legend-item"><div class="legend-dot" style="background:#ff7800"></div><span id="leg-moderate">Moderate loss (20–50%) — 0</span></div>
+          <div class="legend-item"><div class="legend-dot" style="background:#ff4d6a"></div><span id="leg-severe">Severe loss (50%+) — 0</span></div>
+          <div class="legend-item"><div class="legend-dot" style="background:#555"></div><span id="leg-none">No entry set — 0</span></div>
+        </div>
+      </div>
+    </div>
+    <div class="rb-summary-row">
+      <div class="rb-stat">
+        <div class="rb-stat-label">Portfolio Value</div>
+        <div class="rb-stat-value" id="rb-total-value">—</div>
+      </div>
+      <div class="rb-stat">
+        <div class="rb-stat-label">Unrealised Loss</div>
+        <div class="rb-stat-value" id="rb-total-loss" style="color:var(--danger)">—</div>
+      </div>
+      <div class="rb-stat">
+        <div class="rb-stat-label">Recovery Needed</div>
+        <div class="rb-stat-value" id="rb-recovery-pct" style="color:var(--warn)">—</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Position Table -->
+  <div class="card">
+    <div class="card-title">Positions — Sorted by P&L (worst first)</div>
+    <div style="overflow-x:auto">
+      <table class="rb-table">
+        <thead>
+          <tr>
+            <th>Coin</th>
+            <th>Value</th>
+            <th>Entry</th>
+            <th>P&L %</th>
+            <th>P&L $</th>
+            <th>Recovery Needed</th>
+            <th>Status</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="rb-positions-body">
+          <tr><td colspan="8" style="text-align:center;color:var(--text-muted);padding:20px">Loading…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Rebalancing Recommendations -->
+  <div class="card">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;flex-wrap:wrap;gap:8px">
+      <div class="card-title" style="margin:0">🤖 AI Rebalancing Plan</div>
+      <button class="btn-accent btn-sm" id="rb-refresh-btn" onclick="runRebalancingAnalysis()">Refresh Analysis</button>
+    </div>
+    <div class="analysis-meta" id="rb-analysis-date">No analysis yet — click Refresh Analysis</div>
+    <div class="analysis-text" id="rb-analysis-text">Run an analysis to get Claude's rebalancing recommendations for your portfolio.</div>
+  </div>
+
+  <!-- Freed Capital Calculator -->
+  <div class="card">
+    <div class="card-title">💰 Freed Capital Calculator</div>
+    <div style="font-size:0.8rem;color:var(--text-muted);margin-bottom:12px">Select positions to sell and see how much capital you'd free up:</div>
+    <div id="cap-calc-list">
+      <div class="empty-state">Loading positions…</div>
+    </div>
+    <div class="freed-total" id="freed-total-box" style="display:none">
+      <div>
+        <div class="freed-label">Capital Freed</div>
+        <div style="font-size:0.72rem;color:var(--text-muted);margin-top:2px" id="freed-count">0 positions selected</div>
+      </div>
+      <div class="freed-amount" id="freed-amount">$0</div>
+    </div>
+  </div>
+
+</div><!-- /tab-rebalancing -->
+
 <div class="toast" id="toast"></div>
 
 <script>
@@ -670,6 +807,10 @@
       loadLearning();
       loadJournal();
       loadProfile();
+    }
+    if (tab === 'rebalancing' && !window.rebalancingLoaded) {
+      window.rebalancingLoaded = true;
+      loadRebalancingData();
     }
   }
 
@@ -1152,6 +1293,166 @@
     } catch (e) {
       showToast('Failed: ' + e.message, 'error');
     }
+  }
+
+  // ── Rebalancing Tab ───────────────────────────────────────────────────────
+
+  window.rebalancingLoaded = false;
+  let rbPositions = [];
+
+  function drawDonut(canvas, counts) {
+    const ctx = canvas.getContext('2d');
+    const W = canvas.width, H = canvas.height;
+    ctx.clearRect(0, 0, W, H);
+    const total = counts.winning + counts.small_loss + counts.moderate_loss + counts.severe_loss + counts.no_entry;
+    if (total === 0) { ctx.fillStyle = '#333'; ctx.beginPath(); ctx.arc(W/2,H/2,50,0,Math.PI*2); ctx.fill(); return; }
+    const slices = [
+      { val: counts.winning,      color: '#00ffc8' },
+      { val: counts.small_loss,   color: '#ffcc00' },
+      { val: counts.moderate_loss,color: '#ff7800' },
+      { val: counts.severe_loss,  color: '#ff4d6a' },
+      { val: counts.no_entry,     color: '#444' },
+    ].filter(s => s.val > 0);
+    let angle = -Math.PI / 2;
+    const cx = W/2, cy = H/2, outer = 54, inner = 32;
+    for (const s of slices) {
+      const sweep = (s.val / total) * Math.PI * 2;
+      ctx.beginPath();
+      ctx.moveTo(cx + outer * Math.cos(angle), cy + outer * Math.sin(angle));
+      ctx.arc(cx, cy, outer, angle, angle + sweep);
+      ctx.arc(cx, cy, inner, angle + sweep, angle, true);
+      ctx.closePath();
+      ctx.fillStyle = s.color;
+      ctx.fill();
+      angle += sweep;
+    }
+    ctx.beginPath(); ctx.arc(cx, cy, inner, 0, Math.PI*2);
+    ctx.fillStyle = '#1a1a1a'; ctx.fill();
+    ctx.fillStyle = '#e8e8e8'; ctx.font = 'bold 16px sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(total, cx, cy);
+  }
+
+  function getVerdict(pos) {
+    if (pos.category === 'no_entry') return null;
+    if (pos.category === 'winning') return 'HOLD';
+    if (pos.category === 'severe_loss') return 'CUT';
+    return 'WATCH';
+  }
+
+  function renderRbPositions(positions) {
+    rbPositions = positions;
+    const tbody = document.getElementById('rb-positions-body');
+    if (!positions || positions.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--text-muted);padding:20px">No positions found. Set entry prices in Portfolio tab.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = positions.map(p => {
+      const pnlClass = p.unrealisedPnlPct == null ? '' : p.unrealisedPnlPct >= 0 ? 'pnl-positive' : 'pnl-negative';
+      const pnlPctStr = p.unrealisedPnlPct != null ? `${p.unrealisedPnlPct >= 0 ? '+' : ''}${p.unrealisedPnlPct.toFixed(1)}%` : '—';
+      const pnlUsdStr = p.unrealisedPnlUsd != null ? `${p.unrealisedPnlUsd >= 0 ? '+' : ''}$${Math.abs(p.unrealisedPnlUsd).toFixed(0)}` : '—';
+      const pnlUsdClass = p.unrealisedPnlUsd == null ? '' : p.unrealisedPnlUsd >= 0 ? 'pnl-positive' : 'pnl-negative';
+      const recPct = p.recoveryNeededPct > 0 ? `${p.recoveryNeededPct.toFixed(0)}%` : '—';
+      const verdict = getVerdict(p);
+      const verdictHtml = verdict ? `<span class="verdict-badge ${verdict}" onclick="quickAnalyse('${p.coin}')">${verdict}</span>` : '<span style="color:var(--text-muted);font-size:0.75rem">no entry</span>';
+      const entryStr = p.entryPrice ? fmtPrice(p.entryPrice) : '<span style="color:var(--text-muted)">—</span>';
+      return `<tr>
+        <td><strong>${p.coin}</strong></td>
+        <td>$${p.currentValue.toFixed(0)}</td>
+        <td>${entryStr}</td>
+        <td class="${pnlClass}" style="font-weight:600">${pnlPctStr}</td>
+        <td class="${pnlUsdClass}">${pnlUsdStr}</td>
+        <td style="color:var(--warn)">${recPct}</td>
+        <td><span class="cat-badge ${p.category}">${p.category.replace('_',' ')}</span></td>
+        <td>${verdictHtml}</td>
+      </tr>`;
+    }).join('');
+  }
+
+  function renderCapCalc(positions) {
+    const el = document.getElementById('cap-calc-list');
+    const eligible = positions.filter(p => p.unrealisedPnlPct != null);
+    if (eligible.length === 0) { el.innerHTML = '<div class="empty-state">Set entry prices to use this calculator.</div>'; return; }
+    el.innerHTML = eligible.map(p => {
+      const pnlStr = `${p.unrealisedPnlPct >= 0 ? '+' : ''}${p.unrealisedPnlPct.toFixed(1)}%`;
+      const pnlClass = p.unrealisedPnlPct >= 0 ? 'pnl-positive' : 'pnl-negative';
+      return `<div class="cap-row">
+        <label>
+          <input type="checkbox" class="cap-checkbox" data-value="${p.currentValue.toFixed(2)}" data-coin="${p.coin}" onchange="recalcFreed()">
+          <span class="cap-coin">${p.coin}</span>
+          <span class="cap-value">$${p.currentValue.toFixed(0)}</span>
+          <span class="cap-pnl ${pnlClass}">${pnlStr}</span>
+        </label>
+      </div>`;
+    }).join('');
+    document.getElementById('freed-total-box').style.display = 'flex';
+    recalcFreed();
+  }
+
+  function recalcFreed() {
+    const checkboxes = document.querySelectorAll('.cap-checkbox:checked');
+    const total = [...checkboxes].reduce((s, cb) => s + parseFloat(cb.dataset.value), 0);
+    const count = checkboxes.length;
+    document.getElementById('freed-amount').textContent = '$' + total.toFixed(0);
+    document.getElementById('freed-count').textContent = `${count} position${count !== 1 ? 's' : ''} selected`;
+  }
+
+  async function loadRebalancingData() {
+    try {
+      const { positions, summary } = await apiFetch('GET', '/api/rebalancing/positions');
+
+      // Draw donut
+      drawDonut(document.getElementById('health-donut'), summary.categoryCount);
+
+      // Update legend
+      document.getElementById('leg-winning').textContent   = `Winning — ${summary.categoryCount.winning}`;
+      document.getElementById('leg-small').textContent     = `Small loss (0–20%) — ${summary.categoryCount.small_loss}`;
+      document.getElementById('leg-moderate').textContent  = `Moderate loss (20–50%) — ${summary.categoryCount.moderate_loss}`;
+      document.getElementById('leg-severe').textContent    = `Severe loss (50%+) — ${summary.categoryCount.severe_loss}`;
+      document.getElementById('leg-none').textContent      = `No entry set — ${summary.categoryCount.no_entry}`;
+
+      // Stats
+      document.getElementById('rb-total-value').textContent = fmt(summary.totalValue);
+      document.getElementById('rb-total-loss').textContent = summary.totalLoss < 0 ? '-' + fmt(Math.abs(summary.totalLoss)) : fmt(summary.totalLoss);
+      document.getElementById('rb-recovery-pct').textContent = summary.totalLossPct > 0 ? summary.totalLossPct.toFixed(1) + '%' : '—';
+
+      renderRbPositions(positions);
+      renderCapCalc(positions);
+
+      // Load latest stored analysis
+      const latest = await apiFetch('GET', '/api/rebalancing/latest').catch(() => null);
+      if (latest && latest.analysis) {
+        document.getElementById('rb-analysis-text').textContent = latest.analysis;
+        document.getElementById('rb-analysis-date').textContent =
+          'Last analysis: ' + new Date(latest.created_at).toLocaleString();
+      }
+    } catch (e) {
+      console.error('loadRebalancingData:', e.message);
+    }
+  }
+
+  async function runRebalancingAnalysis() {
+    const btn = document.getElementById('rb-refresh-btn');
+    btn.disabled = true;
+    btn.textContent = 'Analysing…';
+    document.getElementById('rb-analysis-text').textContent = '🔍 Asking Claude for rebalancing recommendations… this may take 30-60 seconds.';
+    try {
+      const result = await apiFetch('POST', '/api/rebalancing', {});
+      document.getElementById('rb-analysis-text').textContent = result.analysis;
+      document.getElementById('rb-analysis-date').textContent = 'Last analysis: ' + new Date().toLocaleString();
+      showToast('Analysis complete!', 'success');
+    } catch (e) {
+      document.getElementById('rb-analysis-text').textContent = 'Analysis failed: ' + e.message;
+      showToast('Analysis failed', 'error');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Refresh Analysis';
+    }
+  }
+
+  async function quickAnalyse(coin) {
+    showToast(`Sending '${coin}' analysis to Telegram…`, 'success');
+    // Telegram command handled server-side — just inform user to type it
+    showToast(`Type 'rebalance ${coin}' in Telegram for deep analysis`, '');
   }
 
   // ── Init ──────────────────────────────────────────────────────────────────
