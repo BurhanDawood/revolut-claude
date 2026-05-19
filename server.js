@@ -611,20 +611,35 @@ async function sendMorningBriefing() {
     }
     holdings.sort((a, b) => b.valueUSD - a.valueUSD);
 
-    const totalPct = totalUSD > 0 ? 100 : 0;
+    const dateStr = new Date().toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', timeZone: 'Europe/London' });
 
-    // Build top holdings block (medals for top 3, numbers for rest, top 8 max)
-    const medals = ['🥇', '🥈', '🥉'];
-    const topHoldings = holdings.slice(0, 8).map((h, i) => {
-      const rank = i < 3 ? medals[i] : `${i + 1}.`;
+    // ── Format helpers ──────────────────────────────────────────────────────
+    const fmtAmt  = (n) => '$' + Math.abs(n).toLocaleString('en-US', { maximumFractionDigits: 0 });
+    const fmtPrc  = (n) => n >= 1 ? '$' + n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 4 }) : '$' + n.toPrecision(4);
+
+    // ── Capital P&L lines ───────────────────────────────────────────────────
+    let capitalLine = '';
+    let breakEvenLine = '';
+    try {
+      const cap = getCapitalSummary(totalUSD);
+      const pnlSign = cap.pnl >= 0 ? '+' : '-';
+      capitalLine = `\n💰 Invested: ${fmtAmt(cap.invested)} | P&L: ${pnlSign}${fmtAmt(cap.pnl)} (${pnlSign}${Math.abs(cap.pnlPct).toFixed(1)}%)`;
+      breakEvenLine = cap.pnl < 0
+        ? `\n📈 Need +${cap.breakEvenPct.toFixed(1)}% to break even`
+        : `\n✅ Portfolio in profit`;
+    } catch (e) { /* ignore */ }
+
+    // ── Top 5 holdings ──────────────────────────────────────────────────────
+    const BRIEFING_MEDALS = ['🥇', '🥈', '🥉', '4️⃣', '5️⃣'];
+    const topHoldings = holdings.slice(0, 5).map((h, i) => {
       const pct = ((h.valueUSD / totalUSD) * 100).toFixed(0);
       const overnightStr = h.overnightChange !== null
-        ? ` (${h.overnightChange >= 0 ? '+' : ''}${h.overnightChange.toFixed(1)}% overnight)`
+        ? ` ${h.overnightChange >= 0 ? '+' : ''}${h.overnightChange.toFixed(1)}%`
         : '';
-      return `${rank} ${h.coin} $${h.price.toFixed(4)} — $${h.valueUSD.toFixed(0)} (${pct}%)${overnightStr}`;
+      return `${BRIEFING_MEDALS[i]} ${h.coin} ${fmtPrc(h.price)} — ${fmtAmt(h.valueUSD)} (${pct}%)${overnightStr}`;
     }).join('\n');
 
-    // Check any coins approaching thresholds
+    // ── Alerts to watch ─────────────────────────────────────────────────────
     const alertsToWatch = [];
     for (const h of holdings) {
       const threshold = customThresholds[h.symbol] !== undefined ? customThresholds[h.symbol] : PUMP_THRESHOLD;
@@ -635,66 +650,23 @@ async function sendMorningBriefing() {
           alertsToWatch.push(`${h.coin}: ${(change * 100).toFixed(1)}% move (alert at ${(threshold * 100).toFixed(0)}%)`);
         }
       }
-      // Check fixed targets
       const target = priceTargets.get(h.symbol);
       if (target) {
         const distPct = Math.abs((h.price - target.targetPrice) / target.targetPrice) * 100;
         if (distPct <= 5) {
           const dir = target.direction === 'down' ? 'floor' : 'target';
-          alertsToWatch.push(`${h.coin}: within ${distPct.toFixed(1)}% of fixed ${dir} $${target.targetPrice.toFixed(4)}`);
+          alertsToWatch.push(`${h.coin}: within ${distPct.toFixed(1)}% of fixed ${dir} ${fmtPrc(target.targetPrice)}`);
         }
       }
     }
-    const alertsBlock = alertsToWatch.length > 0
-      ? alertsToWatch.join('\n')
-      : 'No coins approaching alert thresholds.';
+    const alertsBlock = alertsToWatch.length > 0 ? alertsToWatch.join('\n') : 'All clear ✅';
 
-    // Build data context for Claude — compact for token efficiency
-    const portfolioContext = holdings.slice(0, 10).map(h => {
-      const overnight = h.overnightChange !== null ? ` overnight:${h.overnightChange.toFixed(1)}%` : '';
-      const pl = h.plPct !== null ? ` P&L:${h.plPct.toFixed(1)}%` : '';
-      return `${h.coin} $${h.price.toFixed(4)} $${h.valueUSD.toFixed(0)}${overnight}${pl}`;
-    }).join(', ');
-
-    const dateStr = new Date().toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', timeZone: 'Europe/London' });
-
-    // Ask Claude for market conditions, news, and recommendations only
-    const claudeResponse = await anthropic.messages.create({
-      model: 'claude-sonnet-4-5',
-      max_tokens: 1000,
-      tools: [{ type: "web_search_20250305", name: "web_search" }],
-      messages: [{
-        role: 'user',
-        content: `You are writing a morning crypto briefing for Bryan. Search for current BTC price, market conditions, and top crypto news from today. His portfolio (top holdings): ${portfolioContext}. Total: $${totalUSD.toFixed(0)}.
-
-Reply with EXACTLY this format and nothing else — no preamble, no sign-off:
-
-🌍 MARKET CONDITIONS:
-[2-3 sentences on BTC price right now, overall sentiment, key level to watch]
-
-📰 KEY NEWS:
-• [Most important crypto news item today]
-• [Second important news item]
-• [Third news item if relevant]
-
-⚡ TODAY'S RECOMMENDATIONS:
-1. [Specific action for his top holding by value]
-2. [Specific action for second holding]
-3. [BTC key watch level or macro point]
-
-CRITICAL: Your entire response must be under 3000 characters. Be very concise. Use short bullet points. Maximum 2-3 words per bullet. No long explanations.`
-      }]
-    });
-
-    const lastTextBlock = [...claudeResponse.content].reverse().find(b => b.type === 'text');
-    const aiSection = lastTextBlock ? lastTextBlock.text.trim() : '🌍 Market data unavailable.';
-
-    // Recent outcomes (last 24h) and weekly P&L
+    // ── Recent outcomes + weekly stats ──────────────────────────────────────
     let recentOutcomesBlock = '';
     let weeklyPnlBlock = '';
     try {
       const [recentOutcomes] = await db.execute(
-        "SELECT symbol, outcome, outcome_pnl, outcome_notes FROM trading_journal WHERE outcome IS NOT NULL AND action != 'payment' AND updated_at > DATE_SUB(NOW(), INTERVAL 24 HOUR) ORDER BY updated_at DESC LIMIT 5"
+        "SELECT symbol, outcome, outcome_pnl FROM trading_journal WHERE outcome IS NOT NULL AND action != 'payment' AND updated_at > DATE_SUB(NOW(), INTERVAL 24 HOUR) ORDER BY updated_at DESC LIMIT 5"
       );
       if (recentOutcomes.length > 0) {
         const outcomeLines = recentOutcomes.map(t => {
@@ -717,26 +689,72 @@ CRITICAL: Your entire response must be under 3000 characters. Be very concise. U
       }
     } catch (e) { /* ignore — don't break briefing */ }
 
-    // Capital P&L summary line
-    let capitalLine = '';
-    try {
-      const cap = getCapitalSummary(totalUSD);
-      const pnlSign = cap.pnl >= 0 ? '+' : '';
-      const breakEvenStr = cap.pnl < 0 ? ` | Need +${cap.breakEvenPct.toFixed(1)}% to break even` : '';
-      capitalLine = `\n💰 Invested: $${cap.invested.toLocaleString()} | Current: $${totalUSD.toFixed(0)} | P&L: ${pnlSign}$${Math.abs(cap.pnl).toFixed(0)} (${pnlSign}${cap.pnlPct.toFixed(1)}%)${breakEvenStr}`;
-    } catch (e) { /* ignore */ }
-
-    // Assemble final message
-    const fullMessage =
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // MESSAGE 1 — PORTFOLIO SNAPSHOT (no Claude API, instant)
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    const msg1 =
       `🌅 <b>GOOD MORNING BRYAN!</b>\n` +
-      `📅 ${dateStr} | Portfolio: <b>$${totalUSD.toFixed(0)}</b>${capitalLine}\n\n` +
-      `📊 <b>TOP HOLDINGS TODAY:</b>\n${topHoldings}\n\n` +
-      `${aiSection}${recentOutcomesBlock}${weeklyPnlBlock}\n\n` +
-      `🚨 <b>ALERTS TO WATCH:</b>\n${alertsBlock}`;
+      `📅 ${dateStr} | Portfolio: <b>${fmtAmt(totalUSD)}</b>` +
+      capitalLine + breakEvenLine + `\n\n` +
+      `📊 <b>TOP HOLDINGS:</b>\n${topHoldings}\n\n` +
+      `🚨 <b>ALERTS:</b> ${alertsBlock}` +
+      recentOutcomesBlock + weeklyPnlBlock;
 
-    // Send as single message (target <3500 chars)
-    await sendTelegram(fullMessage);
-    console.log('Morning briefing sent. Length:', fullMessage.length);
+    await sendTelegram(msg1);
+    console.log('Morning snapshot sent. Length:', msg1.length);
+
+    // ── 5-second delay before market intelligence ───────────────────────────
+    await new Promise(resolve => setTimeout(resolve, 5000));
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // MESSAGE 2 — MARKET INTELLIGENCE (Claude + web search)
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    const portfolioContext = holdings.slice(0, 5).map(h => {
+      const overnight = h.overnightChange !== null ? ` overnight:${h.overnightChange.toFixed(1)}%` : '';
+      const pl = h.plPct !== null ? ` P&L:${h.plPct.toFixed(1)}%` : '';
+      return `${h.coin} ${fmtPrc(h.price)} ${fmtAmt(h.valueUSD)}${overnight}${pl}`;
+    }).join(', ');
+
+    const claudeResponse = await anthropic.messages.create({
+      model: 'claude-sonnet-4-5',
+      max_tokens: 1000,
+      tools: [{ type: "web_search_20250305", name: "web_search" }],
+      messages: [{
+        role: 'user',
+        content: `Generate a concise morning market intelligence briefing.
+Today is ${dateStr}. Search for latest crypto news.
+Bryan's top holdings: ${portfolioContext}. Total portfolio: ${fmtAmt(totalUSD)}.
+
+Format EXACTLY like this:
+📰 MARKET BRIEFING — ${dateStr}
+
+🌍 MACRO:
+- BTC: $[price] — [1 sentence on trend]
+- Market: [1 sentence on overall sentiment]
+- Key level: [most important level to watch]
+
+📰 TOP NEWS:
+- [headline 1 — 1 line]
+- [headline 2 — 1 line]
+- [headline 3 — 1 line]
+
+⚡ TODAY'S PLAN:
+1. [Specific action for Bryan's portfolio]
+2. [Specific action]
+3. [Key thing to watch]
+
+🎯 FOCUS: [One coin from Bryan's holdings to pay most attention to today and why — 2 sentences max]
+
+Keep total under 3000 characters. No long paragraphs. Be concise.`
+      }]
+    });
+
+    const lastTextBlock = [...claudeResponse.content].reverse().find(b => b.type === 'text');
+    const msg2 = lastTextBlock ? lastTextBlock.text.trim() : '📰 Market intelligence unavailable — check crypto news manually.';
+
+    await sendTelegram(msg2);
+    console.log('Market intelligence sent. Length:', msg2.length);
+
   } catch (e) {
     console.error('sendMorningBriefing error:', e.message);
     await sendTelegram(`❌ Morning briefing failed: ${e.message}`);
