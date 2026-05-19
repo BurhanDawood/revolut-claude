@@ -317,6 +317,15 @@ await db.execute(`CREATE TABLE IF NOT EXISTS rebalancing_history (
   INDEX idx_created (created_at)
 )`);
 
+await db.execute(`CREATE TABLE IF NOT EXISTS price_ranges (
+  symbol VARCHAR(50) PRIMARY KEY,
+  price_7d_high DECIMAL(20,10),
+  price_7d_low DECIMAL(20,10),
+  price_7d_avg DECIMAL(20,10),
+  price_7d_stddev DECIMAL(20,10),
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+)`);
+
 await db.execute(`CREATE TABLE IF NOT EXISTS intention_tracking (
   id INT AUTO_INCREMENT PRIMARY KEY,
   symbols VARCHAR(200) NOT NULL,
@@ -584,6 +593,14 @@ function extractRecommendedPriceLevels(text) {
     while ((m = re.exec(text)) !== null) addPrice(m[1], m[2], type);
   }
   return results.sort((a, b) => a.price - b.price);
+}
+
+// Quick price formatter for alert messages
+function fmtPriceShort(n) {
+  if (n === null || n === undefined) return '—';
+  if (n >= 1000) return '$' + n.toLocaleString('en-US', { maximumFractionDigits: 2 });
+  if (n >= 1)    return '$' + n.toFixed(4);
+  return '$' + n.toPrecision(4);
 }
 
 async function getCurrentPrice(symbol) {
@@ -1719,7 +1736,8 @@ async function checkPortfolio() {
         const coinBase = asset.currency;
         const aiRec = await getQuickAiRecommendation(symbol, change * 100, currentPrice, 'up');
         const replyMenu = `\n\nReply:\n'sell ${coinBase}' - get sell advice\n'buy more ${coinBase}' - get buy advice\n'analyse ${coinBase}' - full analysis\n'acknowledge ${coinBase}' - stop alerts`;
-        const alertMessage = `📈 <b>${symbol} DAILY PUMP ALERT</b>\n\nBaseline: $${basePrices[symbol].toFixed(4)} → Now $${currentPrice.toFixed(4)} (+${pct}%)\nYou hold: ${available} ${coinBase}\n\n⚡ RECOMMENDATION: ${aiRec}${replyMenu}`;
+        const swingPumpHint = `\n\n⚡ SWING SIGNAL: This pump may be your sell opportunity!\nCheck if this is outside normal range — if so, consider taking profits and setting a buy-back alert at ${fmtPriceShort(currentPrice * 0.85)} (-15%)`;
+        const alertMessage = `📈 <b>${symbol} DAILY PUMP ALERT</b>\n\nBaseline: $${basePrices[symbol].toFixed(4)} → Now $${currentPrice.toFixed(4)} (+${pct}%)\nYou hold: ${available} ${coinBase}\n\n⚡ RECOMMENDATION: ${aiRec}${swingPumpHint}${replyMenu}`;
         await sendTelegram(alertMessage);
 
         activeAlerts[symbol] = setInterval(async () => {
@@ -1733,7 +1751,8 @@ async function checkPortfolio() {
         const coinBase = asset.currency;
         const aiRec = await getQuickAiRecommendation(symbol, change * 100, currentPrice, 'down');
         const replyMenu = `\n\nReply:\n'buy more ${coinBase}' - get buy the dip advice\n'sell ${coinBase}' - get sell advice\n'analyse ${coinBase}' - full analysis\n'acknowledge ${coinBase}' - stop alerts`;
-        const alertMessage = `📉 <b>${symbol} DROP ALERT!</b>\n\nBaseline: $${basePrices[symbol].toFixed(4)} → Now $${currentPrice.toFixed(4)} (-${pct}%)\nYou hold: ${available} ${coinBase}\n\n⚡ RECOMMENDATION: ${aiRec}${replyMenu}`;
+        const swingDropHint = `\n\n⚡ SWING SIGNAL: This drop may be your buy opportunity!\nCheck if this is outside normal range — if so, consider buying the dip and setting a sell alert at ${fmtPriceShort(currentPrice * 1.20)} (+20%)`;
+        const alertMessage = `📉 <b>${symbol} DROP ALERT!</b>\n\nBaseline: $${basePrices[symbol].toFixed(4)} → Now $${currentPrice.toFixed(4)} (-${pct}%)\nYou hold: ${available} ${coinBase}\n\n⚡ RECOMMENDATION: ${aiRec}${swingDropHint}${replyMenu}`;
         await sendTelegram(alertMessage);
 
         activeDropAlerts[symbol] = setInterval(async () => {
@@ -1868,6 +1887,102 @@ async function checkPortfolio() {
         }, ALERT_INTERVAL_MS);
       }
     }
+    // ── Extreme move detection (swing trade signals) ──────────────────────────
+    // Update 7-day price ranges and flag extreme moves outside normal trading range
+    const extremeMoveThreshold = 0.15; // 15% outside 7-day average = extreme
+    const extremeAlertsSent = {};
+    try {
+      for (const asset of balances) {
+        if (!asset.currency || SKIP_CURRENCIES.includes(asset.currency)) continue;
+        const symbol = `${asset.currency}-USD`;
+        const currentPrice = priceMap[symbol];
+        if (!currentPrice) continue;
+
+        // Get 7-day price history
+        const [histRows] = await db.execute(
+          'SELECT price, recorded_at FROM price_history WHERE symbol = ? AND recorded_at >= DATE_SUB(NOW(), INTERVAL 7 DAY) ORDER BY recorded_at ASC',
+          [symbol]
+        ).catch(() => [[]]);
+        if (histRows.length < 3) continue; // need enough data
+
+        const prices7d = histRows.map(r => parseFloat(r.price));
+        const avg = prices7d.reduce((s, p) => s + p, 0) / prices7d.length;
+        const high = Math.max(...prices7d);
+        const low  = Math.min(...prices7d);
+        const variance = prices7d.reduce((s, p) => s + Math.pow(p - avg, 2), 0) / prices7d.length;
+        const stddev = Math.sqrt(variance);
+
+        // Update price_ranges table
+        await db.execute(
+          'INSERT INTO price_ranges (symbol, price_7d_high, price_7d_low, price_7d_avg, price_7d_stddev) VALUES (?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE price_7d_high=VALUES(price_7d_high), price_7d_low=VALUES(price_7d_low), price_7d_avg=VALUES(price_7d_avg), price_7d_stddev=VALUES(price_7d_stddev), updated_at=CURRENT_TIMESTAMP',
+          [symbol, high, low, avg, stddev]
+        ).catch(() => {});
+
+        // Detect extreme moves (only fire once per symbol per run to avoid spam)
+        if (extremeAlertsSent[symbol]) continue;
+        const devFromAvg = (currentPrice - avg) / avg;
+        const isExtremeDip  = devFromAvg <= -extremeMoveThreshold && !activeDropAlerts[symbol];
+        const isExtremePump = devFromAvg >=  extremeMoveThreshold && !activeAlerts[symbol];
+
+        if (!isExtremeDip && !isExtremePump) continue;
+
+        // Check we haven't sent this extreme alert recently (use basePrices as proxy)
+        const coinBase = asset.currency;
+        const available = parseFloat(asset.available);
+        const entryPrice = entryPrices.get(symbol);
+
+        if (isExtremeDip) {
+          extremeAlertsSent[symbol] = true;
+          const dropPct = (Math.abs(devFromAvg) * 100).toFixed(1);
+          const buyBackSell = fmtPriceShort(currentPrice * 1.20);
+          const entryLine = entryPrice
+            ? `Entry: ${fmtPriceShort(entryPrice)} | P&L: ${((currentPrice - entryPrice) / entryPrice * 100).toFixed(1)}%\n`
+            : '';
+          const swingMsg =
+            `🎯 <b>SWING TRADE SIGNAL — ${symbol}</b>\n` +
+            `⬇️ <b>EXTREME DIP DETECTED</b>\n\n` +
+            `Current: ${fmtPriceShort(currentPrice)} | 7-day avg: ${fmtPriceShort(avg)} | Drop: -${dropPct}%\n` +
+            `7-day range: ${fmtPriceShort(low)} – ${fmtPriceShort(high)}\n` +
+            `This is OUTSIDE normal trading range!\n\n` +
+            `📊 Bryan's buy signal criteria:\n` +
+            `• Outside normal range: ✅ (-${dropPct}% from avg)\n` +
+            `• RSI likely oversold at this level ✅\n\n` +
+            entryLine +
+            `⚡ <b>RECOMMENDATION:</b> Strong buy signal based on your swing strategy.\n` +
+            `Consider buying here and setting sell alert at ${buyBackSell} (+20%)\n\n` +
+            `Reply 'analyse ${coinBase}' for full analysis`;
+          await sendTelegram(swingMsg);
+          console.log(`Extreme dip signal sent for ${symbol}: ${dropPct}% below 7d avg`);
+        }
+
+        if (isExtremePump) {
+          extremeAlertsSent[symbol] = true;
+          const pumpPct = (devFromAvg * 100).toFixed(1);
+          const buyBackPrice = fmtPriceShort(currentPrice * 0.85);
+          const entryLine = entryPrice
+            ? `Entry: ${fmtPriceShort(entryPrice)} | Profit: +${((currentPrice - entryPrice) / entryPrice * 100).toFixed(1)}%\n`
+            : '';
+          const swingMsg =
+            `🎯 <b>SWING TRADE SIGNAL — ${symbol}</b>\n` +
+            `⬆️ <b>EXTREME PUMP DETECTED</b>\n\n` +
+            `Current: ${fmtPriceShort(currentPrice)} | 7-day avg: ${fmtPriceShort(avg)} | Pump: +${pumpPct}%\n` +
+            `7-day range: ${fmtPriceShort(low)} – ${fmtPriceShort(high)}\n` +
+            `This is OUTSIDE normal trading range!\n\n` +
+            `📊 Bryan's sell signal criteria:\n` +
+            `• Outside normal range: ✅ (+${pumpPct}% from avg)\n` +
+            `• RSI likely overbought at this level ✅\n\n` +
+            entryLine +
+            `⚡ <b>RECOMMENDATION:</b> Sell signal based on your swing strategy.\n` +
+            `Consider taking profits and setting buy-back alert at ${buyBackPrice} (-15%)\n\n` +
+            `Reply 'sell ${coinBase}' for sell advice or 'analyse ${coinBase}' for full analysis`;
+          await sendTelegram(swingMsg);
+          console.log(`Extreme pump signal sent for ${symbol}: ${pumpPct}% above 7d avg`);
+        }
+      }
+    } catch (e) {
+      console.log('Extreme move detection error:', e.message);
+    }
+
     // ── Secondary alert check: sell levels stored in note JSON ──────────────
     // These are sell/profit levels from a recommendation where a buy alert is the primary target.
     // We check them here so both buy and sell levels fire automatically.
@@ -3511,7 +3626,6 @@ IMPORTANT TRADER CONTEXT:
 - Bryan's portfolio is approximately 50% down from historical highs due to bear market conditions and past trading decisions
 - Many individual positions are down 50-80% from entry
 - Bryan's PRIMARY GOAL is portfolio recovery and becoming a more disciplined trader
-- Bryan is learning to be a better swing trader — buying dips and selling pumps
 - Some balance changes detected are Revolut payments (asset used to make purchases) not trading decisions
 - When giving advice, always consider recovery strategy not just short term gains
 - Encourage disciplined trading habits and risk management
@@ -3521,6 +3635,47 @@ IMPORTANT TRADER CONTEXT:
 - For positions doing well (CC, HYPE, LINK): emphasise protecting and growing these gains
 - Always consider overall portfolio recovery in recommendations
 - Suggest position sizing that protects the recovering portfolio
+
+BRYAN'S CORE TRADING STRATEGY:
+Bryan is a swing trader who specifically targets EXTREME price movements outside normal patterns:
+
+BUY SIGNALS Bryan looks for:
+• Sudden sharp DROP outside coin's normal trading range
+• Extreme oversold conditions (RSI < 30)
+• Price significantly below recent support
+• Fear/panic selling creating opportunity
+• The bigger and more sudden the drop, the more interesting
+
+SELL SIGNALS Bryan looks for:
+• Sudden sharp PUMP outside coin's normal trading range
+• Extreme overbought conditions (RSI > 70)
+• Price significantly above recent resistance
+• Euphoria/FOMO buying creating exit opportunity
+• The bigger and more sudden the pump, the more interesting
+
+RETRACE STRATEGY:
+• After selling a pump, Bryan waits for retrace
+• Buys back at lower price to repeat the cycle
+• Goal: capture profit on the move, buy back cheaper
+
+LOSS PROTECTION:
+• Will cut losses if coin drops with no recovery catalyst
+• Prefers to redeploy capital into better opportunities
+• Does not hold indefinitely hoping for recovery on weak coins
+
+WHEN GIVING RECOMMENDATIONS:
+• Always identify if current price is an extreme move outside normal range
+• Flag if coin is in buy zone (extreme dip) or sell zone (extreme pump)
+• Suggest specific buy-back prices after recommending sells
+• Suggest profit-taking levels after recommending buys
+• Reference Bryan's swing trading strategy explicitly in advice
+• Example: 'This 15% sudden drop is exactly your buy signal — outside normal range, RSI oversold'
+• Example: 'This 20% pump is your sell signal — take profits here and watch for retrace to $X to buy back'
+
+ALERT CONTEXT:
+• Daily pump alerts = potential SELL signal (extreme move up)
+• Daily drop alerts = potential BUY signal (extreme move down)
+• Always frame alerts in context of Bryan's swing strategy
 
 ${holdingsList}
 
