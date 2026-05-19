@@ -135,9 +135,13 @@ async function sendTelegramChunked(text) {
 }
 
 const basePrices = {};
-const activeAlerts = {};
-const activeFixedAlerts = {}; // symbol -> intervalId for fixed price target alerts (up direction)
-const activeDropAlerts = {}; // symbol -> intervalId for fixed floor alerts (down direction)
+// Single source of truth for alert state
+const alertState = {
+  active: new Map(),       // symbol -> intervalId (daily pump alerts)
+  acknowledged: new Set(), // symbols currently acknowledged — suppress re-alerts for 15 min
+};
+const activeFixedAlerts = new Map(); // symbol -> intervalId for fixed price target alerts (up)
+const activeDropAlerts  = new Map(); // symbol -> intervalId for fixed floor/drop alerts (down)
 const activeSecondaryAlerts = {}; // `${symbol}:${price}` -> true — fired secondary rec-based alerts
 const lastBalances = {};
 const customThresholds = {};
@@ -169,9 +173,10 @@ async function setThreshold(symbol, threshold) {
   );
 
   // Cancel any active alert interval for this coin
-  if (activeAlerts[symbol]) {
-    clearInterval(activeAlerts[symbol]);
-    delete activeAlerts[symbol];
+  if (alertState.active.has(symbol)) {
+    clearInterval(alertState.active.get(symbol));
+    alertState.active.delete(symbol);
+    console.log('[alert] Cleared pump interval for', symbol, 'on threshold change');
   }
 
   // Reset baseline to current price so monitoring restarts fresh
@@ -387,6 +392,26 @@ try {
   await db.execute(`ALTER TABLE price_targets ADD COLUMN note TEXT`);
   console.log('Added note column to price_targets');
 } catch (e) { /* already exists */ }
+
+// Add acknowledged_until column to custom_thresholds (persists ack status across restarts)
+try {
+  await db.execute(`ALTER TABLE custom_thresholds ADD COLUMN acknowledged_until TIMESTAMP NULL DEFAULT NULL`);
+  console.log('Added acknowledged_until column to custom_thresholds');
+} catch (e) { /* already exists */ }
+
+// Load currently acknowledged coins from DB (acknowledged_until > NOW())
+try {
+  const [ackRows] = await db.execute(`SELECT symbol, acknowledged_until FROM custom_thresholds WHERE acknowledged_until > NOW()`);
+  for (const row of ackRows) {
+    alertState.acknowledged.add(row.symbol);
+    const msLeft = new Date(row.acknowledged_until).getTime() - Date.now();
+    if (msLeft > 0) setTimeout(() => {
+      alertState.acknowledged.delete(row.symbol);
+      console.log('[ack] Acknowledge expired (from DB) for:', row.symbol);
+    }, msLeft);
+  }
+  if (ackRows.length > 0) console.log(`[ack] Loaded ${ackRows.length} acknowledged coin(s) from DB:`, ackRows.map(r => r.symbol).join(', '));
+} catch (e) { console.warn('[ack] Could not load acknowledged coins:', e.message); }
 
 const [rows] = await db.execute('SELECT symbol, price FROM baselines');
 for (const row of rows) {
@@ -622,6 +647,57 @@ function extractRecommendedPriceLevels(text) {
   return results.sort((a, b) => a.price - b.price);
 }
 
+// Single acknowledge function — used by BOTH Telegram command and dashboard API
+// Clears ALL interval types for the symbol and suppresses re-alerts for 15 minutes
+async function acknowledgeAlert(symbol) {
+  console.log('[ack] Acknowledging:', symbol);
+
+  // Mark as acknowledged — blocks all new alerts for this symbol
+  alertState.acknowledged.add(symbol);
+
+  // Clear pump alert interval
+  if (alertState.active.has(symbol)) {
+    clearInterval(alertState.active.get(symbol));
+    alertState.active.delete(symbol);
+    console.log('[ack] Cleared pump interval for:', symbol);
+  }
+
+  // Clear drop alert interval
+  if (activeDropAlerts.has(symbol)) {
+    clearInterval(activeDropAlerts.get(symbol));
+    activeDropAlerts.delete(symbol);
+    console.log('[ack] Cleared drop interval for:', symbol);
+  }
+
+  // Clear fixed target/floor interval
+  if (activeFixedAlerts.has(symbol)) {
+    clearInterval(activeFixedAlerts.get(symbol));
+    activeFixedAlerts.delete(symbol);
+    console.log('[ack] Cleared fixed target interval for:', symbol);
+  }
+
+  // Persist acknowledged_until to DB so it survives restarts
+  const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
+  try {
+    await db.execute(
+      `INSERT INTO custom_thresholds (symbol, threshold, acknowledged_until) VALUES (?, 0.05, ?)
+       ON DUPLICATE KEY UPDATE acknowledged_until = VALUES(acknowledged_until)`,
+      [symbol, expiresAt]
+    );
+  } catch (e) { console.warn('[ack] DB persist failed for', symbol, ':', e.message); }
+
+  // Auto-expire after 15 minutes
+  setTimeout(() => {
+    alertState.acknowledged.delete(symbol);
+    console.log('[ack] Acknowledge expired for:', symbol);
+  }, 15 * 60 * 1000);
+
+  console.log('[ack] Complete for:', symbol,
+    '| Active pump:', alertState.active.size,
+    '| Active drop:', activeDropAlerts.size,
+    '| Active fixed:', activeFixedAlerts.size);
+}
+
 // Quick price formatter for alert messages
 function fmtPriceShort(n) {
   if (n === null || n === undefined) return '—';
@@ -763,7 +839,7 @@ async function sendMorningBriefing() {
       if (basePrices[h.symbol]) {
         const change = (h.price - basePrices[h.symbol]) / basePrices[h.symbol];
         const pctOfThreshold = change / threshold;
-        if (pctOfThreshold >= 0.7 && !activeAlerts[h.symbol]) {
+        if (pctOfThreshold >= 0.7 && !alertState.active.has(h.symbol)) {
           alertsToWatch.push(`${h.coin}: ${(change * 100).toFixed(1)}% move (alert at ${(threshold * 100).toFixed(0)}%)`);
         }
       }
@@ -1707,10 +1783,10 @@ async function checkPortfolio() {
       }
 
       // Check if position was sold
-      if (activeAlerts[symbol] && lastBalances[symbol] && available < lastBalances[symbol] * 0.9) {
-        console.log(`Position reduced for ${symbol}, stopping alerts`);
-        clearInterval(activeAlerts[symbol]);
-        delete activeAlerts[symbol];
+      if (alertState.active.has(symbol) && lastBalances[symbol] && available < lastBalances[symbol] * 0.9) {
+        console.log('[alert] Position reduced for', symbol, '— stopping pump alert');
+        clearInterval(alertState.active.get(symbol));
+        alertState.active.delete(symbol);
         delete basePrices[symbol];
         await sendTelegram(`✅ Alert stopped for ${symbol} — position change detected.`);
       }
@@ -1758,7 +1834,7 @@ async function checkPortfolio() {
 
       // Trigger baseline alert if pumping
       const threshold = customThresholds[symbol] !== undefined ? customThresholds[symbol] : PUMP_THRESHOLD;
-      if (change >= threshold && !activeAlerts[symbol]) {
+      if (change >= threshold && !alertState.active.has(symbol) && !alertState.acknowledged.has(symbol)) {
         const pct = (change * 100).toFixed(1);
         const coinBase = asset.currency;
         const aiRec = await getQuickAiRecommendation(symbol, change * 100, currentPrice, 'up');
@@ -1767,13 +1843,20 @@ async function checkPortfolio() {
         const alertMessage = `📈 <b>${symbol} DAILY PUMP ALERT</b>\n\nBaseline: $${basePrices[symbol].toFixed(4)} → Now $${currentPrice.toFixed(4)} (+${pct}%)\nYou hold: ${available} ${coinBase}\n\n⚡ RECOMMENDATION: ${aiRec}${swingPumpHint}${replyMenu}`;
         await sendTelegram(alertMessage);
 
-        activeAlerts[symbol] = setInterval(async () => {
+        alertState.active.set(symbol, setInterval(async () => {
+          if (alertState.acknowledged.has(symbol)) {
+            console.log('[alert] Pump reminder skipped — recently acknowledged:', symbol);
+            clearInterval(alertState.active.get(symbol));
+            alertState.active.delete(symbol);
+            return;
+          }
+          console.log('[alert] Sending pump reminder for:', symbol);
           await sendTelegram(`⚠️ <b>REMINDER: ${symbol} DAILY PUMP ALERT still active!</b>\n\nStill up ${pct}% from baseline\nReply 'acknowledge ${coinBase}' to stop`);
-        }, ALERT_INTERVAL_MS);
+        }, ALERT_INTERVAL_MS));
       }
 
       // Trigger baseline drop alert
-      if (change <= -threshold && !activeDropAlerts[symbol]) {
+      if (change <= -threshold && !activeDropAlerts.has(symbol) && !alertState.acknowledged.has(symbol)) {
         const pct = (Math.abs(change) * 100).toFixed(1);
         const coinBase = asset.currency;
         const aiRec = await getQuickAiRecommendation(symbol, change * 100, currentPrice, 'down');
@@ -1782,9 +1865,16 @@ async function checkPortfolio() {
         const alertMessage = `📉 <b>${symbol} DROP ALERT!</b>\n\nBaseline: $${basePrices[symbol].toFixed(4)} → Now $${currentPrice.toFixed(4)} (-${pct}%)\nYou hold: ${available} ${coinBase}\n\n⚡ RECOMMENDATION: ${aiRec}${swingDropHint}${replyMenu}`;
         await sendTelegram(alertMessage);
 
-        activeDropAlerts[symbol] = setInterval(async () => {
+        activeDropAlerts.set(symbol, setInterval(async () => {
+          if (alertState.acknowledged.has(symbol)) {
+            console.log('[alert] Drop reminder skipped — recently acknowledged:', symbol);
+            clearInterval(activeDropAlerts.get(symbol));
+            activeDropAlerts.delete(symbol);
+            return;
+          }
+          console.log('[alert] Sending drop reminder for:', symbol);
           await sendTelegram(`⚠️ <b>REMINDER: ${symbol} DROP ALERT still active!</b>\n\nStill down ${pct}% from baseline\nReply 'acknowledge ${coinBase}' to stop`);
-        }, ALERT_INTERVAL_MS);
+        }, ALERT_INTERVAL_MS));
       }
     }
 
@@ -1815,7 +1905,7 @@ async function checkPortfolio() {
 
       const direction = target.direction || 'up';
 
-      if (direction === 'up' && currentPrice >= target.targetPrice && !activeFixedAlerts[symbol]) {
+      if (direction === 'up' && currentPrice >= target.targetPrice && !activeFixedAlerts.has(symbol) && !alertState.acknowledged.has(symbol)) {
         const changePct = ((currentPrice - target.anchorPrice) / target.anchorPrice) * 100;
         const coinBase = symbol.replace('-USD', '');
 
@@ -1869,12 +1959,19 @@ async function checkPortfolio() {
         }
         await sendTelegram(alertMessage);
 
-        activeFixedAlerts[symbol] = setInterval(async () => {
+        activeFixedAlerts.set(symbol, setInterval(async () => {
+          if (alertState.acknowledged.has(symbol)) {
+            console.log('[alert] Fixed-target reminder skipped — recently acknowledged:', symbol);
+            clearInterval(activeFixedAlerts.get(symbol));
+            activeFixedAlerts.delete(symbol);
+            return;
+          }
+          console.log('[alert] Sending fixed-target reminder for:', symbol);
           await sendTelegram(`⚠️ <b>REMINDER: ${symbol} FIXED TARGET STILL ACTIVE!</b>\n\nTarget: $${target.targetPrice.toFixed(4)} | Now: $${currentPrice.toFixed(4)}\nReply 'acknowledge ${coinBase}' to stop`);
-        }, ALERT_INTERVAL_MS);
+        }, ALERT_INTERVAL_MS));
       }
 
-      if (direction === 'down' && currentPrice <= target.targetPrice && !activeFixedAlerts[symbol]) {
+      if (direction === 'down' && currentPrice <= target.targetPrice && !activeFixedAlerts.has(symbol) && !alertState.acknowledged.has(symbol)) {
         const changePct = ((currentPrice - target.anchorPrice) / target.anchorPrice) * 100;
         const coinBase = symbol.replace('-USD', '');
         const entryPrice = entryPrices.get(symbol) || target.entryPrice;
@@ -1909,9 +2006,16 @@ async function checkPortfolio() {
         }
         await sendTelegram(alertMessage);
 
-        activeFixedAlerts[symbol] = setInterval(async () => {
+        activeFixedAlerts.set(symbol, setInterval(async () => {
+          if (alertState.acknowledged.has(symbol)) {
+            console.log('[alert] Fixed-floor reminder skipped — recently acknowledged:', symbol);
+            clearInterval(activeFixedAlerts.get(symbol));
+            activeFixedAlerts.delete(symbol);
+            return;
+          }
+          console.log('[alert] Sending fixed-floor reminder for:', symbol);
           await sendTelegram(`⚠️ <b>REMINDER: ${symbol} FIXED FLOOR STILL ACTIVE!</b>\n\nFloor: $${target.targetPrice.toFixed(4)} | Now: $${currentPrice.toFixed(4)}\nReply 'acknowledge ${coinBase}' to stop`);
-        }, ALERT_INTERVAL_MS);
+        }, ALERT_INTERVAL_MS));
       }
     }
     // ── Extreme move detection (swing trade signals) ──────────────────────────
@@ -1948,8 +2052,8 @@ async function checkPortfolio() {
         // Detect extreme moves (only fire once per symbol per run to avoid spam)
         if (extremeAlertsSent[symbol]) continue;
         const devFromAvg = (currentPrice - avg) / avg;
-        const isExtremeDip  = devFromAvg <= -extremeMoveThreshold && !activeDropAlerts[symbol];
-        const isExtremePump = devFromAvg >=  extremeMoveThreshold && !activeAlerts[symbol];
+        const isExtremeDip  = devFromAvg <= -extremeMoveThreshold && !activeDropAlerts.has(symbol) && !alertState.acknowledged.has(symbol);
+        const isExtremePump = devFromAvg >=  extremeMoveThreshold && !alertState.active.has(symbol) && !alertState.acknowledged.has(symbol);
 
         if (!isExtremeDip && !isExtremePump) continue;
 
@@ -2116,12 +2220,13 @@ app.use((req, res, next) => {
 // GET /api/status — monitoring status, active alerts, baseline prices
 app.get('/api/status', (req, res) => {
   const alerts = {};
-  for (const symbol of Object.keys(activeAlerts)) {
+  for (const symbol of alertState.active.keys()) {
     alerts[symbol] = { alerting: true };
   }
   res.json({
     paused: monitoringPaused,
     activeAlerts: alerts,
+    acknowledged: [...alertState.acknowledged],
     basePrices,
     customThresholds,
     defaultThreshold: PUMP_THRESHOLD
@@ -2179,14 +2284,10 @@ app.get('/api/balances', async (req, res) => {
 // POST /api/acknowledge/:symbol — stop alerts for a coin
 app.post('/api/acknowledge/:symbol', async (req, res) => {
   const symbol = req.params.symbol.toUpperCase();
-  if (activeAlerts[symbol]) {
-    clearInterval(activeAlerts[symbol]);
-    delete activeAlerts[symbol];
-    await sendTelegram(`🔕 Alerts acknowledged for ${symbol} via dashboard.`);
-    res.json({ ok: true, message: `Alerts stopped for ${symbol}` });
-  } else {
-    res.json({ ok: false, message: `No active alert for ${symbol}` });
-  }
+  console.log('[dashboard] Acknowledge request for:', symbol);
+  await acknowledgeAlert(symbol);
+  await sendTelegram(`🔕 Alerts acknowledged for ${symbol} via dashboard. Re-alerts suppressed for 15 minutes.`);
+  res.json({ ok: true, symbol, message: `Acknowledged ${symbol} — all intervals cleared, suppressed 15 min` });
 });
 
 // POST /api/pause — pause all monitoring
@@ -2238,7 +2339,7 @@ app.post('/api/targets/:symbol', async (req, res) => {
       );
       const existing = priceTargets.get(symbol) || {};
       priceTargets.set(symbol, { ...existing, anchorPrice: anchor_price, thresholdPct: threshold_pct, targetPrice });
-      if (activeFixedAlerts[symbol]) { clearInterval(activeFixedAlerts[symbol]); delete activeFixedAlerts[symbol]; }
+      if (activeFixedAlerts.has(symbol)) { clearInterval(activeFixedAlerts.get(symbol)); activeFixedAlerts.delete(symbol); }
       return res.json({ ok: true, symbol, anchorPrice: anchor_price, targetPrice, thresholdPct: threshold_pct });
     } else if (priceTargets.has(symbol)) {
       // Use existing anchor, update threshold
@@ -2249,7 +2350,7 @@ app.post('/api/targets/:symbol', async (req, res) => {
         [symbol, existing.anchorPrice, threshold_pct, targetPrice]
       );
       priceTargets.set(symbol, { ...existing, thresholdPct: threshold_pct, targetPrice });
-      if (activeFixedAlerts[symbol]) { clearInterval(activeFixedAlerts[symbol]); delete activeFixedAlerts[symbol]; }
+      if (activeFixedAlerts.has(symbol)) { clearInterval(activeFixedAlerts.get(symbol)); activeFixedAlerts.delete(symbol); }
       return res.json({ ok: true, symbol, anchorPrice: existing.anchorPrice, targetPrice, thresholdPct: threshold_pct });
     } else {
       // No anchor — fetch current price
@@ -2266,7 +2367,7 @@ app.delete('/api/targets/:symbol', async (req, res) => {
   const symbol = req.params.symbol.toUpperCase();
   await db.execute('DELETE FROM price_targets WHERE symbol = ?', [symbol]);
   priceTargets.delete(symbol);
-  if (activeFixedAlerts[symbol]) { clearInterval(activeFixedAlerts[symbol]); delete activeFixedAlerts[symbol]; }
+  if (activeFixedAlerts.has(symbol)) { clearInterval(activeFixedAlerts.get(symbol)); activeFixedAlerts.delete(symbol); }
   res.json({ ok: true, symbol });
 });
 
@@ -2854,23 +2955,22 @@ app.post('/telegram-webhook', async (req, res) => {
     const ackMatch = commandText.match(/^(?:acknowledge|ack)(?:\s+([a-z0-9]{2,10}))?$/);
     if (ackMatch) {
       if (ackMatch[1]) {
+        // Specific coin
         const coinBase = ackMatch[1].toUpperCase();
         const symbol = `${coinBase}-USD`;
-        const stopped = [];
-        if (activeAlerts[symbol]) { clearInterval(activeAlerts[symbol]); delete activeAlerts[symbol]; stopped.push('daily pump alert'); }
-        if (activeDropAlerts[symbol]) { clearInterval(activeDropAlerts[symbol]); delete activeDropAlerts[symbol]; stopped.push('daily drop alert'); }
-        if (activeFixedAlerts[symbol]) { clearInterval(activeFixedAlerts[symbol]); delete activeFixedAlerts[symbol]; stopped.push('fixed target alert'); }
-        await sendReply(stopped.length ? `✅ ${symbol}: stopped ${stopped.join(' + ')}` : `✅ No active alerts for ${symbol}`);
+        console.log('[telegram] Acknowledge command for:', symbol);
+        await acknowledgeAlert(symbol);
+        await sendReply(`✅ Acknowledged ${symbol} — all alerts stopped, suppressing re-alerts for 15 minutes 🔕`);
       } else {
-        const baseSymbol = Object.keys(activeAlerts)[0];
-        const dropSymbol = Object.keys(activeDropAlerts)[0];
-        const fixedSymbol = Object.keys(activeFixedAlerts)[0];
-        const symbol = baseSymbol || dropSymbol || fixedSymbol;
+        // Generic ack — clear the first active alert found across all types
+        const symbol =
+          [...alertState.active.keys()][0] ||
+          [...activeDropAlerts.keys()][0]  ||
+          [...activeFixedAlerts.keys()][0];
         if (symbol) {
-          if (activeAlerts[symbol]) { clearInterval(activeAlerts[symbol]); delete activeAlerts[symbol]; }
-          if (activeDropAlerts[symbol]) { clearInterval(activeDropAlerts[symbol]); delete activeDropAlerts[symbol]; }
-          if (activeFixedAlerts[symbol]) { clearInterval(activeFixedAlerts[symbol]); delete activeFixedAlerts[symbol]; }
-          await sendReply(`✅ Acknowledged ${symbol}`);
+          console.log('[telegram] Generic acknowledge — targeting:', symbol);
+          await acknowledgeAlert(symbol);
+          await sendReply(`✅ Acknowledged ${symbol} — all alerts stopped, suppressing re-alerts for 15 minutes 🔕`);
         } else {
           await sendReply('✅ No active alerts to acknowledge.');
         }
@@ -2894,12 +2994,17 @@ app.post('/telegram-webhook', async (req, res) => {
 
     // --- Command: status ---
     if (commandText === 'status') {
-      const alertedSymbols = Object.keys(activeAlerts);
+      const alertedSymbols = [...alertState.active.keys()];
+      const dropSymbols    = [...activeDropAlerts.keys()];
+      const fixedSymbols   = [...activeFixedAlerts.keys()];
+      const ackedSymbols   = [...alertState.acknowledged];
       const statusMsg =
         `<b>Monitor Status</b>\n` +
         `Paused: ${monitoringPaused ? 'Yes' : 'No'}\n` +
-        `Active alerts: ${alertedSymbols.length}\n` +
-        (alertedSymbols.length ? `Alerted symbols: ${alertedSymbols.join(', ')}` : 'No active alerts');
+        `Pump alerts: ${alertedSymbols.length ? alertedSymbols.join(', ') : 'none'}\n` +
+        `Drop alerts: ${dropSymbols.length ? dropSymbols.join(', ') : 'none'}\n` +
+        `Fixed alerts: ${fixedSymbols.length ? fixedSymbols.join(', ') : 'none'}\n` +
+        (ackedSymbols.length ? `🔕 Acknowledged (15 min): ${ackedSymbols.join(', ')}` : '');
       await sendReply(statusMsg);
       return res.status(200).json({ ok: true });
     }
@@ -3045,7 +3150,7 @@ app.post('/telegram-webhook', async (req, res) => {
       if (existing) {
         // Update threshold from same anchor
         const newTargetPrice = existing.anchorPrice * (1 + thresholdPct / 100);
-        if (activeFixedAlerts[symbol]) { clearInterval(activeFixedAlerts[symbol]); delete activeFixedAlerts[symbol]; }
+        if (activeFixedAlerts.has(symbol)) { clearInterval(activeFixedAlerts.get(symbol)); activeFixedAlerts.delete(symbol); }
         await db.execute(
           'INSERT INTO price_targets (symbol, anchor_price, threshold_pct, target_price) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE threshold_pct = VALUES(threshold_pct), target_price = VALUES(target_price), updated_at = CURRENT_TIMESTAMP',
           [symbol, existing.anchorPrice, thresholdPct, newTargetPrice]
@@ -3626,7 +3731,7 @@ app.post('/telegram-webhook', async (req, res) => {
           `You are an AI crypto trading assistant. Use ONLY the holdings data provided below. Do not recalculate or estimate prices. The values shown are live and accurate.\n\n` +
           `Here are the user's current holdings sorted by USD value (already calculated):\n${holdingsList}\n\n` +
           `Current baseline prices (set when monitoring started): ${JSON.stringify(basePrices)}\n` +
-          `Active alerts (coins currently above threshold): ${Object.keys(activeAlerts).join(', ') || 'none'}\n\n` +
+          `Active alerts (coins currently above threshold): ${[...alertState.active.keys()].join(', ') || 'none'}\n\n` +
           `Answer the user's questions about their portfolio, crypto market conditions, and trading decisions. Be concise since this is a Telegram message.`;
 
         const chatIdStr = chatId.toString();
@@ -3723,7 +3828,7 @@ ALERT CONTEXT:
 ${holdingsList}
 
 Current baseline prices (set when monitoring started): ${JSON.stringify(basePrices)}
-Active alerts (coins currently above threshold): ${Object.keys(activeAlerts).join(', ') || 'none'}${learningContext}${recoveryContext}`,
+Active alerts (coins currently above threshold): ${[...alertState.active.keys()].join(', ') || 'none'}${learningContext}${recoveryContext}`,
           messages,
         });
         const timeoutPromise = new Promise((_, reject) =>
