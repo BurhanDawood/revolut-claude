@@ -343,9 +343,13 @@ await db.execute(`CREATE TABLE IF NOT EXISTS invested_capital (
 try {
   await db.execute(`ALTER TABLE price_targets ADD COLUMN direction VARCHAR(4) NOT NULL DEFAULT 'up'`);
   console.log('Added direction column to price_targets');
-} catch (e) {
-  // Column already exists — ignore
-}
+} catch (e) { /* already exists */ }
+
+// Add note column (stores JSON context for auto-set alerts)
+try {
+  await db.execute(`ALTER TABLE price_targets ADD COLUMN note TEXT`);
+  console.log('Added note column to price_targets');
+} catch (e) { /* already exists */ }
 
 const [rows] = await db.execute('SELECT symbol, price FROM baselines');
 for (const row of rows) {
@@ -369,14 +373,15 @@ for (const row of thresholdRows) {
 }
 console.log(`Loaded ${thresholdRows.length} custom thresholds from database`);
 
-const [ptRows] = await db.execute('SELECT symbol, anchor_price, threshold_pct, target_price, entry_price, direction FROM price_targets');
+const [ptRows] = await db.execute('SELECT symbol, anchor_price, threshold_pct, target_price, entry_price, direction, note FROM price_targets');
 for (const row of ptRows) {
   priceTargets.set(row.symbol, {
     anchorPrice: parseFloat(row.anchor_price),
     thresholdPct: parseFloat(row.threshold_pct),
     targetPrice: parseFloat(row.target_price),
     entryPrice: row.entry_price ? parseFloat(row.entry_price) : null,
-    direction: row.direction || 'up'
+    direction: row.direction || 'up',
+    note: row.note || null
   });
 }
 console.log(`Loaded ${ptRows.length} price targets from database`);
@@ -485,7 +490,7 @@ async function getQuickAiRecommendation(symbol, changePct, currentPrice, directi
   }
 }
 
-async function setFixedTarget(symbol, thresholdPct, direction = 'up') {
+async function setFixedTarget(symbol, thresholdPct, direction = 'up', note = null) {
   const tickerResponse = await revolutRequest('GET', '/tickers');
   const tickerList = Array.isArray(tickerResponse) ? tickerResponse : (tickerResponse.data || []);
   const priceMap = {};
@@ -500,17 +505,74 @@ async function setFixedTarget(symbol, thresholdPct, direction = 'up') {
   }
   const anchorPrice = priceMap[symbol];
   if (!anchorPrice) throw new Error(`No price available for ${symbol}`);
-  // For 'up': target is above anchor. For 'down': floor is below anchor.
   const targetPrice = direction === 'down'
     ? anchorPrice * (1 - thresholdPct / 100)
     : anchorPrice * (1 + thresholdPct / 100);
   await db.execute(
-    'INSERT INTO price_targets (symbol, anchor_price, threshold_pct, target_price, direction) VALUES (?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE anchor_price = VALUES(anchor_price), threshold_pct = VALUES(threshold_pct), target_price = VALUES(target_price), direction = VALUES(direction), updated_at = CURRENT_TIMESTAMP',
-    [symbol, anchorPrice, thresholdPct, targetPrice, direction]
+    'INSERT INTO price_targets (symbol, anchor_price, threshold_pct, target_price, direction, note) VALUES (?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE anchor_price=VALUES(anchor_price), threshold_pct=VALUES(threshold_pct), target_price=VALUES(target_price), direction=VALUES(direction), note=VALUES(note), updated_at=CURRENT_TIMESTAMP',
+    [symbol, anchorPrice, thresholdPct, targetPrice, direction, note]
   );
   const existing = priceTargets.get(symbol) || {};
-  priceTargets.set(symbol, { ...existing, anchorPrice, thresholdPct, targetPrice, direction });
+  priceTargets.set(symbol, { ...existing, anchorPrice, thresholdPct, targetPrice, direction, note });
   return { anchorPrice, thresholdPct, targetPrice, direction };
+}
+
+// Set a price target using an absolute dollar level rather than a % threshold
+async function setAbsolutePriceTarget(symbol, absoluteTargetPrice, direction = 'down', note = null) {
+  const currentPrice = await getCurrentPrice(symbol);
+  if (!currentPrice) throw new Error(`No price for ${symbol}`);
+  const thresholdPct = Math.abs((absoluteTargetPrice - currentPrice) / currentPrice * 100);
+  await db.execute(
+    'INSERT INTO price_targets (symbol, anchor_price, threshold_pct, target_price, direction, note) VALUES (?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE anchor_price=VALUES(anchor_price), threshold_pct=VALUES(threshold_pct), target_price=VALUES(target_price), direction=VALUES(direction), note=VALUES(note), updated_at=CURRENT_TIMESTAMP',
+    [symbol, currentPrice, thresholdPct, absoluteTargetPrice, direction, note]
+  );
+  const existing = priceTargets.get(symbol) || {};
+  priceTargets.set(symbol, { ...existing, anchorPrice: currentPrice, thresholdPct, targetPrice: absoluteTargetPrice, direction, note });
+  return { anchorPrice: currentPrice, thresholdPct, targetPrice: absoluteTargetPrice, direction };
+}
+
+// Extract recommended price levels from a Claude reply (returns [{price, label}])
+function extractRecommendedPriceLevels(text) {
+  if (!text) return [];
+  const results = [];
+  const seen = new Set();
+
+  const addPrice = (raw, label) => {
+    const p = parseFloat((raw || '').replace(/,/g, ''));
+    if (p > 0 && p < 10_000_000 && !seen.has(p)) { seen.add(p); results.push({ price: p, label }); }
+  };
+
+  // Patterns: each [regex, label]. Regex must have at least group 1 for price, optional group 2 for range end.
+  const patterns = [
+    // "set alert at $43" / "alert at $40-43"
+    [/(?:set\s+)?(?:an?\s+)?alert\s+(?:at|if\s+(?:it\s+)?(?:drops?\s+to|reaches?))\s+\$?([\d,]+(?:\.\d+)?)\s*(?:-|to)\s*\$?([\d,]+(?:\.\d+)?)/gi, 'ALERT'],
+    [/(?:set\s+)?(?:an?\s+)?alert\s+(?:at|if\s+(?:it\s+)?(?:drops?\s+to|reaches?))\s+\$?([\d,]+(?:\.\d+)?)/gi, 'ALERT'],
+    // "buy/add/accumulate at $43" or range "$40-43"
+    [/(?:buy|add|accumulate|load(?:ing)?|pick(?:ing)?\s+up)\s+(?:more\s+)?(?:at|around|near|below|under|if\s+(?:it\s+)?dips?\s+to)\s+\$?([\d,]+(?:\.\d+)?)\s*(?:-|to)\s*\$?([\d,]+(?:\.\d+)?)/gi, 'BUY'],
+    [/(?:buy|add|accumulate|load(?:ing)?|pick(?:ing)?\s+up)\s+(?:more\s+)?(?:at|around|near|below|under|if\s+(?:it\s+)?dips?\s+to)\s+\$?([\d,]+(?:\.\d+)?)/gi, 'BUY'],
+    // "good add/buy/entry at $43"
+    [/good\s+(?:add|buy|entry|accumulation)\s+(?:point\s+)?(?:at|around|near|below)?\s*\$?([\d,]+(?:\.\d+)?)\s*(?:-|to)\s*\$?([\d,]+(?:\.\d+)?)/gi, 'BUY'],
+    [/good\s+(?:add|buy|entry|accumulation)\s+(?:point\s+)?(?:at|around|near|below)?\s*\$?([\d,]+(?:\.\d+)?)/gi, 'BUY'],
+    // "target $43" / "price target $43"
+    [/(?:price\s+)?target\s+(?:of\s+|at\s+)?\$?([\d,]+(?:\.\d+)?)\s*(?:-|to)\s*\$?([\d,]+(?:\.\d+)?)/gi, 'TARGET'],
+    [/(?:price\s+)?target\s+(?:of\s+|at\s+)?\$?([\d,]+(?:\.\d+)?)/gi, 'TARGET'],
+    // "watch $43" / "watch level $43"
+    [/watch\s+(?:(?:the\s+)?(?:level|price|for)\s+)?\$?([\d,]+(?:\.\d+)?)/gi, 'WATCH'],
+    // "support at $43" / "key level $43"
+    [/(?:support|floor|key\s+level|key\s+support)\s+(?:at|around|near)?\s*\$?([\d,]+(?:\.\d+)?)/gi, 'SUPPORT'],
+    // "$43 support/zone/level"
+    [/\$?([\d,]+(?:\.\d+)?)\s+(?:support|zone|floor|entry|add\s+zone|buy\s+zone|level)/gi, 'SUPPORT'],
+  ];
+
+  for (const [re, label] of patterns) {
+    re.lastIndex = 0;
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      addPrice(m[1], label);
+      if (m[2]) addPrice(m[2], label);
+    }
+  }
+  return results.sort((a, b) => a.price - b.price);
 }
 
 async function getCurrentPrice(symbol) {
@@ -1739,16 +1801,36 @@ async function checkPortfolio() {
       if (direction === 'down' && currentPrice <= target.targetPrice && !activeFixedAlerts[symbol]) {
         const changePct = ((currentPrice - target.anchorPrice) / target.anchorPrice) * 100;
         const coinBase = symbol.replace('-USD', '');
-        const aiRec = await getQuickAiRecommendation(symbol, changePct, currentPrice, 'down');
         const entryPrice = entryPrices.get(symbol) || target.entryPrice;
         const plPct = entryPrice ? ((currentPrice - entryPrice) / entryPrice * 100).toFixed(1) : null;
-        const entryLine = plPct !== null
-          ? `\nEntry: $${entryPrice.toFixed(4)} | P&L: ${plPct}%`
-          : '';
         const replyMenu = `\n\nReply:\n'buy more ${coinBase}' - get buy the dip advice\n'sell ${coinBase}' - get sell advice\n'analyse ${coinBase}' - full analysis\n'acknowledge ${coinBase}' - stop alerts`;
-        const autoReady = await getAutomationReadiness(symbol, 'sell');
-        const autoLine = autoReady ? `\n\n⚡ AUTO-READY: This setup has worked ${autoReady.winRate}% of the time (${autoReady.sampleSize} trades). Could be automated.` : '';
-        const alertMessage = `📉 <b>${symbol} FIXED FLOOR HIT!</b>\n\nAnchor: $${target.anchorPrice.toFixed(4)} → Now $${currentPrice.toFixed(4)} (${changePct.toFixed(1)}%)${entryLine}\n\n⚡ RECOMMENDATION: ${aiRec}${replyMenu}${autoLine}`;
+
+        let alertMessage;
+        let noteData = null;
+        try { if (target.note) noteData = JSON.parse(target.note); } catch (e) {}
+
+        if (noteData && noteData.source === 'claude_rec') {
+          // Enhanced message: this was auto-set from Bryan's thumbs-up on a recommendation
+          const assetBalance = balances.find(a => a.currency === coinBase);
+          const qty = assetBalance ? parseFloat(assetBalance.available) : 0;
+          const positionLine = entryPrice && qty > 0
+            ? `Your current position: ${qty.toLocaleString('en-US', { maximumFractionDigits: 6 })} ${coinBase} @ $${entryPrice.toFixed(4)} entry (P&L: ${plPct}%)`
+            : (qty > 0 ? `You hold: ${qty.toLocaleString('en-US', { maximumFractionDigits: 6 })} ${coinBase}` : '');
+          alertMessage =
+            `📊 <b>${coinBase} HIT YOUR BUY LEVEL!</b>\n\n` +
+            `Price: $${currentPrice.toFixed(4)} (your Claude-recommended buy zone)\n` +
+            `Original advice: '<i>${noteData.snippet}</i>'\n` +
+            (positionLine ? positionLine + '\n' : '') +
+            `\n⚡ <b>RECOMMENDATION:</b> This is your planned buy zone.\n` +
+            `Ready to add? Reply 'bought ${coinBase} [price] [qty]' to log the trade.` +
+            replyMenu;
+        } else {
+          const aiRec = await getQuickAiRecommendation(symbol, changePct, currentPrice, 'down');
+          const entryLine = plPct !== null ? `\nEntry: $${entryPrice.toFixed(4)} | P&L: ${plPct}%` : '';
+          const autoReady = await getAutomationReadiness(symbol, 'sell');
+          const autoLine = autoReady ? `\n\n⚡ AUTO-READY: This setup has worked ${autoReady.winRate}% of the time (${autoReady.sampleSize} trades). Could be automated.` : '';
+          alertMessage = `📉 <b>${symbol} FIXED FLOOR HIT!</b>\n\nAnchor: $${target.anchorPrice.toFixed(4)} → Now $${currentPrice.toFixed(4)} (${changePct.toFixed(1)}%)${entryLine}\n\n⚡ RECOMMENDATION: ${aiRec}${replyMenu}${autoLine}`;
+        }
         await sendTelegram(alertMessage);
 
         activeFixedAlerts[symbol] = setInterval(async () => {
@@ -3054,14 +3136,93 @@ app.post('/telegram-webhook', async (req, res) => {
             }
           }
 
-          const isSimpleAgreement = /[\u{1F44D}\u{1F919}]/u.test(rawText) || /✅/.test(rawText) ||
-            /^(?:yes|agreed|ok will do|sounds good|perfect|great|makes sense)\.?$/i.test(rawText.trim());
-          const coinStr = targetCoins.join(' and ');
+          // ── Auto-set recommended price alerts ──────────────────────────────
+          const recText  = lastRec ? (lastRec.rawReply || '') : '';
+          const recAction = lastRec ? (lastRec.action || 'HOLD') : action;
+          // direction: BUY/ADD → 'down' (alert when price drops to level)
+          //            SELL/REDUCE → 'up' (alert when price rises to level)
+          const alertDir = ['SELL', 'REDUCE'].includes(recAction) ? 'up' : 'down';
+          const autoAlertsSet = []; // { coin, targetPrice, label }
+
+          if (recText) {
+            const levels = extractRecommendedPriceLevels(recText);
+            for (const coin of targetCoins) {
+              const sym = `${coin}-USD`;
+              const currentPrice = prices[coin];
+              if (!currentPrice || levels.length === 0) continue;
+
+              // Filter: for 'down' alerts only levels BELOW current; for 'up' only ABOVE
+              const validLevels = levels.filter(l =>
+                alertDir === 'down' ? l.price < currentPrice : l.price > currentPrice
+              );
+              if (validLevels.length === 0) continue;
+
+              // Pick the level that will trigger first (highest for 'down', lowest for 'up')
+              const primaryLevel = alertDir === 'down'
+                ? validLevels.reduce((best, l) => l.price > best.price ? l : best)
+                : validLevels.reduce((best, l) => l.price < best.price ? l : best);
+
+              // Snippet from the recommendation to store as context
+              const snippetMatch = recText.match(new RegExp(`[^.!?\\n]{0,60}\\$?${primaryLevel.price.toString().replace('.', '\\.')}[^.!?\\n]{0,60}`, 'i'));
+              const snippet = snippetMatch ? snippetMatch[0].trim().replace(/\*\*/g, '').substring(0, 100) : `${recAction} at $${primaryLevel.price}`;
+              const allLevelPrices = validLevels.map(l => l.price);
+
+              const noteJson = JSON.stringify({
+                source: 'claude_rec',
+                snippet,
+                allLevels: allLevelPrices,
+                recAction
+              });
+
+              try {
+                await setAbsolutePriceTarget(sym, primaryLevel.price, alertDir, noteJson);
+                autoAlertsSet.push({ coin, targetPrice: primaryLevel.price, allLevels: allLevelPrices, label: primaryLevel.label });
+                console.log(`Auto-set ${alertDir} alert for ${sym} at $${primaryLevel.price} from recommendation`);
+              } catch (alertErr) {
+                console.error(`Auto-alert set failed for ${sym}:`, alertErr.message);
+              }
+            }
+          }
+
+          // ── Build confirmation message ─────────────────────────────────────
           const bulletPrices = Object.entries(prices).map(([c, p]) => `• ${c}: $${p.toFixed(4)}`).join('\n');
-          const actionVerb = action === 'HOLD' ? 'holding' : action === 'BUY' ? 'buying' : action === 'SELL' ? 'selling' : action.toLowerCase() + 'ing';
-          const confirmMsg = isSimpleAgreement
-            ? `✅ Got it Bryan — logged that you're following the advice!\nPrices locked in for tracking:\n${bulletPrices}\nI'll check back in 7 days to see how it plays out 📊`
-            : `✅ Got it Bryan — logged that you're ${actionVerb} ${coinStr}.\nPrices locked in for tracking:\n${bulletPrices}\nI'll check back in 7 days to see how this plays out and update your learning model.`;
+
+          let alertConfirmBlock = '';
+          if (autoAlertsSet.length > 0) {
+            const dirWord = alertDir === 'down' ? 'drops to' : 'rises to';
+            const recLabel = alertDir === 'down' ? '📊 BUY SIGNAL' : '📊 SELL SIGNAL';
+            const alertLines = autoAlertsSet.flatMap(a => {
+              const lines = [];
+              const allSorted = alertDir === 'down'
+                ? [...a.allLevels].sort((x, y) => y - x) // highest first for 'down'
+                : [...a.allLevels].sort((x, y) => x - y); // lowest first for 'up'
+              for (const lvl of allSorted) {
+                const isSub = lvl !== a.targetPrice;
+                lines.push(`• ${a.coin} ${dirWord} $${lvl.toFixed(2)} → ${isSub ? '💡 Watch' : recLabel}`);
+              }
+              return lines;
+            }).join('\n');
+            alertConfirmBlock = `\n\n🔔 <b>Alerts created:</b>\n${alertLines}`;
+          }
+
+          const actionVerb = recAction === 'HOLD' ? 'holding' : recAction === 'BUY' ? 'buying' : recAction === 'SELL' ? 'selling' : recAction.toLowerCase() + 'ing';
+          const coinStr = targetCoins.join(' & ');
+
+          let confirmMsg;
+          if (autoAlertsSet.length > 0) {
+            const currentPriceLines = autoAlertsSet.map(a => `Current ${a.coin}: $${(prices[a.coin] || 0).toFixed(4)}`).join('\n');
+            confirmMsg =
+              `✅ <b>Intention logged & alerts set for ${coinStr}!</b>\n` +
+              alertConfirmBlock + `\n\n` +
+              currentPriceLines + `\n` +
+              `I'll notify you when these levels are hit and check back in 7 days on your ${actionVerb} decision 💪`;
+          } else {
+            confirmMsg =
+              `✅ Got it Bryan — logged that you're ${actionVerb} ${coinStr}.\n` +
+              `Prices locked in:\n${bulletPrices}\n` +
+              `I'll check back in 7 days to see how it plays out 📊`;
+          }
+
           await sendReply(confirmMsg);
           return res.status(200).json({ ok: true });
         } catch (e) {
@@ -3303,6 +3464,7 @@ Active alerts (coins currently above threshold): ${Object.keys(activeAlerts).joi
           lastRecommendationContext.set(chatIdStr, {
             coins: recCoins.length > 0 ? recCoins : [],
             action: recActionMatch ? recActionMatch[1].toUpperCase() : 'HOLD',
+            rawReply: reply,
             timestamp: Date.now()
           });
         } catch (e) { /* ignore */ }
