@@ -3528,8 +3528,20 @@ app.post('/telegram-webhook', async (req, res) => {
     // Capture user message for use inside the async closure
     const userMessage = rawText;
 
+    // FIX 4: Detect broad questions that need extra time and context
+    const broadQuestionPatterns = [
+      /smartest\s+buy/i, /best\s+coin/i, /which\s+(?:coin|should|would)/i,
+      /what\s+would\s+you\s+(?:do|buy|sell|recommend)/i, /analyze\s+(?:my\s+)?portfolio/i,
+      /what.s\s+the\s+best/i, /top\s+(?:pick|choice|coin)/i,
+      /all\s+(?:my\s+)?(?:coins?|holdings?|assets?)/i, /my\s+(?:whole|entire|full)\s+portfolio/i,
+      /overall\s+(?:portfolio|advice|assessment|analysis)/i
+    ];
+    const isBroadQuestion = broadQuestionPatterns.some(p => p.test(userMessage));
+
     // 1. Send acknowledgment then wait briefly so it arrives before Claude processing starts
-    await sendReply('🔍 Researching... give me a moment.');
+    await sendReply(isBroadQuestion
+      ? '🔍 Researching all your assets — this may take a moment...'
+      : '🔍 Researching... give me a moment.');
     await new Promise(r => setTimeout(r, 2000));
 
     // 2. Return 200 to Telegram
@@ -3538,7 +3550,8 @@ app.post('/telegram-webhook', async (req, res) => {
     // 3. Continue processing the Claude API call asynchronously AFTER responding
     // Non-blocking — runs after response is sent
     (async () => {
-      let stillResearchingTimer;
+      let stillResearchingTimer, stillResearchingTimer2;
+      let holdingsList = '';
       try {
         // Fetch fresh balances and prices directly via internal functions
         const balances = await revolutRequest('GET', '/balances');
@@ -3577,7 +3590,7 @@ app.post('/telegram-webhook', async (req, res) => {
         const totalUSD = holdings.reduce((s, h) => s + h.valueUSD, 0);
 
         // Format as numbered list
-        const holdingsList = holdings.length
+        holdingsList = holdings.length
           ? holdings.map((h, i) =>
               `${i + 1}. ${h.symbol}: ${h.available} tokens @ $${h.price.toFixed(2)} = $${h.valueUSD.toFixed(2)} USD`
             ).join('\n')
@@ -3620,9 +3633,12 @@ app.post('/telegram-webhook', async (req, res) => {
         const history = conversationHistory.get(chatIdStr) || [];
 
         // Build messages array: history + current user message
+        // FIX 4: For broad questions, instruct Claude to be concise and focused
         const messages = [
           ...history,
-          { role: 'user', content: userMessage }
+          { role: 'user', content: isBroadQuestion
+            ? userMessage + '\n\nNote: Please answer concisely in under 2000 characters total. Focus on top 3 options only.'
+            : userMessage }
         ];
 
         const claudePromise = anthropic.messages.create({
@@ -3714,15 +3730,21 @@ Active alerts (coins currently above threshold): ${Object.keys(activeAlerts).joi
           setTimeout(() => reject(new Error('timeout')), 110000)
         );
 
-        // Send follow-up after 20 seconds if still processing
+        // FIX 2: Send follow-up messages at 30s and 60s if still processing
         stillResearchingTimer = setTimeout(async () => {
           try {
-            await sendReply('⏳ Still researching, almost there...');
+            await sendReply('🔍 Still researching deeply... complex question needs more time.');
           } catch (e) { /* ignore */ }
-        }, 20000);
+        }, 30000);
+        stillResearchingTimer2 = setTimeout(async () => {
+          try {
+            await sendReply('⏳ Almost there — pulling together the analysis now...');
+          } catch (e) { /* ignore */ }
+        }, 60000);
 
         const response = await Promise.race([claudePromise, timeoutPromise]);
         clearTimeout(stillResearchingTimer);
+        clearTimeout(stillResearchingTimer2);
 
         // Extract the last text block (web_search may produce tool_use blocks before the final text)
         const lastTextBlock = [...response.content].reverse().find(b => b.type === 'text');
@@ -3802,14 +3824,41 @@ Active alerts (coins currently above threshold): ${Object.keys(activeAlerts).joi
           }
         }
 
+        // FIX 5: Log response length before sending
+        const fullReply = reply + (actionTaken || '');
+        console.log('Claude response length:', fullReply.length, 'characters');
+        console.log('Sending in', Math.ceil(fullReply.length / 2500), 'message(s)');
+
         // 3s gap after status message so chunks don't collide with it
         await new Promise(r => setTimeout(r, 3000));
-        await sendTelegramChunked(reply + (actionTaken || ''));
+        await sendTelegramChunked(fullReply);
       } catch (err) {
         console.error('Claude AI error:', err.message);
         clearTimeout(stillResearchingTimer);
+        clearTimeout(stillResearchingTimer2);
         if (err.message === 'timeout') {
-          await sendReply('⏱️ That analysis is taking too long. Try asking something more specific or break it into smaller questions.');
+          // FIX 3: Fallback simpler Claude call — no web search, max 30s, max_tokens 500
+          try {
+            const fallbackPromise = anthropic.messages.create({
+              model: 'claude-sonnet-4-5',
+              max_tokens: 500,
+              system: `You are a crypto advisor. Here are the user's current holdings:\n${holdingsList || 'Portfolio data unavailable'}\nAnswer the user's question briefly in 2-3 sentences. Be direct and actionable.`,
+              messages: [{ role: 'user', content: userMessage }],
+            });
+            const fallbackTimeout = new Promise((_, reject) =>
+              setTimeout(() => reject(new Error('fallback_timeout')), 30000)
+            );
+            const fallbackResponse = await Promise.race([fallbackPromise, fallbackTimeout]);
+            const fallbackBlock = [...fallbackResponse.content].reverse().find(b => b.type === 'text');
+            const fallbackText = fallbackBlock ? fallbackBlock.text : null;
+            if (fallbackText) {
+              await sendReply(`⚡ <b>Quick take</b> (full analysis timed out):\n\n${fallbackText}\n\n<i>Tip: Ask about one specific coin at a time for deeper analysis.</i>`);
+            } else {
+              await sendReply('⏱️ Analysis timed out. Try asking about one specific coin at a time.');
+            }
+          } catch (fallbackErr) {
+            await sendReply('⏱️ Analysis timed out. Try asking about one specific coin at a time.');
+          }
         } else {
           await sendReply('❌ Error getting AI response: ' + err.message);
         }
