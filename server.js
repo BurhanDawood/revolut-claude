@@ -111,6 +111,7 @@ const basePrices = {};
 const activeAlerts = {};
 const activeFixedAlerts = {}; // symbol -> intervalId for fixed price target alerts (up direction)
 const activeDropAlerts = {}; // symbol -> intervalId for fixed floor alerts (down direction)
+const activeSecondaryAlerts = {}; // `${symbol}:${price}` -> true — fired secondary rec-based alerts
 const lastBalances = {};
 const customThresholds = {};
 const priceTargets = new Map(); // symbol -> { anchorPrice, thresholdPct, targetPrice, entryPrice }
@@ -531,46 +532,56 @@ async function setAbsolutePriceTarget(symbol, absoluteTargetPrice, direction = '
   return { anchorPrice: currentPrice, thresholdPct, targetPrice: absoluteTargetPrice, direction };
 }
 
-// Extract recommended price levels from a Claude reply (returns [{price, label}])
+// Extract recommended price levels from a Claude reply.
+// Returns [{price, type: 'buy'|'sell'|'neutral', snippet}]
 function extractRecommendedPriceLevels(text) {
   if (!text) return [];
   const results = [];
   const seen = new Set();
 
-  const addPrice = (raw, label) => {
-    const p = parseFloat((raw || '').replace(/,/g, ''));
-    if (p > 0 && p < 10_000_000 && !seen.has(p)) { seen.add(p); results.push({ price: p, label }); }
+  const addPrice = (raw, raw2, type, re) => {
+    for (const r of [raw, raw2]) {
+      if (!r) continue;
+      const p = parseFloat(r.replace(/,/g, ''));
+      if (p > 0 && p < 10_000_000 && !seen.has(p)) {
+        seen.add(p);
+        results.push({ price: p, type });
+      }
+    }
   };
 
-  // Patterns: each [regex, label]. Regex must have at least group 1 for price, optional group 2 for range end.
+  // Each entry: [regex, type]. Group 1 = price, optional group 2 = range end.
   const patterns = [
-    // "set alert at $43" / "alert at $40-43"
-    [/(?:set\s+)?(?:an?\s+)?alert\s+(?:at|if\s+(?:it\s+)?(?:drops?\s+to|reaches?))\s+\$?([\d,]+(?:\.\d+)?)\s*(?:-|to)\s*\$?([\d,]+(?:\.\d+)?)/gi, 'ALERT'],
-    [/(?:set\s+)?(?:an?\s+)?alert\s+(?:at|if\s+(?:it\s+)?(?:drops?\s+to|reaches?))\s+\$?([\d,]+(?:\.\d+)?)/gi, 'ALERT'],
-    // "buy/add/accumulate at $43" or range "$40-43"
-    [/(?:buy|add|accumulate|load(?:ing)?|pick(?:ing)?\s+up)\s+(?:more\s+)?(?:at|around|near|below|under|if\s+(?:it\s+)?dips?\s+to)\s+\$?([\d,]+(?:\.\d+)?)\s*(?:-|to)\s*\$?([\d,]+(?:\.\d+)?)/gi, 'BUY'],
-    [/(?:buy|add|accumulate|load(?:ing)?|pick(?:ing)?\s+up)\s+(?:more\s+)?(?:at|around|near|below|under|if\s+(?:it\s+)?dips?\s+to)\s+\$?([\d,]+(?:\.\d+)?)/gi, 'BUY'],
-    // "good add/buy/entry at $43"
-    [/good\s+(?:add|buy|entry|accumulation)\s+(?:point\s+)?(?:at|around|near|below)?\s*\$?([\d,]+(?:\.\d+)?)\s*(?:-|to)\s*\$?([\d,]+(?:\.\d+)?)/gi, 'BUY'],
-    [/good\s+(?:add|buy|entry|accumulation)\s+(?:point\s+)?(?:at|around|near|below)?\s*\$?([\d,]+(?:\.\d+)?)/gi, 'BUY'],
-    // "target $43" / "price target $43"
-    [/(?:price\s+)?target\s+(?:of\s+|at\s+)?\$?([\d,]+(?:\.\d+)?)\s*(?:-|to)\s*\$?([\d,]+(?:\.\d+)?)/gi, 'TARGET'],
-    [/(?:price\s+)?target\s+(?:of\s+|at\s+)?\$?([\d,]+(?:\.\d+)?)/gi, 'TARGET'],
-    // "watch $43" / "watch level $43"
-    [/watch\s+(?:(?:the\s+)?(?:level|price|for)\s+)?\$?([\d,]+(?:\.\d+)?)/gi, 'WATCH'],
-    // "support at $43" / "key level $43"
-    [/(?:support|floor|key\s+level|key\s+support)\s+(?:at|around|near)?\s*\$?([\d,]+(?:\.\d+)?)/gi, 'SUPPORT'],
-    // "$43 support/zone/level"
-    [/\$?([\d,]+(?:\.\d+)?)\s+(?:support|zone|floor|entry|add\s+zone|buy\s+zone|level)/gi, 'SUPPORT'],
+    // ── BUY-side ─────────────────────────────────────────────────────────────
+    [/(?:buy|add|accumulate|load(?:ing)?|pick(?:ing)?\s+up)\s+(?:more\s+)?(?:at|around|near|below|under|if\s+(?:it\s+)?dips?\s+to)\s+\$?([\d,]+(?:\.\d+)?)\s*(?:-|to)\s*\$?([\d,]+(?:\.\d+)?)/gi, 'buy'],
+    [/(?:buy|add|accumulate|load(?:ing)?|pick(?:ing)?\s+up)\s+(?:more\s+)?(?:at|around|near|below|under|if\s+(?:it\s+)?dips?\s+to)\s+\$?([\d,]+(?:\.\d+)?)/gi, 'buy'],
+    [/good\s+(?:add|buy|entry|accumulation)\s+(?:point\s+)?(?:at|around|near|below)?\s*\$?([\d,]+(?:\.\d+)?)\s*(?:-|to)\s*\$?([\d,]+(?:\.\d+)?)/gi, 'buy'],
+    [/good\s+(?:add|buy|entry|accumulation)\s+(?:point\s+)?(?:at|around|near|below)?\s*\$?([\d,]+(?:\.\d+)?)/gi, 'buy'],
+    [/(?:support|floor|key\s+(?:support|level))\s+(?:at|around|near)?\s*\$?([\d,]+(?:\.\d+)?)/gi, 'buy'],
+    [/\$?([\d,]+(?:\.\d+)?)\s+(?:support|floor|add\s+zone|buy\s+zone)/gi, 'buy'],
+    [/(?:dip\s+to|retrace\s+to|pullback\s+to)\s+\$?([\d,]+(?:\.\d+)?)\s*(?:-|to)?\s*\$?([\d,]+(?:\.\d+)?)/gi, 'buy'],
+    // ── SELL-side ─────────────────────────────────────────────────────────────
+    [/(?:take\s+profits?|taking\s+profits?)\s+(?:at|around|near|above|if\s+it\s+reaches?)\s+\$?([\d,]+(?:\.\d+)?)\s*(?:-|to)\s*\$?([\d,]+(?:\.\d+)?)/gi, 'sell'],
+    [/(?:take\s+profits?|taking\s+profits?)\s+(?:at|around|near|above|if\s+it\s+reaches?)\s+\$?([\d,]+(?:\.\d+)?)/gi, 'sell'],
+    [/(?:sell|exit|unload)\s+(?:at|around|near|above|if\s+it\s+(?:hits?|reaches?))\s+\$?([\d,]+(?:\.\d+)?)\s*(?:-|to)\s*\$?([\d,]+(?:\.\d+)?)/gi, 'sell'],
+    [/(?:sell|exit|unload)\s+(?:at|around|near|above|if\s+it\s+(?:hits?|reaches?))\s+\$?([\d,]+(?:\.\d+)?)/gi, 'sell'],
+    [/consider\s+(?:selling|taking\s+profits?|exiting)\s+(?:at|around|near|if\s+it\s+(?:hits?|reaches?))?\s+\$?([\d,]+(?:\.\d+)?)\s*(?:-|to)\s*\$?([\d,]+(?:\.\d+)?)/gi, 'sell'],
+    [/consider\s+(?:selling|taking\s+profits?|exiting)\s+(?:at|around|near|if\s+it\s+(?:hits?|reaches?))?\s+\$?([\d,]+(?:\.\d+)?)/gi, 'sell'],
+    [/(?:resistance|profit\s+(?:zone|target|level)|sell\s+zone)\s+(?:at|around|near)?\s*\$?([\d,]+(?:\.\d+)?)\s*(?:-|to)\s*\$?([\d,]+(?:\.\d+)?)/gi, 'sell'],
+    [/(?:resistance|profit\s+(?:zone|target|level)|sell\s+zone)\s+(?:at|around|near)?\s*\$?([\d,]+(?:\.\d+)?)/gi, 'sell'],
+    [/\$?([\d,]+(?:\.\d+)?)\s+(?:resistance|profit\s+zone|sell\s+zone|exit\s+(?:zone|point|level))/gi, 'sell'],
+    [/(?:price\s+)?target\s+(?:of\s+|at\s+)?\$?([\d,]+(?:\.\d+)?)\s*(?:-|to)\s*\$?([\d,]+(?:\.\d+)?)/gi, 'sell'],
+    [/(?:price\s+)?target\s+(?:of\s+|at\s+)?\$?([\d,]+(?:\.\d+)?)/gi, 'sell'],
+    // ── NEUTRAL (type inferred from price vs current later) ───────────────────
+    [/(?:set\s+)?(?:an?\s+)?alert\s+(?:at|if\s+(?:it\s+)?(?:drops?\s+to|reaches?))\s+\$?([\d,]+(?:\.\d+)?)\s*(?:-|to)\s*\$?([\d,]+(?:\.\d+)?)/gi, 'neutral'],
+    [/(?:set\s+)?(?:an?\s+)?alert\s+(?:at|if\s+(?:it\s+)?(?:drops?\s+to|reaches?))\s+\$?([\d,]+(?:\.\d+)?)/gi, 'neutral'],
+    [/watch\s+(?:(?:the\s+)?(?:level|price|for)\s+)?\$?([\d,]+(?:\.\d+)?)/gi, 'neutral'],
   ];
 
-  for (const [re, label] of patterns) {
+  for (const [re, type] of patterns) {
     re.lastIndex = 0;
     let m;
-    while ((m = re.exec(text)) !== null) {
-      addPrice(m[1], label);
-      if (m[2]) addPrice(m[2], label);
-    }
+    while ((m = re.exec(text)) !== null) addPrice(m[1], m[2], type);
   }
   return results.sort((a, b) => a.price - b.price);
 }
@@ -1777,6 +1788,10 @@ async function checkPortfolio() {
           : '';
 
         let alertMessage;
+        // Check if this was auto-set from a Claude sell recommendation
+        let upNoteData = null;
+        try { if (target.note) upNoteData = JSON.parse(target.note); } catch (e) {}
+
         if (isDustCoin) {
           const newValueStr = `$${assetValueUSD.toFixed(2)}`;
           alertMessage =
@@ -1785,6 +1800,21 @@ async function checkPortfolio() {
             `Current: $${priceStr} | Watch set at: $${anchorStr}\n` +
             `You hold: ${assetQty.toLocaleString('en-US', { maximumFractionDigits: 0 })} ${coinBase} = ${newValueStr} at current price\n\n` +
             `💡 Worth buying more? Reply 'analyse ${coinBase}' for full research`;
+        } else if (upNoteData && upNoteData.source === 'claude_rec') {
+          // Enhanced sell alert — this level was set by thumbs-up on a Claude recommendation
+          const positionLine = entryPrice && assetQty > 0
+            ? `Your position: ${assetQty.toLocaleString('en-US', { maximumFractionDigits: 6 })} ${coinBase} @ $${entryPrice.toFixed(4)} entry\nUnrealised profit: +${((currentPrice - entryPrice) / entryPrice * 100).toFixed(1)}% (+$${Math.abs((currentPrice - entryPrice) * assetQty).toFixed(2)})`
+            : (assetQty > 0 ? `You hold ${assetQty.toLocaleString('en-US', { maximumFractionDigits: 6 })} ${coinBase}` : '');
+          alertMessage =
+            `🎯 <b>${coinBase} HIT YOUR PROFIT TARGET!</b>\n\n` +
+            `Price: $${priceStr} (your Claude-recommended sell zone)\n` +
+            `Original advice: '<i>${upNoteData.snippet}</i>'\n` +
+            (positionLine ? positionLine + '\n' : '') +
+            `\n⚡ <b>RECOMMENDATION:</b> This is your planned profit zone.\n` +
+            `Take action? Reply:\n` +
+            `'sold ${coinBase} [price] [qty]' — log the sale\n` +
+            `'analyse ${coinBase}' — get fresh analysis before deciding\n` +
+            `'hold ${coinBase}' — log decision to hold through this level`;
         } else {
           const replyMenu = `\n\nReply:\n'sell ${coinBase}' - get sell advice\n'buy more ${coinBase}' - get buy advice\n'analyse ${coinBase}' - full analysis\n'acknowledge ${coinBase}' - stop alerts\n'threshold ${coinBase} 15%' - change threshold`;
           const autoReady = await getAutomationReadiness(symbol, 'buy');
@@ -1838,6 +1868,47 @@ async function checkPortfolio() {
         }, ALERT_INTERVAL_MS);
       }
     }
+    // ── Secondary alert check: sell levels stored in note JSON ──────────────
+    // These are sell/profit levels from a recommendation where a buy alert is the primary target.
+    // We check them here so both buy and sell levels fire automatically.
+    for (const [symbol, target] of priceTargets) {
+      if (target.direction !== 'down') continue; // only check buy-primary entries for secondary sell levels
+      let noteData = null;
+      try { if (target.note) noteData = JSON.parse(target.note); } catch (e) {}
+      if (!noteData || noteData.source !== 'claude_rec' || !noteData.sellLevels || noteData.sellLevels.length === 0) continue;
+
+      const currentPrice = priceMap[symbol];
+      if (!currentPrice) continue;
+      const coinBase = symbol.replace('-USD', '');
+      const entryPrice = entryPrices.get(symbol) || target.entryPrice;
+
+      for (const sl of noteData.sellLevels) {
+        const key = `${symbol}:sell:${sl.price}`;
+        if (currentPrice >= sl.price && !activeSecondaryAlerts[key]) {
+          activeSecondaryAlerts[key] = true;
+          const assetBalance = balances.find(a => a.currency === coinBase);
+          const qty = assetBalance ? parseFloat(assetBalance.available) : 0;
+          const plPct = entryPrice && qty > 0 ? ((currentPrice - entryPrice) / entryPrice * 100) : null;
+          const plUsd = entryPrice && qty > 0 ? ((currentPrice - entryPrice) * qty) : null;
+          const positionLine = entryPrice && qty > 0
+            ? `Your position: ${qty.toLocaleString('en-US', { maximumFractionDigits: 6 })} ${coinBase} @ $${entryPrice.toFixed(4)} entry\nUnrealised profit: +${plPct.toFixed(1)}% (+$${Math.abs(plUsd).toFixed(2)})`
+            : (qty > 0 ? `You hold ${qty.toLocaleString('en-US', { maximumFractionDigits: 6 })} ${coinBase}` : '');
+          const sellAlertMsg =
+            `🎯 <b>${coinBase} HIT YOUR PROFIT TARGET!</b>\n\n` +
+            `Price: $${currentPrice.toFixed(4)} (your Claude-recommended sell zone)\n` +
+            `Original advice: '<i>${sl.snippet || `take profits at $${sl.price}`}</i>'\n` +
+            (positionLine ? positionLine + '\n' : '') +
+            `\n⚡ <b>RECOMMENDATION:</b> This is your planned profit zone.\n` +
+            `Take action? Reply:\n` +
+            `'sold ${coinBase} [price] [qty]' — log the sale\n` +
+            `'analyse ${coinBase}' — get fresh analysis before deciding\n` +
+            `'hold ${coinBase}' — log decision to hold through this level`;
+          await sendTelegram(sellAlertMsg);
+          console.log(`Secondary sell alert fired for ${symbol} at $${sl.price} (current: $${currentPrice})`);
+        }
+      }
+    }
+
   } catch (e) {
     console.log('Portfolio check error:', e.message, e.stack);
   }
@@ -3137,85 +3208,103 @@ app.post('/telegram-webhook', async (req, res) => {
           }
 
           // ── Auto-set recommended price alerts ──────────────────────────────
-          const recText  = lastRec ? (lastRec.rawReply || '') : '';
+          const recText   = lastRec ? (lastRec.rawReply || '') : '';
           const recAction = lastRec ? (lastRec.action || 'HOLD') : action;
-          // direction: BUY/ADD → 'down' (alert when price drops to level)
-          //            SELL/REDUCE → 'up' (alert when price rises to level)
-          const alertDir = ['SELL', 'REDUCE'].includes(recAction) ? 'up' : 'down';
-          const autoAlertsSet = []; // { coin, targetPrice, label }
+          const buyAlertsSet  = []; // { coin, targetPrice, allLevels }
+          const sellAlertsSet = []; // { coin, targetPrice, allLevels }
 
           if (recText) {
             const levels = extractRecommendedPriceLevels(recText);
+
             for (const coin of targetCoins) {
-              const sym = `${coin}-USD`;
+              const sym          = `${coin}-USD`;
               const currentPrice = prices[coin];
               if (!currentPrice || levels.length === 0) continue;
 
-              // Filter: for 'down' alerts only levels BELOW current; for 'up' only ABOVE
-              const validLevels = levels.filter(l =>
-                alertDir === 'down' ? l.price < currentPrice : l.price > currentPrice
+              // Classify levels: buy if below current or type='buy', sell if above or type='sell'
+              // Neutral levels are classified by price relative to current
+              const buyLevels = levels.filter(l =>
+                l.type === 'buy' ? l.price < currentPrice
+                : l.type === 'sell' ? false
+                : l.price < currentPrice           // neutral → below = buy
               );
-              if (validLevels.length === 0) continue;
+              const sellLevels = levels.filter(l =>
+                l.type === 'sell' ? l.price > currentPrice
+                : l.type === 'buy' ? false
+                : l.price > currentPrice           // neutral → above = sell
+              );
 
-              // Pick the level that will trigger first (highest for 'down', lowest for 'up')
-              const primaryLevel = alertDir === 'down'
-                ? validLevels.reduce((best, l) => l.price > best.price ? l : best)
-                : validLevels.reduce((best, l) => l.price < best.price ? l : best);
+              // ── Primary alert: BUY side (nearest dip level) ───────────────
+              if (buyLevels.length > 0) {
+                const primary = buyLevels.reduce((best, l) => l.price > best.price ? l : best);
+                const snippetRe = new RegExp(`[^.!?\\n]{0,60}\\$?${primary.price.toString().replace('.', '\\.')}[^.!?\\n]{0,60}`, 'i');
+                const snip = (recText.match(snippetRe) || [''])[0].trim().replace(/\*\*/g, '').substring(0, 100) || `buy at $${primary.price}`;
+                const allPrices   = buyLevels.map(l => l.price);
+                const sellPrices  = sellLevels.map(l => {
+                  const sr = new RegExp(`[^.!?\\n]{0,60}\\$?${l.price.toString().replace('.', '\\.')}[^.!?\\n]{0,60}`, 'i');
+                  const ss = (recText.match(sr) || [''])[0].trim().replace(/\*\*/g, '').substring(0, 80) || `take profits at $${l.price}`;
+                  return { price: l.price, snippet: ss };
+                });
+                const noteJson = JSON.stringify({ source: 'claude_rec', snippet: snip, allLevels: allPrices, recAction, sellLevels: sellPrices });
+                try {
+                  await setAbsolutePriceTarget(sym, primary.price, 'down', noteJson);
+                  buyAlertsSet.push({ coin, targetPrice: primary.price, allLevels: allPrices });
+                  console.log(`Auto-set down alert for ${sym} at $${primary.price}`);
+                } catch (e) { console.error(`Buy auto-alert failed for ${sym}:`, e.message); }
+              }
 
-              // Snippet from the recommendation to store as context
-              const snippetMatch = recText.match(new RegExp(`[^.!?\\n]{0,60}\\$?${primaryLevel.price.toString().replace('.', '\\.')}[^.!?\\n]{0,60}`, 'i'));
-              const snippet = snippetMatch ? snippetMatch[0].trim().replace(/\*\*/g, '').substring(0, 100) : `${recAction} at $${primaryLevel.price}`;
-              const allLevelPrices = validLevels.map(l => l.price);
-
-              const noteJson = JSON.stringify({
-                source: 'claude_rec',
-                snippet,
-                allLevels: allLevelPrices,
-                recAction
-              });
-
-              try {
-                await setAbsolutePriceTarget(sym, primaryLevel.price, alertDir, noteJson);
-                autoAlertsSet.push({ coin, targetPrice: primaryLevel.price, allLevels: allLevelPrices, label: primaryLevel.label });
-                console.log(`Auto-set ${alertDir} alert for ${sym} at $${primaryLevel.price} from recommendation`);
-              } catch (alertErr) {
-                console.error(`Auto-alert set failed for ${sym}:`, alertErr.message);
+              // ── Secondary alert: SELL side (nearest profit level) ─────────
+              // Stored separately as an 'up' target only if no buy alert already owns the symbol
+              if (sellLevels.length > 0 && buyLevels.length === 0) {
+                // Pure sell recommendation — set 'up' as primary
+                const primary = sellLevels.reduce((best, l) => l.price < best.price ? l : best);
+                const snippetRe = new RegExp(`[^.!?\\n]{0,60}\\$?${primary.price.toString().replace('.', '\\.')}[^.!?\\n]{0,60}`, 'i');
+                const snip = (recText.match(snippetRe) || [''])[0].trim().replace(/\*\*/g, '').substring(0, 100) || `take profits at $${primary.price}`;
+                const allPrices = sellLevels.map(l => l.price);
+                const noteJson  = JSON.stringify({ source: 'claude_rec', snippet: snip, allLevels: allPrices, recAction, sellLevels: sellLevels.map(l => ({ price: l.price, snippet: snip })) });
+                try {
+                  await setAbsolutePriceTarget(sym, primary.price, 'up', noteJson);
+                  sellAlertsSet.push({ coin, targetPrice: primary.price, allLevels: allPrices });
+                  console.log(`Auto-set up alert for ${sym} at $${primary.price}`);
+                } catch (e) { console.error(`Sell auto-alert failed for ${sym}:`, e.message); }
+              } else if (sellLevels.length > 0) {
+                // Both buy and sell levels — sell levels are stored in the note JSON of the buy target
+                // They'll be checked by the secondary alert monitor in checkPortfolio
+                sellAlertsSet.push({ coin, targetPrice: sellLevels[0].price, allLevels: sellLevels.map(l => l.price) });
               }
             }
           }
 
           // ── Build confirmation message ─────────────────────────────────────
-          const bulletPrices = Object.entries(prices).map(([c, p]) => `• ${c}: $${p.toFixed(4)}`).join('\n');
-
-          let alertConfirmBlock = '';
-          if (autoAlertsSet.length > 0) {
-            const dirWord = alertDir === 'down' ? 'drops to' : 'rises to';
-            const recLabel = alertDir === 'down' ? '📊 BUY SIGNAL' : '📊 SELL SIGNAL';
-            const alertLines = autoAlertsSet.flatMap(a => {
-              const lines = [];
-              const allSorted = alertDir === 'down'
-                ? [...a.allLevels].sort((x, y) => y - x) // highest first for 'down'
-                : [...a.allLevels].sort((x, y) => x - y); // lowest first for 'up'
-              for (const lvl of allSorted) {
-                const isSub = lvl !== a.targetPrice;
-                lines.push(`• ${a.coin} ${dirWord} $${lvl.toFixed(2)} → ${isSub ? '💡 Watch' : recLabel}`);
-              }
-              return lines;
-            }).join('\n');
-            alertConfirmBlock = `\n\n🔔 <b>Alerts created:</b>\n${alertLines}`;
-          }
-
-          const actionVerb = recAction === 'HOLD' ? 'holding' : recAction === 'BUY' ? 'buying' : recAction === 'SELL' ? 'selling' : recAction.toLowerCase() + 'ing';
-          const coinStr = targetCoins.join(' & ');
+          const bulletPrices  = Object.entries(prices).map(([c, p]) => `• ${c}: $${p.toFixed(4)}`).join('\n');
+          const anyAlerts     = buyAlertsSet.length > 0 || sellAlertsSet.length > 0;
+          const actionVerb    = recAction === 'HOLD' ? 'holding' : recAction === 'BUY' ? 'buying' : recAction === 'SELL' ? 'selling' : recAction.toLowerCase() + 'ing';
+          const coinStr       = targetCoins.join(' & ');
 
           let confirmMsg;
-          if (autoAlertsSet.length > 0) {
-            const currentPriceLines = autoAlertsSet.map(a => `Current ${a.coin}: $${(prices[a.coin] || 0).toFixed(4)}`).join('\n');
+          if (anyAlerts) {
+            let buyBlock = '';
+            if (buyAlertsSet.length > 0) {
+              const lines = buyAlertsSet.flatMap(a => {
+                const sorted = [...a.allLevels].sort((x, y) => y - x); // highest first (triggers first on dip)
+                return sorted.map((lvl, i) => `• $${lvl.toFixed(2)} → ${i === 0 ? 'Good add zone 📊' : 'Strong buy zone 📊'}`);
+              });
+              buyBlock = `\n\n🔔 <b>BUY ALERTS (when price drops):</b>\n${lines.join('\n')}`;
+            }
+            let sellBlock = '';
+            if (sellAlertsSet.length > 0) {
+              const lines = sellAlertsSet.flatMap(a => {
+                const sorted = [...a.allLevels].sort((x, y) => x - y); // lowest first (triggers first on rise)
+                return sorted.map((lvl, i) => `• $${lvl.toFixed(2)} → ${i === 0 ? 'Consider taking profits 💰' : i === sorted.length - 1 ? 'Major exit zone 🚀' : 'Strong sell zone 💰'}`);
+              });
+              sellBlock = `\n\n🎯 <b>SELL/PROFIT ALERTS (when price rises):</b>\n${lines.join('\n')}`;
+            }
+            const currentLines = targetCoins.map(c => `Current ${c}: $${(prices[c] || 0).toFixed(4)}`).join('\n');
             confirmMsg =
-              `✅ <b>Intention logged & alerts set for ${coinStr}!</b>\n` +
-              alertConfirmBlock + `\n\n` +
-              currentPriceLines + `\n` +
-              `I'll notify you when these levels are hit and check back in 7 days on your ${actionVerb} decision 💪`;
+              `✅ <b>Intention logged & alerts set for ${coinStr}!</b>` +
+              buyBlock + sellBlock + `\n\n` +
+              currentLines + `\n` +
+              `Full alert framework set — I'll notify you at every key level! 💪`;
           } else {
             confirmMsg =
               `✅ Got it Bryan — logged that you're ${actionVerb} ${coinStr}.\n` +
@@ -3564,11 +3653,19 @@ app.get('/telegram-setup', async (req, res) => {
 
 // Seed default trader profile entries if not already set
 const TRADER_PROFILE_DEFAULTS = [
-  { key: 'goal',      value: 'Recover portfolio losses and become a disciplined profitable swing trader' },
-  { key: 'situation', value: 'Portfolio approximately 50% down from historical highs' },
-  { key: 'style',     value: 'Swing trader - buy dips sell pumps' },
-  { key: 'weakness',  value: 'Past trading decisions led to significant losses - working to improve discipline' },
-  { key: 'strength',  value: 'Good instincts on institutional plays like CC and LINK' },
+  { key: 'goal',             value: 'Recover portfolio losses and become a disciplined profitable swing trader' },
+  { key: 'situation',        value: 'Portfolio approximately 50% down from historical highs' },
+  { key: 'style',            value: 'Swing trader - buy dips sell pumps' },
+  { key: 'weakness',         value: 'Past trading decisions led to significant losses - working to improve discipline' },
+  { key: 'strength',         value: 'Good instincts on institutional plays like CC and LINK' },
+  { key: 'core_strategy',    value: 'Swing trader focused on extreme price movements. Buys sudden sharp dips outside normal price pattern. Sells sudden sharp pumps outside normal price pattern. Always looking to capture profit on big moves and buy back on retraces.' },
+  { key: 'buy_signals',      value: 'Sudden extreme drop outside normal trading range — potential dip buy opportunity' },
+  { key: 'sell_signals',     value: 'Sudden extreme pump outside normal trading range — potential profit taking opportunity' },
+  { key: 'retrace_strategy', value: 'After selling a pump, waits for retrace and buys back at lower price to repeat the cycle' },
+  { key: 'loss_protection',  value: 'Will sell to protect against further losses if coin drops significantly with no recovery catalyst' },
+  { key: 'profit_capture',   value: 'Takes profits on substantial rises then looks to buy back on retrace' },
+  { key: 'trading_goal',     value: 'Portfolio recovery from 50% down — building back through disciplined swing trading' },
+  { key: 'risk_approach',    value: 'Protects downside while capturing upside on extreme moves' },
 ];
 (async () => {
   for (const { key, value } of TRADER_PROFILE_DEFAULTS) {
