@@ -80,30 +80,57 @@ async function editTelegramMessage(chatId, messageId, text) {
   });
 }
 
-async function sendTelegramChunked(text) {
-  const maxLen = 3800;
+// Split text into chunks at \n\n boundaries, never exceeding maxLen characters.
+function splitIntoChunks(text, maxLen = 3800) {
   const chunks = [];
   let remaining = text.trim();
-
   while (remaining.length > 0) {
     if (remaining.length <= maxLen) {
       chunks.push(remaining);
       break;
     }
+    // Prefer double-newline split, fall back to single newline, then hard cut
     let splitAt = remaining.lastIndexOf('\n\n', maxLen);
-    if (splitAt === -1) splitAt = remaining.lastIndexOf('\n', maxLen);
-    if (splitAt === -1) splitAt = maxLen;
+    if (splitAt <= 0) splitAt = remaining.lastIndexOf('\n', maxLen);
+    if (splitAt <= 0) splitAt = maxLen;
     chunks.push(remaining.substring(0, splitAt).trim());
     remaining = remaining.substring(splitAt).trim();
   }
+  return chunks;
+}
 
-  console.log('Total chunks:', chunks.length, 'First 100 chars:', chunks[0]?.substring(0, 100));
+// Send a potentially long response as sequential Telegram messages with 4-second gaps.
+// Chunks are split only at paragraph (\n\n) boundaries, never mid-sentence.
+// Every chunk is logged to Railway with its index, length, and first 60 chars.
+async function sendTelegramChunked(text) {
+  const CHUNK_LIMIT    = 2500; // split threshold — responses longer than this get split
+  const HARD_MAX       = 3800; // absolute max per message (Telegram allows ~4096)
+  const GAP_MS         = 4000; // gap between messages
+
+  const rawText = (text || '').trim();
+
+  // Short enough to send as one — no split needed
+  if (rawText.length <= CHUNK_LIMIT) {
+    console.log('Message 1 of 1: length', rawText.length, 'starts:', rawText.substring(0, 60));
+    await sendTelegram(rawText);
+    return;
+  }
+
+  // Build chunks, each under HARD_MAX
+  const chunks = splitIntoChunks(rawText, HARD_MAX);
+
+  const prefixes = ['', '📄 <b>(continued...)</b>\n\n', '📄 <b>(final...)</b>\n\n'];
+
+  console.log(`Splitting response into ${chunks.length} messages (total ${rawText.length} chars)`);
 
   for (let i = 0; i < chunks.length; i++) {
-    const prefix = i > 0 ? '📄 **(continued...)**\n\n' : '';
-    await sendTelegram(prefix + chunks[i]);
-    console.log('Sent chunk', i + 1, 'of', chunks.length);
-    await new Promise(r => setTimeout(r, 3000));
+    const prefix  = prefixes[Math.min(i, prefixes.length - 1)];
+    const payload = prefix + chunks[i];
+    console.log(`Message ${i + 1} of ${chunks.length}: length ${payload.length} starts: "${chunks[i].substring(0, 60).replace(/\n/g, ' ')}"`);
+    await sendTelegram(payload);
+    if (i < chunks.length - 1) {
+      await new Promise(r => setTimeout(r, GAP_MS));
+    }
   }
 }
 
