@@ -402,6 +402,17 @@ try {
   console.log('Added acknowledged_until column to custom_thresholds');
 } catch (e) { /* already exists */ }
 
+// One-time cleanup: remove ghost symbols created by parser errors (words mistaken for coin names)
+try {
+  const ghostSymbols = ['RISES-USD', 'RAISE-USD', 'TRADE-USD'];
+  const placeholders = ghostSymbols.map(() => '?').join(', ');
+  const [r1] = await db.execute(`DELETE FROM custom_thresholds WHERE symbol IN (${placeholders})`, ghostSymbols);
+  const [r2] = await db.execute(`DELETE FROM price_targets WHERE symbol IN (${placeholders})`, ghostSymbols);
+  if (r1.affectedRows > 0 || r2.affectedRows > 0) {
+    console.log(`[cleanup] Removed ghost symbols — custom_thresholds: ${r1.affectedRows} row(s), price_targets: ${r2.affectedRows} row(s)`);
+  }
+} catch (e) { console.warn('[cleanup] Ghost symbol cleanup failed:', e.message); }
+
 // Load permanently ignored coins from DB
 try {
   const [ignoredRows] = await db.execute('SELECT symbol FROM ignored_coins');
