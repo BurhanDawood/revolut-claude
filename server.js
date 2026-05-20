@@ -103,6 +103,7 @@ async function sendTelegramChunked(text) {
   }
 
   console.log('CHUNKING: total length', text.length, 'split into', chunks.length, 'chunks');
+  console.log('FIRST CHUNK CONTENT:', (chunks[0] || '').substring(0, 200).replace(/\n/g, '|'));
 
   for (let i = 0; i < chunks.length; i++) {
     // Extra 2s before first chunk so the "thinking..." status message fully clears
@@ -4306,6 +4307,8 @@ Active alerts (coins currently above threshold): ${[...alertState.active.keys()]
         console.log('Claude response length:', fullReply.length, 'characters');
         console.log('Sending in', Math.ceil(fullReply.length / 2500), 'message(s)');
         console.log('ABOUT TO CHUNK: response length:', fullReply.length);
+        console.log('FULL REPLY STARTS WITH:', fullReply.substring(0, 200).replace(/\n/g, '|'));
+        console.log('CHUNK 1 WILL START WITH:', fullReply.substring(0, 100).replace(/\n/g, '|'));
 
         // 5s gap after status message so chunks don't collide with it
         await new Promise(r => setTimeout(r, 5000));
