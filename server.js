@@ -152,6 +152,7 @@ let monitoringInterval = null;
 const conversationHistory = new Map(); // chatId -> [{role, content}]
 const lastRecommendationContext = new Map(); // chatId -> { coins, action, prices, timestamp }
 const lastSwingAlertContext = new Map();     // symbol -> { direction: 'pump'|'dip', price, timestamp }
+const swingAlertCooldown = new Map();        // symbol -> timestamp — prevents repeated swing signals (4h cooldown, 6h after reply)
 let mostRecentSwingAlert = null;             // { symbol, coinBase, direction, price, timestamp } — for 👍 / natural language
 const alertRecommendations = new Map();      // symbol -> { rec, timestamp } — reused in reminders, no repeat API calls
 const responseCache = new Map();             // 'type:symbol' -> { response, timestamp } — 30-min cache for sell/buy advice
@@ -2181,6 +2182,13 @@ async function checkPortfolio() {
 
         if (!isExtremeDip && !isExtremePump) continue;
 
+        // Cooldown: skip if we're still within the cooldown window for this coin
+        const swingCooldownExpiry = swingAlertCooldown.get(symbol);
+        if (swingCooldownExpiry && Date.now() < swingCooldownExpiry) {
+          console.log('[swing] Cooldown active for', symbol, '- skipping (', Math.round((swingCooldownExpiry - Date.now()) / 60000), 'min remaining)');
+          continue;
+        }
+
         // Check we haven't sent this extreme alert recently (use basePrices as proxy)
         const coinBase = asset.currency;
         const available = parseFloat(asset.available);
@@ -2214,6 +2222,7 @@ async function checkPortfolio() {
           // Store context so webhook replies can respond intelligently
           lastSwingAlertContext.set(symbol, { direction: 'dip', price: currentPrice, timestamp: Date.now() });
           mostRecentSwingAlert = { symbol, coinBase, direction: 'dip', price: currentPrice, timestamp: Date.now() };
+          swingAlertCooldown.set(symbol, Date.now() + 4 * 60 * 60 * 1000); // 4h cooldown expiry
           console.log(`Extreme dip signal sent for ${symbol}: ${dropPct}% below 7d avg`);
         }
 
@@ -2245,6 +2254,7 @@ async function checkPortfolio() {
           // Store context so webhook replies can respond intelligently
           lastSwingAlertContext.set(symbol, { direction: 'pump', price: currentPrice, timestamp: Date.now() });
           mostRecentSwingAlert = { symbol, coinBase, direction: 'pump', price: currentPrice, timestamp: Date.now() };
+          swingAlertCooldown.set(symbol, Date.now() + 4 * 60 * 60 * 1000); // 4h cooldown expiry
           console.log(`Extreme pump signal sent for ${symbol}: ${pumpPct}% above 7d avg`);
         }
       }
@@ -2955,7 +2965,7 @@ function createMcpServer() {
     }
   );
 
-  // ── Tool: get_context ─────────────────────────────────────────────────────
+  // ── Tool: get_context ──────────────────────────────────────────────────────
   server.tool('get_context',
     "Get Bryan's trader profile, preferences, recent journal entries and learning model summary for Claude context",
     {},
@@ -3514,6 +3524,9 @@ app.post('/telegram-webhook', async (req, res) => {
           await acknowledgeAlert(swSymbol);
           lastSwingAlertContext.delete(swSymbol);
           if (mostRecentSwingAlert?.symbol === swSymbol) mostRecentSwingAlert = null;
+          // Extend cooldown to 6h after a user reply — they've responded, don't re-alert for a while
+          swingAlertCooldown.set(swSymbol, Date.now() + 6 * 60 * 60 * 1000);
+          console.log('[swing] Cooldown extended to 6h for', swSymbol, 'after user reply:', swAction);
 
           const isPump = swCtx.direction === 'pump';
           const currentPrice = await getCurrentPrice(swSymbol).catch(() => swCtx.price);
@@ -3531,27 +3544,43 @@ app.post('/telegram-webhook', async (req, res) => {
 
           if (swAction === 'hold') {
             if (isPump) {
-              // Holding through pump → sell alert at +15%
-              const sellTarget = currentPrice * 1.15;
-              await setAbsolutePriceTarget(swSymbol, sellTarget, 'up',
-                JSON.stringify({ source: 'swing_hold', direction: 'up' })).catch(() => {});
-              await sendReply(
-                `✅ Holding <b>${swCoinBase}</b> logged.\n` +
-                `🎯 Sell alert set at ${fmtPriceShort(sellTarget)} (+15% from here)\n` +
-                `I'll notify you when it hits your target!`
-              );
+              // Holding through pump → sell alert at +15% (only if no existing target)
+              const existing = priceTargets.get(swSymbol);
+              if (existing && existing.direction === 'up') {
+                await sendReply(
+                  `✅ Holding <b>${swCoinBase}</b> logged.\n` +
+                  `📌 You already have a sell target at ${fmtPriceShort(existing.targetPrice)} — keeping that.`
+                );
+              } else {
+                const sellTarget = currentPrice * 1.15;
+                await setAbsolutePriceTarget(swSymbol, sellTarget, 'up',
+                  JSON.stringify({ source: 'swing_hold', direction: 'up' })).catch(() => {});
+                await sendReply(
+                  `✅ Holding <b>${swCoinBase}</b> logged.\n` +
+                  `🎯 Sell alert set at ${fmtPriceShort(sellTarget)} (+15% from here)\n` +
+                  `I'll notify you when it hits your target!`
+                );
+              }
             } else {
-              // Holding through dip → recovery alert at entry or +20%
-              const entryP = entryPrices.get(swSymbol);
-              const recoverTarget = (entryP && entryP > currentPrice) ? entryP : currentPrice * 1.20;
-              const label = (entryP && entryP > currentPrice) ? 'entry price' : '+20% from here';
-              await setAbsolutePriceTarget(swSymbol, recoverTarget, 'up',
-                JSON.stringify({ source: 'swing_hold', direction: 'up' })).catch(() => {});
-              await sendReply(
-                `✅ Holding <b>${swCoinBase}</b> logged.\n` +
-                `🎯 Recovery alert set at ${fmtPriceShort(recoverTarget)} (${label})\n` +
-                `I'll notify you when it recovers!`
-              );
+              // Holding through dip → recovery alert at entry or +20% (only if no existing target)
+              const existing = priceTargets.get(swSymbol);
+              if (existing && existing.direction === 'up') {
+                await sendReply(
+                  `✅ Holding <b>${swCoinBase}</b> logged.\n` +
+                  `📌 You already have a recovery target at ${fmtPriceShort(existing.targetPrice)} — keeping that.`
+                );
+              } else {
+                const entryP = entryPrices.get(swSymbol);
+                const recoverTarget = (entryP && entryP > currentPrice) ? entryP : currentPrice * 1.20;
+                const label = (entryP && entryP > currentPrice) ? 'entry price' : '+20% from here';
+                await setAbsolutePriceTarget(swSymbol, recoverTarget, 'up',
+                  JSON.stringify({ source: 'swing_hold', direction: 'up' })).catch(() => {});
+                await sendReply(
+                  `✅ Holding <b>${swCoinBase}</b> logged.\n` +
+                  `🎯 Recovery alert set at ${fmtPriceShort(recoverTarget)} (${label})\n` +
+                  `I'll notify you when it recovers!`
+                );
+              }
             }
             return res.status(200).json({ ok: true });
           }
