@@ -82,6 +82,7 @@ async function editTelegramMessage(chatId, messageId, text) {
 
 // Split text into chunks at \n\n boundaries, never exceeding maxLen characters.
 async function sendTelegramChunked(text) {
+  console.log('CHUNKING FUNCTION CALLED: text length:', (text || '').length);
   const maxLen = 2500;
   const chunks = [];
   let remaining = (text || '').trim();
@@ -2672,7 +2673,9 @@ app.post('/api/research-dust', async (req, res) => {
         messages: [{ role: 'user', content: `Research ${coin} crypto (${priceStr}). Bryan holds a small dust position. Search for: current project status, recent news, team activity, any upcoming catalysts. Give a clear verdict: ACCUMULATE / HOLD / DUMP. Under 400 words.` }]
       });
       const textBlock = [...response.content].reverse().find(b => b.type === 'text');
-      await sendTelegram(`🔍 <b>DUST RESEARCH — ${coin}</b>\n\n${textBlock ? textBlock.text : 'Research unavailable.'}`);
+      const dustReply = `🔍 <b>DUST RESEARCH — ${coin}</b>\n\n${textBlock ? textBlock.text : 'Research unavailable.'}`;
+      console.log('ABOUT TO CHUNK: dust research length:', dustReply.length);
+      await sendTelegramChunked(dustReply);
     } catch (e) {
       await sendTelegram(`❌ Research failed for ${coin}: ${e.message}`);
     }
@@ -2719,6 +2722,7 @@ app.post('/telegram-webhook', async (req, res) => {
 
     const chatId = message.chat.id;
     const rawText = message.text.trim();
+    console.log('WEBHOOK: message received:', rawText.substring(0, 50));
     // Normalise: strip leading slash, lowercase
     const commandText = rawText.startsWith('/') ? rawText.slice(1).toLowerCase() : rawText.toLowerCase();
 
@@ -3012,9 +3016,11 @@ app.post('/telegram-webhook', async (req, res) => {
             messages: [{ role: 'user', content: `Give specific, actionable sell advice for ${symbol}. Search for current price and market conditions. Should I sell now or wait? Give a clear recommendation with 1-2 price levels to target. Under 300 words.` }]
           });
           const textBlock = [...response.content].reverse().find(b => b.type === 'text');
-          await sendTelegramMessage(chatId, textBlock ? textBlock.text : 'Unable to generate sell advice.');
+          const sellReply = textBlock ? textBlock.text : 'Unable to generate sell advice.';
+          console.log('ABOUT TO CHUNK: sell advice length:', sellReply.length);
+          await sendTelegramChunked(sellReply);
         } catch (e) {
-          await sendTelegramMessage(chatId, '❌ Error: ' + e.message);
+          await sendReply('❌ Error getting sell advice: ' + e.message);
         }
       })();
       return;
@@ -3036,9 +3042,11 @@ app.post('/telegram-webhook', async (req, res) => {
             messages: [{ role: 'user', content: `Give specific, actionable advice on buying more ${symbol}. Search for current price and market conditions. Is now a good DCA entry? What's the risk/reward? Under 300 words.` }]
           });
           const textBlock = [...response.content].reverse().find(b => b.type === 'text');
-          await sendTelegramMessage(chatId, textBlock ? textBlock.text : 'Unable to generate buy advice.');
+          const buyReply = textBlock ? textBlock.text : 'Unable to generate buy advice.';
+          console.log('ABOUT TO CHUNK: buy advice length:', buyReply.length);
+          await sendTelegramChunked(buyReply);
         } catch (e) {
-          await sendTelegramMessage(chatId, '❌ Error: ' + e.message);
+          await sendReply('❌ Error getting buy advice: ' + e.message);
         }
       })();
       return;
@@ -3372,9 +3380,11 @@ app.post('/telegram-webhook', async (req, res) => {
             messages: [{ role: 'user', content: `Research ${coinBase} crypto ${priceStr}. Bryan may hold a dust position. Search for: project fundamentals, team, recent news, tokenomics, upcoming catalysts, any red flags. Give a clear verdict: ACCUMULATE / HOLD / DUMP with reasoning. Under 450 words.` }]
           });
           const textBlock = [...response.content].reverse().find(b => b.type === 'text');
-          await sendTelegram(`🔍 <b>RESEARCH — ${coinBase}</b>\n\n${textBlock ? textBlock.text : 'Research unavailable.'}`);
+          const researchReply = `🔍 <b>RESEARCH — ${coinBase}</b>\n\n${textBlock ? textBlock.text : 'Research unavailable.'}`;
+          console.log('ABOUT TO CHUNK: research reply length:', researchReply.length);
+          await sendTelegramChunked(researchReply);
         } catch (e) {
-          await sendTelegram(`❌ Research failed for ${coinBase}: ${e.message}`);
+          await sendReply(`❌ Research failed for ${coinBase}: ${e.message}`);
         }
       })();
       return;
@@ -3920,6 +3930,7 @@ Active alerts (coins currently above threshold): ${[...alertState.active.keys()]
         const fullReply = reply + (actionTaken || '');
         console.log('Claude response length:', fullReply.length, 'characters');
         console.log('Sending in', Math.ceil(fullReply.length / 2500), 'message(s)');
+        console.log('ABOUT TO CHUNK: response length:', fullReply.length);
 
         // 3s gap after status message so chunks don't collide with it
         await new Promise(r => setTimeout(r, 3000));
