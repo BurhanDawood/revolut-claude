@@ -2955,6 +2955,37 @@ function createMcpServer() {
     }
   );
 
+  // ── Tool: get_context ─────────────────────────────────────────────────────
+  server.tool('get_context',
+    "Get Bryan's trader profile, preferences, recent journal entries and learning model summary for Claude context",
+    {},
+    async () => {
+      const [profileRows]    = await db.execute('SELECT preference_key, preference_value FROM trader_profile');
+      const [recentTrades]   = await db.execute('SELECT * FROM trading_journal ORDER BY created_at DESC LIMIT 5');
+      const [intentionRows]  = await db.execute('SELECT * FROM intention_tracking ORDER BY intention_date DESC LIMIT 3');
+      const [statsRows]      = await db.execute(
+        `SELECT
+           COUNT(*) AS total_completed,
+           SUM(CASE WHEN outcome_pnl > 0 THEN 1 ELSE 0 END) AS wins
+         FROM trading_journal
+         WHERE outcome_pnl IS NOT NULL`
+      );
+      const stats = statsRows[0] || {};
+      const totalCompleted = parseInt(stats.total_completed || 0);
+      const wins = parseInt(stats.wins || 0);
+      const winRate = totalCompleted > 0 ? ((wins / totalCompleted) * 100).toFixed(1) : null;
+      const result = {
+        traderProfile:     profileRows,
+        recentTrades,
+        learningModel:     learningModelCache || 'Not yet generated',
+        investedCapital:   totalInvestedCapital,
+        recentIntentions:  intentionRows,
+        tradingStats: { totalCompleted, winRate: winRate ? `${winRate}%` : 'n/a' },
+      };
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
   // ── Tool: update_invested_capital ─────────────────────────────────────────
   server.tool('update_invested_capital',
     'Update total invested capital (deposits, withdrawals, or set absolute figure)',
