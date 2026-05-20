@@ -2182,10 +2182,12 @@ async function checkPortfolio() {
 
         if (!isExtremeDip && !isExtremePump) continue;
 
-        // Cooldown: skip if we're still within the cooldown window for this coin
-        const swingCooldownExpiry = swingAlertCooldown.get(symbol);
-        if (swingCooldownExpiry && Date.now() < swingCooldownExpiry) {
-          console.log('[swing] Cooldown active for', symbol, '- skipping (', Math.round((swingCooldownExpiry - Date.now()) / 60000), 'min remaining)');
+        // Cooldown: skip if a swing signal was sent within the last 4 hours
+        const lastSwing = swingAlertCooldown.get(symbol);
+        if (lastSwing && (Date.now() - lastSwing) < 4 * 60 * 60 * 1000) {
+          const minsAgo = Math.round((Date.now() - lastSwing) / 60000);
+          const minsLeft = Math.round((4 * 60 * 60 * 1000 - (Date.now() - lastSwing)) / 60000);
+          console.log('[swing] Cooldown active for', symbol, `- skipping (sent ${minsAgo}min ago, ${minsLeft}min remaining)`);
           continue;
         }
 
@@ -2222,7 +2224,7 @@ async function checkPortfolio() {
           // Store context so webhook replies can respond intelligently
           lastSwingAlertContext.set(symbol, { direction: 'dip', price: currentPrice, timestamp: Date.now() });
           mostRecentSwingAlert = { symbol, coinBase, direction: 'dip', price: currentPrice, timestamp: Date.now() };
-          swingAlertCooldown.set(symbol, Date.now() + 4 * 60 * 60 * 1000); // 4h cooldown expiry
+          swingAlertCooldown.set(symbol, Date.now()); // start 4h cooldown
           console.log(`Extreme dip signal sent for ${symbol}: ${dropPct}% below 7d avg`);
         }
 
@@ -2254,7 +2256,7 @@ async function checkPortfolio() {
           // Store context so webhook replies can respond intelligently
           lastSwingAlertContext.set(symbol, { direction: 'pump', price: currentPrice, timestamp: Date.now() });
           mostRecentSwingAlert = { symbol, coinBase, direction: 'pump', price: currentPrice, timestamp: Date.now() };
-          swingAlertCooldown.set(symbol, Date.now() + 4 * 60 * 60 * 1000); // 4h cooldown expiry
+          swingAlertCooldown.set(symbol, Date.now()); // start 4h cooldown
           console.log(`Extreme pump signal sent for ${symbol}: ${pumpPct}% above 7d avg`);
         }
       }
@@ -2319,7 +2321,21 @@ setTimeout(async () => {
 cron.schedule('0 0 * * *', recordDailyPrices, { timezone: 'Europe/London' });
 
 // Send morning briefing at 9:00 AM every day (UK time)
-cron.schedule('0 9 * * *', sendMorningBriefing, { timezone: 'Europe/London' });
+cron.schedule('5 9 * * *', async () => {
+  try {
+    await sendMorningBriefing();
+  } catch (e) {
+    console.error('Morning briefing failed, retrying in 2 minutes:', e.message);
+    setTimeout(async () => {
+      try {
+        await sendMorningBriefing();
+      } catch (e2) {
+        console.error('Morning briefing retry also failed:', e2.message);
+        await sendTelegram('❌ Morning briefing failed twice — check Railway logs.');
+      }
+    }, 2 * 60 * 1000);
+  }
+}, { timezone: 'Europe/London' });
 
 // Check macro news every 5 minutes — free RSS + keyword scan; Claude called at most once per 2h
 cron.schedule('*/5 * * * *', checkMacroNews, { timezone: 'Europe/London' });
@@ -2992,6 +3008,7 @@ function createMcpServer() {
         recentIntentions:  intentionRows,
         tradingStats: { totalCompleted, winRate: winRate ? `${winRate}%` : 'n/a' },
       };
+      console.log('[mcp] get_context called');
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
     }
   );
@@ -3524,9 +3541,9 @@ app.post('/telegram-webhook', async (req, res) => {
           await acknowledgeAlert(swSymbol);
           lastSwingAlertContext.delete(swSymbol);
           if (mostRecentSwingAlert?.symbol === swSymbol) mostRecentSwingAlert = null;
-          // Extend cooldown to 6h after a user reply — they've responded, don't re-alert for a while
-          swingAlertCooldown.set(swSymbol, Date.now() + 6 * 60 * 60 * 1000);
-          console.log('[swing] Cooldown extended to 6h for', swSymbol, 'after user reply:', swAction);
+          // Backdate cooldown by 2h so 4h remaining window = 6h total from now
+          swingAlertCooldown.set(swSymbol, Date.now() - (2 * 60 * 60 * 1000));
+          console.log('[swing] Cooldown extended (4h remaining) for', swSymbol, 'after user reply:', swAction);
 
           const isPump = swCtx.direction === 'pump';
           const currentPrice = await getCurrentPrice(swSymbol).catch(() => swCtx.price);
