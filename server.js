@@ -2746,6 +2746,236 @@ function createMcpServer() {
     return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
   });
 
+  // ── Tool: log_journal_entry ───────────────────────────────────────────────
+  server.tool('log_journal_entry',
+    'Log a trading decision to the journal',
+    {
+      symbol:                  z.string().describe('Coin symbol e.g. LINK-USD'),
+      action:                  z.enum(['buy', 'sell', 'hold', 'add', 'reduce', 'payment']).describe('Trade action'),
+      price:                   z.number().describe('Price at time of decision'),
+      quantity:                z.number().optional().describe('Number of coins (optional)'),
+      reasoning:               z.string().describe('Why you made this decision'),
+      emotion:                 z.enum(['confident', 'uncertain', 'fomo', 'fearful', 'neutral']).describe('Emotional state'),
+      followed_recommendation: z.boolean().optional().describe('Whether you followed Claude\'s recommendation'),
+    },
+    async ({ symbol, action, price, quantity, reasoning, emotion, followed_recommendation }) => {
+      const coinBase = symbol.replace('-USD', '');
+      const valueUsd = quantity ? quantity * price : null;
+      const [result] = await db.execute(
+        `INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, followed_recommendation)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [coinBase, action, price, quantity ?? null, valueUsd, reasoning, emotion, followed_recommendation ?? null]
+      );
+      return { content: [{ type: 'text', text: JSON.stringify({ ok: true, journal_id: result.insertId, symbol: coinBase, action, price }) }] };
+    }
+  );
+
+  // ── Tool: set_alert ───────────────────────────────────────────────────────
+  server.tool('set_alert',
+    'Set a fixed price alert for a coin',
+    {
+      symbol:        z.string().describe('Trading pair e.g. LINK-USD'),
+      direction:     z.enum(['up', 'down']).describe('Alert fires when price goes up or down to target'),
+      threshold_pct: z.number().describe('Percentage move from anchor e.g. 20 for 20%'),
+      anchor_price:  z.number().optional().describe('Anchor price to measure from — uses current price if omitted'),
+    },
+    async ({ symbol, direction, threshold_pct, anchor_price }) => {
+      const sym = symbol.includes('-USD') ? symbol : `${symbol}-USD`;
+      let result;
+      if (anchor_price) {
+        // Set directly with a known anchor
+        const targetPrice = direction === 'down'
+          ? anchor_price * (1 - threshold_pct / 100)
+          : anchor_price * (1 + threshold_pct / 100);
+        await db.execute(
+          'INSERT INTO price_targets (symbol, anchor_price, threshold_pct, target_price, direction) VALUES (?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE anchor_price=VALUES(anchor_price), threshold_pct=VALUES(threshold_pct), target_price=VALUES(target_price), direction=VALUES(direction), updated_at=CURRENT_TIMESTAMP',
+          [sym, anchor_price, threshold_pct, targetPrice, direction]
+        );
+        const existing = priceTargets.get(sym) || {};
+        priceTargets.set(sym, { ...existing, anchorPrice: anchor_price, thresholdPct: threshold_pct, targetPrice, direction, note: null });
+        alertState.acknowledged.delete(sym);
+        result = { anchorPrice: anchor_price, thresholdPct: threshold_pct, targetPrice, direction };
+      } else {
+        result = await setFixedTarget(sym, threshold_pct, direction);
+      }
+      const dirLabel = direction === 'down' ? 'floor' : 'target';
+      return { content: [{ type: 'text', text: JSON.stringify({ ok: true, symbol: sym, direction, threshold_pct, anchor: result.anchorPrice, target: result.targetPrice, message: `Alert set — will fire when ${sym} ${direction === 'down' ? 'drops to' : 'hits'} ${result.targetPrice.toFixed(6)}` }) }] };
+    }
+  );
+
+  // ── Tool: set_daily_threshold ─────────────────────────────────────────────
+  server.tool('set_daily_threshold',
+    'Set the daily pump/drop alert threshold for a coin',
+    {
+      symbol:        z.string().describe('Trading pair e.g. LINK-USD'),
+      threshold_pct: z.number().describe('Threshold percentage e.g. 15 for 15%'),
+    },
+    async ({ symbol, threshold_pct }) => {
+      const sym = symbol.includes('-USD') ? symbol : `${symbol}-USD`;
+      const { oldThreshold, newThreshold } = await setThreshold(sym, threshold_pct / 100);
+      return { content: [{ type: 'text', text: JSON.stringify({ ok: true, symbol: sym, old_threshold_pct: (oldThreshold * 100).toFixed(1), new_threshold_pct: (newThreshold * 100).toFixed(1) }) }] };
+    }
+  );
+
+  // ── Tool: set_entry_price ─────────────────────────────────────────────────
+  server.tool('set_entry_price',
+    'Set average entry price for a coin',
+    {
+      symbol:      z.string().describe('Trading pair e.g. LINK-USD'),
+      entry_price: z.number().describe('Average entry price in USD'),
+    },
+    async ({ symbol, entry_price }) => {
+      const sym = symbol.includes('-USD') ? symbol : `${symbol}-USD`;
+      entryPrices.set(sym, entry_price);
+      await db.execute(
+        'INSERT INTO entry_prices (symbol, entry_price) VALUES (?, ?) ON DUPLICATE KEY UPDATE entry_price = VALUES(entry_price)',
+        [sym, entry_price]
+      );
+      const currentPrice = await getCurrentPrice(sym).catch(() => null);
+      const plPct = currentPrice ? ((currentPrice - entry_price) / entry_price * 100).toFixed(2) : null;
+      return { content: [{ type: 'text', text: JSON.stringify({ ok: true, symbol: sym, entry_price, current_price: currentPrice, pl_pct: plPct }) }] };
+    }
+  );
+
+  // ── Tool: acknowledge_alert ───────────────────────────────────────────────
+  server.tool('acknowledge_alert',
+    'Stop all active alerts for a coin for this session',
+    {
+      symbol: z.string().describe('Trading pair e.g. LINK-USD'),
+    },
+    async ({ symbol }) => {
+      const sym = symbol.includes('-USD') ? symbol : `${symbol}-USD`;
+      await acknowledgeAlert(sym);
+      return { content: [{ type: 'text', text: JSON.stringify({ ok: true, symbol: sym, message: `All alerts stopped for ${sym} this session. Use watch_coin to re-enable.` }) }] };
+    }
+  );
+
+  // ── Tool: ignore_coin ─────────────────────────────────────────────────────
+  server.tool('ignore_coin',
+    'Permanently stop all alerts for a coin (survives restarts)',
+    {
+      symbol: z.string().describe('Trading pair e.g. LINK-USD'),
+    },
+    async ({ symbol }) => {
+      const sym = symbol.includes('-USD') ? symbol : `${symbol}-USD`;
+      await ignoreCoin(sym);
+      return { content: [{ type: 'text', text: JSON.stringify({ ok: true, symbol: sym, message: `${sym} permanently ignored. Send watch command to re-enable.` }) }] };
+    }
+  );
+
+  // ── Tool: get_portfolio_summary ───────────────────────────────────────────
+  server.tool('get_portfolio_summary',
+    'Get full portfolio with prices, P&L and alert status',
+    {},
+    async () => {
+      const balances = await revolutRequest('GET', '/balances');
+      const tickerResponse = await revolutRequest('GET', '/tickers');
+      const tickerList = Array.isArray(tickerResponse) ? tickerResponse : (tickerResponse.data || []);
+      const priceMap = {};
+      for (const t of tickerList) {
+        if (t.symbol) {
+          const p = parseFloat(t.last_price || t.mid || t.ask || t.bid);
+          if (p) { priceMap[t.symbol] = p; priceMap[t.symbol.replace('/', '-')] = p; }
+        }
+      }
+      let totalValue = 0;
+      const positions = [];
+      for (const asset of balances) {
+        if (!asset.currency || SKIP_CURRENCIES.includes(asset.currency)) continue;
+        const qty = parseFloat(asset.available);
+        if (qty <= 0) continue;
+        const sym = `${asset.currency}-USD`;
+        const price = priceMap[sym] || priceMap[`${asset.currency}/USD`] || null;
+        const valueUsd = price ? qty * price : null;
+        if (valueUsd) totalValue += valueUsd;
+        const entry = entryPrices.get(sym) || null;
+        const plPct = entry && price ? ((price - entry) / entry * 100).toFixed(2) : null;
+        const plUsd = entry && price && qty ? ((price - entry) * qty).toFixed(2) : null;
+        const threshold = customThresholds[sym] !== undefined ? customThresholds[sym] : PUMP_THRESHOLD;
+        const basePrice = basePrices[sym] || null;
+        const changeFromBase = basePrice && price ? ((price - basePrice) / basePrice * 100).toFixed(2) : null;
+        positions.push({
+          symbol: sym, currency: asset.currency, quantity: qty, price, value_usd: valueUsd ? valueUsd.toFixed(2) : null,
+          entry_price: entry, pl_pct: plPct, pl_usd: plUsd,
+          baseline_price: basePrice, change_from_baseline_pct: changeFromBase,
+          alert_threshold_pct: (threshold * 100).toFixed(1),
+          pump_alert_active: alertState.active.has(sym),
+          drop_alert_active: activeDropAlerts.has(sym),
+          fixed_alert_active: activeFixedAlerts.has(sym),
+          acknowledged: alertState.acknowledged.has(sym),
+          ignored: ignoredCoins.has(sym),
+          fixed_target: priceTargets.has(sym) ? priceTargets.get(sym) : null,
+        });
+      }
+      positions.sort((a, b) => (parseFloat(b.value_usd) || 0) - (parseFloat(a.value_usd) || 0));
+      const cap = getCapitalSummary(totalValue);
+      return { content: [{ type: 'text', text: JSON.stringify({ total_value_usd: totalValue.toFixed(2), invested: cap.invested, pl_usd: cap.pnl.toFixed(2), pl_pct: cap.pnlPct.toFixed(2), positions }, null, 2) }] };
+    }
+  );
+
+  // ── Tool: get_journal ─────────────────────────────────────────────────────
+  server.tool('get_journal',
+    'Get recent trading journal entries',
+    {
+      symbol: z.string().optional().describe('Filter by coin symbol e.g. LINK (no -USD needed)'),
+      limit:  z.number().optional().describe('Max entries to return (default 10)'),
+    },
+    async ({ symbol, limit = 10 }) => {
+      let rows;
+      if (symbol) {
+        const coinBase = symbol.replace('-USD', '').toUpperCase();
+        [rows] = await db.execute(
+          'SELECT * FROM trading_journal WHERE symbol = ? ORDER BY created_at DESC LIMIT ?',
+          [coinBase, limit]
+        );
+      } else {
+        [rows] = await db.execute('SELECT * FROM trading_journal ORDER BY created_at DESC LIMIT ?', [limit]);
+      }
+      return { content: [{ type: 'text', text: JSON.stringify(rows, null, 2) }] };
+    }
+  );
+
+  // ── Tool: get_alerts ──────────────────────────────────────────────────────
+  server.tool('get_alerts',
+    'Get all current alert settings, active alerts and ignored coins',
+    {},
+    async () => {
+      const result = {
+        daily_thresholds: Object.entries(customThresholds).map(([sym, thr]) => ({ symbol: sym, threshold_pct: (thr * 100).toFixed(1) })),
+        fixed_price_targets: [...priceTargets.entries()].map(([sym, t]) => ({
+          symbol: sym, direction: t.direction, anchor: t.anchorPrice, target: t.targetPrice, threshold_pct: t.thresholdPct
+        })),
+        active_pump_alerts:  [...alertState.active.keys()],
+        active_drop_alerts:  [...activeDropAlerts.keys()],
+        active_fixed_alerts: [...activeFixedAlerts.keys()],
+        acknowledged_this_session: [...alertState.acknowledged].filter(s => !ignoredCoins.has(s)),
+        permanently_ignored: [...ignoredCoins],
+      };
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  // ── Tool: update_invested_capital ─────────────────────────────────────────
+  server.tool('update_invested_capital',
+    'Update total invested capital (deposits, withdrawals, or set absolute figure)',
+    {
+      amount: z.number().describe('Amount in USD'),
+      type:   z.enum(['deposit', 'withdrawal', 'set']).describe('deposit = add to total, withdrawal = subtract, set = replace total'),
+      note:   z.string().optional().describe('Optional note e.g. "May top-up"'),
+    },
+    async ({ amount, type, note }) => {
+      const previous = totalInvestedCapital;
+      let newTotal;
+      if (type === 'deposit')    newTotal = previous + amount;
+      else if (type === 'withdrawal') newTotal = previous - amount;
+      else                           newTotal = amount; // set
+      await updateInvestedCapital(newTotal, note || `${type}: $${amount}`);
+      const portfolioValue = await getCurrentPortfolioValue();
+      const cap = getCapitalSummary(portfolioValue);
+      return { content: [{ type: 'text', text: JSON.stringify({ ok: true, type, previous_total: previous, new_total: newTotal, portfolio_value: portfolioValue.toFixed(2), pl_usd: cap.pnl.toFixed(2), pl_pct: cap.pnlPct.toFixed(2) }) }] };
+    }
+  );
+
   return server;
 }
 
