@@ -17,6 +17,9 @@ const PRIVATE_KEY = process.env.REVOLUTX_PRIVATE_KEY;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const BASE_URL = 'https://revx.revolut.com/api/1.0';
+const TANGEM_XRP_ADDRESS = 'r4E3rtCa4FT4HxTQV2iw3yQHRTrAHMYS3v';
+const TANGEM_XRP_ENTRY   = 2.65; // average entry price for Tangem XRP position
+const XRPL_API = 'https://xrplcluster.com';
 const CHECK_INTERVAL_MS = 5 * 60 * 1000;
 const ALERT_INTERVAL_MS = 60 * 1000;
 const PUMP_THRESHOLD = 0.20;
@@ -413,6 +416,15 @@ try {
   }
 } catch (e) { console.warn('[cleanup] Ghost symbol cleanup failed:', e.message); }
 
+// Seed Tangem XRP entry price if not already set
+try {
+  await db.execute(
+    'INSERT INTO entry_prices (symbol, entry_price) VALUES (?, ?) ON DUPLICATE KEY UPDATE entry_price = entry_price',
+    ['XRP-USD', TANGEM_XRP_ENTRY]
+  );
+  if (!entryPrices.has('XRP-USD')) entryPrices.set('XRP-USD', TANGEM_XRP_ENTRY);
+} catch (e) { console.warn('[tangem] Failed to seed XRP entry price:', e.message); }
+
 // Load permanently ignored coins from DB
 try {
   const [ignoredRows] = await db.execute('SELECT symbol FROM ignored_coins');
@@ -532,8 +544,38 @@ async function getCurrentPortfolioValue() {
       const price = priceMap[`${asset.currency}-USD`];
       if (price) total += qty * price;
     }
+    // Include Tangem XRP self-custody wallet
+    const xrpBalance = await getTangemXRPBalance();
+    if (xrpBalance) {
+      const xrpPrice = priceMap['XRP-USD'] || await getCurrentPrice('XRP-USD');
+      if (xrpPrice) total += xrpBalance * xrpPrice;
+    }
     return total;
   } catch (e) { return 0; }
+}
+
+// Fetch XRP balance from Tangem self-custody wallet via public XRPL API
+async function getTangemXRPBalance() {
+  try {
+    const response = await fetch(XRPL_API, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        method: 'account_info',
+        params: [{ account: TANGEM_XRP_ADDRESS, ledger_index: 'current' }]
+      })
+    });
+    const data = await response.json();
+    if (data.result && data.result.account_data) {
+      // XRP balance is in drops (1 XRP = 1,000,000 drops)
+      const drops = parseInt(data.result.account_data.Balance);
+      return drops / 1_000_000;
+    }
+    return null;
+  } catch (e) {
+    console.error('Tangem XRP fetch error:', e.message);
+    return null;
+  }
 }
 
 // FIX 3: Dust rule — skip API for positions worth < $5
@@ -877,6 +919,23 @@ async function sendMorningBriefing() {
     }
     holdings.sort((a, b) => b.valueUSD - a.valueUSD);
 
+    // ── Tangem XRP wallet ───────────────────────────────────────────────────
+    let tangemValue = 0;
+    let tangemLine  = '';
+    try {
+      const xrpBalance = await getTangemXRPBalance();
+      if (xrpBalance) {
+        const xrpPrice = priceMap['XRP-USD'] || null;
+        if (xrpPrice) {
+          tangemValue = xrpBalance * xrpPrice;
+          totalUSD   += tangemValue;
+          const xrpPnlPct = ((xrpPrice - TANGEM_XRP_ENTRY) / TANGEM_XRP_ENTRY * 100);
+          const xrpPnlEmoji = xrpPnlPct >= 0 ? '🟢' : '🔴';
+          tangemLine = `\n🔐 Tangem: ${xrpBalance.toFixed(2)} XRP = $${tangemValue.toFixed(0)} | Entry $${TANGEM_XRP_ENTRY} | P&L: ${xrpPnlPct.toFixed(1)}% ${xrpPnlEmoji}`;
+        }
+      }
+    } catch (e) { console.warn('[briefing] Tangem XRP fetch failed:', e.message); }
+
     const dateStr = new Date().toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', timeZone: 'Europe/London' });
 
     // ── Format helpers ──────────────────────────────────────────────────────
@@ -961,6 +1020,7 @@ async function sendMorningBriefing() {
     const msg1 =
       `🌅 <b>GOOD MORNING BRYAN!</b>\n` +
       `📅 ${dateStr} | Portfolio: <b>${fmtAmt(totalUSD)}</b>` +
+      (tangemLine ? tangemLine : '') +
       capitalLine + breakEvenLine + `\n\n` +
       `📊 <b>TOP HOLDINGS:</b>\n${topHoldings}\n\n` +
       `🚨 <b>ALERTS:</b> ${alertsBlock}` +
@@ -2992,6 +3052,30 @@ function createMcpServer() {
     }
   );
 
+  // ── Tool: get_tangem_balance ──────────────────────────────────────────────
+  server.tool('get_tangem_balance',
+    'Get Tangem self-custody XRP wallet balance and value',
+    {},
+    async () => {
+      const xrpBalance = await getTangemXRPBalance();
+      const xrpPrice   = await getCurrentPrice('XRP-USD');
+      const valueUSD   = xrpBalance != null && xrpPrice ? xrpBalance * xrpPrice : null;
+      const unrealisedPnlPct = xrpPrice ? ((xrpPrice - TANGEM_XRP_ENTRY) / TANGEM_XRP_ENTRY * 100) : null;
+      const unrealisedPnlUsd = xrpPrice && xrpBalance ? (xrpPrice - TANGEM_XRP_ENTRY) * xrpBalance : null;
+      return { content: [{ type: 'text', text: JSON.stringify({
+        address: TANGEM_XRP_ADDRESS,
+        asset: 'XRP',
+        balance: xrpBalance,
+        price: xrpPrice,
+        valueUSD: valueUSD ? valueUSD.toFixed(2) : null,
+        entryPrice: TANGEM_XRP_ENTRY,
+        unrealisedPnlPct: unrealisedPnlPct ? unrealisedPnlPct.toFixed(2) : null,
+        unrealisedPnlUsd: unrealisedPnlUsd ? unrealisedPnlUsd.toFixed(2) : null,
+        source: 'Tangem Self-Custody Wallet'
+      }, null, 2) }] };
+    }
+  );
+
   // ── Tool: get_context ──────────────────────────────────────────────────────
   server.tool('get_context',
     "Get Bryan's trader profile, preferences, recent journal entries and learning model summary for Claude context",
@@ -3130,6 +3214,31 @@ app.post('/api/research-dust', async (req, res) => {
       await sendTelegram(`❌ Research failed for ${coin}: ${e.message}`);
     }
   })();
+});
+
+// GET /api/tangem — Tangem self-custody XRP wallet balance and P&L
+app.get('/api/tangem', async (req, res) => {
+  try {
+    const xrpBalance = await getTangemXRPBalance();
+    const xrpPrice   = await getCurrentPrice('XRP-USD');
+    const valueUSD   = xrpBalance != null && xrpPrice ? xrpBalance * xrpPrice : null;
+    const entryPrice = TANGEM_XRP_ENTRY;
+    const unrealisedPnlPct = xrpPrice ? ((xrpPrice - entryPrice) / entryPrice * 100) : null;
+    const unrealisedPnlUsd = xrpPrice && xrpBalance ? (xrpPrice - entryPrice) * xrpBalance : null;
+    res.json({
+      address: TANGEM_XRP_ADDRESS,
+      asset: 'XRP',
+      balance: xrpBalance,
+      price: xrpPrice,
+      valueUSD,
+      entryPrice,
+      unrealisedPnlPct,
+      unrealisedPnlUsd,
+      source: 'Tangem Self-Custody'
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // GET /api/capital — current invested capital and P&L summary
