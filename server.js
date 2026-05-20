@@ -105,6 +105,9 @@ async function sendTelegramChunked(text) {
   console.log('CHUNKING: total length', text.length, 'split into', chunks.length, 'chunks');
 
   for (let i = 0; i < chunks.length; i++) {
+    // Extra 2s before first chunk so the "thinking..." status message fully clears
+    if (i === 0) await new Promise(r => setTimeout(r, 2000));
+
     const prefix = i > 0
       ? `📄 (Part ${i + 1} of ${chunks.length})\n\n`
       : `📊 (Part ${i + 1} of ${chunks.length})\n\n`;
@@ -115,7 +118,7 @@ async function sendTelegramChunked(text) {
     await sendTelegram(message);
 
     if (i < chunks.length - 1) {
-      await new Promise(r => setTimeout(r, 4000));
+      await new Promise(r => setTimeout(r, 3000));
     }
   }
 
@@ -4304,8 +4307,8 @@ Active alerts (coins currently above threshold): ${[...alertState.active.keys()]
         console.log('Sending in', Math.ceil(fullReply.length / 2500), 'message(s)');
         console.log('ABOUT TO CHUNK: response length:', fullReply.length);
 
-        // 3s gap after status message so chunks don't collide with it
-        await new Promise(r => setTimeout(r, 3000));
+        // 5s gap after status message so chunks don't collide with it
+        await new Promise(r => setTimeout(r, 5000));
         await sendTelegramChunked(fullReply);
       } catch (err) {
         console.error('Claude AI error:', err.message);
