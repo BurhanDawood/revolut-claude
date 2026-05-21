@@ -296,16 +296,31 @@
       background: var(--surface2);
       border-radius: 10px;
       padding: 14px;
+      border: 1px solid #222;
     }
 
     .threshold-coin-header {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap;
       font-weight: 700;
       font-size: 0.95rem;
       color: var(--accent);
-      margin-bottom: 10px;
+      margin-bottom: 8px;
       padding-bottom: 8px;
       border-bottom: 1px solid #2e2e2e;
     }
+    .tc-name { font-size: 1rem; font-weight: 800; color: var(--accent); }
+    .tc-balance { font-size: 0.78rem; color: var(--text-muted); }
+    .tc-entry-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 6px 0 8px; border-bottom: 1px solid #242424; font-size: 0.8rem; }
+    .tc-entry-label { color: var(--text-muted); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.06em; min-width: 50px; }
+    .tc-entry-value { color: var(--text); font-weight: 600; }
+    .tc-pnl { font-weight: 700; margin-left: auto; }
+    .tc-dust-toggle { text-align: center; margin-top: 14px; }
+    .tc-dust-link { background: none; border: none; color: var(--text-muted); font-size: 0.8rem; cursor: pointer; padding: 6px 12px; border-radius: 6px; text-decoration: underline; }
+    .tc-dust-link:hover { color: var(--text); }
 
     .ctrl-row {
       display: flex;
@@ -1118,7 +1133,7 @@
 
   // ── Holdings rendering ────────────────────────────────────────────────────
 
-  const DUST_USD = 5;
+  const DUST_USD = 10;
   const MEDALS = ['🥇','🥈','🥉','4️⃣','5️⃣'];
   const STABLE_COINS = ['USD','USDT','USDC','EUR','GBP'];
 
@@ -1543,58 +1558,100 @@
 
   function renderThresholds(balances, status, targets, entries, trails) {
     const el = document.getElementById('threshold-list');
-    const coins = (balances || []).filter(b => !['USD','USDT','USDC','EUR','GBP'].includes(b.currency));
-    if (coins.length === 0) {
+    const trailMap = trails || {};
+    const defaultPct = ((status.defaultThreshold || 0.20) * 100).toFixed(0);
+
+    // Sort by USD value descending, exclude stables
+    const allCoins = (balances || [])
+      .filter(b => !STABLE_COINS.includes(b.currency) && b.valueUSD != null)
+      .sort((a, b) => (b.valueUSD || 0) - (a.valueUSD || 0));
+
+    const significant = allCoins.filter(h => (h.valueUSD || 0) >= DUST_USD);
+    const dustCoins   = allCoins.filter(h => (h.valueUSD || 0) <  DUST_USD);
+
+    if (allCoins.length === 0) {
       el.innerHTML = '<div class="empty-state">No coins to configure.</div>';
       return;
     }
-    const defaultPct = ((status.defaultThreshold || 0.20) * 100).toFixed(0);
-    const trailMap = trails || {};
 
-    el.innerHTML = coins.map(h => {
-      const sym = h.symbol || `${h.currency}-USD`;
+    function coinCardHtml(h) {
+      const sym  = h.symbol || `${h.currency}-USD`;
       const coin = h.currency;
+      const price = h.price || 0;
+      const qty   = h.available || 0;
+      const value = h.valueUSD || 0;
 
-      // ── Daily threshold ──
+      // ── Header: coin name + balance ──
+      const header = `
+        <div class="threshold-coin-header">
+          <span class="tc-name">🪙 ${coin}</span>
+          <span class="tc-balance">${qty.toFixed(4)} tokens = ${fmt(value)}</span>
+        </div>`;
+
+      // ── Entry + P&L (read-only) ──
+      const entry = entries && entries[sym];
+      let entryRow = '';
+      if (entry) {
+        const pnl = price ? ((price - entry) / entry * 100) : null;
+        const pnlColour = pnl == null ? '' : pnl >= 5 ? 'var(--accent)' : pnl >= 0 ? '#9effd8' : pnl >= -20 ? '#ffcc00' : 'var(--danger)';
+        const pnlEmoji  = pnl == null ? '' : pnl >= 0 ? '🟢' : '🔴';
+        const pnlStr    = pnl != null ? `<span class="tc-pnl" style="color:${pnlColour}">${pnl >= 0 ? '+' : ''}${pnl.toFixed(1)}% ${pnlEmoji}</span>` : '';
+        entryRow = `
+          <div class="tc-entry-row">
+            <span class="tc-entry-label">Entry</span>
+            <span class="tc-entry-value">${fmtPrice(entry)}</span>
+            <span style="color:var(--text-muted);font-size:0.75rem">→ now ${fmtPrice(price)}</span>
+            ${pnlStr}
+          </div>`;
+      }
+
+      // ── Daily alert ──
       const custom = status.customThresholds && status.customThresholds[sym] !== undefined;
       const dailyPct = custom ? (status.customThresholds[sym] * 100).toFixed(1) : defaultPct;
-      const dailyInfo = custom ? `${dailyPct}% (custom)` : `${dailyPct}% (default)`;
+      const dailyRow = `
+        <div class="ctrl-row">
+          <span class="ctrl-label">📅 Daily Alert</span>
+          <input class="threshold-input" type="number" id="thresh-${coin}" value="${dailyPct}" min="1" max="999" step="0.5" style="width:70px" />
+          <span class="pct-label">%</span>
+          <button class="btn-outline" onclick="setThreshold('${sym}','${coin}')">Set</button>
+          ${custom ? `<span style="font-size:0.7rem;color:var(--accent)">custom</span>` : `<span style="font-size:0.7rem;color:var(--text-muted)">default</span>`}
+        </div>`;
 
       // ── Fixed target ──
-      const tgt = targets[sym];
-      let targetSection;
+      const tgt = targets && targets[sym];
+      let targetRow;
       if (tgt) {
-        targetSection = `
+        targetRow = `
           <div class="ctrl-row">
-            <span class="ctrl-label">🎯 Fixed Target</span>
-            <span class="ctrl-info">${fmtPrice(tgt.anchorPrice)} + ${tgt.thresholdPct}% = ${fmtPrice(tgt.targetPrice)}</span>
-            <input class="threshold-input" type="number" id="ftpct-${coin}" value="${tgt.thresholdPct}" min="0.1" max="500" step="0.1" style="width:70px" />
+            <span class="ctrl-label">🎯 Target</span>
+            <span class="ctrl-info">${fmtPrice(tgt.anchorPrice)} +${tgt.thresholdPct}% = <strong>${fmtPrice(tgt.targetPrice)}</strong></span>
+            <input class="threshold-input" type="number" id="ftpct-${coin}" value="${tgt.thresholdPct}" min="0.1" max="500" step="0.1" style="width:65px" />
             <span class="pct-label">%</span>
-            <button class="btn-outline" onclick="updateTarget('${sym}','${coin}')">Update</button>
+            <button class="btn-outline" onclick="updateTarget('${sym}','${coin}')">Edit</button>
             <button class="btn-danger-outline" onclick="removeTarget('${sym}')">Remove</button>
           </div>`;
       } else {
-        targetSection = `
+        targetRow = `
           <div class="ctrl-row">
-            <span class="ctrl-label">🎯 Fixed Target</span>
+            <span class="ctrl-label">🎯 Target</span>
             <span class="ctrl-info muted">Not set</span>
-            <input class="threshold-input" type="number" id="ftpct-${coin}" placeholder="%" min="0.1" max="500" step="0.1" style="width:70px" />
+            <input class="threshold-input" type="number" id="ftpct-${coin}" placeholder="%" min="0.1" max="500" step="0.1" style="width:65px" />
             <span class="pct-label">% from now</span>
-            <button class="btn-outline" onclick="setTarget('${sym}','${coin}')">Set Target</button>
+            <button class="btn-outline" onclick="setTarget('${sym}','${coin}')">+ Add Target</button>
           </div>`;
       }
 
       // ── Trailing stop ──
       const trail = trailMap[sym];
-      let trailSection;
+      let trailRow;
       if (trail) {
         const pctToTrigger = (((trail.peakPrice - trail.stopPrice) / trail.peakPrice) * 100).toFixed(1);
-        trailSection = `
-          <div class="ctrl-row trail-row">
-            <span class="ctrl-label">🎯 Trailing Stop</span>
+        trailRow = `
+          <div class="ctrl-row">
+            <span class="ctrl-label">🎯 Trail Stop</span>
             <div style="flex:1;min-width:0">
               <div class="trail-info">${trail.trailPct}% trail | Peak: ${fmtPrice(trail.peakPrice)}</div>
-              <div class="trail-sub">Stop: ${fmtPrice(trail.stopPrice)} — triggers if drops ${pctToTrigger}% from peak</div>
+              <div class="trail-sub">Stop: ${fmtPrice(trail.stopPrice)} (−${pctToTrigger}% from peak)</div>
             </div>
             <input class="threshold-input" type="number" id="trail-${coin}" value="${trail.trailPct}" min="0.1" max="99" step="0.1" style="width:60px" />
             <span class="pct-label">%</span>
@@ -1602,55 +1659,49 @@
             <button class="btn-danger-outline" onclick="removeTrailStop('${sym}')">Remove</button>
           </div>`;
       } else {
-        trailSection = `
-          <div class="ctrl-row trail-row">
-            <span class="ctrl-label">🎯 Trailing Stop</span>
+        trailRow = `
+          <div class="ctrl-row">
+            <span class="ctrl-label">🎯 Trail Stop</span>
             <span class="ctrl-info muted">Not set</span>
             <input class="threshold-input" type="number" id="trail-${coin}" placeholder="%" min="0.1" max="99" step="0.1" style="width:60px" />
             <span class="pct-label">% trail</span>
-            <button class="btn-outline" onclick="setTrailStop('${sym}','${coin}')">Set</button>
+            <button class="btn-outline" onclick="setTrailStop('${sym}','${coin}')">+ Add Trail Stop</button>
           </div>`;
       }
 
-      // ── Avg entry ──
-      const entry = entries[sym];
-      let entrySection;
-      if (entry) {
-        const pnl = h.price ? ((h.price - entry) / entry * 100) : null;
-        const pnlClass = pnl != null ? (pnl >= 0 ? 'pnl-positive' : 'pnl-negative') : '';
-        const pnlStr = pnl != null ? `<span class="${pnlClass}">${pnl >= 0 ? '+' : ''}${pnl.toFixed(1)}% ${pnl >= 0 ? '🟢' : '🔴'}</span>` : '';
-        entrySection = `
-          <div class="ctrl-row">
-            <span class="ctrl-label">📍 Avg Entry</span>
-            <span class="ctrl-info">Entry: ${fmtPrice(entry)} → Now: ${fmtPrice(h.price)} ${pnlStr}</span>
-            <input class="threshold-input" type="number" id="entry-${coin}" value="${entry}" min="0.000001" step="any" style="width:90px" />
-            <button class="btn-outline" onclick="setEntryPrice('${sym}','${coin}')">Update</button>
-          </div>`;
-      } else {
-        entrySection = `
-          <div class="ctrl-row">
-            <span class="ctrl-label">📍 Avg Entry</span>
-            <span class="ctrl-info muted">Not set</span>
-            <input class="threshold-input" type="number" id="entry-${coin}" placeholder="$0.00" min="0.000001" step="any" style="width:90px" />
-            <button class="btn-outline" onclick="setEntryPrice('${sym}','${coin}')">Set</button>
-          </div>`;
-      }
+      return `<div class="threshold-card">${header}${entryRow}${dailyRow}${targetRow}${trailRow}</div>`;
+    }
 
-      return `
-        <div class="threshold-card">
-          <div class="threshold-coin-header">${coin}</div>
-          <div class="ctrl-row">
-            <span class="ctrl-label">📅 Daily Alert</span>
-            <span class="ctrl-info muted">${dailyInfo}</span>
-            <input class="threshold-input" type="number" id="thresh-${coin}" value="${dailyPct}" min="1" max="999" step="0.5" style="width:70px" />
-            <span class="pct-label">%</span>
-            <button class="btn-outline" onclick="setThreshold('${sym}','${coin}')">Set</button>
+    const sigHtml  = significant.map(coinCardHtml).join('');
+
+    let dustHtml = '';
+    if (dustCoins.length > 0) {
+      let tcDustExpanded = false;
+      try { tcDustExpanded = localStorage.getItem('tcDustExpanded') === 'true'; } catch(e) {}
+      dustHtml = `
+        <div class="tc-dust-toggle">
+          <button class="tc-dust-link" onclick="toggleTcDust()">
+            🔍 View dust coins (${dustCoins.length}) <span id="tc-dust-arrow">${tcDustExpanded ? '▲' : '▼'}</span>
+          </button>
+        </div>
+        <div class="holdings-full-list${tcDustExpanded ? ' expanded' : ''}" id="tc-dust-list">
+          <div class="holdings-full-list-inner" style="display:flex;flex-direction:column;gap:10px;padding-top:10px">
+            ${dustCoins.map(coinCardHtml).join('')}
           </div>
-          ${targetSection}
-          ${trailSection}
-          ${entrySection}
         </div>`;
-    }).join('');
+    }
+
+    el.innerHTML = sigHtml + dustHtml;
+  }
+
+  function toggleTcDust() {
+    const list  = document.getElementById('tc-dust-list');
+    const arrow = document.getElementById('tc-dust-arrow');
+    if (!list) return;
+    const expanding = !list.classList.contains('expanded');
+    list.classList.toggle('expanded', expanding);
+    if (arrow) arrow.textContent = expanding ? '▲' : '▼';
+    try { localStorage.setItem('tcDustExpanded', String(expanding)); } catch(e) {}
   }
 
   // ── Portfolio API Actions ──────────────────────────────────────────────────
