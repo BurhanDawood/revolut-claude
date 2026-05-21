@@ -1229,7 +1229,7 @@ async function sendMorningBriefing() {
     let weeklyPnlBlock = '';
     try {
       const [recentOutcomes] = await db.execute(
-        "SELECT symbol, outcome, outcome_pnl FROM trading_journal WHERE outcome IS NOT NULL AND action != 'payment' AND updated_at > DATE_SUB(NOW(), INTERVAL 24 HOUR) ORDER BY updated_at DESC LIMIT 5"
+        "SELECT symbol, outcome, outcome_pnl FROM trading_journal WHERE outcome IS NOT NULL AND action NOT IN ('payment', 'transfer') AND updated_at > DATE_SUB(NOW(), INTERVAL 24 HOUR) ORDER BY updated_at DESC LIMIT 5"
       );
       if (recentOutcomes.length > 0) {
         const outcomeLines = recentOutcomes.map(t => {
@@ -1242,7 +1242,7 @@ async function sendMorningBriefing() {
       }
 
       const [weekTrades] = await db.execute(
-        "SELECT outcome_pnl FROM trading_journal WHERE outcome IS NOT NULL AND outcome_pnl IS NOT NULL AND action != 'payment' AND updated_at > DATE_SUB(NOW(), INTERVAL 7 DAY)"
+        "SELECT outcome_pnl FROM trading_journal WHERE outcome IS NOT NULL AND outcome_pnl IS NOT NULL AND action NOT IN ('payment', 'transfer') AND updated_at > DATE_SUB(NOW(), INTERVAL 7 DAY)"
       );
       if (weekTrades.length > 0) {
         const wins = weekTrades.filter(t => parseFloat(t.outcome_pnl) > 0);
@@ -1340,7 +1340,7 @@ Keep total under 2000 characters. No long paragraphs. Be concise.`
 async function updateLearningModel() {
   try {
     const [trades] = await db.execute(
-      "SELECT * FROM trading_journal WHERE outcome IS NOT NULL AND outcome_pnl IS NOT NULL AND action != 'payment' ORDER BY created_at DESC LIMIT 200"
+      "SELECT * FROM trading_journal WHERE outcome IS NOT NULL AND outcome_pnl IS NOT NULL AND action NOT IN ('payment', 'transfer') ORDER BY created_at DESC LIMIT 200"
     );
     if (trades.length < 3) {
       learningModelCache = '';
@@ -1428,11 +1428,11 @@ async function updateLearningModel() {
 async function getLearningContext() {
   try {
     const [recentTrades] = await db.execute(
-      "SELECT * FROM trading_journal WHERE action != 'payment' ORDER BY created_at DESC LIMIT 10"
+      "SELECT * FROM trading_journal WHERE action NOT IN ('payment', 'transfer') ORDER BY created_at DESC LIMIT 10"
     );
     const [profileRows] = await db.execute('SELECT preference_key, preference_value FROM trader_profile');
     const [completedTrades] = await db.execute(
-      "SELECT outcome_pnl FROM trading_journal WHERE outcome_pnl IS NOT NULL AND action != 'payment'"
+      "SELECT outcome_pnl FROM trading_journal WHERE outcome_pnl IS NOT NULL AND action NOT IN ('payment', 'transfer')"
     );
 
     if (recentTrades.length === 0 && profileRows.length === 0 && completedTrades.length === 0) return '';
@@ -1836,7 +1836,8 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
       `2️⃣ Feeling: confident / uncertain / fomo / fearful / neutral\n\n` +
       `Reply: '<b>${coinBase.toLowerCase()} reason [why], [emotion]</b>'\n` +
       `Or: '<b>${coinBase.toLowerCase()} skip</b>' to log without details\n` +
-      `Or: '<b>${coinBase.toLowerCase()} payment</b>' to log as a payment (excluded from stats)\n\n` +
+      `Or: '<b>${coinBase.toLowerCase()} payment</b>' to log as a payment (excluded from stats)\n` +
+      `Or: '<b>${coinBase.toLowerCase()} transfer</b>' to log as internal transfer (excluded from stats)\n\n` +
       `⏰ Will auto-log in 30 minutes if no reply.`;
     await sendTelegram(msg);
 
@@ -2958,7 +2959,7 @@ app.delete('/api/targets/:symbol', async (req, res) => {
 // GET /api/journal/stats — compute stats from trading_journal
 app.get('/api/journal/stats', async (req, res) => {
   try {
-    const [all] = await db.execute("SELECT * FROM trading_journal WHERE action != 'payment'");
+    const [all] = await db.execute("SELECT * FROM trading_journal WHERE action NOT IN ('payment', 'transfer')");
     const completed = all.filter(t => t.outcome_pnl != null);
     const total_trades = all.length;
     const wins = completed.filter(t => parseFloat(t.outcome_pnl) > 0);
@@ -2986,9 +2987,11 @@ app.get('/api/journal/stats', async (req, res) => {
     // Auto-detected outcomes count
     const auto_detected_outcomes = completed.filter(t => t.reasoning === 'auto-detected').length;
 
-    // Payment count
+    // Payment / transfer counts
     const [paymentRows] = await db.execute("SELECT COUNT(*) as cnt FROM trading_journal WHERE action = 'payment'");
     const payment_count = parseInt(paymentRows[0].cnt);
+    const [transferRows] = await db.execute("SELECT COUNT(*) as cnt FROM trading_journal WHERE action = 'transfer'");
+    const transfer_count = parseInt(transferRows[0].cnt);
 
     // Average hold time (hours) for winners vs losers — based on created_at vs updated_at
     const holdHours = (t) => {
@@ -3010,6 +3013,7 @@ app.get('/api/journal/stats', async (req, res) => {
       recommendation_accuracy: { followed_win_rate, ignored_win_rate, followed_count: followed.length, ignored_count: ignored.length },
       auto_detected_outcomes,
       payment_count,
+      transfer_count,
       avg_hold_time_winners_hours,
       avg_hold_time_losers_hours
     });
@@ -3196,7 +3200,7 @@ function createMcpServer() {
     'Log a trading decision to the journal',
     {
       symbol:                  z.string().describe('Coin symbol e.g. LINK-USD'),
-      action:                  z.enum(['buy', 'sell', 'hold', 'add', 'reduce', 'payment']).describe('Trade action'),
+      action:                  z.enum(['buy', 'sell', 'hold', 'add', 'reduce', 'payment', 'transfer']).describe('Trade action'),
       price:                   z.number().describe('Price at time of decision'),
       quantity:                z.number().optional().describe('Number of coins (optional)'),
       reasoning:               z.string().describe('Why you made this decision'),
@@ -3875,6 +3879,26 @@ app.post('/telegram-webhook', async (req, res) => {
         if (!isKnownCommand) {
           matchedPending.push({ symbol, pending, skip: false });
         }
+      }
+
+      // --- Transfer detection: "[coin] transfer" ---
+      const isTransferMsg = lowerMsg.includes('transfer') ||
+        /that was a transfer|moved to kraken|sent to kraken|capital moved/i.test(lowerMsg);
+      const transferMatch = isTransferMsg
+        ? (matchedPending.find(m => lowerMsg.includes(m.symbol.replace('-USD', '').toLowerCase())) || matchedPending[0])
+        : null;
+      if (transferMatch) {
+        const { symbol, pending } = transferMatch;
+        const coinBase = symbol.replace('-USD', '');
+        clearTimeout(pending.timeoutHandle);
+        pendingTradeContext.delete(symbol);
+        await db.execute(
+          'UPDATE trading_journal SET action = ?, reasoning = ?, emotion = ?, notes = ? WHERE id = ?',
+          ['transfer', 'Internal transfer — capital moved between exchanges', 'neutral', 'excluded_from_stats', pending.journalId]
+        );
+        await updateLearningModel().catch(() => {});
+        await sendReply(`✅ <b>${coinBase}</b> logged as internal transfer — capital moved to Kraken, stats unaffected`);
+        return res.status(200).json({ ok: true });
       }
 
       // --- Payment detection: "[coin] payment" or plain English phrases ---
