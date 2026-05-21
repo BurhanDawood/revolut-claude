@@ -631,18 +631,25 @@ async function getTangemXRPBalance() {
 // ── Kraken Exchange Integration ───────────────────────────────────────────────
 
 async function krakenRequest(path, data = {}) {
-  try {
-    const apiKey     = process.env.KRAKEN_API_KEY;
-    const privateKey = process.env.KRAKEN_PRIVATE_KEY;
-    const nonce      = Date.now().toString();
-    const postData   = new URLSearchParams({ nonce, ...data }).toString();
+  const apiKey     = process.env.KRAKEN_API_KEY;
+  const privateKey = process.env.KRAKEN_PRIVATE_KEY;
 
-    // SHA256 hash of nonce + postData, then HMAC-SHA512 with base64-decoded private key
-    const sha256Hash = createHash('sha256').update(nonce + postData).digest('binary');
-    const message    = path + sha256Hash;
-    const signature  = createHmac('sha512', Buffer.from(privateKey, 'base64'))
-      .update(message, 'binary')
-      .digest('base64');
+  if (!apiKey || !privateKey) {
+    throw new Error('Kraken API credentials not configured. Add KRAKEN_API_KEY and KRAKEN_PRIVATE_KEY to Railway environment variables.');
+  }
+
+  try {
+    const nonce    = Date.now().toString();
+    const postData = new URLSearchParams({ nonce, ...data }).toString();
+
+    // Kraken signing: HMAC-SHA512(path + SHA256(nonce + postData), base64-decoded secret)
+    const hashDigest = createHash('sha256').update(nonce + postData).digest();
+    const hmac       = createHmac('sha512', Buffer.from(privateKey, 'base64'));
+    hmac.update(path);
+    hmac.update(hashDigest);
+    const signature = hmac.digest('base64');
+
+    console.log('[kraken] API request to:', path);
 
     const response = await fetch(`${KRAKEN_API_URL}${path}`, {
       method: 'POST',
@@ -668,10 +675,11 @@ const KRAKEN_TO_STANDARD = {
   'XLTC': 'LTC', 'XXLM': 'XLM', 'XADA': 'ADA',
   'XXDG': 'DOGE', 'XZEC': 'ZEC', 'XXMR': 'XMR',
   'XBT':  'BTC', 'ETH':  'ETH', 'XRP':  'XRP',
+  'ZUSD': 'USD', 'ZGBP': 'GBP', 'ZEUR': 'EUR',
 };
 
 function krakenAssetToStandard(asset) {
-  return KRAKEN_TO_STANDARD[asset] || asset.replace(/^X/, '').replace(/^Z/, '');
+  return KRAKEN_TO_STANDARD[asset] || asset;
 }
 
 async function getKrakenBalances() {
