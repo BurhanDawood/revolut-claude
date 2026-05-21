@@ -602,6 +602,24 @@ try {
   console.error('Failed to load swing cooldowns:', e.message);
 }
 
+// Seed default SOL auto trade rules if none exist
+try {
+  const [existingRules] = await db.execute("SELECT id FROM auto_trade_rules WHERE symbol = 'SOL-USD' LIMIT 1");
+  if (existingRules.length === 0) {
+    await db.execute(`INSERT IGNORE INTO auto_trade_rules
+      (symbol, rule_type, trigger_price, direction, order_type, volume, max_position_usd) VALUES
+      ('SOL-USD', 'buy_dip_1',    84.00, 'below', 'buy',  0.3, 200),
+      ('SOL-USD', 'buy_dip_2',    80.00, 'below', 'buy',  0.3, 200),
+      ('SOL-USD', 'sell_pump_1',  93.00, 'above', 'sell', 0.3, null),
+      ('SOL-USD', 'sell_pump_2',  97.00, 'above', 'sell', 0.3, null),
+      ('SOL-USD', 'stop_loss',    79.00, 'below', 'sell', 1.5, null)`
+    );
+    console.log('[auto] Seeded default SOL auto trade rules');
+  }
+} catch (e) {
+  console.error('[auto] Failed to seed SOL rules:', e.message);
+}
+
 updateLearningModel().catch(() => {});
 
 // ── Invested Capital Helpers ──────────────────────────────────────────────────
@@ -4836,6 +4854,64 @@ app.post('/telegram-webhook', async (req, res) => {
       pendingKrakenTrade = null;
       await sendReply(`✅ Trade cancelled — ${t.side.toUpperCase()} ${t.volume} ${t.symbol.replace('-USD','')} was not executed.`);
       return res.status(200).json({ ok: true });
+    }
+
+    // --- Command: auto rules ---
+    if (commandText === 'auto rules') {
+      const [rules] = await db.execute('SELECT * FROM auto_trade_rules ORDER BY symbol, trigger_price ASC');
+      if (rules.length === 0) {
+        await sendReply('📋 No auto trade rules set.');
+      } else {
+        const lines = rules.map(r =>
+          `${r.active ? '✅' : '⏸'} [${r.id}] ${r.rule_type}: ${r.order_type.toUpperCase()} ${r.volume} ${r.symbol.replace('-USD','')} when price goes ${r.direction} $${parseFloat(r.trigger_price).toFixed(2)}` +
+          (r.max_position_usd ? ` (max $${r.max_position_usd})` : '') +
+          (r.last_triggered ? ` | last: ${new Date(r.last_triggered).toLocaleDateString()}` : '')
+        ).join('\n');
+        await sendReply(`📋 <b>Auto Trade Rules</b>\n\n${lines}\n\nReply 'remove auto rule [id]' to delete`);
+      }
+      return res.status(200).json({ ok: true });
+    }
+
+    // --- Command: auto buy COIN PRICE VOLUME ---
+    {
+      const autoMatch = commandText.match(/^auto\s+(buy|sell)\s+([a-z0-9]+)\s+([\d.]+)\s+([\d.]+)(?:\s+([\d.]+))?$/i);
+      if (autoMatch) {
+        const [, orderType, coinRaw, triggerPrice, volume, maxPos] = autoMatch;
+        const coin    = coinRaw.toUpperCase();
+        const sym     = coin.includes('-USD') ? coin : `${coin}-USD`;
+        const trigger = parseFloat(triggerPrice);
+        const vol     = parseFloat(volume);
+        const maxUsd  = maxPos ? parseFloat(maxPos) : null;
+        const direction = orderType.toLowerCase() === 'buy' ? 'below' : 'above';
+        const ruleType  = orderType.toLowerCase() === 'buy' ? 'buy_dip' : 'sell_pump';
+        const [result] = await db.execute(
+          'INSERT INTO auto_trade_rules (symbol, rule_type, trigger_price, direction, order_type, volume, max_position_usd) VALUES (?, ?, ?, ?, ?, ?, ?)',
+          [sym, ruleType, trigger, direction, orderType.toLowerCase(), vol, maxUsd]
+        );
+        await sendReply(
+          `✅ Auto rule set [ID: ${result.insertId}]\n` +
+          `${orderType.toUpperCase()} ${vol} ${coin} when price goes ${direction} $${trigger.toFixed(2)}` +
+          (maxUsd ? `\nMax position: $${maxUsd}` : '')
+        );
+        return res.status(200).json({ ok: true });
+      }
+    }
+
+    // --- Command: remove auto rule [id] ---
+    {
+      const removeAutoMatch = commandText.match(/^remove auto rule\s+(\d+)$/i);
+      if (removeAutoMatch) {
+        const ruleId = parseInt(removeAutoMatch[1]);
+        const [existing] = await db.execute('SELECT * FROM auto_trade_rules WHERE id = ?', [ruleId]);
+        if (existing.length === 0) {
+          await sendReply(`❌ No rule found with ID ${ruleId}`);
+        } else {
+          const r = existing[0];
+          await db.execute('DELETE FROM auto_trade_rules WHERE id = ?', [ruleId]);
+          await sendReply(`🗑 Rule [${ruleId}] deleted: ${r.order_type.toUpperCase()} ${r.volume} ${r.symbol.replace('-USD','')} @ $${parseFloat(r.trigger_price).toFixed(2)}`);
+        }
+        return res.status(200).json({ ok: true });
+      }
     }
 
     // --- Command: pause ---
