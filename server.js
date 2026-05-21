@@ -2447,6 +2447,24 @@ async function checkAutoTradeRules(priceMap) {
           } catch (e) { /* kraken unavailable — skip safety check, abort */ continue; }
         }
 
+        // USD balance check for buys
+        if (rule.order_type === 'buy') {
+          try {
+            const krakenData = await getKrakenBalances();
+            const usdBalance = krakenData.balances.find(b => b.standard === 'USD' || b.symbol === 'ZUSD');
+            const availableUSD = usdBalance?.balance || 0;
+            const requiredUSD = rule.volume * currentPrice;
+            if (availableUSD < requiredUSD) {
+              console.log(`[auto] Skipping buy — insufficient USD: $${availableUSD.toFixed(2)} available, $${requiredUSD.toFixed(2)} required`);
+              await sendTelegram(`⚠️ Auto buy skipped — insufficient USD balance. Need $${requiredUSD.toFixed(2)} but only $${availableUSD.toFixed(2)} available. Sell some ${rule.symbol.replace('-USD', '')} first to fund buys.`);
+              continue;
+            }
+          } catch (e) {
+            console.error('[auto] USD balance check error:', e.message);
+            continue;
+          }
+        }
+
         console.log(`[auto] Executing ${rule.order_type} rule for ${rule.symbol} at $${currentPrice} (trigger: ${rule.direction} $${rule.trigger_price})`);
         const coinBase = rule.symbol.replace('-USD', '');
 
