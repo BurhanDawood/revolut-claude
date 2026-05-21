@@ -3875,7 +3875,7 @@ app.post('/telegram-webhook', async (req, res) => {
       if (matchedPending.length === 0 && pendingTradeContext.size === 1) {
         const [[symbol, pending]] = pendingTradeContext;
         // Only intercept if message isn't a recognised command
-        const isKnownCommand = /^(pause|resume|status|acknowledge|ack|ignore|watch|sell|buy|entry|daily|target|journal|my stats|learning|holding|bought|sold|i prefer|rebalance|rebalancing|trail|trailing|approve|cancel)/i.test(commandText);
+        const isKnownCommand = /^(pause|resume|status|acknowledge|ack|ignore|watch|sell|buy|entry|daily|target|journal|my stats|learning|holding|bought|sold|i prefer|rebalance|rebalancing|trail|trailing|approve|cancel|transfer|payment)/i.test(commandText);
         if (!isKnownCommand) {
           matchedPending.push({ symbol, pending, skip: false });
         }
@@ -3883,7 +3883,7 @@ app.post('/telegram-webhook', async (req, res) => {
 
       // --- Transfer detection: "[coin] transfer" ---
       const isTransferMsg = lowerMsg.includes('transfer') ||
-        /that was a transfer|moved to kraken|sent to kraken|capital moved/i.test(lowerMsg);
+        /internal transfer|rebalancing|moved to kraken|moved between/i.test(lowerMsg);
       const transferMatch = isTransferMsg
         ? (matchedPending.find(m => lowerMsg.includes(m.symbol.replace('-USD', '').toLowerCase())) || matchedPending[0])
         : null;
@@ -3893,11 +3893,15 @@ app.post('/telegram-webhook', async (req, res) => {
         clearTimeout(pending.timeoutHandle);
         pendingTradeContext.delete(symbol);
         await db.execute(
-          'UPDATE trading_journal SET action = ?, reasoning = ?, emotion = ?, notes = ? WHERE id = ?',
-          ['transfer', 'Internal transfer — capital moved between exchanges', 'neutral', 'excluded_from_stats', pending.journalId]
+          'UPDATE trading_journal SET action = ?, reasoning = ?, emotion = ? WHERE id = ?',
+          ['transfer', 'Internal transfer — capital rebalanced within portfolio, invested capital unchanged', 'neutral', pending.journalId]
         );
         await updateLearningModel().catch(() => {});
-        await sendReply(`✅ <b>${coinBase}</b> logged as internal transfer — capital moved to Kraken, stats unaffected`);
+        await sendReply(
+          `✅ <b>${coinBase}</b> logged as internal transfer\n` +
+          `💼 Invested capital unchanged — funds rebalanced within portfolio\n` +
+          `📊 Excluded from trading stats`
+        );
         return res.status(200).json({ ok: true });
       }
 
