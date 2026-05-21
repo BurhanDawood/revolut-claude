@@ -3254,7 +3254,7 @@ function createMcpServer() {
     }
   );
 
-  // ── Tool: save_trader_preference ─────────────────────────────────────────
+  // ── Tool: save_trader_preference ──────────────────────────────────────────
   server.tool('save_trader_preference',
     'Save a trading preference or principle to the trader profile',
     {
