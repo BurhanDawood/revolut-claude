@@ -408,6 +408,21 @@ await db.execute(`CREATE TABLE IF NOT EXISTS trailing_stops (
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 )`);
 
+await db.execute(`CREATE TABLE IF NOT EXISTS auto_trade_rules (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  symbol VARCHAR(50) NOT NULL,
+  rule_type VARCHAR(20) NOT NULL,
+  trigger_price DECIMAL(20,10) NOT NULL,
+  direction VARCHAR(10) NOT NULL,
+  order_type VARCHAR(10) DEFAULT 'market',
+  volume DECIMAL(20,10) NOT NULL,
+  max_position_usd DECIMAL(20,4),
+  active TINYINT(1) DEFAULT 1,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  last_triggered TIMESTAMP NULL,
+  INDEX idx_active (active)
+)`);
+
 await db.execute(`CREATE TABLE IF NOT EXISTS rebalancing_tracker (
   id INT AUTO_INCREMENT PRIMARY KEY,
   out_symbol VARCHAR(50) NOT NULL,
@@ -2379,6 +2394,76 @@ Be honest, direct and actionable.`;
   }
 }
 
+async function checkAutoTradeRules(priceMap) {
+  try {
+    const [rules] = await db.execute('SELECT * FROM auto_trade_rules WHERE active = 1');
+    for (const rule of rules) {
+      try {
+        // Resolve current price from priceMap or live fetch
+        const currentPrice = priceMap[rule.symbol] ||
+          priceMap[rule.symbol.replace('-USD', 'USD')] ||
+          await getCurrentPrice(rule.symbol).catch(() => null);
+        if (!currentPrice) continue;
+
+        // 1-hour cooldown between triggers
+        if (rule.last_triggered) {
+          const lastTrigger = new Date(rule.last_triggered).getTime();
+          if (Date.now() - lastTrigger < 60 * 60 * 1000) continue;
+        }
+
+        const shouldTrigger =
+          (rule.direction === 'below' && currentPrice <= rule.trigger_price) ||
+          (rule.direction === 'above' && currentPrice >= rule.trigger_price);
+        if (!shouldTrigger) continue;
+
+        // Max position safety check for buys
+        if (rule.order_type === 'buy' && rule.max_position_usd) {
+          try {
+            const krakenData = await getKrakenBalances();
+            const existing = krakenData.balances.find(b => b.symbol === rule.symbol || b.standard === rule.symbol.replace('-USD', ''));
+            const currentPositionUSD = existing?.valueUSD || 0;
+            if (currentPositionUSD >= rule.max_position_usd) {
+              console.log(`[auto] Skipping buy — max position reached for ${rule.symbol} ($${currentPositionUSD.toFixed(2)} >= $${rule.max_position_usd})`);
+              continue;
+            }
+          } catch (e) { /* kraken unavailable — skip safety check, abort */ continue; }
+        }
+
+        console.log(`[auto] Executing ${rule.order_type} rule for ${rule.symbol} at $${currentPrice} (trigger: ${rule.direction} $${rule.trigger_price})`);
+        const coinBase = rule.symbol.replace('-USD', '');
+
+        try {
+          const result = await executeKrakenTrade(rule.symbol, rule.order_type, 'market', rule.volume);
+
+          await db.execute('UPDATE auto_trade_rules SET last_triggered = NOW() WHERE id = ?', [rule.id]);
+
+          await db.execute(
+            'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion) VALUES (?, ?, ?, ?, ?, ?, ?)',
+            [coinBase, rule.order_type, currentPrice, rule.volume, currentPrice * rule.volume,
+             `Auto-executed: ${rule.rule_type} rule triggered at $${currentPrice}`, 'neutral']
+          );
+
+          await sendTelegram(
+            `🤖 <b>AUTO TRADE EXECUTED — ${coinBase}</b>\n\n` +
+            `${rule.order_type.toUpperCase()} ${rule.volume} ${coinBase} @ $${currentPrice.toFixed(4)}\n` +
+            `Value: $${(currentPrice * rule.volume).toFixed(2)}\n` +
+            `Rule: ${rule.rule_type}\n` +
+            `Order ID: ${result?.txid?.[0] || 'unknown'}\n\n` +
+            `📝 Journal logged automatically`
+          );
+        } catch (e) {
+          console.error(`[auto] Trade execution failed for ${rule.symbol}:`, e.message);
+          await sendTelegram(`❌ Auto trade failed for ${coinBase}: ${e.message}`);
+        }
+      } catch (e) {
+        console.error(`[auto] Rule processing error (id=${rule.id}):`, e.message);
+      }
+    }
+  } catch (e) {
+    console.error('[auto] checkAutoTradeRules error:', e.message);
+  }
+}
+
 async function checkPortfolio() {
   if (monitoringPaused) {
     console.log('Monitoring paused, skipping check.');
@@ -2978,6 +3063,9 @@ async function checkPortfolio() {
     } catch (e) {
       console.error('[kraken] Monitoring error:', e.message);
     }
+
+    // ── Auto trade rules ──────────────────────────────────────────────────────
+    await checkAutoTradeRules(priceMap);
 
   } catch (e) {
     console.log('Portfolio check error:', e.message, e.stack);
@@ -3640,6 +3728,53 @@ function createMcpServer() {
     }
   );
 
+  // ── Tool: set_auto_trade_rule ─────────────────────────────────────────────
+  server.tool('set_auto_trade_rule',
+    'Set an automatic trade rule for Kraken — executes automatically when price condition is met',
+    {
+      symbol:          z.string().describe('Trading pair e.g. SOL-USD'),
+      rule_type:       z.string().describe('Label e.g. buy_dip, sell_pump, stop_loss'),
+      trigger_price:   z.number().describe('Price that triggers the trade'),
+      direction:       z.enum(['above', 'below']).describe('Trigger when price goes above or below trigger_price'),
+      order_type:      z.enum(['buy', 'sell']).describe('Buy or sell when triggered'),
+      volume:          z.number().describe('Number of tokens to trade'),
+      max_position_usd: z.number().optional().describe('Max position size in USD — skips buy if already holding this much'),
+    },
+    async ({ symbol, rule_type, trigger_price, direction, order_type, volume, max_position_usd }) => {
+      try {
+        const sym = symbol.includes('-USD') ? symbol : `${symbol}-USD`;
+        const [result] = await db.execute(
+          'INSERT INTO auto_trade_rules (symbol, rule_type, trigger_price, direction, order_type, volume, max_position_usd) VALUES (?, ?, ?, ?, ?, ?, ?)',
+          [sym, rule_type, trigger_price, direction, order_type, volume, max_position_usd || null]
+        );
+        await sendTelegram(
+          `🤖 <b>AUTO TRADE RULE SET</b>\n\n` +
+          `${order_type.toUpperCase()} ${volume} ${sym.replace('-USD', '')} when price goes ${direction} $${trigger_price}\n` +
+          `Rule type: ${rule_type}\n` +
+          `Max position: ${max_position_usd ? '$' + max_position_usd : 'unlimited'}`
+        );
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, rule_id: result.insertId, symbol: sym, rule_type, trigger_price, direction, order_type, volume }) }] };
+      } catch (e) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: e.message }) }] };
+      }
+    }
+  );
+
+  // ── Tool: get_auto_rules ──────────────────────────────────────────────────
+  server.tool('get_auto_rules',
+    'Get all automatic trade rules (active and inactive)',
+    {},
+    async () => {
+      try {
+        const [rules] = await db.execute('SELECT * FROM auto_trade_rules ORDER BY created_at DESC');
+        const active = rules.filter(r => r.active);
+        return { content: [{ type: 'text', text: JSON.stringify({ rules, active_count: active.length, total: rules.length }, null, 2) }] };
+      } catch (e) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: e.message }) }] };
+      }
+    }
+  );
+
   // ── Tool: get_rebalancing_history ─────────────────────────────────────────
   server.tool('get_rebalancing_history',
     'Get rebalancing tracker history and accuracy stats',
@@ -4062,6 +4197,47 @@ app.delete('/api/trailing-stops/:symbol', async (req, res) => {
   const symbol = req.params.symbol.toUpperCase();
   await removeTrailingStop(symbol);
   res.json({ ok: true, symbol });
+});
+
+// GET /api/auto-rules
+app.get('/api/auto-rules', async (req, res) => {
+  try {
+    const [rules] = await db.execute('SELECT * FROM auto_trade_rules ORDER BY created_at DESC');
+    res.json(rules);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/auto-rules
+app.post('/api/auto-rules', async (req, res) => {
+  try {
+    const { symbol, rule_type, trigger_price, direction, order_type, volume, max_position_usd } = req.body;
+    if (!symbol || !rule_type || !trigger_price || !direction || !order_type || !volume) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+    const sym = symbol.includes('-USD') ? symbol : `${symbol}-USD`;
+    const [result] = await db.execute(
+      'INSERT INTO auto_trade_rules (symbol, rule_type, trigger_price, direction, order_type, volume, max_position_usd) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [sym, rule_type, trigger_price, direction, order_type, volume, max_position_usd || null]
+    );
+    res.json({ ok: true, id: result.insertId });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// DELETE /api/auto-rules/:id
+app.delete('/api/auto-rules/:id', async (req, res) => {
+  try {
+    await db.execute('DELETE FROM auto_trade_rules WHERE id = ?', [req.params.id]);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// PUT /api/auto-rules/:id/toggle
+app.put('/api/auto-rules/:id/toggle', async (req, res) => {
+  try {
+    await db.execute('UPDATE auto_trade_rules SET active = NOT active WHERE id = ?', [req.params.id]);
+    const [rows] = await db.execute('SELECT active FROM auto_trade_rules WHERE id = ?', [req.params.id]);
+    res.json({ ok: true, active: rows[0]?.active });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // GET /api/kraken/balances
