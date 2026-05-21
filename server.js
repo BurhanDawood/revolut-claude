@@ -2098,7 +2098,10 @@ async function checkPortfolio() {
         const aiRec = alertRecommendations.get(symbol)?.rec || 'HOLD - Monitor the situation closely.';
         const replyMenu = `\n\nReply:\n'sell ${coinBase}' - get sell advice\n'buy more ${coinBase}' - get buy advice\n'analyse ${coinBase}' - full analysis\n'acknowledge ${coinBase}' - stop alerts\n'ignore ${coinBase}' - never alert on this coin again`;
         const swingPumpHint = `\n\n⚡ SWING SIGNAL: This pump may be your sell opportunity!\nCheck if this is outside normal range — if so, consider taking profits and setting a buy-back alert at ${fmtPriceShort(currentPrice * 0.85)} (-15%)`;
-        const alertMessage = `📈 <b>${symbol} DAILY PUMP ALERT</b>\n\nBaseline: $${basePrices[symbol].toFixed(4)} → Now $${currentPrice.toFixed(4)} (+${pct}%)\nYou hold: ${available} ${coinBase}\n\n⚡ RECOMMENDATION: ${aiRec}${swingPumpHint}${replyMenu}`;
+        const trailReminderPump = trailingStops.has(symbol)
+          ? `\n\n📈 TREND IS YOUR FRIEND — Trailing stop is protecting your profits. Let it run unless structure breaks!`
+          : '';
+        const alertMessage = `📈 <b>${symbol} DAILY PUMP ALERT</b>\n\nBaseline: $${basePrices[symbol].toFixed(4)} → Now $${currentPrice.toFixed(4)} (+${pct}%)\nYou hold: ${available} ${coinBase}\n\n⚡ RECOMMENDATION: ${aiRec}${swingPumpHint}${trailReminderPump}${replyMenu}`;
         await sendTelegram(alertMessage);
 
         alertState.active.set(symbol, setInterval(async () => {
@@ -2414,6 +2417,10 @@ async function checkPortfolio() {
           const entryLine = entryPrice
             ? `Entry: ${fmtPriceShort(entryPrice)} | Profit: +${((currentPrice - entryPrice) / entryPrice * 100).toFixed(1)}%\n`
             : '';
+          const tsForSymbol = trailingStops.get(symbol);
+          const pumpRecLine = tsForSymbol
+            ? `Trailing stop active at ${fmtPriceShort(tsForSymbol.stopPrice)} — trend is your friend! Only sell if market structure shifts.`
+            : `Consider taking profits and setting buy-back alert at ${buyBackPrice} (-15%)`;
           const swingMsg =
             `🎯 <b>SWING TRADE SIGNAL — ${symbol}</b>\n` +
             `⬆️ <b>EXTREME PUMP DETECTED</b>\n\n` +
@@ -2425,7 +2432,7 @@ async function checkPortfolio() {
             `• RSI likely overbought at this level ✅\n\n` +
             entryLine +
             `⚡ <b>RECOMMENDATION:</b> Sell signal based on your swing strategy.\n` +
-            `Consider taking profits and setting buy-back alert at ${buyBackPrice} (-15%)\n\n` +
+            pumpRecLine + `\n\n` +
             `Reply:\n` +
             `'sell ${coinBase}' - get sell advice + auto-set profit targets\n` +
             `'hold ${coinBase}' - I'm holding, set sell alert at next resistance\n` +
@@ -3244,6 +3251,22 @@ function createMcpServer() {
       };
       console.log('[mcp] get_context called');
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  // ── Tool: save_trader_preference ─────────────────────────────────────────
+  server.tool('save_trader_preference',
+    'Save a trading preference or principle to the trader profile',
+    {
+      key:   z.string().describe('Preference key e.g. trend_principle, risk_tolerance'),
+      value: z.string().describe('Preference value — a sentence or short paragraph'),
+    },
+    async ({ key, value }) => {
+      await db.execute(
+        'INSERT INTO trader_profile (preference_key, preference_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE preference_value = VALUES(preference_value), updated_at = CURRENT_TIMESTAMP',
+        [key, value]
+      );
+      return { content: [{ type: 'text', text: JSON.stringify({ ok: true, key, value }) }] };
     }
   );
 
