@@ -1963,7 +1963,15 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
             [symbol, newAvgEntry]
           );
           console.log(`[entry] ${symbol} avg entry updated: $${existingEntry.toFixed(6)} → $${newAvgEntry.toFixed(6)}`);
-          avgEntryLine = `\n📊 Avg entry updated: $${existingEntry.toFixed(4)} → $${newAvgEntry.toFixed(4)}`;
+          avgEntryLine = `\n📊 Avg entry updated: $${existingEntry.toFixed(6)} → $${newAvgEntry.toFixed(6)}`;
+        } else if (!existingEntry && price > 0) {
+          entryPrices.set(symbol, price);
+          await db.execute(
+            'INSERT INTO entry_prices (symbol, entry_price) VALUES (?, ?) ON DUPLICATE KEY UPDATE entry_price = VALUES(entry_price)',
+            [symbol, price]
+          );
+          avgEntryLine = `\n📊 Entry price set: $${price.toFixed(6)}`;
+          console.log(`[entry] ${symbol} first entry set: $${price.toFixed(6)}`);
         }
       } catch (e) {
         console.error('[entry] avg entry update error:', e.message);
