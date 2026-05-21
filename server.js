@@ -3362,22 +3362,31 @@ function createMcpServer() {
   server.tool('get_journal',
     'Get recent trading journal entries',
     {
-      symbol: z.string().optional().describe('Filter by coin symbol e.g. LINK (no -USD needed)'),
-      limit:  z.number().optional().describe('Max entries to return (default 10)'),
+      symbol: z.string().optional().describe('Filter by coin symbol e.g. LINK'),
+      limit: z.number().optional().describe('Max entries to return (default 10)'),
     },
-    async ({ symbol, limit = 10 }) => {
-      const limitInt = parseInt(limit) || 10;
-      let rows;
-      if (symbol) {
-        const coinBase = symbol.replace('-USD', '').toUpperCase();
-        [rows] = await db.execute(
-          'SELECT * FROM trading_journal WHERE symbol = ? ORDER BY created_at DESC LIMIT ?',
-          [coinBase, limitInt]
-        );
-      } else {
-        [rows] = await db.execute('SELECT * FROM trading_journal ORDER BY created_at DESC LIMIT ?', [limitInt]);
+    async (params) => {
+      try {
+        const limitInt = parseInt(params?.limit) || 10;
+        const symbol = params?.symbol || null;
+
+        let rows;
+        if (symbol) {
+          const coinBase = symbol.replace('-USD', '').toUpperCase();
+          [rows] = await db.execute(
+            'SELECT * FROM trading_journal WHERE symbol = ? ORDER BY created_at DESC LIMIT ' + limitInt,
+            [coinBase]
+          );
+        } else {
+          [rows] = await db.execute(
+            'SELECT * FROM trading_journal ORDER BY created_at DESC LIMIT ' + limitInt
+          );
+        }
+
+        return { content: [{ type: 'text', text: JSON.stringify(rows, null, 2) }] };
+      } catch (e) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: e.message }) }] };
       }
-      return { content: [{ type: 'text', text: JSON.stringify(rows, null, 2) }] };
     }
   );
 
