@@ -149,7 +149,8 @@ let briefingInProgress = false;
 let lastClaudeCallTime = 0;
 let learningModelCache = ''; // updated by updateLearningModel()
 const pendingJournalState = new Map(); // chatId -> { journalId, step: 'emotion'|'followed', hasClaudeRec, claudeRec, symbol }
-const pendingTradeContext = new Map(); // symbol -> { journalId, detectedAt, timeoutHandle }
+const pendingTradeContext = new Map(); // symbol -> { journalId, detectedAt, timeoutHandle, action, price, valueUsd, qty }
+const pendingRebalanceConfirm = new Map(); // chatId -> { sellSymbol, sellJournalId, sellPrice, sellValueUsd, buySymbol, buyJournalId, buyPrice, buyValueUsd }
 const previousBalances = new Map(); // symbol -> quantity (DB-backed)
 let portfolioCheckCount = 0; // skip trade detection on first check (baseline establishment)
 let monitoringInterval = null;
@@ -405,6 +406,25 @@ await db.execute(`CREATE TABLE IF NOT EXISTS trailing_stops (
   entry_price DECIMAL(20,10),
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+)`);
+
+await db.execute(`CREATE TABLE IF NOT EXISTS rebalance_log (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  out_symbol VARCHAR(20) NOT NULL,
+  out_price DECIMAL(20,10) NOT NULL,
+  out_journal_id INT,
+  in_symbol VARCHAR(20),
+  in_price DECIMAL(20,10),
+  in_journal_id INT,
+  value_usd DECIMAL(20,2),
+  rebalance_date DATE NOT NULL,
+  checked_at TIMESTAMP NULL,
+  out_price_at_check DECIMAL(20,10),
+  in_price_at_check DECIMAL(20,10),
+  verdict TEXT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_rebalance_date (rebalance_date),
+  INDEX idx_checked (checked_at)
 )`);
 
 // Add direction column to price_targets if it doesn't exist
@@ -1763,6 +1783,66 @@ async function recordTradeOutcome(symbol, sellPrice, sellQty, currentQty) {
   }
 }
 
+async function logRebalancePair({ sellSymbol, sellJournalId, sellPrice, sellValueUsd, sellQty, buySymbol, buyJournalId, buyPrice, buyValueUsd, buyQty }) {
+  // Update both journal entries as transfers
+  await db.execute(
+    'UPDATE trading_journal SET action = ?, reasoning = ?, emotion = ? WHERE id = ?',
+    ['transfer', `Rebalance exit — rotating into ${buySymbol || 'another position'}`, 'neutral', sellJournalId]
+  );
+  if (buyJournalId) {
+    await db.execute(
+      'UPDATE trading_journal SET action = ?, reasoning = ?, emotion = ? WHERE id = ?',
+      ['transfer', `Rebalance entry — rotated from ${sellSymbol}`, 'neutral', buyJournalId]
+    );
+  }
+  // Insert rebalance_log record
+  await db.execute(
+    `INSERT INTO rebalance_log (out_symbol, out_price, out_journal_id, in_symbol, in_price, in_journal_id, value_usd, rebalance_date)
+     VALUES (?, ?, ?, ?, ?, ?, ?, CURDATE())`,
+    [sellSymbol, sellPrice, sellJournalId, buySymbol || null, buyPrice || null, buyJournalId || null, sellValueUsd || null]
+  );
+  await updateLearningModel().catch(() => {});
+}
+
+async function checkForRebalancePair(newSymbol, newAction, newJournalId, newPrice, newQty, newValueUsd) {
+  try {
+    const oppositeAction = newAction === 'sell' ? 'buy' : newAction === 'buy' ? 'sell' : null;
+    if (!oppositeAction) return;
+    const fifteenMinAgo = Date.now() - 15 * 60 * 1000;
+    // Look for a complementary trade in pendingTradeContext within 15 minutes
+    for (const [sym, pending] of pendingTradeContext) {
+      if (sym === newSymbol) continue;
+      if (pending.action !== oppositeAction) continue;
+      if (pending.detectedAt < fifteenMinAgo) continue;
+      // Found a pair
+      const sellSymbol = newAction === 'sell' ? newSymbol.replace('-USD', '') : sym.replace('-USD', '');
+      const sellJournalId = newAction === 'sell' ? newJournalId : pending.journalId;
+      const sellPrice = newAction === 'sell' ? newPrice : pending.price;
+      const sellValueUsd = newAction === 'sell' ? newValueUsd : pending.valueUsd;
+      const sellQty = newAction === 'sell' ? newQty : pending.qty;
+      const buySymbol = newAction === 'buy' ? newSymbol.replace('-USD', '') : sym.replace('-USD', '');
+      const buyJournalId = newAction === 'buy' ? newJournalId : pending.journalId;
+      const buyPrice = newAction === 'buy' ? newPrice : pending.price;
+      const buyValueUsd = newAction === 'buy' ? newValueUsd : pending.valueUsd;
+      const buyQty = newAction === 'buy' ? newQty : pending.qty;
+      // Store as pending rebalance confirmation (keyed by a stable string — use a fixed key since single user)
+      pendingRebalanceConfirm.set('main', { sellSymbol, sellJournalId, sellPrice, sellValueUsd, sellQty, buySymbol, buyJournalId, buyPrice, buyValueUsd, buyQty });
+      await sendTelegram(
+        `🔄 <b>REBALANCING DETECTED</b>\n\n` +
+        `📤 Sold ${sellSymbol}: ${sellQty?.toFixed(4)} tokens @ $${sellPrice?.toFixed(4)} ($${sellValueUsd?.toFixed(2)})\n` +
+        `📥 Bought ${buySymbol}: ${buyQty?.toFixed(4)} tokens @ $${buyPrice?.toFixed(4)} ($${buyValueUsd?.toFixed(2)})\n\n` +
+        `Is this a rebalancing or separate trades?\n` +
+        `Reply:\n` +
+        `<b>yes</b> — log as rebalance, track 7-day performance\n` +
+        `<b>no</b> — log as separate trades (will ask for details)`
+      );
+      return; // Only fire once per pair
+    }
+  } catch (e) {
+    console.error('[checkForRebalancePair] error:', e.message);
+  }
+}
+
 async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
   try {
     const coinBase = symbol.replace('-USD', '');
@@ -1837,7 +1917,8 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
       `Reply: '<b>${coinBase.toLowerCase()} reason [why], [emotion]</b>'\n` +
       `Or: '<b>${coinBase.toLowerCase()} skip</b>' to log without details\n` +
       `Or: '<b>${coinBase.toLowerCase()} payment</b>' to log as a payment (excluded from stats)\n` +
-      `Or: '<b>${coinBase.toLowerCase()} transfer</b>' to log as internal transfer (excluded from stats)\n\n` +
+      `Or: '<b>${coinBase.toLowerCase()} transfer</b>' to log as internal transfer (excluded from stats)\n` +
+      `Or: '<b>${coinBase.toLowerCase()} rebalance [coin]</b>' to log as rebalance into another coin\n\n` +
       `⏰ Will auto-log in 30 minutes if no reply.`;
     await sendTelegram(msg);
 
@@ -1854,8 +1935,11 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
       } catch (e) { /* ignore */ }
     }, 30 * 60 * 1000);
 
-    pendingTradeContext.set(symbol, { journalId, detectedAt: Date.now(), timeoutHandle });
+    pendingTradeContext.set(symbol, { journalId, detectedAt: Date.now(), timeoutHandle, action, price, valueUsd, qty: absQty });
     console.log(`Auto-logged trade: ${symbol} ${action} ${absQty.toFixed(4)} @ $${price.toFixed(4)}`);
+
+    // Check if this forms a rebalancing pair with another recent trade
+    await checkForRebalancePair(symbol, action, journalId, price, absQty, valueUsd);
   } catch (e) {
     console.error('autoLogTrade error:', e.message);
   }
@@ -1895,6 +1979,57 @@ function extractIntentionDetails(text) {
     }
   }
   return { action, coins: [...new Set(coins)] };
+}
+
+async function checkRebalanceOutcomes() {
+  try {
+    const [pending] = await db.execute(
+      'SELECT * FROM rebalance_log WHERE checked_at IS NULL AND in_symbol IS NOT NULL AND rebalance_date <= DATE_SUB(CURDATE(), INTERVAL 7 DAY)'
+    );
+    for (const row of pending) {
+      try {
+        const outSym = `${row.out_symbol}-USD`;
+        const inSym  = `${row.in_symbol}-USD`;
+        const [outData, inData] = await Promise.all([
+          fetchPrices([outSym]),
+          fetchPrices([inSym]),
+        ]);
+        const outNow = outData?.[outSym]?.price;
+        const inNow  = inData?.[inSym]?.price;
+        if (!outNow || !inNow) continue;
+
+        const outPct = ((outNow - parseFloat(row.out_price)) / parseFloat(row.out_price)) * 100;
+        const inPct  = ((inNow  - parseFloat(row.in_price))  / parseFloat(row.in_price))  * 100;
+        const diff   = inPct - outPct;
+        const good   = diff > 0;
+        const verdict = good
+          ? `Good rebalance — ${row.in_symbol} outperformed ${row.out_symbol} by ${Math.abs(diff).toFixed(1)}%`
+          : `Suboptimal rebalance — ${row.out_symbol} outperformed ${row.in_symbol} by ${Math.abs(diff).toFixed(1)}%`;
+
+        await db.execute(
+          'UPDATE rebalance_log SET checked_at = NOW(), out_price_at_check = ?, in_price_at_check = ?, verdict = ? WHERE id = ?',
+          [outNow, inNow, verdict, row.id]
+        );
+
+        const rebalDate = new Date(row.rebalance_date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+        const emoji = good ? '✅' : '📉';
+        await sendTelegram(
+          `📊 <b>7-DAY REBALANCE CHECK</b>\n\n` +
+          `Rebalance logged: ${rebalDate}\n` +
+          `📤 OUT: ${row.out_symbol} @ $${parseFloat(row.out_price).toFixed(4)}\n` +
+          `📥 IN: ${row.in_symbol} @ $${parseFloat(row.in_price).toFixed(4)}\n\n` +
+          `7-day performance:\n` +
+          `${row.out_symbol}: $${parseFloat(row.out_price).toFixed(4)} → $${outNow.toFixed(4)} (${outPct >= 0 ? '+' : ''}${outPct.toFixed(1)}%)\n` +
+          `${row.in_symbol}: $${parseFloat(row.in_price).toFixed(4)} → $${inNow.toFixed(4)} (${inPct >= 0 ? '+' : ''}${inPct.toFixed(1)}%)\n\n` +
+          `${emoji} ${verdict}`
+        );
+      } catch (e) {
+        console.error('[rebalance check] row error:', e.message);
+      }
+    }
+  } catch (e) {
+    console.error('[checkRebalanceOutcomes] error:', e.message);
+  }
 }
 
 async function checkIntentionOutcomes() {
@@ -2781,7 +2916,10 @@ cron.schedule('5 9 * * 1', async () => {
 // Daily intention outcome checks — 10 AM, checks for 7-day and 30-day pending follow-ups
 cron.schedule('0 10 * * *', checkIntentionOutcomes, { timezone: 'Europe/London' });
 
-console.log('Cron jobs scheduled: midnight price recording + 9 AM morning briefing + every-2h macro news + Monday 9:05 rebalancing check + 10 AM intention outcomes (Europe/London)');
+// Daily rebalance 7-day outcome checks — 10:02 AM
+cron.schedule('2 10 * * *', checkRebalanceOutcomes, { timezone: 'Europe/London' });
+
+console.log('Cron jobs scheduled: midnight price recording + 9 AM morning briefing + every-2h macro news + Monday 9:05 rebalancing check + 10 AM intention outcomes + 10:02 AM rebalance checks (Europe/London)');
 
 const app = express();
 app.use(cors());
@@ -3362,6 +3500,23 @@ function createMcpServer() {
     }
   );
 
+  // ── Tool: get_rebalances ──────────────────────────────────────────────────
+  server.tool('get_rebalances',
+    'Get rebalance history with 7-day outcome verdicts',
+    { limit: z.number().optional().describe('Max entries to return (default 10)') },
+    async (params) => {
+      try {
+        const limitInt = parseInt(params?.limit) || 10;
+        const [rows] = await db.execute(
+          'SELECT * FROM rebalance_log ORDER BY rebalance_date DESC LIMIT ' + limitInt
+        );
+        return { content: [{ type: 'text', text: JSON.stringify(rows, null, 2) }] };
+      } catch (e) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: e.message }) }] };
+      }
+    }
+  );
+
   // ── Tool: get_journal ─────────────────────────────────────────────────────
   server.tool('get_journal',
     'Get recent trading journal entries',
@@ -3853,6 +4008,36 @@ app.post('/telegram-webhook', async (req, res) => {
       pendingJournalState.delete(chatIdStr);
     }
 
+    // --- Pending rebalance confirmation: 'yes' / 'no' reply ---
+    if (pendingRebalanceConfirm.has('main')) {
+      const lowerMsg2 = commandText.toLowerCase().trim();
+      const isYes = /^(yes|y|rebalance|yes rebalance|rebalancing)$/i.test(lowerMsg2);
+      const isNo  = /^(no|n|separate|no separate)$/i.test(lowerMsg2);
+      if (isYes || isNo) {
+        const conf = pendingRebalanceConfirm.get('main');
+        pendingRebalanceConfirm.delete('main');
+        if (isYes) {
+          // Clear both from pendingTradeContext
+          const sellKey = [...pendingTradeContext.keys()].find(k => k.replace('-USD','') === conf.sellSymbol);
+          const buyKey  = [...pendingTradeContext.keys()].find(k => k.replace('-USD','') === conf.buySymbol);
+          if (sellKey) { clearTimeout(pendingTradeContext.get(sellKey).timeoutHandle); pendingTradeContext.delete(sellKey); }
+          if (buyKey)  { clearTimeout(pendingTradeContext.get(buyKey).timeoutHandle);  pendingTradeContext.delete(buyKey);  }
+          await logRebalancePair(conf);
+          const rebalDate = new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+          await sendReply(
+            `✅ Rebalancing logged!\n` +
+            `📤 OUT: ${conf.sellSymbol} @ $${conf.sellPrice?.toFixed(4)}\n` +
+            `📥 IN: ${conf.buySymbol} @ $${conf.buyPrice?.toFixed(4)}\n\n` +
+            `I'll check back in 7 days — did ${conf.buySymbol} outperform ${conf.sellSymbol}? 📊`
+          );
+        } else {
+          // User wants separate trade logging — individual context messages already sent, nothing more to do
+          await sendReply(`OK, logging as separate trades. Reply to each trade prompt for details.`);
+        }
+        return res.status(200).json({ ok: true });
+      }
+    }
+
     // --- Auto-trade context: natural language replies when any trade is pending ---
     if (pendingTradeContext.size > 0) {
       const EMOTION_WORDS = ['confident', 'uncertain', 'fomo', 'fearful', 'neutral'];
@@ -3875,9 +4060,114 @@ app.post('/telegram-webhook', async (req, res) => {
       if (matchedPending.length === 0 && pendingTradeContext.size === 1) {
         const [[symbol, pending]] = pendingTradeContext;
         // Only intercept if message isn't a recognised command
-        const isKnownCommand = /^(pause|resume|status|acknowledge|ack|ignore|watch|sell|buy|entry|daily|target|journal|my stats|learning|holding|bought|sold|i prefer|rebalance|rebalancing|trail|trailing|approve|cancel|transfer|payment)/i.test(commandText);
+        const isKnownCommand = /^(pause|resume|status|acknowledge|ack|ignore|watch|sell|buy|entry|daily|target|journal|my stats|learning|holding|bought|sold|i prefer|trail|trailing|approve|cancel|transfer|payment)/i.test(commandText);
         if (!isKnownCommand) {
           matchedPending.push({ symbol, pending, skip: false });
+        }
+      }
+
+      // --- Smart rebalance detection ---
+      // Detect: "near hype rebalance", "rebalanced near into hype", "swapped near for hype", "near into hype", "moved near to hype"
+      const isRebalanceIntent = lowerMsg.includes('rebalance') || lowerMsg.includes('rebalancing') ||
+        /\binto\b|\bswapped\b|\bmoved\b/.test(lowerMsg);
+
+      if (isRebalanceIntent) {
+        // Find all pending coins mentioned in the message
+        const pendingCoinsInMsg = [];
+        for (const [symbol, pending] of pendingTradeContext) {
+          if (lowerMsg.includes(symbol.replace('-USD', '').toLowerCase())) {
+            pendingCoinsInMsg.push({ symbol, pending });
+          }
+        }
+
+        // Also check recent journal entries (last 2 hours) for coins mentioned but past 30min window
+        const recentJournalMatches = [];
+        const allWords = lowerMsg.split(/\s+/).map(w => w.replace(/[^a-z]/g, '').toUpperCase()).filter(w => w.length >= 2);
+        if (pendingCoinsInMsg.length < 2) {
+          try {
+            const [recentRows] = await db.execute(
+              "SELECT id, symbol, action, price, value_usd, quantity FROM trading_journal WHERE created_at > DATE_SUB(NOW(), INTERVAL 2 HOUR) AND action IN ('buy','sell','transfer') ORDER BY created_at DESC LIMIT 20"
+            );
+            for (const row of recentRows) {
+              const sym = row.symbol.replace('-USD','');
+              if (allWords.includes(sym) && !pendingCoinsInMsg.find(p => p.symbol.replace('-USD','') === sym)) {
+                recentJournalMatches.push({ symbol: row.symbol, journalId: row.id, action: row.action, price: parseFloat(row.price), valueUsd: Math.abs(parseFloat(row.value_usd || 0)), qty: parseFloat(row.quantity || 0) });
+              }
+            }
+          } catch (e) { /* ignore */ }
+        }
+
+        // Build full candidate list
+        const candidates = [
+          ...pendingCoinsInMsg.map(p => ({ symbol: p.symbol, pending: p.pending, journalId: p.pending.journalId, action: p.pending.action, price: p.pending.price, valueUsd: p.pending.valueUsd, qty: p.pending.qty, fromPending: true })),
+          ...recentJournalMatches.map(r => ({ symbol: r.symbol, journalId: r.journalId, action: r.action, price: r.price, valueUsd: r.valueUsd, qty: r.qty, fromPending: false })),
+        ];
+
+        const sellCandidate = candidates.find(c => c.action === 'sell');
+        const buyCandidate  = candidates.find(c => c.action === 'buy' || c.action === 'transfer');
+
+        if (candidates.length >= 2 && sellCandidate && buyCandidate && sellCandidate.symbol !== buyCandidate.symbol) {
+          // Clear both from pendingTradeContext if they're there
+          if (sellCandidate.fromPending) { clearTimeout(sellCandidate.pending?.timeoutHandle); pendingTradeContext.delete(sellCandidate.symbol); }
+          if (buyCandidate.fromPending)  { clearTimeout(buyCandidate.pending?.timeoutHandle);  pendingTradeContext.delete(buyCandidate.symbol);  }
+
+          const sellSym = sellCandidate.symbol.replace('-USD', '');
+          const buySym  = buyCandidate.symbol.replace('-USD', '');
+
+          await logRebalancePair({
+            sellSymbol: sellSym, sellJournalId: sellCandidate.journalId, sellPrice: sellCandidate.price, sellValueUsd: sellCandidate.valueUsd, sellQty: sellCandidate.qty,
+            buySymbol:  buySym,  buyJournalId:  buyCandidate.journalId,  buyPrice:  buyCandidate.price,  buyValueUsd:  buyCandidate.valueUsd,  buyQty:  buyCandidate.qty,
+          });
+
+          const rebalDate = new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+          await sendReply(
+            `✅ Rebalancing logged!\n` +
+            `📤 OUT: ${sellSym} @ $${sellCandidate.price?.toFixed(4)} ($${sellCandidate.valueUsd?.toFixed(2)})\n` +
+            `📥 IN: ${buySym} @ $${buyCandidate.price?.toFixed(4)} ($${buyCandidate.valueUsd?.toFixed(2)})\n\n` +
+            `I'll check back in 7 days — did ${buySym} outperform ${sellSym}? 📊`
+          );
+          return res.status(200).json({ ok: true });
+        }
+
+        // Single coin with rebalance keyword — log that coin as transfer, look for in-coin in message or recent buys
+        if (candidates.length >= 1) {
+          const outCandidate = sellCandidate || candidates[0];
+          const outSym = outCandidate.symbol.replace('-USD', '');
+          if (outCandidate.fromPending) { clearTimeout(outCandidate.pending?.timeoutHandle); pendingTradeContext.delete(outCandidate.symbol); }
+
+          // Try to find in-coin from message words (not already in candidates)
+          const inCoinFromMsg = allWords.find(w => w.length >= 2 && w !== outSym && w !== 'REBALANCE' && w !== 'INTO' && w !== 'SWAP' && w !== 'MOVE' && w !== 'FROM' && w !== 'FOR');
+
+          // Look for any recent BUY in journal if no pending buy found
+          let inPrice = null, inJournalId = null, inSym = inCoinFromMsg || null;
+          if (!buyCandidate && inSym) {
+            try {
+              const [inRows] = await db.execute(
+                "SELECT id, price FROM trading_journal WHERE symbol = ? AND action = 'buy' AND created_at > DATE_SUB(NOW(), INTERVAL 2 HOUR) ORDER BY created_at DESC LIMIT 1",
+                [inSym]
+              );
+              if (inRows.length > 0) { inPrice = parseFloat(inRows[0].price); inJournalId = inRows[0].id; }
+            } catch (e) { /* ignore */ }
+          } else if (buyCandidate) {
+            inSym = buyCandidate.symbol.replace('-USD', '');
+            inPrice = buyCandidate.price;
+            inJournalId = buyCandidate.journalId;
+            if (buyCandidate.fromPending) { clearTimeout(buyCandidate.pending?.timeoutHandle); pendingTradeContext.delete(buyCandidate.symbol); }
+          }
+
+          await logRebalancePair({
+            sellSymbol: outSym, sellJournalId: outCandidate.journalId, sellPrice: outCandidate.price, sellValueUsd: outCandidate.valueUsd, sellQty: outCandidate.qty,
+            buySymbol: inSym, buyJournalId: inJournalId, buyPrice: inPrice, buyValueUsd: null, buyQty: null,
+          });
+
+          const inLine = inSym ? `📥 IN: ${inSym}${inPrice ? ` @ $${inPrice.toFixed(4)}` : ' (price TBC)'}` : '📥 IN: (not specified)';
+          await sendReply(
+            `✅ Rebalancing logged!\n` +
+            `📤 OUT: ${outSym} @ $${outCandidate.price?.toFixed(4)} ($${outCandidate.valueUsd?.toFixed(2)})\n` +
+            `${inLine}\n\n` +
+            `I'll check back in 7 days — did ${inSym || 'the new position'} outperform ${outSym}? 📊`
+          );
+          return res.status(200).json({ ok: true });
         }
       }
 
