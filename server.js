@@ -159,6 +159,8 @@ const swingAlertCooldown = new Map();        // symbol -> timestamp — prevents
 let mostRecentSwingAlert = null;             // { symbol, coinBase, direction, price, timestamp } — for 👍 / natural language
 const alertRecommendations = new Map();      // symbol -> { rec, timestamp } — reused in reminders, no repeat API calls
 const responseCache = new Map();             // 'type:symbol' -> { response, timestamp } — 30-min cache for sell/buy advice
+const trailingStops = new Map();             // symbol -> { trailPct, peakPrice, stopPrice, entryPrice }
+const trailingStopAlerted = new Map();       // symbol -> timestamp — tracks recently-triggered trailing stops for hold reply
 let totalInvestedCapital = 20600; // loaded from DB on startup
 
 async function setThreshold(symbol, threshold) {
@@ -387,6 +389,16 @@ await db.execute(`CREATE TABLE IF NOT EXISTS invested_capital (
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )`);
 
+await db.execute(`CREATE TABLE IF NOT EXISTS trailing_stops (
+  symbol VARCHAR(50) PRIMARY KEY,
+  trail_pct DECIMAL(10,4) NOT NULL,
+  peak_price DECIMAL(20,10) NOT NULL,
+  stop_price DECIMAL(20,10) NOT NULL,
+  entry_price DECIMAL(20,10),
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+)`);
+
 // Add direction column to price_targets if it doesn't exist
 try {
   await db.execute(`ALTER TABLE price_targets ADD COLUMN direction VARCHAR(4) NOT NULL DEFAULT 'up'`);
@@ -493,6 +505,22 @@ try {
   }
 } catch (e) {
   console.error('Failed to load invested capital:', e.message);
+}
+
+// Load trailing stops from DB
+try {
+  const [tsRows] = await db.execute('SELECT * FROM trailing_stops');
+  for (const row of tsRows) {
+    trailingStops.set(row.symbol, {
+      trailPct:   parseFloat(row.trail_pct),
+      peakPrice:  parseFloat(row.peak_price),
+      stopPrice:  parseFloat(row.stop_price),
+      entryPrice: row.entry_price ? parseFloat(row.entry_price) : null
+    });
+  }
+  console.log(`Loaded ${tsRows.length} trailing stops from database`);
+} catch (e) {
+  console.error('Failed to load trailing stops:', e.message);
 }
 
 updateLearningModel().catch(() => {});
@@ -811,6 +839,49 @@ async function resumeAlerts(symbol) {
     await db.execute('DELETE FROM ignored_coins WHERE symbol = ?', [symbol]);
     console.log('[watch] Resumed alerts for:', symbol);
   } catch (e) { console.warn('[watch] DB delete failed for', symbol, ':', e.message); }
+}
+
+// ── Trailing Stop Functions ───────────────────────────────────────────────────
+
+async function setTrailingStop(symbol, trailPct, currentPrice, entryPrice = null) {
+  const stopPrice = currentPrice * (1 - trailPct / 100);
+  const ts = { trailPct, peakPrice: currentPrice, stopPrice, entryPrice };
+  trailingStops.set(symbol, ts);
+  await db.execute(
+    'INSERT INTO trailing_stops (symbol, trail_pct, peak_price, stop_price, entry_price) VALUES (?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE trail_pct=VALUES(trail_pct), peak_price=VALUES(peak_price), stop_price=VALUES(stop_price), entry_price=VALUES(entry_price), updated_at=CURRENT_TIMESTAMP',
+    [symbol, trailPct, currentPrice, stopPrice, entryPrice]
+  );
+  alertState.acknowledged.delete(symbol); // Setting new trail re-enables coin
+  return { trailPct, peakPrice: currentPrice, stopPrice };
+}
+
+async function removeTrailingStop(symbol) {
+  trailingStops.delete(symbol);
+  trailingStopAlerted.delete(symbol);
+  await db.execute('DELETE FROM trailing_stops WHERE symbol = ?', [symbol]);
+}
+
+async function updateTrailingStop(symbol, currentPrice) {
+  const ts = trailingStops.get(symbol);
+  if (!ts) return null;
+
+  // If price rose above peak, update peak and stop
+  if (currentPrice > ts.peakPrice) {
+    ts.peakPrice = currentPrice;
+    ts.stopPrice = currentPrice * (1 - ts.trailPct / 100);
+    trailingStops.set(symbol, ts);
+    await db.execute(
+      'UPDATE trailing_stops SET peak_price = ?, stop_price = ?, updated_at = CURRENT_TIMESTAMP WHERE symbol = ?',
+      [ts.peakPrice, ts.stopPrice, symbol]
+    );
+    console.log(`[trailing] ${symbol} new peak ${fmtPriceShort(currentPrice)} → stop now ${fmtPriceShort(ts.stopPrice)}`);
+  }
+
+  // Check if stop triggered
+  if (currentPrice <= ts.stopPrice && !alertState.acknowledged.has(symbol) && !ignoredCoins.has(symbol)) {
+    return { triggered: true, ts };
+  }
+  return { triggered: false, ts };
 }
 
 // Quick price formatter for alert messages
@@ -2214,6 +2285,43 @@ async function checkPortfolio() {
         }, ALERT_INTERVAL_MS));
       }
     }
+    // ── Trailing stop checks ──────────────────────────────────────────────────
+    for (const [symbol, ts] of trailingStops) {
+      const currentPrice = priceMap[symbol];
+      if (!currentPrice) continue;
+      if (alertState.acknowledged.has(symbol)) continue;
+      if (ignoredCoins.has(symbol)) continue;
+
+      const result = await updateTrailingStop(symbol, currentPrice);
+      if (!result || !result.triggered) continue;
+
+      const coinBase = symbol.replace('-USD', '');
+      const entryPrice = ts.entryPrice || entryPrices.get(symbol) || null;
+      const plPct = entryPrice ? ((currentPrice - entryPrice) / entryPrice * 100).toFixed(1) : null;
+      const dropFromPeak = ((currentPrice - ts.peakPrice) / ts.peakPrice * 100).toFixed(1);
+      const stillUp = entryPrice && currentPrice > entryPrice;
+      const entryLine = plPct !== null
+        ? `Entry: ${fmtPriceShort(entryPrice)} | ${stillUp ? 'Still up: +' + plPct + '% from entry 🟢' : 'P&L: ' + plPct + '% 🔴'}`
+        : '';
+
+      const alertMsg =
+        `⚠️ <b>TRAILING STOP TRIGGERED — ${coinBase}</b>\n\n` +
+        `📉 Drop: ${dropFromPeak}% from peak\n` +
+        `Peak: ${fmtPriceShort(ts.peakPrice)} | Current: ${fmtPriceShort(currentPrice)}\n` +
+        `Trail: ${ts.trailPct}% | Stop level: ${fmtPriceShort(ts.stopPrice)}\n` +
+        (entryLine ? entryLine + '\n' : '') +
+        `\n💡 Come to Claude to evaluate before deciding!\n\n` +
+        `Reply:\n` +
+        `'sell ${coinBase}' - get sell advice\n` +
+        `'hold ${coinBase}' - keep holding, reset trail from current price\n` +
+        `'acknowledge ${coinBase}' - dismiss this alert`;
+
+      await sendTelegram(alertMsg);
+      await acknowledgeAlert(symbol); // silence until user responds
+      trailingStopAlerted.set(symbol, Date.now()); // track for hold reply handler
+      console.log(`[trailing] Stop triggered for ${symbol} at ${fmtPriceShort(currentPrice)} (peak: ${fmtPriceShort(ts.peakPrice)})`);
+    }
+
     // ── Extreme move detection (swing trade signals) ──────────────────────────
     // Update 7-day price ranges and flag extreme moves outside normal trading range
     const extremeMoveThreshold = 0.15; // 15% outside 7-day average = extreme
@@ -3042,6 +3150,13 @@ function createMcpServer() {
         fixed_price_targets: [...priceTargets.entries()].map(([sym, t]) => ({
           symbol: sym, direction: t.direction, anchor: t.anchorPrice, target: t.targetPrice, threshold_pct: t.thresholdPct
         })),
+        trailing_stops: [...trailingStops.entries()].map(([sym, ts]) => ({
+          symbol: sym,
+          trail_pct: ts.trailPct,
+          peak_price: ts.peakPrice,
+          stop_price: ts.stopPrice,
+          entry_price: ts.entryPrice
+        })),
         active_pump_alerts:  [...alertState.active.keys()],
         active_drop_alerts:  [...activeDropAlerts.keys()],
         active_fixed_alerts: [...activeFixedAlerts.keys()],
@@ -3049,6 +3164,30 @@ function createMcpServer() {
         permanently_ignored: [...ignoredCoins],
       };
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  // ── Tool: set_trailing_stop ───────────────────────────────────────────────
+  server.tool('set_trailing_stop',
+    'Set a trailing stop alert for a coin. Will alert when price drops trail_pct% from any peak.',
+    {
+      symbol:    z.string().describe('Trading pair e.g. HYPE-USD or HYPE'),
+      trail_pct: z.number().describe('Trailing percentage e.g. 12 for 12%'),
+    },
+    async ({ symbol, trail_pct }) => {
+      const sym = symbol.includes('-USD') ? symbol.toUpperCase() : `${symbol.toUpperCase()}-USD`;
+      const currentPrice = await getCurrentPrice(sym);
+      if (!currentPrice) throw new Error(`No price available for ${sym}`);
+      const entryPrice = entryPrices.get(sym) || null;
+      const result = await setTrailingStop(sym, trail_pct, currentPrice, entryPrice);
+      return { content: [{ type: 'text', text: JSON.stringify({
+        ok: true,
+        symbol: sym,
+        trail_pct,
+        peak_price: result.peakPrice,
+        stop_price: result.stopPrice,
+        message: `Trailing stop set — will alert if ${sym} drops ${trail_pct}% from any new peak`
+      }, null, 2) }] };
     }
   );
 
@@ -3271,6 +3410,38 @@ app.post('/api/capital', async (req, res) => {
   }
 });
 
+// GET /api/trailing-stops — all active trailing stops
+app.get('/api/trailing-stops', (req, res) => {
+  const out = {};
+  for (const [sym, ts] of trailingStops) {
+    out[sym] = { trailPct: ts.trailPct, peakPrice: ts.peakPrice, stopPrice: ts.stopPrice, entryPrice: ts.entryPrice };
+  }
+  res.json(out);
+});
+
+// POST /api/trailing-stops/:symbol — set trailing stop
+app.post('/api/trailing-stops/:symbol', async (req, res) => {
+  const symbol = req.params.symbol.toUpperCase();
+  const { trail_pct } = req.body;
+  if (!trail_pct || trail_pct <= 0 || trail_pct > 99) return res.status(400).json({ error: 'trail_pct must be 0.1–99' });
+  try {
+    const currentPrice = await getCurrentPrice(symbol);
+    if (!currentPrice) return res.status(404).json({ error: `No price for ${symbol}` });
+    const entryPrice = entryPrices.get(symbol) || null;
+    const result = await setTrailingStop(symbol, parseFloat(trail_pct), currentPrice, entryPrice);
+    res.json({ ok: true, symbol, ...result });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// DELETE /api/trailing-stops/:symbol — remove trailing stop
+app.delete('/api/trailing-stops/:symbol', async (req, res) => {
+  const symbol = req.params.symbol.toUpperCase();
+  await removeTrailingStop(symbol);
+  res.json({ ok: true, symbol });
+});
+
 // POST /telegram-webhook — handle incoming Telegram messages
 app.post('/telegram-webhook', async (req, res) => {
   try {
@@ -3349,7 +3520,7 @@ app.post('/telegram-webhook', async (req, res) => {
       if (matchedPending.length === 0 && pendingTradeContext.size === 1) {
         const [[symbol, pending]] = pendingTradeContext;
         // Only intercept if message isn't a recognised command
-        const isKnownCommand = /^(pause|resume|status|acknowledge|ack|ignore|watch|sell|buy|entry|daily|target|journal|my stats|learning|holding|bought|sold|i prefer|rebalance|rebalancing)/i.test(commandText);
+        const isKnownCommand = /^(pause|resume|status|acknowledge|ack|ignore|watch|sell|buy|entry|daily|target|journal|my stats|learning|holding|bought|sold|i prefer|rebalance|rebalancing|trail|trailing)/i.test(commandText);
         if (!isKnownCommand) {
           matchedPending.push({ symbol, pending, skip: false });
         }
@@ -3574,6 +3745,61 @@ app.post('/telegram-webhook', async (req, res) => {
       return res.status(200).json({ ok: true });
     }
 
+    // --- Command: trailing stop COIN X% / trail COIN X% — set trailing stop ---
+    const trailSetMatch = commandText.match(/^(?:trailing\s+stop|trail)\s+([a-z0-9]{2,10})\s+([\d.]+)%?$/i);
+    if (trailSetMatch) {
+      const coinBase   = trailSetMatch[1].toUpperCase();
+      const symbol     = `${coinBase}-USD`;
+      const trailPct   = parseFloat(trailSetMatch[2]);
+      if (trailPct <= 0 || trailPct > 99) {
+        await sendReply(`❌ Trail % must be between 0.1 and 99. Example: 'trail HYPE 12%'`);
+        return res.status(200).json({ ok: true });
+      }
+      const currentPrice = await getCurrentPrice(symbol);
+      if (!currentPrice) {
+        await sendReply(`❌ Couldn't get price for ${symbol}. Is it listed on Revolut X?`);
+        return res.status(200).json({ ok: true });
+      }
+      const entryPrice = entryPrices.get(symbol) || null;
+      const result = await setTrailingStop(symbol, trailPct, currentPrice, entryPrice);
+      await sendReply(
+        `✅ <b>Trailing stop set on ${coinBase}</b>\n\n` +
+        `Current/Peak: ${fmtPriceShort(result.peakPrice)}\n` +
+        `Trail: ${trailPct}%\n` +
+        `Stop level: ${fmtPriceShort(result.stopPrice)}\n\n` +
+        `I'll notify you if ${coinBase} drops ${trailPct}% from any new peak!`
+      );
+      return res.status(200).json({ ok: true });
+    }
+
+    // --- Command: remove trailing stop COIN / cancel trail COIN ---
+    const trailRemoveMatch = commandText.match(/^(?:remove\s+trailing\s+stop|cancel\s+trail(?:ing\s+stop)?)\s+([a-z0-9]{2,10})$/i);
+    if (trailRemoveMatch) {
+      const coinBase = trailRemoveMatch[1].toUpperCase();
+      const symbol   = `${coinBase}-USD`;
+      if (!trailingStops.has(symbol)) {
+        await sendReply(`ℹ️ No trailing stop set for ${coinBase}.`);
+        return res.status(200).json({ ok: true });
+      }
+      await removeTrailingStop(symbol);
+      await sendReply(`✅ Trailing stop removed for <b>${coinBase}</b>.`);
+      return res.status(200).json({ ok: true });
+    }
+
+    // --- Command: trailing stops / my trails — list all active trailing stops ---
+    if (/^(?:trailing\s+stops?|my\s+trails?)$/i.test(commandText)) {
+      if (trailingStops.size === 0) {
+        await sendReply(`📊 No active trailing stops.\n\nSet one with: 'trail HYPE 12%'`);
+        return res.status(200).json({ ok: true });
+      }
+      const lines = [...trailingStops.entries()].map(([sym, ts]) => {
+        const cb = sym.replace('-USD', '');
+        return `• <b>${cb}</b>: ${ts.trailPct}% trail | Peak ${fmtPriceShort(ts.peakPrice)} | Stop ${fmtPriceShort(ts.stopPrice)}`;
+      });
+      await sendReply(`📊 <b>ACTIVE TRAILING STOPS:</b>\n\n${lines.join('\n')}`);
+      return res.status(200).json({ ok: true });
+    }
+
     // --- Command: pause ---
     if (commandText === 'pause') {
       monitoringPaused = true;
@@ -3595,16 +3821,46 @@ app.post('/telegram-webhook', async (req, res) => {
       const fixedSymbols   = [...activeFixedAlerts.keys()];
       const ackedSymbols   = [...alertState.acknowledged].filter(s => !ignoredCoins.has(s));
       const ignoredList    = [...ignoredCoins];
+      const trailLines     = [...trailingStops.entries()].map(([sym, ts]) =>
+        `  ${sym.replace('-USD', '')}: ${ts.trailPct}% | Peak ${fmtPriceShort(ts.peakPrice)} | Stop ${fmtPriceShort(ts.stopPrice)}`
+      );
       const statusMsg =
         `<b>Monitor Status</b>\n` +
         `Paused: ${monitoringPaused ? 'Yes' : 'No'}\n` +
         `Pump alerts: ${alertedSymbols.length ? alertedSymbols.join(', ') : 'none'}\n` +
         `Drop alerts: ${dropSymbols.length ? dropSymbols.join(', ') : 'none'}\n` +
         `Fixed alerts: ${fixedSymbols.length ? fixedSymbols.join(', ') : 'none'}\n` +
+        (trailLines.length ? `🎯 Trailing stops (${trailLines.length}):\n${trailLines.join('\n')}\n` : '') +
         (ackedSymbols.length ? `🔕 Acknowledged (silent until restart): ${ackedSymbols.join(', ')}\n` : '') +
         (ignoredList.length ? `🚫 Permanently ignored: ${ignoredList.join(', ')}` : '');
       await sendReply(statusMsg);
       return res.status(200).json({ ok: true });
+    }
+
+    // --- Trailing stop: intercept 'hold COIN' reply to reset trail from current price ---
+    {
+      const trailHoldMatch = commandText.match(/^hold\s+([a-z0-9]{2,12})$/i);
+      if (trailHoldMatch) {
+        const holdCoinBase = trailHoldMatch[1].toUpperCase();
+        const holdSymbol   = `${holdCoinBase}-USD`;
+        const recentAlert  = trailingStopAlerted.get(holdSymbol);
+        // Only intercept if a trailing stop fired within last 2 hours AND the coin still has a trail
+        if (recentAlert && (Date.now() - recentAlert) < 2 * 60 * 60 * 1000 && trailingStops.has(holdSymbol)) {
+          const currentPrice = await getCurrentPrice(holdSymbol).catch(() => null);
+          if (currentPrice) {
+            const ts = trailingStops.get(holdSymbol);
+            const newStop = currentPrice * (1 - ts.trailPct / 100);
+            await setTrailingStop(holdSymbol, ts.trailPct, currentPrice, ts.entryPrice);
+            trailingStopAlerted.delete(holdSymbol);
+            await sendReply(
+              `✅ Holding <b>${holdCoinBase}</b> — trailing stop reset from current price ${fmtPriceShort(currentPrice)}.\n` +
+              `New stop: ${fmtPriceShort(newStop)} (${ts.trailPct}% trail)\n` +
+              `I'll alert you again if it drops ${ts.trailPct}% from any new peak!`
+            );
+            return res.status(200).json({ ok: true });
+          }
+        }
+      }
     }
 
     // --- Swing alert reply handler ---

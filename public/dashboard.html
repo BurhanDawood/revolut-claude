@@ -568,6 +568,20 @@
     .portfolio-sub-row .sub-label { display: flex; align-items: center; gap: 5px; }
     .portfolio-sub-row .sub-value { font-weight: 600; color: var(--text); }
 
+    /* ── Trailing stop rows (inside threshold cards) ─────────────────────────── */
+    .trail-row { margin-top: 6px; }
+    .trail-info { font-size: 0.8rem; color: var(--accent); font-weight: 600; }
+    .trail-sub  { font-size: 0.75rem; color: var(--text-muted); margin-top: 1px; }
+
+    /* ── Trailing stop summary section ───────────────────────────────────────── */
+    .trail-summary { background: var(--surface2); border-radius: var(--radius); padding: 12px 16px; margin-bottom: 12px; border-left: 3px solid var(--accent); }
+    .trail-summary-title { font-size: 0.7rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--accent); margin-bottom: 8px; }
+    .trail-summary-row { display: flex; justify-content: space-between; align-items: center; padding: 4px 0; border-bottom: 1px solid rgba(255,255,255,0.04); font-size: 0.83rem; }
+    .trail-summary-row:last-child { border-bottom: none; }
+    .trail-summary-coin { font-weight: 700; color: var(--text); }
+    .trail-summary-detail { color: var(--text-muted); font-size: 0.78rem; }
+    .trail-summary-stop { color: var(--danger); font-weight: 600; }
+
     /* ── Tangem card ─────────────────────────────────────────────────────────── */
     .tangem-card { background: var(--surface); border-radius: var(--radius); padding: 18px; margin-bottom: var(--gap); border: 1px solid rgba(0,255,200,0.1); }
     .tangem-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; }
@@ -714,6 +728,12 @@
       </div>
       <button class="btn-accent" id="pause-resume-btn" onclick="toggleMonitoring()">Pause</button>
     </div>
+  </div>
+
+  <!-- Trailing Stops Summary -->
+  <div class="trail-summary" id="trail-summary" style="display:none">
+    <div class="trail-summary-title">🎯 Active Trailing Stops</div>
+    <div id="trail-summary-list"></div>
   </div>
 
   <!-- Thresholds -->
@@ -931,6 +951,7 @@
   let statusData = {};
   let targetsData = {};
   let entryPricesData = {};
+  let trailingStopsData = {};
   let revolutTotalUSD = 0;
 
   window.journalLoaded = false;
@@ -1329,6 +1350,47 @@
     if (tanSubEl) tanSubEl.textContent = `${fmt(tangem.valueUSD)} (${tangem.balance.toFixed(0)} XRP)`;
   }
 
+  function renderTrailSummary(trails) {
+    const box     = document.getElementById('trail-summary');
+    const listEl  = document.getElementById('trail-summary-list');
+    if (!box || !listEl) return;
+    const entries = Object.entries(trails || {});
+    if (entries.length === 0) { box.style.display = 'none'; return; }
+    box.style.display = '';
+    listEl.innerHTML = entries.map(([sym, ts]) => {
+      const coin = sym.replace('-USD', '');
+      const pctNeeded = (((ts.peakPrice - ts.stopPrice) / ts.peakPrice) * 100).toFixed(1);
+      return `
+        <div class="trail-summary-row">
+          <span class="trail-summary-coin">${coin}</span>
+          <span class="trail-summary-detail">${ts.trailPct}% trail | Peak ${fmtPrice(ts.peakPrice)}</span>
+          <span class="trail-summary-stop">Stop ${fmtPrice(ts.stopPrice)} (−${pctNeeded}%)</span>
+        </div>`;
+    }).join('');
+  }
+
+  async function setTrailStop(symbol, coin) {
+    const pct = parseFloat(document.getElementById(`trail-${coin}`).value);
+    if (!pct || pct <= 0 || pct > 99) { showToast('Trail % must be 0.1–99', 'error'); return; }
+    try {
+      await apiFetch('POST', `/api/trailing-stops/${symbol}`, { trail_pct: pct });
+      showToast(`${symbol} trailing stop set to ${pct}%`, 'success');
+      trailingStopsData = await apiFetch('GET', '/api/trailing-stops').catch(() => trailingStopsData);
+      renderThresholds(balancesData, statusData, targetsData, entryPricesData, trailingStopsData);
+      renderTrailSummary(trailingStopsData);
+    } catch (e) { showToast('Failed: ' + e.message, 'error'); }
+  }
+
+  async function removeTrailStop(symbol) {
+    try {
+      await apiFetch('DELETE', `/api/trailing-stops/${symbol}`);
+      showToast(`${symbol} trailing stop removed`, 'success');
+      trailingStopsData = await apiFetch('GET', '/api/trailing-stops').catch(() => trailingStopsData);
+      renderThresholds(balancesData, statusData, targetsData, entryPricesData, trailingStopsData);
+      renderTrailSummary(trailingStopsData);
+    } catch (e) { showToast('Failed: ' + e.message, 'error'); }
+  }
+
   function showQuickEntry(coinBase) {
     const el = document.getElementById(`quick-entry-${coinBase}`);
     if (el) el.style.display = 'flex';
@@ -1382,7 +1444,7 @@
     }
   }
 
-  function renderThresholds(balances, status, targets, entries) {
+  function renderThresholds(balances, status, targets, entries, trails) {
     const el = document.getElementById('threshold-list');
     const coins = (balances || []).filter(b => !['USD','USDT','USDC','EUR','GBP'].includes(b.currency));
     if (coins.length === 0) {
@@ -1390,6 +1452,7 @@
       return;
     }
     const defaultPct = ((status.defaultThreshold || 0.20) * 100).toFixed(0);
+    const trailMap = trails || {};
 
     el.innerHTML = coins.map(h => {
       const sym = h.symbol || `${h.currency}-USD`;
@@ -1421,6 +1484,34 @@
             <input class="threshold-input" type="number" id="ftpct-${coin}" placeholder="%" min="0.1" max="500" step="0.1" style="width:70px" />
             <span class="pct-label">% from now</span>
             <button class="btn-outline" onclick="setTarget('${sym}','${coin}')">Set Target</button>
+          </div>`;
+      }
+
+      // ── Trailing stop ──
+      const trail = trailMap[sym];
+      let trailSection;
+      if (trail) {
+        const pctToTrigger = (((trail.peakPrice - trail.stopPrice) / trail.peakPrice) * 100).toFixed(1);
+        trailSection = `
+          <div class="ctrl-row trail-row">
+            <span class="ctrl-label">🎯 Trailing Stop</span>
+            <div style="flex:1;min-width:0">
+              <div class="trail-info">${trail.trailPct}% trail | Peak: ${fmtPrice(trail.peakPrice)}</div>
+              <div class="trail-sub">Stop: ${fmtPrice(trail.stopPrice)} — triggers if drops ${pctToTrigger}% from peak</div>
+            </div>
+            <input class="threshold-input" type="number" id="trail-${coin}" value="${trail.trailPct}" min="0.1" max="99" step="0.1" style="width:60px" />
+            <span class="pct-label">%</span>
+            <button class="btn-outline" onclick="setTrailStop('${sym}','${coin}')">Update</button>
+            <button class="btn-danger-outline" onclick="removeTrailStop('${sym}')">Remove</button>
+          </div>`;
+      } else {
+        trailSection = `
+          <div class="ctrl-row trail-row">
+            <span class="ctrl-label">🎯 Trailing Stop</span>
+            <span class="ctrl-info muted">Not set</span>
+            <input class="threshold-input" type="number" id="trail-${coin}" placeholder="%" min="0.1" max="99" step="0.1" style="width:60px" />
+            <span class="pct-label">% trail</span>
+            <button class="btn-outline" onclick="setTrailStop('${sym}','${coin}')">Set</button>
           </div>`;
       }
 
@@ -1459,6 +1550,7 @@
             <button class="btn-outline" onclick="setThreshold('${sym}','${coin}')">Set</button>
           </div>
           ${targetSection}
+          ${trailSection}
           ${entrySection}
         </div>`;
     }).join('');
@@ -1510,7 +1602,7 @@
       await apiFetch('POST', `/api/targets/${symbol}`, { threshold_pct: pct });
       showToast(`${symbol} fixed target set to +${pct}% from current price`, 'success');
       targetsData = await apiFetch('GET', '/api/targets');
-      renderThresholds(balancesData, statusData, targetsData, entryPricesData);
+      renderThresholds(balancesData, statusData, targetsData, entryPricesData, trailingStopsData);
     } catch (e) {
       showToast('Failed: ' + e.message, 'error');
     }
@@ -1523,7 +1615,7 @@
       await apiFetch('POST', `/api/targets/${symbol}`, { threshold_pct: pct });
       showToast(`${symbol} fixed target updated to ${pct}%`, 'success');
       targetsData = await apiFetch('GET', '/api/targets');
-      renderThresholds(balancesData, statusData, targetsData, entryPricesData);
+      renderThresholds(balancesData, statusData, targetsData, entryPricesData, trailingStopsData);
     } catch (e) {
       showToast('Failed: ' + e.message, 'error');
     }
@@ -1534,7 +1626,7 @@
       await apiFetch('DELETE', `/api/targets/${symbol}`);
       showToast(`${symbol} fixed target removed`, 'success');
       targetsData = await apiFetch('GET', '/api/targets');
-      renderThresholds(balancesData, statusData, targetsData, entryPricesData);
+      renderThresholds(balancesData, statusData, targetsData, entryPricesData, trailingStopsData);
     } catch (e) {
       showToast('Failed: ' + e.message, 'error');
     }
@@ -1547,7 +1639,7 @@
       await apiFetch('POST', `/api/entryprices/${symbol}`, { entry_price: price });
       showToast(`${symbol} entry price set to $${price}`, 'success');
       entryPricesData = await apiFetch('GET', '/api/entryprices');
-      renderThresholds(balancesData, statusData, targetsData, entryPricesData);
+      renderThresholds(balancesData, statusData, targetsData, entryPricesData, trailingStopsData);
     } catch (e) {
       showToast('Failed: ' + e.message, 'error');
     }
@@ -1579,19 +1671,22 @@
     showError('');
     try {
       await refreshBalances();
-      const [status, targets, entries, capital, tangem] = await Promise.all([
+      const [status, targets, entries, capital, tangem, tsData] = await Promise.all([
         apiFetch('GET', '/api/status'),
         apiFetch('GET', '/api/targets'),
         apiFetch('GET', '/api/entryprices'),
         apiFetch('GET', '/api/capital').catch(() => null),
         apiFetch('GET', '/api/tangem').catch(() => null),
+        apiFetch('GET', '/api/trailing-stops').catch(() => ({})),
       ]);
       statusData = status;
       targetsData = targets;
       entryPricesData = entries;
+      trailingStopsData = tsData || {};
       renderAlerts(status.activeAlerts);
       renderMonitorStatus(status.paused);
-      renderThresholds(balancesData, statusData, targetsData, entryPricesData);
+      renderThresholds(balancesData, statusData, targetsData, entryPricesData, trailingStopsData);
+      renderTrailSummary(trailingStopsData);
       if (capital) renderCapitalBar(capital);
       renderPnlSummary(balancesData);
       if (tangem) renderTangemCard(tangem, balancesData);
