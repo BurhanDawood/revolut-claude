@@ -616,6 +616,7 @@
   <button class="tab-btn active" onclick="switchTab('portfolio')">Portfolio</button>
   <button class="tab-btn" onclick="switchTab('journal')">📓 Journal</button>
   <button class="tab-btn" onclick="switchTab('rebalancing')">📊 Rebalancing</button>
+  <button class="tab-btn" onclick="switchTab('kraken')">🦑 Kraken</button>
 </nav>
 
 <div class="error-banner" id="error-banner"></div>
@@ -941,6 +942,49 @@
 
 </div><!-- /tab-rebalancing -->
 
+<!-- ════════════════════════════════════ KRAKEN TAB ══════════════════════ -->
+<div id="tab-kraken" class="tab-content">
+
+  <!-- Kraken total -->
+  <div class="card">
+    <div class="card-title">🦑 Kraken Exchange</div>
+    <div id="kraken-total" style="font-size:clamp(1.8rem,6vw,2.8rem);font-weight:700;color:var(--accent)">—</div>
+    <div id="kraken-status" style="font-size:0.8rem;color:var(--text-muted);margin-top:4px">Loading…</div>
+  </div>
+
+  <!-- Kraken holdings list -->
+  <div class="card">
+    <div class="card-title">Holdings</div>
+    <div id="kraken-holdings"><div class="empty-state">Loading…</div></div>
+  </div>
+
+  <!-- Trade execution panel -->
+  <div class="card">
+    <div class="card-title">⚡ Execute Trade</div>
+    <div style="display:flex;flex-direction:column;gap:10px">
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <select id="k-side" style="background:var(--surface2);color:var(--text);border:1px solid rgba(255,255,255,0.1);border-radius:6px;padding:6px 10px;font-size:0.9rem">
+          <option value="buy">Buy</option>
+          <option value="sell">Sell</option>
+        </select>
+        <input id="k-symbol" type="text" placeholder="Symbol e.g. ZK" style="width:90px;background:var(--surface2);color:var(--text);border:1px solid rgba(255,255,255,0.1);border-radius:6px;padding:6px 10px;font-size:0.9rem" />
+        <input id="k-volume" type="number" placeholder="Volume" min="0" step="any" style="width:110px;background:var(--surface2);color:var(--text);border:1px solid rgba(255,255,255,0.1);border-radius:6px;padding:6px 10px;font-size:0.9rem" />
+        <select id="k-ordertype" style="background:var(--surface2);color:var(--text);border:1px solid rgba(255,255,255,0.1);border-radius:6px;padding:6px 10px;font-size:0.9rem">
+          <option value="market">Market</option>
+          <option value="limit">Limit</option>
+        </select>
+        <input id="k-price" type="number" placeholder="Limit price" min="0" step="any" style="width:120px;background:var(--surface2);color:var(--text);border:1px solid rgba(255,255,255,0.1);border-radius:6px;padding:6px 10px;font-size:0.9rem" />
+      </div>
+      <div id="k-trade-preview" style="font-size:0.82rem;color:var(--text-muted);min-height:18px"></div>
+      <button class="btn-outline" onclick="submitKrakenTrade()" style="align-self:flex-start">Send to Telegram for Approval</button>
+      <div style="font-size:0.75rem;color:var(--text-muted)">
+        Trade request will be sent to Telegram. Reply <b>'approve trade'</b> to execute or <b>'cancel trade'</b> to abort.
+      </div>
+    </div>
+  </div>
+
+</div><!-- /tab-kraken -->
+
 <div class="toast" id="toast"></div>
 
 <script>
@@ -1014,6 +1058,9 @@
     if (tab === 'rebalancing' && !window.rebalancingLoaded) {
       window.rebalancingLoaded = true;
       loadRebalancingData();
+    }
+    if (tab === 'kraken') {
+      loadKrakenTab();
     }
   }
 
@@ -2071,6 +2118,94 @@
     // Telegram command handled server-side — just inform user to type it
     showToast(`Type 'rebalance ${coin}' in Telegram for deep analysis`, '');
   }
+
+  // ── Kraken Tab ────────────────────────────────────────────────────────────
+
+  async function loadKrakenTab() {
+    document.getElementById('kraken-status').textContent = 'Fetching…';
+    try {
+      const data = await apiFetch('GET', '/api/kraken/balances');
+      const totalEl = document.getElementById('kraken-total');
+      const statusEl = document.getElementById('kraken-status');
+      const holdingsEl = document.getElementById('kraken-holdings');
+
+      if (!data || data.balances.length === 0) {
+        totalEl.textContent = '$0.00';
+        statusEl.textContent = 'No assets found on Kraken';
+        holdingsEl.innerHTML = '<div class="empty-state">No Kraken holdings detected.</div>';
+        return;
+      }
+
+      totalEl.textContent = '$' + (data.totalUSD || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      statusEl.textContent = `${data.balances.length} asset(s) · Updated ${new Date().toLocaleTimeString([], { hour:'2-digit', minute:'2-digit' })}`;
+
+      holdingsEl.innerHTML = data.balances.map(a => {
+        const pnlPct = a.unrealisedPnlPct;
+        const pnlClass = pnlPct != null ? (pnlPct >= 0 ? 'pnl-pos' : 'pnl-neg') : '';
+        const pnlStr = pnlPct != null
+          ? `<span class="${pnlClass}" style="font-size:0.8rem">${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}% ${pnlPct >= 0 ? '🟢' : '🔴'}</span>`
+          : '';
+        const entryStr = a.entryPrice
+          ? `<div style="font-size:0.75rem;color:var(--text-muted)">Entry: ${fmtPrice(a.entryPrice)} ${pnlStr}</div>`
+          : '';
+        return `
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;padding:10px 0;border-bottom:1px solid rgba(255,255,255,0.05)">
+            <div>
+              <div style="font-weight:700;font-size:1rem">${a.standard}</div>
+              <div style="font-size:0.8rem;color:var(--text-muted)">${a.quantity.toFixed(4)} @ ${fmtPrice(a.price)}</div>
+              ${entryStr}
+            </div>
+            <div style="text-align:right">
+              <div style="font-weight:600">${a.valueUSD ? '$' + a.valueUSD.toFixed(2) : '—'}</div>
+              <div style="font-size:0.75rem;color:var(--text-muted)">Kraken</div>
+            </div>
+          </div>`;
+      }).join('');
+    } catch (e) {
+      document.getElementById('kraken-status').textContent = 'Error: ' + e.message;
+      document.getElementById('kraken-holdings').innerHTML = '<div class="empty-state">Could not load Kraken data.</div>';
+    }
+  }
+
+  async function submitKrakenTrade() {
+    const side      = document.getElementById('k-side').value;
+    const symbol    = document.getElementById('k-symbol').value.trim().toUpperCase();
+    const volume    = parseFloat(document.getElementById('k-volume').value);
+    const orderType = document.getElementById('k-ordertype').value;
+    const priceVal  = parseFloat(document.getElementById('k-price').value) || null;
+
+    if (!symbol) { showToast('Enter a symbol e.g. ZK', 'error'); return; }
+    if (!volume || volume <= 0) { showToast('Enter a valid volume > 0', 'error'); return; }
+    if (orderType === 'limit' && !priceVal) { showToast('Enter a limit price', 'error'); return; }
+
+    const sym = symbol.includes('-USD') ? symbol : `${symbol}-USD`;
+    document.getElementById('k-trade-preview').textContent = 'Sending approval request to Telegram…';
+    try {
+      await apiFetch('POST', '/api/kraken/trade', {
+        symbol: sym, side, orderType, volume, price: priceVal, approved: true
+      });
+      showToast('Trade sent for Telegram approval — reply "approve trade" to execute', 'success');
+      document.getElementById('k-trade-preview').textContent = '✅ Approval request sent to Telegram';
+    } catch (e) {
+      showToast('Failed: ' + e.message, 'error');
+      document.getElementById('k-trade-preview').textContent = '';
+    }
+  }
+
+  // Live trade preview
+  ['k-side','k-symbol','k-volume','k-ordertype','k-price'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener('input', () => {
+      const side   = document.getElementById('k-side').value;
+      const symbol = document.getElementById('k-symbol').value.trim().toUpperCase() || '?';
+      const volume = document.getElementById('k-volume').value || '?';
+      const ot     = document.getElementById('k-ordertype').value;
+      const price  = document.getElementById('k-price').value;
+      const priceStr = price ? ` @ $${price}` : (ot === 'market' ? ' @ market price' : '');
+      document.getElementById('k-trade-preview').textContent =
+        volume !== '?' ? `Preview: ${side.toUpperCase()} ${volume} ${symbol}${priceStr}` : '';
+    });
+  });
 
   // ── Init ──────────────────────────────────────────────────────────────────
 

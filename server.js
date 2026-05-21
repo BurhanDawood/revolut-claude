@@ -3,7 +3,7 @@ import cors from 'cors';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
-import { createPrivateKey, sign, createHash } from 'crypto';
+import { createPrivateKey, sign, createHash, createHmac } from 'crypto';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import mysql from 'mysql2/promise';
@@ -17,6 +17,7 @@ const PRIVATE_KEY = process.env.REVOLUTX_PRIVATE_KEY;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const BASE_URL = 'https://revx.revolut.com/api/1.0';
+const KRAKEN_API_URL = 'https://api.kraken.com';
 const TANGEM_XRP_ADDRESS = 'r4E3rtCa4FT4HxTQV2iw3yQHRTrAHMYS3v';
 const TANGEM_XRP_ENTRY   = 2.65; // average entry price for Tangem XRP position
 const XRPL_API = 'https://xrplcluster.com';
@@ -161,6 +162,7 @@ const alertRecommendations = new Map();      // symbol -> { rec, timestamp } —
 const responseCache = new Map();             // 'type:symbol' -> { response, timestamp } — 30-min cache for sell/buy advice
 const trailingStops = new Map();             // symbol -> { trailPct, peakPrice, stopPrice, entryPrice }
 const trailingStopAlerted = new Map();       // symbol -> timestamp — tracks recently-triggered trailing stops for hold reply
+let pendingKrakenTrade = null;               // { symbol, side, orderType, volume, price, valueUSD } — awaiting Telegram approval
 let totalInvestedCapital = 20600; // loaded from DB on startup
 
 async function setThreshold(symbol, threshold) {
@@ -595,6 +597,9 @@ async function getCurrentPortfolioValue() {
       const xrpPrice = priceMap['XRP-USD'] || await getCurrentPrice('XRP-USD');
       if (xrpPrice) total += xrpBalance * xrpPrice;
     }
+    // Include Kraken exchange
+    const krakenData = await getKrakenBalances().catch(() => ({ totalUSD: 0 }));
+    total += krakenData.totalUSD || 0;
     return total;
   } catch (e) { return 0; }
 }
@@ -621,6 +626,130 @@ async function getTangemXRPBalance() {
     console.error('Tangem XRP fetch error:', e.message);
     return null;
   }
+}
+
+// ── Kraken Exchange Integration ───────────────────────────────────────────────
+
+async function krakenRequest(path, data = {}) {
+  try {
+    const apiKey     = process.env.KRAKEN_API_KEY;
+    const privateKey = process.env.KRAKEN_PRIVATE_KEY;
+    const nonce      = Date.now().toString();
+    const postData   = new URLSearchParams({ nonce, ...data }).toString();
+
+    // SHA256 hash of nonce + postData, then HMAC-SHA512 with base64-decoded private key
+    const sha256Hash = createHash('sha256').update(nonce + postData).digest('binary');
+    const message    = path + sha256Hash;
+    const signature  = createHmac('sha512', Buffer.from(privateKey, 'base64'))
+      .update(message, 'binary')
+      .digest('base64');
+
+    const response = await fetch(`${KRAKEN_API_URL}${path}`, {
+      method: 'POST',
+      headers: {
+        'API-Key': apiKey,
+        'API-Sign': signature,
+        'Content-Type': 'application/x-www-form-urlencoded'
+      },
+      body: postData
+    });
+    const result = await response.json();
+    if (result.error && result.error.length > 0) throw new Error(result.error.join(', '));
+    return result.result;
+  } catch (e) {
+    console.error('[kraken] API error:', e.message);
+    throw e;
+  }
+}
+
+// Map Kraken asset codes → standard ticker symbols
+const KRAKEN_TO_STANDARD = {
+  'XXBT': 'BTC', 'XETH': 'ETH', 'XXRP': 'XRP',
+  'XLTC': 'LTC', 'XXLM': 'XLM', 'XADA': 'ADA',
+  'XXDG': 'DOGE', 'XZEC': 'ZEC', 'XXMR': 'XMR',
+  'XBT':  'BTC', 'ETH':  'ETH', 'XRP':  'XRP',
+};
+
+function krakenAssetToStandard(asset) {
+  return KRAKEN_TO_STANDARD[asset] || asset.replace(/^X/, '').replace(/^Z/, '');
+}
+
+async function getKrakenBalances() {
+  try {
+    const balances = await krakenRequest('/0/private/Balance');
+
+    const nonZeroAssets = Object.entries(balances)
+      .filter(([, amount]) => parseFloat(amount) > 0.00001)
+      .filter(([asset]) => !['ZUSD', 'ZEUR', 'ZGBP', 'USDT', 'USDC', 'USD'].includes(asset));
+
+    if (nonZeroAssets.length === 0) return { balances: [], totalUSD: 0 };
+
+    // Build comma-separated pairs for public ticker
+    const pairNames = nonZeroAssets.map(([asset]) => {
+      const standard = krakenAssetToStandard(asset);
+      // Kraken public ticker uses XBTUSD, ETHUSD etc.
+      const krakenBase = standard === 'BTC' ? 'XBT' : standard;
+      return `${krakenBase}USD`;
+    }).join(',');
+
+    let priceMap = {};
+    try {
+      const tickerRes = await fetch(`${KRAKEN_API_URL}/0/public/Ticker?pair=${pairNames}`).then(r => r.json());
+      if (tickerRes.result) {
+        for (const [pair, data] of Object.entries(tickerRes.result)) {
+          priceMap[pair] = parseFloat(data.c[0]); // last trade price
+        }
+      }
+    } catch (e) { console.error('[kraken] Ticker error:', e.message); }
+
+    let totalUSD = 0;
+    const result = [];
+
+    for (const [asset, amount] of nonZeroAssets) {
+      const qty      = parseFloat(amount);
+      const standard = krakenAssetToStandard(asset);
+      const symbol   = `${standard}-USD`;
+      const krakenBase = standard === 'BTC' ? 'XBT' : standard;
+
+      // Try several pair name formats Kraken might return
+      const price =
+        priceMap[`${krakenBase}USD`] ||
+        priceMap[`X${krakenBase}ZUSD`] ||
+        priceMap[`${krakenBase}ZUSD`] || null;
+
+      const valueUSD   = price ? qty * price : null;
+      if (valueUSD) totalUSD += valueUSD;
+
+      const entryPrice = entryPrices.get(symbol) || null;
+      const unrealisedPnlPct = entryPrice && price
+        ? ((price - entryPrice) / entryPrice * 100) : null;
+
+      result.push({ asset, standard, symbol, quantity: qty, price, valueUSD, entryPrice, unrealisedPnlPct, source: 'Kraken' });
+    }
+
+    result.sort((a, b) => (b.valueUSD || 0) - (a.valueUSD || 0));
+    return { balances: result, totalUSD };
+  } catch (e) {
+    console.error('[kraken] getKrakenBalances error:', e.message);
+    return { balances: [], totalUSD: 0 };
+  }
+}
+
+async function executeKrakenTrade(symbol, side, orderType, volume, price = null) {
+  const standard    = symbol.replace('-USD', '');
+  const krakenBase  = standard === 'BTC' ? 'XBT' : standard;
+  const pair        = `${krakenBase}USD`;
+
+  const orderData = {
+    pair,
+    type:      side,       // 'buy' or 'sell'
+    ordertype: orderType,  // 'market' or 'limit'
+    volume:    volume.toString()
+  };
+  if (orderType === 'limit' && price) orderData.price = price.toString();
+
+  const result = await krakenRequest('/0/private/AddOrder', orderData);
+  return result;
 }
 
 // FIX 3: Dust rule — skip API for positions worth < $5
@@ -1007,6 +1136,19 @@ async function sendMorningBriefing() {
     }
     holdings.sort((a, b) => b.valueUSD - a.valueUSD);
 
+    // ── Kraken exchange ─────────────────────────────────────────────────────
+    let krakenBriefingLine = '';
+    try {
+      const kData = await getKrakenBalances();
+      if (kData.totalUSD > 0) {
+        totalUSD += kData.totalUSD;
+        const krakenTop = kData.balances.slice(0, 3)
+          .map(a => `${a.standard}: $${a.valueUSD?.toFixed(0) || '?'}`)
+          .join(', ');
+        krakenBriefingLine = `\n🦑 Kraken: $${kData.totalUSD.toFixed(0)} (${krakenTop})`;
+      }
+    } catch (e) { console.warn('[briefing] Kraken fetch failed:', e.message); }
+
     // ── Tangem XRP wallet ───────────────────────────────────────────────────
     let tangemValue = 0;
     let tangemLine  = '';
@@ -1108,6 +1250,7 @@ async function sendMorningBriefing() {
     const msg1 =
       `🌅 <b>GOOD MORNING BRYAN!</b>\n` +
       `📅 ${dateStr} | Portfolio: <b>${fmtAmt(totalUSD)}</b>` +
+      (krakenBriefingLine ? krakenBriefingLine : '') +
       (tangemLine ? tangemLine : '') +
       capitalLine + breakEvenLine + `\n\n` +
       `📊 <b>TOP HOLDINGS:</b>\n${topHoldings}\n\n` +
@@ -2516,6 +2659,63 @@ async function checkPortfolio() {
       }
     }
 
+    // ── Kraken exchange monitoring ────────────────────────────────────────────
+    try {
+      const krakenData = await getKrakenBalances();
+      if (krakenData.totalUSD > 0) {
+        console.log(`[kraken] Portfolio: $${krakenData.totalUSD.toFixed(2)} across ${krakenData.balances.length} asset(s)`);
+      }
+      for (const asset of krakenData.balances) {
+        if (!asset.price || !asset.valueUSD) continue;
+        const symbol   = asset.symbol;
+        const coinBase = asset.standard;
+
+        // Set baseline if not yet set
+        if (!basePrices[symbol]) {
+          basePrices[symbol] = asset.price;
+          console.log(`[kraken] Baseline set for ${symbol}: $${asset.price}`);
+          continue;
+        }
+
+        const change    = (asset.price - basePrices[symbol]) / basePrices[symbol];
+        const threshold = customThresholds[symbol] !== undefined ? customThresholds[symbol] : PUMP_THRESHOLD;
+
+        // Pump alert
+        if (change >= threshold && !alertState.active.has(symbol) && !alertState.acknowledged.has(symbol) && !ignoredCoins.has(symbol)) {
+          const pct   = (change * 100).toFixed(1);
+          const aiRec = alertRecommendations.get(symbol)?.rec || 'HOLD - Monitor closely.';
+          const trailReminderKraken = trailingStops.has(symbol)
+            ? `\n\n📈 TREND IS YOUR FRIEND — Trailing stop active at ${fmtPriceShort(trailingStops.get(symbol).stopPrice)}.`
+            : '';
+          await sendTelegram(
+            `📈 <b>${symbol} DAILY PUMP ALERT (Kraken)</b>\n\n` +
+            `Baseline: ${fmtPriceShort(basePrices[symbol])} → Now ${fmtPriceShort(asset.price)} (+${pct}%)\n` +
+            `You hold: ${asset.quantity.toFixed(4)} ${coinBase} on Kraken\n\n` +
+            `⚡ RECOMMENDATION: ${aiRec}` + trailReminderKraken + `\n\n` +
+            `Reply 'acknowledge ${coinBase}' to stop alerts`
+          );
+        }
+
+        // Trailing stop check for Kraken assets
+        if (trailingStops.has(symbol) && !alertState.acknowledged.has(symbol) && !ignoredCoins.has(symbol)) {
+          const result = await updateTrailingStop(symbol, asset.price);
+          if (result && result.triggered) {
+            await sendTelegram(
+              `⚠️ <b>TRAILING STOP TRIGGERED — ${coinBase} (Kraken)</b>\n\n` +
+              `Peak: ${fmtPriceShort(result.ts.peakPrice)} | Current: ${fmtPriceShort(asset.price)}\n` +
+              `Trail: ${result.ts.trailPct}% | Stop: ${fmtPriceShort(result.ts.stopPrice)}\n\n` +
+              `💡 Come to Claude to evaluate before deciding!\n\n` +
+              `Reply 'acknowledge ${coinBase}' to dismiss`
+            );
+            await acknowledgeAlert(symbol);
+            trailingStopAlerted.set(symbol, Date.now());
+          }
+        }
+      }
+    } catch (e) {
+      console.error('[kraken] Monitoring error:', e.message);
+    }
+
   } catch (e) {
     console.log('Portfolio check error:', e.message, e.stack);
   }
@@ -3158,15 +3358,16 @@ function createMcpServer() {
       limit:  z.number().optional().describe('Max entries to return (default 10)'),
     },
     async ({ symbol, limit = 10 }) => {
+      const limitInt = parseInt(limit) || 10;
       let rows;
       if (symbol) {
         const coinBase = symbol.replace('-USD', '').toUpperCase();
         [rows] = await db.execute(
           'SELECT * FROM trading_journal WHERE symbol = ? ORDER BY created_at DESC LIMIT ?',
-          [coinBase, limit]
+          [coinBase, limitInt]
         );
       } else {
-        [rows] = await db.execute('SELECT * FROM trading_journal ORDER BY created_at DESC LIMIT ?', [limit]);
+        [rows] = await db.execute('SELECT * FROM trading_journal ORDER BY created_at DESC LIMIT ?', [limitInt]);
       }
       return { content: [{ type: 'text', text: JSON.stringify(rows, null, 2) }] };
     }
@@ -3276,6 +3477,54 @@ function createMcpServer() {
       };
       console.log('[mcp] get_context called');
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  // ── Tool: get_kraken_balances ────────────────────────────────────────────
+  server.tool('get_kraken_balances',
+    'Get Kraken exchange balances and USD values for all held assets',
+    {},
+    async () => {
+      const data = await getKrakenBalances();
+      return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+    }
+  );
+
+  // ── Tool: execute_kraken_trade ────────────────────────────────────────────
+  server.tool('execute_kraken_trade',
+    'Request Telegram approval to execute a trade on Kraken. Sends details to Telegram; user must reply "approve trade" to confirm.',
+    {
+      symbol:     z.string().describe('Trading pair e.g. ZK-USD or ZK'),
+      side:       z.enum(['buy', 'sell']).describe('Buy or sell'),
+      order_type: z.enum(['market', 'limit']).describe('Market or limit order'),
+      volume:     z.number().describe('Amount of the base asset to trade'),
+      price:      z.number().optional().describe('Limit price (required for limit orders)'),
+    },
+    async ({ symbol, side, order_type, volume, price }) => {
+      const sym        = symbol.includes('-USD') ? symbol.toUpperCase() : `${symbol.toUpperCase()}-USD`;
+      const coinBase   = sym.replace('-USD', '');
+      const livePrice  = price || await getCurrentPrice(sym).catch(() => null);
+      const valueUSD   = livePrice ? livePrice * volume : null;
+
+      // Store pending trade for Telegram approval
+      pendingKrakenTrade = { symbol: sym, side, orderType: order_type, volume, price: livePrice, valueUSD };
+
+      await sendTelegram(
+        `🔔 <b>TRADE APPROVAL REQUIRED</b>\n\n` +
+        `Exchange: Kraken\n` +
+        `Action: <b>${side.toUpperCase()} ${volume} ${coinBase}</b>\n` +
+        `Type: ${order_type}\n` +
+        `Price: ${livePrice ? fmtPriceShort(livePrice) : 'market'}\n` +
+        `Value: ~${valueUSD ? '$' + valueUSD.toFixed(2) : 'unknown'}\n\n` +
+        `Reply <b>'approve trade'</b> to execute\n` +
+        `Reply <b>'cancel trade'</b> to abort`
+      );
+      return { content: [{ type: 'text', text: JSON.stringify({
+        ok: true,
+        status: 'pending_approval',
+        message: `Approval request sent to Telegram. Reply "approve trade" to execute ${side} ${volume} ${coinBase}.`,
+        symbol: sym, side, order_type, volume, price: livePrice, valueUSD
+      }) }] };
     }
   );
 
@@ -3490,6 +3739,43 @@ app.delete('/api/trailing-stops/:symbol', async (req, res) => {
   res.json({ ok: true, symbol });
 });
 
+// GET /api/kraken/balances
+app.get('/api/kraken/balances', async (req, res) => {
+  try {
+    const data = await getKrakenBalances();
+    res.json(data);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/kraken/trade — execute a Kraken trade (requires approved: true)
+app.post('/api/kraken/trade', async (req, res) => {
+  try {
+    const { symbol, side, orderType, volume, price, approved } = req.body;
+    if (!approved) return res.status(400).json({ error: 'Trade requires approved: true explicitly set' });
+    if (!symbol || !side || !orderType || !volume) return res.status(400).json({ error: 'Missing required fields: symbol, side, orderType, volume' });
+    const result = await executeKrakenTrade(symbol, side, orderType, parseFloat(volume), price ? parseFloat(price) : null);
+    const currentPrice = price ? parseFloat(price) : (await getCurrentPrice(symbol) || 0);
+    const valueUSD = currentPrice * parseFloat(volume);
+    const coinBase = symbol.replace('-USD', '');
+    await db.execute(
+      'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [coinBase, side, currentPrice, parseFloat(volume), valueUSD, 'Kraken executed trade via dashboard', 'confident']
+    ).catch(e => console.error('[kraken] Journal insert failed:', e.message));
+    await sendTelegram(
+      `✅ <b>KRAKEN TRADE EXECUTED</b>\n\n` +
+      `${side.toUpperCase()} ${volume} ${coinBase} @ ${fmtPriceShort(currentPrice)}\n` +
+      `Value: $${valueUSD.toFixed(2)}\n` +
+      `Order ID: ${result?.txid?.[0] || 'unknown'}\n\n` +
+      `📝 Journal entry logged automatically`
+    );
+    res.json({ ok: true, result });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // POST /telegram-webhook — handle incoming Telegram messages
 app.post('/telegram-webhook', async (req, res) => {
   try {
@@ -3568,7 +3854,7 @@ app.post('/telegram-webhook', async (req, res) => {
       if (matchedPending.length === 0 && pendingTradeContext.size === 1) {
         const [[symbol, pending]] = pendingTradeContext;
         // Only intercept if message isn't a recognised command
-        const isKnownCommand = /^(pause|resume|status|acknowledge|ack|ignore|watch|sell|buy|entry|daily|target|journal|my stats|learning|holding|bought|sold|i prefer|rebalance|rebalancing|trail|trailing)/i.test(commandText);
+        const isKnownCommand = /^(pause|resume|status|acknowledge|ack|ignore|watch|sell|buy|entry|daily|target|journal|my stats|learning|holding|bought|sold|i prefer|rebalance|rebalancing|trail|trailing|approve|cancel)/i.test(commandText);
         if (!isKnownCommand) {
           matchedPending.push({ symbol, pending, skip: false });
         }
@@ -3845,6 +4131,50 @@ app.post('/telegram-webhook', async (req, res) => {
         return `• <b>${cb}</b>: ${ts.trailPct}% trail | Peak ${fmtPriceShort(ts.peakPrice)} | Stop ${fmtPriceShort(ts.stopPrice)}`;
       });
       await sendReply(`📊 <b>ACTIVE TRAILING STOPS:</b>\n\n${lines.join('\n')}`);
+      return res.status(200).json({ ok: true });
+    }
+
+    // --- Command: approve trade / cancel trade ---
+    if (/^approve\s+trade$/i.test(commandText)) {
+      if (!pendingKrakenTrade) {
+        await sendReply('ℹ️ No pending Kraken trade to approve.');
+        return res.status(200).json({ ok: true });
+      }
+      const t = pendingKrakenTrade;
+      pendingKrakenTrade = null;
+      await sendReply(`⏳ Executing ${t.side.toUpperCase()} ${t.volume} ${t.symbol.replace('-USD','')} on Kraken…`);
+      res.status(200).json({ ok: true });
+      (async () => {
+        try {
+          const result = await executeKrakenTrade(t.symbol, t.side, t.orderType, t.volume, t.price);
+          const coinBase = t.symbol.replace('-USD', '');
+          const valueStr = t.valueUSD ? `$${t.valueUSD.toFixed(2)}` : 'unknown';
+          await db.execute(
+            'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion) VALUES (?, ?, ?, ?, ?, ?, ?)',
+            [coinBase, t.side, t.price, t.volume, t.valueUSD, 'Kraken trade approved via Telegram', 'confident']
+          ).catch(e => console.error('[kraken] Journal insert failed:', e.message));
+          await sendTelegram(
+            `✅ <b>KRAKEN TRADE EXECUTED</b>\n\n` +
+            `${t.side.toUpperCase()} ${t.volume} ${coinBase} @ ${fmtPriceShort(t.price)}\n` +
+            `Value: ${valueStr}\n` +
+            `Order ID: ${result?.txid?.[0] || 'unknown'}\n\n` +
+            `📝 Journal entry logged automatically`
+          );
+        } catch (e) {
+          await sendTelegram(`❌ Kraken trade failed: ${e.message}`);
+        }
+      })();
+      return;
+    }
+
+    if (/^cancel\s+trade$/i.test(commandText)) {
+      if (!pendingKrakenTrade) {
+        await sendReply('ℹ️ No pending Kraken trade to cancel.');
+        return res.status(200).json({ ok: true });
+      }
+      const t = pendingKrakenTrade;
+      pendingKrakenTrade = null;
+      await sendReply(`✅ Trade cancelled — ${t.side.toUpperCase()} ${t.volume} ${t.symbol.replace('-USD','')} was not executed.`);
       return res.status(200).json({ ok: true });
     }
 
