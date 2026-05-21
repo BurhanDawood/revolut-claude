@@ -513,6 +513,20 @@
       .threshold-input { flex: 1; width: auto; }
     }
 
+    /* ── Rebalancing Tracker ─────────────────────────────────────────────── */
+    .rebal-accuracy-bar { display: flex; align-items: center; gap: 14px; padding: 14px 16px; background: var(--surface2); border-radius: 10px; margin-bottom: 14px; }
+    .rebal-accuracy-pct { font-size: 2rem; font-weight: 800; color: var(--accent); line-height: 1; }
+    .rebal-accuracy-label { font-size: 0.78rem; color: var(--text-muted); }
+    .rebal-tracker-table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
+    .rebal-tracker-table th { text-align: left; padding: 7px 10px; font-size: 0.63rem; text-transform: uppercase; letter-spacing: 0.07em; color: var(--text-muted); border-bottom: 1px solid #2e2e2e; white-space: nowrap; }
+    .rebal-tracker-table td { padding: 9px 10px; border-bottom: 1px solid #1a1a1a; vertical-align: middle; }
+    .rebal-tracker-table tr:last-child td { border-bottom: none; }
+    .rebal-tracker-table tr.row-good td { background: rgba(0,255,200,0.04); }
+    .rebal-tracker-table tr.row-bad  td { background: rgba(255,77,106,0.04); }
+    .rebal-outcome-badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.68rem; font-weight: 700; }
+    .rebal-outcome-badge.good { background: rgba(0,255,200,0.15); color: var(--accent); }
+    .rebal-outcome-badge.bad  { background: rgba(255,77,106,0.18); color: var(--danger); }
+    .rebal-outcome-badge.pending { background: rgba(136,136,136,0.15); color: var(--text-muted); }
     /* ── Rebalancing tab ──────────────────────────────────────────────────── */
     .health-grid { display: grid; grid-template-columns: auto 1fr; gap: 20px; align-items: center; margin-bottom: 4px; }
     @media(max-width:500px) { .health-grid { grid-template-columns: 1fr; } }
@@ -858,6 +872,42 @@
 
 <!-- ══════════════════════════════════ REBALANCING TAB ═══════════════════ -->
 <div id="tab-rebalancing" class="tab-content">
+
+  <!-- Rebalancing Tracker -->
+  <div class="card" id="rebal-tracker-card">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;flex-wrap:wrap;gap:8px">
+      <div class="card-title" style="margin:0">🔄 Rebalancing Tracker</div>
+      <div id="rebal-tracker-meta" style="font-size:0.75rem;color:var(--text-muted)">Loading…</div>
+    </div>
+    <div id="rebal-accuracy-bar" class="rebal-accuracy-bar" style="display:none">
+      <div class="rebal-accuracy-pct" id="rebal-accuracy-pct">—</div>
+      <div>
+        <div style="font-weight:700;font-size:0.9rem" id="rebal-accuracy-label">ACCURACY</div>
+        <div class="rebal-accuracy-label" id="rebal-accuracy-sub">— decisions</div>
+      </div>
+      <div style="margin-left:auto;text-align:right">
+        <div style="font-size:0.72rem;color:var(--text-muted)">Avg 7d gain</div>
+        <div style="font-weight:700" id="rebal-avg-pnl">—</div>
+      </div>
+    </div>
+    <div style="overflow-x:auto">
+      <table class="rebal-tracker-table">
+        <thead>
+          <tr>
+            <th>Date</th>
+            <th>Sold</th>
+            <th>Bought</th>
+            <th>7d Result</th>
+            <th>30d Result</th>
+            <th>Outcome</th>
+          </tr>
+        </thead>
+        <tbody id="rebal-tracker-body">
+          <tr><td colspan="6" style="text-align:center;color:var(--text-muted);padding:20px">No rebalances logged yet</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
 
   <!-- Health Overview -->
   <div class="card">
@@ -2060,7 +2110,65 @@
     document.getElementById('freed-count').textContent = `${count} position${count !== 1 ? 's' : ''} selected`;
   }
 
+  async function loadRebalancingTracker() {
+    try {
+      const data = await apiFetch('GET', '/api/rebalancing-tracker');
+      const meta = document.getElementById('rebal-tracker-meta');
+
+      if (data.total > 0) {
+        const bar = document.getElementById('rebal-accuracy-bar');
+        bar.style.display = 'flex';
+        document.getElementById('rebal-accuracy-pct').textContent = data.accuracy != null ? data.accuracy + '%' : '—';
+        document.getElementById('rebal-accuracy-label').textContent = 'ACCURACY';
+        document.getElementById('rebal-accuracy-sub').textContent = `${data.good}/${data.total} decisions`;
+        document.getElementById('rebal-avg-pnl').textContent = data.avg_pnl_7d != null
+          ? (parseFloat(data.avg_pnl_7d) >= 0 ? '+' : '') + data.avg_pnl_7d + '%'
+          : '—';
+        meta.textContent = `${data.history.length} rebalance${data.history.length !== 1 ? 's' : ''} logged`;
+      } else {
+        meta.textContent = 'No rebalances logged yet';
+      }
+
+      const tbody = document.getElementById('rebal-tracker-body');
+      if (!data.history || data.history.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--text-muted);padding:20px">No rebalances logged yet — use Telegram to log rebalancing moves</td></tr>';
+        return;
+      }
+      tbody.innerHTML = data.history.map(r => {
+        const date = new Date(r.rebalance_date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+        const outPrice = parseFloat(r.out_price);
+        const inPrice  = parseFloat(r.in_price);
+        const pnl7 = r.pnl_7d != null ? parseFloat(r.pnl_7d) : null;
+        const pnl30 = r.pnl_30d != null ? parseFloat(r.pnl_30d) : null;
+
+        const fmt7 = pnl7 != null
+          ? `<span style="color:${pnl7 >= 0 ? 'var(--accent)' : 'var(--danger)'}">${pnl7 >= 0 ? '+' : ''}${pnl7.toFixed(1)}%</span>`
+          : '<span style="color:var(--text-muted)">Pending</span>';
+        const fmt30 = pnl30 != null
+          ? `<span style="color:${pnl30 >= 0 ? 'var(--accent)' : 'var(--danger)'}">${pnl30 >= 0 ? '+' : ''}${pnl30.toFixed(1)}%</span>`
+          : '<span style="color:var(--text-muted)">Pending</span>';
+
+        const outcome = r.outcome || 'pending';
+        const outcomeBadge = `<span class="rebal-outcome-badge ${outcome}">${outcome === 'good' ? '✅ Good' : outcome === 'bad' ? '❌ Bad' : '⏳ Pending'}</span>`;
+        const rowClass = outcome === 'good' ? 'row-good' : outcome === 'bad' ? 'row-bad' : '';
+
+        return `<tr class="${rowClass}">
+          <td style="white-space:nowrap">${date}</td>
+          <td><strong>${r.out_symbol}</strong><br><span style="font-size:0.72rem;color:var(--text-muted)">$${outPrice.toFixed(4)}</span></td>
+          <td><strong>${r.in_symbol}</strong><br><span style="font-size:0.72rem;color:var(--text-muted)">$${inPrice.toFixed(4)}</span></td>
+          <td>${fmt7}</td>
+          <td>${fmt30}</td>
+          <td>${outcomeBadge}</td>
+        </tr>`;
+      }).join('');
+    } catch (e) {
+      document.getElementById('rebal-tracker-meta').textContent = 'Failed to load';
+      console.error('loadRebalancingTracker:', e.message);
+    }
+  }
+
   async function loadRebalancingData() {
+    loadRebalancingTracker();
     try {
       const { positions, summary } = await apiFetch('GET', '/api/rebalancing/positions');
 

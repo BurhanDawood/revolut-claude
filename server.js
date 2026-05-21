@@ -408,6 +408,31 @@ await db.execute(`CREATE TABLE IF NOT EXISTS trailing_stops (
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 )`);
 
+await db.execute(`CREATE TABLE IF NOT EXISTS rebalancing_tracker (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  out_symbol VARCHAR(50) NOT NULL,
+  out_price DECIMAL(20,10) NOT NULL,
+  out_quantity DECIMAL(20,10),
+  out_value_usd DECIMAL(20,4),
+  in_symbol VARCHAR(50) NOT NULL,
+  in_price DECIMAL(20,10) NOT NULL,
+  in_quantity DECIMAL(20,10),
+  in_value_usd DECIMAL(20,4),
+  rebalance_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  check_date_7 TIMESTAMP NULL,
+  check_date_30 TIMESTAMP NULL,
+  out_price_7d DECIMAL(20,10) NULL,
+  in_price_7d DECIMAL(20,10) NULL,
+  out_price_30d DECIMAL(20,10) NULL,
+  in_price_30d DECIMAL(20,10) NULL,
+  pnl_7d DECIMAL(10,4) NULL,
+  pnl_30d DECIMAL(10,4) NULL,
+  outcome VARCHAR(20) NULL,
+  notes TEXT NULL,
+  INDEX idx_rebalance_date (rebalance_date),
+  INDEX idx_outcome (outcome)
+)`);
+
 await db.execute(`CREATE TABLE IF NOT EXISTS rebalance_log (
   id INT AUTO_INCREMENT PRIMARY KEY,
   out_symbol VARCHAR(20) NOT NULL,
@@ -1437,6 +1462,18 @@ async function updateLearningModel() {
       }
     } catch (e) { /* ignore */ }
 
+    // Rebalancing accuracy
+    try {
+      const [rebalances] = await db.execute('SELECT * FROM rebalancing_tracker WHERE outcome IS NOT NULL');
+      if (rebalances.length >= 3) {
+        const goodRebalances = rebalances.filter(r => r.outcome === 'good');
+        const rebalanceAccuracy = Math.round(goodRebalances.length / rebalances.length * 100);
+        const avgPnl = rebalances.reduce((s, r) => s + parseFloat(r.pnl_7d || 0), 0) / rebalances.length;
+        summary += `- Rebalancing accuracy: ${rebalanceAccuracy}% (${goodRebalances.length}/${rebalances.length} correct)\n`;
+        summary += `- Average rebalancing gain: ${avgPnl >= 0 ? '+' : ''}${avgPnl.toFixed(1)}%\n`;
+      }
+    } catch (e) { /* ignore */ }
+
     learningModelCache = summary.trim();
     return learningModelCache;
   } catch (e) {
@@ -1795,7 +1832,14 @@ async function logRebalancePair({ sellSymbol, sellJournalId, sellPrice, sellValu
       ['transfer', `Rebalance entry — rotated from ${sellSymbol}`, 'neutral', buyJournalId]
     );
   }
-  // Insert rebalance_log record
+  // Insert into rebalancing_tracker (primary) and rebalance_log (legacy)
+  if (buySymbol && buyPrice) {
+    await db.execute(
+      `INSERT INTO rebalancing_tracker (out_symbol, out_price, out_quantity, out_value_usd, in_symbol, in_price, in_quantity, in_value_usd)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [sellSymbol, sellPrice || 0, sellQty || null, sellValueUsd || null, buySymbol, buyPrice, buyQty || null, buyValueUsd || null]
+    );
+  }
   await db.execute(
     `INSERT INTO rebalance_log (out_symbol, out_price, out_journal_id, in_symbol, in_price, in_journal_id, value_usd, rebalance_date)
      VALUES (?, ?, ?, ?, ?, ?, ?, CURDATE())`,
@@ -1981,56 +2025,101 @@ function extractIntentionDetails(text) {
   return { action, coins: [...new Set(coins)] };
 }
 
-async function checkRebalanceOutcomes() {
+async function checkRebalancingOutcomes() {
   try {
-    const [pending] = await db.execute(
-      'SELECT * FROM rebalance_log WHERE checked_at IS NULL AND in_symbol IS NOT NULL AND rebalance_date <= DATE_SUB(CURDATE(), INTERVAL 7 DAY)'
+    // 7-day check
+    const [sevenDay] = await db.execute(
+      'SELECT * FROM rebalancing_tracker WHERE check_date_7 IS NULL AND rebalance_date < DATE_SUB(NOW(), INTERVAL 7 DAY)'
     );
-    for (const row of pending) {
+    for (const row of sevenDay) {
       try {
         const outSym = `${row.out_symbol}-USD`;
         const inSym  = `${row.in_symbol}-USD`;
-        const [outData, inData] = await Promise.all([
-          fetchPrices([outSym]),
-          fetchPrices([inSym]),
-        ]);
+        const [outData, inData] = await Promise.all([fetchPrices([outSym]), fetchPrices([inSym])]);
         const outNow = outData?.[outSym]?.price;
         const inNow  = inData?.[inSym]?.price;
         if (!outNow || !inNow) continue;
-
         const outPct = ((outNow - parseFloat(row.out_price)) / parseFloat(row.out_price)) * 100;
         const inPct  = ((inNow  - parseFloat(row.in_price))  / parseFloat(row.in_price))  * 100;
-        const diff   = inPct - outPct;
-        const good   = diff > 0;
-        const verdict = good
-          ? `Good rebalance — ${row.in_symbol} outperformed ${row.out_symbol} by ${Math.abs(diff).toFixed(1)}%`
-          : `Suboptimal rebalance — ${row.out_symbol} outperformed ${row.in_symbol} by ${Math.abs(diff).toFixed(1)}%`;
-
+        const pnl7d  = inPct - outPct;
+        const good   = pnl7d > 0;
+        const outcome = good ? 'good' : 'bad';
         await db.execute(
-          'UPDATE rebalance_log SET checked_at = NOW(), out_price_at_check = ?, in_price_at_check = ?, verdict = ? WHERE id = ?',
-          [outNow, inNow, verdict, row.id]
+          'UPDATE rebalancing_tracker SET check_date_7 = NOW(), out_price_7d = ?, in_price_7d = ?, pnl_7d = ?, outcome = ? WHERE id = ?',
+          [outNow, inNow, pnl7d.toFixed(4), outcome, row.id]
         );
-
+        // Also mark legacy rebalance_log
+        await db.execute(
+          "UPDATE rebalance_log SET checked_at = NOW(), out_price_at_check = ?, in_price_at_check = ?, verdict = ? WHERE out_symbol = ? AND in_symbol = ? AND checked_at IS NULL ORDER BY id DESC LIMIT 1",
+          [outNow, inNow, outcome, row.out_symbol, row.in_symbol]
+        ).catch(() => {});
+        await updateLearningModel().catch(() => {});
         const rebalDate = new Date(row.rebalance_date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-        const emoji = good ? '✅' : '📉';
-        await sendTelegram(
-          `📊 <b>7-DAY REBALANCE CHECK</b>\n\n` +
-          `Rebalance logged: ${rebalDate}\n` +
-          `📤 OUT: ${row.out_symbol} @ $${parseFloat(row.out_price).toFixed(4)}\n` +
-          `📥 IN: ${row.in_symbol} @ $${parseFloat(row.in_price).toFixed(4)}\n\n` +
-          `7-day performance:\n` +
-          `${row.out_symbol}: $${parseFloat(row.out_price).toFixed(4)} → $${outNow.toFixed(4)} (${outPct >= 0 ? '+' : ''}${outPct.toFixed(1)}%)\n` +
-          `${row.in_symbol}: $${parseFloat(row.in_price).toFixed(4)} → $${inNow.toFixed(4)} (${inPct >= 0 ? '+' : ''}${inPct.toFixed(1)}%)\n\n` +
-          `${emoji} ${verdict}`
+        if (good) {
+          await sendTelegram(
+            `📊 <b>REBALANCING CHECK — 7 days ago</b>\n\n` +
+            `📤 Sold ${row.out_symbol} @ $${parseFloat(row.out_price).toFixed(4)} → Now $${outNow.toFixed(4)} (${outPct >= 0 ? '+' : ''}${outPct.toFixed(1)}%)\n` +
+            `📥 Bought ${row.in_symbol} @ $${parseFloat(row.in_price).toFixed(4)} → Now $${inNow.toFixed(4)} (${inPct >= 0 ? '+' : ''}${inPct.toFixed(1)}%)\n\n` +
+            `✅ <b>GOOD REBALANCE</b> — ${row.in_symbol} outperformed ${row.out_symbol} by +${Math.abs(pnl7d).toFixed(1)}%\n` +
+            `Your instinct to switch was correct! 🎉\n🧠 Learning model updated`
+          );
+        } else {
+          await sendTelegram(
+            `📊 <b>REBALANCING CHECK — 7 days ago</b>\n\n` +
+            `📤 Sold ${row.out_symbol} @ $${parseFloat(row.out_price).toFixed(4)} → Now $${outNow.toFixed(4)} (${outPct >= 0 ? '+' : ''}${outPct.toFixed(1)}%)\n` +
+            `📥 Bought ${row.in_symbol} @ $${parseFloat(row.in_price).toFixed(4)} → Now $${inNow.toFixed(4)} (${inPct >= 0 ? '+' : ''}${inPct.toFixed(1)}%)\n\n` +
+            `❌ ${row.out_symbol} outperformed ${row.in_symbol} by ${Math.abs(pnl7d).toFixed(1)}%\n` +
+            `Holding ${row.out_symbol} would have been better this time.\n🧠 Learning model updated — every data point helps`
+          );
+        }
+      } catch (e) { console.error('[rebalance 7d] row error:', e.message); }
+    }
+
+    // 30-day check
+    const [thirtyDay] = await db.execute(
+      'SELECT * FROM rebalancing_tracker WHERE check_date_30 IS NULL AND rebalance_date < DATE_SUB(NOW(), INTERVAL 30 DAY)'
+    );
+    for (const row of thirtyDay) {
+      try {
+        const outSym = `${row.out_symbol}-USD`;
+        const inSym  = `${row.in_symbol}-USD`;
+        const [outData, inData] = await Promise.all([fetchPrices([outSym]), fetchPrices([inSym])]);
+        const outNow = outData?.[outSym]?.price;
+        const inNow  = inData?.[inSym]?.price;
+        if (!outNow || !inNow) continue;
+        const outPct = ((outNow - parseFloat(row.out_price)) / parseFloat(row.out_price)) * 100;
+        const inPct  = ((inNow  - parseFloat(row.in_price))  / parseFloat(row.in_price))  * 100;
+        const pnl30d = inPct - outPct;
+        const good   = pnl30d > 0;
+        await db.execute(
+          'UPDATE rebalancing_tracker SET check_date_30 = NOW(), out_price_30d = ?, in_price_30d = ?, pnl_30d = ? WHERE id = ?',
+          [outNow, inNow, pnl30d.toFixed(4), row.id]
         );
-      } catch (e) {
-        console.error('[rebalance check] row error:', e.message);
-      }
+        await updateLearningModel().catch(() => {});
+        if (good) {
+          await sendTelegram(
+            `📊 <b>REBALANCING CHECK — 30 days ago</b>\n\n` +
+            `📤 Sold ${row.out_symbol} @ $${parseFloat(row.out_price).toFixed(4)} → Now $${outNow.toFixed(4)} (${outPct >= 0 ? '+' : ''}${outPct.toFixed(1)}%)\n` +
+            `📥 Bought ${row.in_symbol} @ $${parseFloat(row.in_price).toFixed(4)} → Now $${inNow.toFixed(4)} (${inPct >= 0 ? '+' : ''}${inPct.toFixed(1)}%)\n\n` +
+            `✅ <b>GOOD REBALANCE</b> — ${row.in_symbol} outperformed ${row.out_symbol} by +${Math.abs(pnl30d).toFixed(1)}% over 30 days 🎉`
+          );
+        } else {
+          await sendTelegram(
+            `📊 <b>REBALANCING CHECK — 30 days ago</b>\n\n` +
+            `📤 Sold ${row.out_symbol} @ $${parseFloat(row.out_price).toFixed(4)} → Now $${outNow.toFixed(4)} (${outPct >= 0 ? '+' : ''}${outPct.toFixed(1)}%)\n` +
+            `📥 Bought ${row.in_symbol} @ $${parseFloat(row.in_price).toFixed(4)} → Now $${inNow.toFixed(4)} (${inPct >= 0 ? '+' : ''}${inPct.toFixed(1)}%)\n\n` +
+            `❌ ${row.out_symbol} outperformed ${row.in_symbol} by ${Math.abs(pnl30d).toFixed(1)}% over 30 days\nHolding ${row.out_symbol} would have been better.`
+          );
+        }
+      } catch (e) { console.error('[rebalance 30d] row error:', e.message); }
     }
   } catch (e) {
-    console.error('[checkRebalanceOutcomes] error:', e.message);
+    console.error('[checkRebalancingOutcomes] error:', e.message);
   }
 }
+
+// Keep old name as alias for backward compat
+const checkRebalanceOutcomes = checkRebalancingOutcomes;
 
 async function checkIntentionOutcomes() {
   try {
@@ -2916,8 +3005,8 @@ cron.schedule('5 9 * * 1', async () => {
 // Daily intention outcome checks — 10 AM, checks for 7-day and 30-day pending follow-ups
 cron.schedule('0 10 * * *', checkIntentionOutcomes, { timezone: 'Europe/London' });
 
-// Daily rebalance 7-day outcome checks — 10:02 AM
-cron.schedule('2 10 * * *', checkRebalanceOutcomes, { timezone: 'Europe/London' });
+// Daily rebalancing outcome checks — 10:05 AM (7-day + 30-day)
+cron.schedule('5 10 * * *', checkRebalancingOutcomes, { timezone: 'Europe/London' });
 
 console.log('Cron jobs scheduled: midnight price recording + 9 AM morning briefing + every-2h macro news + Monday 9:05 rebalancing check + 10 AM intention outcomes + 10:02 AM rebalance checks (Europe/London)');
 
@@ -3092,6 +3181,27 @@ app.delete('/api/targets/:symbol', async (req, res) => {
   priceTargets.delete(symbol);
   if (activeFixedAlerts.has(symbol)) { clearInterval(activeFixedAlerts.get(symbol)); activeFixedAlerts.delete(symbol); }
   res.json({ ok: true, symbol });
+});
+
+// GET /api/rebalancing-tracker — rebalancing history + accuracy stats
+app.get('/api/rebalancing-tracker', async (req, res) => {
+  try {
+    const [rows] = await db.execute('SELECT * FROM rebalancing_tracker ORDER BY rebalance_date DESC LIMIT 50');
+    const [stats] = await db.execute(
+      `SELECT COUNT(*) as total, SUM(CASE WHEN outcome = 'good' THEN 1 ELSE 0 END) as good, AVG(pnl_7d) as avg_pnl_7d
+       FROM rebalancing_tracker WHERE outcome IS NOT NULL`
+    );
+    const s = stats[0];
+    res.json({
+      history: rows,
+      accuracy: s.total > 0 ? Math.round(s.good / s.total * 100) : null,
+      total: parseInt(s.total) || 0,
+      good: parseInt(s.good) || 0,
+      avg_pnl_7d: s.avg_pnl_7d ? parseFloat(s.avg_pnl_7d).toFixed(1) : null,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // GET /api/journal/stats — compute stats from trading_journal
@@ -3500,17 +3610,26 @@ function createMcpServer() {
     }
   );
 
-  // ── Tool: get_rebalances ──────────────────────────────────────────────────
-  server.tool('get_rebalances',
-    'Get rebalance history with 7-day outcome verdicts',
+  // ── Tool: get_rebalancing_history ─────────────────────────────────────────
+  server.tool('get_rebalancing_history',
+    'Get rebalancing tracker history and accuracy stats',
     { limit: z.number().optional().describe('Max entries to return (default 10)') },
     async (params) => {
       try {
         const limitInt = parseInt(params?.limit) || 10;
         const [rows] = await db.execute(
-          'SELECT * FROM rebalance_log ORDER BY rebalance_date DESC LIMIT ' + limitInt
+          'SELECT * FROM rebalancing_tracker ORDER BY rebalance_date DESC LIMIT ' + limitInt
         );
-        return { content: [{ type: 'text', text: JSON.stringify(rows, null, 2) }] };
+        const [stats] = await db.execute(
+          `SELECT COUNT(*) as total, SUM(CASE WHEN outcome = 'good' THEN 1 ELSE 0 END) as good, AVG(pnl_7d) as avg_pnl_7d
+           FROM rebalancing_tracker WHERE outcome IS NOT NULL`
+        );
+        const s = stats[0];
+        return { content: [{ type: 'text', text: JSON.stringify({
+          history: rows,
+          stats: s,
+          accuracy: s.total > 0 ? Math.round(s.good / s.total * 100) + '%' : 'No completed rebalances yet'
+        }, null, 2) }] };
       } catch (e) {
         return { content: [{ type: 'text', text: JSON.stringify({ error: e.message }) }] };
       }
