@@ -420,8 +420,12 @@ await db.execute(`CREATE TABLE IF NOT EXISTS auto_trade_rules (
   active TINYINT(1) DEFAULT 1,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   last_triggered TIMESTAMP NULL,
+  source VARCHAR(20) DEFAULT 'manual',
   INDEX idx_active (active)
 )`);
+
+// Add source column to existing tables that may not have it
+try { await db.execute("ALTER TABLE auto_trade_rules ADD COLUMN source VARCHAR(20) DEFAULT 'manual'"); } catch (e) { /* column already exists */ }
 
 await db.execute(`CREATE TABLE IF NOT EXISTS rebalancing_tracker (
   id INT AUTO_INCREMENT PRIMARY KEY,
@@ -2412,6 +2416,95 @@ Be honest, direct and actionable.`;
   }
 }
 
+async function cascadeRulesAfterTrade(rule, executedPrice) {
+  try {
+    const symbol   = rule.symbol;
+    const coinBase = symbol.replace('-USD', '');
+    const MAX_SELL = 3;
+    const MAX_BUY  = 3;
+    const PROX_PCT = 0.02; // 2% proximity — skip if similar rule exists
+
+    const isSell = rule.order_type === 'sell' && rule.rule_type !== 'stop_loss';
+    const isBuy  = rule.order_type === 'buy';
+    if (!isSell && !isBuy) return; // never cascade stop_loss
+
+    let newSellPrice, newBuyPrice, cascadeMsg;
+
+    if (isSell) {
+      newSellPrice = executedPrice * 1.10; // 10% higher — ride the trend
+      newBuyPrice  = executedPrice * 0.92; // 8% retrace — buy back on dip
+      cascadeMsg =
+        `🔄 <b>CASCADE RULES UPDATED</b>\n\n` +
+        `Sold ${rule.volume} ${coinBase} @ $${executedPrice.toFixed(2)}\n` +
+        `New sell target: $${newSellPrice.toFixed(2)} (+10%)\n` +
+        `New buy back: $${newBuyPrice.toFixed(2)} (-8% retrace)\n` +
+        `Riding the trend! 📈`;
+    } else {
+      newBuyPrice  = executedPrice * 0.95; // 5% deeper — add on continued dip
+      newSellPrice = executedPrice * 1.08; // 8% bounce — sell the recovery
+      cascadeMsg =
+        `🔄 <b>CASCADE RULES UPDATED</b>\n\n` +
+        `Bought ${rule.volume} ${coinBase} @ $${executedPrice.toFixed(2)}\n` +
+        `New buy target: $${newBuyPrice.toFixed(2)} (-5% deeper dip)\n` +
+        `New sell target: $${newSellPrice.toFixed(2)} (+8% bounce)\n` +
+        `Buying the dip! 📉`;
+    }
+
+    // Fetch current active rules for this symbol
+    const [allRules] = await db.execute('SELECT * FROM auto_trade_rules WHERE symbol = ? AND active = 1', [symbol]);
+    let sellRules = allRules.filter(r => r.order_type === 'sell' && r.rule_type !== 'stop_loss');
+    let buyRules  = allRules.filter(r => r.order_type === 'buy');
+
+    // Check proximity: true if a rule already exists within PROX_PCT of target
+    const nearExists = (ruleSet, targetPrice) =>
+      ruleSet.some(r => Math.abs(parseFloat(r.trigger_price) - targetPrice) / targetPrice < PROX_PCT);
+
+    // Enforce max: if at limit, remove the oldest rule to make room
+    const enforceMax = async (ruleSet, maxCount, label) => {
+      if (ruleSet.length >= maxCount) {
+        const oldest = ruleSet.reduce((a, b) => a.id < b.id ? a : b);
+        await db.execute('DELETE FROM auto_trade_rules WHERE id = ?', [oldest.id]);
+        console.log(`[cascade] Removed oldest ${label} rule id=${oldest.id} to stay within max ${maxCount}`);
+        return ruleSet.filter(r => r.id !== oldest.id);
+      }
+      return ruleSet;
+    };
+
+    let created = false;
+
+    // Create cascaded sell rule
+    if (!nearExists(sellRules, newSellPrice)) {
+      sellRules = await enforceMax(sellRules, MAX_SELL, 'sell');
+      await db.execute(
+        'INSERT INTO auto_trade_rules (symbol, rule_type, trigger_price, direction, order_type, volume, source) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        [symbol, 'sell_pump', newSellPrice, 'above', 'sell', 2, 'cascade']
+      );
+      console.log(`[cascade] Created sell_pump @ $${newSellPrice.toFixed(2)} for ${symbol}`);
+      created = true;
+    } else {
+      console.log(`[cascade] Sell rule near $${newSellPrice.toFixed(2)} already exists — skipped`);
+    }
+
+    // Create cascaded buy rule
+    if (!nearExists(buyRules, newBuyPrice)) {
+      buyRules = await enforceMax(buyRules, MAX_BUY, 'buy');
+      await db.execute(
+        'INSERT INTO auto_trade_rules (symbol, rule_type, trigger_price, direction, order_type, volume, source) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        [symbol, 'buy_dip', newBuyPrice, 'below', 'buy', 2, 'cascade']
+      );
+      console.log(`[cascade] Created buy_dip @ $${newBuyPrice.toFixed(2)} for ${symbol}`);
+      created = true;
+    } else {
+      console.log(`[cascade] Buy rule near $${newBuyPrice.toFixed(2)} already exists — skipped`);
+    }
+
+    if (created) await sendTelegram(cascadeMsg);
+
+  } catch (e) {
+    console.error('[cascade] cascadeRulesAfterTrade error:', e.message);
+  }
+}
+
 async function checkAutoTradeRules(priceMap) {
   try {
     const [rules] = await db.execute('SELECT * FROM auto_trade_rules WHERE active = 1');
@@ -2487,6 +2580,10 @@ async function checkAutoTradeRules(priceMap) {
             `Order ID: ${result?.txid?.[0] || 'unknown'}\n\n` +
             `📝 Journal logged automatically`
           );
+
+          // Cascade: generate next set of rules based on executed price
+          await cascadeRulesAfterTrade(rule, currentPrice);
+
         } catch (e) {
           console.error(`[auto] Trade execution failed for ${rule.symbol}:`, e.message);
           await sendTelegram(`❌ Auto trade failed for ${coinBase}: ${e.message}`);
@@ -4876,16 +4973,22 @@ app.post('/telegram-webhook', async (req, res) => {
 
     // --- Command: auto rules ---
     if (commandText === 'auto rules') {
-      const [rules] = await db.execute('SELECT * FROM auto_trade_rules ORDER BY symbol, trigger_price ASC');
+      const [rules] = await db.execute('SELECT * FROM auto_trade_rules ORDER BY symbol, order_type DESC, trigger_price ASC');
       if (rules.length === 0) {
         await sendReply('📋 No auto trade rules set.');
       } else {
-        const lines = rules.map(r =>
-          `${r.active ? '✅' : '⏸'} [${r.id}] ${r.rule_type}: ${r.order_type.toUpperCase()} ${r.volume} ${r.symbol.replace('-USD','')} when price goes ${r.direction} $${parseFloat(r.trigger_price).toFixed(2)}` +
-          (r.max_position_usd ? ` (max $${r.max_position_usd})` : '') +
-          (r.last_triggered ? ` | last: ${new Date(r.last_triggered).toLocaleDateString()}` : '')
-        ).join('\n');
-        await sendReply(`📋 <b>Auto Trade Rules</b>\n\n${lines}\n\nReply 'remove auto rule [id]' to delete`);
+        const lines = rules.map(r => {
+          const sourceTag = r.source === 'cascade' ? ' 🔄' : ' ✍️';
+          const lastTag   = r.last_triggered
+            ? ` | fired: ${new Date(r.last_triggered).toLocaleDateString('en-GB', { day:'numeric', month:'short' })}`
+            : ' | never fired';
+          const icon = r.rule_type === 'stop_loss' ? '🛑' : r.order_type === 'buy' ? '📉' : '📈';
+          return `${r.active ? '✅' : '⏸'} ${icon} [${r.id}] ${r.rule_type}${sourceTag}\n` +
+                 `   ${r.order_type.toUpperCase()} ${r.volume} ${r.symbol.replace('-USD','')} ${r.direction} $${parseFloat(r.trigger_price).toFixed(2)}` +
+                 (r.max_position_usd ? ` (max $${r.max_position_usd})` : '') +
+                 lastTag;
+        }).join('\n');
+        await sendReply(`📋 <b>Auto Trade Rules</b>\n\n${lines}\n\n✍️ = manual  🔄 = cascade\nReply 'remove auto rule [id]' to delete`);
       }
       return res.status(200).json({ ok: true });
     }
@@ -6153,88 +6256,4 @@ Active alerts (coins currently above threshold): ${[...alertState.active.keys()]
         console.log('Sending in', Math.ceil(fullReply.length / 2500), 'message(s)');
         console.log('ABOUT TO CHUNK: response length:', fullReply.length);
         console.log('FULL REPLY STARTS WITH:', fullReply.substring(0, 200).replace(/\n/g, '|'));
-        console.log('CHUNK 1 WILL START WITH:', fullReply.substring(0, 100).replace(/\n/g, '|'));
-
-        // 5s gap after status message so chunks don't collide with it
-        await new Promise(r => setTimeout(r, 5000));
-        await sendTelegramChunked(fullReply);
-      } catch (err) {
-        console.error('Claude AI error:', err.message);
-        clearTimeout(stillResearchingTimer);
-        clearTimeout(stillResearchingTimer2);
-        if (err.message === 'timeout') {
-          // FIX 3: Fallback simpler Claude call — no web search, max 30s, max_tokens 500
-          try {
-            const fallbackPromise = anthropic.messages.create({
-              model: 'claude-sonnet-4-5',
-              max_tokens: 500,
-              system: `You are a crypto advisor. Here are the user's current holdings:\n${holdingsList || 'Portfolio data unavailable'}\nAnswer the user's question briefly in 2-3 sentences. Be direct and actionable.`,
-              messages: [{ role: 'user', content: userMessage }],
-            });
-            const fallbackTimeout = new Promise((_, reject) =>
-              setTimeout(() => reject(new Error('fallback_timeout')), 30000)
-            );
-            const fallbackResponse = await Promise.race([fallbackPromise, fallbackTimeout]);
-            const fallbackBlock = [...fallbackResponse.content].reverse().find(b => b.type === 'text');
-            const fallbackText = fallbackBlock ? fallbackBlock.text : null;
-            if (fallbackText) {
-              await sendReply(`⚡ <b>Quick take</b> (full analysis timed out):\n\n${fallbackText}\n\n<i>Tip: Ask about one specific coin at a time for deeper analysis.</i>`);
-            } else {
-              await sendReply('⏱️ Analysis timed out. Try asking about one specific coin at a time.');
-            }
-          } catch (fallbackErr) {
-            await sendReply('⏱️ Analysis timed out. Try asking about one specific coin at a time.');
-          }
-        } else {
-          await sendReply('❌ Error getting AI response: ' + err.message);
-        }
-      }
-    })();
-
-  } catch (err) {
-    console.error('Telegram webhook error:', err.message);
-    if (!res.headersSent) {
-      res.status(200).json({ ok: true });
-    }
-  }
-});
-
-// GET /telegram-setup — register the webhook URL with Telegram
-app.get('/telegram-setup', async (req, res) => {
-  const token = process.env.TELEGRAM_BOT_TOKEN;
-  const webhookUrl = 'https://revolut-claude-production.up.railway.app/telegram-webhook';
-  const response = await fetch(`https://api.telegram.org/bot${token}/setWebhook?url=${webhookUrl}`);
-  const data = await response.json();
-  res.json(data);
-});
-
-// Seed default trader profile entries if not already set
-const TRADER_PROFILE_DEFAULTS = [
-  { key: 'goal',             value: 'Recover portfolio losses and become a disciplined profitable swing trader' },
-  { key: 'situation',        value: 'Portfolio approximately 50% down from historical highs' },
-  { key: 'style',            value: 'Swing trader - buy dips sell pumps' },
-  { key: 'weakness',         value: 'Past trading decisions led to significant losses - working to improve discipline' },
-  { key: 'strength',         value: 'Good instincts on institutional plays like CC and LINK' },
-  { key: 'core_strategy',    value: 'Swing trader focused on extreme price movements. Buys sudden sharp dips outside normal price pattern. Sells sudden sharp pumps outside normal price pattern. Always looking to capture profit on big moves and buy back on retraces.' },
-  { key: 'buy_signals',      value: 'Sudden extreme drop outside normal trading range — potential dip buy opportunity' },
-  { key: 'sell_signals',     value: 'Sudden extreme pump outside normal trading range — potential profit taking opportunity' },
-  { key: 'retrace_strategy', value: 'After selling a pump, waits for retrace and buys back at lower price to repeat the cycle' },
-  { key: 'loss_protection',  value: 'Will sell to protect against further losses if coin drops significantly with no recovery catalyst' },
-  { key: 'profit_capture',   value: 'Takes profits on substantial rises then looks to buy back on retrace' },
-  { key: 'trading_goal',     value: 'Portfolio recovery from 50% down — building back through disciplined swing trading' },
-  { key: 'risk_approach',    value: 'Protects downside while capturing upside on extreme moves' },
-];
-(async () => {
-  for (const { key, value } of TRADER_PROFILE_DEFAULTS) {
-    await db.execute(
-      'INSERT INTO trader_profile (preference_key, preference_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE preference_key = preference_key',
-      [key, value]
-    ).catch(() => {});
-  }
-  console.log('Trader profile defaults seeded.');
-})();
-
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+        console.log('CHUNK 1 WIL
