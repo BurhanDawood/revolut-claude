@@ -366,6 +366,12 @@ await db.execute(`CREATE TABLE IF NOT EXISTS ignored_coins (
   ignored_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )`);
 
+await db.execute(`CREATE TABLE IF NOT EXISTS swing_cooldowns (
+  symbol VARCHAR(50) PRIMARY KEY,
+  last_alert_at TIMESTAMP NOT NULL,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+)`);
+
 await db.execute(`CREATE TABLE IF NOT EXISTS intention_tracking (
   id INT AUTO_INCREMENT PRIMARY KEY,
   symbols VARCHAR(200) NOT NULL,
@@ -521,6 +527,17 @@ try {
   console.log(`Loaded ${tsRows.length} trailing stops from database`);
 } catch (e) {
   console.error('Failed to load trailing stops:', e.message);
+}
+
+// Load swing cooldowns from DB
+try {
+  const [cooldownRows] = await db.execute('SELECT symbol, last_alert_at FROM swing_cooldowns');
+  for (const row of cooldownRows) {
+    swingAlertCooldown.set(row.symbol, new Date(row.last_alert_at).getTime());
+  }
+  console.log(`Loaded ${cooldownRows.length} swing cooldowns from database`);
+} catch (e) {
+  console.error('Failed to load swing cooldowns:', e.message);
 }
 
 updateLearningModel().catch(() => {});
@@ -2407,6 +2424,10 @@ async function checkPortfolio() {
           lastSwingAlertContext.set(symbol, { direction: 'dip', price: currentPrice, timestamp: Date.now() });
           mostRecentSwingAlert = { symbol, coinBase, direction: 'dip', price: currentPrice, timestamp: Date.now() };
           swingAlertCooldown.set(symbol, Date.now()); // start 4h cooldown
+          await db.execute(
+            'INSERT INTO swing_cooldowns (symbol, last_alert_at) VALUES (?, NOW()) ON DUPLICATE KEY UPDATE last_alert_at = NOW(), updated_at = CURRENT_TIMESTAMP',
+            [symbol]
+          ).catch(e => console.error('Failed to persist swing cooldown:', e.message));
           console.log(`Extreme dip signal sent for ${symbol}: ${dropPct}% below 7d avg`);
         }
 
@@ -2443,6 +2464,10 @@ async function checkPortfolio() {
           lastSwingAlertContext.set(symbol, { direction: 'pump', price: currentPrice, timestamp: Date.now() });
           mostRecentSwingAlert = { symbol, coinBase, direction: 'pump', price: currentPrice, timestamp: Date.now() };
           swingAlertCooldown.set(symbol, Date.now()); // start 4h cooldown
+          await db.execute(
+            'INSERT INTO swing_cooldowns (symbol, last_alert_at) VALUES (?, NOW()) ON DUPLICATE KEY UPDATE last_alert_at = NOW(), updated_at = CURRENT_TIMESTAMP',
+            [symbol]
+          ).catch(e => console.error('Failed to persist swing cooldown:', e.message));
           console.log(`Extreme pump signal sent for ${symbol}: ${pumpPct}% above 7d avg`);
         }
       }
@@ -3942,6 +3967,10 @@ app.post('/telegram-webhook', async (req, res) => {
           if (mostRecentSwingAlert?.symbol === swSymbol) mostRecentSwingAlert = null;
           // Backdate cooldown by 2h so 4h remaining window = 6h total from now
           swingAlertCooldown.set(swSymbol, Date.now() - (2 * 60 * 60 * 1000));
+          await db.execute(
+            'INSERT INTO swing_cooldowns (symbol, last_alert_at) VALUES (?, DATE_SUB(NOW(), INTERVAL 2 HOUR)) ON DUPLICATE KEY UPDATE last_alert_at = DATE_SUB(NOW(), INTERVAL 2 HOUR), updated_at = CURRENT_TIMESTAMP',
+            [swSymbol]
+          ).catch(e => console.error('Failed to persist swing cooldown:', e.message));
           console.log('[swing] Cooldown extended (4h remaining) for', swSymbol, 'after user reply:', swAction);
 
           const isPump = swCtx.direction === 'pump';
