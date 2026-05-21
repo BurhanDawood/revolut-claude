@@ -4872,25 +4872,51 @@ app.post('/telegram-webhook', async (req, res) => {
       return res.status(200).json({ ok: true });
     }
 
-    // --- Command: auto buy COIN PRICE VOLUME ---
+    // --- Command: auto buy/sell/stop COIN PRICE VOLUME [maxUSD] ---
     {
-      const autoMatch = commandText.match(/^auto\s+(buy|sell)\s+([a-z0-9]+)\s+([\d.]+)\s+([\d.]+)(?:\s+([\d.]+))?$/i);
+      const autoMatch = commandText.match(/^auto\s+(buy|sell|stop)\s+([a-z0-9]+)\s+([\d.]+)\s+([\d.]+)(?:\s+([\d.]+))?$/i);
       if (autoMatch) {
-        const [, orderType, coinRaw, triggerPrice, volume, maxPos] = autoMatch;
+        const [, cmdType, coinRaw, triggerPrice, volume, maxPos] = autoMatch;
         const coin    = coinRaw.toUpperCase();
         const sym     = coin.includes('-USD') ? coin : `${coin}-USD`;
         const trigger = parseFloat(triggerPrice);
         const vol     = parseFloat(volume);
         const maxUsd  = maxPos ? parseFloat(maxPos) : null;
-        const direction = orderType.toLowerCase() === 'buy' ? 'below' : 'above';
-        const ruleType  = orderType.toLowerCase() === 'buy' ? 'buy_dip' : 'sell_pump';
+
+        let direction, orderType, ruleType;
+        if (cmdType.toLowerCase() === 'buy') {
+          // Buy: always triggers below (buying the dip)
+          direction = 'below';
+          orderType = 'buy';
+          ruleType  = 'buy_dip';
+        } else if (cmdType.toLowerCase() === 'stop') {
+          // Explicit stop loss: always sell below
+          direction = 'below';
+          orderType = 'sell';
+          ruleType  = 'stop_loss';
+        } else {
+          // Sell: detect direction from current price
+          const currentPrice = await getCurrentPrice(sym).catch(() => null);
+          if (currentPrice && trigger < currentPrice) {
+            // Trigger is below current price → stop loss
+            direction = 'below';
+            ruleType  = 'stop_loss';
+          } else {
+            // Trigger is above current price → take profit
+            direction = 'above';
+            ruleType  = 'sell_pump';
+          }
+          orderType = 'sell';
+        }
+
         const [result] = await db.execute(
           'INSERT INTO auto_trade_rules (symbol, rule_type, trigger_price, direction, order_type, volume, max_position_usd) VALUES (?, ?, ?, ?, ?, ?, ?)',
-          [sym, ruleType, trigger, direction, orderType.toLowerCase(), vol, maxUsd]
+          [sym, ruleType, trigger, direction, orderType, vol, maxUsd]
         );
+        const label = ruleType === 'stop_loss' ? '🛑 Stop loss' : ruleType === 'buy_dip' ? '📉 Buy dip' : '📈 Take profit';
         await sendReply(
           `✅ Auto rule set [ID: ${result.insertId}]\n` +
-          `${orderType.toUpperCase()} ${vol} ${coin} when price goes ${direction} $${trigger.toFixed(2)}` +
+          `${label}: ${orderType.toUpperCase()} ${vol} ${coin} when price goes ${direction} $${trigger.toFixed(2)}` +
           (maxUsd ? `\nMax position: $${maxUsd}` : '')
         );
         return res.status(200).json({ ok: true });
