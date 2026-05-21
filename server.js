@@ -1948,13 +1948,35 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
       } catch (e) { /* ignore */ }
     }
 
+    // If buy: recalculate weighted average entry price
+    let avgEntryLine = '';
+    if (action === 'buy') {
+      try {
+        const prevQty = previousBalances.get(symbol) || 0;
+        const existingEntry = entryPrices.get(symbol);
+        if (existingEntry && prevQty > 0) {
+          const newQty = prevQty + absQty;
+          const newAvgEntry = ((prevQty * existingEntry) + (absQty * price)) / newQty;
+          entryPrices.set(symbol, newAvgEntry);
+          await db.execute(
+            'INSERT INTO entry_prices (symbol, entry_price) VALUES (?, ?) ON DUPLICATE KEY UPDATE entry_price = VALUES(entry_price)',
+            [symbol, newAvgEntry]
+          );
+          console.log(`[entry] ${symbol} avg entry updated: $${existingEntry.toFixed(6)} → $${newAvgEntry.toFixed(6)}`);
+          avgEntryLine = `\n📊 Avg entry updated: $${existingEntry.toFixed(4)} → $${newAvgEntry.toFixed(4)}`;
+        }
+      } catch (e) {
+        console.error('[entry] avg entry update error:', e.message);
+      }
+    }
+
     // Send Telegram notification asking for context
     const actionLabel = action === 'buy' ? 'BOUGHT' : action === 'sell' ? 'SOLD' : action.toUpperCase();
     const recLine = claudeRec ? `\n📊 Last Claude rec: ${claudeRec}` : '';
     const reentryLine = reentryNote || '';
     const msg =
       `📝 <b>TRADE DETECTED — ${symbol}</b>\n` +
-      `Action: ${actionLabel} ~${absQty.toFixed(4)} tokens at $${price.toFixed(4)} ($${valueUsd.toFixed(2)})${pnlLine}${recLine}${reentryLine}\n\n` +
+      `Action: ${actionLabel} ~${absQty.toFixed(4)} tokens at $${price.toFixed(4)} ($${valueUsd.toFixed(2)})${pnlLine}${avgEntryLine}${recLine}${reentryLine}\n\n` +
       `Quick questions while it's fresh:\n` +
       `1️⃣ Why did you make this trade?\n` +
       `2️⃣ Feeling: confident / uncertain / fomo / fearful / neutral\n\n` +
