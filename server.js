@@ -3100,22 +3100,22 @@ setTimeout(async () => {
 // Record prices at midnight every day (UK time)
 cron.schedule('0 0 * * *', recordDailyPrices, { timezone: 'Europe/London' });
 
-// Send morning briefing at 9:00 AM every day (UK time)
-cron.schedule('5 9 * * *', async () => {
-  try {
-    await sendMorningBriefing();
-  } catch (e) {
-    console.error('Morning briefing failed, retrying in 2 minutes:', e.message);
-    setTimeout(async () => {
-      try {
-        await sendMorningBriefing();
-      } catch (e2) {
-        console.error('Morning briefing retry also failed:', e2.message);
-        await sendTelegram('❌ Morning briefing failed twice — check Railway logs.');
-      }
-    }, 2 * 60 * 1000);
-  }
-}, { timezone: 'Europe/London' });
+// Morning briefing disabled — sendMorningBriefing() kept for manual use
+// cron.schedule('5 9 * * *', async () => {
+//   try {
+//     await sendMorningBriefing();
+//   } catch (e) {
+//     console.error('Morning briefing failed, retrying in 2 minutes:', e.message);
+//     setTimeout(async () => {
+//       try {
+//         await sendMorningBriefing();
+//       } catch (e2) {
+//         console.error('Morning briefing retry also failed:', e2.message);
+//         await sendTelegram('❌ Morning briefing failed twice — check Railway logs.');
+//       }
+//     }, 2 * 60 * 1000);
+//   }
+// }, { timezone: 'Europe/London' });
 
 // Check macro news every 5 minutes — free RSS + keyword scan; Claude called at most once per 2h
 cron.schedule('*/5 * * * *', checkMacroNews, { timezone: 'Europe/London' });
