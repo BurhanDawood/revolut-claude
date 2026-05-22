@@ -485,6 +485,13 @@ await db.execute(`CREATE TABLE IF NOT EXISTS trade_intentions (
   INDEX idx_expires (expires_at)
 )`);
 
+await db.execute(`CREATE TABLE IF NOT EXISTS system_config (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  config_key VARCHAR(100) UNIQUE NOT NULL,
+  config_value LONGTEXT NOT NULL,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+)`);
+
 // Add direction column to price_targets if it doesn't exist
 try {
   await db.execute(`ALTER TABLE price_targets ADD COLUMN direction VARCHAR(4) NOT NULL DEFAULT 'up'`);
@@ -636,6 +643,43 @@ try {
   }
 } catch (e) {
   console.error('[auto] Failed to seed SOL rules:', e.message);
+}
+
+// Seed system config — always keep project description current
+try {
+  await db.execute(
+    'INSERT INTO system_config (config_key, config_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)',
+    ['project_description', `## REVOLUT X AI PORTFOLIO MANAGER
+
+### INFRASTRUCTURE
+- Railway server: https://revolut-claude-production.up.railway.app
+- GitHub: https://github.com/BurhanDawood/revolut-claude
+- Local code: C:\\Users\\owner\\revolut-claude\\server.js
+- Database: MySQL on Railway
+- Stack: Node.js/Express, MySQL, Anthropic API, Telegram Bot API
+- Revolut X API: REVOLUTX_API_KEY + REVOLUTX_PRIVATE_KEY in Railway env vars
+- Kraken API: KRAKEN_API_KEY + KRAKEN_PRIVATE_KEY in Railway env vars
+
+### MCP TOOLS (11 active)
+get_context, get_portfolio_summary, get_portfolio_data,
+get_trading_data, manage_alerts, manage_trading,
+set_entry_price, execute_kraken_trade,
+set_auto_trade_rule, get_auto_rules, get_prices
+
+### ROADMAP
+1. Kraken monitoring and trade execution DONE
+2. Tangem XRP wallet integration DONE
+3. SOL fully automated trading DONE
+4. Trade intention system DONE
+5. MCP tools consolidated to 11 DONE
+6. Revolut X trade execution IN PROGRESS
+7. Native mobile app PENDING
+8. Portfolio rebalancing automation PENDING
+9. Auto compound profits PENDING`]
+  );
+  console.log('[config] Project description seeded to system_config');
+} catch (e) {
+  console.error('[config] Failed to seed project_description:', e.message);
 }
 
 updateLearningModel().catch(() => {});
@@ -3336,6 +3380,34 @@ cron.schedule('0 2 * * *', async () => {
 // Daily rebalancing outcome checks — 10:05 AM (7-day + 30-day)
 cron.schedule('5 10 * * *', checkRebalancingOutcomes, { timezone: 'Europe/London' });
 
+// Weekly snapshot — every Monday 9:10 AM, saves portfolio state to system_config
+cron.schedule('10 9 * * 1', async () => {
+  try {
+    const portfolioValue = await getCurrentPortfolioValue();
+    const cap = getCapitalSummary(portfolioValue);
+    const [rules]   = await db.execute('SELECT * FROM auto_trade_rules WHERE active = 1');
+    const [trails]  = await db.execute('SELECT * FROM trailing_stops');
+    const [targets] = await db.execute('SELECT * FROM price_targets');
+    const weeklySnapshot = {
+      date: new Date().toISOString(),
+      portfolio_value: portfolioValue.toFixed(2),
+      invested: cap.invested,
+      pl_usd: cap.pnl.toFixed(2),
+      pl_pct: cap.pnlPct.toFixed(2),
+      active_auto_rules: rules.length,
+      trailing_stops: trails.map(t => ({ symbol: t.symbol, trail_pct: t.trail_pct, peak_price: t.peak_price })),
+      price_targets:  targets.map(t => ({ symbol: t.symbol, target: t.target_price, direction: t.direction })),
+    };
+    await db.execute(
+      'INSERT INTO system_config (config_key, config_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)',
+      ['weekly_snapshot', JSON.stringify(weeklySnapshot, null, 2)]
+    );
+    console.log('[config] Weekly snapshot saved to system_config');
+  } catch (e) {
+    console.error('[config] Weekly snapshot error:', e.message);
+  }
+}, { timezone: 'Europe/London' });
+
 console.log('Cron jobs scheduled: midnight price recording + 9 AM morning briefing + every-2h macro news + Monday 9:05 rebalancing check + 10 AM intention outcomes + 10:02 AM rebalance checks (Europe/London)');
 
 const app = express();
@@ -4155,6 +4227,7 @@ function createMcpServer() {
       const [profileRows]    = await db.execute('SELECT preference_key, preference_value FROM trader_profile');
       const [recentTrades]   = await db.execute('SELECT * FROM trading_journal ORDER BY created_at DESC LIMIT 5');
       const [intentionRows]  = await db.execute('SELECT * FROM intention_tracking ORDER BY intention_date DESC LIMIT 3');
+      const [configRows]     = await db.execute('SELECT config_key, config_value FROM system_config');
       const [statsRows]      = await db.execute(
         `SELECT
            COUNT(*) AS total_completed,
@@ -4173,6 +4246,7 @@ function createMcpServer() {
         investedCapital:   totalInvestedCapital,
         recentIntentions:  intentionRows,
         tradingStats: { totalCompleted, winRate: winRate ? `${winRate}%` : 'n/a' },
+        systemConfig:      configRows,
       };
       console.log('[mcp] get_context called');
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
@@ -6159,256 +6233,4 @@ IMPORTANT TRADER CONTEXT:
 - Encourage disciplined trading habits and risk management
 - Be honest about positions that may not recover and suggest better opportunities
 - Celebrate good trading decisions to reinforce positive patterns
-- For positions down 50%+: acknowledge the loss honestly and advise whether to cut or hold for recovery
-- For positions doing well (CC, HYPE, LINK): emphasise protecting and growing these gains
-- Always consider overall portfolio recovery in recommendations
-- Suggest position sizing that protects the recovering portfolio
-
-BRYAN'S CORE TRADING STRATEGY:
-Bryan is a swing trader who specifically targets EXTREME price movements outside normal patterns:
-
-BUY SIGNALS Bryan looks for:
-• Sudden sharp DROP outside coin's normal trading range
-• Extreme oversold conditions (RSI < 30)
-• Price significantly below recent support
-• Fear/panic selling creating opportunity
-• The bigger and more sudden the drop, the more interesting
-
-SELL SIGNALS Bryan looks for:
-• Sudden sharp PUMP outside coin's normal trading range
-• Extreme overbought conditions (RSI > 70)
-• Price significantly above recent resistance
-• Euphoria/FOMO buying creating exit opportunity
-• The bigger and more sudden the pump, the more interesting
-
-RETRACE STRATEGY:
-• After selling a pump, Bryan waits for retrace
-• Buys back at lower price to repeat the cycle
-• Goal: capture profit on the move, buy back cheaper
-
-LOSS PROTECTION:
-• Will cut losses if coin drops with no recovery catalyst
-• Prefers to redeploy capital into better opportunities
-• Does not hold indefinitely hoping for recovery on weak coins
-
-WHEN GIVING RECOMMENDATIONS:
-• Always identify if current price is an extreme move outside normal range
-• Flag if coin is in buy zone (extreme dip) or sell zone (extreme pump)
-• Suggest specific buy-back prices after recommending sells
-• Suggest profit-taking levels after recommending buys
-• Reference Bryan's swing trading strategy explicitly in advice
-• Example: 'This 15% sudden drop is exactly your buy signal — outside normal range, RSI oversold'
-• Example: 'This 20% pump is your sell signal — take profits here and watch for retrace to $X to buy back'
-
-ALERT CONTEXT:
-• Daily pump alerts = potential SELL signal (extreme move up)
-• Daily drop alerts = potential BUY signal (extreme move down)
-• Always frame alerts in context of Bryan's swing strategy
-
-${holdingsList}
-
-Current baseline prices (set when monitoring started): ${JSON.stringify(basePrices)}
-Active alerts (coins currently above threshold): ${[...alertState.active.keys()].join(', ') || 'none'}${learningContext}${recoveryContext}`,
-          messages,
-        });
-        const timeoutPromise = new Promise((_, reject) =>
-          setTimeout(() => reject(new Error('timeout')), 110000)
-        );
-
-        // FIX 2: Send follow-up messages at 30s and 60s if still processing
-        stillResearchingTimer = setTimeout(async () => {
-          try {
-            await sendReply('🔍 Still researching deeply... complex question needs more time.');
-          } catch (e) { /* ignore */ }
-        }, 30000);
-        stillResearchingTimer2 = setTimeout(async () => {
-          try {
-            await sendReply('⏳ Almost there — pulling together the analysis now...');
-          } catch (e) { /* ignore */ }
-        }, 60000);
-
-        const response = await Promise.race([claudePromise, timeoutPromise]);
-        clearTimeout(stillResearchingTimer);
-        clearTimeout(stillResearchingTimer2);
-
-        // Extract the last text block (web_search may produce tool_use blocks before the final text)
-        const lastTextBlock = [...response.content].reverse().find(b => b.type === 'text');
-        const reply = lastTextBlock ? lastTextBlock.text : '(no response)';
-
-        // Update last recommendation context for intention tracking
-        try {
-          const recCoins = holdings.filter(h => reply.toUpperCase().includes(h.symbol.replace('-USD', ''))).map(h => h.symbol.replace('-USD', ''));
-          const recActionMatch = reply.match(/\*\*(HOLD|SELL|BUY MORE|BUY|REDUCE|ADD)\*\*/i) || reply.match(/\b(HOLD|SELL|BUY|REDUCE|ADD)\b/i);
-          lastRecommendationContext.set(chatIdStr, {
-            coins: recCoins.length > 0 ? recCoins : [],
-            action: recActionMatch ? recActionMatch[1].toUpperCase() : 'HOLD',
-            rawReply: reply,
-            timestamp: Date.now()
-          });
-        } catch (e) { /* ignore */ }
-
-        // Extract recommendation from Claude's reply and save to analysis_history
-        try {
-          const recMatch = reply.match(/\*\*(HOLD|SELL|BUY MORE|BUY|REDUCE|ADD)\*\*/i) || reply.match(/^(HOLD|SELL|BUY MORE|BUY|REDUCE|ADD)\b/im);
-          if (recMatch) {
-            const rec = recMatch[1].toUpperCase();
-            const coinInMsg = userMessage.match(/\b([A-Z]{2,10})\b/);
-            const coinBase = coinInMsg ? coinInMsg[1] : null;
-            const symbol = coinBase && !SKIP_WORDS.has(coinBase) ? `${coinBase}-USD` : null;
-            if (symbol) {
-              const priceNow = await getCurrentPrice(symbol).catch(() => null);
-              const summary = reply.substring(0, 500);
-              await db.execute(
-                'INSERT INTO analysis_history (symbol, analysis_type, price_at_analysis, recommendation, claude_summary) VALUES (?, ?, ?, ?, ?)',
-                [symbol, 'telegram_analysis', priceNow, rec, summary]
-              ).catch(() => {});
-            }
-          }
-        } catch (e) { /* ignore */ }
-
-        // Update in-memory history
-        const updatedHistory = [
-          ...history,
-          { role: 'user', content: userMessage },
-          { role: 'assistant', content: reply }
-        ];
-        // Keep last 10 exchanges (20 messages)
-        const trimmed = updatedHistory.slice(-20);
-        conversationHistory.set(chatIdStr, trimmed);
-
-        // Persist to DB
-        await db.execute('INSERT INTO conversation_history (chat_id, role, content) VALUES (?, ?, ?)', [chatId, 'user', userMessage]);
-        await db.execute('INSERT INTO conversation_history (chat_id, role, content) VALUES (?, ?, ?)', [chatId, 'assistant', reply]);
-
-        // Clean up old rows (keep last 20 per chat)
-        await db.execute('DELETE FROM conversation_history WHERE chat_id = ? AND id NOT IN (SELECT id FROM (SELECT id FROM conversation_history WHERE chat_id = ? ORDER BY created_at DESC LIMIT 20) t)', [chatId, chatId]);
-
-        // Check if Claude's response implies it set a threshold — actually execute it
-        const claudeAlertPatterns = [
-          /(?:alert(?:ing)?\s+you|set\s+(?:up\s+)?(?:an?\s+)?alert|creat(?:ed?)?\s+(?:an?\s+)?alert|threshold\s+set|notify\s+you|notification\s+set)\s+.*?([A-Za-z]{2,10}(?:-USD)?)\s+.*?([\d.]+)\s*%/i,
-          /([A-Za-z]{2,10}(?:-USD)?)\s+.*?(?:alert|threshold|notification)\s+.*?([\d.]+)\s*%/i,
-          /threshold.*?([A-Za-z]{2,10}(?:-USD)?)\s+.*?([\d.]+)\s*%/i,
-        ];
-
-        let actionTaken = null;
-        for (const pattern of claudeAlertPatterns) {
-          const m = reply.match(pattern);
-          if (m) {
-            const coinBase = m[1].toUpperCase();
-            // Skip common false positives
-            if (['THE', 'FOR', 'AND', 'YOU', 'SET', 'GET', 'HAS', 'ARE'].includes(coinBase)) continue;
-            const symbol = coinBase.endsWith('-USD') ? coinBase : `${coinBase}-USD`;
-            const threshold = parseFloat(m[2]) / 100;
-            if (threshold > 0 && threshold <= 1) { // sanity check: 0–100%
-              const { oldThreshold, newThreshold } = await setThreshold(symbol, threshold);
-              const newPct = (newThreshold * 100).toFixed(1);
-              const oldPct = (oldThreshold * 100).toFixed(1);
-              actionTaken = `\n\n✅ Actually saved to server - ${symbol} threshold changed to ${newPct}% (was ${oldPct}%). Old alert cancelled and monitoring restarted fresh from current price.`;
-            }
-            break;
-          }
-        }
-
-        // FIX 5: Log response length before sending
-        const fullReply = reply + (actionTaken || '');
-        console.log('Claude response length:', fullReply.length, 'characters');
-        console.log('Sending in', Math.ceil(fullReply.length / 2500), 'message(s)');
-        console.log('ABOUT TO CHUNK: response length:', fullReply.length);
-        console.log('FULL REPLY STARTS WITH:', fullReply.substring(0, 200).replace(/\n/g, '|'));
-        console.log('CHUNK 1 WILL START WITH:', fullReply.substring(0, 100).replace(/\n/g, '|'));
-
-        // 5s gap after status message so chunks don't collide with it
-        await new Promise(r => setTimeout(r, 5000));
-        await sendTelegramChunked(fullReply);
-      } catch (err) {
-        console.error('Claude AI error:', err.message);
-        clearTimeout(stillResearchingTimer);
-        clearTimeout(stillResearchingTimer2);
-        if (err.message === 'timeout') {
-          // FIX 3: Fallback simpler Claude call — no web search, max 30s, max_tokens 500
-          try {
-            const fallbackPromise = anthropic.messages.create({
-              model: 'claude-sonnet-4-5',
-              max_tokens: 500,
-              system: `You are a crypto advisor. Here are the user's current holdings:\n${holdingsList || 'Portfolio data unavailable'}\nAnswer the user's question briefly in 2-3 sentences. Be direct and actionable.`,
-              messages: [{ role: 'user', content: userMessage }],
-            });
-            const fallbackTimeout = new Promise((_, reject) =>
-              setTimeout(() => reject(new Error('fallback_timeout')), 30000)
-            );
-            const fallbackResponse = await Promise.race([fallbackPromise, fallbackTimeout]);
-            const fallbackBlock = [...fallbackResponse.content].reverse().find(b => b.type === 'text');
-            const fallbackText = fallbackBlock ? fallbackBlock.text : null;
-            if (fallbackText) {
-              await sendReply(`⚡ <b>Quick take</b> (full analysis timed out):\n\n${fallbackText}\n\n<i>Tip: Ask about one specific coin at a time for deeper analysis.</i>`);
-            } else {
-              await sendReply('⏱️ Analysis timed out. Try asking about one specific coin at a time.');
-            }
-          } catch (fallbackErr) {
-            await sendReply('⏱️ Analysis timed out. Try asking about one specific coin at a time.');
-          }
-        } else {
-          await sendReply('❌ Error getting AI response: ' + err.message);
-        }
-      }
-    })();
-
-  } catch (err) {
-    console.error('Telegram webhook error:', err.message);
-    if (!res.headersSent) {
-      res.status(200).json({ ok: true });
-    }
-  }
-});
-
-// GET /telegram-setup — register the webhook URL with Telegram
-app.get('/telegram-setup', async (req, res) => {
-  const token = process.env.TELEGRAM_BOT_TOKEN;
-  const webhookUrl = 'https://revolut-claude-production.up.railway.app/telegram-webhook';
-  const response = await fetch(`https://api.telegram.org/bot${token}/setWebhook?url=${webhookUrl}`);
-  const data = await response.json();
-  res.json(data);
-});
-
-// Seed default trader profile entries if not already set
-const TRADER_PROFILE_DEFAULTS = [
-  { key: 'goal',             value: 'Recover portfolio losses and become a disciplined profitable swing trader' },
-  { key: 'situation',        value: 'Portfolio approximately 50% down from historical highs' },
-  { key: 'style',            value: 'Swing trader - buy dips sell pumps' },
-  { key: 'weakness',         value: 'Past trading decisions led to significant losses - working to improve discipline' },
-  { key: 'strength',         value: 'Good instincts on institutional plays like CC and LINK' },
-  { key: 'core_strategy',    value: 'Swing trader focused on extreme price movements. Buys sudden sharp dips outside normal price pattern. Sells sudden sharp pumps outside normal price pattern. Always looking to capture profit on big moves and buy back on retraces.' },
-  { key: 'buy_signals',      value: 'Sudden extreme drop outside normal trading range — potential dip buy opportunity' },
-  { key: 'sell_signals',     value: 'Sudden extreme pump outside normal trading range — potential profit taking opportunity' },
-  { key: 'retrace_strategy', value: 'After selling a pump, waits for retrace and buys back at lower price to repeat the cycle' },
-  { key: 'loss_protection',  value: 'Will sell to protect against further losses if coin drops significantly with no recovery catalyst' },
-  { key: 'profit_capture',   value: 'Takes profits on substantial rises then looks to buy back on retrace' },
-  { key: 'trading_goal',     value: 'Portfolio recovery from 50% down — building back through disciplined swing trading' },
-  { key: 'risk_approach',    value: 'Protects downside while capturing upside on extreme moves' },
-];
-(async () => {
-  for (const { key, value } of TRADER_PROFILE_DEFAULTS) {
-    await db.execute(
-      'INSERT INTO trader_profile (preference_key, preference_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE preference_key = preference_key',
-      [key, value]
-    ).catch(() => {});
-  }
-  console.log('Trader profile defaults seeded.');
-})();
-
-// DELETE /api/cleanup/trade-intentions — one-time cleanup of unmatched intentions
-app.delete('/api/cleanup/trade-intentions', async (req, res) => {
-  try {
-    const [result] = await db.execute(
-      'DELETE FROM trade_intentions WHERE matched_at IS NULL'
-    );
-    res.json({ ok: true, deleted: result.affectedRows });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+- For positions down 50%+: acknowledge the 
