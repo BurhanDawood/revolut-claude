@@ -550,6 +550,39 @@ try {
   await db.execute(`CREATE INDEX idx_tranches_symbol ON position_tranches(symbol)`);
 } catch (e) { /* index already exists */ }
 
+await db.execute(`CREATE TABLE IF NOT EXISTS tax_lots (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  symbol VARCHAR(50) NOT NULL,
+  exchange VARCHAR(20) DEFAULT 'revolut',
+  quantity DECIMAL(20,10) NOT NULL,
+  cost_basis_usd DECIMAL(20,10) NOT NULL,
+  cost_per_unit DECIMAL(20,10) NOT NULL,
+  acquired_at TIMESTAMP NOT NULL,
+  disposed_at TIMESTAMP NULL,
+  disposed_quantity DECIMAL(20,10) NULL,
+  disposal_price DECIMAL(20,10) NULL,
+  disposal_value_usd DECIMAL(20,10) NULL,
+  gain_loss_usd DECIMAL(20,10) NULL,
+  holding_days INT NULL,
+  is_long_term TINYINT(1) NULL,
+  lot_status VARCHAR(20) DEFAULT 'open',
+  journal_id INT NULL,
+  notes TEXT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_tax_symbol (symbol),
+  INDEX idx_tax_status (lot_status),
+  INDEX idx_tax_acquired (acquired_at)
+)`);
+
+await db.execute(`CREATE TABLE IF NOT EXISTS uk_s104_pool (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  symbol VARCHAR(50) UNIQUE NOT NULL,
+  total_quantity DECIMAL(20,10) NOT NULL DEFAULT 0,
+  total_cost_gbp DECIMAL(20,10) NOT NULL DEFAULT 0,
+  average_cost_gbp DECIMAL(20,10) NOT NULL DEFAULT 0,
+  last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+)`);
+
 // Add direction column to price_targets if it doesn't exist
 try {
   await db.execute(`ALTER TABLE price_targets ADD COLUMN direction VARCHAR(4) NOT NULL DEFAULT 'up'`);
@@ -718,11 +751,11 @@ try {
 - Revolut X API: REVOLUTX_API_KEY + REVOLUTX_PRIVATE_KEY in Railway env vars
 - Kraken API: KRAKEN_API_KEY + KRAKEN_PRIVATE_KEY in Railway env vars
 
-### MCP TOOLS (12 active)
+### MCP TOOLS (11 active)
 get_context, get_portfolio_summary, get_portfolio_data,
 get_trading_data, manage_alerts, manage_trading,
 set_entry_price, execute_kraken_trade,
-set_auto_trade_rule, get_auto_rules, get_prices, get_tranches
+set_auto_trade_rule, get_auto_rules, get_prices
 
 ### ROADMAP
 1. Kraken monitoring and trade execution DONE
@@ -731,10 +764,50 @@ set_auto_trade_rule, get_auto_rules, get_prices, get_tranches
 4. Trade intention system DONE
 5. MCP tools consolidated to 11 DONE
 6. Revolut X trade execution DONE
-7. Tranche tracking system DONE
+7. Tax lot tracking US HIFO and UK S104 DONE
 8. Native mobile app PENDING
-8. Portfolio rebalancing automation PENDING
-9. Auto compound profits PENDING`]
+9. Portfolio rebalancing automation PENDING
+10. Auto compound profits PENDING`]
+  );
+  await db.execute(
+    'INSERT INTO system_config (config_key, config_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)',
+    ['system_capabilities', JSON.stringify({
+      last_updated: new Date().toISOString(),
+      total_mcp_tools: 11,
+      tools: [
+        'get_portfolio_summary', 'get_portfolio_data', 'get_trading_data',
+        'get_context', 'manage_alerts', 'manage_trading',
+        'set_entry_price', 'execute_kraken_trade',
+        'set_auto_trade_rule', 'get_auto_rules', 'get_prices'
+      ],
+      trade_execution: {
+        revolut_x: true,
+        kraken: true,
+        symbol_format: 'LINK-USD dash format for orders',
+        supports_quote_size: true,
+        supports_base_size: true
+      },
+      tax_tracking: {
+        us_hifo: true,
+        uk_s104: true,
+        csv_export: true,
+        dual_jurisdiction: true
+      },
+      roadmap_completed: [
+        'Kraken monitoring and trade execution',
+        'Tangem XRP wallet integration',
+        'SOL fully automated trading with cascading rules',
+        'Trade intention system',
+        'MCP tools consolidated to 11',
+        'Revolut X trade execution',
+        'Tax lot tracking US HIFO and UK S104'
+      ],
+      roadmap_pending: [
+        'Native mobile app',
+        'Portfolio rebalancing automation',
+        'Auto compound profits into winners'
+      ]
+    }, null, 2)]
   );
   console.log('[config] Project description seeded to system_config');
 } catch (e) {
@@ -800,6 +873,128 @@ async function reduceTranches(symbol, exchange, qtySold) {
     }
   } catch (e) {
     console.error('[tranches] reduceTranches failed:', e.message);
+  }
+}
+
+// ── Tax Lot Helpers (US HIFO + UK S104) ──────────────────────────────────────
+
+async function addTaxLot(symbol, exchange, quantity, costPerUnit, acquiredAt, journalId, notes = null) {
+  try {
+    const costBasis = quantity * costPerUnit;
+    await db.execute(
+      `INSERT INTO tax_lots (symbol, exchange, quantity, cost_basis_usd, cost_per_unit, acquired_at, journal_id, notes)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [symbol, exchange, quantity, costBasis, costPerUnit, acquiredAt, journalId, notes]
+    );
+    console.log(`[tax] Lot added: ${quantity} ${symbol} @ $${costPerUnit}`);
+  } catch (e) {
+    console.error('[tax] addTaxLot error:', e.message);
+  }
+}
+
+async function disposeTaxLotsHIFO(symbol, quantity, disposalPrice, disposedAt, journalId) {
+  try {
+    const [openLots] = await db.execute(
+      `SELECT * FROM tax_lots WHERE symbol = ? AND lot_status = 'open'
+       ORDER BY cost_per_unit DESC, acquired_at ASC`,
+      [symbol]
+    );
+
+    let remainingQty = quantity;
+    const disposals = [];
+
+    for (const lot of openLots) {
+      if (remainingQty <= 0) break;
+
+      const lotQty = parseFloat(lot.quantity);
+      const qtyFromThisLot = Math.min(remainingQty, lotQty);
+      const costPerUnit = parseFloat(lot.cost_per_unit);
+      const gainLoss = (disposalPrice - costPerUnit) * qtyFromThisLot;
+      const holdingDays = Math.floor(
+        (new Date(disposedAt) - new Date(lot.acquired_at)) / (1000 * 60 * 60 * 24)
+      );
+      const isLongTerm = holdingDays >= 365;
+
+      if (qtyFromThisLot >= lotQty) {
+        await db.execute(
+          `UPDATE tax_lots SET lot_status = 'closed', disposed_at = ?, disposed_quantity = ?,
+           disposal_price = ?, disposal_value_usd = ?, gain_loss_usd = ?,
+           holding_days = ?, is_long_term = ? WHERE id = ?`,
+          [disposedAt, qtyFromThisLot, disposalPrice, disposalPrice * qtyFromThisLot,
+           gainLoss, holdingDays, isLongTerm ? 1 : 0, lot.id]
+        );
+      } else {
+        // Partial lot — mark original then create remainder
+        await db.execute(
+          `UPDATE tax_lots SET lot_status = 'partial', disposed_quantity = ?,
+           disposal_price = ?, disposal_value_usd = ?, gain_loss_usd = ?,
+           holding_days = ?, is_long_term = ? WHERE id = ?`,
+          [qtyFromThisLot, disposalPrice, disposalPrice * qtyFromThisLot,
+           gainLoss, holdingDays, isLongTerm ? 1 : 0, lot.id]
+        );
+        await db.execute(
+          `INSERT INTO tax_lots (symbol, exchange, quantity, cost_basis_usd, cost_per_unit, acquired_at, lot_status, notes)
+           VALUES (?, ?, ?, ?, ?, ?, 'open', ?)`,
+          [symbol, lot.exchange, lotQty - qtyFromThisLot,
+           (lotQty - qtyFromThisLot) * costPerUnit, costPerUnit, lot.acquired_at,
+           `Remainder after partial disposal on ${disposedAt}`]
+        );
+      }
+
+      disposals.push({
+        lot_id: lot.id, quantity: qtyFromThisLot, cost_per_unit: costPerUnit,
+        disposal_price: disposalPrice, gain_loss_usd: gainLoss,
+        holding_days: holdingDays, is_long_term: isLongTerm,
+        term: isLongTerm ? 'long-term' : 'short-term'
+      });
+      remainingQty -= qtyFromThisLot;
+    }
+
+    const totalGL = disposals.reduce((s, d) => s + d.gain_loss_usd, 0);
+    console.log(`[tax] HIFO disposal: ${quantity} ${symbol} @ $${disposalPrice}`);
+    console.log(`[tax] Lots used: ${disposals.length}, Total gain/loss: $${totalGL.toFixed(2)}`);
+    return disposals;
+  } catch (e) {
+    console.error('[tax] disposeTaxLotsHIFO error:', e.message);
+    return [];
+  }
+}
+
+async function updateS104Pool(symbol, action, quantity, priceGbp) {
+  try {
+    const [pool] = await db.execute('SELECT * FROM uk_s104_pool WHERE symbol = ?', [symbol]);
+
+    if (action === 'buy') {
+      if (pool.length === 0) {
+        await db.execute(
+          `INSERT INTO uk_s104_pool (symbol, total_quantity, total_cost_gbp, average_cost_gbp)
+           VALUES (?, ?, ?, ?)`,
+          [symbol, quantity, quantity * priceGbp, priceGbp]
+        );
+      } else {
+        const newQty  = parseFloat(pool[0].total_quantity) + quantity;
+        const newCost = parseFloat(pool[0].total_cost_gbp) + (quantity * priceGbp);
+        await db.execute(
+          `UPDATE uk_s104_pool SET total_quantity = ?, total_cost_gbp = ?, average_cost_gbp = ? WHERE symbol = ?`,
+          [newQty, newCost, newCost / newQty, symbol]
+        );
+      }
+    } else if (action === 'sell' && pool.length > 0) {
+      const avgCost = parseFloat(pool[0].average_cost_gbp);
+      const newQty  = parseFloat(pool[0].total_quantity) - quantity;
+      const newCost = newQty * avgCost;
+      if (newQty <= 0) {
+        await db.execute('DELETE FROM uk_s104_pool WHERE symbol = ?', [symbol]);
+      } else {
+        await db.execute(
+          `UPDATE uk_s104_pool SET total_quantity = ?, total_cost_gbp = ? WHERE symbol = ?`,
+          [newQty, newCost, symbol]
+        );
+      }
+    }
+    console.log(`[tax] UK S104 pool updated for ${symbol}`);
+  } catch (e) {
+    console.error('[tax] updateS104Pool error:', e.message);
   }
 }
 
@@ -2155,6 +2350,26 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
     );
     const journalId = result.insertId;
 
+    // Tax lot tracking — US HIFO disposal / buy lot recording
+    if (action === 'buy') {
+      await addTaxLot(
+        symbol.replace('-USD', ''), 'revolut', absQty, price,
+        new Date(), journalId, 'Buy detected via auto-log'
+      );
+    }
+    if (action === 'sell') {
+      const disposals = await disposeTaxLotsHIFO(
+        symbol.replace('-USD', ''), absQty, price, new Date(), journalId
+      );
+      if (disposals.length > 0) {
+        const totalGL = disposals.reduce((s, d) => s + d.gain_loss_usd, 0);
+        const hasLong = disposals.some(d => d.is_long_term);
+        const hasShort = disposals.some(d => !d.is_long_term);
+        const termLabel = hasLong && hasShort ? 'mixed' : hasLong ? 'long-term' : 'short-term';
+        console.log(`[tax] US HIFO: ${totalGL >= 0 ? 'Gain' : 'Loss'} $${Math.abs(totalGL).toFixed(2)} (${termLabel})`);
+      }
+    }
+
     // If sell: record outcome with full P&L notification
     let pnlLine = '';
     if (action === 'sell') {
@@ -2215,6 +2430,15 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
         console.error('[entry] avg entry update error:', e.message);
       }
     }
+
+    // Update balance snapshot immediately so position quantities stay accurate
+    // without waiting for the next scheduled portfolio check
+    previousBalances.set(symbol, currentQty);
+    await db.execute(
+      'INSERT INTO balance_snapshots (symbol, quantity) VALUES (?, ?) ON DUPLICATE KEY UPDATE quantity = VALUES(quantity)',
+      [symbol, currentQty]
+    ).catch(e => console.error('[balance] snapshot update failed:', e.message));
+    console.log(`[balance] ${symbol} quantity updated to ${currentQty} after ${action}`);
 
     // Check if Bryan stated his intention for this trade beforehand
     const matchedIntention = await findMatchingIntention(symbol, action);
@@ -4759,6 +4983,98 @@ app.put('/api/auto-rules/:id/toggle', async (req, res) => {
     await db.execute('UPDATE auto_trade_rules SET active = NOT active WHERE id = ?', [req.params.id]);
     const [rows] = await db.execute('SELECT active FROM auto_trade_rules WHERE id = ?', [req.params.id]);
     res.json({ ok: true, active: rows[0]?.active });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Tax Lot API Endpoints ─────────────────────────────────────────────────────
+
+// GET /api/tax/lots — all tax lots (optionally filter by symbol and/or status)
+app.get('/api/tax/lots', async (req, res) => {
+  try {
+    const { symbol, status } = req.query;
+    let query = 'SELECT * FROM tax_lots WHERE 1=1';
+    const params = [];
+    if (symbol) { query += ' AND symbol = ?'; params.push(symbol.toUpperCase()); }
+    if (status) { query += ' AND lot_status = ?'; params.push(status); }
+    query += ' ORDER BY acquired_at DESC';
+    const [rows] = await db.execute(query, params);
+    res.json(rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/tax/summary — current-year gain/loss summary (US HIFO + UK S104)
+app.get('/api/tax/summary', async (req, res) => {
+  try {
+    const [closedLots] = await db.execute(
+      `SELECT symbol,
+        SUM(gain_loss_usd) as total_gain_loss,
+        SUM(CASE WHEN is_long_term = 1 THEN gain_loss_usd ELSE 0 END) as long_term_gain_loss,
+        SUM(CASE WHEN is_long_term = 0 THEN gain_loss_usd ELSE 0 END) as short_term_gain_loss,
+        COUNT(*) as disposals
+       FROM tax_lots
+       WHERE lot_status IN ('closed', 'partial') AND YEAR(disposed_at) = YEAR(NOW())
+       GROUP BY symbol ORDER BY total_gain_loss DESC`
+    );
+
+    const totalGL    = closedLots.reduce((s, r) => s + parseFloat(r.total_gain_loss   || 0), 0);
+    const longTermGL = closedLots.reduce((s, r) => s + parseFloat(r.long_term_gain_loss  || 0), 0);
+    const shortTermGL = closedLots.reduce((s, r) => s + parseFloat(r.short_term_gain_loss || 0), 0);
+
+    const [s104] = await db.execute('SELECT * FROM uk_s104_pool ORDER BY symbol');
+
+    res.json({
+      us_hifo: {
+        total_gain_loss_usd: totalGL.toFixed(2),
+        long_term_gain_loss_usd: longTermGL.toFixed(2),
+        short_term_gain_loss_usd: shortTermGL.toFixed(2),
+        by_symbol: closedLots
+      },
+      uk_s104: {
+        pools: s104,
+        note: 'S104 average cost pool — used for UK CGT calculation'
+      },
+      tax_year: new Date().getFullYear(),
+      disclaimer: 'For informational purposes only. Consult a qualified tax advisor for US and UK filing.'
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/tax/export — CSV export for tax software
+app.get('/api/tax/export', async (req, res) => {
+  try {
+    const [lots] = await db.execute(
+      `SELECT * FROM tax_lots WHERE lot_status IN ('closed', 'partial') ORDER BY disposed_at ASC`
+    );
+
+    const csv = [
+      'Symbol,Exchange,Quantity,Cost Per Unit,Cost Basis USD,Acquired Date,Disposed Date,Disposal Price,Disposal Value USD,Gain Loss USD,Holding Days,Term',
+      ...lots.map(l => [
+        l.symbol, l.exchange, l.quantity, l.cost_per_unit, l.cost_basis_usd,
+        l.acquired_at, l.disposed_at, l.disposal_price, l.disposal_value_usd,
+        l.gain_loss_usd, l.holding_days,
+        l.is_long_term ? 'long-term' : 'short-term'
+      ].join(','))
+    ].join('\n');
+
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', 'attachment; filename="crypto-tax-lots.csv"');
+    res.send(csv);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/tax/backfill — manually add a historical tax lot
+app.post('/api/tax/backfill', async (req, res) => {
+  try {
+    const { symbol, exchange, quantity, cost_per_unit, acquired_at, notes } = req.body;
+    if (!symbol || !quantity || !cost_per_unit || !acquired_at) {
+      return res.status(400).json({ error: 'symbol, quantity, cost_per_unit, acquired_at required' });
+    }
+    await addTaxLot(
+      symbol.toUpperCase(), exchange || 'revolut',
+      parseFloat(quantity), parseFloat(cost_per_unit),
+      new Date(acquired_at), null, notes || 'Backfilled historical position'
+    );
+    res.json({ ok: true, symbol: symbol.toUpperCase(), quantity, cost_per_unit, acquired_at });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
