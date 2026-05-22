@@ -4320,28 +4320,33 @@ function createMcpServer() {
     }
   );
 
-  // ── Tool: execute_kraken_trade ────────────────────────────────────────────
+  // ── Tool: execute_kraken_trade (unified — handles Kraken + Revolut X) ─────
   server.tool('execute_kraken_trade',
-    'Request Telegram approval to execute a trade on Kraken. Sends details to Telegram; user must reply "approve trade" to confirm.',
+    'Request Telegram approval to execute a trade on Kraken or Revolut X. Sends details to Telegram — user must reply "approve trade" to confirm.',
     {
-      symbol:     z.string().describe('Trading pair e.g. ZK-USD or ZK'),
+      exchange:   z.enum(['kraken', 'revolut']).describe('Which exchange to trade on'),
+      symbol:     z.string().describe('Trading pair e.g. SOL-USD or LINK-USD'),
       side:       z.enum(['buy', 'sell']).describe('Buy or sell'),
       order_type: z.enum(['market', 'limit']).describe('Market or limit order'),
-      volume:     z.number().describe('Amount of the base asset to trade'),
-      price:      z.number().optional().describe('Limit price (required for limit orders)'),
+      volume:     z.number().describe('Amount of base currency to trade'),
+      price:      z.number().optional().describe('Limit price — required for limit orders'),
     },
-    async ({ symbol, side, order_type, volume, price }) => {
-      const sym        = symbol.includes('-USD') ? symbol.toUpperCase() : `${symbol.toUpperCase()}-USD`;
-      const coinBase   = sym.replace('-USD', '');
-      const livePrice  = price || await getCurrentPrice(sym).catch(() => null);
-      const valueUSD   = livePrice ? livePrice * volume : null;
+    async ({ exchange, symbol, side, order_type, volume, price }) => {
+      const sym           = symbol.includes('-USD') ? symbol.toUpperCase() : `${symbol.toUpperCase()}-USD`;
+      const coinBase      = sym.replace('-USD', '');
+      const livePrice     = price || await getCurrentPrice(sym).catch(() => null);
+      const valueUSD      = livePrice ? livePrice * volume : null;
+      const exchangeLabel = exchange === 'revolut' ? 'Revolut X' : 'Kraken';
 
-      // Store pending trade for Telegram approval
-      pendingKrakenTrade = { symbol: sym, side, orderType: order_type, volume, price: livePrice, valueUSD };
+      if (exchange === 'revolut') {
+        pendingRevolutTrade = { symbol: sym, side, orderType: order_type, baseSize: volume, price: livePrice, valueUSD };
+      } else {
+        pendingKrakenTrade = { symbol: sym, side, orderType: order_type, volume, price: livePrice, valueUSD };
+      }
 
       await sendTelegram(
         `🔔 <b>TRADE APPROVAL REQUIRED</b>\n\n` +
-        `Exchange: Kraken\n` +
+        `Exchange: ${exchangeLabel}\n` +
         `Action: <b>${side.toUpperCase()} ${volume} ${coinBase}</b>\n` +
         `Type: ${order_type}\n` +
         `Price: ${livePrice ? fmtPriceShort(livePrice) : 'market'}\n` +
@@ -4349,49 +4354,13 @@ function createMcpServer() {
         `Reply <b>'approve trade'</b> to execute\n` +
         `Reply <b>'cancel trade'</b> to abort`
       );
-      return { content: [{ type: 'text', text: JSON.stringify({
-        ok: true,
-        status: 'pending_approval',
-        message: `Approval request sent to Telegram. Reply "approve trade" to execute ${side} ${volume} ${coinBase}.`,
-        symbol: sym, side, order_type, volume, price: livePrice, valueUSD
-      }) }] };
-    }
-  );
-
-  // ── Tool: execute_revolut_trade ──────────────────────────────────────────
-  server.tool('execute_revolut_trade',
-    'Request Telegram approval to execute a trade on Revolut X. Sends details to Telegram — user must reply "approve trade" to confirm.',
-    {
-      symbol:     z.string().describe('Trading pair e.g. LINK-USD or LINK'),
-      side:       z.enum(['buy', 'sell']).describe('Buy or sell'),
-      order_type: z.enum(['market', 'limit']).describe('Market or limit order'),
-      base_size:  z.number().describe('Amount of base currency to trade e.g. 10 for 10 LINK'),
-      price:      z.number().optional().describe('Limit price — required for limit orders'),
-    },
-    async ({ symbol, side, order_type, base_size, price }) => {
-      const sym      = symbol.includes('-USD') ? symbol.toUpperCase() : `${symbol.toUpperCase()}-USD`;
-      const coinBase = sym.replace('-USD', '');
-      const livePrice = price || await getCurrentPrice(sym).catch(() => null);
-      const valueUSD  = livePrice ? livePrice * base_size : null;
-
-      pendingRevolutTrade = { symbol: sym, side, orderType: order_type, baseSize: base_size, price: livePrice, valueUSD };
-
-      await sendTelegram(
-        `🔔 <b>TRADE APPROVAL REQUIRED</b>\n\n` +
-        `Exchange: Revolut X\n` +
-        `Action: <b>${side.toUpperCase()} ${base_size} ${coinBase}</b>\n` +
-        `Type: ${order_type}\n` +
-        `Price: ${livePrice ? fmtPriceShort(livePrice) : 'market'}\n` +
-        `Value: ~${valueUSD ? '$' + valueUSD.toFixed(2) : 'unknown'}\n\n` +
-        `Reply <b>'approve trade'</b> to execute\n` +
-        `Reply <b>'cancel trade'</b> to abort`
-      );
 
       return { content: [{ type: 'text', text: JSON.stringify({
         ok: true,
         status: 'pending_approval',
-        message: `Approval request sent to Telegram. Reply "approve trade" to execute ${side} ${base_size} ${coinBase} on Revolut X.`,
-        symbol: sym, side, order_type, base_size, price: livePrice, valueUSD,
+        exchange,
+        message: `Approval request sent to Telegram. Reply "approve trade" to execute ${side} ${volume} ${coinBase} on ${exchangeLabel}.`,
+        symbol: sym, side, order_type, volume, price: livePrice, valueUSD,
       }) }] };
     }
   );
