@@ -64,20 +64,37 @@ async function placeRevolutOrder(symbol, side, orderType, baseSize, price = null
     throw new Error(`Order value $${orderValue.toFixed(2)} is below Revolut X minimum of $10. Increase size.`);
   }
   const clientOrderId = randomUUID();
+
+  // Look up the exact symbol format from live tickers instead of guessing
+  const tickerResponse = await revolutRequest('GET', '/tickers');
+  const tickerList = Array.isArray(tickerResponse) ? tickerResponse : (tickerResponse.data || []);
+  const baseCurrency = symbol.replace('-USD', '').replace('-USDT', '').replace('-USDC', '');
+  const matchingTicker = tickerList.find(t =>
+    t.symbol === `${baseCurrency}/USD` ||
+    t.symbol === `${baseCurrency}/USDT` ||
+    t.symbol === `${baseCurrency}/USDC` ||
+    t.symbol?.startsWith(`${baseCurrency}/`)
+  );
+  if (!matchingTicker) {
+    throw new Error(`No trading pair found for ${baseCurrency} on Revolut X. This coin may not be available.`);
+  }
+  const revolutSymbol = matchingTicker.symbol;
+  console.log(`[revolut] Resolved symbol: ${symbol} → ${revolutSymbol}`);
+
   const orderConfig = orderType === 'limit' && price
     ? { limit: { base_size: baseSize.toString(), price: price.toString() } }
     : { market: { base_size: baseSize.toString() } };
   const body = {
     client_order_id: clientOrderId,
-    symbol: symbol.includes('-USD') ? symbol.replace('-USD', '/USD') : symbol,
+    symbol: revolutSymbol,
     side: side.toUpperCase(),
     order_configuration: orderConfig,
   };
   console.log('[revolut] Placing order:', JSON.stringify(body));
   const result = await revolutRequest('POST', '/orders', body);
   console.log('[revolut] Full order response:', JSON.stringify(result));
-  if (result.error || result.errors) {
-    throw new Error(JSON.stringify(result.error || result.errors));
+  if (result.message || result.error || result.errors) {
+    throw new Error(result.message || JSON.stringify(result.error || result.errors));
   }
   return { ...result, client_order_id: clientOrderId };
 }
