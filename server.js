@@ -73,21 +73,9 @@ async function placeRevolutOrder(symbol, side, orderType, baseSize, price = null
   }
   const clientOrderId = randomUUID();
 
-  // Look up the exact symbol format from live tickers instead of guessing
-  const tickerResponse = await revolutRequest('GET', '/tickers');
-  const tickerList = Array.isArray(tickerResponse) ? tickerResponse : (tickerResponse.data || []);
-  const baseCurrency = symbol.replace('-USD', '').replace('-USDT', '').replace('-USDC', '');
-  const matchingTicker = tickerList.find(t =>
-    t.symbol === `${baseCurrency}/USD` ||
-    t.symbol === `${baseCurrency}/USDT` ||
-    t.symbol === `${baseCurrency}/USDC` ||
-    t.symbol?.startsWith(`${baseCurrency}/`)
-  );
-  if (!matchingTicker) {
-    throw new Error(`No trading pair found for ${baseCurrency} on Revolut X. This coin may not be available.`);
-  }
-  const revolutSymbol = matchingTicker.symbol;
-  console.log(`[revolut] Resolved symbol: ${symbol} → ${revolutSymbol}`);
+  // Orders API uses dash format (LINK-USD), tickers API uses slash (LINK/USD)
+  const revolutSymbol = symbol.includes('-USD') ? symbol.toUpperCase() : `${symbol.toUpperCase()}-USD`;
+  console.log(`[revolut] Using order symbol: ${revolutSymbol}`);
 
   const orderConfig = orderType === 'limit' && price
     ? { limit: { base_size: baseSize.toString(), price: price.toString() } }
