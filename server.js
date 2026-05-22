@@ -471,6 +471,20 @@ await db.execute(`CREATE TABLE IF NOT EXISTS rebalance_log (
   INDEX idx_checked (checked_at)
 )`);
 
+await db.execute(`CREATE TABLE IF NOT EXISTS trade_intentions (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  symbol VARCHAR(50) NOT NULL,
+  action VARCHAR(10) NOT NULL,
+  reasoning TEXT NOT NULL,
+  emotion VARCHAR(20) DEFAULT 'confident',
+  stated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  matched_journal_id INT NULL,
+  matched_at TIMESTAMP NULL,
+  expires_at TIMESTAMP NOT NULL,
+  INDEX idx_symbol_action (symbol, action),
+  INDEX idx_expires (expires_at)
+)`);
+
 // Add direction column to price_targets if it doesn't exist
 try {
   await db.execute(`ALTER TABLE price_targets ADD COLUMN direction VARCHAR(4) NOT NULL DEFAULT 'up'`);
@@ -1924,6 +1938,30 @@ async function checkForRebalancePair(newSymbol, newAction, newJournalId, newPric
   }
 }
 
+async function findMatchingIntention(symbol, action) {
+  try {
+    // Broaden match: sell/reduce are equivalent, buy/add are equivalent
+    const normalizedAction = action === 'sell' ? ['sell', 'reduce']
+                           : action === 'buy'  ? ['buy', 'add']
+                           : [action];
+    const placeholders = normalizedAction.map(() => '?').join(',');
+    const [rows] = await db.execute(
+      `SELECT * FROM trade_intentions
+       WHERE symbol = ?
+       AND action IN (${placeholders})
+       AND matched_at IS NULL
+       AND expires_at > NOW()
+       ORDER BY stated_at DESC
+       LIMIT 1`,
+      [symbol, ...normalizedAction]
+    );
+    return rows.length > 0 ? rows[0] : null;
+  } catch (e) {
+    console.error('[intention] findMatchingIntention error:', e.message);
+    return null;
+  }
+}
+
 async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
   try {
     const coinBase = symbol.replace('-USD', '');
@@ -2015,7 +2053,38 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
       }
     }
 
-    // Send Telegram notification asking for context
+    // Check if Bryan stated his intention for this trade beforehand
+    const matchedIntention = await findMatchingIntention(symbol, action);
+
+    if (matchedIntention) {
+      // Auto-log with stored reasoning — no questions needed
+      await db.execute(
+        'UPDATE trading_journal SET reasoning = ?, emotion = ? WHERE id = ?',
+        [matchedIntention.reasoning, matchedIntention.emotion, journalId]
+      );
+      await db.execute(
+        'UPDATE trade_intentions SET matched_journal_id = ?, matched_at = NOW() WHERE id = ?',
+        [journalId, matchedIntention.id]
+      );
+      await updateLearningModel().catch(() => {});
+
+      const actionLabel = action === 'buy' ? 'BOUGHT' : action === 'sell' ? 'SOLD' : action.toUpperCase();
+      await sendTelegram(
+        `✅ <b>TRADE AUTO-LOGGED — ${coinBase}</b>\n\n` +
+        `${actionLabel} ~${absQty.toFixed(4)} ${coinBase} @ $${price.toFixed(4)} ($${valueUsd.toFixed(2)})${pnlLine}${avgEntryLine}${reentryNote}\n\n` +
+        `Reason: ${matchedIntention.reasoning}\n` +
+        `Emotion: ${matchedIntention.emotion}\n\n` +
+        `🎯 Matched your earlier intention — no input needed!\n` +
+        `🧠 Journal updated automatically`
+      );
+      console.log(`Auto-logged trade with matched intention: ${symbol} ${action} ${absQty.toFixed(4)} @ $${price.toFixed(4)}`);
+
+      // Still check for rebalancing pair
+      await checkForRebalancePair(symbol, action, journalId, price, absQty, valueUsd);
+      return; // Skip the normal pending context flow
+    }
+
+    // No intention matched — ask for context as normal
     const actionLabel = action === 'buy' ? 'BOUGHT' : action === 'sell' ? 'SOLD' : action.toUpperCase();
     const recLine = claudeRec ? `\n📊 Last Claude rec: ${claudeRec}` : '';
     const reentryLine = reentryNote || '';
@@ -3256,6 +3325,14 @@ cron.schedule('5 9 * * 1', async () => {
 // Daily intention outcome checks — 10 AM, checks for 7-day and 30-day pending follow-ups
 cron.schedule('0 10 * * *', checkIntentionOutcomes, { timezone: 'Europe/London' });
 
+// Daily cleanup — 2 AM: delete expired unmatched trade intentions
+cron.schedule('0 2 * * *', async () => {
+  try {
+    const [r] = await db.execute('DELETE FROM trade_intentions WHERE expires_at < NOW() AND matched_at IS NULL');
+    if (r.affectedRows > 0) console.log(`[intentions] Cleaned up ${r.affectedRows} expired unmatched intention(s)`);
+  } catch (e) { console.error('[intentions] cleanup error:', e.message); }
+}, { timezone: 'Europe/London' });
+
 // Daily rebalancing outcome checks — 10:05 AM (7-day + 30-day)
 cron.schedule('5 10 * * *', checkRebalancingOutcomes, { timezone: 'Europe/London' });
 
@@ -3693,6 +3770,35 @@ function createMcpServer() {
     const data = await revolutRequest('GET', '/orders/active');
     return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
   });
+
+  // ── Tool: log_trade_intention ─────────────────────────────────────────────
+  server.tool('log_trade_intention',
+    'Log Bryan\'s intention to make a trade so when it executes the reason is auto-logged without asking',
+    {
+      symbol:        z.string().describe('Coin e.g. HYPE-USD or HYPE'),
+      action:        z.enum(['buy', 'sell', 'reduce', 'add']).describe('Intended action'),
+      reasoning:     z.string().describe('Why Bryan plans to make this trade'),
+      emotion:       z.string().optional().describe('Emotional state e.g. confident, uncertain'),
+      expires_hours: z.number().optional().describe('Hours until intention expires (default 24)'),
+    },
+    async ({ symbol, action, reasoning, emotion, expires_hours }) => {
+      const sym = symbol.includes('-USD') ? symbol.toUpperCase() : `${symbol.toUpperCase()}-USD`;
+      const expiresHours = expires_hours || 24;
+      const [result] = await db.execute(
+        'INSERT INTO trade_intentions (symbol, action, reasoning, emotion, expires_at) VALUES (?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL ? HOUR))',
+        [sym, action, reasoning, emotion || 'confident', expiresHours]
+      );
+      await sendTelegram(
+        `🎯 <b>TRADE INTENTION LOGGED — ${sym.replace('-USD', '')}</b>\n\n` +
+        `Action: ${action.toUpperCase()}\n` +
+        `Reason: ${reasoning}\n` +
+        `Emotion: ${emotion || 'confident'}\n` +
+        `Expires in: ${expiresHours}h\n\n` +
+        `When you execute this trade it will auto-log without asking!`
+      );
+      return { content: [{ type: 'text', text: JSON.stringify({ ok: true, id: result.insertId, symbol: sym, action, reasoning, expires_hours: expiresHours }) }] };
+    }
+  );
 
   // ── Tool: log_journal_entry ───────────────────────────────────────────────
   server.tool('log_journal_entry',
@@ -6168,176 +6274,4 @@ Active alerts (coins currently above threshold): ${[...alertState.active.keys()]
           } catch (e) { /* ignore */ }
         }, 60000);
 
-        const response = await Promise.race([claudePromise, timeoutPromise]);
-        clearTimeout(stillResearchingTimer);
-        clearTimeout(stillResearchingTimer2);
-
-        // Extract the last text block (web_search may produce tool_use blocks before the final text)
-        const lastTextBlock = [...response.content].reverse().find(b => b.type === 'text');
-        const reply = lastTextBlock ? lastTextBlock.text : '(no response)';
-
-        // Update last recommendation context for intention tracking
-        try {
-          const recCoins = holdings.filter(h => reply.toUpperCase().includes(h.symbol.replace('-USD', ''))).map(h => h.symbol.replace('-USD', ''));
-          const recActionMatch = reply.match(/\*\*(HOLD|SELL|BUY MORE|BUY|REDUCE|ADD)\*\*/i) || reply.match(/\b(HOLD|SELL|BUY|REDUCE|ADD)\b/i);
-          lastRecommendationContext.set(chatIdStr, {
-            coins: recCoins.length > 0 ? recCoins : [],
-            action: recActionMatch ? recActionMatch[1].toUpperCase() : 'HOLD',
-            rawReply: reply,
-            timestamp: Date.now()
-          });
-        } catch (e) { /* ignore */ }
-
-        // Extract recommendation from Claude's reply and save to analysis_history
-        try {
-          const recMatch = reply.match(/\*\*(HOLD|SELL|BUY MORE|BUY|REDUCE|ADD)\*\*/i) || reply.match(/^(HOLD|SELL|BUY MORE|BUY|REDUCE|ADD)\b/im);
-          if (recMatch) {
-            const rec = recMatch[1].toUpperCase();
-            const coinInMsg = userMessage.match(/\b([A-Z]{2,10})\b/);
-            const coinBase = coinInMsg ? coinInMsg[1] : null;
-            const symbol = coinBase && !SKIP_WORDS.has(coinBase) ? `${coinBase}-USD` : null;
-            if (symbol) {
-              const priceNow = await getCurrentPrice(symbol).catch(() => null);
-              const summary = reply.substring(0, 500);
-              await db.execute(
-                'INSERT INTO analysis_history (symbol, analysis_type, price_at_analysis, recommendation, claude_summary) VALUES (?, ?, ?, ?, ?)',
-                [symbol, 'telegram_analysis', priceNow, rec, summary]
-              ).catch(() => {});
-            }
-          }
-        } catch (e) { /* ignore */ }
-
-        // Update in-memory history
-        const updatedHistory = [
-          ...history,
-          { role: 'user', content: userMessage },
-          { role: 'assistant', content: reply }
-        ];
-        // Keep last 10 exchanges (20 messages)
-        const trimmed = updatedHistory.slice(-20);
-        conversationHistory.set(chatIdStr, trimmed);
-
-        // Persist to DB
-        await db.execute('INSERT INTO conversation_history (chat_id, role, content) VALUES (?, ?, ?)', [chatId, 'user', userMessage]);
-        await db.execute('INSERT INTO conversation_history (chat_id, role, content) VALUES (?, ?, ?)', [chatId, 'assistant', reply]);
-
-        // Clean up old rows (keep last 20 per chat)
-        await db.execute('DELETE FROM conversation_history WHERE chat_id = ? AND id NOT IN (SELECT id FROM (SELECT id FROM conversation_history WHERE chat_id = ? ORDER BY created_at DESC LIMIT 20) t)', [chatId, chatId]);
-
-        // Check if Claude's response implies it set a threshold — actually execute it
-        const claudeAlertPatterns = [
-          /(?:alert(?:ing)?\s+you|set\s+(?:up\s+)?(?:an?\s+)?alert|creat(?:ed?)?\s+(?:an?\s+)?alert|threshold\s+set|notify\s+you|notification\s+set)\s+.*?([A-Za-z]{2,10}(?:-USD)?)\s+.*?([\d.]+)\s*%/i,
-          /([A-Za-z]{2,10}(?:-USD)?)\s+.*?(?:alert|threshold|notification)\s+.*?([\d.]+)\s*%/i,
-          /threshold.*?([A-Za-z]{2,10}(?:-USD)?)\s+.*?([\d.]+)\s*%/i,
-        ];
-
-        let actionTaken = null;
-        for (const pattern of claudeAlertPatterns) {
-          const m = reply.match(pattern);
-          if (m) {
-            const coinBase = m[1].toUpperCase();
-            // Skip common false positives
-            if (['THE', 'FOR', 'AND', 'YOU', 'SET', 'GET', 'HAS', 'ARE'].includes(coinBase)) continue;
-            const symbol = coinBase.endsWith('-USD') ? coinBase : `${coinBase}-USD`;
-            const threshold = parseFloat(m[2]) / 100;
-            if (threshold > 0 && threshold <= 1) { // sanity check: 0–100%
-              const { oldThreshold, newThreshold } = await setThreshold(symbol, threshold);
-              const newPct = (newThreshold * 100).toFixed(1);
-              const oldPct = (oldThreshold * 100).toFixed(1);
-              actionTaken = `\n\n✅ Actually saved to server - ${symbol} threshold changed to ${newPct}% (was ${oldPct}%). Old alert cancelled and monitoring restarted fresh from current price.`;
-            }
-            break;
-          }
-        }
-
-        // FIX 5: Log response length before sending
-        const fullReply = reply + (actionTaken || '');
-        console.log('Claude response length:', fullReply.length, 'characters');
-        console.log('Sending in', Math.ceil(fullReply.length / 2500), 'message(s)');
-        console.log('ABOUT TO CHUNK: response length:', fullReply.length);
-        console.log('FULL REPLY STARTS WITH:', fullReply.substring(0, 200).replace(/\n/g, '|'));
-        console.log('CHUNK 1 WILL START WITH:', fullReply.substring(0, 100).replace(/\n/g, '|'));
-
-        // 5s gap after status message so chunks don't collide with it
-        await new Promise(r => setTimeout(r, 5000));
-        await sendTelegramChunked(fullReply);
-      } catch (err) {
-        console.error('Claude AI error:', err.message);
-        clearTimeout(stillResearchingTimer);
-        clearTimeout(stillResearchingTimer2);
-        if (err.message === 'timeout') {
-          // FIX 3: Fallback simpler Claude call — no web search, max 30s, max_tokens 500
-          try {
-            const fallbackPromise = anthropic.messages.create({
-              model: 'claude-sonnet-4-5',
-              max_tokens: 500,
-              system: `You are a crypto advisor. Here are the user's current holdings:\n${holdingsList || 'Portfolio data unavailable'}\nAnswer the user's question briefly in 2-3 sentences. Be direct and actionable.`,
-              messages: [{ role: 'user', content: userMessage }],
-            });
-            const fallbackTimeout = new Promise((_, reject) =>
-              setTimeout(() => reject(new Error('fallback_timeout')), 30000)
-            );
-            const fallbackResponse = await Promise.race([fallbackPromise, fallbackTimeout]);
-            const fallbackBlock = [...fallbackResponse.content].reverse().find(b => b.type === 'text');
-            const fallbackText = fallbackBlock ? fallbackBlock.text : null;
-            if (fallbackText) {
-              await sendReply(`⚡ <b>Quick take</b> (full analysis timed out):\n\n${fallbackText}\n\n<i>Tip: Ask about one specific coin at a time for deeper analysis.</i>`);
-            } else {
-              await sendReply('⏱️ Analysis timed out. Try asking about one specific coin at a time.');
-            }
-          } catch (fallbackErr) {
-            await sendReply('⏱️ Analysis timed out. Try asking about one specific coin at a time.');
-          }
-        } else {
-          await sendReply('❌ Error getting AI response: ' + err.message);
-        }
-      }
-    })();
-
-  } catch (err) {
-    console.error('Telegram webhook error:', err.message);
-    if (!res.headersSent) {
-      res.status(200).json({ ok: true });
-    }
-  }
-});
-
-// GET /telegram-setup — register the webhook URL with Telegram
-app.get('/telegram-setup', async (req, res) => {
-  const token = process.env.TELEGRAM_BOT_TOKEN;
-  const webhookUrl = 'https://revolut-claude-production.up.railway.app/telegram-webhook';
-  const response = await fetch(`https://api.telegram.org/bot${token}/setWebhook?url=${webhookUrl}`);
-  const data = await response.json();
-  res.json(data);
-});
-
-// Seed default trader profile entries if not already set
-const TRADER_PROFILE_DEFAULTS = [
-  { key: 'goal',             value: 'Recover portfolio losses and become a disciplined profitable swing trader' },
-  { key: 'situation',        value: 'Portfolio approximately 50% down from historical highs' },
-  { key: 'style',            value: 'Swing trader - buy dips sell pumps' },
-  { key: 'weakness',         value: 'Past trading decisions led to significant losses - working to improve discipline' },
-  { key: 'strength',         value: 'Good instincts on institutional plays like CC and LINK' },
-  { key: 'core_strategy',    value: 'Swing trader focused on extreme price movements. Buys sudden sharp dips outside normal price pattern. Sells sudden sharp pumps outside normal price pattern. Always looking to capture profit on big moves and buy back on retraces.' },
-  { key: 'buy_signals',      value: 'Sudden extreme drop outside normal trading range — potential dip buy opportunity' },
-  { key: 'sell_signals',     value: 'Sudden extreme pump outside normal trading range — potential profit taking opportunity' },
-  { key: 'retrace_strategy', value: 'After selling a pump, waits for retrace and buys back at lower price to repeat the cycle' },
-  { key: 'loss_protection',  value: 'Will sell to protect against further losses if coin drops significantly with no recovery catalyst' },
-  { key: 'profit_capture',   value: 'Takes profits on substantial rises then looks to buy back on retrace' },
-  { key: 'trading_goal',     value: 'Portfolio recovery from 50% down — building back through disciplined swing trading' },
-  { key: 'risk_approach',    value: 'Protects downside while capturing upside on extreme moves' },
-];
-(async () => {
-  for (const { key, value } of TRADER_PROFILE_DEFAULTS) {
-    await db.execute(
-      'INSERT INTO trader_profile (preference_key, preference_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE preference_key = preference_key',
-      [key, value]
-    ).catch(() => {});
-  }
-  console.log('Trader profile defaults seeded.');
-})();
-
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+        const response = awa
