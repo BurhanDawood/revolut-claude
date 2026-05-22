@@ -53,8 +53,16 @@ async function revolutRequest(method, path, body = null) {
   };
   const fetchOptions = { method, headers };
   if (body) fetchOptions.body = bodyString;
+  if (method === 'POST') {
+    console.log('[revolut] Request URL:', `${BASE_URL}${path}`);
+    console.log('[revolut] Signature message (first 120):', message.substring(0, 120));
+  }
   const response = await fetch(`${BASE_URL}${path}`, fetchOptions);
   const text = await response.text();
+  if (method === 'POST') {
+    console.log('[revolut] Response status:', response.status);
+    console.log('[revolut] Response body:', text);
+  }
   return JSON.parse(text);
 }
 
