@@ -66,7 +66,7 @@ async function revolutRequest(method, path, body = null) {
   return JSON.parse(text);
 }
 
-async function placeRevolutOrder(symbol, side, orderType, baseSize, price = null) {
+async function placeRevolutOrder(symbol, side, orderType, baseSize, price = null, valueUsd = null) {
   const clientOrderId = randomUUID();
 
   // Orders API uses dash format (LINK-USD), tickers API uses slash (LINK/USD)
@@ -75,7 +75,9 @@ async function placeRevolutOrder(symbol, side, orderType, baseSize, price = null
 
   const orderConfig = orderType === 'limit' && price
     ? { limit: { base_size: baseSize.toString(), price: price.toString() } }
-    : { market: { base_size: baseSize.toString() } };
+    : valueUsd
+      ? { market: { quote_size: valueUsd.toString() } }
+      : { market: { base_size: baseSize.toString() } };
   const body = {
     client_order_id: clientOrderId,
     symbol: revolutSymbol,
@@ -4437,29 +4439,31 @@ function createMcpServer() {
       symbol:     z.string().describe('Trading pair e.g. SOL-USD or LINK-USD'),
       side:       z.enum(['buy', 'sell']).describe('Buy or sell'),
       order_type: z.enum(['market', 'limit']).describe('Market or limit order'),
-      volume:     z.number().describe('Amount of base currency to trade'),
+      volume:     z.number().optional().describe('Amount of base currency to trade e.g. 1.3 for 1.3 NEAR — use value_usd instead for Revolut market orders'),
+      value_usd:  z.number().optional().describe('USD value to trade — Revolut calculates tokens automatically. Use instead of volume for cleaner execution e.g. 3 for $3 of NEAR'),
       price:      z.number().optional().describe('Limit price — required for limit orders'),
     },
-    async ({ exchange, symbol, side, order_type, volume, price }) => {
+    async ({ exchange, symbol, side, order_type, volume, value_usd, price }) => {
       const sym           = symbol.includes('-USD') ? symbol.toUpperCase() : `${symbol.toUpperCase()}-USD`;
       const coinBase      = sym.replace('-USD', '');
       const livePrice     = price || await getCurrentPrice(sym).catch(() => null);
-      const valueUSD      = livePrice ? livePrice * volume : null;
+      const tradeValueUSD = value_usd || (livePrice && volume ? livePrice * volume : null);
       const exchangeLabel = exchange === 'revolut' ? 'Revolut X' : 'Kraken';
+      const displayQty    = value_usd ? `$${value_usd}` : `${volume} ${coinBase}`;
 
       if (exchange === 'revolut') {
-        pendingRevolutTrade = { symbol: sym, side, orderType: order_type, baseSize: volume, price: livePrice, valueUSD, timestamp: Date.now() };
+        pendingRevolutTrade = { symbol: sym, side, orderType: order_type, baseSize: volume || 0, valueUsd: value_usd || null, price: livePrice, valueUSD: tradeValueUSD, timestamp: Date.now() };
       } else {
-        pendingKrakenTrade = { symbol: sym, side, orderType: order_type, volume, price: livePrice, valueUSD, timestamp: Date.now() };
+        pendingKrakenTrade = { symbol: sym, side, orderType: order_type, volume: volume || 0, price: livePrice, valueUSD: tradeValueUSD, timestamp: Date.now() };
       }
 
       await sendTelegram(
         `🔔 <b>TRADE APPROVAL REQUIRED</b>\n\n` +
         `Exchange: ${exchangeLabel}\n` +
-        `Action: <b>${side.toUpperCase()} ${volume} ${coinBase}</b>\n` +
+        `Action: <b>${side.toUpperCase()} ${displayQty}${value_usd ? ` of ${coinBase}` : ''}</b>\n` +
         `Type: ${order_type}\n` +
         `Price: ${livePrice ? fmtPriceShort(livePrice) : 'market'}\n` +
-        `Value: ~${valueUSD ? '$' + valueUSD.toFixed(2) : 'unknown'}\n\n` +
+        `Value: ~${tradeValueUSD ? '$' + tradeValueUSD.toFixed(2) : 'unknown'}\n\n` +
         `Reply <b>'approve trade'</b> to execute\n` +
         `Reply <b>'cancel trade'</b> to abort`
       );
@@ -4468,8 +4472,8 @@ function createMcpServer() {
         ok: true,
         status: 'pending_approval',
         exchange,
-        message: `Approval request sent to Telegram. Reply "approve trade" to execute ${side} ${volume} ${coinBase} on ${exchangeLabel}.`,
-        symbol: sym, side, order_type, volume, price: livePrice, valueUSD,
+        message: `Approval request sent to Telegram. Reply "approve trade" to execute ${side} ${displayQty}${value_usd ? ` of ${coinBase}` : ''} on ${exchangeLabel}.`,
+        symbol: sym, side, order_type, volume, value_usd, price: livePrice, valueUSD: tradeValueUSD,
       }) }] };
     }
   );
@@ -5381,7 +5385,7 @@ app.post('/telegram-webhook', async (req, res) => {
         res.status(200).json({ ok: true });
         (async () => {
           try {
-            const result = await placeRevolutOrder(t.symbol, t.side, t.orderType, t.baseSize, t.price);
+            const result = await placeRevolutOrder(t.symbol, t.side, t.orderType, t.baseSize, t.price, t.valueUsd);
             const coinBase = t.symbol.replace('-USD', '');
             const executedPrice = t.price || await getCurrentPrice(t.symbol).catch(() => 0) || 0;
             const valueUSD = executedPrice * parseFloat(t.baseSize);
