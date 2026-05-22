@@ -67,10 +67,6 @@ async function revolutRequest(method, path, body = null) {
 }
 
 async function placeRevolutOrder(symbol, side, orderType, baseSize, price = null) {
-  const orderValue = baseSize * (price || 0);
-  if (orderValue < 10) {
-    throw new Error(`Order value $${orderValue.toFixed(2)} is below Revolut X minimum of $10. Increase size.`);
-  }
   const clientOrderId = randomUUID();
 
   // Orders API uses dash format (LINK-USD), tickers API uses slash (LINK/USD)
