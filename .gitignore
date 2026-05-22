@@ -1,0 +1,8 @@
+node_modules/
+.env
+_archive_bats/
+*.bat
+*.log
+check_output.txt
+commit_log.txt
+followed
