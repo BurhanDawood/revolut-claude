@@ -6682,6 +6682,18 @@ app.post('/api/revolut/trade', async (req, res) => {
   }
 });
 
+// GET /api/debug/link-pairs — temporary diagnostic: all LINK trading pairs on Revolut X
+app.get('/api/debug/link-pairs', async (req, res) => {
+  try {
+    const tickerResponse = await revolutRequest('GET', '/tickers');
+    const tickerList = Array.isArray(tickerResponse) ? tickerResponse : (tickerResponse.data || []);
+    const linkPairs = tickerList.filter(t => t.symbol?.includes('LINK'));
+    res.json({ total_tickers: tickerList.length, link_pairs: linkPairs });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // DELETE /api/cleanup/trade-intentions — one-time cleanup of unmatched intentions
 app.delete('/api/cleanup/trade-intentions', async (req, res) => {
   try {
