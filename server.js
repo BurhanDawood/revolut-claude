@@ -4448,9 +4448,9 @@ function createMcpServer() {
       const exchangeLabel = exchange === 'revolut' ? 'Revolut X' : 'Kraken';
 
       if (exchange === 'revolut') {
-        pendingRevolutTrade = { symbol: sym, side, orderType: order_type, baseSize: volume, price: livePrice, valueUSD };
+        pendingRevolutTrade = { symbol: sym, side, orderType: order_type, baseSize: volume, price: livePrice, valueUSD, timestamp: Date.now() };
       } else {
-        pendingKrakenTrade = { symbol: sym, side, orderType: order_type, volume, price: livePrice, valueUSD };
+        pendingKrakenTrade = { symbol: sym, side, orderType: order_type, volume, price: livePrice, valueUSD, timestamp: Date.now() };
       }
 
       await sendTelegram(
@@ -5314,8 +5314,27 @@ app.post('/telegram-webhook', async (req, res) => {
 
     // --- Command: approve trade / cancel trade ---
     if (/^approve\s+trade$/i.test(commandText)) {
-      // Check Kraken first
-      if (pendingKrakenTrade) {
+      console.log('[approve] pendingKrakenTrade:', pendingKrakenTrade ? JSON.stringify(pendingKrakenTrade) : 'null');
+      console.log('[approve] pendingRevolutTrade:', pendingRevolutTrade ? JSON.stringify(pendingRevolutTrade) : 'null');
+
+      // Determine which pending trade to execute
+      // If both are set, use the most recently created one (by timestamp)
+      let routeToKraken = false;
+      let routeToRevolut = false;
+      if (pendingKrakenTrade && pendingRevolutTrade) {
+        if (pendingRevolutTrade.timestamp >= pendingKrakenTrade.timestamp) {
+          routeToRevolut = true;
+        } else {
+          routeToKraken = true;
+        }
+      } else if (pendingKrakenTrade) {
+        routeToKraken = true;
+      } else if (pendingRevolutTrade) {
+        routeToRevolut = true;
+      }
+      console.log('[approve] routing to:', routeToRevolut ? 'Revolut X' : routeToKraken ? 'Kraken' : 'none');
+
+      if (routeToKraken) {
         const t = pendingKrakenTrade;
         pendingKrakenTrade = null;
         await sendReply(`⏳ Executing ${t.side.toUpperCase()} ${t.volume} ${t.symbol.replace('-USD','')} on Kraken…`);
@@ -5355,8 +5374,7 @@ app.post('/telegram-webhook', async (req, res) => {
         return;
       }
 
-      // Check Revolut X
-      if (pendingRevolutTrade) {
+      if (routeToRevolut) {
         const t = pendingRevolutTrade;
         pendingRevolutTrade = null;
         await sendReply(`⏳ Executing ${t.side.toUpperCase()} ${t.baseSize} ${t.symbol.replace('-USD','')} on Revolut X…`);
@@ -5422,9 +5440,10 @@ app.post('/telegram-webhook', async (req, res) => {
         return;
       }
 
-      // Neither pending
-      await sendReply('ℹ️ No pending trade to approve.');
-      return res.status(200).json({ ok: true });
+      if (!routeToKraken && !routeToRevolut) {
+        await sendReply('ℹ️ No pending trade to approve.');
+        return res.status(200).json({ ok: true });
+      }
     }
 
     if (/^cancel\s+trade$/i.test(commandText)) {
