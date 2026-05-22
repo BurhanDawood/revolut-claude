@@ -534,6 +534,24 @@ await db.execute(`CREATE TABLE IF NOT EXISTS system_config (
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 )`);
 
+await db.execute(`CREATE TABLE IF NOT EXISTS position_tranches (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  symbol VARCHAR(20) NOT NULL,
+  exchange VARCHAR(20) NOT NULL DEFAULT 'revolut',
+  quantity DECIMAL(20,8) NOT NULL,
+  entry_price DECIMAL(20,8) NOT NULL,
+  entry_date DATETIME NOT NULL,
+  cost_basis DECIMAL(20,8) GENERATED ALWAYS AS (quantity * entry_price) STORED,
+  remaining_quantity DECIMAL(20,8) NOT NULL,
+  is_legacy TINYINT(1) DEFAULT 0,
+  notes VARCHAR(255),
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+)`);
+try {
+  await db.execute(`CREATE INDEX idx_tranches_symbol ON position_tranches(symbol)`);
+} catch (e) { /* index already exists */ }
+
 // Add direction column to price_targets if it doesn't exist
 try {
   await db.execute(`ALTER TABLE price_targets ADD COLUMN direction VARCHAR(4) NOT NULL DEFAULT 'up'`);
@@ -702,11 +720,11 @@ try {
 - Revolut X API: REVOLUTX_API_KEY + REVOLUTX_PRIVATE_KEY in Railway env vars
 - Kraken API: KRAKEN_API_KEY + KRAKEN_PRIVATE_KEY in Railway env vars
 
-### MCP TOOLS (11 active)
+### MCP TOOLS (12 active)
 get_context, get_portfolio_summary, get_portfolio_data,
 get_trading_data, manage_alerts, manage_trading,
 set_entry_price, execute_kraken_trade,
-set_auto_trade_rule, get_auto_rules, get_prices
+set_auto_trade_rule, get_auto_rules, get_prices, get_tranches
 
 ### ROADMAP
 1. Kraken monitoring and trade execution DONE
@@ -714,8 +732,9 @@ set_auto_trade_rule, get_auto_rules, get_prices
 3. SOL fully automated trading DONE
 4. Trade intention system DONE
 5. MCP tools consolidated to 11 DONE
-6. Revolut X trade execution IN PROGRESS
-7. Native mobile app PENDING
+6. Revolut X trade execution DONE
+7. Tranche tracking system DONE
+8. Native mobile app PENDING
 8. Portfolio rebalancing automation PENDING
 9. Auto compound profits PENDING`]
   );
@@ -724,7 +743,67 @@ set_auto_trade_rule, get_auto_rules, get_prices
   console.error('[config] Failed to seed project_description:', e.message);
 }
 
+seedLegacyTranches().catch(e => console.error('[tranches] Startup seed failed:', e.message));
+
 updateLearningModel().catch(() => {});
+
+// ── Tranche Helpers ───────────────────────────────────────────────────────────
+
+async function seedLegacyTranches() {
+  try {
+    const [existing] = await db.execute('SELECT COUNT(*) as count FROM position_tranches WHERE is_legacy = 1');
+    if (existing[0].count > 0) {
+      console.log('[tranches] Legacy tranches already seeded — skipping');
+      return;
+    }
+    const [entries] = await db.execute('SELECT symbol, entry_price FROM entry_prices WHERE entry_price IS NOT NULL AND entry_price > 0');
+    for (const row of entries) {
+      const coinBase = row.symbol.replace('-USD', '');
+      const [balRow] = await db.execute(
+        'SELECT quantity FROM balance_snapshots WHERE symbol = ? ORDER BY created_at DESC LIMIT 1',
+        [row.symbol]
+      );
+      const qty = parseFloat(balRow[0]?.quantity || 0);
+      if (qty <= 0) continue;
+      await db.execute(
+        `INSERT INTO position_tranches (symbol, exchange, quantity, entry_price, entry_date, remaining_quantity, is_legacy, notes)
+         VALUES (?, 'revolut', ?, ?, NOW(), ?, 1, 'Legacy tranche — seeded from avg entry price')`,
+        [coinBase, qty, row.entry_price, qty]
+      );
+      console.log(`[tranches] Seeded legacy tranche: ${coinBase} qty=${qty} entry=${row.entry_price}`);
+    }
+    console.log('[tranches] Legacy tranche seeding complete');
+  } catch (e) {
+    console.error('[tranches] seedLegacyTranches failed:', e.message);
+  }
+}
+
+async function reduceTranches(symbol, exchange, qtySold) {
+  try {
+    const coinBase = symbol.replace('-USD', '');
+    const [tranches] = await db.execute(
+      `SELECT id, remaining_quantity, entry_price FROM position_tranches
+       WHERE symbol = ? AND exchange = ? AND remaining_quantity > 0
+       ORDER BY entry_price DESC`,
+      [coinBase, exchange]
+    );
+    let remaining = parseFloat(qtySold);
+    for (const tranche of tranches) {
+      if (remaining <= 0) break;
+      const available = parseFloat(tranche.remaining_quantity);
+      const toReduce = Math.min(available, remaining);
+      const newQty = available - toReduce;
+      await db.execute(
+        'UPDATE position_tranches SET remaining_quantity = ?, updated_at = NOW() WHERE id = ?',
+        [newQty, tranche.id]
+      );
+      remaining -= toReduce;
+      console.log(`[tranches] Reduced tranche ${tranche.id} (entry $${tranche.entry_price}) by ${toReduce} — remaining: ${newQty}`);
+    }
+  } catch (e) {
+    console.error('[tranches] reduceTranches failed:', e.message);
+  }
+}
 
 // ── Invested Capital Helpers ──────────────────────────────────────────────────
 
@@ -4240,6 +4319,14 @@ function createMcpServer() {
         const threshold = customThresholds[sym] !== undefined ? customThresholds[sym] : PUMP_THRESHOLD;
         const basePrice = basePrices[sym] || null;
         const changeFromBase = basePrice && price ? ((price - basePrice) / basePrice * 100).toFixed(2) : null;
+        const [trancheRows] = await db.execute(
+          `SELECT entry_price, remaining_quantity, is_legacy, entry_date
+           FROM position_tranches
+           WHERE symbol = ? AND remaining_quantity > 0
+           ORDER BY entry_price DESC`,
+          [asset.currency]
+        ).catch(() => [[]]);
+
         positions.push({
           symbol: sym, currency: asset.currency, quantity: qty, price, value_usd: valueUsd ? valueUsd.toFixed(2) : null,
           entry_price: entry, pl_pct: plPct, pl_usd: plUsd,
@@ -4251,6 +4338,12 @@ function createMcpServer() {
           acknowledged: alertState.acknowledged.has(sym),
           ignored: ignoredCoins.has(sym),
           fixed_target: priceTargets.has(sym) ? priceTargets.get(sym) : null,
+          tranches: trancheRows.map(t => ({
+            entry_price: parseFloat(t.entry_price),
+            quantity: parseFloat(t.remaining_quantity),
+            is_legacy: t.is_legacy === 1,
+            entry_date: t.entry_date
+          })),
         });
       }
       positions.sort((a, b) => (parseFloat(b.value_usd) || 0) - (parseFloat(a.value_usd) || 0));
@@ -4382,6 +4475,75 @@ function createMcpServer() {
         message: `Approval request sent to Telegram. Reply "approve trade" to execute ${side} ${volume} ${coinBase} on ${exchangeLabel}.`,
         symbol: sym, side, order_type, volume, price: livePrice, valueUSD,
       }) }] };
+    }
+  );
+
+  // ── Tool: get_tranches ────────────────────────────────────────────────────
+  server.tool('get_tranches',
+    'Get tranche breakdown for one or all positions. Shows each buy lot separately with entry price, quantity, cost basis and P&L per tranche.',
+    {
+      symbol: z.string().optional().describe('Coin symbol e.g. LINK — omit to get all positions'),
+    },
+    async ({ symbol }) => {
+      try {
+        const coinBase = symbol ? symbol.replace('-USD', '').toUpperCase() : null;
+        const where = coinBase ? `WHERE symbol = ? AND remaining_quantity > 0` : `WHERE remaining_quantity > 0`;
+        const params = coinBase ? [coinBase] : [];
+
+        const [tranches] = await db.execute(
+          `SELECT symbol, exchange, quantity, entry_price, remaining_quantity, is_legacy, entry_date, notes,
+                  (remaining_quantity * entry_price) as cost_basis
+           FROM position_tranches
+           ${where}
+           ORDER BY symbol, entry_price DESC`,
+          params
+        );
+
+        // Group by symbol
+        const grouped = {};
+        for (const t of tranches) {
+          if (!grouped[t.symbol]) grouped[t.symbol] = [];
+          grouped[t.symbol].push(t);
+        }
+
+        // Fetch current prices for P&L
+        const symbols = Object.keys(grouped);
+        const priceMap = {};
+        for (const sym of symbols) {
+          try {
+            const ticker = await revolutRequest('GET', `/tickers/${sym}/USD`);
+            priceMap[sym] = parseFloat(ticker?.ask_price || ticker?.last_price || 0);
+          } catch { priceMap[sym] = 0; }
+        }
+
+        const result = symbols.map(sym => {
+          const lots = grouped[sym];
+          const currentPrice = priceMap[sym] || 0;
+          return {
+            symbol: sym,
+            current_price: currentPrice,
+            tranches: lots.map(lot => ({
+              entry_price: parseFloat(lot.entry_price),
+              quantity: parseFloat(lot.remaining_quantity),
+              cost_basis: parseFloat(lot.remaining_quantity) * parseFloat(lot.entry_price),
+              current_value: currentPrice > 0 ? parseFloat(lot.remaining_quantity) * currentPrice : null,
+              pl_usd: currentPrice > 0
+                ? (currentPrice - parseFloat(lot.entry_price)) * parseFloat(lot.remaining_quantity)
+                : null,
+              pl_pct: currentPrice > 0
+                ? ((currentPrice - parseFloat(lot.entry_price)) / parseFloat(lot.entry_price)) * 100
+                : null,
+              entry_date: lot.entry_date,
+              is_legacy: lot.is_legacy === 1,
+              notes: lot.notes
+            }))
+          };
+        });
+
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      } catch (e) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: e.message }) }] };
+      }
     }
   );
 
@@ -5170,6 +5332,19 @@ app.post('/telegram-webhook', async (req, res) => {
               'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion) VALUES (?, ?, ?, ?, ?, ?, ?)',
               [coinBase, t.side, t.price, t.volume, t.valueUSD, 'Kraken trade approved via Telegram', 'confident']
             ).catch(e => console.error('[kraken] Journal insert failed:', e.message));
+
+            // Tranche tracking
+            if (t.side.toLowerCase() === 'buy') {
+              await db.execute(
+                `INSERT INTO position_tranches (symbol, exchange, quantity, entry_price, entry_date, remaining_quantity, is_legacy, notes)
+                 VALUES (?, 'kraken', ?, ?, NOW(), ?, 0, ?)`,
+                [coinBase, parseFloat(t.volume), t.price, parseFloat(t.volume), `Buy via Claude approval — Kraken`]
+              ).catch(e => console.error('[tranches] Insert failed:', e.message));
+            } else if (t.side.toLowerCase() === 'sell') {
+              await reduceTranches(coinBase, 'kraken', parseFloat(t.volume))
+                .catch(e => console.error('[tranches] Reduce failed:', e.message));
+            }
+
             await sendTelegram(
               `✅ <b>KRAKEN TRADE EXECUTED</b>\n\n` +
               `${t.side.toUpperCase()} ${t.volume} ${coinBase} @ ${fmtPriceShort(t.price)}\n` +
@@ -5220,6 +5395,19 @@ app.post('/telegram-webhook', async (req, res) => {
                 entryPrices.set(t.symbol, newAvgEntry);
                 await db.execute('INSERT INTO entry_prices (symbol, entry_price) VALUES (?, ?) ON DUPLICATE KEY UPDATE entry_price = VALUES(entry_price)', [t.symbol, newAvgEntry]).catch(() => {});
               }
+            }
+
+            // Tranche tracking
+            if (t.side.toLowerCase() === 'buy') {
+              await db.execute(
+                `INSERT INTO position_tranches (symbol, exchange, quantity, entry_price, entry_date, remaining_quantity, is_legacy, notes)
+                 VALUES (?, 'revolut', ?, ?, NOW(), ?, 0, ?)`,
+                [coinBase, parseFloat(t.baseSize), executedPrice, parseFloat(t.baseSize),
+                 `Buy via Claude approval — Order ${result?.client_order_id || 'unknown'}`]
+              ).catch(e => console.error('[tranches] Insert failed:', e.message));
+            } else if (t.side.toLowerCase() === 'sell') {
+              await reduceTranches(coinBase, 'revolut', parseFloat(t.baseSize))
+                .catch(e => console.error('[tranches] Reduce failed:', e.message));
             }
 
             await sendTelegram(
