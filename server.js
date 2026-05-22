@@ -75,7 +75,10 @@ async function placeRevolutOrder(symbol, side, orderType, baseSize, price = null
   };
   console.log('[revolut] Placing order:', JSON.stringify(body));
   const result = await revolutRequest('POST', '/orders', body);
-  console.log('[revolut] Order result:', JSON.stringify(result));
+  console.log('[revolut] Full order response:', JSON.stringify(result));
+  if (result.error || result.errors) {
+    throw new Error(JSON.stringify(result.error || result.errors));
+  }
   return { ...result, client_order_id: clientOrderId };
 }
 
