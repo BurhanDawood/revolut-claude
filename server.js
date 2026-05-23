@@ -5633,7 +5633,9 @@ app.post('/telegram-webhook', async (req, res) => {
     }
 
     // --- Command: approve trade / cancel trade ---
-    if (/^approve\s+trade$/i.test(commandText)) {
+    if (/^approve\s+trade$/i.test(commandText) ||
+        rawText.trim() === '👍' ||
+        /^\u{1F44D}/u.test(rawText.trim())) {
       console.log('[approve] pendingKrakenTrade:', pendingKrakenTrade ? JSON.stringify(pendingKrakenTrade) : 'null');
       console.log('[approve] pendingRevolutTrade:', pendingRevolutTrade ? JSON.stringify(pendingRevolutTrade) : 'null');
 
@@ -5766,7 +5768,9 @@ app.post('/telegram-webhook', async (req, res) => {
       }
     }
 
-    if (/^cancel\s+trade$/i.test(commandText)) {
+    if (/^cancel\s+trade$/i.test(commandText) ||
+        rawText.trim() === '👎' ||
+        /^\u{1F44E}/u.test(rawText.trim())) {
       if (pendingKrakenTrade) {
         const t = pendingKrakenTrade;
         pendingKrakenTrade = null;
