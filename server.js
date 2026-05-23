@@ -93,6 +93,52 @@ async function placeRevolutOrder(symbol, side, orderType, baseSize, price = null
   return { ...result, client_order_id: clientOrderId };
 }
 
+async function sweepToUSDT(proceedsUsd, sourceSymbol) {
+  try {
+    const [configRows] = await db.execute(
+      "SELECT config_value FROM system_config WHERE config_key = 'usdt_sweep_config'"
+    );
+    if (!configRows.length) return;
+
+    const config = JSON.parse(configRows[0].config_value);
+    if (!config.enabled) return;
+    if (proceedsUsd < config.min_trade_value_usd) return;
+    if ((config.excluded_symbols || []).includes(sourceSymbol)) return;
+
+    const sweepAmountUsd = proceedsUsd * (config.sweep_pct / 100);
+
+    // Get current USDT balance for the confirmation message
+    const balances = await revolutRequest('GET', '/balances');
+    const usdtBalance = balances.find(b => b.currency === 'USDT');
+    const currentUSDT = parseFloat(usdtBalance?.available || 0);
+
+    console.log(`[sweep] Sweeping $${sweepAmountUsd.toFixed(2)} to USDT after ${sourceSymbol} sell`);
+
+    await placeRevolutOrder('USDT-USD', 'buy', 'market', null, null, sweepAmountUsd);
+
+    const approxNewUSDT = currentUSDT + sweepAmountUsd;
+
+    await sendTelegram(
+      `💰 <b>USDT SWEEP EXECUTED</b>\n\n` +
+      `After selling ${sourceSymbol.replace('-USD', '')}\n` +
+      `Swept: $${sweepAmountUsd.toFixed(2)} → USDT\n` +
+      `Config: ${config.sweep_pct}% of proceeds\n` +
+      `USDT reserve: ~$${approxNewUSDT.toFixed(2)}\n\n` +
+      `💡 Ready for next dip buy!`
+    );
+
+    await db.execute(
+      'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      ['USDT', 'buy', 1, sweepAmountUsd, sweepAmountUsd,
+       `Auto-sweep: ${config.sweep_pct}% of ${sourceSymbol} sell proceeds`, 'neutral']
+    ).catch(() => {});
+
+  } catch (e) {
+    console.error('[sweep] USDT sweep error:', e.message);
+    await sendTelegram(`⚠️ USDT sweep failed after ${sourceSymbol} sell: ${e.message}`).catch(() => {});
+  }
+}
+
 async function sendTelegram(message) {
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
   await fetch(url, {
@@ -816,6 +862,24 @@ set_auto_trade_rule, get_auto_rules, get_prices
   console.log('[config] Project description seeded to system_config');
 } catch (e) {
   console.error('[config] Failed to seed project_description:', e.message);
+}
+
+// Seed default USDT sweep config (ON CONFLICT DO NOTHING — preserves user settings)
+try {
+  await db.execute(
+    'INSERT INTO system_config (config_key, config_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE config_key = config_key',
+    ['usdt_sweep_config', JSON.stringify({
+      enabled: false,
+      sweep_pct: 20,
+      min_trade_value_usd: 50,
+      applies_to: 'all',
+      excluded_symbols: [],
+      created_at: new Date().toISOString()
+    })]
+  );
+  console.log('[config] USDT sweep config seeded');
+} catch (e) {
+  console.error('[config] Failed to seed usdt_sweep_config:', e.message);
 }
 
 seedLegacyTranches().catch(e => console.error('[tranches] Startup seed failed:', e.message));
@@ -3217,6 +3281,12 @@ async function checkAutoTradeRules(priceMap) {
           // Cascade: generate next set of rules based on executed price
           await cascadeRulesAfterTrade(rule, currentPrice);
 
+          // USDT sweep after qualifying Kraken sells
+          if (rule.order_type === 'sell') {
+            const proceeds = currentPrice * rule.volume;
+            await sweepToUSDT(proceeds, rule.symbol).catch(() => {});
+          }
+
         } catch (e) {
           console.error(`[auto] Trade execution failed for ${rule.symbol}:`, e.message);
           await sendTelegram(`❌ Auto trade failed for ${coinBase}: ${e.message}`);
@@ -4590,9 +4660,9 @@ function createMcpServer() {
 
   // ── Tool: manage_trading ───────────────────────────────────────────────────
   server.tool('manage_trading',
-    'Log journal entries, trade intentions, trader preferences, or update invested capital',
+    'Log journal entries, trade intentions, trader preferences, update invested capital, or configure USDT sweep',
     {
-      action:                 z.enum(['log_journal', 'log_intention', 'save_preference', 'update_capital']).describe('What trading action to perform'),
+      action:                 z.enum(['log_journal', 'log_intention', 'save_preference', 'update_capital', 'configure_sweep']).describe('What trading action to perform'),
       symbol:                 z.string().optional().describe('Coin e.g. NEAR-USD or NEAR'),
       trade_action:           z.enum(['buy', 'sell', 'hold', 'add', 'reduce', 'payment', 'transfer']).optional().describe('Trade action for log_journal or log_intention'),
       price:                  z.number().optional().describe('Price for log_journal'),
@@ -4606,8 +4676,12 @@ function createMcpServer() {
       amount:                 z.number().optional().describe('Amount in USD for update_capital'),
       capital_type:           z.enum(['deposit', 'withdrawal', 'set']).optional().describe('Capital update type'),
       note:                   z.string().optional().describe('Optional note for update_capital'),
+      enabled:                z.boolean().optional().describe('Enable or disable USDT sweep (configure_sweep)'),
+      sweep_pct:              z.number().optional().describe('Percentage of sell proceeds to sweep to USDT (configure_sweep)'),
+      min_trade_value_usd:    z.number().optional().describe('Minimum sell value in USD to trigger sweep (configure_sweep)'),
+      excluded_symbols:       z.array(z.string()).optional().describe('Symbols to exclude from sweep e.g. ["USDT-USD"] (configure_sweep)'),
     },
-    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, capital_type, note }) => {
+    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols }) => {
 
       if (action === 'log_journal') {
         const sym      = symbol?.includes('-USD') ? symbol.toUpperCase() : `${symbol?.toUpperCase()}-USD`;
@@ -4653,6 +4727,27 @@ function createMcpServer() {
         const portfolioValue = await getCurrentPortfolioValue();
         const cap = getCapitalSummary(portfolioValue);
         return { content: [{ type: 'text', text: JSON.stringify({ ok: true, capital_type, previous_total: previous, new_total: newTotal, portfolio_value: portfolioValue.toFixed(2), pl_usd: cap.pnl.toFixed(2), pl_pct: cap.pnlPct.toFixed(2) }) }] };
+
+      } else if (action === 'configure_sweep') {
+        const sweepConfig = {
+          enabled: enabled ?? true,
+          sweep_pct: sweep_pct || 20,
+          min_trade_value_usd: min_trade_value_usd || 50,
+          applies_to: 'all',
+          excluded_symbols: excluded_symbols || [],
+          updated_at: new Date().toISOString(),
+        };
+        await db.execute(
+          'INSERT INTO system_config (config_key, config_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)',
+          ['usdt_sweep_config', JSON.stringify(sweepConfig)]
+        );
+        await sendTelegram(
+          `💰 <b>USDT SWEEP ${sweepConfig.enabled ? 'ENABLED' : 'DISABLED'}</b>\n\n` +
+          `Sweep: ${sweepConfig.sweep_pct}% of sell proceeds\n` +
+          `Min trade size: $${sweepConfig.min_trade_value_usd}\n` +
+          `Applies to: all qualifying sells`
+        );
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, config: sweepConfig }) }] };
       }
     }
   );
@@ -6106,6 +6201,12 @@ app.post('/telegram-webhook', async (req, res) => {
               `📝 Journal logged automatically` +
               (matchedIntention ? '\n🎯 Matched your earlier intention!' : '')
             );
+
+            // USDT sweep — convert a % of sell proceeds to USDT for dry-powder reserves
+            if (t.side.toLowerCase() === 'sell') {
+              const proceeds = executedPrice * parseFloat(t.baseSize);
+              await sweepToUSDT(proceeds, t.symbol).catch(() => {});
+            }
           } catch (e) {
             console.error('[revolut] Trade execution failed:', e.message);
             await sendTelegram(`❌ Revolut X trade failed: ${e.message}`);
