@@ -3147,17 +3147,23 @@ async function checkAutoTradeRules(priceMap) {
             const availableUSD = usdBalance?.balance || 0;
             const requiredUSD = rule.volume * currentPrice;
             if (availableUSD < requiredUSD) {
-              console.log(`[auto] Skipping buy — insufficient USD: $${availableUSD.toFixed(2)} available, $${requiredUSD.toFixed(2)} required`);
-              const lastSkipAlert = autoSkipAlerted.get(rule.symbol);
-              const oneHour = 60 * 60 * 1000;
-              if (!lastSkipAlert || Date.now() - lastSkipAlert > oneHour) {
-                await sendTelegram(
-                  `⚠️ Auto buy skipped — insufficient USD: $${availableUSD.toFixed(2)} available, $${requiredUSD.toFixed(2)} required.\n` +
-                  `Sell some ${rule.symbol.replace('-USD', '')} first to fund buys.`
-                );
-                autoSkipAlerted.set(rule.symbol, Date.now());
+              // Only notify if there IS some USD but not enough — complete silence when balance is $0
+              if (availableUSD > 1) {
+                const lastSkipAlert = autoSkipAlerted.get(rule.symbol);
+                const oneHour = 60 * 60 * 1000;
+                if (!lastSkipAlert || Date.now() - lastSkipAlert > oneHour) {
+                  await sendTelegram(
+                    `⚠️ Auto buy skipped — insufficient USD:\n` +
+                    `$${availableUSD.toFixed(2)} available, ` +
+                    `$${requiredUSD.toFixed(2)} required.`
+                  );
+                  autoSkipAlerted.set(rule.symbol, Date.now());
+                } else {
+                  console.log(`[auto] Buy skipped (USD low) — alert suppressed, sent ${Math.round((Date.now() - lastSkipAlert) / 60000)}min ago`);
+                }
               } else {
-                console.log(`[auto] Buy skipped (USD low) — alert suppressed, sent ${Math.round((Date.now() - lastSkipAlert) / 60000)}min ago`);
+                // Zero balance — completely silent
+                console.log(`[auto] Buy skipped — zero USD balance (silent)`);
               }
               continue;
             }
@@ -4779,27 +4785,38 @@ function createMcpServer() {
 
   // ── Tool: manage_auto_rules ───────────────────────────────────────────────
   server.tool('manage_auto_rules',
-    'Manage automatic trade rules — list, remove or disable a rule by ID',
+    'Manage automatic trade rules — list, remove, disable or enable a rule by ID',
     {
-      action:  z.enum(['list', 'remove', 'disable']),
-      rule_id: z.number().optional().describe('Rule ID to remove or disable'),
+      action:  z.enum(['list', 'remove', 'disable', 'enable']).describe('Action to perform'),
+      rule_id: z.number().optional().describe('Rule ID to remove, disable or enable'),
     },
     async ({ action, rule_id }) => {
       try {
         if (action === 'list') {
           const [rules] = await db.execute('SELECT * FROM auto_trade_rules ORDER BY created_at DESC');
-          const active = rules.filter(r => r.active);
-          return { content: [{ type: 'text', text: JSON.stringify({ rules, active_count: active.length, total: rules.length }, null, 2) }] };
+          return { content: [{ type: 'text', text: JSON.stringify({ rules, active: rules.filter(r => r.active) }, null, 2) }] };
         }
         if (action === 'remove' && rule_id) {
+          const [existing] = await db.execute('SELECT * FROM auto_trade_rules WHERE id = ?', [rule_id]);
+          if (existing.length === 0) throw new Error(`Rule ${rule_id} not found`);
           await db.execute('DELETE FROM auto_trade_rules WHERE id = ?', [rule_id]);
-          return { content: [{ type: 'text', text: JSON.stringify({ ok: true, deleted: rule_id }) }] };
+          await sendTelegram(
+            `🗑 Auto rule [${rule_id}] removed:\n` +
+            `${existing[0].order_type.toUpperCase()} ` +
+            `${existing[0].volume} ${existing[0].symbol.replace('-USD', '')} ` +
+            `${existing[0].direction} $${parseFloat(existing[0].trigger_price).toFixed(2)}`
+          );
+          return { content: [{ type: 'text', text: JSON.stringify({ ok: true, removed: rule_id, rule: existing[0] }) }] };
         }
         if (action === 'disable' && rule_id) {
           await db.execute('UPDATE auto_trade_rules SET active = 0 WHERE id = ?', [rule_id]);
           return { content: [{ type: 'text', text: JSON.stringify({ ok: true, disabled: rule_id }) }] };
         }
-        return { content: [{ type: 'text', text: JSON.stringify({ error: 'rule_id required for remove/disable' }) }] };
+        if (action === 'enable' && rule_id) {
+          await db.execute('UPDATE auto_trade_rules SET active = 1 WHERE id = ?', [rule_id]);
+          return { content: [{ type: 'text', text: JSON.stringify({ ok: true, enabled: rule_id }) }] };
+        }
+        return { content: [{ type: 'text', text: JSON.stringify({ error: 'rule_id required for remove/disable/enable' }) }] };
       } catch (e) {
         return { content: [{ type: 'text', text: JSON.stringify({ error: e.message }) }] };
       }
@@ -5558,36 +5575,51 @@ app.post('/telegram-webhook', async (req, res) => {
         const coinBase = symbol.replace('-USD', '');
         clearTimeout(pending.timeoutHandle);
         pendingTradeContext.delete(symbol);
+
         await db.execute(
           'UPDATE trading_journal SET action = ?, reasoning = ?, emotion = ?, notes = ? WHERE id = ?',
           ['payment', 'Revolut payment made using this asset', 'neutral', 'excluded_from_stats', pending.journalId]
         );
-        await updateLearningModel().catch(() => {});
 
-        // Deduct payment value from invested capital
+        // AUTO-DEDUCT FROM INVESTED CAPITAL
         try {
-          const [jRows] = await db.execute('SELECT value_usd FROM trading_journal WHERE id = ?', [pending.journalId]);
-          const paymentValueUsd = jRows[0]?.value_usd ? Math.abs(parseFloat(jRows[0].value_usd)) : null;
+          const [jRows] = await db.execute(
+            'SELECT value_usd FROM trading_journal WHERE id = ?',
+            [pending.journalId]
+          );
+          const paymentValueUsd = jRows[0]?.value_usd
+            ? Math.abs(parseFloat(jRows[0].value_usd))
+            : null;
+
           if (paymentValueUsd && paymentValueUsd > 0) {
             const prevInvested = totalInvestedCapital;
             const newTotal = totalInvestedCapital - paymentValueUsd;
-            await updateInvestedCapital(newTotal, `Payment deduction: ${coinBase} -$${paymentValueUsd.toFixed(2)}`);
-            const portfolioValue = await getCurrentPortfolioValue();
-            const cap = getCapitalSummary(portfolioValue);
-            const pnlSign = cap.pnl >= 0 ? '+' : '';
+            await updateInvestedCapital(
+              newTotal,
+              `Auto-deducted: ${coinBase} payment -$${paymentValueUsd.toFixed(2)}`
+            );
+
             await sendReply(
-              `✅ <b>${coinBase}</b> payment logged — $${paymentValueUsd.toFixed(2)} deducted from invested capital\n` +
-              `💰 Previous invested: $${prevInvested.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}\n` +
-              `💰 Updated invested: $${newTotal.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}\n` +
-              `📊 Current portfolio: $${portfolioValue.toFixed(0)}\n` +
-              `📉 P&L: ${pnlSign}$${Math.abs(cap.pnl).toFixed(0)} (${pnlSign}${cap.pnlPct.toFixed(1)}%)`
+              `✅ <b>${coinBase}</b> logged as payment\n` +
+              `💸 $${paymentValueUsd.toFixed(2)} auto-deducted from invested capital\n` +
+              `💰 Previous: $${prevInvested.toFixed(2)}\n` +
+              `💰 Updated: $${newTotal.toFixed(2)}\n` +
+              `📊 Excluded from trading stats`
             );
           } else {
-            await sendReply(`✅ <b>${coinBase}</b> logged as payment — excluded from trading stats`);
+            await sendReply(
+              `✅ <b>${coinBase}</b> logged as payment — excluded from stats`
+            );
           }
         } catch (e) {
-          await sendReply(`✅ <b>${coinBase}</b> logged as payment — excluded from trading stats`);
+          console.error('[payment] Capital auto-deduct error:', e.message);
+          await sendReply(
+            `✅ <b>${coinBase}</b> logged as payment — excluded from stats\n` +
+            `⚠️ Could not auto-update capital — update manually`
+          );
         }
+
+        await updateLearningModel().catch(() => {});
         return res.status(200).json({ ok: true });
       }
 
