@@ -2257,17 +2257,54 @@ async function logRebalancePair({ sellSymbol, sellJournalId, sellPrice, sellValu
   await updateLearningModel().catch(() => {});
 }
 
-async function checkForRebalancePair(newSymbol, newAction, newJournalId, newPrice, newQty, newValueUsd) {
+async function checkForRebalancePair(newSymbol, newAction, newJournalId, newPrice, newQty, newValueUsd, newExchange = 'revolut', reasoning = null) {
   try {
     const oppositeAction = newAction === 'sell' ? 'buy' : newAction === 'buy' ? 'sell' : null;
     if (!oppositeAction) return;
+
+    // Check 4: skip if this is a test trade
+    if (reasoning && reasoning.toLowerCase().includes('test')) {
+      console.log('[rebalance] Skipping — test trade detected');
+      return;
+    }
+
+    // Check 2: skip if current trade is too small to be a rebalance
+    if ((newValueUsd || 0) < 10) {
+      console.log('[rebalance] Skipping — trade too small for rebalance:', (newValueUsd || 0).toFixed(2));
+      return;
+    }
+
     const fifteenMinAgo = Date.now() - 15 * 60 * 1000;
     // Look for a complementary trade in pendingTradeContext within 15 minutes
     for (const [sym, pending] of pendingTradeContext) {
       if (sym === newSymbol) continue;
       if (pending.action !== oppositeAction) continue;
       if (pending.detectedAt < fifteenMinAgo) continue;
-      // Found a pair
+
+      // Check 3: same exchange only
+      if ((pending.exchange || 'revolut') !== newExchange) {
+        console.log('[rebalance] Skipping — different exchanges:', pending.exchange, 'vs', newExchange);
+        continue;
+      }
+
+      // Check 2: counterpart trade also must meet minimum size
+      if ((pending.valueUsd || 0) < 10) {
+        console.log('[rebalance] Skipping — counterpart trade too small:', (pending.valueUsd || 0).toFixed(2));
+        continue;
+      }
+
+      // Check 1: values must be within 50% of each other
+      const sellValue = newAction === 'sell' ? (newValueUsd || 0) : (pending.valueUsd || 0);
+      const buyValue  = newAction === 'buy'  ? (newValueUsd || 0) : (pending.valueUsd || 0);
+      const larger    = Math.max(sellValue, buyValue);
+      const smaller   = Math.min(sellValue, buyValue);
+      const similarity = larger > 0 ? smaller / larger : 0;
+      if (similarity < 0.5) {
+        console.log('[rebalance] Skipping — values too different:', sellValue.toFixed(2), 'vs', buyValue.toFixed(2));
+        continue;
+      }
+
+      // Passed all checks — Found a valid pair
       const sellSymbol = newAction === 'sell' ? newSymbol.replace('-USD', '') : sym.replace('-USD', '');
       const sellJournalId = newAction === 'sell' ? newJournalId : pending.journalId;
       const sellPrice = newAction === 'sell' ? newPrice : pending.price;
@@ -2467,7 +2504,7 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
       console.log(`Auto-logged trade with matched intention: ${symbol} ${action} ${absQty.toFixed(4)} @ $${price.toFixed(4)}`);
 
       // Still check for rebalancing pair
-      await checkForRebalancePair(symbol, action, journalId, price, absQty, valueUsd);
+      await checkForRebalancePair(symbol, action, journalId, price, absQty, valueUsd, 'revolut', matchedIntention.reasoning);
       return; // Skip the normal pending context flow
     }
 
@@ -2530,11 +2567,11 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
       } catch (e) { /* ignore */ }
     }, 30 * 60 * 1000);
 
-    pendingTradeContext.set(symbol, { journalId, detectedAt: Date.now(), timeoutHandle, action, price, valueUsd, qty: absQty });
+    pendingTradeContext.set(symbol, { journalId, detectedAt: Date.now(), timeoutHandle, action, price, valueUsd, qty: absQty, exchange: 'revolut' });
     console.log(`Auto-logged trade: ${symbol} ${action} ${absQty.toFixed(4)} @ $${price.toFixed(4)}`);
 
     // Check if this forms a rebalancing pair with another recent trade
-    await checkForRebalancePair(symbol, action, journalId, price, absQty, valueUsd);
+    await checkForRebalancePair(symbol, action, journalId, price, absQty, valueUsd, 'revolut', null);
   } catch (e) {
     console.error('autoLogTrade error:', e.message);
   }
