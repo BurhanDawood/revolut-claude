@@ -3602,6 +3602,16 @@ async function checkPortfolio() {
           continue;
         }
 
+        // Skip swing signal if coin already has a custom alert plan in place
+        const hasCustomPlan =
+          priceTargets.has(symbol) ||          // fixed target set
+          trailingStops.has(symbol) ||          // trailing stop active
+          alertState.acknowledged.has(symbol);  // recently acknowledged
+        if (hasCustomPlan) {
+          console.log(`[swing] Skipping ${symbol} — custom alert plan already in place`);
+          continue;
+        }
+
         // Check we haven't sent this extreme alert recently (use basePrices as proxy)
         const coinBase = asset.currency;
         const available = parseFloat(asset.available);
