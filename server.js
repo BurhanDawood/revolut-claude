@@ -2631,14 +2631,11 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
     const msg =
       `📝 <b>TRADE DETECTED — ${symbol}</b>\n` +
       `Action: ${actionLabel} ~${absQty.toFixed(4)} tokens at $${price.toFixed(4)} ($${valueUsd.toFixed(2)})${pnlLine}${avgEntryLine}${recLine}${reentryLine}\n\n` +
-      `Quick questions while it's fresh:\n` +
-      `1️⃣ Why did you make this trade?\n` +
-      `2️⃣ Feeling: confident / uncertain / fomo / fearful / neutral\n\n` +
-      `Reply: '<b>${coinBase.toLowerCase()} reason [why], [emotion]</b>'\n` +
-      `Or: '<b>${coinBase.toLowerCase()} skip</b>' to log without details\n` +
-      `Or: '<b>${coinBase.toLowerCase()} payment</b>' to log as a payment (excluded from stats)\n` +
-      `Or: '<b>${coinBase.toLowerCase()} transfer</b>' to log as internal transfer (excluded from stats)\n` +
-      `Or: '<b>${coinBase.toLowerCase()} rebalance [coin]</b>' to log as rebalance into another coin\n\n` +
+      `Just reply:\n` +
+      `'<b>taking profits, confident</b>' — reason + emotion, done\n` +
+      `'<b>payment</b>' — Revolut payment (excluded from stats)\n` +
+      `'<b>transfer</b>' — internal transfer (excluded from stats)\n` +
+      `'<b>skip</b>' — log without details\n\n` +
       `⏰ Will auto-log in 30 minutes if no reply.`;
     await sendTelegram(msg);
 
@@ -5426,8 +5423,12 @@ app.post('/telegram-webhook', async (req, res) => {
       const matchedPending = [];
       for (const [symbol, pending] of pendingTradeContext) {
         const coinBase = symbol.replace('-USD', '').toLowerCase();
-        // Check explicit "[COIN] skip"
-        if (lowerMsg === `${coinBase} skip` || lowerMsg === `skip ${coinBase}`) {
+        // Check explicit "[COIN] skip" or bare "skip" with one pending
+        if (
+          lowerMsg === `${coinBase} skip` ||
+          lowerMsg === `skip ${coinBase}` ||
+          (lowerMsg.trim() === 'skip' && pendingTradeContext.size === 1)
+        ) {
           matchedPending.push({ symbol, pending, skip: true });
         } else if (lowerMsg.includes(coinBase)) {
           matchedPending.push({ symbol, pending, skip: false });
@@ -5438,10 +5439,18 @@ app.post('/telegram-webhook', async (req, res) => {
       // treat ANY non-command message as context for that trade
       if (matchedPending.length === 0 && pendingTradeContext.size === 1) {
         const [[symbol, pending]] = pendingTradeContext;
-        // Only intercept if message isn't a recognised command
-        const isKnownCommand = /^(pause|resume|status|acknowledge|ack|ignore|watch|sell|buy|entry|daily|target|journal|my stats|learning|holding|bought|sold|i prefer|trail|trailing|approve|cancel|transfer|payment)/i.test(commandText);
-        if (!isKnownCommand) {
-          matchedPending.push({ symbol, pending, skip: false });
+        const trimmed = lowerMsg.trim();
+
+        // Single-word shortcuts always route to the pending trade — do NOT treat as unknown commands
+        const singleWordShortcuts = ['payment', 'transfer', 'skip', 'rebalance'];
+        if (singleWordShortcuts.includes(trimmed)) {
+          matchedPending.push({ symbol, pending, skip: trimmed === 'skip' });
+        } else {
+          // For everything else, only intercept if it isn't a recognised system command
+          const isKnownCommand = /^(pause|resume|status|acknowledge|ack|ignore|watch|sell|buy|entry|daily|target|journal|my stats|learning|holding|bought|sold|i prefer|trail|trailing|approve|cancel)/i.test(commandText);
+          if (!isKnownCommand) {
+            matchedPending.push({ symbol, pending, skip: false });
+          }
         }
       }
 
