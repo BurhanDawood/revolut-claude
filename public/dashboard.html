@@ -663,8 +663,18 @@
         <span class="sub-value" id="revolut-subtotal">—</span>
       </div>
       <div class="portfolio-sub-row">
+        <span class="sub-label">🦑 Kraken</span>
+        <span class="sub-value" id="kraken-subtotal">—</span>
+      </div>
+      <div class="portfolio-sub-row">
         <span class="sub-label">🔐 Tangem XRP</span>
         <span class="sub-value" id="tangem-subtotal">—</span>
+      </div>
+      <div style="border-top:1px solid rgba(255,255,255,0.1);margin-top:4px;padding-top:4px">
+        <div class="portfolio-sub-row">
+          <span class="sub-label" style="font-weight:700;color:var(--text)">💼 TOTAL</span>
+          <span class="sub-value" style="font-weight:700;color:var(--accent)" id="portfolio-total-sum">—</span>
+        </div>
       </div>
     </div>
   </div>
@@ -1447,8 +1457,14 @@
       addrEl.textContent = a.slice(0, 8) + '…' + a.slice(-6);
     }
 
-    // Update portfolio header — show three-line breakdown
-    const combined = revolutTotalUSD + (tangem.valueUSD || 0);
+    // Update portfolio header — Revolut + Kraken + Tangem
+    let krakenTotalUSD = 0;
+    try {
+      const krakenData = await apiFetch('GET', '/api/kraken/balances');
+      krakenTotalUSD = krakenData?.totalUSD || 0;
+    } catch (e) { console.warn('Kraken balance fetch failed for portfolio header:', e); }
+
+    const combined = revolutTotalUSD + krakenTotalUSD + (tangem.valueUSD || 0);
     const pvEl = document.getElementById('portfolio-value');
     if (pvEl) pvEl.textContent = fmt(combined);
 
@@ -1458,8 +1474,14 @@
     const revSubEl = document.getElementById('revolut-subtotal');
     if (revSubEl) revSubEl.textContent = fmt(revolutTotalUSD);
 
+    const krakenSubEl = document.getElementById('kraken-subtotal');
+    if (krakenSubEl) krakenSubEl.textContent = krakenTotalUSD > 0 ? fmt(krakenTotalUSD) : '—';
+
     const tanSubEl = document.getElementById('tangem-subtotal');
     if (tanSubEl) tanSubEl.textContent = `${fmt(tangem.valueUSD)} (${tangem.balance.toFixed(0)} XRP)`;
+
+    const totalSumEl = document.getElementById('portfolio-total-sum');
+    if (totalSumEl) totalSumEl.textContent = fmt(combined);
   }
 
   function renderTrailSummary(trails) {
@@ -1799,7 +1821,13 @@
     const data = await apiFetch('GET', '/api/balances');
     balancesData = data.balances || [];
     revolutTotalUSD = data.totalUSD || 0;
-    document.getElementById('portfolio-value').textContent = fmt(data.totalUSD);
+    // Don't overwrite the big portfolio-value here — renderTangemCard() sets
+    // the combined Revolut + Kraken + Tangem total when Tangem loads.
+    // Only set it if the portfolio-totals breakdown isn't visible yet.
+    const totalsEl = document.getElementById('portfolio-totals');
+    if (!totalsEl || totalsEl.style.display === 'none') {
+      document.getElementById('portfolio-value').textContent = fmt(data.totalUSD);
+    }
     renderHoldings(balancesData);
     renderPnlSummary(balancesData);
     return balancesData;
