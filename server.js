@@ -204,6 +204,8 @@ const trailingStops = new Map();             // symbol -> { trailPct, peakPrice,
 const trailingStopAlerted = new Map();       // symbol -> timestamp — tracks recently-triggered trailing stops for hold reply
 let pendingKrakenTrade = null;               // { symbol, side, orderType, volume, price, valueUSD } — awaiting Telegram approval
 let pendingRevolutTrade = null;             // { symbol, side, orderType, baseSize, price, valueUSD } — awaiting Telegram approval
+let pendingKrakenTradeReminder = null;      // setInterval handle for Kraken approval reminders
+let pendingRevolutTradeReminder = null;     // setInterval handle for Revolut X approval reminders
 let totalInvestedCapital = 20600; // loaded from DB on startup
 
 async function setThreshold(symbol, threshold) {
@@ -874,6 +876,71 @@ async function reduceTranches(symbol, exchange, qtySold) {
   } catch (e) {
     console.error('[tranches] reduceTranches failed:', e.message);
   }
+}
+
+// ── Trade Approval Reminder + Auto-Cancel ────────────────────────────────────
+
+function startTradeApprovalReminder(exchange) {
+  const t = exchange === 'revolut' ? pendingRevolutTrade : pendingKrakenTrade;
+  if (!t) return;
+
+  let reminderCount = 0;
+  const maxReminders = 5;
+  const reminderInterval = 2.5 * 60 * 1000; // 2.5 minutes
+
+  const intervalId = setInterval(async () => {
+    reminderCount++;
+
+    const current = exchange === 'revolut' ? pendingRevolutTrade : pendingKrakenTrade;
+    if (!current) {
+      // Trade was approved or cancelled — stop reminders
+      clearInterval(intervalId);
+      if (exchange === 'revolut') pendingRevolutTradeReminder = null;
+      else pendingKrakenTradeReminder = null;
+      return;
+    }
+
+    const coinBase = current.symbol.replace('-USD', '');
+    const exchangeLabel = exchange === 'revolut' ? 'Revolut X' : 'Kraken';
+    const qtyDisplay = current.volume || current.baseSize;
+
+    if (reminderCount >= maxReminders) {
+      // Auto-cancel after 5 reminders (~12.5 minutes total)
+      clearInterval(intervalId);
+      if (exchange === 'revolut') {
+        pendingRevolutTrade = null;
+        pendingRevolutTradeReminder = null;
+      } else {
+        pendingKrakenTrade = null;
+        pendingKrakenTradeReminder = null;
+      }
+      await sendTelegram(
+        `⚠️ <b>TRADE AUTO-CANCELLED — ${coinBase}</b>\n\n` +
+        `No response received within 12 minutes.\n` +
+        `${current.side.toUpperCase()} ${qtyDisplay} ${coinBase} on ${exchangeLabel} was NOT executed.\n\n` +
+        `Safety auto-cancel — request again when ready.`
+      ).catch(e => console.error('[trade reminder] auto-cancel telegram failed:', e.message));
+      console.log(`[trade] Auto-cancelled ${exchange} trade for ${coinBase} after ${maxReminders} reminders`);
+      return;
+    }
+
+    // Send reminder
+    const minsLeft = ((maxReminders - reminderCount) * 2.5).toFixed(0);
+    await sendTelegram(
+      `🔔 <b>TRADE APPROVAL REMINDER ${reminderCount}/${maxReminders}</b>\n\n` +
+      `Exchange: ${exchangeLabel}\n` +
+      `Action: <b>${current.side.toUpperCase()} ${qtyDisplay} ${coinBase}</b>\n` +
+      `Price: ${current.price ? '$' + current.price.toFixed(4) : 'market'}\n` +
+      `Value: ~${current.valueUSD ? '$' + current.valueUSD.toFixed(2) : 'unknown'}\n\n` +
+      `Reply <b>'approve trade'</b> or 👍 to execute\n` +
+      `Reply <b>'cancel trade'</b> or 👎 to abort\n\n` +
+      `⚠️ Auto-cancels in ${minsLeft} min if no response`
+    ).catch(e => console.error('[trade reminder] telegram failed:', e.message));
+    console.log(`[trade] Reminder ${reminderCount}/${maxReminders} sent for ${exchange} ${coinBase}`);
+  }, reminderInterval);
+
+  if (exchange === 'revolut') pendingRevolutTradeReminder = intervalId;
+  else pendingKrakenTradeReminder = intervalId;
 }
 
 // ── Tax Lot Helpers (US HIFO + UK S104) ──────────────────────────────────────
@@ -4725,9 +4792,13 @@ function createMcpServer() {
         `Type: ${order_type}\n` +
         `Price: ${livePrice ? fmtPriceShort(livePrice) : 'market'}\n` +
         `Value: ~${tradeValueUSD ? '$' + tradeValueUSD.toFixed(2) : 'unknown'}\n\n` +
-        `Reply <b>'approve trade'</b> to execute\n` +
-        `Reply <b>'cancel trade'</b> to abort`
+        `Reply <b>'approve trade'</b> or 👍 to execute\n` +
+        `Reply <b>'cancel trade'</b> or 👎 to abort\n\n` +
+        `⏱ Auto-cancels in ~12 minutes if no response`
       );
+
+      // Start reminder cycle — first reminder after 2.5 minutes
+      setTimeout(() => startTradeApprovalReminder(exchange), 2.5 * 60 * 1000);
 
       return { content: [{ type: 'text', text: JSON.stringify({
         ok: true,
@@ -5696,6 +5767,7 @@ app.post('/telegram-webhook', async (req, res) => {
       if (routeToKraken) {
         const t = pendingKrakenTrade;
         pendingKrakenTrade = null;
+        if (pendingKrakenTradeReminder) { clearInterval(pendingKrakenTradeReminder); pendingKrakenTradeReminder = null; }
         await sendReply(`⏳ Executing ${t.side.toUpperCase()} ${t.volume} ${t.symbol.replace('-USD','')} on Kraken…`);
         res.status(200).json({ ok: true });
         (async () => {
@@ -5736,6 +5808,7 @@ app.post('/telegram-webhook', async (req, res) => {
       if (routeToRevolut) {
         const t = pendingRevolutTrade;
         pendingRevolutTrade = null;
+        if (pendingRevolutTradeReminder) { clearInterval(pendingRevolutTradeReminder); pendingRevolutTradeReminder = null; }
         await sendReply(`⏳ Executing ${t.side.toUpperCase()} ${t.baseSize} ${t.symbol.replace('-USD','')} on Revolut X…`);
         res.status(200).json({ ok: true });
         (async () => {
@@ -5811,10 +5884,12 @@ app.post('/telegram-webhook', async (req, res) => {
       if (pendingKrakenTrade) {
         const t = pendingKrakenTrade;
         pendingKrakenTrade = null;
+        if (pendingKrakenTradeReminder) { clearInterval(pendingKrakenTradeReminder); pendingKrakenTradeReminder = null; }
         await sendReply(`✅ Kraken trade cancelled — ${t.side.toUpperCase()} ${t.volume} ${t.symbol.replace('-USD','')} was not executed.`);
       } else if (pendingRevolutTrade) {
         const t = pendingRevolutTrade;
         pendingRevolutTrade = null;
+        if (pendingRevolutTradeReminder) { clearInterval(pendingRevolutTradeReminder); pendingRevolutTradeReminder = null; }
         await sendReply(`✅ Revolut X trade cancelled — ${t.side.toUpperCase()} ${t.baseSize} ${t.symbol.replace('-USD','')} was not executed.`);
       } else {
         await sendReply('ℹ️ No pending trade to cancel.');
