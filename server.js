@@ -2568,7 +2568,6 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
         'UPDATE trade_intentions SET matched_journal_id = ?, matched_at = NOW() WHERE id = ?',
         [journalId, matchedIntention.id]
       );
-      await updateLearningModel().catch(() => {});
 
       const actionLabel = action === 'buy' ? 'BOUGHT' : action === 'sell' ? 'SOLD' : action.toUpperCase();
       await sendTelegram(
@@ -2579,11 +2578,9 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
         `🎯 Matched your earlier intention — no input needed!\n` +
         `🧠 Journal updated automatically`
       );
-      console.log(`Auto-logged trade with matched intention: ${symbol} ${action} ${absQty.toFixed(4)} @ $${price.toFixed(4)}`);
-
-      // Still check for rebalancing pair
-      await checkForRebalancePair(symbol, action, journalId, price, absQty, valueUsd, 'revolut', matchedIntention.reasoning);
-      return; // Skip the normal pending context flow
+      await updateLearningModel().catch(() => {});
+      console.log(`[intention] Match found for ${symbol} — suppressing Telegram question`);
+      return; // EXIT: skip pendingTradeContext, journal question, and 30-min timeout
     }
 
     // No intention matched — ask for context as normal
