@@ -516,6 +516,8 @@ await db.execute(`CREATE TABLE IF NOT EXISTS auto_trade_rules (
 
 // Add source column to existing tables that may not have it
 try { await db.execute("ALTER TABLE auto_trade_rules ADD COLUMN source VARCHAR(20) DEFAULT 'manual'"); } catch (e) { /* column already exists */ }
+// Add volume_type column for percentage-based volumes
+try { await db.execute("ALTER TABLE auto_trade_rules ADD COLUMN volume_type VARCHAR(10) DEFAULT 'fixed'"); } catch (e) { /* column already exists */ }
 
 await db.execute(`CREATE TABLE IF NOT EXISTS rebalancing_tracker (
   id INT AUTO_INCREMENT PRIMARY KEY,
@@ -3153,30 +3155,59 @@ async function cascadeRulesAfterTrade(rule, executedPrice) {
 
     let created = false;
 
+    // Inherit volume and volume_type from the triggering rule
+    const cascadeVol     = rule.volume;
+    const cascadeVolType = rule.volume_type || 'fixed';
+
     // Create cascaded sell rule
     if (!nearExists(sellRules, newSellPrice)) {
       sellRules = await enforceMax(sellRules, MAX_SELL, 'sell');
       await db.execute(
-        'INSERT INTO auto_trade_rules (symbol, rule_type, trigger_price, direction, order_type, volume, source) VALUES (?, ?, ?, ?, ?, ?, ?)',
-        [symbol, 'sell_pump', newSellPrice, 'above', 'sell', 2, 'cascade']
+        'INSERT INTO auto_trade_rules (symbol, rule_type, trigger_price, direction, order_type, volume, volume_type, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        [symbol, 'sell_pump', newSellPrice, 'above', 'sell', cascadeVol, cascadeVolType, 'cascade']
       );
-      console.log(`[cascade] Created sell_pump @ $${newSellPrice.toFixed(2)} for ${symbol}`);
+      console.log(`[cascade] Created sell_pump @ $${newSellPrice.toFixed(6)} for ${symbol}`);
       created = true;
     } else {
-      console.log(`[cascade] Sell rule near $${newSellPrice.toFixed(2)} already exists — skipped`);
+      console.log(`[cascade] Sell rule near $${newSellPrice.toFixed(6)} already exists — skipped`);
     }
 
-    // Create cascaded buy rule
-    if (!nearExists(buyRules, newBuyPrice)) {
+    // Create cascaded buy-back rule only when USDT sweep is enabled
+    // (sweep ensures dry powder will be available after the sell)
+    if (isSell) {
+      let sweepEnabled = false;
+      try {
+        const [sweepRows] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'usdt_sweep_config'");
+        if (sweepRows.length) {
+          const cfg = JSON.parse(sweepRows[0].config_value);
+          sweepEnabled = cfg.enabled === true;
+        }
+      } catch (e) { /* ignore — default false */ }
+
+      if (sweepEnabled && !nearExists(buyRules, newBuyPrice)) {
+        buyRules = await enforceMax(buyRules, MAX_BUY, 'buy');
+        await db.execute(
+          'INSERT INTO auto_trade_rules (symbol, rule_type, trigger_price, direction, order_type, volume, volume_type, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+          [symbol, 'buy_retrace', newBuyPrice, 'below', 'buy', cascadeVol, cascadeVolType, 'cascade']
+        );
+        console.log(`[cascade] Buy-back created @ $${newBuyPrice.toFixed(6)} (sweep enabled — cash coming)`);
+        created = true;
+      } else if (!sweepEnabled) {
+        console.log(`[cascade] Buy-back skipped — USDT sweep not enabled (no cash guaranteed)`);
+      } else {
+        console.log(`[cascade] Buy rule near $${newBuyPrice.toFixed(6)} already exists — skipped`);
+      }
+    } else if (isBuy && !nearExists(buyRules, newBuyPrice)) {
+      // After a buy fires: create a deeper dip buy
       buyRules = await enforceMax(buyRules, MAX_BUY, 'buy');
       await db.execute(
-        'INSERT INTO auto_trade_rules (symbol, rule_type, trigger_price, direction, order_type, volume, source) VALUES (?, ?, ?, ?, ?, ?, ?)',
-        [symbol, 'buy_dip', newBuyPrice, 'below', 'buy', 2, 'cascade']
+        'INSERT INTO auto_trade_rules (symbol, rule_type, trigger_price, direction, order_type, volume, volume_type, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        [symbol, 'buy_dip', newBuyPrice, 'below', 'buy', cascadeVol, cascadeVolType, 'cascade']
       );
-      console.log(`[cascade] Created buy_dip @ $${newBuyPrice.toFixed(2)} for ${symbol}`);
+      console.log(`[cascade] Created buy_dip @ $${newBuyPrice.toFixed(6)} for ${symbol}`);
       created = true;
-    } else {
-      console.log(`[cascade] Buy rule near $${newBuyPrice.toFixed(2)} already exists — skipped`);
+    } else if (isBuy) {
+      console.log(`[cascade] Buy rule near $${newBuyPrice.toFixed(6)} already exists — skipped`);
     }
 
     if (created) await sendTelegram(cascadeMsg);
@@ -3203,10 +3234,34 @@ async function checkAutoTradeRules(priceMap) {
           if (Date.now() - lastTrigger < 60 * 60 * 1000) continue;
         }
 
+        // Moon bag rules are markers only — never auto-execute
+        if (rule.rule_type === 'moon_bag') continue;
+
         const shouldTrigger =
           (rule.direction === 'below' && currentPrice <= rule.trigger_price) ||
           (rule.direction === 'above' && currentPrice >= rule.trigger_price);
         if (!shouldTrigger) continue;
+
+        // Resolve volume — fixed token amount or percentage of current position
+        let resolvedVolume = parseFloat(rule.volume);
+        if (rule.volume_type === 'pct') {
+          try {
+            const krakenData = await getKrakenBalances();
+            const asset = krakenData.balances.find(
+              b => b.symbol === rule.symbol || b.standard === rule.symbol.replace('-USD', '')
+            );
+            const currentQty = parseFloat(asset?.quantity || asset?.balance || 0);
+            resolvedVolume = currentQty * (parseFloat(rule.volume) / 100);
+            console.log(`[auto] ${rule.symbol} pct volume: ${rule.volume}% of ${currentQty} = ${resolvedVolume.toFixed(6)}`);
+            if (resolvedVolume <= 0) {
+              console.log(`[auto] Skipping ${rule.symbol} pct rule — resolved volume is 0`);
+              continue;
+            }
+          } catch (e) {
+            console.error('[auto] Pct volume resolution failed:', e.message);
+            continue;
+          }
+        }
 
         // Max position safety check for buys
         if (rule.order_type === 'buy' && rule.max_position_usd) {
@@ -3227,7 +3282,7 @@ async function checkAutoTradeRules(priceMap) {
             const krakenData = await getKrakenBalances();
             const usdBalance = krakenData.balances.find(b => b.standard === 'USD' || b.symbol === 'ZUSD');
             const availableUSD = usdBalance?.balance || 0;
-            const requiredUSD = rule.volume * currentPrice;
+            const requiredUSD = resolvedVolume * currentPrice;
             if (availableUSD < requiredUSD) {
               // Only notify if there IS some USD but not enough — complete silence when balance is $0
               if (availableUSD > 1) {
@@ -3255,25 +3310,25 @@ async function checkAutoTradeRules(priceMap) {
           }
         }
 
-        console.log(`[auto] Executing ${rule.order_type} rule for ${rule.symbol} at $${currentPrice} (trigger: ${rule.direction} $${rule.trigger_price})`);
+        console.log(`[auto] Executing ${rule.order_type} rule for ${rule.symbol} at $${currentPrice} (trigger: ${rule.direction} $${rule.trigger_price}, vol: ${resolvedVolume})`);
         const coinBase = rule.symbol.replace('-USD', '');
 
         try {
-          const result = await executeKrakenTrade(rule.symbol, rule.order_type, 'market', rule.volume);
+          const result = await executeKrakenTrade(rule.symbol, rule.order_type, 'market', resolvedVolume);
 
           await db.execute('UPDATE auto_trade_rules SET last_triggered = NOW() WHERE id = ?', [rule.id]);
 
           await db.execute(
             'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion) VALUES (?, ?, ?, ?, ?, ?, ?)',
-            [coinBase, rule.order_type, currentPrice, rule.volume, currentPrice * rule.volume,
-             `Auto-executed: ${rule.rule_type} rule triggered at $${currentPrice}`, 'neutral']
+            [coinBase, rule.order_type, currentPrice, resolvedVolume, currentPrice * resolvedVolume,
+             `Auto-executed: ${rule.rule_type} rule triggered at $${currentPrice}${rule.volume_type === 'pct' ? ` (${rule.volume}% of position)` : ''}`, 'neutral']
           );
 
           await sendTelegram(
             `🤖 <b>AUTO TRADE EXECUTED — ${coinBase}</b>\n\n` +
-            `${rule.order_type.toUpperCase()} ${formatTradeQty(rule.volume)} ${coinBase} @ $${currentPrice.toFixed(4)}\n` +
-            `Value: $${(currentPrice * rule.volume).toFixed(2)}\n` +
-            `Rule: ${rule.rule_type}\n` +
+            `${rule.order_type.toUpperCase()} ${formatTradeQty(resolvedVolume)} ${coinBase} @ $${currentPrice.toFixed(4)}\n` +
+            `Value: $${(currentPrice * resolvedVolume).toFixed(2)}\n` +
+            `Rule: ${rule.rule_type}${rule.volume_type === 'pct' ? ` (${rule.volume}% of position)` : ''}\n` +
             `Order ID: ${result?.txid?.[0] || 'unknown'}\n\n` +
             `📝 Journal logged automatically`
           );
@@ -3283,7 +3338,7 @@ async function checkAutoTradeRules(priceMap) {
 
           // USDT sweep after qualifying Kraken sells
           if (rule.order_type === 'sell') {
-            const proceeds = currentPrice * rule.volume;
+            const proceeds = currentPrice * resolvedVolume;
             await sweepToUSDT(proceeds, rule.symbol).catch(() => {});
           }
 
@@ -4855,30 +4910,34 @@ function createMcpServer() {
 
   // ── Tool: set_auto_trade_rule ─────────────────────────────────────────────
   server.tool('set_auto_trade_rule',
-    'Set an automatic trade rule for Kraken — executes automatically when price condition is met',
+    'Set an automatic trade rule for Kraken — executes automatically when price condition is met. Use rule_type moon_bag to mark a portion as never-sell.',
     {
-      symbol:          z.string().describe('Trading pair e.g. SOL-USD'),
-      rule_type:       z.string().describe('Label e.g. buy_dip, sell_pump, stop_loss'),
-      trigger_price:   z.number().describe('Price that triggers the trade'),
-      direction:       z.enum(['above', 'below']).describe('Trigger when price goes above or below trigger_price'),
-      order_type:      z.enum(['buy', 'sell']).describe('Buy or sell when triggered'),
-      volume:          z.number().describe('Number of tokens to trade'),
+      symbol:           z.string().describe('Trading pair e.g. SOL-USD'),
+      rule_type:        z.string().describe('Label: buy_dip, sell_pump, stop_loss, buy_retrace, moon_bag'),
+      trigger_price:    z.number().describe('Price that triggers the trade (use 0 for moon_bag markers)'),
+      direction:        z.enum(['above', 'below']).describe('Trigger when price goes above or below trigger_price'),
+      order_type:       z.enum(['buy', 'sell']).describe('Buy or sell when triggered'),
+      volume:           z.number().describe('Token amount (fixed) or percentage (pct) of position to trade'),
+      volume_type:      z.enum(['fixed', 'pct']).optional().describe('fixed = token count, pct = % of current position (default: fixed)'),
       max_position_usd: z.number().optional().describe('Max position size in USD — skips buy if already holding this much'),
     },
-    async ({ symbol, rule_type, trigger_price, direction, order_type, volume, max_position_usd }) => {
+    async ({ symbol, rule_type, trigger_price, direction, order_type, volume, volume_type, max_position_usd }) => {
       try {
-        const sym = symbol.includes('-USD') ? symbol : `${symbol}-USD`;
+        const sym     = symbol.includes('-USD') ? symbol : `${symbol}-USD`;
+        const volType = volume_type || 'fixed';
         const [result] = await db.execute(
-          'INSERT INTO auto_trade_rules (symbol, rule_type, trigger_price, direction, order_type, volume, max_position_usd) VALUES (?, ?, ?, ?, ?, ?, ?)',
-          [sym, rule_type, trigger_price, direction, order_type, volume, max_position_usd || null]
+          'INSERT INTO auto_trade_rules (symbol, rule_type, trigger_price, direction, order_type, volume, volume_type, max_position_usd) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+          [sym, rule_type, trigger_price, direction, order_type, volume, volType, max_position_usd || null]
         );
+        const volLabel = volType === 'pct' ? `${volume}% of position` : `${volume} tokens`;
+        const moonNote = rule_type === 'moon_bag' ? '\n🌙 Moon bag — marker only, never auto-sold' : '';
         await sendTelegram(
           `🤖 <b>AUTO TRADE RULE SET</b>\n\n` +
-          `${order_type.toUpperCase()} ${volume} ${sym.replace('-USD', '')} when price goes ${direction} $${trigger_price}\n` +
+          `${order_type.toUpperCase()} ${volLabel} ${sym.replace('-USD', '')} when price goes ${direction} $${trigger_price}\n` +
           `Rule type: ${rule_type}\n` +
-          `Max position: ${max_position_usd ? '$' + max_position_usd : 'unlimited'}`
+          `Max position: ${max_position_usd ? '$' + max_position_usd : 'unlimited'}${moonNote}`
         );
-        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, rule_id: result.insertId, symbol: sym, rule_type, trigger_price, direction, order_type, volume }) }] };
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, rule_id: result.insertId, symbol: sym, rule_type, trigger_price, direction, order_type, volume, volume_type: volType }) }] };
       } catch (e) {
         return { content: [{ type: 'text', text: JSON.stringify({ error: e.message }) }] };
       }
@@ -6251,9 +6310,10 @@ app.post('/telegram-webhook', async (req, res) => {
           const lastTag   = r.last_triggered
             ? ` | fired: ${new Date(r.last_triggered).toLocaleDateString('en-GB', { day:'numeric', month:'short' })}`
             : ' | never fired';
-          const icon = r.rule_type === 'stop_loss' ? '🛑' : r.order_type === 'buy' ? '📉' : '📈';
+          const icon = r.rule_type === 'moon_bag' ? '🌙' : r.rule_type === 'stop_loss' ? '🛑' : r.order_type === 'buy' ? '📉' : '📈';
+          const volDisplay = r.volume_type === 'pct' ? `${r.volume}% of pos` : `${formatTradeQty(r.volume)}`;
           return `${r.active ? '✅' : '⏸'} ${icon} [${r.id}] ${r.rule_type}${sourceTag}\n` +
-                 `   ${r.order_type.toUpperCase()} ${r.volume} ${r.symbol.replace('-USD','')} ${r.direction} $${parseFloat(r.trigger_price).toFixed(2)}` +
+                 `   ${r.order_type.toUpperCase()} ${volDisplay} ${r.symbol.replace('-USD','')} ${r.direction} $${parseFloat(r.trigger_price).toFixed(6)}` +
                  (r.max_position_usd ? ` (max $${r.max_position_usd})` : '') +
                  lastTag;
         }).join('\n');
@@ -6262,37 +6322,58 @@ app.post('/telegram-webhook', async (req, res) => {
       return res.status(200).json({ ok: true });
     }
 
-    // --- Command: auto buy/sell/stop COIN PRICE VOLUME [maxUSD] ---
+    // --- Command: auto moonbag COIN VOLUME[pct] ---
     {
-      const autoMatch = commandText.match(/^auto\s+(buy|sell|stop)\s+([a-z0-9]+)\s+([\d.]+)\s+([\d.]+)(?:\s+([\d.]+))?$/i);
+      const moonbagMatch = commandText.match(/^auto\s+moonbag\s+([a-z0-9]+)\s+([\d.]+)(pct)?$/i);
+      if (moonbagMatch) {
+        const [, coinRaw, volRaw, isPct] = moonbagMatch;
+        const coin     = coinRaw.toUpperCase();
+        const sym      = coin.includes('-USD') ? coin : `${coin}-USD`;
+        const vol      = parseFloat(volRaw);
+        const volType  = isPct ? 'pct' : 'fixed';
+        const volLabel = isPct ? `${vol}% of position` : `${vol} tokens`;
+
+        const [result] = await db.execute(
+          'INSERT INTO auto_trade_rules (symbol, rule_type, trigger_price, direction, order_type, volume, volume_type, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+          [sym, 'moon_bag', 0, 'above', 'sell', vol, volType, 'manual']
+        );
+        await sendReply(
+          `🌙 Moon bag set [ID: ${result.insertId}]\n` +
+          `${coin}: ${volLabel} marked as long-term hold — never auto-sold\n` +
+          `Appears in auto rules list for reference only`
+        );
+        return res.status(200).json({ ok: true });
+      }
+    }
+
+    // --- Command: auto buy/sell/stop COIN PRICE VOLUME[pct] [maxUSD] ---
+    {
+      const autoMatch = commandText.match(/^auto\s+(buy|sell|stop)\s+([a-z0-9]+)\s+([\d.]+)\s+([\d.]+)(pct)?(?:\s+([\d.]+))?$/i);
       if (autoMatch) {
-        const [, cmdType, coinRaw, triggerPrice, volume, maxPos] = autoMatch;
-        const coin    = coinRaw.toUpperCase();
-        const sym     = coin.includes('-USD') ? coin : `${coin}-USD`;
-        const trigger = parseFloat(triggerPrice);
-        const vol     = parseFloat(volume);
-        const maxUsd  = maxPos ? parseFloat(maxPos) : null;
+        const [, cmdType, coinRaw, triggerPrice, volRaw, isPct, maxPos] = autoMatch;
+        const coin     = coinRaw.toUpperCase();
+        const sym      = coin.includes('-USD') ? coin : `${coin}-USD`;
+        const trigger  = parseFloat(triggerPrice);
+        const vol      = parseFloat(volRaw);
+        const volType  = isPct ? 'pct' : 'fixed';
+        const maxUsd   = maxPos ? parseFloat(maxPos) : null;
+        const volLabel = isPct ? `${vol}% of position` : `${vol} ${coin}`;
 
         let direction, orderType, ruleType;
         if (cmdType.toLowerCase() === 'buy') {
-          // Buy: always triggers below (buying the dip)
           direction = 'below';
           orderType = 'buy';
           ruleType  = 'buy_dip';
         } else if (cmdType.toLowerCase() === 'stop') {
-          // Explicit stop loss: always sell below
           direction = 'below';
           orderType = 'sell';
           ruleType  = 'stop_loss';
         } else {
-          // Sell: detect direction from current price
           const currentPrice = await getCurrentPrice(sym).catch(() => null);
           if (currentPrice && trigger < currentPrice) {
-            // Trigger is below current price → stop loss
             direction = 'below';
             ruleType  = 'stop_loss';
           } else {
-            // Trigger is above current price → take profit
             direction = 'above';
             ruleType  = 'sell_pump';
           }
@@ -6300,13 +6381,13 @@ app.post('/telegram-webhook', async (req, res) => {
         }
 
         const [result] = await db.execute(
-          'INSERT INTO auto_trade_rules (symbol, rule_type, trigger_price, direction, order_type, volume, max_position_usd) VALUES (?, ?, ?, ?, ?, ?, ?)',
-          [sym, ruleType, trigger, direction, orderType, vol, maxUsd]
+          'INSERT INTO auto_trade_rules (symbol, rule_type, trigger_price, direction, order_type, volume, volume_type, max_position_usd) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+          [sym, ruleType, trigger, direction, orderType, vol, volType, maxUsd]
         );
         const label = ruleType === 'stop_loss' ? '🛑 Stop loss' : ruleType === 'buy_dip' ? '📉 Buy dip' : '📈 Take profit';
         await sendReply(
           `✅ Auto rule set [ID: ${result.insertId}]\n` +
-          `${label}: ${orderType.toUpperCase()} ${vol} ${coin} when price goes ${direction} $${trigger.toFixed(2)}` +
+          `${label}: ${orderType.toUpperCase()} ${volLabel} when price goes ${direction} $${trigger.toFixed(6)}` +
           (maxUsd ? `\nMax position: $${maxUsd}` : '')
         );
         return res.status(200).json({ ok: true });
