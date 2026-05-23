@@ -245,6 +245,7 @@ const lastSwingAlertContext = new Map();     // symbol -> { direction: 'pump'|'d
 const swingAlertCooldown = new Map();        // symbol -> timestamp — prevents repeated swing signals (4h cooldown, 6h after reply)
 const autoSkipAlerted = new Map();           // symbol -> timestamp — throttles "auto buy skipped" Telegram messages (1h cooldown)
 const lastAlertContext = new Map();          // chatId -> { symbol, coinBase, alertType } — powers numbered reply shortcuts
+const ruleApproachAlerted = new Map();       // ruleId -> timestamp — tracks 2% approach alerts so they don't spam
 let mostRecentSwingAlert = null;             // { symbol, coinBase, direction, price, timestamp } — for 👍 / natural language
 const alertRecommendations = new Map();      // symbol -> { rec, timestamp } — reused in reminders, no repeat API calls
 const responseCache = new Map();             // 'type:symbol' -> { response, timestamp } — 30-min cache for sell/buy advice
@@ -3275,6 +3276,29 @@ async function checkAutoTradeRules(priceMap) {
         // Moon bag rules are markers only — never auto-execute
         if (rule.rule_type === 'moon_bag') continue;
 
+        // ── Approach alert: notify when within 2% of trigger ─────────────────
+        const triggerPrice = parseFloat(rule.trigger_price);
+        const priceDiff = Math.abs(currentPrice - triggerPrice) / triggerPrice;
+        const approachAlerted = ruleApproachAlerted.get(rule.id);
+        const coinBaseApproach = rule.symbol.replace('-USD', '');
+
+        if (priceDiff < 0.02 && !approachAlerted) {
+          ruleApproachAlerted.set(rule.id, Date.now());
+          await sendTelegram(
+            `⚠️ <b>AUTO RULE APPROACHING — ${coinBaseApproach}</b>\n\n` +
+            `Rule: ${rule.rule_type}\n` +
+            `Trigger: ${rule.direction} $${triggerPrice.toFixed(6)}\n` +
+            `Current: $${currentPrice.toFixed(6)}\n` +
+            `Distance: ${(priceDiff * 100).toFixed(2)}% away\n\n` +
+            `🤖 Will execute automatically when triggered`
+          ).catch(() => {});
+        }
+        // Reset approach alert when price moves back out beyond 5%
+        if (priceDiff > 0.05 && approachAlerted) {
+          ruleApproachAlerted.delete(rule.id);
+        }
+        // ─────────────────────────────────────────────────────────────────────
+
         const shouldTrigger =
           (rule.direction === 'below' && currentPrice <= rule.trigger_price) ||
           (rule.direction === 'above' && currentPrice >= rule.trigger_price);
@@ -3400,13 +3424,36 @@ async function checkAutoTradeRules(priceMap) {
              `Auto-executed: ${rule.rule_type} rule triggered at $${currentPrice}${rule.volume_type === 'pct' ? ` (${rule.volume}% of position)` : ''} via ${exchange}`, 'neutral']
           );
 
+          // Fetch USDT sweep config for notification
+          let sweepEnabled = false;
+          let sweepPct = 0;
+          try {
+            const [sweepRows] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'usdt_sweep_config'");
+            if (sweepRows.length) {
+              const cfg = JSON.parse(sweepRows[0].config_value);
+              sweepEnabled = cfg.enabled === true;
+              sweepPct = cfg.sweep_pct || 0;
+            }
+          } catch (e) { /* ignore */ }
+
+          const valueUsd = currentPrice * resolvedVolume;
+          const volLabel = rule.volume_type === 'pct' ? ` (${rule.volume}% of position)` : '';
+          const sweepLine = (rule.order_type === 'sell' && exchange === 'kraken')
+            ? `💰 USDT sweep: ${sweepEnabled ? `${sweepPct}% of proceeds ($${(valueUsd * sweepPct / 100).toFixed(2)})` : 'disabled'}\n`
+            : '';
+
+          // Clear approach alert now that rule has fired
+          ruleApproachAlerted.delete(rule.id);
+
           await sendTelegram(
-            `🤖 <b>AUTO TRADE EXECUTED — ${coinBase}</b>\n\n` +
-            `${rule.order_type.toUpperCase()} ${formatTradeQty(resolvedVolume)} ${coinBase} @ $${currentPrice.toFixed(4)}\n` +
-            `Value: $${(currentPrice * resolvedVolume).toFixed(2)}\n` +
-            `Exchange: ${exchange.toUpperCase()}\n` +
-            `Rule: ${rule.rule_type}${rule.volume_type === 'pct' ? ` (${rule.volume}% of position)` : ''}\n` +
+            `🤖 <b>AUTO TRADE EXECUTED — ${exchange.toUpperCase()}</b>\n\n` +
+            `${rule.order_type.toUpperCase()} ${formatTradeQty(resolvedVolume)} ${coinBase} @ $${currentPrice.toFixed(6)}\n` +
+            `Value: $${valueUsd.toFixed(2)}\n` +
+            `Rule: ${rule.rule_type}${volLabel}\n` +
+            `Trigger: ${rule.direction} $${triggerPrice.toFixed(6)}\n` +
             `Order ID: ${orderId}\n\n` +
+            `📊 Cascade rules updated automatically\n` +
+            sweepLine +
             `📝 Journal logged automatically`
           );
 
