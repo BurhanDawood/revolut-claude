@@ -518,6 +518,9 @@ await db.execute(`CREATE TABLE IF NOT EXISTS auto_trade_rules (
 try { await db.execute("ALTER TABLE auto_trade_rules ADD COLUMN source VARCHAR(20) DEFAULT 'manual'"); } catch (e) { /* column already exists */ }
 // Add volume_type column for percentage-based volumes
 try { await db.execute("ALTER TABLE auto_trade_rules ADD COLUMN volume_type VARCHAR(10) DEFAULT 'fixed'"); } catch (e) { /* column already exists */ }
+// Add exchange column to support Revolut X alongside Kraken
+try { await db.execute("ALTER TABLE auto_trade_rules ADD COLUMN exchange VARCHAR(20) DEFAULT 'kraken'"); } catch (e) { /* column already exists */ }
+try { await db.execute("UPDATE auto_trade_rules SET exchange = 'kraken' WHERE exchange IS NULL"); } catch (e) { /* backfill */ }
 
 await db.execute(`CREATE TABLE IF NOT EXISTS rebalancing_tracker (
   id INT AUTO_INCREMENT PRIMARY KEY,
@@ -3242,17 +3245,30 @@ async function checkAutoTradeRules(priceMap) {
           (rule.direction === 'above' && currentPrice >= rule.trigger_price);
         if (!shouldTrigger) continue;
 
+        // Resolve exchange — default to kraken for backward compatibility
+        const exchange = (rule.exchange || 'kraken').toLowerCase();
+
         // Resolve volume — fixed token amount or percentage of current position
         let resolvedVolume = parseFloat(rule.volume);
         if (rule.volume_type === 'pct') {
           try {
-            const krakenData = await getKrakenBalances();
-            const asset = krakenData.balances.find(
-              b => b.symbol === rule.symbol || b.standard === rule.symbol.replace('-USD', '')
-            );
-            const currentQty = parseFloat(asset?.quantity || asset?.balance || 0);
-            resolvedVolume = currentQty * (parseFloat(rule.volume) / 100);
-            console.log(`[auto] ${rule.symbol} pct volume: ${rule.volume}% of ${currentQty} = ${resolvedVolume.toFixed(6)}`);
+            if (exchange === 'revolut') {
+              // Revolut: fetch from /balances
+              const rBalances = await revolutRequest('GET', '/balances');
+              const coinBase_ = rule.symbol.replace('-USD', '');
+              const asset = rBalances.find(b => b.currency === coinBase_);
+              const currentQty = parseFloat(asset?.available || 0);
+              resolvedVolume = currentQty * (parseFloat(rule.volume) / 100);
+              console.log(`[auto] ${rule.symbol} (revolut) pct volume: ${rule.volume}% of ${currentQty} = ${resolvedVolume.toFixed(6)}`);
+            } else {
+              const krakenData = await getKrakenBalances();
+              const asset = krakenData.balances.find(
+                b => b.symbol === rule.symbol || b.standard === rule.symbol.replace('-USD', '')
+              );
+              const currentQty = parseFloat(asset?.quantity || asset?.balance || 0);
+              resolvedVolume = currentQty * (parseFloat(rule.volume) / 100);
+              console.log(`[auto] ${rule.symbol} pct volume: ${rule.volume}% of ${currentQty} = ${resolvedVolume.toFixed(6)}`);
+            }
             if (resolvedVolume <= 0) {
               console.log(`[auto] Skipping ${rule.symbol} pct rule — resolved volume is 0`);
               continue;
@@ -3266,22 +3282,40 @@ async function checkAutoTradeRules(priceMap) {
         // Max position safety check for buys
         if (rule.order_type === 'buy' && rule.max_position_usd) {
           try {
-            const krakenData = await getKrakenBalances();
-            const existing = krakenData.balances.find(b => b.symbol === rule.symbol || b.standard === rule.symbol.replace('-USD', ''));
-            const currentPositionUSD = existing?.valueUSD || 0;
-            if (currentPositionUSD >= rule.max_position_usd) {
-              console.log(`[auto] Skipping buy — max position reached for ${rule.symbol} ($${currentPositionUSD.toFixed(2)} >= $${rule.max_position_usd})`);
-              continue;
+            if (exchange === 'revolut') {
+              const rBalances = await revolutRequest('GET', '/balances');
+              const coinBase_ = rule.symbol.replace('-USD', '');
+              const asset = rBalances.find(b => b.currency === coinBase_);
+              const currentPositionUSD = parseFloat(asset?.available || 0) * currentPrice;
+              if (currentPositionUSD >= rule.max_position_usd) {
+                console.log(`[auto] Skipping revolut buy — max position reached for ${rule.symbol} ($${currentPositionUSD.toFixed(2)} >= $${rule.max_position_usd})`);
+                continue;
+              }
+            } else {
+              const krakenData = await getKrakenBalances();
+              const existing = krakenData.balances.find(b => b.symbol === rule.symbol || b.standard === rule.symbol.replace('-USD', ''));
+              const currentPositionUSD = existing?.valueUSD || 0;
+              if (currentPositionUSD >= rule.max_position_usd) {
+                console.log(`[auto] Skipping buy — max position reached for ${rule.symbol} ($${currentPositionUSD.toFixed(2)} >= $${rule.max_position_usd})`);
+                continue;
+              }
             }
-          } catch (e) { /* kraken unavailable — skip safety check, abort */ continue; }
+          } catch (e) { console.error('[auto] Max position check error:', e.message); continue; }
         }
 
         // USD balance check for buys
         if (rule.order_type === 'buy') {
           try {
-            const krakenData = await getKrakenBalances();
-            const usdBalance = krakenData.balances.find(b => b.standard === 'USD' || b.symbol === 'ZUSD');
-            const availableUSD = usdBalance?.balance || 0;
+            let availableUSD = 0;
+            if (exchange === 'revolut') {
+              const rBalances = await revolutRequest('GET', '/balances');
+              const usdAsset = rBalances.find(b => b.currency === 'USD');
+              availableUSD = parseFloat(usdAsset?.available || 0);
+            } else {
+              const krakenData = await getKrakenBalances();
+              const usdBalance = krakenData.balances.find(b => b.standard === 'USD' || b.symbol === 'ZUSD');
+              availableUSD = usdBalance?.balance || 0;
+            }
             const requiredUSD = resolvedVolume * currentPrice;
             if (availableUSD < requiredUSD) {
               // Only notify if there IS some USD but not enough — complete silence when balance is $0
@@ -3310,34 +3344,42 @@ async function checkAutoTradeRules(priceMap) {
           }
         }
 
-        console.log(`[auto] Executing ${rule.order_type} rule for ${rule.symbol} at $${currentPrice} (trigger: ${rule.direction} $${rule.trigger_price}, vol: ${resolvedVolume})`);
+        console.log(`[auto] Executing ${rule.order_type} rule for ${rule.symbol} at $${currentPrice} via ${exchange} (trigger: ${rule.direction} $${rule.trigger_price}, vol: ${resolvedVolume})`);
         const coinBase = rule.symbol.replace('-USD', '');
 
         try {
-          const result = await executeKrakenTrade(rule.symbol, rule.order_type, 'market', resolvedVolume);
+          let result, orderId;
+          if (exchange === 'revolut') {
+            result = await placeRevolutOrder(rule.symbol, rule.order_type, 'market', resolvedVolume, null, null);
+            orderId = result?.id || 'unknown';
+          } else {
+            result = await executeKrakenTrade(rule.symbol, rule.order_type, 'market', resolvedVolume);
+            orderId = result?.txid?.[0] || 'unknown';
+          }
 
           await db.execute('UPDATE auto_trade_rules SET last_triggered = NOW() WHERE id = ?', [rule.id]);
 
           await db.execute(
             'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion) VALUES (?, ?, ?, ?, ?, ?, ?)',
             [coinBase, rule.order_type, currentPrice, resolvedVolume, currentPrice * resolvedVolume,
-             `Auto-executed: ${rule.rule_type} rule triggered at $${currentPrice}${rule.volume_type === 'pct' ? ` (${rule.volume}% of position)` : ''}`, 'neutral']
+             `Auto-executed: ${rule.rule_type} rule triggered at $${currentPrice}${rule.volume_type === 'pct' ? ` (${rule.volume}% of position)` : ''} via ${exchange}`, 'neutral']
           );
 
           await sendTelegram(
             `🤖 <b>AUTO TRADE EXECUTED — ${coinBase}</b>\n\n` +
             `${rule.order_type.toUpperCase()} ${formatTradeQty(resolvedVolume)} ${coinBase} @ $${currentPrice.toFixed(4)}\n` +
             `Value: $${(currentPrice * resolvedVolume).toFixed(2)}\n` +
+            `Exchange: ${exchange.toUpperCase()}\n` +
             `Rule: ${rule.rule_type}${rule.volume_type === 'pct' ? ` (${rule.volume}% of position)` : ''}\n` +
-            `Order ID: ${result?.txid?.[0] || 'unknown'}\n\n` +
+            `Order ID: ${orderId}\n\n` +
             `📝 Journal logged automatically`
           );
 
           // Cascade: generate next set of rules based on executed price
           await cascadeRulesAfterTrade(rule, currentPrice);
 
-          // USDT sweep after qualifying Kraken sells
-          if (rule.order_type === 'sell') {
+          // USDT sweep after qualifying sells (Kraken only — Revolut handles its own treasury)
+          if (rule.order_type === 'sell' && exchange === 'kraken') {
             const proceeds = currentPrice * resolvedVolume;
             await sweepToUSDT(proceeds, rule.symbol).catch(() => {});
           }
@@ -4910,7 +4952,7 @@ function createMcpServer() {
 
   // ── Tool: set_auto_trade_rule ─────────────────────────────────────────────
   server.tool('set_auto_trade_rule',
-    'Set an automatic trade rule for Kraken — executes automatically when price condition is met. Use rule_type moon_bag to mark a portion as never-sell.',
+    'Set an automatic trade rule for Kraken or Revolut X — executes automatically when price condition is met. Use rule_type moon_bag to mark a portion as never-sell.',
     {
       symbol:           z.string().describe('Trading pair e.g. SOL-USD'),
       rule_type:        z.string().describe('Label: buy_dip, sell_pump, stop_loss, buy_retrace, moon_bag'),
@@ -4920,14 +4962,16 @@ function createMcpServer() {
       volume:           z.number().describe('Token amount (fixed) or percentage (pct) of position to trade'),
       volume_type:      z.enum(['fixed', 'pct']).optional().describe('fixed = token count, pct = % of current position (default: fixed)'),
       max_position_usd: z.number().optional().describe('Max position size in USD — skips buy if already holding this much'),
+      exchange:         z.enum(['kraken', 'revolut']).optional().describe('Exchange to execute on: kraken (default) or revolut'),
     },
-    async ({ symbol, rule_type, trigger_price, direction, order_type, volume, volume_type, max_position_usd }) => {
+    async ({ symbol, rule_type, trigger_price, direction, order_type, volume, volume_type, max_position_usd, exchange }) => {
       try {
         const sym     = symbol.includes('-USD') ? symbol : `${symbol}-USD`;
         const volType = volume_type || 'fixed';
+        const exch    = exchange || 'kraken';
         const [result] = await db.execute(
-          'INSERT INTO auto_trade_rules (symbol, rule_type, trigger_price, direction, order_type, volume, volume_type, max_position_usd) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-          [sym, rule_type, trigger_price, direction, order_type, volume, volType, max_position_usd || null]
+          'INSERT INTO auto_trade_rules (symbol, rule_type, trigger_price, direction, order_type, volume, volume_type, max_position_usd, exchange) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+          [sym, rule_type, trigger_price, direction, order_type, volume, volType, max_position_usd || null, exch]
         );
         const volLabel = volType === 'pct' ? `${volume}% of position` : `${volume} tokens`;
         const moonNote = rule_type === 'moon_bag' ? '\n🌙 Moon bag — marker only, never auto-sold' : '';
@@ -4935,9 +4979,10 @@ function createMcpServer() {
           `🤖 <b>AUTO TRADE RULE SET</b>\n\n` +
           `${order_type.toUpperCase()} ${volLabel} ${sym.replace('-USD', '')} when price goes ${direction} $${trigger_price}\n` +
           `Rule type: ${rule_type}\n` +
+          `Exchange: ${exch.toUpperCase()}\n` +
           `Max position: ${max_position_usd ? '$' + max_position_usd : 'unlimited'}${moonNote}`
         );
-        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, rule_id: result.insertId, symbol: sym, rule_type, trigger_price, direction, order_type, volume, volume_type: volType }) }] };
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, rule_id: result.insertId, symbol: sym, rule_type, trigger_price, direction, order_type, volume, volume_type: volType, exchange: exch }) }] };
       } catch (e) {
         return { content: [{ type: 'text', text: JSON.stringify({ error: e.message }) }] };
       }
@@ -6306,13 +6351,14 @@ app.post('/telegram-webhook', async (req, res) => {
         await sendReply('📋 No auto trade rules set.');
       } else {
         const lines = rules.map(r => {
-          const sourceTag = r.source === 'cascade' ? ' 🔄' : ' ✍️';
-          const lastTag   = r.last_triggered
+          const sourceTag  = r.source === 'cascade' ? ' 🔄' : ' ✍️';
+          const exchTag    = `[${(r.exchange || 'kraken').toUpperCase()}]`;
+          const lastTag    = r.last_triggered
             ? ` | fired: ${new Date(r.last_triggered).toLocaleDateString('en-GB', { day:'numeric', month:'short' })}`
             : ' | never fired';
           const icon = r.rule_type === 'moon_bag' ? '🌙' : r.rule_type === 'stop_loss' ? '🛑' : r.order_type === 'buy' ? '📉' : '📈';
           const volDisplay = r.volume_type === 'pct' ? `${r.volume}% of pos` : `${formatTradeQty(r.volume)}`;
-          return `${r.active ? '✅' : '⏸'} ${icon} [${r.id}] ${r.rule_type}${sourceTag}\n` +
+          return `${r.active ? '✅' : '⏸'} ${icon} [${r.id}] ${r.rule_type}${sourceTag} ${exchTag}\n` +
                  `   ${r.order_type.toUpperCase()} ${volDisplay} ${r.symbol.replace('-USD','')} ${r.direction} $${parseFloat(r.trigger_price).toFixed(6)}` +
                  (r.max_position_usd ? ` (max $${r.max_position_usd})` : '') +
                  lastTag;
@@ -6334,8 +6380,8 @@ app.post('/telegram-webhook', async (req, res) => {
         const volLabel = isPct ? `${vol}% of position` : `${vol} tokens`;
 
         const [result] = await db.execute(
-          'INSERT INTO auto_trade_rules (symbol, rule_type, trigger_price, direction, order_type, volume, volume_type, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-          [sym, 'moon_bag', 0, 'above', 'sell', vol, volType, 'manual']
+          'INSERT INTO auto_trade_rules (symbol, rule_type, trigger_price, direction, order_type, volume, volume_type, source, exchange) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+          [sym, 'moon_bag', 0, 'above', 'sell', vol, volType, 'manual', 'kraken']
         );
         await sendReply(
           `🌙 Moon bag set [ID: ${result.insertId}]\n` +
@@ -6346,17 +6392,18 @@ app.post('/telegram-webhook', async (req, res) => {
       }
     }
 
-    // --- Command: auto buy/sell/stop COIN PRICE VOLUME[pct] [maxUSD] ---
+    // --- Command: auto buy/sell/stop COIN PRICE VOLUME[pct] [maxUSD] [kraken|revolut] ---
     {
-      const autoMatch = commandText.match(/^auto\s+(buy|sell|stop)\s+([a-z0-9]+)\s+([\d.]+)\s+([\d.]+)(pct)?(?:\s+([\d.]+))?$/i);
+      const autoMatch = commandText.match(/^auto\s+(buy|sell|stop)\s+([a-z0-9]+)\s+([\d.]+)\s+([\d.]+)(pct)?(?:\s+([\d.]+))?(?:\s+(kraken|revolut))?$/i);
       if (autoMatch) {
-        const [, cmdType, coinRaw, triggerPrice, volRaw, isPct, maxPos] = autoMatch;
+        const [, cmdType, coinRaw, triggerPrice, volRaw, isPct, maxPos, exchangeRaw] = autoMatch;
         const coin     = coinRaw.toUpperCase();
         const sym      = coin.includes('-USD') ? coin : `${coin}-USD`;
         const trigger  = parseFloat(triggerPrice);
         const vol      = parseFloat(volRaw);
         const volType  = isPct ? 'pct' : 'fixed';
         const maxUsd   = maxPos ? parseFloat(maxPos) : null;
+        const exchVal  = (exchangeRaw || 'kraken').toLowerCase();
         const volLabel = isPct ? `${vol}% of position` : `${vol} ${coin}`;
 
         let direction, orderType, ruleType;
@@ -6381,14 +6428,15 @@ app.post('/telegram-webhook', async (req, res) => {
         }
 
         const [result] = await db.execute(
-          'INSERT INTO auto_trade_rules (symbol, rule_type, trigger_price, direction, order_type, volume, volume_type, max_position_usd) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-          [sym, ruleType, trigger, direction, orderType, vol, volType, maxUsd]
+          'INSERT INTO auto_trade_rules (symbol, rule_type, trigger_price, direction, order_type, volume, volume_type, max_position_usd, exchange) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+          [sym, ruleType, trigger, direction, orderType, vol, volType, maxUsd, exchVal]
         );
         const label = ruleType === 'stop_loss' ? '🛑 Stop loss' : ruleType === 'buy_dip' ? '📉 Buy dip' : '📈 Take profit';
         await sendReply(
           `✅ Auto rule set [ID: ${result.insertId}]\n` +
           `${label}: ${orderType.toUpperCase()} ${volLabel} when price goes ${direction} $${trigger.toFixed(6)}` +
-          (maxUsd ? `\nMax position: $${maxUsd}` : '')
+          (maxUsd ? `\nMax position: $${maxUsd}` : '') +
+          `\nExchange: ${exchVal.toUpperCase()}`
         );
         return res.status(200).json({ ok: true });
       }
