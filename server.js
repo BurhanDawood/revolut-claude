@@ -522,6 +522,21 @@ try { await db.execute("ALTER TABLE auto_trade_rules ADD COLUMN volume_type VARC
 try { await db.execute("ALTER TABLE auto_trade_rules ADD COLUMN exchange VARCHAR(20) DEFAULT 'kraken'"); } catch (e) { /* column already exists */ }
 try { await db.execute("UPDATE auto_trade_rules SET exchange = 'kraken' WHERE exchange IS NULL"); } catch (e) { /* backfill */ }
 
+// One-time data corrections
+try {
+  // Fix journal ID 96: was auto-detected as buy, was actually a transfer-in from Kraken
+  await db.execute(
+    "UPDATE trading_journal SET action = 'transfer', reasoning = 'Transfer in from Kraken — SOL consolidated to Revolut X for auto trading. Auto-detected incorrectly as buy.', claude_recommendation = NULL, claude_reasoning = NULL, followed_recommendation = NULL WHERE id = 96"
+  );
+  // Remove duplicate correction entry
+  await db.execute("DELETE FROM trading_journal WHERE id = 99");
+  // Expire old SOL sell intention (ID 3) so it never matches future trades
+  await db.execute("UPDATE trade_intentions SET expires_at = NOW(), matched_at = NOW() WHERE id = 3 AND matched_at IS NULL");
+  console.log('[migration] One-time data corrections applied (journal 96, delete 99, expire intention 3)');
+} catch (e) {
+  console.log('[migration] One-time corrections skipped or already applied:', e.message);
+}
+
 await db.execute(`CREATE TABLE IF NOT EXISTS rebalancing_tracker (
   id INT AUTO_INCREMENT PRIMARY KEY,
   out_symbol VARCHAR(50) NOT NULL,
@@ -2493,10 +2508,12 @@ async function checkForRebalancePair(newSymbol, newAction, newJournalId, newPric
 
 async function findMatchingIntention(symbol, action) {
   try {
-    // Broaden match: sell/reduce are equivalent, buy/add are equivalent
-    const normalizedAction = action === 'sell' ? ['sell', 'reduce']
-                           : action === 'buy'  ? ['buy', 'add']
-                           : [action];
+    // Strict action mapping — never cross-match sell↔buy or transfer↔buy
+    const normalizedAction =
+      action === 'sell'     ? ['sell', 'reduce'] :
+      action === 'buy'      ? ['buy', 'add'] :
+      action === 'transfer' ? ['transfer'] :
+      [action];
     const placeholders = normalizedAction.map(() => '?').join(',');
     const [rows] = await db.execute(
       `SELECT * FROM trade_intentions
@@ -2504,6 +2521,7 @@ async function findMatchingIntention(symbol, action) {
        AND action IN (${placeholders})
        AND matched_at IS NULL
        AND expires_at > NOW()
+       AND stated_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)
        ORDER BY stated_at DESC
        LIMIT 1`,
       [symbol, ...normalizedAction]
@@ -2538,10 +2556,27 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
       if (recRows.length > 0) claudeRec = recRows[0].recommendation;
     } catch (e) { /* ignore */ }
 
+    // Reclassify incoming buy as transfer if a transfer intention exists
+    // (prevents transfers-in from Kraken being logged as buys)
+    let reasoning = 'auto-detected';
+    if (action === 'buy') {
+      try {
+        const transferIntention = await findMatchingIntention(symbol, 'transfer');
+        if (transferIntention) {
+          console.log(`[intention] Transfer intention matched for ${symbol} — reclassifying buy as transfer`);
+          action = 'transfer';
+          reasoning = transferIntention.reasoning || 'Transfer in — matched to stated intention';
+          await db.execute('UPDATE trade_intentions SET matched_at = NOW() WHERE id = ?', [transferIntention.id]).catch(() => {});
+        }
+      } catch (e) {
+        console.error('[intention] Transfer reclassification error:', e.message);
+      }
+    }
+
     // Insert journal entry
     const [result] = await db.execute(
       'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, claude_recommendation) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-      [symbol, action, price, absQty, valueUsd, 'auto-detected', 'pending', claudeRec]
+      [symbol, action, price, absQty, valueUsd, reasoning, 'pending', claudeRec]
     );
     const journalId = result.insertId;
 
@@ -3543,6 +3578,13 @@ async function checkPortfolio() {
       const change = (currentPrice - basePrices[symbol]) / basePrices[symbol];
       console.log(`${symbol}: $${currentPrice} (${(change * 100).toFixed(1)}% from baseline)`);
 
+      // Dust position check — suppress pump/drop alerts for positions worth less than $1
+      const positionValueUsd = available * currentPrice;
+      if (positionValueUsd > 0 && positionValueUsd < 1.00) {
+        console.log(`[dust] Skipping ${symbol} — position value $${positionValueUsd.toFixed(4)} below $1 minimum`);
+        continue;
+      }
+
       // Trigger baseline alert if pumping
       const threshold = customThresholds[symbol] !== undefined ? customThresholds[symbol] : PUMP_THRESHOLD;
       if (change >= threshold && !alertState.active.has(symbol) && !alertState.acknowledged.has(symbol) && !ignoredCoins.has(symbol)) {
@@ -3634,6 +3676,18 @@ async function checkPortfolio() {
     for (const [symbol, target] of priceTargets) {
       const currentPrice = priceMap[symbol];
       if (!currentPrice) continue;
+
+      // Dust check — suppress fixed target alerts for positions < $1
+      // (but allow through if no position held — might be a watch for buy entry)
+      {
+        const coinBase_ = symbol.replace('-USD', '');
+        const assetB = balances.find(a => a.currency === coinBase_);
+        const ftPositionValue = assetB ? parseFloat(assetB.available) * currentPrice : 0;
+        if (ftPositionValue > 0 && ftPositionValue < 1.00) {
+          console.log(`[dust] Skipping fixed target for ${symbol} — $${ftPositionValue.toFixed(4)} below $1`);
+          continue;
+        }
+      }
 
       const direction = target.direction || 'up';
 
@@ -3761,6 +3815,19 @@ async function checkPortfolio() {
       if (alertState.acknowledged.has(symbol)) continue;
       if (ignoredCoins.has(symbol)) continue;
 
+      // Dust check with exception: trailing stops fire even on dust if explicitly set by Claude
+      // Since all entries in trailingStops were explicitly set, hasExplicitTrailingStop is always true —
+      // meaning this effectively allows trailing stops to always fire regardless of position size.
+      {
+        const hasExplicitTrailingStop = trailingStops.has(symbol);
+        const assetB = balances.find(a => a.currency === symbol.replace('-USD', ''));
+        const tsPositionValue = assetB ? parseFloat(assetB.available) * currentPrice : 0;
+        if (tsPositionValue > 0 && tsPositionValue < 1.00 && !hasExplicitTrailingStop) {
+          console.log(`[dust] Skipping trailing stop for ${symbol} — $${tsPositionValue.toFixed(4)} below $1`);
+          continue;
+        }
+      }
+
       const result = await updateTrailingStop(symbol, currentPrice);
       if (!result || !result.triggered) continue;
 
@@ -3801,6 +3868,13 @@ async function checkPortfolio() {
         const symbol = `${asset.currency}-USD`;
         const currentPrice = priceMap[symbol];
         if (!currentPrice) continue;
+
+        // Dust check — skip swing signals for positions < $1
+        const swingPositionValue = parseFloat(asset.available) * currentPrice;
+        if (swingPositionValue > 0 && swingPositionValue < 1.00) {
+          console.log(`[dust] Skipping swing signal for ${symbol} — $${swingPositionValue.toFixed(4)} below $1`);
+          continue;
+        }
 
         // Get 7-day price history
         const [histRows] = await db.execute(
@@ -4946,7 +5020,10 @@ function createMcpServer() {
       }
       positions.sort((a, b) => (parseFloat(b.value_usd) || 0) - (parseFloat(a.value_usd) || 0));
       const cap = getCapitalSummary(totalValue);
-      return { content: [{ type: 'text', text: JSON.stringify({ total_value_usd: totalValue.toFixed(2), invested: cap.invested, pl_usd: cap.pnl.toFixed(2), pl_pct: cap.pnlPct.toFixed(2), positions }, null, 2) }] };
+      // Filter dust positions from main list — keep for reference as count
+      const dustCount = positions.filter(p => parseFloat(p.value_usd || 0) > 0 && parseFloat(p.value_usd || 0) < 1.00).length;
+      const cleanPositions = positions.filter(p => parseFloat(p.value_usd || 0) >= 1.00);
+      return { content: [{ type: 'text', text: JSON.stringify({ total_value_usd: totalValue.toFixed(2), invested: cap.invested, pl_usd: cap.pnl.toFixed(2), pl_pct: cap.pnlPct.toFixed(2), positions: cleanPositions, dust_positions: dustCount }, null, 2) }] };
     }
   );
 
