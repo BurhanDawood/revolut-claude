@@ -2484,6 +2484,19 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
         console.log(`[tax] US HIFO: ${totalGL >= 0 ? 'Gain' : 'Loss'} $${Math.abs(totalGL).toFixed(2)} (${termLabel})`);
       }
     }
+    if (action === 'payment') {
+      // Spending crypto is a taxable disposal under both HMRC and IRS rules
+      const disposals = await disposeTaxLotsHIFO(
+        symbol.replace('-USD', ''), absQty, price, new Date(), journalId
+      ).catch(e => { console.error('[tax] Payment disposal error:', e.message); return []; });
+      if (disposals.length > 0) {
+        const totalGL = disposals.reduce((s, d) => s + d.gain_loss_usd, 0);
+        const hasLong = disposals.some(d => d.is_long_term);
+        const hasShort = disposals.some(d => !d.is_long_term);
+        const termLabel = hasLong && hasShort ? 'mixed' : hasLong ? 'long-term' : 'short-term';
+        console.log(`[tax] Payment disposal — US HIFO: ${totalGL >= 0 ? 'Gain' : 'Loss'} $${Math.abs(totalGL).toFixed(2)} (${termLabel})`);
+      }
+    }
 
     // If sell: record outcome with full P&L notification
     let pnlLine = '';
