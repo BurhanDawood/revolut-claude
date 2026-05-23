@@ -197,6 +197,7 @@ const conversationHistory = new Map(); // chatId -> [{role, content}]
 const lastRecommendationContext = new Map(); // chatId -> { coins, action, prices, timestamp }
 const lastSwingAlertContext = new Map();     // symbol -> { direction: 'pump'|'dip', price, timestamp }
 const swingAlertCooldown = new Map();        // symbol -> timestamp — prevents repeated swing signals (4h cooldown, 6h after reply)
+const autoSkipAlerted = new Map();           // symbol -> timestamp — throttles "auto buy skipped" Telegram messages (1h cooldown)
 let mostRecentSwingAlert = null;             // { symbol, coinBase, direction, price, timestamp } — for 👍 / natural language
 const alertRecommendations = new Map();      // symbol -> { rec, timestamp } — reused in reminders, no repeat API calls
 const responseCache = new Map();             // 'type:symbol' -> { response, timestamp } — 30-min cache for sell/buy advice
@@ -876,6 +877,16 @@ async function reduceTranches(symbol, exchange, qtySold) {
   } catch (e) {
     console.error('[tranches] reduceTranches failed:', e.message);
   }
+}
+
+// ── Do-Not-Disturb Helper ─────────────────────────────────────────────────────
+
+function hasAgreedStrategy(symbol) {
+  return (
+    priceTargets.has(symbol) ||    // fixed target/alert set
+    trailingStops.has(symbol) ||   // trailing stop active
+    ignoredCoins.has(symbol)       // permanently silenced
+  );
 }
 
 // ── Trade Approval Reminder + Auto-Cancel ────────────────────────────────────
@@ -3137,7 +3148,17 @@ async function checkAutoTradeRules(priceMap) {
             const requiredUSD = rule.volume * currentPrice;
             if (availableUSD < requiredUSD) {
               console.log(`[auto] Skipping buy — insufficient USD: $${availableUSD.toFixed(2)} available, $${requiredUSD.toFixed(2)} required`);
-              await sendTelegram(`⚠️ Auto buy skipped — insufficient USD balance. Need $${requiredUSD.toFixed(2)} but only $${availableUSD.toFixed(2)} available. Sell some ${rule.symbol.replace('-USD', '')} first to fund buys.`);
+              const lastSkipAlert = autoSkipAlerted.get(rule.symbol);
+              const oneHour = 60 * 60 * 1000;
+              if (!lastSkipAlert || Date.now() - lastSkipAlert > oneHour) {
+                await sendTelegram(
+                  `⚠️ Auto buy skipped — insufficient USD: $${availableUSD.toFixed(2)} available, $${requiredUSD.toFixed(2)} required.\n` +
+                  `Sell some ${rule.symbol.replace('-USD', '')} first to fund buys.`
+                );
+                autoSkipAlerted.set(rule.symbol, Date.now());
+              } else {
+                console.log(`[auto] Buy skipped (USD low) — alert suppressed, sent ${Math.round((Date.now() - lastSkipAlert) / 60000)}min ago`);
+              }
               continue;
             }
           } catch (e) {
@@ -3216,6 +3237,19 @@ async function checkPortfolio() {
     }
     console.log('Price map size:', Object.keys(priceMap).length);
     console.log('Price map sample:', JSON.stringify(Object.entries(priceMap).slice(0, 3)));
+
+    // Reset autoSkipAlerted for coins whose price moved >3% since last skip alert
+    for (const [symbol, lastAlert] of autoSkipAlerted) {
+      const currentPrice = priceMap[symbol];
+      const basePrice = basePrices[symbol];
+      if (currentPrice && basePrice) {
+        const move = Math.abs((currentPrice - basePrice) / basePrice);
+        if (move > 0.03) {
+          autoSkipAlerted.delete(symbol);
+          console.log(`[auto] Reset skip alert for ${symbol} — price moved ${(move * 100).toFixed(1)}%`);
+        }
+      }
+    }
 
     // FIX 2+3: Pre-pass — find all alerts that would fire, handle dust rule-based, batch-call Claude for the rest
     {
@@ -3321,6 +3355,9 @@ async function checkPortfolio() {
       // Trigger baseline alert if pumping
       const threshold = customThresholds[symbol] !== undefined ? customThresholds[symbol] : PUMP_THRESHOLD;
       if (change >= threshold && !alertState.active.has(symbol) && !alertState.acknowledged.has(symbol) && !ignoredCoins.has(symbol)) {
+        if (hasAgreedStrategy(symbol)) {
+          console.log(`[alert] ${symbol} has agreed strategy — suppressing daily pump alert`);
+        } else {
         const pct = (change * 100).toFixed(1);
         const coinBase = asset.currency;
         // FIX 1: Read from pre-pass cache — no extra API call here
@@ -3346,10 +3383,14 @@ async function checkPortfolio() {
           console.log('[alert] Sending pump reminder for:', symbol);
           await sendTelegram(`⚠️ <b>REMINDER: ${symbol} DAILY PUMP ALERT still active!</b>\n\nStill up ${pct}% from baseline${recLine}\n\nReply 'acknowledge ${coinBase}' to stop`);
         }, ALERT_INTERVAL_MS));
+        } // end else (hasAgreedStrategy pump suppression)
       }
 
       // Trigger baseline drop alert
       if (change <= -threshold && !activeDropAlerts.has(symbol) && !alertState.acknowledged.has(symbol) && !ignoredCoins.has(symbol)) {
+        if (hasAgreedStrategy(symbol)) {
+          console.log(`[alert] ${symbol} has agreed strategy — suppressing daily drop alert`);
+        } else {
         const pct = (Math.abs(change) * 100).toFixed(1);
         const coinBase = asset.currency;
         // FIX 1: Read from pre-pass cache — no extra API call here
@@ -3372,6 +3413,7 @@ async function checkPortfolio() {
           console.log('[alert] Sending drop reminder for:', symbol);
           await sendTelegram(`⚠️ <b>REMINDER: ${symbol} DROP ALERT still active!</b>\n\nStill down ${pct}% from baseline${recLine}\n\nReply 'acknowledge ${coinBase}' to stop`);
         }, ALERT_INTERVAL_MS));
+        } // end else (hasAgreedStrategy drop suppression)
       }
     }
 
@@ -4729,6 +4771,35 @@ function createMcpServer() {
         const [rules] = await db.execute('SELECT * FROM auto_trade_rules ORDER BY created_at DESC');
         const active = rules.filter(r => r.active);
         return { content: [{ type: 'text', text: JSON.stringify({ rules, active_count: active.length, total: rules.length }, null, 2) }] };
+      } catch (e) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: e.message }) }] };
+      }
+    }
+  );
+
+  // ── Tool: manage_auto_rules ───────────────────────────────────────────────
+  server.tool('manage_auto_rules',
+    'Manage automatic trade rules — list, remove or disable a rule by ID',
+    {
+      action:  z.enum(['list', 'remove', 'disable']),
+      rule_id: z.number().optional().describe('Rule ID to remove or disable'),
+    },
+    async ({ action, rule_id }) => {
+      try {
+        if (action === 'list') {
+          const [rules] = await db.execute('SELECT * FROM auto_trade_rules ORDER BY created_at DESC');
+          const active = rules.filter(r => r.active);
+          return { content: [{ type: 'text', text: JSON.stringify({ rules, active_count: active.length, total: rules.length }, null, 2) }] };
+        }
+        if (action === 'remove' && rule_id) {
+          await db.execute('DELETE FROM auto_trade_rules WHERE id = ?', [rule_id]);
+          return { content: [{ type: 'text', text: JSON.stringify({ ok: true, deleted: rule_id }) }] };
+        }
+        if (action === 'disable' && rule_id) {
+          await db.execute('UPDATE auto_trade_rules SET active = 0 WHERE id = ?', [rule_id]);
+          return { content: [{ type: 'text', text: JSON.stringify({ ok: true, disabled: rule_id }) }] };
+        }
+        return { content: [{ type: 'text', text: JSON.stringify({ error: 'rule_id required for remove/disable' }) }] };
       } catch (e) {
         return { content: [{ type: 'text', text: JSON.stringify({ error: e.message }) }] };
       }
