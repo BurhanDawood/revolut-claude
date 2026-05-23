@@ -905,7 +905,24 @@ try {
 
 seedLegacyTranches().catch(e => console.error('[tranches] Startup seed failed:', e.message));
 
-updateLearningModel().catch(() => {});
+// Generate learning model on startup if missing or never generated
+(async () => {
+  try {
+    const [lmCheck] = await db.execute(
+      "SELECT config_value FROM system_config WHERE config_key = 'learning_model'"
+    );
+    if (!lmCheck.length || !lmCheck[0].config_value || lmCheck[0].config_value === 'Not yet generated') {
+      console.log('[learning] No model cached — generating initial model on startup...');
+      await updateLearningModel().catch(e => console.error('[learning] Initial generation failed:', e.message));
+    } else {
+      console.log('[learning] Existing model found — skipping startup regeneration');
+    }
+  } catch (e) {
+    // system_config may not have a learning_model row — just run it
+    console.log('[learning] Could not check model cache — running updateLearningModel()');
+    await updateLearningModel().catch(() => {});
+  }
+})();
 
 // ── Tranche Helpers ───────────────────────────────────────────────────────────
 
@@ -1967,97 +1984,185 @@ Keep total under 2000 characters. No long paragraphs. Be concise.`
 
 async function updateLearningModel() {
   try {
-    const [trades] = await db.execute(
-      "SELECT * FROM trading_journal WHERE outcome IS NOT NULL AND outcome_pnl IS NOT NULL AND action NOT IN ('payment', 'transfer') ORDER BY created_at DESC LIMIT 200"
+    // ── 1. All journal entries (not just completed) ───────────────────────────
+    const [allTrades] = await db.execute(
+      "SELECT * FROM trading_journal WHERE action NOT IN ('payment', 'transfer') ORDER BY created_at DESC LIMIT 500"
     );
-    if (trades.length < 3) {
+    const completedTrades = allTrades.filter(t => t.outcome_pnl != null);
+
+    // Need at least a few entries to say anything useful
+    if (allTrades.length < 3) {
       learningModelCache = '';
       return '';
     }
 
-    const wins = trades.filter(t => parseFloat(t.outcome_pnl) > 0).length;
-    const overallWinRate = Math.round((wins / trades.length) * 100);
+    // ── 2. Win-rate stats (completed trades only) ─────────────────────────────
+    let winRateSection = '';
+    if (completedTrades.length >= 3) {
+      const wins = completedTrades.filter(t => parseFloat(t.outcome_pnl) > 0).length;
+      const overallWinRate = Math.round((wins / completedTrades.length) * 100);
 
-    // Stats by action
-    const byAction = {};
-    for (const t of trades) {
-      const a = t.action;
-      if (!byAction[a]) byAction[a] = { wins: 0, total: 0 };
-      byAction[a].total++;
-      if (parseFloat(t.outcome_pnl) > 0) byAction[a].wins++;
+      const byAction = {};
+      for (const t of completedTrades) {
+        const a = t.action;
+        if (!byAction[a]) byAction[a] = { wins: 0, total: 0 };
+        byAction[a].total++;
+        if (parseFloat(t.outcome_pnl) > 0) byAction[a].wins++;
+      }
+      const actionLines = Object.entries(byAction).map(([action, s]) =>
+        `- ${action.toUpperCase()} trades: ${Math.round(s.wins / s.total * 100)}% win rate (${s.wins}/${s.total})`
+      );
+
+      const categories = {
+        institutional: ['CC', 'LINK'],
+        defi: ['HYPE', 'ENA', 'AAVE'],
+        layer1: ['SOL', 'AVAX', 'NEAR', 'ADA'],
+        meme: ['MOG', 'BONK', 'TURBO'],
+      };
+      const catLines = [];
+      for (const [cat, coins] of Object.entries(categories)) {
+        const catTrades = completedTrades.filter(t => coins.some(c => t.symbol.startsWith(c)));
+        if (catTrades.length === 0) continue;
+        const catWins = catTrades.filter(t => parseFloat(t.outcome_pnl) > 0).length;
+        catLines.push(`- ${cat.charAt(0).toUpperCase() + cat.slice(1)} coins: ${Math.round(catWins / catTrades.length * 100)}% win rate`);
+      }
+
+      const byEmotion = {};
+      for (const t of completedTrades) {
+        if (!t.emotion || t.emotion === 'pending' || t.emotion === 'neutral') continue;
+        if (!byEmotion[t.emotion]) byEmotion[t.emotion] = { wins: 0, total: 0 };
+        byEmotion[t.emotion].total++;
+        if (parseFloat(t.outcome_pnl) > 0) byEmotion[t.emotion].wins++;
+      }
+      const emotionLines = Object.entries(byEmotion).map(([emo, s]) =>
+        `- Trading when ${emo}: ${Math.round(s.wins / s.total * 100)}% win rate (${s.total} trades)`
+      );
+
+      const followed = completedTrades.filter(t => t.followed_recommendation === 1);
+      const ignored  = completedTrades.filter(t => t.followed_recommendation === 0);
+      const followedWR = followed.length > 0 ? Math.round(followed.filter(t => parseFloat(t.outcome_pnl) > 0).length / followed.length * 100) : null;
+      const ignoredWR  = ignored.length  > 0 ? Math.round(ignored.filter(t => parseFloat(t.outcome_pnl) > 0).length  / ignored.length  * 100) : null;
+
+      winRateSection =
+        `WIN RATES (${completedTrades.length} completed of ${allTrades.length} total, ${overallWinRate}% win rate):\n` +
+        actionLines.join('\n') + '\n' +
+        (catLines.length ? catLines.join('\n') + '\n' : '') +
+        (emotionLines.length ? emotionLines.join('\n') + '\n' : '') +
+        (followedWR !== null ? `- Followed Claude's advice: ${followedWR}% win rate (${followed.length} trades)\n` : '') +
+        (ignoredWR  !== null ? `- Ignored  Claude's advice: ${ignoredWR}% win rate (${ignored.length} trades)\n` : '');
+    } else {
+      winRateSection = `JOURNAL ENTRIES: ${allTrades.length} logged (${completedTrades.length} with P&L outcomes so far — win rates available once outcomes are recorded)\n`;
     }
-    const actionLines = Object.entries(byAction).map(([action, s]) =>
-      `- ${action.toUpperCase()} trades: ${Math.round(s.wins / s.total * 100)}% win rate (${s.wins}/${s.total} trades)`
-    );
 
-    // Stats by coin category
-    const categories = {
-      institutional: ['CC', 'LINK'],
-      defi: ['HYPE', 'ENA', 'AAVE'],
-      layer1: ['SOL', 'AVAX', 'NEAR', 'ADA'],
-      meme: ['MOG', 'BONK', 'TURBO'],
-    };
-    const catLines = [];
-    for (const [cat, coins] of Object.entries(categories)) {
-      const catTrades = trades.filter(t => coins.some(c => t.symbol.startsWith(c)));
-      if (catTrades.length === 0) continue;
-      const catWins = catTrades.filter(t => parseFloat(t.outcome_pnl) > 0).length;
-      catLines.push(`- ${cat.charAt(0).toUpperCase() + cat.slice(1)} coins: ${Math.round(catWins / catTrades.length * 100)}% win rate`);
-    }
+    // ── 3. Recent activity (last 10 entries regardless of outcome) ────────────
+    const recent = allTrades.slice(0, 10);
+    const recentLines = recent.map(t => {
+      const date = new Date(t.created_at).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
+      const pnl = t.outcome_pnl != null ? ` | P&L: ${parseFloat(t.outcome_pnl) >= 0 ? '+' : ''}${parseFloat(t.outcome_pnl).toFixed(1)}%` : '';
+      const emotion = t.emotion && t.emotion !== 'pending' ? ` [${t.emotion}]` : '';
+      return `- ${date}: ${t.action.toUpperCase()} ${t.symbol.replace('-USD','')} @ $${parseFloat(t.price).toFixed(4)}${emotion}${pnl}`;
+    });
+    const recentSection = `RECENT TRADES (last ${recent.length}):\n` + recentLines.join('\n') + '\n';
 
-    // Stats by emotion
-    const byEmotion = {};
-    for (const t of trades) {
-      if (!t.emotion) continue;
-      if (!byEmotion[t.emotion]) byEmotion[t.emotion] = { wins: 0, total: 0 };
-      byEmotion[t.emotion].total++;
-      if (parseFloat(t.outcome_pnl) > 0) byEmotion[t.emotion].wins++;
-    }
-    const emotionLines = Object.entries(byEmotion).map(([emo, s]) =>
-      `- Trading when ${emo}: ${Math.round(s.wins / s.total * 100)}% win rate (${s.total} trades)`
-    );
+    // ── 4. Active portfolio positions ─────────────────────────────────────────
+    let portfolioSection = '';
+    try {
+      const [snapshots] = await db.execute('SELECT symbol, quantity FROM balance_snapshots');
+      const [entryRows] = await db.execute('SELECT symbol, entry_price FROM entry_prices');
+      const entryMap = Object.fromEntries(entryRows.map(r => [r.symbol, parseFloat(r.entry_price)]));
+      if (snapshots.length > 0) {
+        const posLines = snapshots
+          .filter(s => parseFloat(s.quantity) > 0)
+          .map(s => {
+            const ep = entryMap[s.symbol];
+            return ep
+              ? `- ${s.symbol.replace('-USD','')}: ${parseFloat(s.quantity).toFixed(4)} tokens @ $${ep.toFixed(4)} entry`
+              : `- ${s.symbol.replace('-USD','')}: ${parseFloat(s.quantity).toFixed(4)} tokens`;
+          });
+        if (posLines.length > 0) portfolioSection = `CURRENT POSITIONS (${posLines.length}):\n` + posLines.join('\n') + '\n';
+      }
+    } catch (e) { /* ignore */ }
 
-    // Followed vs ignored recommendation win rates
-    const followed = trades.filter(t => t.followed_recommendation === 1);
-    const ignored = trades.filter(t => t.followed_recommendation === 0);
-    const followedWinRate = followed.length > 0 ? Math.round(followed.filter(t => parseFloat(t.outcome_pnl) > 0).length / followed.length * 100) : null;
-    const ignoredWinRate = ignored.length > 0 ? Math.round(ignored.filter(t => parseFloat(t.outcome_pnl) > 0).length / ignored.length * 100) : null;
+    // ── 5. Active auto rules ──────────────────────────────────────────────────
+    let rulesSection = '';
+    try {
+      const [autoRules] = await db.execute('SELECT * FROM auto_trade_rules WHERE active = 1 ORDER BY symbol');
+      if (autoRules.length > 0) {
+        const ruleLines = autoRules.map(r =>
+          `- [${r.id}] ${r.rule_type}: ${r.order_type.toUpperCase()} ${r.volume}${r.volume_type === 'pct' ? '%' : ''} ${r.symbol.replace('-USD','')} when ${r.direction} $${parseFloat(r.trigger_price).toFixed(4)} [${(r.exchange || 'kraken').toUpperCase()}]`
+        );
+        rulesSection = `ACTIVE AUTO RULES (${autoRules.length}):\n` + ruleLines.join('\n') + '\n';
+      }
+    } catch (e) { /* ignore */ }
 
-    let summary = `LEARNING FROM PAST PERFORMANCE (${trades.length} completed trades, ${overallWinRate}% win rate):\n`;
-    summary += actionLines.join('\n') + '\n';
-    if (catLines.length) summary += catLines.join('\n') + '\n';
-    if (emotionLines.length) summary += emotionLines.join('\n') + '\n';
-    if (followedWinRate !== null) summary += `- Followed Claude's advice: ${followedWinRate}% win rate (${followed.length} trades)\n`;
-    if (ignoredWinRate !== null) summary += `- Ignored Claude's advice: ${ignoredWinRate}% win rate (${ignored.length} trades)\n`;
+    // ── 6. Recent trade intentions ────────────────────────────────────────────
+    let intentionsSection = '';
+    try {
+      const [intentions] = await db.execute(
+        "SELECT * FROM trade_intentions WHERE stated_at > DATE_SUB(NOW(), INTERVAL 7 DAY) ORDER BY stated_at DESC LIMIT 20"
+      );
+      if (intentions.length > 0) {
+        const matched = intentions.filter(i => i.matched_at != null).length;
+        const intentLines = intentions.map(i => {
+          const status = i.matched_at ? '✅ matched' : i.expires_at < new Date() ? '⏰ expired' : '⏳ pending';
+          return `- ${i.symbol.replace('-USD','')}: ${i.action} — ${status}`;
+        });
+        intentionsSection =
+          `RECENT INTENTIONS (7d): ${matched}/${intentions.length} matched to trades\n` +
+          intentLines.join('\n') + '\n';
+      }
+    } catch (e) { /* ignore */ }
 
-    // Intention tracking accuracy
+    // ── 7. Intention tracking accuracy ───────────────────────────────────────
+    let intentionAccSection = '';
     try {
       const [allIntentions] = await db.execute('SELECT * FROM intention_tracking');
       const completed = allIntentions.filter(i => i.pnl_result != null);
       if (allIntentions.length > 0) {
-        summary += `- Commitments logged: ${allIntentions.length} (${completed.length} with outcomes)\n`;
+        intentionAccSection += `- Commitments logged: ${allIntentions.length} (${completed.length} with outcomes)\n`;
         if (completed.length > 0) {
           const profitable = completed.filter(i => parseFloat(i.pnl_result) > 0);
-          const intentionAccuracy = Math.round(profitable.length / completed.length * 100);
+          const acc = Math.round(profitable.length / completed.length * 100);
           const avgPnl = (completed.reduce((s, i) => s + parseFloat(i.pnl_result), 0) / completed.length).toFixed(1);
-          summary += `- Advice accuracy when followed: ${intentionAccuracy}% profitable | Avg P&L: ${avgPnl >= 0 ? '+' : ''}${avgPnl}%\n`;
+          intentionAccSection += `- Advice accuracy when followed: ${acc}% profitable | Avg P&L: ${avgPnl >= 0 ? '+' : ''}${avgPnl}%\n`;
         }
       }
     } catch (e) { /* ignore */ }
 
-    // Rebalancing accuracy
+    // ── 8. Rebalancing accuracy ───────────────────────────────────────────────
+    let rebalanceSection = '';
     try {
       const [rebalances] = await db.execute('SELECT * FROM rebalancing_tracker WHERE outcome IS NOT NULL');
       if (rebalances.length >= 3) {
-        const goodRebalances = rebalances.filter(r => r.outcome === 'good');
-        const rebalanceAccuracy = Math.round(goodRebalances.length / rebalances.length * 100);
+        const good = rebalances.filter(r => r.outcome === 'good');
+        const acc = Math.round(good.length / rebalances.length * 100);
         const avgPnl = rebalances.reduce((s, r) => s + parseFloat(r.pnl_7d || 0), 0) / rebalances.length;
-        summary += `- Rebalancing accuracy: ${rebalanceAccuracy}% (${goodRebalances.length}/${rebalances.length} correct)\n`;
-        summary += `- Average rebalancing gain: ${avgPnl >= 0 ? '+' : ''}${avgPnl.toFixed(1)}%\n`;
+        rebalanceSection =
+          `- Rebalancing accuracy: ${acc}% (${good.length}/${rebalances.length} correct)\n` +
+          `- Average rebalancing gain: ${avgPnl >= 0 ? '+' : ''}${avgPnl.toFixed(1)}%\n`;
       }
     } catch (e) { /* ignore */ }
 
-    learningModelCache = summary.trim();
+    // ── Assemble final summary ────────────────────────────────────────────────
+    const summary = [
+      winRateSection,
+      recentSection,
+      portfolioSection,
+      rulesSection,
+      intentionsSection,
+      intentionAccSection,
+      rebalanceSection,
+    ].filter(Boolean).join('\n').trim();
+
+    learningModelCache = summary;
+
+    // Persist to system_config so startup check can detect it
+    await db.execute(
+      "INSERT INTO system_config (config_key, config_value) VALUES ('learning_model', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)",
+      [summary.substring(0, 8000)] // cap at 8KB to stay within config field limits
+    ).catch(() => {});
+
+    console.log(`[learning] Model updated — ${allTrades.length} total entries, ${completedTrades.length} with outcomes`);
     return learningModelCache;
   } catch (e) {
     console.error('updateLearningModel error:', e.message);
@@ -2580,6 +2685,16 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
       [symbol, action, price, absQty, valueUsd, reasoning, 'pending', claudeRec]
     );
     const journalId = result.insertId;
+
+    // Regenerate learning model every 10th journal entry
+    try {
+      const [countRows] = await db.execute('SELECT COUNT(*) as total FROM trading_journal');
+      const totalEntries = countRows[0].total;
+      if (totalEntries % 10 === 0) {
+        console.log(`[learning] ${totalEntries} journal entries — regenerating model`);
+        updateLearningModel().catch(() => {});
+      }
+    } catch (e) { /* non-critical — ignore */ }
 
     // Tax lot tracking — US HIFO disposal / buy lot recording
     if (action === 'buy') {
