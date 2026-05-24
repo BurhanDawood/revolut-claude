@@ -1048,7 +1048,7 @@ function startTradeApprovalReminder(exchange) {
       `🔔 <b>TRADE APPROVAL REMINDER ${reminderCount}/${maxReminders}</b>\n\n` +
       `Exchange: ${exchangeLabel}\n` +
       `Action: <b>${current.side.toUpperCase()} ${qtyDisplay} ${coinBase}</b>\n` +
-      `Price: ${current.price ? '$' + current.price.toFixed(4) : 'market'}\n` +
+      `Price: ${current.price ? formatPrice(current.price) : 'market'}\n` +
       `Value: ~${current.valueUSD ? '$' + current.valueUSD.toFixed(2) : 'unknown'}\n\n` +
       `Reply <b>'approve trade'</b> or 👍 to execute\n` +
       `Reply <b>'cancel trade'</b> or 👎 to abort\n\n` +
@@ -1693,6 +1693,17 @@ function formatTradeQty(quantity) {
   if (qty >= 1_000)     return (qty / 1_000).toFixed(2) + 'K';
   if (qty < 0.001)      return qty.toExponential(4);
   return qty.toFixed(4);
+}
+
+// Price formatter — smart decimal places based on magnitude (handles SHIB/PEPE tier through normal coins)
+function formatPrice(price) {
+  const p = parseFloat(price);
+  if (!p || isNaN(p)) return '$0';
+  if (p < 0.000001)   return '$' + p.toFixed(10);  // SHIB/PEPE tier
+  else if (p < 0.0001) return '$' + p.toFixed(8);  // micro price
+  else if (p < 0.01)   return '$' + p.toFixed(6);  // small price
+  else if (p < 1)      return '$' + p.toFixed(4);  // sub-dollar
+  else                 return '$' + p.toFixed(2);   // normal price
 }
 
 async function getCurrentPrice(symbol) {
@@ -2804,14 +2815,14 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
             [symbol, newAvgEntry]
           );
           console.log(`[entry] ${symbol} avg entry updated: $${existingEntry.toFixed(6)} → $${newAvgEntry.toFixed(6)}`);
-          avgEntryLine = `\n📊 Avg entry updated: $${existingEntry.toFixed(6)} → $${newAvgEntry.toFixed(6)}`;
+          avgEntryLine = `\n📊 Avg entry updated: ${formatPrice(existingEntry)} → ${formatPrice(newAvgEntry)}`;
         } else if (!existingEntry && price > 0) {
           entryPrices.set(symbol, price);
           await db.execute(
             'INSERT INTO entry_prices (symbol, entry_price) VALUES (?, ?) ON DUPLICATE KEY UPDATE entry_price = VALUES(entry_price)',
             [symbol, price]
           );
-          avgEntryLine = `\n📊 Entry price set: $${price.toFixed(6)}`;
+          avgEntryLine = `\n📊 Entry price set: ${formatPrice(price)}`;
           console.log(`[entry] ${symbol} first entry set: $${price.toFixed(6)}`);
         }
       } catch (e) {
@@ -2845,7 +2856,7 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
       const actionLabel = action === 'buy' ? 'BOUGHT' : action === 'sell' ? 'SOLD' : action.toUpperCase();
       await sendTelegram(
         `✅ <b>TRADE AUTO-LOGGED — ${coinBase}</b>\n\n` +
-        `${actionLabel} ~${formatTradeQty(absQty)} ${coinBase} @ $${price.toFixed(4)} ($${valueUsd.toFixed(2)})${pnlLine}${avgEntryLine}${reentryNote}\n\n` +
+        `${actionLabel} ~${formatTradeQty(absQty)} ${coinBase} @ ${formatPrice(price)} ($${valueUsd.toFixed(2)})${pnlLine}${avgEntryLine}${reentryNote}\n\n` +
         `Reason: ${matchedIntention.reasoning}\n` +
         `Emotion: ${matchedIntention.emotion}\n\n` +
         `🎯 Matched your earlier intention — no input needed!\n` +
@@ -2890,7 +2901,7 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
     const reentryLine = reentryNote || '';
     const msg =
       `📝 <b>TRADE DETECTED — ${symbol}</b>\n` +
-      `Action: ${actionLabel} ~${formatTradeQty(absQty)} tokens at $${price.toFixed(4)} ($${valueUsd.toFixed(2)})${pnlLine}${avgEntryLine}${recLine}${reentryLine}\n\n` +
+      `Action: ${actionLabel} ~${formatTradeQty(absQty)} tokens at ${formatPrice(price)} ($${valueUsd.toFixed(2)})${pnlLine}${avgEntryLine}${recLine}${reentryLine}\n\n` +
       `Just reply:\n` +
       `'<b>taking profits, confident</b>' — reason + emotion, done\n` +
       `'<b>payment</b>' — Revolut payment (excluded from stats)\n` +
@@ -3638,10 +3649,10 @@ async function checkAutoTradeRules(priceMap) {
 
           await sendTelegram(
             `🤖 <b>AUTO TRADE EXECUTED — ${exchange.toUpperCase()}</b>\n\n` +
-            `${rule.order_type.toUpperCase()} ${formatTradeQty(resolvedVolume)} ${coinBase} @ $${currentPrice.toFixed(6)}\n` +
+            `${rule.order_type.toUpperCase()} ${formatTradeQty(resolvedVolume)} ${coinBase} @ ${formatPrice(currentPrice)}\n` +
             `Value: $${valueUsd.toFixed(2)}\n` +
             `Rule: ${rule.rule_type}${volLabel}\n` +
-            `Trigger: ${rule.direction} $${triggerPrice.toFixed(6)}\n` +
+            `Trigger: ${rule.direction} ${formatPrice(triggerPrice)}\n` +
             `Order ID: ${orderId}\n\n` +
             `📊 Cascade rules updated automatically\n` +
             sweepLine +
@@ -3838,7 +3849,7 @@ async function checkPortfolio() {
         const trailReminderPump = trailingStops.has(symbol)
           ? `\n\n📈 TREND IS YOUR FRIEND — Trailing stop is protecting your profits. Let it run unless structure breaks!`
           : '';
-        const alertMessage = `📈 <b>${symbol} DAILY PUMP ALERT</b>\n\nBaseline: $${basePrices[symbol].toFixed(4)} → Now $${currentPrice.toFixed(4)} (+${pct}%)\nYou hold: ${available} ${coinBase}\n\n⚡ RECOMMENDATION: ${aiRec}${swingPumpHint}${trailReminderPump}${replyMenu}`;
+        const alertMessage = `📈 <b>${symbol} DAILY PUMP ALERT</b>\n\nBaseline: ${formatPrice(basePrices[symbol])} → Now ${formatPrice(currentPrice)} (+${pct}%)\nYou hold: ${available} ${coinBase}\n\n⚡ RECOMMENDATION: ${aiRec}${swingPumpHint}${trailReminderPump}${replyMenu}`;
         await sendTelegram(alertMessage);
         lastAlertContext.set(TELEGRAM_CHAT_ID, { symbol, coinBase, alertType: 'pump' });
 
@@ -3869,7 +3880,7 @@ async function checkPortfolio() {
         const aiRec = alertRecommendations.get(symbol)?.rec || 'HOLD - Monitor the situation closely.';
         const replyMenu = `\n\n1️⃣ Hold — acknowledge & set buy target\n2️⃣ Buy more — get buy the dip advice\n3️⃣ Sell — get sell advice\n4️⃣ Analyse — full analysis\n5️⃣ Ignore — never alert again`;
         const swingDropHint = `\n\n⚡ SWING SIGNAL: This drop may be your buy opportunity!\nCheck if this is outside normal range — if so, consider buying the dip and setting a sell alert at ${fmtPriceShort(currentPrice * 1.20)} (+20%)`;
-        const alertMessage = `📉 <b>${symbol} DROP ALERT!</b>\n\nBaseline: $${basePrices[symbol].toFixed(4)} → Now $${currentPrice.toFixed(4)} (-${pct}%)\nYou hold: ${available} ${coinBase}\n\n⚡ RECOMMENDATION: ${aiRec}${swingDropHint}${replyMenu}`;
+        const alertMessage = `📉 <b>${symbol} DROP ALERT!</b>\n\nBaseline: ${formatPrice(basePrices[symbol])} → Now ${formatPrice(currentPrice)} (-${pct}%)\nYou hold: ${available} ${coinBase}\n\n⚡ RECOMMENDATION: ${aiRec}${swingDropHint}${replyMenu}`;
         await sendTelegram(alertMessage);
         lastAlertContext.set(TELEGRAM_CHAT_ID, { symbol, coinBase, alertType: 'drop' });
 
@@ -3941,11 +3952,11 @@ async function checkPortfolio() {
 
         // FIX 3: Skip API for dust coins; FIX 7: pass reason for cost logging
         const aiRec = isDustCoin ? getDustRecommendation('up') : await getQuickAiRecommendation(symbol, changePct, currentPrice, 'up', 'fixed target hit');
-        const priceStr = currentPrice < 0.001 ? currentPrice.toFixed(8) : currentPrice.toFixed(4);
-        const anchorStr = target.anchorPrice < 0.001 ? target.anchorPrice.toFixed(8) : target.anchorPrice.toFixed(4);
+        const priceStr = formatPrice(currentPrice).replace('$', '');
+        const anchorStr = formatPrice(target.anchorPrice).replace('$', '');
         const entryPrice = entryPrices.get(symbol) || target.entryPrice;
         const entryLine = entryPrice && !isDustCoin
-          ? `\nEntry: $${entryPrice.toFixed(4)} | P&L: +${((currentPrice - entryPrice) / entryPrice * 100).toFixed(1)}%`
+          ? `\nEntry: ${formatPrice(entryPrice)} | P&L: +${((currentPrice - entryPrice) / entryPrice * 100).toFixed(1)}%`
           : '';
 
         let alertMessage;
@@ -3964,7 +3975,7 @@ async function checkPortfolio() {
         } else if (upNoteData && upNoteData.source === 'claude_rec') {
           // Enhanced sell alert — this level was set by thumbs-up on a Claude recommendation
           const positionLine = entryPrice && assetQty > 0
-            ? `Your position: ${assetQty.toLocaleString('en-US', { maximumFractionDigits: 6 })} ${coinBase} @ $${entryPrice.toFixed(4)} entry\nUnrealised profit: +${((currentPrice - entryPrice) / entryPrice * 100).toFixed(1)}% (+$${Math.abs((currentPrice - entryPrice) * assetQty).toFixed(2)})`
+            ? `Your position: ${assetQty.toLocaleString('en-US', { maximumFractionDigits: 6 })} ${coinBase} @ ${formatPrice(entryPrice)} entry\nUnrealised profit: +${((currentPrice - entryPrice) / entryPrice * 100).toFixed(1)}% (+$${Math.abs((currentPrice - entryPrice) * assetQty).toFixed(2)})`
             : (assetQty > 0 ? `You hold ${assetQty.toLocaleString('en-US', { maximumFractionDigits: 6 })} ${coinBase}` : '');
           alertMessage =
             `🎯 <b>${coinBase} HIT YOUR PROFIT TARGET!</b>\n\n` +
@@ -3993,7 +4004,7 @@ async function checkPortfolio() {
             return;
           }
           console.log('[alert] Sending fixed-target reminder for:', symbol);
-          await sendTelegram(`⚠️ <b>REMINDER: ${symbol} FIXED TARGET STILL ACTIVE!</b>\n\nTarget: $${target.targetPrice.toFixed(4)} | Now: $${currentPrice.toFixed(4)}\nReply 'acknowledge ${coinBase}' to stop`);
+          await sendTelegram(`⚠️ <b>REMINDER: ${symbol} FIXED TARGET STILL ACTIVE!</b>\n\nTarget: ${formatPrice(target.targetPrice)} | Now: ${formatPrice(currentPrice)}\nReply 'acknowledge ${coinBase}' to stop`);
         }, ALERT_INTERVAL_MS));
       }
 
@@ -4013,11 +4024,11 @@ async function checkPortfolio() {
           const assetBalance = balances.find(a => a.currency === coinBase);
           const qty = assetBalance ? parseFloat(assetBalance.available) : 0;
           const positionLine = entryPrice && qty > 0
-            ? `Your current position: ${qty.toLocaleString('en-US', { maximumFractionDigits: 6 })} ${coinBase} @ $${entryPrice.toFixed(4)} entry (P&L: ${plPct}%)`
+            ? `Your current position: ${qty.toLocaleString('en-US', { maximumFractionDigits: 6 })} ${coinBase} @ ${formatPrice(entryPrice)} entry (P&L: ${plPct}%)`
             : (qty > 0 ? `You hold: ${qty.toLocaleString('en-US', { maximumFractionDigits: 6 })} ${coinBase}` : '');
           alertMessage =
             `📊 <b>${coinBase} HIT YOUR BUY LEVEL!</b>\n\n` +
-            `Price: $${currentPrice.toFixed(4)} (your Claude-recommended buy zone)\n` +
+            `Price: ${formatPrice(currentPrice)} (your Claude-recommended buy zone)\n` +
             `Original advice: '<i>${noteData.snippet}</i>'\n` +
             (positionLine ? positionLine + '\n' : '') +
             `\n⚡ <b>RECOMMENDATION:</b> This is your planned buy zone.\n` +
@@ -4026,10 +4037,10 @@ async function checkPortfolio() {
         } else {
           // FIX 7: pass reason for cost logging
           const aiRec = await getQuickAiRecommendation(symbol, changePct, currentPrice, 'down', 'fixed floor hit');
-          const entryLine = plPct !== null ? `\nEntry: $${entryPrice.toFixed(4)} | P&L: ${plPct}%` : '';
+          const entryLine = plPct !== null ? `\nEntry: ${formatPrice(entryPrice)} | P&L: ${plPct}%` : '';
           const autoReady = await getAutomationReadiness(symbol, 'sell');
           const autoLine = autoReady ? `\n\n⚡ AUTO-READY: This setup has worked ${autoReady.winRate}% of the time (${autoReady.sampleSize} trades). Could be automated.` : '';
-          alertMessage = `📉 <b>${symbol} FIXED FLOOR HIT!</b>\n\nAnchor: $${target.anchorPrice.toFixed(4)} → Now $${currentPrice.toFixed(4)} (${changePct.toFixed(1)}%)${entryLine}\n\n⚡ RECOMMENDATION: ${aiRec}${replyMenu}${autoLine}`;
+          alertMessage = `📉 <b>${symbol} FIXED FLOOR HIT!</b>\n\nAnchor: ${formatPrice(target.anchorPrice)} → Now ${formatPrice(currentPrice)} (${changePct.toFixed(1)}%)${entryLine}\n\n⚡ RECOMMENDATION: ${aiRec}${replyMenu}${autoLine}`;
         }
         await sendTelegram(alertMessage);
         lastAlertContext.set(TELEGRAM_CHAT_ID, { symbol, coinBase, alertType: 'fixed_target_down' });
@@ -4042,7 +4053,7 @@ async function checkPortfolio() {
             return;
           }
           console.log('[alert] Sending fixed-floor reminder for:', symbol);
-          await sendTelegram(`⚠️ <b>REMINDER: ${symbol} FIXED FLOOR STILL ACTIVE!</b>\n\nFloor: $${target.targetPrice.toFixed(4)} | Now: $${currentPrice.toFixed(4)}\nReply 'acknowledge ${coinBase}' to stop`);
+          await sendTelegram(`⚠️ <b>REMINDER: ${symbol} FIXED FLOOR STILL ACTIVE!</b>\n\nFloor: ${formatPrice(target.targetPrice)} | Now: ${formatPrice(currentPrice)}\nReply 'acknowledge ${coinBase}' to stop`);
         }, ALERT_INTERVAL_MS));
       }
     }
@@ -5459,7 +5470,7 @@ function createMcpServer() {
         `Exchange: ${exchangeLabel}\n` +
         `Action: <b>${side.toUpperCase()} ${displayQty}${value_usd ? ` of ${coinBase}` : ''}</b>\n` +
         `Type: ${order_type}\n` +
-        `Price: ${livePrice ? fmtPriceShort(livePrice) : 'market'}\n` +
+        `Price: ${livePrice ? formatPrice(livePrice) : 'market'}\n` +
         `Value: ~${tradeValueUSD ? '$' + tradeValueUSD.toFixed(2) : 'unknown'}\n\n` +
         `Reply <b>'approve trade'</b> or 👍 to execute\n` +
         `Reply <b>'cancel trade'</b> or 👎 to abort\n\n` +
