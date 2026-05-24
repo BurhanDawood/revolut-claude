@@ -4518,7 +4518,7 @@ app.get('/api/balances', async (req, res) => {
       const entryPrice = (!SKIP_CURRENCIES.includes(asset.currency)) ? (entryPrices.get(symbol) || null) : null;
       const unrealisedPnlPct = (entryPrice && price) ? ((price - entryPrice) / entryPrice * 100) : null;
       const unrealisedPnlUsd = (entryPrice && price) ? ((price - entryPrice) * available) : null;
-      result.push({ currency: asset.currency, available, price, valueUSD, symbol, overnightChangePct, entryPrice, unrealisedPnlPct, unrealisedPnlUsd });
+      result.push({ currency: asset.currency, available, price, valueUSD, symbol, overnightChangePct, entryPrice, unrealisedPnlPct, unrealisedPnlUsd, ignored: ignoredCoins.has(symbol) });
     }
     res.json({ balances: result, totalUSD });
   } catch (e) {
@@ -5258,10 +5258,42 @@ function createMcpServer() {
       }
       positions.sort((a, b) => (parseFloat(b.value_usd) || 0) - (parseFloat(a.value_usd) || 0));
       const cap = getCapitalSummary(totalValue);
-      // Filter dust positions from main list — keep for reference as count
-      const dustCount = positions.filter(p => parseFloat(p.value_usd || 0) > 0 && parseFloat(p.value_usd || 0) < 1.00).length;
-      const cleanPositions = positions.filter(p => parseFloat(p.value_usd || 0) >= 1.00);
-      return { content: [{ type: 'text', text: JSON.stringify({ total_value_usd: totalValue.toFixed(2), invested: cap.invested, pl_usd: cap.pnl.toFixed(2), pl_pct: cap.pnlPct.toFixed(2), positions: cleanPositions, dust_positions: dustCount }, null, 2) }] };
+
+      // Filter: remove dust (<$1) and ignored coins
+      const ignoredCount = positions.filter(p => ignoredCoins.has(p.symbol)).length;
+      const dustCount    = positions.filter(p => !ignoredCoins.has(p.symbol) && parseFloat(p.value_usd || 0) > 0 && parseFloat(p.value_usd || 0) < 1.00).length;
+      const cleanPositions = positions.filter(p =>
+        !ignoredCoins.has(p.symbol) && parseFloat(p.value_usd || 0) >= 1.00
+      );
+
+      // Live cash balances — always included so Portfolio Manager can size trades without a separate call
+      let revolutUsdBalance = 0, krakenUsdBalance = 0;
+      try {
+        const usdAsset = balances.find(b => b.currency === 'USD');
+        revolutUsdBalance = parseFloat(usdAsset?.available || 0);
+      } catch (e) { /* ignore */ }
+      try {
+        const krakenRaw = await krakenRequest('/0/private/Balance').catch(() => ({}));
+        krakenUsdBalance = parseFloat(krakenRaw['ZUSD'] || krakenRaw['USD'] || 0);
+      } catch (e) { /* ignore */ }
+
+      const cash_available = {
+        revolut_usd: parseFloat(revolutUsdBalance.toFixed(2)),
+        kraken_usd:  parseFloat(krakenUsdBalance.toFixed(2)),
+        total_usd:   parseFloat((revolutUsdBalance + krakenUsdBalance).toFixed(2)),
+        note: 'Live balance — use this for trade sizing'
+      };
+
+      return { content: [{ type: 'text', text: JSON.stringify({
+        total_value_usd: totalValue.toFixed(2),
+        invested: cap.invested,
+        pl_usd: cap.pnl.toFixed(2),
+        pl_pct: cap.pnlPct.toFixed(2),
+        positions: cleanPositions,
+        dust_positions: dustCount,
+        ignored_positions: ignoredCount,
+        cash_available
+      }, null, 2) }] };
     }
   );
 
@@ -8024,114 +8056,4 @@ app.get('/telegram-setup', async (req, res) => {
   const webhookUrl = 'https://revolut-claude-production.up.railway.app/telegram-webhook';
   const response = await fetch(`https://api.telegram.org/bot${token}/setWebhook?url=${webhookUrl}`);
   const data = await response.json();
-  res.json(data);
-});
-
-// Seed default trader profile entries if not already set
-const TRADER_PROFILE_DEFAULTS = [
-  { key: 'goal',             value: 'Recover portfolio losses and become a disciplined profitable swing trader' },
-  { key: 'situation',        value: 'Portfolio approximately 50% down from historical highs' },
-  { key: 'style',            value: 'Swing trader - buy dips sell pumps' },
-  { key: 'weakness',         value: 'Past trading decisions led to significant losses - working to improve discipline' },
-  { key: 'strength',         value: 'Good instincts on institutional plays like CC and LINK' },
-  { key: 'core_strategy',    value: 'Swing trader focused on extreme price movements. Buys sudden sharp dips outside normal price pattern. Sells sudden sharp pumps outside normal price pattern. Always looking to capture profit on big moves and buy back on retraces.' },
-  { key: 'buy_signals',      value: 'Sudden extreme drop outside normal trading range — potential dip buy opportunity' },
-  { key: 'sell_signals',     value: 'Sudden extreme pump outside normal trading range — potential profit taking opportunity' },
-  { key: 'retrace_strategy', value: 'After selling a pump, waits for retrace and buys back at lower price to repeat the cycle' },
-  { key: 'loss_protection',  value: 'Will sell to protect against further losses if coin drops significantly with no recovery catalyst' },
-  { key: 'profit_capture',   value: 'Takes profits on substantial rises then looks to buy back on retrace' },
-  { key: 'trading_goal',     value: 'Portfolio recovery from 50% down — building back through disciplined swing trading' },
-  { key: 'risk_approach',    value: 'Protects downside while capturing upside on extreme moves' },
-];
-(async () => {
-  for (const { key, value } of TRADER_PROFILE_DEFAULTS) {
-    await db.execute(
-      'INSERT INTO trader_profile (preference_key, preference_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE preference_key = preference_key',
-      [key, value]
-    ).catch(() => {});
-  }
-  console.log('Trader profile defaults seeded.');
-})();
-
-// GET /api/system/config — read all system config values
-app.get('/api/system/config', async (req, res) => {
-  try {
-    const [rows] = await db.execute(
-      'SELECT config_key, config_value, updated_at FROM system_config ORDER BY config_key'
-    );
-    res.json({ ok: true, config: rows });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// POST /api/system/config — upsert a config key/value
-app.post('/api/system/config', async (req, res) => {
-  try {
-    const { key, value } = req.body;
-    if (!key || !value) return res.status(400).json({ error: 'key and value required' });
-    await db.execute(
-      'INSERT INTO system_config (config_key, config_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)',
-      [key, value]
-    );
-    res.json({ ok: true, key, updated_at: new Date().toISOString() });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// POST /api/revolut/trade — execute a Revolut X trade directly (requires approved: true)
-app.post('/api/revolut/trade', async (req, res) => {
-  try {
-    const { symbol, side, orderType, baseSize, price, approved } = req.body;
-    if (!approved) return res.status(400).json({ error: 'Trade requires approved: true explicitly set' });
-    if (!symbol || !side || !orderType || !baseSize) return res.status(400).json({ error: 'Missing required fields: symbol, side, orderType, baseSize' });
-    const result = await placeRevolutOrder(symbol, side, orderType, parseFloat(baseSize), price ? parseFloat(price) : null);
-    const coinBase = symbol.replace('-USD', '');
-    const executedPrice = price || await getCurrentPrice(symbol).catch(() => 0) || 0;
-    const valueUSD = executedPrice * parseFloat(baseSize);
-    await db.execute(
-      'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      [coinBase, side, executedPrice, baseSize, valueUSD, 'Revolut X trade via dashboard', 'confident']
-    ).catch(e => console.error('[revolut] Journal insert failed:', e.message));
-    await sendTelegram(
-      `✅ <b>REVOLUT X TRADE EXECUTED</b>\n\n` +
-      `${side.toUpperCase()} ${baseSize} ${coinBase} @ ${fmtPriceShort(executedPrice)}\n` +
-      `Value: $${valueUSD.toFixed(2)}\n` +
-      `Order ID: ${result?.client_order_id || 'unknown'}\n\n` +
-      `📝 Journal entry logged automatically`
-    );
-    res.json({ ok: true, result });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// GET /api/debug/link-pairs — temporary diagnostic: all LINK trading pairs on Revolut X
-app.get('/api/debug/link-pairs', async (req, res) => {
-  try {
-    const tickerResponse = await revolutRequest('GET', '/tickers');
-    const tickerList = Array.isArray(tickerResponse) ? tickerResponse : (tickerResponse.data || []);
-    const linkPairs = tickerList.filter(t => t.symbol?.includes('LINK'));
-    res.json({ total_tickers: tickerList.length, link_pairs: linkPairs });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// DELETE /api/cleanup/trade-intentions — one-time cleanup of unmatched intentions
-app.delete('/api/cleanup/trade-intentions', async (req, res) => {
-  try {
-    const [result] = await db.execute(
-      'DELETE FROM trade_intentions WHERE matched_at IS NULL'
-    );
-    res.json({ ok: true, deleted: result.affectedRows });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+ 

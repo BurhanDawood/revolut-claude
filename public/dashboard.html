@@ -1304,7 +1304,7 @@
     }
 
     const coins = balances
-      .filter(h => h.valueUSD != null && !STABLE_COINS.includes(h.currency))
+      .filter(h => h.valueUSD != null && !STABLE_COINS.includes(h.currency) && !h.ignored)
       .sort((a, b) => (b.valueUSD || 0) - (a.valueUSD || 0));
 
     const significant = coins.filter(h => (h.valueUSD || 0) >= DUST_USD);
@@ -2495,5 +2495,4 @@
   refreshAll();
   setInterval(refreshAll, REFRESH_MS);
 </script>
-</body>
-</html>
+</
