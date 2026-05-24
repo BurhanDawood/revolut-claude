@@ -526,6 +526,7 @@ try { await db.execute("UPDATE auto_trade_rules SET exchange = 'kraken' WHERE ex
 try { await db.execute("ALTER TABLE auto_trade_rules ADD COLUMN cascade_count INT DEFAULT 0"); } catch (e) { /* column already exists */ }
 try { await db.execute("ALTER TABLE auto_trade_rules ADD COLUMN max_cascades INT DEFAULT 3"); } catch (e) { /* column already exists */ }
 try { await db.execute("ALTER TABLE auto_trade_rules ADD COLUMN cascade_parent_id INT NULL"); } catch (e) { /* column already exists */ }
+try { await db.execute("ALTER TABLE auto_trade_rules ADD COLUMN proceeds_reserved DECIMAL(12,2) NULL"); } catch (e) { /* column already exists */ }
 
 // One-time data corrections
 try {
@@ -3418,20 +3419,25 @@ async function cascadeRulesAfterTrade(rule, executedPrice) {
       console.log(`[cascade] Sell rule near $${newSellPrice.toFixed(6)} already exists — skipped`);
     }
 
-    // Create cascaded buy-back rule (sell path: sweep-gated + cascade limit + entry price guard)
+    // Create cascaded buy-back rule (sell path: ringfenced proceeds + cascade limit + entry price guard)
     if (isSell) {
+      // Calculate ringfenced proceeds — subtract any USDT sweep so we don't double-count
       let sweepEnabled = false;
+      let sweepPct = 0;
       try {
         const [sweepRows] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'usdt_sweep_config'");
         if (sweepRows.length) {
           const cfg = JSON.parse(sweepRows[0].config_value);
           sweepEnabled = cfg.enabled === true;
+          sweepPct = cfg.sweep_pct || 0;
         }
       } catch (e) { /* ignore — default false */ }
 
-      if (!sweepEnabled) {
-        console.log(`[cascade] Buy-back skipped — USDT sweep not enabled (no cash guaranteed)`);
-      } else if (nearExists(buyRules, newBuyPrice)) {
+      const sellProceeds = executedPrice * parseFloat(cascadeVol);
+      const sweepDeduction = sweepEnabled ? sellProceeds * (sweepPct / 100) : 0;
+      const availableForBuyback = sellProceeds - sweepDeduction;
+
+      if (nearExists(buyRules, newBuyPrice)) {
         console.log(`[cascade] Buy rule near $${newBuyPrice.toFixed(6)} already exists — skipped`);
       } else {
         // Guard: don't buy back below 95% of entry price
@@ -3448,10 +3454,10 @@ async function cascadeRulesAfterTrade(rule, executedPrice) {
         } else {
           buyRules = await enforceMax(buyRules, MAX_BUY, 'buy');
           await db.execute(
-            'INSERT INTO auto_trade_rules (symbol, rule_type, trigger_price, direction, order_type, volume, volume_type, source, exchange, cascade_count, max_cascades, cascade_parent_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-            [symbol, 'buy_retrace', newBuyPrice, 'below', 'buy', cascadeVol, cascadeVolType, 'cascade', cascadeExchange, 0, maxCascades, rule.id]
+            'INSERT INTO auto_trade_rules (symbol, rule_type, trigger_price, direction, order_type, volume, volume_type, source, exchange, cascade_count, max_cascades, cascade_parent_id, proceeds_reserved) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            [symbol, 'buy_retrace', newBuyPrice, 'below', 'buy', cascadeVol, cascadeVolType, 'cascade', cascadeExchange, 0, maxCascades, rule.id, availableForBuyback]
           );
-          console.log(`[cascade] Buy-back created @ $${newBuyPrice.toFixed(6)} (sweep enabled — cash coming)`);
+          console.log(`[cascade] Buy-back created @ $${newBuyPrice.toFixed(6)} with $${availableForBuyback.toFixed(2)} ringfenced from sell proceeds`);
           created = true;
         }
       }
@@ -3607,42 +3613,51 @@ async function checkAutoTradeRules(priceMap) {
 
         // USD balance check for buys
         if (rule.order_type === 'buy') {
-          try {
-            let availableUSD = 0;
-            if (exchange === 'revolut') {
-              const rBalances = await revolutRequest('GET', '/balances');
-              const usdAsset = rBalances.find(b => b.currency === 'USD');
-              availableUSD = parseFloat(usdAsset?.available || 0);
-            } else {
-              const krakenData = await getKrakenBalances();
-              const usdBalance = krakenData.balances.find(b => b.standard === 'USD' || b.symbol === 'ZUSD');
-              availableUSD = usdBalance?.balance || 0;
-            }
-            const requiredUSD = resolvedVolume * currentPrice;
-            if (availableUSD < requiredUSD) {
-              // Only notify if there IS some USD but not enough — complete silence when balance is $0
-              if (availableUSD > 1) {
-                const lastSkipAlert = autoSkipAlerted.get(rule.symbol);
-                const oneHour = 60 * 60 * 1000;
-                if (!lastSkipAlert || Date.now() - lastSkipAlert > oneHour) {
-                  await sendTelegram(
-                    `⚠️ Auto buy skipped — insufficient USD:\n` +
-                    `$${availableUSD.toFixed(2)} available, ` +
-                    `$${requiredUSD.toFixed(2)} required.`
-                  );
-                  autoSkipAlerted.set(rule.symbol, Date.now());
-                } else {
-                  console.log(`[auto] Buy skipped (USD low) — alert suppressed, sent ${Math.round((Date.now() - lastSkipAlert) / 60000)}min ago`);
-                }
+          const ringfencedUsd = rule.proceeds_reserved ? parseFloat(rule.proceeds_reserved) : 0;
+
+          if (ringfencedUsd > 0) {
+            // Ringfenced path — use proceeds from paired sell, bypass general balance check
+            resolvedVolume = ringfencedUsd / currentPrice;
+            console.log(`[cascade] Using ringfenced $${ringfencedUsd.toFixed(2)} for buy-back of ${rule.symbol} — ${resolvedVolume.toFixed(6)} tokens @ ${formatPrice(currentPrice)}`);
+          } else {
+            // General balance path — original behaviour
+            try {
+              let availableUSD = 0;
+              if (exchange === 'revolut') {
+                const rBalances = await revolutRequest('GET', '/balances');
+                const usdAsset = rBalances.find(b => b.currency === 'USD');
+                availableUSD = parseFloat(usdAsset?.available || 0);
               } else {
-                // Zero balance — completely silent
-                console.log(`[auto] Buy skipped — zero USD balance (silent)`);
+                const krakenData = await getKrakenBalances();
+                const usdBalance = krakenData.balances.find(b => b.standard === 'USD' || b.symbol === 'ZUSD');
+                availableUSD = usdBalance?.balance || 0;
               }
+              const requiredUSD = resolvedVolume * currentPrice;
+              if (availableUSD < requiredUSD) {
+                // Only notify if there IS some USD but not enough — complete silence when balance is $0
+                if (availableUSD > 1) {
+                  const lastSkipAlert = autoSkipAlerted.get(rule.symbol);
+                  const oneHour = 60 * 60 * 1000;
+                  if (!lastSkipAlert || Date.now() - lastSkipAlert > oneHour) {
+                    await sendTelegram(
+                      `⚠️ Auto buy skipped — insufficient USD:\n` +
+                      `$${availableUSD.toFixed(2)} available, ` +
+                      `$${requiredUSD.toFixed(2)} required.`
+                    );
+                    autoSkipAlerted.set(rule.symbol, Date.now());
+                  } else {
+                    console.log(`[auto] Buy skipped (USD low) — alert suppressed, sent ${Math.round((Date.now() - lastSkipAlert) / 60000)}min ago`);
+                  }
+                } else {
+                  // Zero balance — completely silent
+                  console.log(`[auto] Buy skipped — zero USD balance (silent)`);
+                }
+                continue;
+              }
+            } catch (e) {
+              console.error('[auto] USD balance check error:', e.message);
               continue;
             }
-          } catch (e) {
-            console.error('[auto] USD balance check error:', e.message);
-            continue;
           }
         }
 
@@ -3688,17 +3703,36 @@ async function checkAutoTradeRules(priceMap) {
           // Clear approach alert now that rule has fired
           ruleApproachAlerted.delete(rule.id);
 
-          await sendTelegram(
-            `🤖 <b>AUTO TRADE EXECUTED — ${exchange.toUpperCase()}</b>\n\n` +
-            `${rule.order_type.toUpperCase()} ${formatTradeQty(resolvedVolume)} ${coinBase} @ ${formatPrice(currentPrice)}\n` +
-            `Value: $${valueUsd.toFixed(2)}\n` +
-            `Rule: ${rule.rule_type}${volLabel}\n` +
-            `Trigger: ${rule.direction} ${formatPrice(triggerPrice)}\n` +
-            `Order ID: ${orderId}\n\n` +
-            `📊 Cascade rules updated automatically\n` +
-            sweepLine +
-            `📝 Journal logged automatically`
-          );
+          // Ringfenced buy-back — send dedicated notification and clear the reserved amount
+          const isRingfenced = rule.order_type === 'buy' && rule.proceeds_reserved > 0;
+          if (isRingfenced) {
+            await db.execute('UPDATE auto_trade_rules SET proceeds_reserved = NULL WHERE id = ?', [rule.id]);
+            await sendTelegram(
+              `🔄 <b>RINGFENCED BUY-BACK EXECUTED — ${exchange.toUpperCase()}</b>\n\n` +
+              `${coinBase} @ ${formatPrice(currentPrice)}\n` +
+              `Bought: ${formatTradeQty(resolvedVolume)} ${coinBase}\n` +
+              `Value: $${valueUsd.toFixed(2)}\n` +
+              `Rule: ${rule.rule_type}\n` +
+              `Trigger: ${rule.direction} ${formatPrice(triggerPrice)}\n` +
+              `Order ID: ${orderId}\n\n` +
+              `💰 Source: Ringfenced from paired sell ✅\n` +
+              `🏦 General balance: Untouched ✅\n\n` +
+              `📊 Cascade cycle complete — self-funded\n` +
+              `📝 Journal logged automatically`
+            );
+          } else {
+            await sendTelegram(
+              `🤖 <b>AUTO TRADE EXECUTED — ${exchange.toUpperCase()}</b>\n\n` +
+              `${rule.order_type.toUpperCase()} ${formatTradeQty(resolvedVolume)} ${coinBase} @ ${formatPrice(currentPrice)}\n` +
+              `Value: $${valueUsd.toFixed(2)}\n` +
+              `Rule: ${rule.rule_type}${volLabel}\n` +
+              `Trigger: ${rule.direction} ${formatPrice(triggerPrice)}\n` +
+              `Order ID: ${orderId}\n\n` +
+              `📊 Cascade rules updated automatically\n` +
+              sweepLine +
+              `📝 Journal logged automatically`
+            );
+          }
 
           // Cascade: generate next set of rules based on executed price
           await cascadeRulesAfterTrade(rule, currentPrice);
