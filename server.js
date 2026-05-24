@@ -103,7 +103,15 @@ async function sweepToUSDT(proceedsUsd, sourceSymbol) {
     const config = JSON.parse(configRows[0].config_value);
     if (!config.enabled) return;
     if (proceedsUsd < config.min_trade_value_usd) return;
-    if ((config.excluded_symbols || []).includes(sourceSymbol)) return;
+
+    // Check exclusions against both bare coin name (BONK) and full symbol (BONK-USD)
+    if (config.excluded_symbols && config.excluded_symbols.length > 0) {
+      const coinBase = sourceSymbol.replace('-USD', '');
+      if (config.excluded_symbols.includes(coinBase) || config.excluded_symbols.includes(sourceSymbol)) {
+        console.log(`[sweep] ${coinBase} excluded from USDT sweep — skipping`);
+        return;
+      }
+    }
 
     const sweepAmountUsd = proceedsUsd * (config.sweep_pct / 100);
 
@@ -5236,11 +5244,14 @@ function createMcpServer() {
           'INSERT INTO system_config (config_key, config_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)',
           ['usdt_sweep_config', JSON.stringify(sweepConfig)]
         );
+        const excludedLine = sweepConfig.excluded_symbols.length > 0
+          ? `\nExcluded: ${sweepConfig.excluded_symbols.join(', ')}`
+          : '';
         await sendTelegram(
           `💰 <b>USDT SWEEP ${sweepConfig.enabled ? 'ENABLED' : 'DISABLED'}</b>\n\n` +
           `Sweep: ${sweepConfig.sweep_pct}% of sell proceeds\n` +
           `Min trade size: $${sweepConfig.min_trade_value_usd}\n` +
-          `Applies to: all qualifying sells`
+          `Applies to: all qualifying sells${excludedLine}`
         );
         return { content: [{ type: 'text', text: JSON.stringify({ ok: true, config: sweepConfig }) }] };
       }
