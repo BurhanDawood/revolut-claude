@@ -2767,6 +2767,47 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
         const termLabel = hasLong && hasShort ? 'mixed' : hasLong ? 'long-term' : 'short-term';
         console.log(`[tax] Payment disposal — US HIFO: ${totalGL >= 0 ? 'Gain' : 'Loss'} $${Math.abs(totalGL).toFixed(2)} (${termLabel})`);
       }
+
+      // Calculate P&L against entry price and update journal
+      const payEntryPrice = entryPrices.get(symbol);
+      const salePrice = parseFloat(price);
+      const saleQty = parseFloat(absQty);
+
+      if (payEntryPrice && salePrice && saleQty) {
+        const gainLoss = (salePrice - payEntryPrice) * saleQty;
+        const gainLossPct = ((salePrice - payEntryPrice) / payEntryPrice * 100);
+        const isGain = gainLoss > 0;
+
+        await db.execute(
+          `UPDATE trading_journal SET outcome_pnl = ?, outcome_notes = ? WHERE id = ?`,
+          [gainLoss,
+           `Payment disposal: ${isGain ? 'GAIN' : 'LOSS'} of $${Math.abs(gainLoss).toFixed(2)} (${gainLossPct.toFixed(1)}%) — taxable event`,
+           journalId]
+        ).catch(e => console.error('[payment] P&L update error:', e.message));
+
+        await sendTelegram(
+          `✅ <b>PAYMENT LOGGED — ${coinBase}</b>\n\n` +
+          `Amount: ${formatTradeQty(saleQty)} ${coinBase}\n` +
+          `Sale price: ${formatPrice(salePrice)}\n` +
+          `Value: $${(salePrice * saleQty).toFixed(2)}\n\n` +
+          `📊 <b>Tax Disposal:</b>\n` +
+          `Entry price: ${formatPrice(payEntryPrice)}\n` +
+          `${isGain ? '✅ Gain' : '⚠️ Loss'}: ${isGain ? '+' : ''}$${gainLoss.toFixed(2)} (${gainLossPct.toFixed(1)}%)\n\n` +
+          `⚠️ This is a taxable disposal event\n` +
+          `Excluded from trading performance stats\n` +
+          `Recorded in tax lot tracking`
+        ).catch(() => {});
+      } else {
+        // No entry price — basic confirmation
+        await sendTelegram(
+          `✅ <b>PAYMENT LOGGED — ${coinBase}</b>\n` +
+          `${formatTradeQty(absQty)} ${coinBase} @ ${formatPrice(price)} ($${valueUsd.toFixed(2)})\n` +
+          `Excluded from trading stats.\n` +
+          `⚠️ Taxable disposal — no entry price on record`
+        ).catch(() => {});
+      }
+
+      return; // Skip the TRADE DETECTED question — payment is fully handled above
     }
 
     // If sell: record outcome with full P&L notification
@@ -8169,6 +8210,69 @@ app.delete('/api/cleanup/trade-intentions', async (req, res) => {
       'DELETE FROM trade_intentions WHERE matched_at IS NULL'
     );
     res.json({ ok: true, deleted: result.affectedRows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── One-time backfill: payment P&L ───────────────────────────────────────────
+// POST /api/fix/payment-pnl — calculates P&L on existing payment entries missing outcome_pnl
+app.post('/api/fix/payment-pnl', async (req, res) => {
+  try {
+    const [payments] = await db.execute(
+      `SELECT id, symbol, price, quantity, value_usd
+       FROM trading_journal
+       WHERE action = 'payment'
+       AND outcome_pnl IS NULL`
+    );
+
+    const results = [];
+
+    for (const payment of payments) {
+      const coinBase = payment.symbol.replace('-USD', '');
+      const [entryRows] = await db.execute(
+        'SELECT entry_price FROM entry_prices WHERE symbol = ?',
+        [`${coinBase}-USD`]
+      );
+
+      if (!entryRows.length) {
+        results.push({ id: payment.id, symbol: coinBase, status: 'skipped — no entry price' });
+        continue;
+      }
+
+      const entryPrice = parseFloat(entryRows[0].entry_price);
+      const salePrice  = parseFloat(payment.price);
+      const qty        = parseFloat(payment.quantity);
+
+      if (!entryPrice || !salePrice || !qty) {
+        results.push({ id: payment.id, symbol: coinBase, status: 'skipped — missing data' });
+        continue;
+      }
+
+      const gainLoss    = (salePrice - entryPrice) * qty;
+      const gainLossPct = ((salePrice - entryPrice) / entryPrice * 100);
+      const isGain      = gainLoss > 0;
+
+      await db.execute(
+        `UPDATE trading_journal SET outcome_pnl = ?, outcome_notes = ? WHERE id = ?`,
+        [gainLoss,
+         `Payment disposal: ${isGain ? 'GAIN' : 'LOSS'} of $${Math.abs(gainLoss).toFixed(2)} (${gainLossPct.toFixed(1)}%) — taxable event`,
+         payment.id]
+      );
+
+      results.push({
+        id: payment.id,
+        symbol: coinBase,
+        entry: entryPrice,
+        sale: salePrice,
+        qty,
+        gain_loss: gainLoss.toFixed(2),
+        gain_loss_pct: gainLossPct.toFixed(1),
+        status: isGain ? 'GAIN' : 'LOSS'
+      });
+    }
+
+    res.json({ ok: true, processed: results.length, results });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
