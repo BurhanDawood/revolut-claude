@@ -659,16 +659,34 @@
     <div id="portfolio-value">—</div>
     <div class="portfolio-totals" id="portfolio-totals" style="display:none">
       <div class="portfolio-sub-row">
-        <span class="sub-label">🔄 Revolut X</span>
-        <span class="sub-value" id="revolut-subtotal">—</span>
+        <span class="sub-label">🔄 Revolut X crypto</span>
+        <span class="sub-value" id="revolut-crypto-subtotal">—</span>
       </div>
       <div class="portfolio-sub-row">
-        <span class="sub-label">🦑 Kraken</span>
-        <span class="sub-value" id="kraken-subtotal">—</span>
+        <span class="sub-label">💵 Revolut X cash</span>
+        <span class="sub-value" id="revolut-cash-subtotal">—</span>
+      </div>
+      <div class="portfolio-sub-row">
+        <span class="sub-label">🦑 Kraken crypto</span>
+        <span class="sub-value" id="kraken-crypto-subtotal">—</span>
+      </div>
+      <div class="portfolio-sub-row">
+        <span class="sub-label">💵 Kraken cash</span>
+        <span class="sub-value" id="kraken-cash-subtotal">—</span>
       </div>
       <div class="portfolio-sub-row">
         <span class="sub-label">🔐 Tangem XRP</span>
         <span class="sub-value" id="tangem-subtotal">—</span>
+      </div>
+      <div style="border-top:1px solid rgba(255,255,255,0.08);margin-top:4px;padding-top:4px">
+        <div class="portfolio-sub-row">
+          <span class="sub-label" style="color:var(--text-muted)">📊 Total crypto</span>
+          <span class="sub-value" id="portfolio-crypto-sum">—</span>
+        </div>
+        <div class="portfolio-sub-row">
+          <span class="sub-label" style="color:var(--text-muted)">💵 Total cash</span>
+          <span class="sub-value" id="portfolio-cash-sum">—</span>
+        </div>
       </div>
       <div style="border-top:1px solid rgba(255,255,255,0.1);margin-top:4px;padding-top:4px">
         <div class="portfolio-sub-row">
@@ -1492,31 +1510,44 @@
       addrEl.textContent = a.slice(0, 8) + '…' + a.slice(-6);
     }
 
-    // Update portfolio header — Revolut + Kraken + Tangem
-    let krakenTotalUSD = 0;
+    // Update portfolio header — detailed breakdown: Revolut crypto+cash, Kraken crypto+cash, Tangem
+    let krakenCryptoUSD = 0;
+    let krakenCashUSD   = 0;
     try {
       const krakenData = await apiFetch('GET', '/api/kraken/balances');
-      krakenTotalUSD = krakenData?.totalUSD || 0;
+      krakenCryptoUSD = krakenData?.totalUSD || 0;
+      krakenCashUSD   = krakenData?.usdCash  || 0;
     } catch (e) { console.warn('Kraken balance fetch failed for portfolio header:', e); }
 
-    const combined = revolutTotalUSD + krakenTotalUSD + (tangem.valueUSD || 0);
+    // Split Revolut balancesData into crypto vs cash (USD/USDT/USDC/EUR/GBP)
+    const REVOLUT_CASH = ['USD','USDT','USDC','EUR','GBP'];
+    const revCryptoUSD = (balancesData || [])
+      .filter(b => !REVOLUT_CASH.includes(b.currency) && b.valueUSD != null)
+      .reduce((s, b) => s + (b.valueUSD || 0), 0);
+    const revCashUSD = (balancesData || [])
+      .filter(b => REVOLUT_CASH.includes(b.currency) && b.valueUSD != null)
+      .reduce((s, b) => s + (b.valueUSD || 0), 0);
+
+    const tangemUSD    = parseFloat(tangem.valueUSD) || 0;
+    const totalCrypto  = revCryptoUSD + krakenCryptoUSD + tangemUSD;
+    const totalCash    = revCashUSD + krakenCashUSD;
+    const combined     = totalCrypto + totalCash;
+
     const pvEl = document.getElementById('portfolio-value');
     if (pvEl) pvEl.textContent = fmt(combined);
 
     const totalsEl = document.getElementById('portfolio-totals');
     if (totalsEl) totalsEl.style.display = '';
 
-    const revSubEl = document.getElementById('revolut-subtotal');
-    if (revSubEl) revSubEl.textContent = fmt(revolutTotalUSD);
-
-    const krakenSubEl = document.getElementById('kraken-subtotal');
-    if (krakenSubEl) krakenSubEl.textContent = krakenTotalUSD > 0 ? fmt(krakenTotalUSD) : '—';
-
-    const tanSubEl = document.getElementById('tangem-subtotal');
-    if (tanSubEl) tanSubEl.textContent = `${fmt(tangem.valueUSD)} (${tangem.balance.toFixed(0)} XRP)`;
-
-    const totalSumEl = document.getElementById('portfolio-total-sum');
-    if (totalSumEl) totalSumEl.textContent = fmt(combined);
+    const set = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
+    set('revolut-crypto-subtotal', fmt(revCryptoUSD));
+    set('revolut-cash-subtotal',   revCashUSD > 0 ? fmt(revCashUSD) : '—');
+    set('kraken-crypto-subtotal',  krakenCryptoUSD > 0 ? fmt(krakenCryptoUSD) : '—');
+    set('kraken-cash-subtotal',    krakenCashUSD > 0 ? fmt(krakenCashUSD) : '—');
+    set('tangem-subtotal',         `${fmt(tangemUSD)} (${tangem.balance.toFixed(0)} XRP)`);
+    set('portfolio-crypto-sum',    fmt(totalCrypto));
+    set('portfolio-cash-sum',      totalCash > 0 ? fmt(totalCash) : '—');
+    set('portfolio-total-sum',     fmt(combined));
   }
 
   function renderTrailSummary(trails) {

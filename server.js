@@ -1254,6 +1254,8 @@ async function getCurrentPortfolioValue() {
 
 // Fetch XRP balance from Tangem self-custody wallet via public XRPL API
 async function getTangemXRPBalance() {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5000);
   try {
     const response = await fetch(XRPL_API, {
       method: 'POST',
@@ -1261,16 +1263,39 @@ async function getTangemXRPBalance() {
       body: JSON.stringify({
         method: 'account_info',
         params: [{ account: TANGEM_XRP_ADDRESS, ledger_index: 'current' }]
-      })
+      }),
+      signal: controller.signal
     });
+    clearTimeout(timeout);
     const data = await response.json();
     if (data.result && data.result.account_data) {
       // XRP balance is in drops (1 XRP = 1,000,000 drops)
       const drops = parseInt(data.result.account_data.Balance);
-      return drops / 1_000_000;
+      const balance = drops / 1_000_000;
+      // Cache the last known balance
+      await db.execute(
+        "INSERT INTO system_config (config_key, config_value) VALUES ('tangem_last_balance', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)",
+        [JSON.stringify({ balance, cached_at: new Date().toISOString() })]
+      ).catch(() => {});
+      return balance;
     }
     return null;
   } catch (e) {
+    clearTimeout(timeout);
+    if (e.name === 'AbortError') {
+      console.log('[tangem] XRPScan timeout — using cached value');
+      try {
+        const [cached] = await db.execute(
+          "SELECT config_value FROM system_config WHERE config_key = 'tangem_last_balance'"
+        );
+        if (cached.length) {
+          const parsed = JSON.parse(cached[0].config_value);
+          console.log(`[tangem] Returning cached balance ${parsed.balance} from ${parsed.cached_at}`);
+          return parsed.balance;
+        }
+      } catch (dbErr) { /* ignore */ }
+      return null;
+    }
     console.error('Tangem XRP fetch error:', e.message);
     return null;
   }
@@ -1334,9 +1359,15 @@ async function getKrakenBalances() {
   try {
     const balances = await krakenRequest('/0/private/Balance');
 
+    // Capture USD/stable cash before filtering it out
+    const KRAKEN_CASH_ASSETS = ['ZUSD', 'ZEUR', 'ZGBP', 'USDT', 'USDC', 'USD'];
+    const usdCash = Object.entries(balances)
+      .filter(([asset]) => KRAKEN_CASH_ASSETS.includes(asset))
+      .reduce((sum, [, amount]) => sum + parseFloat(amount || 0), 0);
+
     const nonZeroAssets = Object.entries(balances)
       .filter(([, amount]) => parseFloat(amount) > 0.00001)
-      .filter(([asset]) => !['ZUSD', 'ZEUR', 'ZGBP', 'USDT', 'USDC', 'USD'].includes(asset));
+      .filter(([asset]) => !KRAKEN_CASH_ASSETS.includes(asset));
 
     if (nonZeroAssets.length === 0) return { balances: [], totalUSD: 0 };
 
@@ -1384,10 +1415,10 @@ async function getKrakenBalances() {
     }
 
     result.sort((a, b) => (b.valueUSD || 0) - (a.valueUSD || 0));
-    return { balances: result, totalUSD };
+    return { balances: result, totalUSD, usdCash };
   } catch (e) {
     console.error('[kraken] getKrakenBalances error:', e.message);
-    return { balances: [], totalUSD: 0 };
+    return { balances: [], totalUSD: 0, usdCash: 0 };
   }
 }
 
