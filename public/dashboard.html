@@ -1447,7 +1447,7 @@
     totalEl.className   = 'pnl-sum-value ' + (totalUSD >= 0 ? 'upnl-profit' : 'upnl-severe');
   }
 
-  function renderTangemCard(tangem) {
+  async function renderTangemCard(tangem) {
     const loading = document.getElementById('tangem-loading');
     const content = document.getElementById('tangem-content');
     if (!tangem || tangem.valueUSD == null) {
@@ -1854,8 +1854,8 @@
 
   async function refreshBalances() {
     const data = await apiFetch('GET', '/api/balances');
-    balancesData = data.balances || [];
-    revolutTotalUSD = data.totalUSD || 0;
+    balancesData = data?.balances || [];
+    revolutTotalUSD = data?.totalUSD || 0;
     // Don't overwrite the big portfolio-value here — renderTangemCard() sets
     // the combined Revolut + Kraken + Tangem total when Tangem loads.
     // Only set it if the portfolio-totals breakdown isn't visible yet.
@@ -1880,7 +1880,9 @@
   async function loadSweepConfig() {
     try {
       const data = await apiFetch('GET', '/api/system/config');
-      const sweepRaw = data?.usdt_sweep_config;
+      const configRows = data?.config || [];
+      const sweepRow = configRows.find(r => r.config_key === 'usdt_sweep_config');
+      const sweepRaw = sweepRow?.config_value;
       const config = sweepRaw ? (typeof sweepRaw === 'string' ? JSON.parse(sweepRaw) : sweepRaw) : null;
 
       document.getElementById('sweep-loading').style.display = 'none';
@@ -1941,26 +1943,26 @@
     setLoading(true);
     showError('');
     try {
-      await refreshBalances();
+      await refreshBalances().catch(e => { console.error('refreshBalances failed:', e); });
       const [status, targets, entries, capital, tangem, tsData] = await Promise.all([
-        apiFetch('GET', '/api/status'),
-        apiFetch('GET', '/api/targets'),
-        apiFetch('GET', '/api/entryprices'),
+        apiFetch('GET', '/api/status').catch(() => ({})),
+        apiFetch('GET', '/api/targets').catch(() => ({})),
+        apiFetch('GET', '/api/entryprices').catch(() => ({})),
         apiFetch('GET', '/api/capital').catch(() => null),
         apiFetch('GET', '/api/tangem').catch(() => null),
         apiFetch('GET', '/api/trailing-stops').catch(() => ({})),
       ]);
-      statusData = status;
-      targetsData = targets;
-      entryPricesData = entries;
+      statusData = status || {};
+      targetsData = targets || {};
+      entryPricesData = entries || {};
       trailingStopsData = tsData || {};
-      renderAlerts(status.activeAlerts);
-      renderMonitorStatus(status.paused);
-      renderThresholds(balancesData, statusData, targetsData, entryPricesData, trailingStopsData);
-      renderTrailSummary(trailingStopsData);
-      if (capital) renderCapitalBar(capital);
-      renderPnlSummary(balancesData);
-      if (tangem) renderTangemCard(tangem, balancesData);
+      try { renderAlerts(statusData.activeAlerts); } catch(e) { console.error('renderAlerts:', e); }
+      try { renderMonitorStatus(statusData.paused); } catch(e) { console.error('renderMonitorStatus:', e); }
+      try { renderThresholds(balancesData, statusData, targetsData, entryPricesData, trailingStopsData); } catch(e) { console.error('renderThresholds:', e); }
+      try { renderTrailSummary(trailingStopsData); } catch(e) { console.error('renderTrailSummary:', e); }
+      try { if (capital) renderCapitalBar(capital); } catch(e) { console.error('renderCapitalBar:', e); }
+      try { renderPnlSummary(balancesData); } catch(e) { console.error('renderPnlSummary:', e); }
+      try { if (tangem) renderTangemCard(tangem).catch(e => console.error('renderTangemCard:', e)); } catch(e) { console.error('renderTangemCard sync:', e); }
       loadSweepConfig().catch(() => {});
       const now = new Date();
       document.getElementById('last-updated').textContent =

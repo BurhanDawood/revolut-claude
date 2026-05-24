@@ -2819,12 +2819,50 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
       return; // Skip the TRADE DETECTED question — payment is fully handled above
     }
 
-    // If sell: record outcome with full P&L notification
+    // If sell: calculate and store realised P&L immediately
     let pnlLine = '';
     if (action === 'sell') {
-      const result = await recordTradeOutcome(symbol, price, absQty, currentQty);
-      if (result) {
-        pnlLine = `\nP&L: ${result.pnlPct >= 0 ? '+' : ''}${result.pnlPct.toFixed(1)}% ${result.pnlPct >= 0 ? '✅' : '❌'}`;
+      // Legacy outcome recording (kept for any downstream consumers)
+      await recordTradeOutcome(symbol, price, absQty, currentQty).catch(() => {});
+
+      try {
+        const sellEntryPrice = entryPrices.get(symbol);
+        const salePrice      = parseFloat(price);
+        const saleQty        = parseFloat(absQty);
+
+        if (sellEntryPrice && salePrice && saleQty) {
+          const realisedPnl    = (salePrice - sellEntryPrice) * saleQty;
+          const realisedPnlPct = ((salePrice - sellEntryPrice) / sellEntryPrice * 100);
+          const isGain         = realisedPnl > 0;
+
+          // Persist to journal
+          await db.execute(
+            `UPDATE trading_journal SET outcome_pnl = ?, outcome_notes = ? WHERE id = ?`,
+            [realisedPnl,
+             `Realised ${isGain ? 'gain' : 'loss'}: ${isGain ? '+' : ''}$${realisedPnl.toFixed(2)} ` +
+             `(${realisedPnlPct.toFixed(1)}%) | ` +
+             `Entry: ${formatPrice(sellEntryPrice)} | Sale: ${formatPrice(salePrice)} | Method: US HIFO`,
+             journalId]
+          );
+
+          // Running total realised P&L for this coin
+          const [runningRows] = await db.execute(
+            `SELECT SUM(outcome_pnl) as total_pnl, COUNT(*) as total_sells
+             FROM trading_journal
+             WHERE symbol = ? AND action = 'sell' AND outcome_pnl IS NOT NULL`,
+            [coinBase]
+          );
+          const totalPnl   = parseFloat(runningRows[0]?.total_pnl || 0);
+          const totalSells = runningRows[0]?.total_sells || 0;
+
+          pnlLine =
+            `\n${isGain ? '✅' : '⚠️'} Realised: ${isGain ? '+' : ''}$${realisedPnl.toFixed(2)} (${realisedPnlPct.toFixed(1)}%)\n` +
+            `📊 Total ${coinBase} P&L: ${totalPnl >= 0 ? '+' : ''}$${totalPnl.toFixed(2)} across ${totalSells} sells`;
+
+          console.log(`[pnl] ${coinBase} sell: ${isGain ? 'GAIN' : 'LOSS'} $${realisedPnl.toFixed(2)} (${realisedPnlPct.toFixed(1)}%) | running total: $${totalPnl.toFixed(2)}`);
+        }
+      } catch (e) {
+        console.error('[pnl] P&L calculation error:', e.message);
       }
     }
 
@@ -8255,6 +8293,70 @@ app.delete('/api/cleanup/trade-intentions', async (req, res) => {
       'DELETE FROM trade_intentions WHERE matched_at IS NULL'
     );
     res.json({ ok: true, deleted: result.affectedRows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── One-time backfill: sell P&L ──────────────────────────────────────────────
+// POST /api/fix/sell-pnl — calculates realised P&L on existing sell entries missing outcome_pnl
+app.post('/api/fix/sell-pnl', async (req, res) => {
+  try {
+    const [sells] = await db.execute(
+      `SELECT id, symbol, price, quantity
+       FROM trading_journal
+       WHERE action = 'sell'
+       AND outcome_pnl IS NULL
+       AND price IS NOT NULL
+       AND quantity IS NOT NULL`
+    );
+
+    const results = [];
+
+    for (const sell of sells) {
+      const coinBase = sell.symbol.replace('-USD', '');
+      const [entryRows] = await db.execute(
+        'SELECT entry_price FROM entry_prices WHERE symbol = ?',
+        [`${coinBase}-USD`]
+      );
+
+      if (!entryRows.length) {
+        results.push({ id: sell.id, symbol: coinBase, status: 'skipped — no entry price' });
+        continue;
+      }
+
+      const entryPrice    = parseFloat(entryRows[0].entry_price);
+      const salePrice     = parseFloat(sell.price);
+      const qty           = parseFloat(sell.quantity);
+      const realisedPnl   = (salePrice - entryPrice) * qty;
+      const realisedPnlPct = ((salePrice - entryPrice) / entryPrice * 100);
+      const isGain        = realisedPnl > 0;
+
+      await db.execute(
+        `UPDATE trading_journal SET outcome_pnl = ?, outcome_notes = ? WHERE id = ?`,
+        [realisedPnl,
+         `Realised ${isGain ? 'gain' : 'loss'}: ${isGain ? '+' : ''}$${realisedPnl.toFixed(2)} ` +
+         `(${realisedPnlPct.toFixed(1)}%) | Entry: $${entryPrice} | Sale: $${salePrice} | Method: US HIFO`,
+         sell.id]
+      );
+
+      results.push({
+        id: sell.id,
+        symbol: coinBase,
+        entry: entryPrice,
+        sale: salePrice,
+        qty,
+        realised_pnl: realisedPnl.toFixed(2),
+        pnl_pct: realisedPnlPct.toFixed(1),
+        status: isGain ? 'GAIN' : 'LOSS'
+      });
+    }
+
+    const totalGainLoss = results
+      .reduce((s, r) => s + parseFloat(r.realised_pnl || 0), 0)
+      .toFixed(2);
+
+    res.json({ ok: true, processed: results.length, total_gain_loss: totalGainLoss, results });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
