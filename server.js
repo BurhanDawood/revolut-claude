@@ -522,6 +522,10 @@ try { await db.execute("ALTER TABLE auto_trade_rules ADD COLUMN volume_type VARC
 // Add exchange column to support Revolut X alongside Kraken
 try { await db.execute("ALTER TABLE auto_trade_rules ADD COLUMN exchange VARCHAR(20) DEFAULT 'kraken'"); } catch (e) { /* column already exists */ }
 try { await db.execute("UPDATE auto_trade_rules SET exchange = 'kraken' WHERE exchange IS NULL"); } catch (e) { /* backfill */ }
+// Cascade protection columns
+try { await db.execute("ALTER TABLE auto_trade_rules ADD COLUMN cascade_count INT DEFAULT 0"); } catch (e) { /* column already exists */ }
+try { await db.execute("ALTER TABLE auto_trade_rules ADD COLUMN max_cascades INT DEFAULT 3"); } catch (e) { /* column already exists */ }
+try { await db.execute("ALTER TABLE auto_trade_rules ADD COLUMN cascade_parent_id INT NULL"); } catch (e) { /* column already exists */ }
 
 // One-time data corrections
 try {
@@ -1974,6 +1978,31 @@ Keep total under 2000 characters. No long paragraphs. Be concise.`
     await sendTelegram(msg2);
     console.log('Market intelligence sent. Length:', msg2.length);
 
+    // Cascade activity report — warn about any runaway downside buying overnight
+    try {
+      const [cascadeActivity] = await db.execute(
+        `SELECT symbol, cascade_count, max_cascades
+         FROM auto_trade_rules
+         WHERE cascade_count > 0
+           AND rule_type IN ('buy_retrace', 'buy_dip')
+           AND active = 1
+         ORDER BY cascade_count DESC`
+      );
+      if (cascadeActivity.length > 0) {
+        const cascadeMsg = cascadeActivity
+          .map(r => `${r.symbol.replace('-USD', '')}: ${r.cascade_count}/${r.max_cascades || 3} cascade buys`)
+          .join('\n');
+        await sendTelegram(
+          `📊 <b>CASCADE ACTIVITY OVERNIGHT</b>\n\n` +
+          cascadeMsg + '\n\n' +
+          `Review these positions — multiple buys\n` +
+          `without sells may indicate downtrend.`
+        );
+      }
+    } catch (e) {
+      console.log('[cascade] Overnight report skipped:', e.message);
+    }
+
   } catch (e) {
     console.error('sendMorningBriefing error:', e.message);
     await sendTelegram(`❌ Morning briefing failed: ${e.message}`);
@@ -3309,16 +3338,27 @@ async function cascadeRulesAfterTrade(rule, executedPrice) {
 
     let created = false;
 
-    // Inherit volume and volume_type from the triggering rule
-    const cascadeVol     = rule.volume;
-    const cascadeVolType = rule.volume_type || 'fixed';
+    // Inherit volume, volume_type, exchange, and cascade tracking from triggering rule
+    const cascadeVol          = rule.volume;
+    const cascadeVolType      = rule.volume_type || 'fixed';
+    const cascadeExchange     = rule.exchange || 'kraken';
+    const parentCascadeCount  = parseInt(rule.cascade_count || 0);
+    const maxCascades         = parseInt(rule.max_cascades  || 3);
+
+    // When a sell fires — reset cascade count on all downstream rules (price went up, ladder worked)
+    if (isSell) {
+      await db.execute(
+        'UPDATE auto_trade_rules SET cascade_count = 0 WHERE cascade_parent_id = ?',
+        [rule.id]
+      ).catch(() => {});
+    }
 
     // Create cascaded sell rule
     if (!nearExists(sellRules, newSellPrice)) {
       sellRules = await enforceMax(sellRules, MAX_SELL, 'sell');
       await db.execute(
-        'INSERT INTO auto_trade_rules (symbol, rule_type, trigger_price, direction, order_type, volume, volume_type, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-        [symbol, 'sell_pump', newSellPrice, 'above', 'sell', cascadeVol, cascadeVolType, 'cascade']
+        'INSERT INTO auto_trade_rules (symbol, rule_type, trigger_price, direction, order_type, volume, volume_type, source, exchange, cascade_count, max_cascades, cascade_parent_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        [symbol, 'sell_pump', newSellPrice, 'above', 'sell', cascadeVol, cascadeVolType, 'cascade', cascadeExchange, 0, maxCascades, rule.id]
       );
       console.log(`[cascade] Created sell_pump @ $${newSellPrice.toFixed(6)} for ${symbol}`);
       created = true;
@@ -3326,8 +3366,7 @@ async function cascadeRulesAfterTrade(rule, executedPrice) {
       console.log(`[cascade] Sell rule near $${newSellPrice.toFixed(6)} already exists — skipped`);
     }
 
-    // Create cascaded buy-back rule only when USDT sweep is enabled
-    // (sweep ensures dry powder will be available after the sell)
+    // Create cascaded buy-back rule (sell path: sweep-gated + cascade limit + entry price guard)
     if (isSell) {
       let sweepEnabled = false;
       try {
@@ -3338,30 +3377,67 @@ async function cascadeRulesAfterTrade(rule, executedPrice) {
         }
       } catch (e) { /* ignore — default false */ }
 
-      if (sweepEnabled && !nearExists(buyRules, newBuyPrice)) {
-        buyRules = await enforceMax(buyRules, MAX_BUY, 'buy');
-        await db.execute(
-          'INSERT INTO auto_trade_rules (symbol, rule_type, trigger_price, direction, order_type, volume, volume_type, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-          [symbol, 'buy_retrace', newBuyPrice, 'below', 'buy', cascadeVol, cascadeVolType, 'cascade']
-        );
-        console.log(`[cascade] Buy-back created @ $${newBuyPrice.toFixed(6)} (sweep enabled — cash coming)`);
-        created = true;
-      } else if (!sweepEnabled) {
+      if (!sweepEnabled) {
         console.log(`[cascade] Buy-back skipped — USDT sweep not enabled (no cash guaranteed)`);
+      } else if (nearExists(buyRules, newBuyPrice)) {
+        console.log(`[cascade] Buy rule near $${newBuyPrice.toFixed(6)} already exists — skipped`);
+      } else {
+        // Guard: don't buy back below 95% of entry price
+        const entryPrice = entryPrices.get(symbol);
+        if (entryPrice && newBuyPrice < entryPrice * 0.95) {
+          console.log(`[cascade] Buy-back at $${newBuyPrice.toFixed(6)} is below entry $${entryPrice.toFixed(6)} — skipping to avoid buying below cost`);
+          await sendTelegram(
+            `⚠️ <b>CASCADE BUY SKIPPED — ${coinBase}</b>\n\n` +
+            `Buy-back at $${newBuyPrice.toFixed(6)} is below\n` +
+            `your entry price $${entryPrice.toFixed(6)}.\n` +
+            `Not buying below cost basis.\n` +
+            `Stop loss still protecting position.`
+          ).catch(() => {});
+        } else {
+          buyRules = await enforceMax(buyRules, MAX_BUY, 'buy');
+          await db.execute(
+            'INSERT INTO auto_trade_rules (symbol, rule_type, trigger_price, direction, order_type, volume, volume_type, source, exchange, cascade_count, max_cascades, cascade_parent_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            [symbol, 'buy_retrace', newBuyPrice, 'below', 'buy', cascadeVol, cascadeVolType, 'cascade', cascadeExchange, 0, maxCascades, rule.id]
+          );
+          console.log(`[cascade] Buy-back created @ $${newBuyPrice.toFixed(6)} (sweep enabled — cash coming)`);
+          created = true;
+        }
+      }
+
+    } else if (isBuy) {
+      // After a buy fires: cascade deeper — but respect the cascade limit
+      if (parentCascadeCount >= maxCascades) {
+        console.log(`[cascade] Max cascade buys (${maxCascades}) reached for ${symbol} — stopping runaway downside buying`);
+        await sendTelegram(
+          `⚠️ <b>CASCADE LIMIT REACHED — ${coinBase}</b>\n\n` +
+          `${maxCascades} consecutive buy-backs fired without a sell.\n` +
+          `Stopping cascade buys — stop loss still active.\n` +
+          `Review position manually.`
+        ).catch(() => {});
+      } else if (!nearExists(buyRules, newBuyPrice)) {
+        // Entry price guard for deeper dip buys too
+        const entryPrice = entryPrices.get(symbol);
+        if (entryPrice && newBuyPrice < entryPrice * 0.95) {
+          console.log(`[cascade] Deeper dip buy at $${newBuyPrice.toFixed(6)} is below entry $${entryPrice.toFixed(6)} — skipping`);
+          await sendTelegram(
+            `⚠️ <b>CASCADE BUY SKIPPED — ${coinBase}</b>\n\n` +
+            `Deeper dip buy at $${newBuyPrice.toFixed(6)} is below\n` +
+            `your entry price $${entryPrice.toFixed(6)}.\n` +
+            `Not buying below cost basis.`
+          ).catch(() => {});
+        } else {
+          buyRules = await enforceMax(buyRules, MAX_BUY, 'buy');
+          const newCascadeCount = parentCascadeCount + 1;
+          await db.execute(
+            'INSERT INTO auto_trade_rules (symbol, rule_type, trigger_price, direction, order_type, volume, volume_type, source, exchange, cascade_count, max_cascades, cascade_parent_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            [symbol, 'buy_dip', newBuyPrice, 'below', 'buy', cascadeVol, cascadeVolType, 'cascade', cascadeExchange, newCascadeCount, maxCascades, rule.id]
+          );
+          console.log(`[cascade] Created buy_dip @ $${newBuyPrice.toFixed(6)} for ${symbol} (cascade ${newCascadeCount}/${maxCascades})`);
+          created = true;
+        }
       } else {
         console.log(`[cascade] Buy rule near $${newBuyPrice.toFixed(6)} already exists — skipped`);
       }
-    } else if (isBuy && !nearExists(buyRules, newBuyPrice)) {
-      // After a buy fires: create a deeper dip buy
-      buyRules = await enforceMax(buyRules, MAX_BUY, 'buy');
-      await db.execute(
-        'INSERT INTO auto_trade_rules (symbol, rule_type, trigger_price, direction, order_type, volume, volume_type, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-        [symbol, 'buy_dip', newBuyPrice, 'below', 'buy', cascadeVol, cascadeVolType, 'cascade']
-      );
-      console.log(`[cascade] Created buy_dip @ $${newBuyPrice.toFixed(6)} for ${symbol}`);
-      created = true;
-    } else if (isBuy) {
-      console.log(`[cascade] Buy rule near $${newBuyPrice.toFixed(6)} already exists — skipped`);
     }
 
     if (created) await sendTelegram(cascadeMsg);
@@ -5202,15 +5278,17 @@ function createMcpServer() {
       volume_type:      z.enum(['fixed', 'pct']).optional().describe('fixed = token count, pct = % of current position (default: fixed)'),
       max_position_usd: z.number().optional().describe('Max position size in USD — skips buy if already holding this much'),
       exchange:         z.enum(['kraken', 'revolut']).optional().describe('Exchange to execute on: kraken (default) or revolut'),
+      max_cascades:     z.number().optional().describe('Max cascade buy-backs before stopping runaway downside buying — default 3'),
     },
-    async ({ symbol, rule_type, trigger_price, direction, order_type, volume, volume_type, max_position_usd, exchange }) => {
+    async ({ symbol, rule_type, trigger_price, direction, order_type, volume, volume_type, max_position_usd, exchange, max_cascades }) => {
       try {
-        const sym     = symbol.includes('-USD') ? symbol : `${symbol}-USD`;
-        const volType = volume_type || 'fixed';
-        const exch    = exchange || 'kraken';
+        const sym         = symbol.includes('-USD') ? symbol : `${symbol}-USD`;
+        const volType     = volume_type || 'fixed';
+        const exch        = exchange || 'kraken';
+        const maxCascades = max_cascades ?? 3;
         const [result] = await db.execute(
-          'INSERT INTO auto_trade_rules (symbol, rule_type, trigger_price, direction, order_type, volume, volume_type, max_position_usd, exchange) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-          [sym, rule_type, trigger_price, direction, order_type, volume, volType, max_position_usd || null, exch]
+          'INSERT INTO auto_trade_rules (symbol, rule_type, trigger_price, direction, order_type, volume, volume_type, max_position_usd, exchange, max_cascades) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+          [sym, rule_type, trigger_price, direction, order_type, volume, volType, max_position_usd || null, exch, maxCascades]
         );
         const volLabel = volType === 'pct' ? `${volume}% of position` : `${volume} tokens`;
         const moonNote = rule_type === 'moon_bag' ? '\n🌙 Moon bag — marker only, never auto-sold' : '';
@@ -5219,9 +5297,10 @@ function createMcpServer() {
           `${order_type.toUpperCase()} ${volLabel} ${sym.replace('-USD', '')} when price goes ${direction} $${trigger_price}\n` +
           `Rule type: ${rule_type}\n` +
           `Exchange: ${exch.toUpperCase()}\n` +
+          `Max cascades: ${maxCascades}\n` +
           `Max position: ${max_position_usd ? '$' + max_position_usd : 'unlimited'}${moonNote}`
         );
-        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, rule_id: result.insertId, symbol: sym, rule_type, trigger_price, direction, order_type, volume, volume_type: volType, exchange: exch }) }] };
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, rule_id: result.insertId, symbol: sym, rule_type, trigger_price, direction, order_type, volume, volume_type: volType, exchange: exch, max_cascades: maxCascades }) }] };
       } catch (e) {
         return { content: [{ type: 'text', text: JSON.stringify({ error: e.message }) }] };
       }
@@ -7958,101 +8037,4 @@ const TRADER_PROFILE_DEFAULTS = [
   { key: 'core_strategy',    value: 'Swing trader focused on extreme price movements. Buys sudden sharp dips outside normal price pattern. Sells sudden sharp pumps outside normal price pattern. Always looking to capture profit on big moves and buy back on retraces.' },
   { key: 'buy_signals',      value: 'Sudden extreme drop outside normal trading range — potential dip buy opportunity' },
   { key: 'sell_signals',     value: 'Sudden extreme pump outside normal trading range — potential profit taking opportunity' },
-  { key: 'retrace_strategy', value: 'After selling a pump, waits for retrace and buys back at lower price to repeat the cycle' },
-  { key: 'loss_protection',  value: 'Will sell to protect against further losses if coin drops significantly with no recovery catalyst' },
-  { key: 'profit_capture',   value: 'Takes profits on substantial rises then looks to buy back on retrace' },
-  { key: 'trading_goal',     value: 'Portfolio recovery from 50% down — building back through disciplined swing trading' },
-  { key: 'risk_approach',    value: 'Protects downside while capturing upside on extreme moves' },
-];
-(async () => {
-  for (const { key, value } of TRADER_PROFILE_DEFAULTS) {
-    await db.execute(
-      'INSERT INTO trader_profile (preference_key, preference_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE preference_key = preference_key',
-      [key, value]
-    ).catch(() => {});
-  }
-  console.log('Trader profile defaults seeded.');
-})();
-
-// GET /api/system/config — read all system config values
-app.get('/api/system/config', async (req, res) => {
-  try {
-    const [rows] = await db.execute(
-      'SELECT config_key, config_value, updated_at FROM system_config ORDER BY config_key'
-    );
-    res.json({ ok: true, config: rows });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// POST /api/system/config — upsert a config key/value
-app.post('/api/system/config', async (req, res) => {
-  try {
-    const { key, value } = req.body;
-    if (!key || !value) return res.status(400).json({ error: 'key and value required' });
-    await db.execute(
-      'INSERT INTO system_config (config_key, config_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)',
-      [key, value]
-    );
-    res.json({ ok: true, key, updated_at: new Date().toISOString() });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// POST /api/revolut/trade — execute a Revolut X trade directly (requires approved: true)
-app.post('/api/revolut/trade', async (req, res) => {
-  try {
-    const { symbol, side, orderType, baseSize, price, approved } = req.body;
-    if (!approved) return res.status(400).json({ error: 'Trade requires approved: true explicitly set' });
-    if (!symbol || !side || !orderType || !baseSize) return res.status(400).json({ error: 'Missing required fields: symbol, side, orderType, baseSize' });
-    const result = await placeRevolutOrder(symbol, side, orderType, parseFloat(baseSize), price ? parseFloat(price) : null);
-    const coinBase = symbol.replace('-USD', '');
-    const executedPrice = price || await getCurrentPrice(symbol).catch(() => 0) || 0;
-    const valueUSD = executedPrice * parseFloat(baseSize);
-    await db.execute(
-      'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      [coinBase, side, executedPrice, baseSize, valueUSD, 'Revolut X trade via dashboard', 'confident']
-    ).catch(e => console.error('[revolut] Journal insert failed:', e.message));
-    await sendTelegram(
-      `✅ <b>REVOLUT X TRADE EXECUTED</b>\n\n` +
-      `${side.toUpperCase()} ${baseSize} ${coinBase} @ ${fmtPriceShort(executedPrice)}\n` +
-      `Value: $${valueUSD.toFixed(2)}\n` +
-      `Order ID: ${result?.client_order_id || 'unknown'}\n\n` +
-      `📝 Journal entry logged automatically`
-    );
-    res.json({ ok: true, result });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// GET /api/debug/link-pairs — temporary diagnostic: all LINK trading pairs on Revolut X
-app.get('/api/debug/link-pairs', async (req, res) => {
-  try {
-    const tickerResponse = await revolutRequest('GET', '/tickers');
-    const tickerList = Array.isArray(tickerResponse) ? tickerResponse : (tickerResponse.data || []);
-    const linkPairs = tickerList.filter(t => t.symbol?.includes('LINK'));
-    res.json({ total_tickers: tickerList.length, link_pairs: linkPairs });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// DELETE /api/cleanup/trade-intentions — one-time cleanup of unmatched intentions
-app.delete('/api/cleanup/trade-intentions', async (req, res) => {
-  try {
-    const [result] = await db.execute(
-      'DELETE FROM trade_intentions WHERE matched_at IS NULL'
-    );
-    res.json({ ok: true, deleted: result.affectedRows });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+  { key: 'retrace_strate
