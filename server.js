@@ -232,6 +232,7 @@ const alertState = {
 const ignoredCoins = new Set(); // permanently ignored coins — survives restarts via DB
 const activeFixedAlerts = new Map(); // symbol -> intervalId for fixed price target alerts (up)
 const activeDropAlerts  = new Map(); // symbol -> intervalId for fixed floor/drop alerts (down)
+const targetReminderCount = new Map(); // symbol -> number of reminders sent (resets on acknowledge)
 const activeSecondaryAlerts = {}; // `${symbol}:${price}` -> true — fired secondary rec-based alerts
 const lastBalances = {};
 const customThresholds = {};
@@ -748,6 +749,41 @@ for (const row of ptRows) {
   });
 }
 console.log(`Loaded ${ptRows.length} price targets from database`);
+
+// Startup cross-check: remove price_targets that are already covered by an active auto rule
+// e.g. if SOL-USD has a sell rule at $150 and a 'up' price target at $150 — target is redundant
+try {
+  const [activeRules] = await db.execute(
+    "SELECT symbol, order_type, trigger_price FROM auto_trade_rules WHERE is_active = 1"
+  );
+  let removedCount = 0;
+  for (const [symbol, target] of priceTargets) {
+    const dir = target.direction || 'up';
+    const tPrice = target.targetPrice;
+    // Check if any active rule makes this target redundant
+    const redundant = activeRules.some(r => {
+      if (r.symbol !== symbol) return false;
+      if (dir === 'up' && r.order_type === 'sell') {
+        // Sell rule at or below target means the auto rule will fire first
+        return parseFloat(r.trigger_price) <= tPrice;
+      }
+      if (dir === 'down' && r.order_type === 'buy') {
+        // Buy rule at or above target means the auto rule will fire first
+        return parseFloat(r.trigger_price) >= tPrice;
+      }
+      return false;
+    });
+    if (redundant) {
+      console.log(`[startup] Removing redundant price target for ${symbol} — already covered by auto rule`);
+      priceTargets.delete(symbol);
+      await db.execute('DELETE FROM price_targets WHERE symbol = ?', [symbol]).catch(e => console.error('[startup] Delete target failed:', e.message));
+      removedCount++;
+    }
+  }
+  if (removedCount > 0) console.log(`[startup] Removed ${removedCount} redundant price target(s)`);
+} catch (e) {
+  console.warn('[startup] Price target cross-check failed:', e.message);
+}
 
 const [epRows] = await db.execute('SELECT symbol, entry_price FROM entry_prices');
 for (const row of epRows) {
@@ -1644,6 +1680,12 @@ async function acknowledgeAlert(symbol) {
     console.log('[ack] Cleared fixed target interval for:', symbol);
   }
 
+  // Reset reminder counter so a re-fired target gets fresh 2 reminders
+  if (targetReminderCount.has(symbol)) {
+    targetReminderCount.delete(symbol);
+    console.log('[ack] Reset reminder count for:', symbol);
+  }
+
   console.log('[ack] Complete for:', symbol,
     '| Active pump:', alertState.active.size,
     '| Active drop:', activeDropAlerts.size,
@@ -1659,6 +1701,7 @@ async function ignoreCoin(symbol) {
   if (alertState.active.has(symbol)) { clearInterval(alertState.active.get(symbol)); alertState.active.delete(symbol); }
   if (activeDropAlerts.has(symbol)) { clearInterval(activeDropAlerts.get(symbol)); activeDropAlerts.delete(symbol); }
   if (activeFixedAlerts.has(symbol)) { clearInterval(activeFixedAlerts.get(symbol)); activeFixedAlerts.delete(symbol); }
+  targetReminderCount.delete(symbol); // reset reminder count on ignore
   try {
     await db.execute('INSERT INTO ignored_coins (symbol) VALUES (?) ON DUPLICATE KEY UPDATE ignored_at = CURRENT_TIMESTAMP', [symbol]);
     console.log('[ignore] Permanently ignored:', symbol);
@@ -3446,6 +3489,46 @@ Be honest, direct and actionable.`;
   }
 }
 
+// Cancel price targets that are now obsolete after an auto trade execution.
+// e.g. a sell rule fired at $2.00 — any 'up' target at or below $2.00 is now moot.
+// e.g. a buy rule fired at $1.80 — any 'down' target at or above $1.80 is now moot.
+async function cancelObsoleteTargets(symbol, executedPrice, action) {
+  try {
+    const target = priceTargets.get(symbol);
+    if (!target) return;
+
+    const tPrice = target.targetPrice;
+    const dir    = target.direction || 'up';
+
+    let isObsolete = false;
+    if (action === 'sell' && dir === 'up' && tPrice <= executedPrice) {
+      isObsolete = true; // sell happened at or above the 'up' target — target is already passed
+    } else if (action === 'buy' && dir === 'down' && tPrice >= executedPrice) {
+      isObsolete = true; // buy happened at or below the 'down' target — target is already passed
+    }
+
+    if (!isObsolete) return;
+
+    console.log(`[targets] Cancelling obsolete ${dir} target for ${symbol} — target ${tPrice}, exec ${executedPrice}, action ${action}`);
+    priceTargets.delete(symbol);
+    targetReminderCount.delete(symbol);
+
+    // Clear any active interval
+    if (activeFixedAlerts.has(symbol)) {
+      clearInterval(activeFixedAlerts.get(symbol));
+      activeFixedAlerts.delete(symbol);
+    }
+
+    // Remove from DB
+    await db.execute('DELETE FROM price_targets WHERE symbol = ?', [symbol]).catch(e => console.error('[targets] Delete failed:', e.message));
+
+    const coinBase = symbol.replace('-USD', '');
+    await sendTelegram(`🗑️ <b>Target auto-cancelled: ${coinBase}</b>\nObsolete after ${action} executed at ${formatPrice(executedPrice)} — target was ${formatPrice(tPrice)} (${dir})`).catch(() => {});
+  } catch (e) {
+    console.error('[targets] cancelObsoleteTargets error:', e.message);
+  }
+}
+
 async function cascadeRulesAfterTrade(rule, executedPrice) {
   try {
     const symbol   = rule.symbol;
@@ -3848,6 +3931,9 @@ async function checkAutoTradeRules(priceMap) {
           // Cascade: generate next set of rules based on executed price
           await cascadeRulesAfterTrade(rule, currentPrice);
 
+          // Cancel any price targets that are now obsolete after this execution
+          await cancelObsoleteTargets(rule.symbol, currentPrice, rule.order_type);
+
           // USDT sweep after qualifying sells (Kraken only — Revolut handles its own treasury)
           if (rule.order_type === 'sell' && exchange === 'kraken') {
             const proceeds = currentPrice * resolvedVolume;
@@ -4130,6 +4216,17 @@ async function checkPortfolio() {
         const changePct = ((currentPrice - target.anchorPrice) / target.anchorPrice) * 100;
         const coinBase = symbol.replace('-USD', '');
 
+        // Max-2-reminders: if already sent 2+ reminders, auto-acknowledge and delete target
+        const remindersSent = targetReminderCount.get(symbol) || 0;
+        if (remindersSent >= 2) {
+          console.log(`[targets] Auto-acknowledging ${symbol} — ${remindersSent} reminders already sent`);
+          priceTargets.delete(symbol);
+          targetReminderCount.delete(symbol);
+          await db.execute('DELETE FROM price_targets WHERE symbol = ?', [symbol]).catch(() => {});
+          await sendTelegram(`🔕 <b>Target auto-dismissed: ${coinBase}</b>\nNo response after 2 reminders — target removed. Set a new one when ready.`).catch(() => {});
+          continue;
+        }
+
         // Check if this is a dust coin (balance < $5)
         const assetBalance = balances.find(a => a.currency === coinBase);
         const assetQty = assetBalance ? parseFloat(assetBalance.available) : 0;
@@ -4182,6 +4279,7 @@ async function checkPortfolio() {
         await sendTelegram(alertMessage);
         lastAlertContext.set(TELEGRAM_CHAT_ID, { symbol, coinBase, alertType: 'fixed_target_up' });
 
+        targetReminderCount.set(symbol, 0); // reset counter when first alert fires
         activeFixedAlerts.set(symbol, setInterval(async () => {
           if (alertState.acknowledged.has(symbol)) {
             console.log('[alert] Fixed-target reminder skipped — recently acknowledged:', symbol);
@@ -4189,14 +4287,34 @@ async function checkPortfolio() {
             activeFixedAlerts.delete(symbol);
             return;
           }
-          console.log('[alert] Sending fixed-target reminder for:', symbol);
-          await sendTelegram(`⚠️ <b>REMINDER: ${symbol} FIXED TARGET STILL ACTIVE!</b>\n\nTarget: ${formatPrice(target.targetPrice)} | Now: ${formatPrice(currentPrice)}\nReply 'acknowledge ${coinBase}' to stop`);
+          const count = (targetReminderCount.get(symbol) || 0) + 1;
+          targetReminderCount.set(symbol, count);
+          const reminderSuffix = ` (Reminder ${count}/2)`;
+          console.log('[alert] Sending fixed-target reminder for:', symbol, `(${count}/2)`);
+          if (count >= 2) {
+            // Final reminder — next cycle will auto-dismiss
+            clearInterval(activeFixedAlerts.get(symbol));
+            activeFixedAlerts.delete(symbol);
+          }
+          await sendTelegram(`⚠️ <b>REMINDER: ${symbol} FIXED TARGET STILL ACTIVE!</b>${reminderSuffix}\n\nTarget: ${formatPrice(target.targetPrice)} | Now: ${formatPrice(currentPrice)}\nReply 'acknowledge ${coinBase}' to stop`);
         }, ALERT_INTERVAL_MS));
       }
 
       if (direction === 'down' && currentPrice <= target.targetPrice && !activeFixedAlerts.has(symbol) && !alertState.acknowledged.has(symbol) && !ignoredCoins.has(symbol)) {
         const changePct = ((currentPrice - target.anchorPrice) / target.anchorPrice) * 100;
         const coinBase = symbol.replace('-USD', '');
+
+        // Max-2-reminders: if already sent 2+ reminders, auto-acknowledge and delete target
+        const remindersSentDown = targetReminderCount.get(symbol) || 0;
+        if (remindersSentDown >= 2) {
+          console.log(`[targets] Auto-acknowledging ${symbol} (down) — ${remindersSentDown} reminders already sent`);
+          priceTargets.delete(symbol);
+          targetReminderCount.delete(symbol);
+          await db.execute('DELETE FROM price_targets WHERE symbol = ?', [symbol]).catch(() => {});
+          await sendTelegram(`🔕 <b>Target auto-dismissed: ${coinBase}</b>\nNo response after 2 reminders — target removed. Set a new one when ready.`).catch(() => {});
+          continue;
+        }
+
         const entryPrice = entryPrices.get(symbol) || target.entryPrice;
         const plPct = entryPrice ? ((currentPrice - entryPrice) / entryPrice * 100).toFixed(1) : null;
         const replyMenu = `\n\n1️⃣ Buy more — get buy the dip advice\n2️⃣ Hold — keep holding\n3️⃣ Sell — get sell advice\n4️⃣ Acknowledge — dismiss alert`;
@@ -4231,6 +4349,7 @@ async function checkPortfolio() {
         await sendTelegram(alertMessage);
         lastAlertContext.set(TELEGRAM_CHAT_ID, { symbol, coinBase, alertType: 'fixed_target_down' });
 
+        targetReminderCount.set(symbol, 0); // reset counter when first alert fires
         activeFixedAlerts.set(symbol, setInterval(async () => {
           if (alertState.acknowledged.has(symbol)) {
             console.log('[alert] Fixed-floor reminder skipped — recently acknowledged:', symbol);
@@ -4238,8 +4357,16 @@ async function checkPortfolio() {
             activeFixedAlerts.delete(symbol);
             return;
           }
-          console.log('[alert] Sending fixed-floor reminder for:', symbol);
-          await sendTelegram(`⚠️ <b>REMINDER: ${symbol} FIXED FLOOR STILL ACTIVE!</b>\n\nFloor: ${formatPrice(target.targetPrice)} | Now: ${formatPrice(currentPrice)}\nReply 'acknowledge ${coinBase}' to stop`);
+          const count = (targetReminderCount.get(symbol) || 0) + 1;
+          targetReminderCount.set(symbol, count);
+          const reminderSuffix = ` (Reminder ${count}/2)`;
+          console.log('[alert] Sending fixed-floor reminder for:', symbol, `(${count}/2)`);
+          if (count >= 2) {
+            // Final reminder — next cycle will auto-dismiss
+            clearInterval(activeFixedAlerts.get(symbol));
+            activeFixedAlerts.delete(symbol);
+          }
+          await sendTelegram(`⚠️ <b>REMINDER: ${symbol} FIXED FLOOR STILL ACTIVE!</b>${reminderSuffix}\n\nFloor: ${formatPrice(target.targetPrice)} | Now: ${formatPrice(currentPrice)}\nReply 'acknowledge ${coinBase}' to stop`);
         }, ALERT_INTERVAL_MS));
       }
     }
