@@ -4091,6 +4091,65 @@ async function checkPortfolio() {
     console.log('Price map size:', Object.keys(priceMap).length);
     console.log('Price map sample:', JSON.stringify(Object.entries(priceMap).slice(0, 3)));
 
+    // ── USDT balance change detection — debit card payments vs dry powder ────
+    if (portfolioCheckCount > 1) {
+      try {
+        const usdtAsset = balances.find(b => b.currency === 'USDT');
+        const currentUSDT = usdtAsset ? parseFloat(usdtAsset.available) : 0;
+        const prevUSDT    = previousBalances.get('USDT-USD') ?? null;
+
+        if (prevUSDT !== null) {
+          const usdtDecrease = prevUSDT - currentUSDT;
+          const usdtIncrease = currentUSDT - prevUSDT;
+
+          if (usdtDecrease > 0.50) {
+            // Debit card payment — auto-log and deduct capital
+            console.log(`[usdt] USDT decreased by $${usdtDecrease.toFixed(2)} — auto-logging as payment`);
+            await db.execute(
+              `INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+              ['USDT', 'payment', 1.00, usdtDecrease, usdtDecrease,
+               'Revolut debit card payment — USDT spent', 'neutral', 'auto_payment']
+            );
+            const prevCapital = totalInvestedCapital;
+            const newCapital  = totalInvestedCapital - usdtDecrease;
+            await updateInvestedCapital(newCapital, `Auto-deducted: USDT debit card payment $${usdtDecrease.toFixed(2)}`);
+            previousBalances.set('USDT-USD', currentUSDT);
+            await db.execute(
+              'INSERT INTO balance_snapshots (symbol, quantity) VALUES (?, ?) ON DUPLICATE KEY UPDATE quantity = VALUES(quantity)',
+              ['USDT-USD', currentUSDT]
+            );
+            await sendTelegram(
+              `💳 <b>DEBIT CARD PAYMENT DETECTED</b>\n\n` +
+              `USDT spent: $${usdtDecrease.toFixed(2)}\n` +
+              `Auto-logged as payment ✅\n` +
+              `Capital updated: $${prevCapital.toFixed(2)} → $${newCapital.toFixed(2)}\n\n` +
+              `No action needed.`
+            );
+            console.log(`[usdt] Payment auto-logged — capital $${prevCapital.toFixed(2)} → $${newCapital.toFixed(2)}`);
+          } else if (usdtIncrease > 0.50) {
+            // USDT increased (sweep deposit or manual top-up) — just update snapshot silently
+            console.log(`[usdt] USDT increased by $${usdtIncrease.toFixed(2)} — dry powder reserve updated (no journal entry)`);
+            previousBalances.set('USDT-USD', currentUSDT);
+            await db.execute(
+              'INSERT INTO balance_snapshots (symbol, quantity) VALUES (?, ?) ON DUPLICATE KEY UPDATE quantity = VALUES(quantity)',
+              ['USDT-USD', currentUSDT]
+            );
+          }
+        } else {
+          // First time seeing USDT — just record the baseline
+          previousBalances.set('USDT-USD', currentUSDT);
+          await db.execute(
+            'INSERT INTO balance_snapshots (symbol, quantity) VALUES (?, ?) ON DUPLICATE KEY UPDATE quantity = VALUES(quantity)',
+            ['USDT-USD', currentUSDT]
+          ).catch(() => {});
+        }
+      } catch (e) {
+        console.error('[usdt] Payment detection error:', e.message);
+      }
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     // Reset autoSkipAlerted for coins whose price moved >3% since last skip alert
     for (const [symbol, lastAlert] of autoSkipAlerted) {
       const currentPrice = priceMap[symbol];
