@@ -537,6 +537,7 @@ await db.execute("ALTER TABLE auto_trade_rules ADD COLUMN IF NOT EXISTS max_casc
 await db.execute("ALTER TABLE auto_trade_rules ADD COLUMN IF NOT EXISTS cascade_parent_id INT NULL").catch(e => console.log('[migration] auto_trade_rules.cascade_parent_id:', e.message));
 await db.execute("ALTER TABLE auto_trade_rules ADD COLUMN IF NOT EXISTS proceeds_reserved DECIMAL(12,2) NULL").catch(e => console.log('[migration] auto_trade_rules.proceeds_reserved:', e.message));
 await db.execute("ALTER TABLE trading_journal ADD COLUMN IF NOT EXISTS source VARCHAR(20) DEFAULT 'auto_detected'").catch(e => console.log('[migration] trading_journal.source:', e.message));
+await db.execute("ALTER TABLE trading_journal ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP").catch(e => console.log('[migration] trading_journal.updated_at:', e.message));
 
 // One-time data corrections
 try {
@@ -8820,7 +8821,7 @@ app.get('/api/activity', async (req, res) => {
     const [trades] = await db.execute(
       `SELECT id, symbol, action, price, quantity, value_usd,
               reasoning, emotion, outcome_pnl, outcome_notes,
-              source, created_at
+              created_at
        FROM trading_journal
        ${where}
        ORDER BY created_at DESC
@@ -8829,7 +8830,8 @@ app.get('/api/activity', async (req, res) => {
     );
     res.json({ ok: true, trades, total: trades.length });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error('[activity] endpoint error:', e.message);
+    res.status(500).json({ error: e.message, hint: 'Check Railway logs for details' });
   }
 });
 
