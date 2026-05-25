@@ -3931,8 +3931,46 @@ async function checkAutoTradeRules(priceMap) {
           // Cascade: generate next set of rules based on executed price
           await cascadeRulesAfterTrade(rule, currentPrice);
 
-          // Cancel any price targets that are now obsolete after this execution
-          await cancelObsoleteTargets(rule.symbol, currentPrice, rule.order_type);
+          // Real-time target cancellation: after a sell fires, wipe 'up' targets at or below executed price
+          if (rule.order_type === 'sell') {
+            try {
+              const [staleTargets] = await db.execute(
+                `SELECT * FROM price_targets WHERE symbol = ? AND direction = 'up' AND target_price <= ?`,
+                [rule.symbol, currentPrice]
+              );
+              for (const staleTarget of staleTargets) {
+                priceTargets.delete(rule.symbol);
+                alertState.acknowledged.add(rule.symbol);
+                targetReminderCount.delete(rule.symbol);
+                if (activeFixedAlerts.has(rule.symbol)) {
+                  clearInterval(activeFixedAlerts.get(rule.symbol));
+                  activeFixedAlerts.delete(rule.symbol);
+                }
+                await db.execute('DELETE FROM price_targets WHERE id = ?', [staleTarget.id]);
+                console.log(`[target] Real-time cancel: ${rule.symbol} target $${staleTarget.target_price} — auto rule already fired at $${currentPrice}`);
+              }
+            } catch (e) { console.error('[target] Real-time sell target cancel failed:', e.message); }
+          }
+
+          // Also cancel drop targets if a stop loss fired
+          if (rule.rule_type === 'stop_loss') {
+            try {
+              const [dropTargets] = await db.execute(
+                `SELECT * FROM price_targets WHERE symbol = ? AND direction = 'down' AND target_price >= ?`,
+                [rule.symbol, currentPrice]
+              );
+              for (const dropTarget of dropTargets) {
+                priceTargets.delete(rule.symbol);
+                targetReminderCount.delete(rule.symbol);
+                if (activeFixedAlerts.has(rule.symbol)) {
+                  clearInterval(activeFixedAlerts.get(rule.symbol));
+                  activeFixedAlerts.delete(rule.symbol);
+                }
+                await db.execute('DELETE FROM price_targets WHERE id = ?', [dropTarget.id]);
+                console.log(`[target] Stop loss fired — cancelled drop target for ${rule.symbol}`);
+              }
+            } catch (e) { console.error('[target] Stop loss drop target cancel failed:', e.message); }
+          }
 
           // USDT sweep after qualifying sells (Kraken only — Revolut handles its own treasury)
           if (rule.order_type === 'sell' && exchange === 'kraken') {
