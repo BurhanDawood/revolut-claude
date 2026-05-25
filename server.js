@@ -535,6 +535,7 @@ try { await db.execute("ALTER TABLE auto_trade_rules ADD COLUMN cascade_count IN
 try { await db.execute("ALTER TABLE auto_trade_rules ADD COLUMN max_cascades INT DEFAULT 3"); } catch (e) { /* column already exists */ }
 try { await db.execute("ALTER TABLE auto_trade_rules ADD COLUMN cascade_parent_id INT NULL"); } catch (e) { /* column already exists */ }
 try { await db.execute("ALTER TABLE auto_trade_rules ADD COLUMN proceeds_reserved DECIMAL(12,2) NULL"); } catch (e) { /* column already exists */ }
+try { await db.execute("ALTER TABLE trading_journal ADD COLUMN source VARCHAR(20) DEFAULT 'auto_detected'"); } catch (e) { /* column already exists */ }
 
 // One-time data corrections
 try {
@@ -2725,12 +2726,45 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
     const absQty = Math.abs(qtyChange);
     const valueUsd = absQty * price;
 
+    // Auto-handle USDT buys/sells — always internal sweeps or conversions, never trading decisions
+    if (coinBase === 'USDT') {
+      const usdtReasoning = action === 'sell'
+        ? 'USDT conversion — auto-logged as payment'
+        : 'USDT sweep — auto-converted from sell proceeds';
+      const usdtAction  = action === 'sell' ? 'payment' : 'buy';
+      const usdtSource  = action === 'sell' ? 'auto_detected' : 'auto_rule';
+      await db.execute(
+        'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        ['USDT', usdtAction, price, absQty, valueUsd, usdtReasoning, 'neutral', usdtSource]
+      ).catch(e => console.error('[autoLog] USDT journal insert error:', e.message));
+      console.log(`[autoLog] USDT ${action} auto-logged as ${usdtAction} — suppressing Telegram`);
+      return;
+    }
+
     // Debounce: if same symbol detected within 10 minutes, skip
     const existing = pendingTradeContext.get(symbol);
     if (existing && (Date.now() - existing.detectedAt) < 10 * 60 * 1000) {
       console.log(`Trade detection debounced for ${symbol} (within 10 min window)`);
       return;
     }
+
+    // Suppress if trade was already logged by Claude MCP or an auto rule within the last 5 minutes
+    try {
+      const [recentSourced] = await db.execute(
+        `SELECT id, source FROM trading_journal
+         WHERE symbol = ?
+         AND action = ?
+         AND source IN ('claude_mcp', 'auto_rule')
+         AND ABS(CAST(price AS DECIMAL(20,10)) - ?) < (? * 0.01 + 0.000001)
+         AND created_at > DATE_SUB(NOW(), INTERVAL 5 MINUTE)
+         LIMIT 1`,
+        [coinBase, action, price, price]
+      );
+      if (recentSourced.length > 0) {
+        console.log(`[autoLog] Suppressing — trade already logged (source=${recentSourced[0].source}, id=${recentSourced[0].id})`);
+        return;
+      }
+    } catch (e) { console.error('[autoLog] Source suppression check error:', e.message); }
 
     // Look up most recent Claude recommendation for this coin
     let claudeRec = null;
@@ -3754,9 +3788,9 @@ async function checkAutoTradeRules(priceMap) {
           await db.execute('UPDATE auto_trade_rules SET last_triggered = NOW() WHERE id = ?', [rule.id]);
 
           await db.execute(
-            'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion) VALUES (?, ?, ?, ?, ?, ?, ?)',
+            'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
             [coinBase, rule.order_type, currentPrice, resolvedVolume, currentPrice * resolvedVolume,
-             `Auto-executed: ${rule.rule_type} rule triggered at $${currentPrice}${rule.volume_type === 'pct' ? ` (${rule.volume}% of position)` : ''} via ${exchange}`, 'neutral']
+             `Auto-executed: ${rule.rule_type} rule triggered at $${currentPrice}${rule.volume_type === 'pct' ? ` (${rule.volume}% of position)` : ''} via ${exchange}`, 'neutral', 'auto_rule']
           );
 
           // Fetch USDT sweep config for notification
@@ -5615,9 +5649,9 @@ function createMcpServer() {
       const displayQty    = value_usd ? `$${value_usd}` : `${formatTradeQty(volume)} ${coinBase}`;
 
       if (exchange === 'revolut') {
-        pendingRevolutTrade = { symbol: sym, side, orderType: order_type, baseSize: volume || 0, valueUsd: value_usd || null, price: livePrice, valueUSD: tradeValueUSD, timestamp: Date.now() };
+        pendingRevolutTrade = { symbol: sym, side, orderType: order_type, baseSize: volume || 0, valueUsd: value_usd || null, price: livePrice, valueUSD: tradeValueUSD, timestamp: Date.now(), source: 'claude_mcp' };
       } else {
-        pendingKrakenTrade = { symbol: sym, side, orderType: order_type, volume: volume || 0, price: livePrice, valueUSD: tradeValueUSD, timestamp: Date.now() };
+        pendingKrakenTrade = { symbol: sym, side, orderType: order_type, volume: volume || 0, price: livePrice, valueUSD: tradeValueUSD, timestamp: Date.now(), source: 'claude_mcp' };
       }
 
       await sendTelegram(
@@ -6731,9 +6765,10 @@ app.post('/telegram-webhook', async (req, res) => {
           try {
             const result = await executeKrakenTrade(t.symbol, t.side, t.orderType, t.volume, t.price);
             const coinBase = t.symbol.replace('-USD', '');
+            const krakenSource = t.source === 'claude_mcp' ? 'claude_mcp' : 'manual';
             await db.execute(
-              'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion) VALUES (?, ?, ?, ?, ?, ?, ?)',
-              [coinBase, t.side, t.price, t.volume, t.valueUSD, 'Kraken trade approved via Telegram', 'confident']
+              'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+              [coinBase, t.side, t.price, t.volume, t.valueUSD, 'Kraken trade approved via Telegram', 'confident', krakenSource]
             ).catch(e => console.error('[kraken] Journal insert failed:', e.message));
 
             // Tranche tracking
@@ -6779,9 +6814,10 @@ app.post('/telegram-webhook', async (req, res) => {
             const matchedIntention = await findMatchingIntention(t.symbol, t.side);
             const reasoning = matchedIntention ? matchedIntention.reasoning : 'Revolut X trade approved via Telegram';
 
+            const revolutSource = t.source === 'claude_mcp' ? 'claude_mcp' : 'manual';
             await db.execute(
-              'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion) VALUES (?, ?, ?, ?, ?, ?, ?)',
-              [coinBase, t.side, executedPrice, t.baseSize, valueUSD, reasoning, 'confident']
+              'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+              [coinBase, t.side, executedPrice, t.baseSize, valueUSD, reasoning, 'confident', revolutSource]
             ).catch(e => console.error('[revolut] Journal insert failed:', e.message));
 
             if (matchedIntention) {
