@@ -255,6 +255,7 @@ const lastRecommendationContext = new Map(); // chatId -> { coins, action, price
 const lastSwingAlertContext = new Map();     // symbol -> { direction: 'pump'|'dip', price, timestamp }
 const swingAlertCooldown = new Map();        // symbol -> timestamp — prevents repeated swing signals (4h cooldown, 6h after reply)
 const autoSkipAlerted = new Map();           // symbol -> timestamp — throttles "auto buy skipped" Telegram messages (1h cooldown)
+const lowCashAlerted = new Map();            // exchange -> date string — throttles low-cash warnings to once per day per exchange
 const lastAlertContext = new Map();          // chatId -> { symbol, coinBase, alertType } — powers numbered reply shortcuts
 const ruleApproachAlerted = new Map();       // ruleId -> timestamp — tracks 2% approach alerts so they don't spam
 let mostRecentSwingAlert = null;             // { symbol, coinBase, direction, price, timestamp } — for 👍 / natural language
@@ -526,19 +527,16 @@ await db.execute(`CREATE TABLE IF NOT EXISTS auto_trade_rules (
   INDEX idx_active (active)
 )`);
 
-// Add source column to existing tables that may not have it
-try { await db.execute("ALTER TABLE auto_trade_rules ADD COLUMN source VARCHAR(20) DEFAULT 'manual'"); } catch (e) { /* column already exists */ }
-// Add volume_type column for percentage-based volumes
-try { await db.execute("ALTER TABLE auto_trade_rules ADD COLUMN volume_type VARCHAR(10) DEFAULT 'fixed'"); } catch (e) { /* column already exists */ }
-// Add exchange column to support Revolut X alongside Kraken
-try { await db.execute("ALTER TABLE auto_trade_rules ADD COLUMN exchange VARCHAR(20) DEFAULT 'kraken'"); } catch (e) { /* column already exists */ }
-try { await db.execute("UPDATE auto_trade_rules SET exchange = 'kraken' WHERE exchange IS NULL"); } catch (e) { /* backfill */ }
-// Cascade protection columns
-try { await db.execute("ALTER TABLE auto_trade_rules ADD COLUMN cascade_count INT DEFAULT 0"); } catch (e) { /* column already exists */ }
-try { await db.execute("ALTER TABLE auto_trade_rules ADD COLUMN max_cascades INT DEFAULT 3"); } catch (e) { /* column already exists */ }
-try { await db.execute("ALTER TABLE auto_trade_rules ADD COLUMN cascade_parent_id INT NULL"); } catch (e) { /* column already exists */ }
-try { await db.execute("ALTER TABLE auto_trade_rules ADD COLUMN proceeds_reserved DECIMAL(12,2) NULL"); } catch (e) { /* column already exists */ }
-try { await db.execute("ALTER TABLE trading_journal ADD COLUMN source VARCHAR(20) DEFAULT 'auto_detected'"); } catch (e) { /* column already exists */ }
+// Safe migration helper — ADD COLUMN IF NOT EXISTS (MySQL 8.0.1+); catch logs for older MySQL fallback
+await db.execute("ALTER TABLE auto_trade_rules ADD COLUMN IF NOT EXISTS source VARCHAR(20) DEFAULT 'manual'").catch(e => console.log('[migration] auto_trade_rules.source:', e.message));
+await db.execute("ALTER TABLE auto_trade_rules ADD COLUMN IF NOT EXISTS volume_type VARCHAR(10) DEFAULT 'fixed'").catch(e => console.log('[migration] auto_trade_rules.volume_type:', e.message));
+await db.execute("ALTER TABLE auto_trade_rules ADD COLUMN IF NOT EXISTS exchange VARCHAR(20) DEFAULT 'kraken'").catch(e => console.log('[migration] auto_trade_rules.exchange:', e.message));
+await db.execute("UPDATE auto_trade_rules SET exchange = 'kraken' WHERE exchange IS NULL").catch(() => {});
+await db.execute("ALTER TABLE auto_trade_rules ADD COLUMN IF NOT EXISTS cascade_count INT DEFAULT 0").catch(e => console.log('[migration] auto_trade_rules.cascade_count:', e.message));
+await db.execute("ALTER TABLE auto_trade_rules ADD COLUMN IF NOT EXISTS max_cascades INT DEFAULT 3").catch(e => console.log('[migration] auto_trade_rules.max_cascades:', e.message));
+await db.execute("ALTER TABLE auto_trade_rules ADD COLUMN IF NOT EXISTS cascade_parent_id INT NULL").catch(e => console.log('[migration] auto_trade_rules.cascade_parent_id:', e.message));
+await db.execute("ALTER TABLE auto_trade_rules ADD COLUMN IF NOT EXISTS proceeds_reserved DECIMAL(12,2) NULL").catch(e => console.log('[migration] auto_trade_rules.proceeds_reserved:', e.message));
+await db.execute("ALTER TABLE trading_journal ADD COLUMN IF NOT EXISTS source VARCHAR(20) DEFAULT 'auto_detected'").catch(e => console.log('[migration] trading_journal.source:', e.message));
 
 // One-time data corrections
 try {
@@ -671,23 +669,9 @@ await db.execute(`CREATE TABLE IF NOT EXISTS uk_s104_pool (
   last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 )`);
 
-// Add direction column to price_targets if it doesn't exist
-try {
-  await db.execute(`ALTER TABLE price_targets ADD COLUMN direction VARCHAR(4) NOT NULL DEFAULT 'up'`);
-  console.log('Added direction column to price_targets');
-} catch (e) { /* already exists */ }
-
-// Add note column (stores JSON context for auto-set alerts)
-try {
-  await db.execute(`ALTER TABLE price_targets ADD COLUMN note TEXT`);
-  console.log('Added note column to price_targets');
-} catch (e) { /* already exists */ }
-
-// Add acknowledged_until column to custom_thresholds (persists ack status across restarts)
-try {
-  await db.execute(`ALTER TABLE custom_thresholds ADD COLUMN acknowledged_until TIMESTAMP NULL DEFAULT NULL`);
-  console.log('Added acknowledged_until column to custom_thresholds');
-} catch (e) { /* already exists */ }
+await db.execute(`ALTER TABLE price_targets ADD COLUMN IF NOT EXISTS direction VARCHAR(4) NOT NULL DEFAULT 'up'`).catch(e => console.log('[migration] price_targets.direction:', e.message));
+await db.execute(`ALTER TABLE price_targets ADD COLUMN IF NOT EXISTS note TEXT`).catch(e => console.log('[migration] price_targets.note:', e.message));
+await db.execute(`ALTER TABLE custom_thresholds ADD COLUMN IF NOT EXISTS acknowledged_until TIMESTAMP NULL DEFAULT NULL`).catch(e => console.log('[migration] custom_thresholds.acknowledged_until:', e.message));
 
 // One-time cleanup: remove ghost symbols created by parser errors (words mistaken for coin names)
 try {
@@ -756,7 +740,7 @@ console.log(`Loaded ${ptRows.length} price targets from database`);
 // e.g. if SOL-USD has a sell rule at $150 and a 'up' price target at $150 — target is redundant
 try {
   const [activeRules] = await db.execute(
-    "SELECT symbol, order_type, trigger_price FROM auto_trade_rules WHERE is_active = 1"
+    "SELECT symbol, order_type, trigger_price FROM auto_trade_rules WHERE active = 1"
   );
   let removedCount = 0;
   for (const [symbol, target] of priceTargets) {
@@ -3711,6 +3695,23 @@ async function cascadeRulesAfterTrade(rule, executedPrice) {
   }
 }
 
+// Returns available USD/USDT cash on a given exchange
+async function getAvailableUSD(exchange) {
+  try {
+    if (exchange === 'revolut') {
+      const balances = await revolutRequest('GET', '/balances');
+      const usd = balances.find(b => b.currency === 'USD' || b.currency === 'USDT');
+      return parseFloat(usd?.available || 0);
+    } else {
+      const krakenData = await getKrakenBalances();
+      return krakenData.usdCash || 0;
+    }
+  } catch (e) {
+    console.error('[cash] getAvailableUSD error:', e.message);
+    return 0;
+  }
+}
+
 async function checkAutoTradeRules(priceMap) {
   try {
     const [rules] = await db.execute('SELECT * FROM auto_trade_rules WHERE active = 1');
@@ -3817,49 +3818,76 @@ async function checkAutoTradeRules(priceMap) {
           } catch (e) { console.error('[auto] Max position check error:', e.message); continue; }
         }
 
-        // USD balance check for buys
+        // USD balance check for buys — covers both ringfenced and general paths
         if (rule.order_type === 'buy') {
           const ringfencedUsd = rule.proceeds_reserved ? parseFloat(rule.proceeds_reserved) : 0;
+          const coinBase_ = rule.symbol.replace('-USD', '');
+          const exchangeLabel_ = exchange === 'revolut' ? 'Revolut X' : 'Kraken';
 
           if (ringfencedUsd > 0) {
-            // Ringfenced path — use proceeds from paired sell, bypass general balance check
+            // Ringfenced path — verify the cash actually exists before committing
+            const availableUSD = await getAvailableUSD(exchange);
+            const requiredUSD = ringfencedUsd;
+            if (availableUSD < requiredUSD) {
+              const shortfall = requiredUSD - availableUSD;
+              const lastSkipAlert = autoSkipAlerted.get(rule.symbol);
+              const oneHour = 60 * 60 * 1000;
+              if (availableUSD < 1) {
+                console.log(`[cash] ${coinBase_} ringfenced buy-back skipped — zero USD on ${exchangeLabel_}`);
+              } else if (!lastSkipAlert || Date.now() - lastSkipAlert > oneHour) {
+                autoSkipAlerted.set(rule.symbol, Date.now());
+                await sendTelegram(
+                  `⚠️ <b>BUY-BACK SKIPPED — ${coinBase_}</b>\n\n` +
+                  `Exchange: ${exchangeLabel_}\n` +
+                  `Rule: ${rule.rule_type} @ ${formatPrice(parseFloat(rule.trigger_price))}\n` +
+                  `Required: $${requiredUSD.toFixed(2)} (ringfenced)\n` +
+                  `Available: $${availableUSD.toFixed(2)}\n` +
+                  `Shortfall: $${shortfall.toFixed(2)}\n\n` +
+                  `💡 Options:\n` +
+                  `• Sell another position to free cash\n` +
+                  `• Deposit funds to ${exchangeLabel_}\n` +
+                  `• Remove rule if no longer needed\n\n` +
+                  `Rule ID: ${rule.id} — use 'remove auto rule ${rule.id}' to delete`
+                );
+              }
+              continue;
+            }
             resolvedVolume = ringfencedUsd / currentPrice;
             console.log(`[cascade] Using ringfenced $${ringfencedUsd.toFixed(2)} for buy-back of ${rule.symbol} — ${resolvedVolume.toFixed(6)} tokens @ ${formatPrice(currentPrice)}`);
           } else {
-            // General balance path — original behaviour
+            // General balance path
             try {
-              let availableUSD = 0;
-              if (exchange === 'revolut') {
-                const rBalances = await revolutRequest('GET', '/balances');
-                const usdAsset = rBalances.find(b => b.currency === 'USD');
-                availableUSD = parseFloat(usdAsset?.available || 0);
-              } else {
-                const krakenData = await getKrakenBalances();
-                const usdBalance = krakenData.balances.find(b => b.standard === 'USD' || b.symbol === 'ZUSD');
-                availableUSD = usdBalance?.balance || 0;
-              }
+              const availableUSD = await getAvailableUSD(exchange);
               const requiredUSD = resolvedVolume * currentPrice;
               if (availableUSD < requiredUSD) {
-                // Only notify if there IS some USD but not enough — complete silence when balance is $0
-                if (availableUSD > 1) {
+                const shortfall = requiredUSD - availableUSD;
+                if (availableUSD < 1) {
+                  console.log(`[cash] ${coinBase_} buy skipped — zero USD on ${exchangeLabel_} (silent)`);
+                } else {
                   const lastSkipAlert = autoSkipAlerted.get(rule.symbol);
                   const oneHour = 60 * 60 * 1000;
                   if (!lastSkipAlert || Date.now() - lastSkipAlert > oneHour) {
-                    await sendTelegram(
-                      `⚠️ Auto buy skipped — insufficient USD:\n` +
-                      `$${availableUSD.toFixed(2)} available, ` +
-                      `$${requiredUSD.toFixed(2)} required.`
-                    );
                     autoSkipAlerted.set(rule.symbol, Date.now());
+                    await sendTelegram(
+                      `⚠️ <b>BUY-BACK SKIPPED — ${coinBase_}</b>\n\n` +
+                      `Exchange: ${exchangeLabel_}\n` +
+                      `Rule: ${rule.rule_type} @ ${formatPrice(parseFloat(rule.trigger_price))}\n` +
+                      `Required: $${requiredUSD.toFixed(2)}\n` +
+                      `Available: $${availableUSD.toFixed(2)}\n` +
+                      `Shortfall: $${shortfall.toFixed(2)}\n\n` +
+                      `💡 Options:\n` +
+                      `• Sell another position to free cash\n` +
+                      `• Deposit funds to ${exchangeLabel_}\n` +
+                      `• Remove rule if no longer needed\n\n` +
+                      `Rule ID: ${rule.id} — use 'remove auto rule ${rule.id}' to delete`
+                    );
                   } else {
-                    console.log(`[auto] Buy skipped (USD low) — alert suppressed, sent ${Math.round((Date.now() - lastSkipAlert) / 60000)}min ago`);
+                    console.log(`[cash] Buy skipped (USD low) — alert suppressed, sent ${Math.round((Date.now() - lastSkipAlert) / 60000)}min ago`);
                   }
-                } else {
-                  // Zero balance — completely silent
-                  console.log(`[auto] Buy skipped — zero USD balance (silent)`);
                 }
                 continue;
               }
+              console.log(`[cash] ${coinBase_} buy: $${availableUSD.toFixed(2)} available, $${requiredUSD.toFixed(2)} required ✅`);
             } catch (e) {
               console.error('[auto] USD balance check error:', e.message);
               continue;
@@ -3909,6 +3937,13 @@ async function checkAutoTradeRules(priceMap) {
           // Clear approach alert now that rule has fired
           ruleApproachAlerted.delete(rule.id);
 
+          // Fetch remaining cash for post-execution report
+          const remainingUSD = await getAvailableUSD(exchange).catch(() => null);
+          const exchangeLabel = exchange === 'revolut' ? 'Revolut X' : 'Kraken';
+          const cashLine = remainingUSD !== null
+            ? `\n💵 Remaining cash: $${remainingUSD.toFixed(2)}${remainingUSD < 20 ? '\n⚠️ Cash running low — consider topping up' : ''}`
+            : '';
+
           // Ringfenced buy-back — send dedicated notification and clear the reserved amount
           const isRingfenced = rule.order_type === 'buy' && rule.proceeds_reserved > 0;
           if (isRingfenced) {
@@ -3922,8 +3957,9 @@ async function checkAutoTradeRules(priceMap) {
               `Trigger: ${rule.direction} ${formatPrice(triggerPrice)}\n` +
               `Order ID: ${orderId}\n\n` +
               `💰 Source: Ringfenced from paired sell ✅\n` +
-              `🏦 General balance: Untouched ✅\n\n` +
-              `📊 Cascade cycle complete — self-funded\n` +
+              `🏦 General balance: Untouched ✅\n` +
+              cashLine +
+              `\n📊 Cascade cycle complete — self-funded\n` +
               `📝 Journal logged automatically`
             );
           } else {
@@ -3933,11 +3969,30 @@ async function checkAutoTradeRules(priceMap) {
               `Value: $${valueUsd.toFixed(2)}\n` +
               `Rule: ${rule.rule_type}${volLabel}\n` +
               `Trigger: ${rule.direction} ${formatPrice(triggerPrice)}\n` +
-              `Order ID: ${orderId}\n\n` +
-              `📊 Cascade rules updated automatically\n` +
+              `Order ID: ${orderId}\n` +
+              cashLine +
+              `\n📊 Cascade rules updated automatically\n` +
               sweepLine +
               `📝 Journal logged automatically`
             );
+          }
+
+          // Part 3: Low cash warning — once per day per exchange after any trade
+          if (remainingUSD !== null && remainingUSD < 20) {
+            const today = new Date().toDateString();
+            const lastLowCashAlert = lowCashAlerted.get(exchange);
+            if (lastLowCashAlert !== today) {
+              lowCashAlerted.set(exchange, today);
+              await sendTelegram(
+                `💸 <b>LOW CASH WARNING — ${exchangeLabel}</b>\n\n` +
+                `${exchangeLabel} cash: $${remainingUSD.toFixed(2)}\n\n` +
+                `Buy-back rules may not execute if cash runs out. Consider:\n` +
+                `• Enabling USDT sweep on more coins\n` +
+                `• Selling a position to free up cash\n` +
+                `• Depositing additional funds\n\n` +
+                `Current USDT sweep: ${sweepEnabled ? `ON ✅ (${sweepPct}%)` : 'OFF ❌'}`
+              ).catch(() => {});
+            }
           }
 
           // Cascade: generate next set of rules based on executed price
@@ -4914,6 +4969,11 @@ app.use((req, res, next) => {
     return res.sendStatus(204);
   }
   next();
+});
+
+// GET /api/health — lightweight liveness check (no DB, no external calls)
+app.get('/api/health', (req, res) => {
+  res.json({ ok: true, time: new Date().toISOString(), uptime: Math.round(process.uptime()) });
 });
 
 // GET /api/status — monitoring status, active alerts, baseline prices

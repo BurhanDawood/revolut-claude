@@ -1163,9 +1163,25 @@
   async function apiFetch(method, path, body) {
     const opts = { method, headers: { 'Content-Type': 'application/json' } };
     if (body !== undefined) opts.body = JSON.stringify(body);
-    const res = await fetch(BASE + path, opts);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return res.json();
+    let res;
+    try {
+      res = await fetch(BASE + path, opts);
+    } catch (networkErr) {
+      console.error(`[apiFetch] Network error on ${method} ${path}:`, networkErr.message);
+      throw new Error(`Network error: ${networkErr.message}`);
+    }
+    if (!res.ok) {
+      console.error(`[apiFetch] HTTP ${res.status} on ${method} ${path}`);
+      throw new Error(`HTTP ${res.status}`);
+    }
+    const text = await res.text();
+    if (!text || text.trim() === '') return {};
+    try {
+      return JSON.parse(text);
+    } catch (parseErr) {
+      console.error(`[apiFetch] JSON parse error on ${method} ${path}:`, text.substring(0, 300));
+      throw new Error(`Invalid JSON response from ${path}`);
+    }
   }
 
   // ── Tab switching ─────────────────────────────────────────────────────────
@@ -1974,6 +1990,14 @@
     setLoading(true);
     showError('');
     try {
+      // Quick health check — if this fails, server is down
+      const health = await apiFetch('GET', '/api/health').catch(() => null);
+      if (!health?.ok) {
+        showError('Server unreachable — check Railway deployment');
+        document.getElementById('last-updated').textContent = 'Server offline';
+        setLoading(false);
+        return;
+      }
       await refreshBalances().catch(e => { console.error('refreshBalances failed:', e); });
       const [status, targets, entries, capital, tangem, tsData] = await Promise.all([
         apiFetch('GET', '/api/status').catch(() => ({})),
