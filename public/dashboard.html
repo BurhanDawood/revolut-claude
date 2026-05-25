@@ -628,6 +628,28 @@
     .tangem-loading { color: var(--text-muted); font-size: 0.85rem; }
     .pnl-pos { color: var(--accent); }
     .pnl-neg { color: var(--danger); }
+    /* Activity Feed */
+    .filter-bar { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 14px; }
+    .filter-btn { background: var(--surface); color: var(--text-muted); border: 1px solid #333; padding: 4px 12px; border-radius: 20px; font-size: 0.78rem; cursor: pointer; }
+    .filter-btn.active { background: var(--accent); color: #0d0d0d; border-color: var(--accent); font-weight: 600; }
+    .activity-item { border-left: 3px solid #444; padding: 10px 12px; margin-bottom: 8px; background: var(--surface); border-radius: 4px; transition: border-color 0.15s; }
+    .activity-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; }
+    .activity-action { font-weight: 700; text-transform: uppercase; font-size: 0.72rem; letter-spacing: 0.05em; }
+    .activity-symbol { color: white; font-weight: 700; margin-left: 6px; }
+    .activity-time { color: #666; font-size: 0.72rem; }
+    .activity-details { color: #aaa; font-size: 0.78rem; margin-bottom: 6px; }
+    .activity-reason { display: flex; align-items: center; gap: 8px; }
+    .activity-reason-text { color: #666; font-size: 0.72rem; flex: 1; }
+    .activity-edit-btn { background: none; border: 1px solid #444; color: #888; padding: 2px 8px; border-radius: 4px; font-size: 0.68rem; cursor: pointer; white-space: nowrap; }
+    .activity-edit-btn:hover { border-color: var(--accent); color: var(--accent); }
+    .activity-edit-form { display: none; margin-top: 8px; }
+    .activity-edit-form select, .activity-edit-form textarea { width: 100%; background: #222; color: white; border: 1px solid #444; padding: 5px 8px; border-radius: 4px; font-size: 0.78rem; box-sizing: border-box; }
+    .activity-edit-form select { margin-bottom: 6px; }
+    .activity-edit-form textarea { resize: vertical; }
+    .activity-edit-actions { display: flex; gap: 6px; margin-top: 6px; }
+    .activity-save-btn { background: var(--accent); color: #0d0d0d; border: none; padding: 4px 0; border-radius: 4px; font-size: 0.78rem; font-weight: 600; cursor: pointer; flex: 1; }
+    .activity-cancel-btn { background: #333; color: white; border: none; padding: 4px 12px; border-radius: 4px; font-size: 0.78rem; cursor: pointer; }
+    .pnl-badge { font-size: 0.72rem; margin-left: 8px; font-weight: 600; }
   </style>
 </head>
 <body>
@@ -643,6 +665,7 @@
 <!-- Tab navigation -->
 <nav class="tab-nav">
   <button class="tab-btn active" onclick="switchTab('portfolio')">Portfolio</button>
+  <button class="tab-btn" onclick="switchTab('activity')">📋 Activity</button>
   <button class="tab-btn" onclick="switchTab('journal')">📓 Journal</button>
   <button class="tab-btn" onclick="switchTab('rebalancing')">📊 Rebalancing</button>
   <button class="tab-btn" onclick="switchTab('kraken')">🦑 Kraken</button>
@@ -1113,6 +1136,28 @@
 
 </div><!-- /tab-kraken -->
 
+<!-- ════════════════════════════════════ ACTIVITY TAB ════════════════════ -->
+<div id="tab-activity" class="tab-content">
+
+  <div class="card">
+    <div class="card-title">📋 Activity Feed</div>
+    <p style="color:var(--text-muted);font-size:0.78rem;margin:0 0 14px">
+      All trades, payments, sweeps and transfers. Tap Edit on any entry to correct the reason or type.
+    </p>
+
+    <div class="filter-bar">
+      <button onclick="filterActivity('all', event)" class="filter-btn active">All</button>
+      <button onclick="filterActivity('sell', event)" class="filter-btn">Sells</button>
+      <button onclick="filterActivity('buy', event)" class="filter-btn">Buys</button>
+      <button onclick="filterActivity('payment', event)" class="filter-btn">Payments</button>
+      <button onclick="filterActivity('transfer', event)" class="filter-btn">Transfers</button>
+    </div>
+
+    <div id="activity-feed"><div class="empty-state">Loading…</div></div>
+  </div>
+
+</div><!-- /tab-activity -->
+
 <div class="toast" id="toast"></div>
 
 <script>
@@ -1205,6 +1250,9 @@
     }
     if (tab === 'kraken') {
       loadKrakenTab();
+    }
+    if (tab === 'activity') {
+      loadActivity(currentFilter);
     }
   }
 
@@ -2546,6 +2594,133 @@
         volume !== '?' ? `Preview: ${side.toUpperCase()} ${volume} ${symbol}${priceStr}` : '';
     });
   });
+
+  // ── Activity Feed ─────────────────────────────────────────────────────────
+
+  let currentFilter = 'all';
+
+  const ACTION_COLORS = {
+    buy: '#00ff88', sell: '#ff4444', payment: '#ffaa00',
+    transfer: '#888888', sweep: '#4488ff'
+  };
+
+  function formatQty(qty, symbol) {
+    const q = Math.abs(parseFloat(qty));
+    if (!q) return '';
+    if (q >= 1000000) return (q / 1000000).toFixed(2) + 'M';
+    if (q >= 1000)    return (q / 1000).toFixed(2) + 'K';
+    if (q < 0.001)    return q.toExponential(4);
+    return q.toFixed(4);
+  }
+
+  function formatPriceDisplay(price) {
+    const p = parseFloat(price);
+    if (!p) return '';
+    if (p < 0.000001) return '$' + p.toFixed(10);
+    if (p < 0.0001)   return '$' + p.toFixed(8);
+    if (p < 0.01)     return '$' + p.toFixed(6);
+    if (p < 1)        return '$' + p.toFixed(4);
+    return '$' + p.toFixed(2);
+  }
+
+  async function loadActivity(filter = 'all') {
+    const feedEl = document.getElementById('activity-feed');
+    if (!feedEl) return;
+    feedEl.innerHTML = '<div class="empty-state">Loading…</div>';
+    try {
+      const data = await apiFetch('GET', `/api/activity?limit=50&filter=${filter}`);
+      if (!data.trades?.length) {
+        feedEl.innerHTML = '<p style="color:var(--text-muted);text-align:center;padding:20px">No activity yet</p>';
+        return;
+      }
+      feedEl.innerHTML = data.trades.map(t => {
+        const date    = new Date(t.created_at);
+        const timeStr = date.toLocaleDateString('en-GB', { day: '2-digit', month: 'short' })
+                      + ' ' + date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        const color   = ACTION_COLORS[t.action] || '#888';
+        const pnl     = t.outcome_pnl ? parseFloat(t.outcome_pnl) : null;
+        const pnlBadge = pnl != null
+          ? `<span class="pnl-badge" style="color:${pnl >= 0 ? 'var(--accent)' : 'var(--danger)'}">${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}</span>`
+          : '';
+        const qtyStr  = t.quantity ? formatQty(t.quantity, t.symbol) : '';
+        const priceStr = t.price   ? formatPriceDisplay(t.price)     : '';
+        const valStr  = t.value_usd ? ` = $${parseFloat(t.value_usd).toFixed(2)}` : '';
+        const detailParts = [qtyStr, priceStr ? `@ ${priceStr}` : '', valStr].filter(Boolean);
+        const sourceTag = t.source && t.source !== 'auto_detected'
+          ? `<span style="color:#555;font-size:0.68rem;margin-left:6px">[${t.source.replace('_', ' ')}]</span>`
+          : '';
+
+        return `<div class="activity-item" id="activity-${t.id}" style="border-left-color:${color}">
+          <div class="activity-header">
+            <div>
+              <span class="activity-action" style="color:${color}">${t.action}</span>
+              <span class="activity-symbol">${t.symbol}</span>
+              ${pnlBadge}${sourceTag}
+            </div>
+            <span class="activity-time">${timeStr}</span>
+          </div>
+          ${detailParts.length ? `<div class="activity-details">${detailParts.join(' ')}</div>` : ''}
+          <div class="activity-reason" id="reason-display-${t.id}">
+            <span class="activity-reason-text">📋 ${t.reasoning || '<em>No reason logged</em>'}</span>
+            <button class="activity-edit-btn" onclick="editActivity(${t.id})">Edit</button>
+          </div>
+          <div class="activity-edit-form" id="reason-edit-${t.id}">
+            <select id="action-edit-${t.id}">
+              ${['buy','sell','payment','transfer','sweep'].map(a =>
+                `<option value="${a}"${t.action===a?' selected':''}>${a.charAt(0).toUpperCase()+a.slice(1)}</option>`
+              ).join('')}
+            </select>
+            <textarea id="reason-input-${t.id}" rows="2">${t.reasoning || ''}</textarea>
+            <div class="activity-edit-actions">
+              <button class="activity-save-btn" onclick="saveActivity(${t.id})">Save</button>
+              <button class="activity-cancel-btn" onclick="cancelEdit(${t.id})">Cancel</button>
+            </div>
+          </div>
+        </div>`;
+      }).join('');
+    } catch (e) {
+      console.error('Activity load error:', e);
+      feedEl.innerHTML = `<p style="color:var(--danger);text-align:center;padding:16px">Failed to load: ${e.message}</p>`;
+    }
+  }
+
+  function editActivity(id) {
+    document.getElementById(`reason-display-${id}`).style.display = 'none';
+    document.getElementById(`reason-edit-${id}`).style.display = 'block';
+    document.getElementById(`reason-input-${id}`).focus();
+  }
+
+  function cancelEdit(id) {
+    document.getElementById(`reason-display-${id}`).style.display = 'flex';
+    document.getElementById(`reason-edit-${id}`).style.display = 'none';
+  }
+
+  async function saveActivity(id) {
+    const action    = document.getElementById(`action-edit-${id}`).value;
+    const reasoning = document.getElementById(`reason-input-${id}`).value.trim();
+    const btn       = document.querySelector(`#reason-edit-${id} .activity-save-btn`);
+    btn.textContent = 'Saving…';
+    btn.disabled    = true;
+    try {
+      await apiFetch('PATCH', `/api/activity/${id}`, { action, reasoning });
+      cancelEdit(id);
+      // Update reason text inline without full reload
+      const reasonEl = document.querySelector(`#reason-display-${id} .activity-reason-text`);
+      if (reasonEl) reasonEl.innerHTML = '📋 ' + (reasoning || '<em>No reason logged</em>');
+      showToast('Entry updated', 'success');
+    } catch (e) {
+      showToast('Failed to save: ' + e.message, 'error');
+      btn.textContent = 'Save';
+      btn.disabled    = false;
+    }
+  }
+
+  function filterActivity(filter, ev) {
+    currentFilter = filter;
+    document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+    if (ev?.target) ev.target.classList.add('active');
+    loadActivity(filter);
+  }
 
   // ── Init ──────────────────────────────────────────────────────────────────
 
