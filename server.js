@@ -233,6 +233,8 @@ const ignoredCoins = new Set(); // permanently ignored coins — survives restar
 const activeFixedAlerts = new Map(); // symbol -> intervalId for fixed price target alerts (up)
 const activeDropAlerts  = new Map(); // symbol -> intervalId for fixed floor/drop alerts (down)
 const targetReminderCount = new Map(); // symbol -> number of reminders sent (resets on acknowledge)
+const alertFirstSent = new Map();    // symbol -> timestamp when first pump/drop/swing alert was sent
+const alertReminderSent = new Map(); // symbol -> timestamp when single follow-up reminder was sent
 const activeSecondaryAlerts = {}; // `${symbol}:${price}` -> true — fired secondary rec-based alerts
 const lastBalances = {};
 const customThresholds = {};
@@ -1686,6 +1688,10 @@ async function acknowledgeAlert(symbol) {
     console.log('[ack] Reset reminder count for:', symbol);
   }
 
+  // Clear pump/drop/swing alert timing so they can fire fresh if the move recurs
+  alertFirstSent.delete(symbol);
+  alertReminderSent.delete(symbol);
+
   console.log('[ack] Complete for:', symbol,
     '| Active pump:', alertState.active.size,
     '| Active drop:', activeDropAlerts.size,
@@ -1702,6 +1708,8 @@ async function ignoreCoin(symbol) {
   if (activeDropAlerts.has(symbol)) { clearInterval(activeDropAlerts.get(symbol)); activeDropAlerts.delete(symbol); }
   if (activeFixedAlerts.has(symbol)) { clearInterval(activeFixedAlerts.get(symbol)); activeFixedAlerts.delete(symbol); }
   targetReminderCount.delete(symbol); // reset reminder count on ignore
+  alertFirstSent.delete(symbol);
+  alertReminderSent.delete(symbol);
   try {
     await db.execute('INSERT INTO ignored_coins (symbol) VALUES (?) ON DUPLICATE KEY UPDATE ignored_at = CURRENT_TIMESTAMP', [symbol]);
     console.log('[ignore] Permanently ignored:', symbol);
@@ -1806,6 +1814,10 @@ async function getCurrentPrice(symbol) {
 async function recordDailyPrices() {
   try {
     console.log('Recording daily prices for price_history...');
+    // Reset daily alert tracking so each new day gets a fresh first-alert + reminder cycle
+    alertFirstSent.clear();
+    alertReminderSent.clear();
+    console.log('[alert] Daily alert tracking reset at midnight');
     const balances = await revolutRequest('GET', '/balances');
     const tickerResponse = await revolutRequest('GET', '/tickers');
     const tickerList = Array.isArray(tickerResponse) ? tickerResponse : (tickerResponse.data || []);
@@ -4146,67 +4158,113 @@ async function checkPortfolio() {
 
       // Trigger baseline alert if pumping
       const threshold = customThresholds[symbol] !== undefined ? customThresholds[symbol] : PUMP_THRESHOLD;
-      if (change >= threshold && !alertState.active.has(symbol) && !alertState.acknowledged.has(symbol) && !ignoredCoins.has(symbol)) {
+      if (change >= threshold && !alertState.acknowledged.has(symbol) && !ignoredCoins.has(symbol)) {
         if (hasAgreedStrategy(symbol)) {
           console.log(`[alert] ${symbol} has agreed strategy — suppressing daily pump alert`);
         } else {
         const pct = (change * 100).toFixed(1);
         const coinBase = asset.currency;
-        // FIX 1: Read from pre-pass cache — no extra API call here
+        const now = Date.now();
+        const firstSent = alertFirstSent.get(symbol);
+        const reminderSent = alertReminderSent.get(symbol);
+        const tenMinutes = 10 * 60 * 1000;
+
+        // Reminder already sent — auto-acknowledge and stop
+        if (reminderSent) {
+          console.log(`[alert] ${symbol} pump — reminder already sent, auto-acknowledging`);
+          await acknowledgeAlert(symbol);
+          alertFirstSent.delete(symbol);
+          alertReminderSent.delete(symbol);
+          continue;
+        }
+
+        // First alert already sent — check if 10 minutes have passed
+        if (firstSent) {
+          if (now - firstSent >= tenMinutes) {
+            alertReminderSent.set(symbol, now);
+            console.log('[alert] Sending final pump reminder for:', symbol);
+            await sendTelegram(
+              `🔔 <b>REMINDER — ${coinBase} PUMP ALERT</b>\n\n` +
+              `Still up ${pct}% from baseline today.\n` +
+              `This is the final reminder.\n\n` +
+              `1️⃣ Hold\n2️⃣ Sell advice\n3️⃣ Buy more\n4️⃣ Analyse\n5️⃣ Acknowledge — stop alerts`
+            );
+          }
+          // else: within 10 min window — stay silent
+          continue;
+        }
+
+        // First time firing for this move
+        alertFirstSent.set(symbol, now);
+        alertState.active.set(symbol, true); // signal to other parts of the code that pump alert is live
         const aiRec = alertRecommendations.get(symbol)?.rec || 'HOLD - Monitor the situation closely.';
         const replyMenu = `\n\n1️⃣ Hold — acknowledge & set sell target\n2️⃣ Sell — get sell advice\n3️⃣ Buy more — get buy advice\n4️⃣ Analyse — full analysis\n5️⃣ Ignore — never alert again`;
         const swingPumpHint = `\n\n⚡ SWING SIGNAL: This pump may be your sell opportunity!\nCheck if this is outside normal range — if so, consider taking profits and setting a buy-back alert at ${fmtPriceShort(currentPrice * 0.85)} (-15%)`;
         const trailReminderPump = trailingStops.has(symbol)
           ? `\n\n📈 TREND IS YOUR FRIEND — Trailing stop is protecting your profits. Let it run unless structure breaks!`
           : '';
-        const alertMessage = `📈 <b>${symbol} DAILY PUMP ALERT</b>\n\nBaseline: ${formatPrice(basePrices[symbol])} → Now ${formatPrice(currentPrice)} (+${pct}%)\nYou hold: ${available} ${coinBase}\n\n⚡ RECOMMENDATION: ${aiRec}${swingPumpHint}${trailReminderPump}${replyMenu}`;
+        const alertMessage =
+          `📈 <b>${symbol} DAILY PUMP ALERT</b>\n\n` +
+          `Baseline: ${formatPrice(basePrices[symbol])} → Now ${formatPrice(currentPrice)} (+${pct}%)\n` +
+          `You hold: ${available} ${coinBase}\n\n` +
+          `⚡ RECOMMENDATION: ${aiRec}${swingPumpHint}${trailReminderPump}${replyMenu}\n\n` +
+          `⏰ One reminder in 10 min if no response`;
         await sendTelegram(alertMessage);
         lastAlertContext.set(TELEGRAM_CHAT_ID, { symbol, coinBase, alertType: 'pump' });
-
-        alertState.active.set(symbol, setInterval(async () => {
-          if (alertState.acknowledged.has(symbol)) {
-            console.log('[alert] Pump reminder skipped — recently acknowledged:', symbol);
-            clearInterval(alertState.active.get(symbol));
-            alertState.active.delete(symbol);
-            return;
-          }
-          // FIX 1: Reuse stored recommendation — no new API call
-          const storedRec = alertRecommendations.get(symbol)?.rec || '';
-          const recLine = storedRec ? `\n\n💡 Original recommendation: ${storedRec}` : '';
-          console.log('[alert] Sending pump reminder for:', symbol);
-          await sendTelegram(`⚠️ <b>REMINDER: ${symbol} DAILY PUMP ALERT still active!</b>\n\nStill up ${pct}% from baseline${recLine}\n\nReply 'acknowledge ${coinBase}' to stop`);
-        }, ALERT_INTERVAL_MS));
         } // end else (hasAgreedStrategy pump suppression)
       }
 
       // Trigger baseline drop alert
-      if (change <= -threshold && !activeDropAlerts.has(symbol) && !alertState.acknowledged.has(symbol) && !ignoredCoins.has(symbol)) {
+      if (change <= -threshold && !alertState.acknowledged.has(symbol) && !ignoredCoins.has(symbol)) {
         if (hasAgreedStrategy(symbol)) {
           console.log(`[alert] ${symbol} has agreed strategy — suppressing daily drop alert`);
         } else {
         const pct = (Math.abs(change) * 100).toFixed(1);
         const coinBase = asset.currency;
-        // FIX 1: Read from pre-pass cache — no extra API call here
+        const now = Date.now();
+        const firstSent = alertFirstSent.get(symbol);
+        const reminderSent = alertReminderSent.get(symbol);
+        const tenMinutes = 10 * 60 * 1000;
+
+        // Reminder already sent — auto-acknowledge and stop
+        if (reminderSent) {
+          console.log(`[alert] ${symbol} drop — reminder already sent, auto-acknowledging`);
+          await acknowledgeAlert(symbol);
+          alertFirstSent.delete(symbol);
+          alertReminderSent.delete(symbol);
+          continue;
+        }
+
+        // First alert already sent — check if 10 minutes have passed
+        if (firstSent) {
+          if (now - firstSent >= tenMinutes) {
+            alertReminderSent.set(symbol, now);
+            console.log('[alert] Sending final drop reminder for:', symbol);
+            await sendTelegram(
+              `🔔 <b>REMINDER — ${coinBase} DROP ALERT</b>\n\n` +
+              `Still down ${pct}% from baseline today.\n` +
+              `This is the final reminder.\n\n` +
+              `1️⃣ Hold\n2️⃣ Buy more\n3️⃣ Sell advice\n4️⃣ Analyse\n5️⃣ Acknowledge — stop alerts`
+            );
+          }
+          // else: within 10 min window — stay silent
+          continue;
+        }
+
+        // First time firing for this move
+        alertFirstSent.set(symbol, now);
+        activeDropAlerts.set(symbol, true); // signal to other parts of the code that drop alert is live
         const aiRec = alertRecommendations.get(symbol)?.rec || 'HOLD - Monitor the situation closely.';
         const replyMenu = `\n\n1️⃣ Hold — acknowledge & set buy target\n2️⃣ Buy more — get buy the dip advice\n3️⃣ Sell — get sell advice\n4️⃣ Analyse — full analysis\n5️⃣ Ignore — never alert again`;
         const swingDropHint = `\n\n⚡ SWING SIGNAL: This drop may be your buy opportunity!\nCheck if this is outside normal range — if so, consider buying the dip and setting a sell alert at ${fmtPriceShort(currentPrice * 1.20)} (+20%)`;
-        const alertMessage = `📉 <b>${symbol} DROP ALERT!</b>\n\nBaseline: ${formatPrice(basePrices[symbol])} → Now ${formatPrice(currentPrice)} (-${pct}%)\nYou hold: ${available} ${coinBase}\n\n⚡ RECOMMENDATION: ${aiRec}${swingDropHint}${replyMenu}`;
+        const alertMessage =
+          `📉 <b>${symbol} DROP ALERT!</b>\n\n` +
+          `Baseline: ${formatPrice(basePrices[symbol])} → Now ${formatPrice(currentPrice)} (-${pct}%)\n` +
+          `You hold: ${available} ${coinBase}\n\n` +
+          `⚡ RECOMMENDATION: ${aiRec}${swingDropHint}${replyMenu}\n\n` +
+          `⏰ One reminder in 10 min if no response`;
         await sendTelegram(alertMessage);
         lastAlertContext.set(TELEGRAM_CHAT_ID, { symbol, coinBase, alertType: 'drop' });
-
-        activeDropAlerts.set(symbol, setInterval(async () => {
-          if (alertState.acknowledged.has(symbol)) {
-            console.log('[alert] Drop reminder skipped — recently acknowledged:', symbol);
-            clearInterval(activeDropAlerts.get(symbol));
-            activeDropAlerts.delete(symbol);
-            return;
-          }
-          // FIX 1: Reuse stored recommendation — no new API call
-          const storedRec = alertRecommendations.get(symbol)?.rec || '';
-          const recLine = storedRec ? `\n\n💡 Original recommendation: ${storedRec}` : '';
-          console.log('[alert] Sending drop reminder for:', symbol);
-          await sendTelegram(`⚠️ <b>REMINDER: ${symbol} DROP ALERT still active!</b>\n\nStill down ${pct}% from baseline${recLine}\n\nReply 'acknowledge ${coinBase}' to stop`);
-        }, ALERT_INTERVAL_MS));
         } // end else (hasAgreedStrategy drop suppression)
       }
     }
@@ -4527,6 +4585,40 @@ async function checkPortfolio() {
         const coinBase = asset.currency;
         const available = parseFloat(asset.available);
         const entryPrice = entryPrices.get(symbol);
+
+        // Swing: check one-alert + one-reminder logic (shared Maps with pump/drop alerts)
+        {
+          const swNow = Date.now();
+          const swFirstSent = alertFirstSent.get(symbol);
+          const swReminderSent = alertReminderSent.get(symbol);
+          const tenMin = 10 * 60 * 1000;
+          if (swReminderSent) {
+            console.log(`[swing] ${symbol} — reminder already sent, auto-acknowledging`);
+            await acknowledgeAlert(symbol);
+            alertFirstSent.delete(symbol);
+            alertReminderSent.delete(symbol);
+            continue;
+          }
+          if (swFirstSent) {
+            if (swNow - swFirstSent >= tenMin && !swReminderSent) {
+              alertReminderSent.set(symbol, swNow);
+              const swDir = isExtremePump ? 'PUMP' : 'DIP';
+              const swPct = isExtremePump
+                ? (devFromAvg * 100).toFixed(1)
+                : (Math.abs(devFromAvg) * 100).toFixed(1);
+              const coinBase = asset.currency;
+              await sendTelegram(
+                `🔔 <b>REMINDER — ${coinBase} SWING ${swDir} SIGNAL</b>\n\n` +
+                `Still ${swPct}% outside 7-day average.\n` +
+                `This is the final reminder.\n\n` +
+                `Reply 'acknowledge ${coinBase}' to stop alerts`
+              );
+            }
+            continue; // already alerted this cycle — skip re-send
+          }
+          // First time — record timestamp, let the normal send proceed below
+          alertFirstSent.set(symbol, swNow);
+        }
 
         if (isExtremeDip) {
           extremeAlertsSent[symbol] = true;
