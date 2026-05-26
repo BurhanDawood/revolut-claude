@@ -4065,6 +4065,11 @@ async function checkPortfolio() {
     console.log('Price map sample:', JSON.stringify(Object.entries(priceMap).slice(0, 3)));
 
     // ── USDT balance change detection — debit card payments vs dry powder ────
+    if (portfolioCheckCount === 2) {
+      // Debug log on second check to confirm USDT is visible in balances
+      const usdtDebug = balances.find(b => b.currency === 'USDT' || b.currency === 'USD');
+      console.log('[usdt] Balance check:', JSON.stringify(usdtDebug));
+    }
     if (portfolioCheckCount > 1) {
       try {
         const usdtAsset = balances.find(b => b.currency === 'USDT');
@@ -4078,6 +4083,20 @@ async function checkPortfolio() {
           if (usdtDecrease > 0.50) {
             // Debit card payment — auto-log and deduct capital
             console.log(`[usdt] USDT decreased by $${usdtDecrease.toFixed(2)} — auto-logging as payment`);
+
+            // Dedup guard: don't double-log if already recorded in last 10 min
+            const [recentLog] = await db.execute(
+              `SELECT id FROM trading_journal
+               WHERE symbol = 'USDT' AND action = 'payment'
+               AND source IN ('auto_payment', 'revolut_card')
+               AND created_at > DATE_SUB(NOW(), INTERVAL 10 MINUTE)
+               LIMIT 1`
+            );
+            if (recentLog.length > 0) {
+              console.log('[usdt] Payment already logged in last 10 min — skipping duplicate');
+              previousBalances.set('USDT-USD', currentUSDT);
+            } else {
+
             await db.execute(
               `INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -4094,6 +4113,7 @@ async function checkPortfolio() {
             );
             await sendTelegram(`💳 PAYMENT $${usdtDecrease.toFixed(2)} — capital updated`);
             console.log(`[usdt] Payment auto-logged — capital $${prevCapital.toFixed(2)} → $${newCapital.toFixed(2)}`);
+            } // end dedup guard else
           } else if (usdtIncrease > 0.50) {
             // USDT increased (sweep deposit or manual top-up) — just update snapshot silently
             console.log(`[usdt] USDT increased by $${usdtIncrease.toFixed(2)} — dry powder reserve updated (no journal entry)`);
