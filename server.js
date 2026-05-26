@@ -263,6 +263,8 @@ const alertRecommendations = new Map();      // symbol -> { rec, timestamp } —
 const responseCache = new Map();             // 'type:symbol' -> { response, timestamp } — 30-min cache for sell/buy advice
 const trailingStops = new Map();             // symbol -> { trailPct, peakPrice, stopPrice, entryPrice }
 const trailingStopAlerted = new Map();       // symbol -> timestamp — tracks recently-triggered trailing stops for hold reply
+const pendingAnalysis = new Map();           // symbol -> { type, recommendation, analysis, price, timestamp }
+const analysisRateLimit = new Map();         // symbol -> timestamp of last Claude analysis (rate-limit: 1/hr)
 let pendingKrakenTrade = null;               // { symbol, side, orderType, volume, price, valueUSD } — awaiting Telegram approval
 let pendingRevolutTrade = null;             // { symbol, side, orderType, baseSize, price, valueUSD } — awaiting Telegram approval
 let pendingKrakenTradeReminder = null;      // setInterval handle for Kraken approval reminders
@@ -3700,6 +3702,142 @@ async function getAvailableUSD(exchange) {
   }
 }
 
+// ── Claude Auto-Analysis on Alerts ───────────────────────────────────────────
+
+async function analyseTrailingStopAlert(symbol, currentPrice, peakPrice, trailPct, stopPrice) {
+  const ONE_HOUR = 60 * 60 * 1000;
+  const lastAnalysis = analysisRateLimit.get(symbol);
+  if (lastAnalysis && Date.now() - lastAnalysis < ONE_HOUR) {
+    console.log(`[analysis] Rate limited — ${symbol} analysed ${Math.round((Date.now()-lastAnalysis)/60000)}min ago`);
+    return;
+  }
+  analysisRateLimit.set(symbol, Date.now());
+
+  try {
+    const coinBase = symbol.replace('-USD', '');
+    const entryPrice = entryPrices.get(symbol);
+    const plPct = entryPrice ? ((currentPrice - entryPrice) / entryPrice * 100) : null;
+    const dropFromPeak = ((peakPrice - currentPrice) / peakPrice * 100);
+
+    const [recentTrades] = await db.execute(
+      `SELECT action, price, reasoning, created_at FROM trading_journal WHERE symbol = ? ORDER BY created_at DESC LIMIT 5`,
+      [coinBase]
+    );
+    const [autoRules] = await db.execute(
+      `SELECT rule_type, trigger_price, order_type, volume FROM auto_trade_rules WHERE symbol = ? AND active = 1`,
+      [symbol]
+    );
+    const [profile] = await db.execute(`SELECT preference_key, preference_value FROM trader_profile LIMIT 20`);
+    const profileStr = profile.map(p => `${p.preference_key}: ${p.preference_value}`).join('\n');
+
+    const prompt = `You are analysing a trailing stop alert for a crypto portfolio.
+
+TRAILING STOP ALERT: ${coinBase}
+- Current price: $${currentPrice.toFixed(6)}
+- Peak price: $${peakPrice.toFixed(6)}
+- Drop from peak: -${dropFromPeak.toFixed(1)}%
+- Trailing stop: ${trailPct}%
+- Stop price: $${stopPrice.toFixed(6)}
+- Entry price: ${entryPrice ? '$' + entryPrice.toFixed(6) : 'unknown'}
+- P&L from entry: ${plPct !== null ? (plPct > 0 ? '+' : '') + plPct.toFixed(1) + '%' : 'unknown'}
+
+RECENT TRADE HISTORY:
+${recentTrades.map(t => `${t.action.toUpperCase()} @ $${parseFloat(t.price).toFixed(6)} — ${t.reasoning || 'no reason'}`).join('\n') || 'No recent trades'}
+
+ACTIVE AUTO RULES:
+${autoRules.map(r => `${r.rule_type}: ${r.order_type} @ $${parseFloat(r.trigger_price).toFixed(6)}`).join('\n') || 'None'}
+
+TRADER PROFILE:
+${profileStr}
+
+Analyse this trailing stop alert. Be concise — max 4 lines:
+RECOMMENDATION: [SELL NOW / HOLD AND RESET / WAIT AND WATCH]
+REASON: [one sentence]
+WATCH: [price level to confirm your view]
+CONFIDENCE: [High/Medium/Low]`;
+
+    const msg = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 300,
+      messages: [{ role: 'user', content: prompt }]
+    });
+    const analysis = msg.content?.[0]?.text || 'Analysis unavailable';
+    console.log(`[analysis] ${coinBase} trailing stop: ${msg.usage?.input_tokens}in ${msg.usage?.output_tokens}out`);
+
+    const recMatch = analysis.match(/RECOMMENDATION:\s*(.+)/i);
+    const recommendation = recMatch ? recMatch[1].trim() : 'REVIEW NEEDED';
+
+    pendingAnalysis.set(symbol, { type: 'trailing_stop', recommendation, analysis, price: currentPrice, timestamp: Date.now() });
+    lastAlertContext.set(TELEGRAM_CHAT_ID, { symbol, coinBase, alertType: 'claude_analysis_trailing' });
+
+    await sendTelegram(
+      `🧠 <b>CLAUDE ANALYSIS — ${coinBase}</b>\n\n` +
+      `${analysis}\n\n` +
+      `─────────────────\n` +
+      `1️⃣ Sell now — take profits\n` +
+      `2️⃣ Hold — reset trailing stop\n` +
+      `3️⃣ Wait — monitor next candle\n` +
+      `4️⃣ Buy more — add to position\n` +
+      `5️⃣ Ignore — dismiss alert`
+    );
+  } catch (e) {
+    console.error('[analysis] analyseTrailingStopAlert error:', e.message);
+  }
+}
+
+async function analyseFixedTargetAlert(symbol, currentPrice, target) {
+  const ONE_HOUR = 60 * 60 * 1000;
+  const lastAnalysis = analysisRateLimit.get(symbol);
+  if (lastAnalysis && Date.now() - lastAnalysis < ONE_HOUR) {
+    console.log(`[analysis] Rate limited — ${symbol} analysed ${Math.round((Date.now()-lastAnalysis)/60000)}min ago`);
+    return;
+  }
+  analysisRateLimit.set(symbol, Date.now());
+
+  try {
+    const coinBase = symbol.replace('-USD', '');
+    const entryPrice = entryPrices.get(symbol) || target.entryPrice;
+
+    const prompt = `Price target hit for ${coinBase}.
+Target: $${parseFloat(target.targetPrice).toFixed(6)}
+Current: $${currentPrice.toFixed(6)}
+Entry: ${entryPrice ? '$' + entryPrice.toFixed(6) : 'unknown'}
+Direction: ${target.direction}
+
+Should Bryan take profits now, hold for more, or ladder out partially?
+Be concise — 3 lines max:
+RECOMMENDATION: [SELL/HOLD/LADDER]
+REASON: [one sentence]
+NEXT TARGET: [price if holding]`;
+
+    const msg = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 200,
+      messages: [{ role: 'user', content: prompt }]
+    });
+    const analysis = msg.content?.[0]?.text || 'Analysis unavailable';
+    console.log(`[analysis] ${coinBase} fixed target: ${msg.usage?.input_tokens}in ${msg.usage?.output_tokens}out`);
+
+    pendingAnalysis.set(symbol, { type: 'fixed_target', analysis, price: currentPrice, timestamp: Date.now() });
+    lastAlertContext.set(TELEGRAM_CHAT_ID, { symbol, coinBase, alertType: 'claude_analysis_target' });
+
+    await sendTelegram(
+      `🧠 <b>CLAUDE ANALYSIS — ${coinBase} TARGET HIT</b>\n\n` +
+      `${analysis}\n\n` +
+      `─────────────────\n` +
+      `1️⃣ Sell — take profits\n` +
+      `2️⃣ Hold — wait for more\n` +
+      `3️⃣ Ladder — sell 25% only\n` +
+      `4️⃣ Set new target\n` +
+      `5️⃣ Dismiss`
+    );
+  } catch (e) {
+    console.error('[analysis] analyseFixedTargetAlert error:', e.message);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 async function checkAutoTradeRules(priceMap) {
   try {
     const [rules] = await db.execute('SELECT * FROM auto_trade_rules WHERE active = 1');
@@ -4505,6 +4643,11 @@ async function checkPortfolio() {
         }
         await sendTelegram(alertMessage);
         lastAlertContext.set(TELEGRAM_CHAT_ID, { symbol, coinBase, alertType: 'fixed_target_up' });
+        // Auto-trigger Claude analysis for non-dust, non-claude_rec alerts
+        if (!isDustCoin && !(upNoteData && upNoteData.source === 'claude_rec')) {
+          analyseFixedTargetAlert(symbol, currentPrice, target)
+            .catch(e => console.error('[analysis] fixed target up:', e.message));
+        }
 
         targetReminderCount.set(symbol, 0); // reset counter when first alert fires
         activeFixedAlerts.set(symbol, setInterval(async () => {
@@ -4645,6 +4788,9 @@ async function checkPortfolio() {
       await acknowledgeAlert(symbol); // silence until user responds
       trailingStopAlerted.set(symbol, Date.now()); // track for hold reply handler
       console.log(`[trailing] Stop triggered for ${symbol} at ${fmtPriceShort(currentPrice)} (peak: ${fmtPriceShort(ts.peakPrice)})`);
+      // Auto-trigger Claude analysis — updates lastAlertContext to 'claude_analysis_trailing'
+      analyseTrailingStopAlert(symbol, currentPrice, ts.peakPrice, ts.trailPct, ts.stopPrice)
+        .catch(e => console.error('[analysis] trailing stop:', e.message));
     }
 
     // ── Extreme move detection (swing trade signals) ──────────────────────────
@@ -6518,6 +6664,117 @@ app.post('/telegram-webhook', async (req, res) => {
     // --- Numbered reply shortcuts ---
     const chatIdStr = chatId.toString();
     const numberReply = commandText.match(/^[1-5]$/);
+
+    // --- Claude Analysis numbered responses (1️⃣–5️⃣ after auto-analysis message) ---
+    if (numberReply && lastAlertContext.has(TELEGRAM_CHAT_ID)) {
+      const ctx = lastAlertContext.get(TELEGRAM_CHAT_ID);
+      if (ctx.alertType === 'claude_analysis_trailing' || ctx.alertType === 'claude_analysis_target') {
+        const { symbol, coinBase } = ctx;
+        const pending = pendingAnalysis.get(symbol);
+        const choice = parseInt(numberReply[0]);
+        pendingAnalysis.delete(symbol);
+        lastAlertContext.delete(TELEGRAM_CHAT_ID);
+
+        if (choice === 1) {
+          // SELL NOW — set up 25% ladder sell pending approval
+          const currentPrice = await getCurrentPrice(symbol).catch(() => null);
+          if (!currentPrice) { await sendReply(`⚠️ Could not fetch ${coinBase} price`); return res.status(200).json({ ok: true }); }
+          const balancesNow = await revolutRequest('GET', '/balances').catch(() => []);
+          const asset = balancesNow.find(b => b.currency === coinBase);
+          const currentQty = parseFloat(asset?.available || 0);
+          if (currentQty <= 0) {
+            await sendReply(`⚠️ No ${coinBase} balance found — nothing to sell`);
+            return res.status(200).json({ ok: true });
+          }
+          const sellQty = currentQty * 0.25;
+          const valueUSD = sellQty * currentPrice;
+          pendingRevolutTrade = { symbol, side: 'sell', orderType: 'market', baseSize: sellQty, price: currentPrice, valueUSD, timestamp: Date.now(), source: 'claude_analysis' };
+          await db.execute(
+            `INSERT INTO trade_intentions (symbol, action, reasoning, emotion, expires_at) VALUES (?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL 1 HOUR))`,
+            [symbol, 'sell', `Claude analysis: SELL after trailing stop alert — ladder 25% out`, 'confident']
+          ).catch(() => {});
+          await sendReply(
+            `🔔 <b>SELL REQUEST — ${coinBase}</b>\n\n` +
+            `Selling 25% = ${sellQty.toFixed(4)} ${coinBase}\n` +
+            `@ ~$${currentPrice.toFixed(4)} = ~$${valueUSD.toFixed(2)}\n\n` +
+            `👍 approve  👎 cancel\n` +
+            `Auto-cancels in 12.5 min if no response`
+          );
+          setTimeout(() => startTradeApprovalReminder('revolut'), 2.5 * 60 * 1000);
+
+        } else if (choice === 2) {
+          // HOLD — reset trailing stop from current price
+          const currentPrice = await getCurrentPrice(symbol).catch(() => null);
+          if (currentPrice && trailingStops.has(symbol)) {
+            await setTrailingStop(symbol, trailingStops.get(symbol).trailPct, currentPrice, entryPrices.get(symbol));
+            await sendReply(`✅ Trailing stop reset for ${coinBase}\nNew peak: ${fmtPriceShort(currentPrice)} | Stop: ${fmtPriceShort(trailingStops.get(symbol)?.stopPrice)}`);
+          } else {
+            await sendReply(`✅ ${coinBase} — holding noted`);
+          }
+
+        } else if (choice === 3) {
+          if (pending?.type === 'fixed_target') {
+            // LADDER SELL 25% for fixed target context
+            const currentPrice = await getCurrentPrice(symbol).catch(() => null);
+            if (!currentPrice) { await sendReply(`⚠️ Could not fetch ${coinBase} price`); return res.status(200).json({ ok: true }); }
+            const balancesNow = await revolutRequest('GET', '/balances').catch(() => []);
+            const asset = balancesNow.find(b => b.currency === coinBase);
+            const currentQty = parseFloat(asset?.available || 0);
+            const sellQty = currentQty * 0.25;
+            const valueUSD = sellQty * currentPrice;
+            pendingRevolutTrade = { symbol, side: 'sell', orderType: 'market', baseSize: sellQty, price: currentPrice, valueUSD, timestamp: Date.now(), source: 'claude_analysis' };
+            await sendReply(
+              `🔔 <b>LADDER SELL — ${coinBase}</b>\n\n` +
+              `Selling 25% = ${sellQty.toFixed(4)} ${coinBase}\n` +
+              `@ ~$${currentPrice.toFixed(4)} = ~$${valueUSD.toFixed(2)}\n\n` +
+              `👍 approve  👎 cancel`
+            );
+            setTimeout(() => startTradeApprovalReminder('revolut'), 2.5 * 60 * 1000);
+          } else {
+            // WAIT 30 min for trailing stop context
+            alertState.acknowledged.set(symbol, Date.now());
+            setTimeout(() => { alertState.acknowledged.delete(symbol); }, 30 * 60 * 1000);
+            await sendReply(`⏳ ${coinBase} — watching for 30 min, then alert resumes`);
+          }
+
+        } else if (choice === 4) {
+          // BUY MORE — check USD, set up pending buy
+          const currentPrice = await getCurrentPrice(symbol).catch(() => null);
+          if (!currentPrice) { await sendReply(`⚠️ Could not fetch ${coinBase} price`); return res.status(200).json({ ok: true }); }
+          const balancesNow = await revolutRequest('GET', '/balances').catch(() => []);
+          const usdAsset = balancesNow.find(b => b.currency === 'USD' || b.currency === 'USDT');
+          const availableUSD = parseFloat(usdAsset?.available || 0);
+          if (availableUSD < 10) {
+            await sendReply(`⚠️ Insufficient USD to buy ${coinBase}\nAvailable: $${availableUSD.toFixed(2)} (min $10)`);
+            return res.status(200).json({ ok: true });
+          }
+          const buyUSD = Math.min(availableUSD * 0.50, availableUSD - 5);
+          const buyQty = buyUSD / currentPrice;
+          pendingRevolutTrade = { symbol, side: 'buy', orderType: 'market', baseSize: buyQty, price: currentPrice, valueUSD: buyUSD, timestamp: Date.now(), source: 'claude_analysis' };
+          await db.execute(
+            `INSERT INTO trade_intentions (symbol, action, reasoning, emotion, expires_at) VALUES (?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL 1 HOUR))`,
+            [symbol, 'buy', `Claude analysis: adding to ${coinBase} after trailing stop consolidation signal`, 'confident']
+          ).catch(() => {});
+          await sendReply(
+            `🔔 <b>BUY REQUEST — ${coinBase}</b>\n\n` +
+            `Buying $${buyUSD.toFixed(2)} worth = ${buyQty.toFixed(4)} ${coinBase}\n` +
+            `@ ~$${currentPrice.toFixed(4)}\n` +
+            `Available USD: $${availableUSD.toFixed(2)}\n\n` +
+            `👍 approve  👎 cancel\n` +
+            `Auto-cancels in 12.5 min if no response`
+          );
+          setTimeout(() => startTradeApprovalReminder('revolut'), 2.5 * 60 * 1000);
+
+        } else if (choice === 5) {
+          // IGNORE — dismiss alert
+          await acknowledgeAlert(symbol);
+          await sendReply(`🔕 ${coinBase} alert dismissed`);
+        }
+
+        return res.status(200).json({ ok: true });
+      }
+    }
+
     if (numberReply && lastAlertContext.has(TELEGRAM_CHAT_ID)) {
       const ctx = lastAlertContext.get(TELEGRAM_CHAT_ID);
       const { symbol, coinBase, alertType } = ctx;
@@ -8581,360 +8838,3 @@ Active alerts (coins currently above threshold): ${[...alertState.active.keys()]
               const { oldThreshold, newThreshold } = await setThreshold(symbol, threshold);
               const newPct = (newThreshold * 100).toFixed(1);
               const oldPct = (oldThreshold * 100).toFixed(1);
-              actionTaken = `\n\n✅ Actually saved to server - ${symbol} threshold changed to ${newPct}% (was ${oldPct}%). Old alert cancelled and monitoring restarted fresh from current price.`;
-            }
-            break;
-          }
-        }
-
-        // FIX 5: Log response length before sending
-        const fullReply = reply + (actionTaken || '');
-        console.log('Claude response length:', fullReply.length, 'characters');
-        console.log('Sending in', Math.ceil(fullReply.length / 2500), 'message(s)');
-        console.log('ABOUT TO CHUNK: response length:', fullReply.length);
-        console.log('FULL REPLY STARTS WITH:', fullReply.substring(0, 200).replace(/\n/g, '|'));
-        console.log('CHUNK 1 WILL START WITH:', fullReply.substring(0, 100).replace(/\n/g, '|'));
-
-        // 5s gap after status message so chunks don't collide with it
-        await new Promise(r => setTimeout(r, 5000));
-        await sendTelegramChunked(fullReply);
-      } catch (err) {
-        console.error('Claude AI error:', err.message);
-        clearTimeout(stillResearchingTimer);
-        clearTimeout(stillResearchingTimer2);
-        if (err.message === 'timeout') {
-          // FIX 3: Fallback simpler Claude call — no web search, max 30s, max_tokens 500
-          try {
-            const fallbackPromise = anthropic.messages.create({
-              model: 'claude-sonnet-4-5',
-              max_tokens: 500,
-              system: `You are a crypto advisor. Here are the user's current holdings:\n${holdingsList || 'Portfolio data unavailable'}\nAnswer the user's question briefly in 2-3 sentences. Be direct and actionable.`,
-              messages: [{ role: 'user', content: userMessage }],
-            });
-            const fallbackTimeout = new Promise((_, reject) =>
-              setTimeout(() => reject(new Error('fallback_timeout')), 30000)
-            );
-            const fallbackResponse = await Promise.race([fallbackPromise, fallbackTimeout]);
-            const fallbackBlock = [...fallbackResponse.content].reverse().find(b => b.type === 'text');
-            const fallbackText = fallbackBlock ? fallbackBlock.text : null;
-            if (fallbackText) {
-              await sendReply(`⚡ <b>Quick take</b> (full analysis timed out):\n\n${fallbackText}\n\n<i>Tip: Ask about one specific coin at a time for deeper analysis.</i>`);
-            } else {
-              await sendReply('⏱️ Analysis timed out. Try asking about one specific coin at a time.');
-            }
-          } catch (fallbackErr) {
-            await sendReply('⏱️ Analysis timed out. Try asking about one specific coin at a time.');
-          }
-        } else {
-          await sendReply('❌ Error getting AI response: ' + err.message);
-        }
-      }
-    })();
-
-  } catch (err) {
-    console.error('Telegram webhook error:', err.message);
-    if (!res.headersSent) {
-      res.status(200).json({ ok: true });
-    }
-  }
-});
-
-// GET /telegram-setup — register the webhook URL with Telegram
-app.get('/telegram-setup', async (req, res) => {
-  const token = process.env.TELEGRAM_BOT_TOKEN;
-  const webhookUrl = 'https://revolut-claude-production.up.railway.app/telegram-webhook';
-  const response = await fetch(`https://api.telegram.org/bot${token}/setWebhook?url=${webhookUrl}`);
-  const data = await response.json();
-  res.json(data);
-});
-
-// Seed default trader profile entries if not already set
-const TRADER_PROFILE_DEFAULTS = [
-  { key: 'goal',             value: 'Recover portfolio losses and become a disciplined profitable swing trader' },
-  { key: 'situation',        value: 'Portfolio approximately 50% down from historical highs' },
-  { key: 'style',            value: 'Swing trader - buy dips sell pumps' },
-  { key: 'weakness',         value: 'Past trading decisions led to significant losses - working to improve discipline' },
-  { key: 'strength',         value: 'Good instincts on institutional plays like CC and LINK' },
-  { key: 'core_strategy',    value: 'Swing trader focused on extreme price movements. Buys sudden sharp dips outside normal price pattern. Sells sudden sharp pumps outside normal price pattern. Always looking to capture profit on big moves and buy back on retraces.' },
-  { key: 'buy_signals',      value: 'Sudden extreme drop outside normal trading range — potential dip buy opportunity' },
-  { key: 'sell_signals',     value: 'Sudden extreme pump outside normal trading range — potential profit taking opportunity' },
-  { key: 'retrace_strategy', value: 'After selling a pump, waits for retrace and buys back at lower price to repeat the cycle' },
-  { key: 'loss_protection',  value: 'Will sell to protect against further losses if coin drops significantly with no recovery catalyst' },
-  { key: 'profit_capture',   value: 'Takes profits on substantial rises then looks to buy back on retrace' },
-  { key: 'trading_goal',     value: 'Portfolio recovery from 50% down — building back through disciplined swing trading' },
-  { key: 'risk_approach',    value: 'Protects downside while capturing upside on extreme moves' },
-];
-(async () => {
-  for (const { key, value } of TRADER_PROFILE_DEFAULTS) {
-    await db.execute(
-      'INSERT INTO trader_profile (preference_key, preference_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE preference_key = preference_key',
-      [key, value]
-    ).catch(() => {});
-  }
-  console.log('Trader profile defaults seeded.');
-})();
-
-// GET /api/system/config — read all system config values
-app.get('/api/system/config', async (req, res) => {
-  try {
-    const [rows] = await db.execute(
-      'SELECT config_key, config_value, updated_at FROM system_config ORDER BY config_key'
-    );
-    res.json({ ok: true, config: rows });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// POST /api/system/config — upsert a config key/value
-app.post('/api/system/config', async (req, res) => {
-  try {
-    const { key, value } = req.body;
-    if (!key || !value) return res.status(400).json({ error: 'key and value required' });
-    await db.execute(
-      'INSERT INTO system_config (config_key, config_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)',
-      [key, value]
-    );
-    res.json({ ok: true, key, updated_at: new Date().toISOString() });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// POST /api/revolut/trade — execute a Revolut X trade directly (requires approved: true)
-app.post('/api/revolut/trade', async (req, res) => {
-  try {
-    const { symbol, side, orderType, baseSize, price, approved } = req.body;
-    if (!approved) return res.status(400).json({ error: 'Trade requires approved: true explicitly set' });
-    if (!symbol || !side || !orderType || !baseSize) return res.status(400).json({ error: 'Missing required fields: symbol, side, orderType, baseSize' });
-    const result = await placeRevolutOrder(symbol, side, orderType, parseFloat(baseSize), price ? parseFloat(price) : null);
-    const coinBase = symbol.replace('-USD', '');
-    const executedPrice = price || await getCurrentPrice(symbol).catch(() => 0) || 0;
-    const valueUSD = executedPrice * parseFloat(baseSize);
-    await db.execute(
-      'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      [coinBase, side, executedPrice, baseSize, valueUSD, 'Revolut X trade via dashboard', 'confident']
-    ).catch(e => console.error('[revolut] Journal insert failed:', e.message));
-    await sendTelegram(
-      `✅ <b>REVOLUT X TRADE EXECUTED</b>\n\n` +
-      `${side.toUpperCase()} ${baseSize} ${coinBase} @ ${fmtPriceShort(executedPrice)}\n` +
-      `Value: $${valueUSD.toFixed(2)}\n` +
-      `Order ID: ${result?.client_order_id || 'unknown'}\n\n` +
-      `📝 Journal entry logged automatically`
-    );
-    res.json({ ok: true, result });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// GET /api/debug/link-pairs — temporary diagnostic: all LINK trading pairs on Revolut X
-app.get('/api/debug/link-pairs', async (req, res) => {
-  try {
-    const tickerResponse = await revolutRequest('GET', '/tickers');
-    const tickerList = Array.isArray(tickerResponse) ? tickerResponse : (tickerResponse.data || []);
-    const linkPairs = tickerList.filter(t => t.symbol?.includes('LINK'));
-    res.json({ total_tickers: tickerList.length, link_pairs: linkPairs });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// DELETE /api/cleanup/trade-intentions — one-time cleanup of unmatched intentions
-app.delete('/api/cleanup/trade-intentions', async (req, res) => {
-  try {
-    const [result] = await db.execute(
-      'DELETE FROM trade_intentions WHERE matched_at IS NULL'
-    );
-    res.json({ ok: true, deleted: result.affectedRows });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// ── One-time backfill: sell P&L ──────────────────────────────────────────────
-// POST /api/fix/sell-pnl — calculates realised P&L on existing sell entries missing outcome_pnl
-app.post('/api/fix/sell-pnl', async (req, res) => {
-  try {
-    const [sells] = await db.execute(
-      `SELECT id, symbol, price, quantity
-       FROM trading_journal
-       WHERE action = 'sell'
-       AND outcome_pnl IS NULL
-       AND price IS NOT NULL
-       AND quantity IS NOT NULL`
-    );
-
-    const results = [];
-
-    for (const sell of sells) {
-      const coinBase = sell.symbol.replace('-USD', '');
-      const [entryRows] = await db.execute(
-        'SELECT entry_price FROM entry_prices WHERE symbol = ?',
-        [`${coinBase}-USD`]
-      );
-
-      if (!entryRows.length) {
-        results.push({ id: sell.id, symbol: coinBase, status: 'skipped — no entry price' });
-        continue;
-      }
-
-      const entryPrice    = parseFloat(entryRows[0].entry_price);
-      const salePrice     = parseFloat(sell.price);
-      const qty           = parseFloat(sell.quantity);
-      const realisedPnl   = (salePrice - entryPrice) * qty;
-      const realisedPnlPct = ((salePrice - entryPrice) / entryPrice * 100);
-      const isGain        = realisedPnl > 0;
-
-      await db.execute(
-        `UPDATE trading_journal SET outcome_pnl = ?, outcome_notes = ? WHERE id = ?`,
-        [realisedPnl,
-         `Realised ${isGain ? 'gain' : 'loss'}: ${isGain ? '+' : ''}$${realisedPnl.toFixed(2)} ` +
-         `(${realisedPnlPct.toFixed(1)}%) | Entry: $${entryPrice} | Sale: $${salePrice} | Method: US HIFO`,
-         sell.id]
-      );
-
-      results.push({
-        id: sell.id,
-        symbol: coinBase,
-        entry: entryPrice,
-        sale: salePrice,
-        qty,
-        realised_pnl: realisedPnl.toFixed(2),
-        pnl_pct: realisedPnlPct.toFixed(1),
-        status: isGain ? 'GAIN' : 'LOSS'
-      });
-    }
-
-    const totalGainLoss = results
-      .reduce((s, r) => s + parseFloat(r.realised_pnl || 0), 0)
-      .toFixed(2);
-
-    res.json({ ok: true, processed: results.length, total_gain_loss: totalGainLoss, results });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// ── One-time backfill: payment P&L ───────────────────────────────────────────
-// POST /api/fix/payment-pnl — calculates P&L on existing payment entries missing outcome_pnl
-app.post('/api/fix/payment-pnl', async (req, res) => {
-  try {
-    const [payments] = await db.execute(
-      `SELECT id, symbol, price, quantity, value_usd
-       FROM trading_journal
-       WHERE action = 'payment'
-       AND outcome_pnl IS NULL`
-    );
-
-    const results = [];
-
-    for (const payment of payments) {
-      const coinBase = payment.symbol.replace('-USD', '');
-      const [entryRows] = await db.execute(
-        'SELECT entry_price FROM entry_prices WHERE symbol = ?',
-        [`${coinBase}-USD`]
-      );
-
-      if (!entryRows.length) {
-        results.push({ id: payment.id, symbol: coinBase, status: 'skipped — no entry price' });
-        continue;
-      }
-
-      const entryPrice = parseFloat(entryRows[0].entry_price);
-      const salePrice  = parseFloat(payment.price);
-      const qty        = parseFloat(payment.quantity);
-
-      if (!entryPrice || !salePrice || !qty) {
-        results.push({ id: payment.id, symbol: coinBase, status: 'skipped — missing data' });
-        continue;
-      }
-
-      const gainLoss    = (salePrice - entryPrice) * qty;
-      const gainLossPct = ((salePrice - entryPrice) / entryPrice * 100);
-      const isGain      = gainLoss > 0;
-
-      await db.execute(
-        `UPDATE trading_journal SET outcome_pnl = ?, outcome_notes = ? WHERE id = ?`,
-        [gainLoss,
-         `Payment disposal: ${isGain ? 'GAIN' : 'LOSS'} of $${Math.abs(gainLoss).toFixed(2)} (${gainLossPct.toFixed(1)}%) — taxable event`,
-         payment.id]
-      );
-
-      results.push({
-        id: payment.id,
-        symbol: coinBase,
-        entry: entryPrice,
-        sale: salePrice,
-        qty,
-        gain_loss: gainLoss.toFixed(2),
-        gain_loss_pct: gainLossPct.toFixed(1),
-        status: isGain ? 'GAIN' : 'LOSS'
-      });
-    }
-
-    res.json({ ok: true, processed: results.length, results });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// GET /api/activity — paginated trade feed with optional action filter
-app.get('/api/activity', async (req, res) => {
-  try {
-    const limit  = Math.min(parseInt(req.query.limit) || 50, 200);
-    const filter = req.query.filter || 'all';
-    const params = [limit];
-    const where  = filter !== 'all' ? 'WHERE action = ?' : '';
-    if (filter !== 'all') params.unshift(filter);
-    const [trades] = await db.execute(
-      `SELECT id, symbol, action, price, quantity, value_usd,
-              reasoning, emotion, outcome_pnl,
-              created_at
-       FROM trading_journal
-       ${where}
-       ORDER BY created_at DESC
-       LIMIT ?`,
-      params
-    );
-    res.json({ ok: true, trades, total: trades.length });
-  } catch (e) {
-    console.error('[activity] endpoint error:', e.message);
-    res.status(500).json({ error: e.message, hint: 'Check Railway logs for details' });
-  }
-});
-
-// PATCH /api/activity/:id — edit trade action and/or reasoning
-app.patch('/api/activity/:id', async (req, res) => {
-  try {
-    const id        = parseInt(req.params.id);
-    const { action, reasoning, emotion } = req.body;
-    if (!id || !action) return res.status(400).json({ error: 'id and action required' });
-
-    await db.execute(
-      `UPDATE trading_journal
-       SET action = ?, reasoning = ?, emotion = COALESCE(?, emotion), updated_at = NOW()
-       WHERE id = ?`,
-      [action, reasoning || null, emotion || null, id]
-    );
-
-    // If corrected to 'payment' — deduct from invested capital
-    if (action === 'payment') {
-      const [[trade]] = await db.execute('SELECT value_usd FROM trading_journal WHERE id = ?', [id]);
-      if (trade?.value_usd) {
-        const amount   = Math.abs(parseFloat(trade.value_usd));
-        const newTotal = totalInvestedCapital - amount;
-        await updateInvestedCapital(newTotal, `Payment correction — journal ID ${id}`).catch(e => console.error('[activity] capital update failed:', e.message));
-      }
-    }
-
-    res.json({ ok: true, id });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
