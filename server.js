@@ -3046,21 +3046,18 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
         [journalId, matchedIntention.id]
       );
 
-      const actionLabel = action === 'buy' ? 'BOUGHT' : action === 'sell' ? 'SOLD' : action.toUpperCase();
-      await sendTelegram(
-        `✅ <b>TRADE AUTO-LOGGED — ${coinBase}</b>\n\n` +
-        `${actionLabel} ~${formatTradeQty(absQty)} ${coinBase} @ ${formatPrice(price)} ($${valueUsd.toFixed(2)})${pnlLine}${avgEntryLine}${reentryNote}\n\n` +
-        `Reason: ${matchedIntention.reasoning}\n` +
-        `Emotion: ${matchedIntention.emotion}\n\n` +
-        `🎯 Matched your earlier intention — no input needed!\n` +
-        `🧠 Journal updated automatically`
-      );
+      await sendTelegram(`${action === 'sell' ? '✅' : '🟢'} ${action.toUpperCase()} ${formatTradeQty(absQty)} ${coinBase} @ ${formatPrice(price)} = $${valueUsd.toFixed(2)} 🎯`);
       await updateLearningModel().catch(() => {});
       console.log(`[intention] Match found for ${symbol} — suppressing Telegram question`);
       return; // EXIT: skip pendingTradeContext, journal question, and 30-min timeout
     }
 
-    // No intention matched — ask for context as normal
+    // No intention matched — only ask for context if truly manual (not transfer/payment/USDT)
+    if (action === 'transfer' || action === 'payment' || coinBase === 'USDT') {
+      console.log(`[autoLog] ${symbol} ${action} — non-manual source, skipping context question`);
+      return;
+    }
+
     const actionLabel = action === 'buy' ? 'BOUGHT' : action === 'sell' ? 'SOLD' : action.toUpperCase();
 
     // Check if a trailing stop recently triggered for this symbol (within 2 hours)
@@ -3543,21 +3540,11 @@ async function cascadeRulesAfterTrade(rule, executedPrice) {
     if (isSell) {
       newSellPrice = executedPrice * 1.10; // 10% higher — ride the trend
       newBuyPrice  = executedPrice * 0.92; // 8% retrace — buy back on dip
-      cascadeMsg =
-        `🔄 <b>CASCADE RULES UPDATED</b>\n\n` +
-        `Sold ${rule.volume} ${coinBase} @ $${executedPrice.toFixed(2)}\n` +
-        `New sell target: $${newSellPrice.toFixed(2)} (+10%)\n` +
-        `New buy back: $${newBuyPrice.toFixed(2)} (-8% retrace)\n` +
-        `Riding the trend! 📈`;
+      cascadeMsg = `🔁 CASCADE — ${coinBase}\nNext sell: ${formatPrice(newSellPrice)} / Buy-back: ${formatPrice(newBuyPrice)}`;
     } else {
       newBuyPrice  = executedPrice * 0.95; // 5% deeper — add on continued dip
       newSellPrice = executedPrice * 1.08; // 8% bounce — sell the recovery
-      cascadeMsg =
-        `🔄 <b>CASCADE RULES UPDATED</b>\n\n` +
-        `Bought ${rule.volume} ${coinBase} @ $${executedPrice.toFixed(2)}\n` +
-        `New buy target: $${newBuyPrice.toFixed(2)} (-5% deeper dip)\n` +
-        `New sell target: $${newSellPrice.toFixed(2)} (+8% bounce)\n` +
-        `Buying the dip! 📉`;
+      cascadeMsg = `🔁 CASCADE — ${coinBase}\nNext sell: ${formatPrice(newSellPrice)} / Buy-back: ${formatPrice(newBuyPrice)}`;
     }
 
     // Fetch current active rules for this symbol
@@ -3945,38 +3932,24 @@ async function checkAutoTradeRules(priceMap) {
             ? `\n💵 Remaining cash: $${remainingUSD.toFixed(2)}${remainingUSD < 20 ? '\n⚠️ Cash running low — consider topping up' : ''}`
             : '';
 
-          // Ringfenced buy-back — send dedicated notification and clear the reserved amount
+          // Clear ringfenced reservation if applicable
           const isRingfenced = rule.order_type === 'buy' && rule.proceeds_reserved > 0;
           if (isRingfenced) {
             await db.execute('UPDATE auto_trade_rules SET proceeds_reserved = NULL WHERE id = ?', [rule.id]);
-            await sendTelegram(
-              `🔄 <b>RINGFENCED BUY-BACK EXECUTED — ${exchange.toUpperCase()}</b>\n\n` +
-              `${coinBase} @ ${formatPrice(currentPrice)}\n` +
-              `Bought: ${formatTradeQty(resolvedVolume)} ${coinBase}\n` +
-              `Value: $${valueUsd.toFixed(2)}\n` +
-              `Rule: ${rule.rule_type}\n` +
-              `Trigger: ${rule.direction} ${formatPrice(triggerPrice)}\n` +
-              `Order ID: ${orderId}\n\n` +
-              `💰 Source: Ringfenced from paired sell ✅\n` +
-              `🏦 General balance: Untouched ✅\n` +
-              cashLine +
-              `\n📊 Cascade cycle complete — self-funded\n` +
-              `📝 Journal logged automatically`
-            );
-          } else {
-            await sendTelegram(
-              `🤖 <b>AUTO TRADE EXECUTED — ${exchange.toUpperCase()}</b>\n\n` +
-              `${rule.order_type.toUpperCase()} ${formatTradeQty(resolvedVolume)} ${coinBase} @ ${formatPrice(currentPrice)}\n` +
-              `Value: $${valueUsd.toFixed(2)}\n` +
-              `Rule: ${rule.rule_type}${volLabel}\n` +
-              `Trigger: ${rule.direction} ${formatPrice(triggerPrice)}\n` +
-              `Order ID: ${orderId}\n` +
-              cashLine +
-              `\n📊 Cascade rules updated automatically\n` +
-              sweepLine +
-              `📝 Journal logged automatically`
-            );
           }
+
+          // One-line execution confirmation
+          const exchIcon  = exchange === 'revolut' ? '🔄' : '🦑';
+          const tradeIcon = rule.rule_type === 'stop_loss' ? '🛑' : rule.order_type === 'sell' ? '✅' : '🟢';
+          const actionTag = rule.rule_type === 'stop_loss'
+            ? `STOP LOSS`
+            : `AUTO ${rule.order_type.toUpperCase()}`;
+          const cashSuffix = remainingUSD !== null && remainingUSD < 20
+            ? ` ⚠️ $${remainingUSD.toFixed(0)} cash left`
+            : '';
+          await sendTelegram(
+            `${tradeIcon} ${actionTag} ${formatTradeQty(resolvedVolume)} ${coinBase} @ ${formatPrice(currentPrice)} = $${valueUsd.toFixed(2)} ${exchIcon}${cashSuffix}`
+          );
 
           // Part 3: Low cash warning — once per day per exchange after any trade
           if (remainingUSD !== null && remainingUSD < 20) {
@@ -4119,13 +4092,7 @@ async function checkPortfolio() {
               'INSERT INTO balance_snapshots (symbol, quantity) VALUES (?, ?) ON DUPLICATE KEY UPDATE quantity = VALUES(quantity)',
               ['USDT-USD', currentUSDT]
             );
-            await sendTelegram(
-              `💳 <b>DEBIT CARD PAYMENT DETECTED</b>\n\n` +
-              `USDT spent: $${usdtDecrease.toFixed(2)}\n` +
-              `Auto-logged as payment ✅\n` +
-              `Capital updated: $${prevCapital.toFixed(2)} → $${newCapital.toFixed(2)}\n\n` +
-              `No action needed.`
-            );
+            await sendTelegram(`💳 PAYMENT $${usdtDecrease.toFixed(2)} — capital updated`);
             console.log(`[usdt] Payment auto-logged — capital $${prevCapital.toFixed(2)} → $${newCapital.toFixed(2)}`);
           } else if (usdtIncrease > 0.50) {
             // USDT increased (sweep deposit or manual top-up) — just update snapshot silently
@@ -7160,13 +7127,7 @@ app.post('/telegram-webhook', async (req, res) => {
                 .catch(e => console.error('[tranches] Reduce failed:', e.message));
             }
 
-            await sendTelegram(
-              `✅ <b>KRAKEN TRADE EXECUTED</b>\n\n` +
-              `${t.side.toUpperCase()} ${t.volume} ${coinBase} @ ${fmtPriceShort(t.price)}\n` +
-              `Value: $${t.valueUSD?.toFixed(2)}\n` +
-              `Order ID: ${result?.txid?.[0] || 'unknown'}\n\n` +
-              `📝 Journal entry logged automatically`
-            );
+            await sendTelegram(`${t.side === 'sell' ? '✅' : '🟢'} MCP ${t.side.toUpperCase()} ${formatTradeQty(t.volume)} ${coinBase} @ ${formatPrice(t.price)} = $${t.valueUSD?.toFixed(2)} 🦑 ✓`);
           } catch (e) {
             await sendTelegram(`❌ Kraken trade failed: ${e.message}`);
           }
@@ -7226,14 +7187,7 @@ app.post('/telegram-webhook', async (req, res) => {
                 .catch(e => console.error('[tranches] Reduce failed:', e.message));
             }
 
-            await sendTelegram(
-              `✅ <b>REVOLUT X TRADE EXECUTED</b>\n\n` +
-              `${t.side.toUpperCase()} ${formatTradeQty(t.baseSize)} ${coinBase} @ ${fmtPriceShort(executedPrice)}\n` +
-              `Value: ~$${valueUSD.toFixed(2)}\n` +
-              `Order ID: ${result?.client_order_id || 'unknown'}\n\n` +
-              `📝 Journal logged automatically` +
-              (matchedIntention ? '\n🎯 Matched your earlier intention!' : '')
-            );
+            await sendTelegram(`${t.side === 'sell' ? '✅' : '🟢'} MCP ${t.side.toUpperCase()} ${formatTradeQty(t.baseSize)} ${coinBase} @ ${formatPrice(executedPrice)} = $${valueUSD.toFixed(2)} 🔄 ✓`);
 
             // USDT sweep — convert a % of sell proceeds to USDT for dry-powder reserves
             if (t.side.toLowerCase() === 'sell') {
