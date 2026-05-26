@@ -4082,7 +4082,35 @@ async function checkPortfolio() {
 
           if (usdtDecrease > 0.50) {
             // Debit card payment — auto-log and deduct capital
-            console.log(`[usdt] USDT decreased by $${usdtDecrease.toFixed(2)} — auto-logging as payment`);
+            console.log(`[usdt] USDT decreased by $${usdtDecrease.toFixed(2)} — checking if swap or real payment`);
+
+            // Swap guard: if a crypto balance increased by ~same USD value in this cycle,
+            // it's a USDT→crypto internal swap — not a card payment
+            let isCryptoSwap = false;
+            for (const asset of balances) {
+              if (!asset.currency || SKIP_CURRENCIES.includes(asset.currency)) continue;
+              const sym = `${asset.currency}-USD`;
+              const prevQty = previousBalances.get(sym) || 0;
+              const currQty = parseFloat(asset.available || 0);
+              const increase = currQty - prevQty;
+              if (increase <= 0) continue;
+              const coinPrice = priceMap[sym] || 0;
+              const increaseUSD = increase * coinPrice;
+              if (increaseUSD > 0 && Math.abs(increaseUSD - usdtDecrease) / usdtDecrease < 0.10) {
+                isCryptoSwap = true;
+                console.log(`[usdt] USDT decrease matched ${sym} increase of $${increaseUSD.toFixed(2)} — internal swap, not payment`);
+                break;
+              }
+            }
+
+            if (isCryptoSwap) {
+              // Just update the snapshot — the crypto buy will be logged by autoLogTrade
+              previousBalances.set('USDT-USD', currentUSDT);
+              await db.execute(
+                'INSERT INTO balance_snapshots (symbol, quantity) VALUES (?, ?) ON DUPLICATE KEY UPDATE quantity = VALUES(quantity)',
+                ['USDT-USD', currentUSDT]
+              ).catch(() => {});
+            } else {
 
             // Dedup guard: don't double-log if already recorded in last 10 min
             const [recentLog] = await db.execute(
@@ -4114,6 +4142,7 @@ async function checkPortfolio() {
             await sendTelegram(`💳 PAYMENT $${usdtDecrease.toFixed(2)} — capital updated`);
             console.log(`[usdt] Payment auto-logged — capital $${prevCapital.toFixed(2)} → $${newCapital.toFixed(2)}`);
             } // end dedup guard else
+            } // end swap guard else
           } else if (usdtIncrease > 0.50) {
             // USDT increased (sweep deposit or manual top-up) — just update snapshot silently
             console.log(`[usdt] USDT increased by $${usdtIncrease.toFixed(2)} — dry powder reserve updated (no journal entry)`);
@@ -5935,6 +5964,12 @@ function createMcpServer() {
           const [existing] = await db.execute('SELECT * FROM auto_trade_rules WHERE id = ?', [rule_id]);
           if (existing.length === 0) throw new Error(`Rule ${rule_id} not found`);
           await db.execute('DELETE FROM auto_trade_rules WHERE id = ?', [rule_id]);
+          // No in-memory rule cache exists — checkAutoTradeRules always reads DB fresh.
+          // Clear any related target-reminder state for this symbol just in case.
+          if (existing[0]?.symbol) {
+            targetReminderCount.delete(existing[0].symbol);
+          }
+          console.log(`[rules] Rule ${rule_id} removed from DB — will be absent on next checkAutoTradeRules cycle`);
           await sendTelegram(
             `🗑 Auto rule [${rule_id}] removed:\n` +
             `${existing[0].order_type.toUpperCase()} ` +
@@ -5945,6 +5980,7 @@ function createMcpServer() {
         }
         if (action === 'disable' && rule_id) {
           await db.execute('UPDATE auto_trade_rules SET active = 0 WHERE id = ?', [rule_id]);
+          console.log(`[rules] Rule ${rule_id} disabled — will be skipped on next checkAutoTradeRules cycle`);
           return { content: [{ type: 'text', text: JSON.stringify({ ok: true, disabled: rule_id }) }] };
         }
         if (action === 'enable' && rule_id) {
@@ -8846,59 +8882,4 @@ app.post('/api/fix/payment-pnl', async (req, res) => {
 // GET /api/activity — paginated trade feed with optional action filter
 app.get('/api/activity', async (req, res) => {
   try {
-    const limit  = Math.min(parseInt(req.query.limit) || 50, 200);
-    const filter = req.query.filter || 'all';
-    const params = [limit];
-    const where  = filter !== 'all' ? 'WHERE action = ?' : '';
-    if (filter !== 'all') params.unshift(filter);
-    const [trades] = await db.execute(
-      `SELECT id, symbol, action, price, quantity, value_usd,
-              reasoning, emotion, outcome_pnl, outcome_notes,
-              created_at
-       FROM trading_journal
-       ${where}
-       ORDER BY created_at DESC
-       LIMIT ?`,
-      params
-    );
-    res.json({ ok: true, trades, total: trades.length });
-  } catch (e) {
-    console.error('[activity] endpoint error:', e.message);
-    res.status(500).json({ error: e.message, hint: 'Check Railway logs for details' });
-  }
-});
-
-// PATCH /api/activity/:id — edit trade action and/or reasoning
-app.patch('/api/activity/:id', async (req, res) => {
-  try {
-    const id        = parseInt(req.params.id);
-    const { action, reasoning, emotion } = req.body;
-    if (!id || !action) return res.status(400).json({ error: 'id and action required' });
-
-    await db.execute(
-      `UPDATE trading_journal
-       SET action = ?, reasoning = ?, emotion = COALESCE(?, emotion), updated_at = NOW()
-       WHERE id = ?`,
-      [action, reasoning || null, emotion || null, id]
-    );
-
-    // If corrected to 'payment' — deduct from invested capital
-    if (action === 'payment') {
-      const [[trade]] = await db.execute('SELECT value_usd FROM trading_journal WHERE id = ?', [id]);
-      if (trade?.value_usd) {
-        const amount   = Math.abs(parseFloat(trade.value_usd));
-        const newTotal = totalInvestedCapital - amount;
-        await updateInvestedCapital(newTotal, `Payment correction — journal ID ${id}`).catch(e => console.error('[activity] capital update failed:', e.message));
-      }
-    }
-
-    res.json({ ok: true, id });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+    const limit  = Math.min(par
