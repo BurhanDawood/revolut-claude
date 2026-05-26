@@ -8882,4 +8882,59 @@ app.post('/api/fix/payment-pnl', async (req, res) => {
 // GET /api/activity — paginated trade feed with optional action filter
 app.get('/api/activity', async (req, res) => {
   try {
-    const limit  = Math.min(par
+    const limit  = Math.min(parseInt(req.query.limit) || 50, 200);
+    const filter = req.query.filter || 'all';
+    const params = [limit];
+    const where  = filter !== 'all' ? 'WHERE action = ?' : '';
+    if (filter !== 'all') params.unshift(filter);
+    const [trades] = await db.execute(
+      `SELECT id, symbol, action, price, quantity, value_usd,
+              reasoning, emotion, outcome_pnl,
+              created_at
+       FROM trading_journal
+       ${where}
+       ORDER BY created_at DESC
+       LIMIT ?`,
+      params
+    );
+    res.json({ ok: true, trades, total: trades.length });
+  } catch (e) {
+    console.error('[activity] endpoint error:', e.message);
+    res.status(500).json({ error: e.message, hint: 'Check Railway logs for details' });
+  }
+});
+
+// PATCH /api/activity/:id — edit trade action and/or reasoning
+app.patch('/api/activity/:id', async (req, res) => {
+  try {
+    const id        = parseInt(req.params.id);
+    const { action, reasoning, emotion } = req.body;
+    if (!id || !action) return res.status(400).json({ error: 'id and action required' });
+
+    await db.execute(
+      `UPDATE trading_journal
+       SET action = ?, reasoning = ?, emotion = COALESCE(?, emotion), updated_at = NOW()
+       WHERE id = ?`,
+      [action, reasoning || null, emotion || null, id]
+    );
+
+    // If corrected to 'payment' — deduct from invested capital
+    if (action === 'payment') {
+      const [[trade]] = await db.execute('SELECT value_usd FROM trading_journal WHERE id = ?', [id]);
+      if (trade?.value_usd) {
+        const amount   = Math.abs(parseFloat(trade.value_usd));
+        const newTotal = totalInvestedCapital - amount;
+        await updateInvestedCapital(newTotal, `Payment correction — journal ID ${id}`).catch(e => console.error('[activity] capital update failed:', e.message));
+      }
+    }
+
+    res.json({ ok: true, id });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
