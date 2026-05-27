@@ -698,6 +698,18 @@ await safeAddColumn('price_targets',    'direction',       "VARCHAR(4) NOT NULL 
 await safeAddColumn('price_targets',    'note',            'TEXT');
 await safeAddColumn('custom_thresholds','acknowledged_until','TIMESTAMP NULL DEFAULT NULL');
 
+// Track Claude API usage and costs
+await db.execute(`CREATE TABLE IF NOT EXISTS claude_api_calls (
+  id             INT AUTO_INCREMENT PRIMARY KEY,
+  reason         VARCHAR(100) NOT NULL,
+  model          VARCHAR(60) NOT NULL,
+  input_tokens   INT DEFAULT 0,
+  output_tokens  INT DEFAULT 0,
+  cache_read_tokens INT DEFAULT 0,
+  estimated_cost DECIMAL(10,6) DEFAULT 0,
+  created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)`).catch(e => console.error('[migration] claude_api_calls:', e.message));
+
 // Track manually deleted auto-rules so seeding logic never recreates them
 await db.execute(`CREATE TABLE IF NOT EXISTS deleted_rules_log (
   id          INT AUTO_INCREMENT PRIMARY KEY,
@@ -1585,6 +1597,28 @@ async function getKrakenPriceForSymbol(symbol) {
   return null;
 }
 
+// ── Claude API cost logger ──────────────────────────────────────────────────
+// Pricing (per million tokens): Sonnet $3 in / $15 out; Haiku $0.80 in / $4 out; cache read ~10% of input price
+function claudeCost(model, inputTokens, outputTokens, cacheReadTokens = 0) {
+  const isHaiku   = model.includes('haiku');
+  const inPrice   = isHaiku ? 0.0000008  : 0.000003;
+  const outPrice  = isHaiku ? 0.000004   : 0.000015;
+  const cachePrice = isHaiku ? 0.00000008 : 0.0000003;
+  return inputTokens * inPrice + outputTokens * outPrice + cacheReadTokens * cachePrice;
+}
+
+async function logClaudeCall(reason, model, usage) {
+  const inputTokens     = usage?.input_tokens       || 0;
+  const outputTokens    = usage?.output_tokens      || 0;
+  const cacheReadTokens = usage?.cache_read_input_tokens || 0;
+  const cost            = claudeCost(model, inputTokens, outputTokens, cacheReadTokens);
+  console.log('CLAUDE API CALL:', { reason, model, inputTokens, outputTokens, cacheReadTokens, estimatedCost: cost.toFixed(6) });
+  await db.execute(
+    'INSERT INTO claude_api_calls (reason, model, input_tokens, output_tokens, cache_read_tokens, estimated_cost) VALUES (?, ?, ?, ?, ?, ?)',
+    [reason, model, inputTokens, outputTokens, cacheReadTokens, cost.toFixed(6)]
+  ).catch(e => console.warn('[claude_log]', e.message));
+}
+
 // FIX 3: Dust rule — skip API for positions worth < $5
 function getDustRecommendation(direction) {
   return direction === 'down'
@@ -1608,14 +1642,7 @@ async function getQuickAiRecommendation(symbol, changePct, currentPrice, directi
         content: `In 2-3 sentences max, give a quick trading recommendation for ${symbol} which is ${dirText}. Consider current market conditions. Start with ${actionOptions} in bold.`
       }]
     });
-    // FIX 7: Log API call cost
-    console.log('CLAUDE API CALL:', {
-      reason,
-      symbol,
-      inputTokens:   response.usage?.input_tokens  || 0,
-      outputTokens:  response.usage?.output_tokens || 0,
-      estimatedCost: (((response.usage?.input_tokens || 0) * 0.000003) + ((response.usage?.output_tokens || 0) * 0.000015)).toFixed(6)
-    });
+    await logClaudeCall(reason, response.model || 'claude-sonnet-4-5', response.usage);
     const textBlock = response.content.find(b => b.type === 'text');
     return textBlock ? textBlock.text : 'HOLD - Monitor the situation closely.';
   } catch (e) {
@@ -1635,15 +1662,14 @@ async function batchGetRecommendations(alerts) {
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-5',
       max_tokens: Math.min(80 * alerts.length, 400),
-      messages: [{ role: 'user', content: `Quick trading recommendations for these alerts:\n${lines}\n\nFor each give ONE short line — HOLD/SELL/BUY + brief reason.\nFormat exactly:\n${format}` }]
+      system: [{
+        type: 'text',
+        text: 'You are a concise crypto trading assistant. For each alert give ONE short line — HOLD/SELL/BUY + brief reason. Use the exact format provided by the user.',
+        cache_control: { type: 'ephemeral' }
+      }],
+      messages: [{ role: 'user', content: `Quick trading recommendations for these alerts:\n${lines}\n\nFormat exactly:\n${format}` }]
     });
-    // FIX 7: cost log
-    console.log('CLAUDE API CALL:', {
-      reason: `batch alert recommendations (${alerts.length} coins)`,
-      inputTokens:   response.usage?.input_tokens  || 0,
-      outputTokens:  response.usage?.output_tokens || 0,
-      estimatedCost: (((response.usage?.input_tokens || 0) * 0.000003) + ((response.usage?.output_tokens || 0) * 0.000015)).toFixed(6)
-    });
+    await logClaudeCall(`batch alert recommendations (${alerts.length} coins)`, response.model || 'claude-sonnet-4-5', response.usage);
     const text = response.content.find(b => b.type === 'text')?.text || '';
     for (const a of alerts) {
       const match = text.match(new RegExp(`${a.coinBase}:\\s*([^\\n]+)`, 'i'));
@@ -2194,13 +2220,7 @@ Format EXACTLY like this:
 Keep total under 2000 characters. No long paragraphs. Be concise.`
       }]
     });
-    // FIX 7: Log morning briefing API cost
-    console.log('CLAUDE API CALL:', {
-      reason: 'morning briefing message 2',
-      inputTokens:   claudeResponse.usage?.input_tokens  || 0,
-      outputTokens:  claudeResponse.usage?.output_tokens || 0,
-      estimatedCost: (((claudeResponse.usage?.input_tokens || 0) * 0.000003) + ((claudeResponse.usage?.output_tokens || 0) * 0.000015)).toFixed(6)
-    });
+    await logClaudeCall('morning briefing', claudeResponse.model || 'claude-sonnet-4-5', claudeResponse.usage);
 
     const lastTextBlock = [...claudeResponse.content].reverse().find(b => b.type === 'text');
     const msg2 = lastTextBlock ? lastTextBlock.text.trim() : '📰 Market intelligence unavailable — check crypto news manually.';
@@ -2613,23 +2633,39 @@ async function checkMacroNews() {
     const totalSignificant = significantHoldings.reduce((s, h) => s + h.valueUSD, 0);
 
     const claudeResponse = await anthropic.messages.create({
-      model: 'claude-sonnet-4-5',
+      model: 'claude-haiku-4-5-20251001',
       max_tokens: 600,
-      tools: [{ type: "web_search_20250305", name: "web_search" }],
+      system: [{
+        type: 'text',
+        text: `You are a macro news screener for a crypto portfolio. Analyse whether news could significantly impact crypto holdings.
+
+Your holdings to monitor: BTC, ETH, SOL, LINK, NEAR, CC, ENA, JTO, PEPE, INJ, FET, RENDER, AVAX.
+
+Only flag HIGH or MEDIUM impact events. Ignore minor price moves already reflected in markets.
+
+High-impact triggers: regulation/bans, major exchange hacks, institutional ETF/custody news, Fed rate decisions, geopolitical escalation, protocol failures.
+
+Start your response with EXACTLY one of:
+🚨 MACRO ALERT
+✅ NO SIGNIFICANT ALERTS
+
+If alert, for each issue:
+- What happened
+- Which coins affected and direction (bullish/bearish)
+- Recommended action (1 sentence)
+- Urgency: act now / watch / FYI
+
+Keep total response under 1800 characters.`,
+        cache_control: { type: 'ephemeral' }
+      }],
       messages: [{
         role: 'user',
-        content: `The user holds these crypto assets worth over $300: ${holdingsList}. Total: $${totalSignificant.toFixed(0)}.\n\nRSS headlines just fetched (scan for relevance): ${newsSnippet}\n\nSearch for the latest news on: ${foundKeywords.slice(0, 5).join(', ')}.\n\nAnalyse if any current news could significantly impact the user's holdings. Rate each affected coin HIGH/MEDIUM/LOW. Only report HIGH or MEDIUM impacts.\n\nStart your response with EXACTLY one of:\n🚨 MACRO ALERT\n✅ NO SIGNIFICANT ALERTS\n\nIf alert, for each issue:\n- What happened\n- Which coins affected and direction (bullish/bearish)\n- Recommended action (1 sentence)\n- Urgency: act now / watch / FYI\n\nKeep total response under 1800 characters.`
+        content: `Holdings: ${holdingsList}. Total: $${totalSignificant.toFixed(0)}.\n\nRSS headlines: ${newsSnippet}\n\nKeywords triggering this scan: ${foundKeywords.slice(0, 5).join(', ')}.\n\nAnalyse for significant portfolio impact.`
       }]
     });
 
     lastClaudeCallTime = Date.now();
-    // FIX 7: Log macro news API cost
-    console.log('CLAUDE API CALL:', {
-      reason: 'macro news analysis',
-      inputTokens:   claudeResponse.usage?.input_tokens  || 0,
-      outputTokens:  claudeResponse.usage?.output_tokens || 0,
-      estimatedCost: (((claudeResponse.usage?.input_tokens || 0) * 0.000003) + ((claudeResponse.usage?.output_tokens || 0) * 0.000015)).toFixed(6)
-    });
+    await logClaudeCall('macro news analysis', claudeResponse.model || 'claude-haiku-4-5-20251001', claudeResponse.usage);
     const lastTextBlock = [...claudeResponse.content].reverse().find(b => b.type === 'text');
     const analysis = lastTextBlock ? lastTextBlock.text.trim() : '✅ NO SIGNIFICANT ALERTS';
     console.log('Claude macro response:', analysis.substring(0, 300));
@@ -3866,9 +3902,22 @@ async function analyseTrailingStopAlert(symbol, currentPrice, peakPrice, trailPc
     const [profile] = await db.execute(`SELECT preference_key, preference_value FROM trader_profile LIMIT 20`);
     const profileStr = profile.map(p => `${p.preference_key}: ${p.preference_value}`).join('\n');
 
-    const prompt = `You are analysing a trailing stop alert for a crypto portfolio.
+    const traderSystemPrompt = `You are a crypto trading analyst for a swing trader. Strategy:
+- Buys sharp dips, sells sharp pumps
+- Uses trailing stops to protect profits
+- Never sells 100% — always keeps a moon bag
+- Looks for Market Structure Shifts (MSS): break of previous Higher Low after failing to make new Higher High
 
-TRAILING STOP ALERT: ${coinBase}
+Trader profile:
+${profileStr}
+
+Respond in exactly 4 lines:
+RECOMMENDATION: [SELL NOW / HOLD AND RESET / WAIT AND WATCH]
+REASON: [one sentence]
+WATCH: [key price level]
+CONFIDENCE: [High/Medium/Low]`;
+
+    const dynamicContent = `TRAILING STOP ALERT: ${coinBase}
 - Exchange: ${exchange === 'kraken' ? 'Kraken' : 'Revolut X'}
 - Current price: $${currentPrice.toFixed(6)}
 - Peak price: $${peakPrice.toFixed(6)}
@@ -3878,28 +3927,24 @@ TRAILING STOP ALERT: ${coinBase}
 - Entry price: ${entryPrice ? '$' + entryPrice.toFixed(6) : 'unknown'}
 - P&L from entry: ${plPct !== null ? (plPct > 0 ? '+' : '') + plPct.toFixed(1) + '%' : 'unknown'}
 
-RECENT TRADE HISTORY:
+RECENT TRADES:
 ${recentTrades.map(t => `${t.action.toUpperCase()} @ $${parseFloat(t.price).toFixed(6)} — ${t.reasoning || 'no reason'}`).join('\n') || 'No recent trades'}
 
 ACTIVE AUTO RULES:
-${autoRules.map(r => `${r.rule_type}: ${r.order_type} @ $${parseFloat(r.trigger_price).toFixed(6)}`).join('\n') || 'None'}
-
-TRADER PROFILE:
-${profileStr}
-
-Analyse this trailing stop alert. Be concise — max 4 lines:
-RECOMMENDATION: [SELL NOW / HOLD AND RESET / WAIT AND WATCH]
-REASON: [one sentence]
-WATCH: [price level to confirm your view]
-CONFIDENCE: [High/Medium/Low]`;
+${autoRules.map(r => `${r.rule_type}: ${r.order_type} @ $${parseFloat(r.trigger_price).toFixed(6)}`).join('\n') || 'None'}`;
 
     const msg = await anthropic.messages.create({
       model: 'claude-sonnet-4-20250514',
       max_tokens: 300,
-      messages: [{ role: 'user', content: prompt }]
+      system: [{
+        type: 'text',
+        text: traderSystemPrompt,
+        cache_control: { type: 'ephemeral' }
+      }],
+      messages: [{ role: 'user', content: dynamicContent }]
     });
     const analysis = msg.content?.[0]?.text || 'Analysis unavailable';
-    console.log(`[analysis] ${coinBase} trailing stop: ${msg.usage?.input_tokens}in ${msg.usage?.output_tokens}out`);
+    await logClaudeCall(`trailing stop analysis (${coinBase})`, msg.model || 'claude-sonnet-4-20250514', msg.usage);
 
     const recMatch = analysis.match(/RECOMMENDATION:\s*(.+)/i);
     const recommendation = recMatch ? recMatch[1].trim().toUpperCase() : 'REVIEW NEEDED';
@@ -3974,25 +4019,18 @@ async function analyseFixedTargetAlert(symbol, currentPrice, target) {
     const coinBase = symbol.replace('-USD', '');
     const entryPrice = entryPrices.get(symbol) || target.entryPrice;
 
-    const prompt = `Price target hit for ${coinBase}.
-Target: $${parseFloat(target.targetPrice).toFixed(6)}
-Current: $${currentPrice.toFixed(6)}
-Entry: ${entryPrice ? '$' + entryPrice.toFixed(6) : 'unknown'}
-Direction: ${target.direction}
-
-Should Bryan take profits now, hold for more, or ladder out partially?
-Be concise — 3 lines max:
-RECOMMENDATION: [SELL/HOLD/LADDER]
-REASON: [one sentence]
-NEXT TARGET: [price if holding]`;
-
     const msg = await anthropic.messages.create({
       model: 'claude-sonnet-4-20250514',
       max_tokens: 200,
-      messages: [{ role: 'user', content: prompt }]
+      system: [{
+        type: 'text',
+        text: 'You are a crypto trading analyst. Bryan is a swing trader who buys dips and sells pumps, never selling 100% (keeps a moon bag). When a price target hits, advise concisely in 3 lines:\nRECOMMENDATION: [SELL/HOLD/LADDER]\nREASON: [one sentence]\nNEXT TARGET: [price if holding]',
+        cache_control: { type: 'ephemeral' }
+      }],
+      messages: [{ role: 'user', content: `Price target hit for ${coinBase}.\nTarget: $${parseFloat(target.targetPrice).toFixed(6)}\nCurrent: $${currentPrice.toFixed(6)}\nEntry: ${entryPrice ? '$' + entryPrice.toFixed(6) : 'unknown'}\nDirection: ${target.direction}\n\nShould Bryan take profits now, hold for more, or ladder out partially?` }]
     });
     const analysis = msg.content?.[0]?.text || 'Analysis unavailable';
-    console.log(`[analysis] ${coinBase} fixed target: ${msg.usage?.input_tokens}in ${msg.usage?.output_tokens}out`);
+    await logClaudeCall(`fixed target analysis (${coinBase})`, msg.model || 'claude-sonnet-4-20250514', msg.usage);
 
     pendingAnalysis.set(symbol, { type: 'fixed_target', analysis, price: currentPrice, timestamp: Date.now() });
     lastAlertContext.set(TELEGRAM_CHAT_ID, { symbol, coinBase, alertType: 'claude_analysis_target' });
@@ -5881,6 +5919,26 @@ app.get('/api/entryprices', (req, res) => {
   const out = {};
   for (const [sym, price] of entryPrices) out[sym] = price;
   res.json(out);
+});
+
+// GET /api/claude-usage — Claude API call history and cost summary
+app.get('/api/claude-usage', async (req, res) => {
+  const [rows] = await db.execute(
+    `SELECT reason, model, input_tokens as inputTokens,
+     output_tokens as outputTokens, cache_read_tokens as cacheReadTokens,
+     estimated_cost, created_at FROM claude_api_calls
+     ORDER BY created_at DESC LIMIT 50`
+  ).catch(() => [[]]);
+
+  const today = new Date().toDateString();
+  const todayCalls = rows.filter(r => new Date(r.created_at).toDateString() === today);
+
+  res.json({
+    recent_calls: rows,
+    calls_today: todayCalls.length,
+    today_cost:  todayCalls.reduce((s, r) => s + parseFloat(r.estimated_cost || 0), 0),
+    month_cost:  rows.reduce((s, r) => s + parseFloat(r.estimated_cost || 0), 0),
+  });
 });
 
 // POST /api/entryprices/:symbol — set average entry price
