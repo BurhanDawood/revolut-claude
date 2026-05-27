@@ -963,6 +963,48 @@ try {
 
 seedLegacyTranches().catch(e => console.error('[tranches] Startup seed failed:', e.message));
 
+// ── Auto-execute: enable in DB + startup status log ──────────────────────────
+(async () => {
+  try {
+    const [rows] = await db.execute(
+      "SELECT config_value FROM system_config WHERE config_key = 'ai_auto_execute'"
+    );
+    if (rows.length) {
+      const cfg = JSON.parse(rows[0].config_value);
+
+      // Fix 3: force-enable if still at seeded default (disabled)
+      if (!cfg.enabled) {
+        cfg.enabled = true;
+        cfg.max_sell_pct = cfg.max_sell_pct || 25;
+        cfg.require_confidence = cfg.require_confidence || 'High';
+        cfg.cooldown_minutes = cfg.cooldown_minutes || 60;
+        cfg.updated_at = new Date().toISOString();
+        await db.execute(
+          "INSERT INTO system_config (config_key, config_value) VALUES ('ai_auto_execute', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)",
+          [JSON.stringify(cfg)]
+        );
+        console.log('[auto-exec] Enabled via startup patch:', JSON.stringify(cfg));
+      }
+
+      // Fix 4: status log every startup
+      const reloaded = JSON.parse((await db.execute(
+        "SELECT config_value FROM system_config WHERE config_key = 'ai_auto_execute'"
+      ))[0][0]?.config_value || '{}');
+      console.log(
+        `[auto-exec] Status on startup: ${reloaded.enabled ? 'ENABLED ✅' : 'DISABLED ❌'} | ` +
+        `Max sell: ${reloaded.max_sell_pct}% | ` +
+        `Confidence: ${reloaded.require_confidence} | ` +
+        `Cooldown: ${reloaded.cooldown_minutes}min`
+      );
+    } else {
+      console.log('[auto-exec] No config found in system_config — using defaults (disabled)');
+    }
+  } catch (e) {
+    console.error('[auto-exec] Startup check failed:', e.message);
+  }
+})();
+// ─────────────────────────────────────────────────────────────────────────────
+
 // Generate learning model on startup if missing or never generated
 (async () => {
   try {
@@ -3788,11 +3830,12 @@ CONFIDENCE: [High/Medium/Low]`;
     const confMatch = analysis.match(/CONFIDENCE:\s*(High|Medium|Low)/i);
     const confidence = confMatch ? confMatch[1] : 'Low';
 
-    // Check auto-execute config
+    // Check auto-execute config — reads from system_config only
     const [autoExecRows] = await db.execute(
       "SELECT config_value FROM system_config WHERE config_key = 'ai_auto_execute'"
     );
     const autoExec = autoExecRows.length ? JSON.parse(autoExecRows[0].config_value) : { enabled: false };
+    console.log('[auto-exec] Config loaded:', JSON.stringify(autoExec));
 
     const shouldAutoExecute =
       autoExec.enabled &&
@@ -6032,19 +6075,21 @@ function createMcpServer() {
           cooldown_minutes: cooldown_minutes || 60,
           updated_at: new Date().toISOString()
         };
+        // Always saves to system_config — NOT trader_profile
         await db.execute(
-          'INSERT INTO system_config (config_key, config_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)',
-          ['ai_auto_execute', JSON.stringify(config)]
+          `INSERT INTO system_config (config_key, config_value) VALUES ('ai_auto_execute', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)`,
+          [JSON.stringify(config)]
         );
+        console.log('[auto-exec] Config saved to system_config:', JSON.stringify(config));
         await sendTelegram(
           `🤖 <b>AI AUTO-EXECUTE ${config.enabled ? 'ENABLED ✅' : 'DISABLED ❌'}</b>\n\n` +
           `Max sell: ${config.max_sell_pct}% per trade\n` +
           `Max buy: $${config.max_buy_usd}\n` +
-          `Triggers: ${config.allowed_triggers.join(', ')}\n` +
-          `Required confidence: ${config.require_confidence}\n` +
-          `Cooldown: ${config.cooldown_minutes} min`
+          `Confidence required: ${config.require_confidence}\n` +
+          `Cooldown: ${config.cooldown_minutes} min\n` +
+          `Triggers: ${config.allowed_triggers.join(', ')}`
         );
-        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, config }) }] };
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, config, saved_to: 'system_config' }) }] };
       }
     }
   );
@@ -8822,551 +8867,4 @@ app.post('/telegram-webhook', async (req, res) => {
           `Here are the user's current holdings sorted by USD value (already calculated):\n${holdingsList}\n\n` +
           `Current baseline prices (set when monitoring started): ${JSON.stringify(basePrices)}\n` +
           `Active alerts (coins currently above threshold): ${[...alertState.active.keys()].join(', ') || 'none'}\n\n` +
-          `Answer the user's questions about their portfolio, crypto market conditions, and trading decisions. Be concise since this is a Telegram message.`;
-
-        const chatIdStr = chatId.toString();
-        const history = conversationHistory.get(chatIdStr) || [];
-
-        // Build messages array: history + current user message
-        // FIX 4: For broad questions, instruct Claude to be concise and focused
-        const messages = [
-          ...history,
-          { role: 'user', content: isBroadQuestion
-            ? userMessage + '\n\nNote: Please answer concisely in under 2000 characters total. Focus on top 3 options only.'
-            : userMessage }
-        ];
-
-        const claudePromise = anthropic.messages.create({
-          model: 'claude-sonnet-4-5',
-          max_tokens: 4000,
-          tools: [{
-            type: "web_search_20250305",
-            name: "web_search"
-          }],
-          system: `You are an expert AI crypto trading analyst and advisor. You have access to the user's live Revolut X portfolio data provided below. When answering questions:
-- Search the web for current news, prices and market conditions
-- Give detailed technical and fundamental analysis
-- Reference specific coins from the user's portfolio
-- Give actionable insights and specific recommendations
-- ALWAYS start your response with a 1-2 line plain-text summary of your key conclusion BEFORE any headers or bullet points
-- Format the rest of the response clearly with headers and bullet points
-- Be thorough and comprehensive
-- Always consider macro conditions, Bitcoin dominance, and market sentiment
-- Keep responses under 4000 characters total
-- End with a one line disclaimer only
-
-IMPORTANT TRADER CONTEXT:
-- Bryan's total invested capital: $${totalInvestedCapital.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-- Current portfolio value: $${totalUSD > 0 ? totalUSD.toFixed(2) : 'see holdings above'}
-- Real P&L: $${(totalUSD - totalInvestedCapital).toFixed(2)} (${totalUSD > 0 ? (((totalUSD - totalInvestedCapital) / totalInvestedCapital) * 100).toFixed(1) : '?'}%)
-- Recovery target: +${totalUSD > 0 && totalUSD < totalInvestedCapital ? (((totalInvestedCapital - totalUSD) / totalUSD) * 100).toFixed(1) : '0'}% needed to break even
-- This context is CRITICAL for all recommendations — always reference real P&L not just price movements
-- Bryan's portfolio is approximately 50% down from historical highs due to bear market conditions and past trading decisions
-- Many individual positions are down 50-80% from entry
-- Bryan's PRIMARY GOAL is portfolio recovery and becoming a more disciplined trader
-- Some balance changes detected are Revolut payments (asset used to make purchases) not trading decisions
-- When giving advice, always consider recovery strategy not just short term gains
-- Encourage disciplined trading habits and risk management
-- Be honest about positions that may not recover and suggest better opportunities
-- Celebrate good trading decisions to reinforce positive patterns
-- For positions down 50%+: acknowledge the loss honestly and advise whether to cut or hold for recovery
-- For positions doing well (CC, HYPE, LINK): emphasise protecting and growing these gains
-- Always consider overall portfolio recovery in recommendations
-- Suggest position sizing that protects the recovering portfolio
-
-BRYAN'S CORE TRADING STRATEGY:
-Bryan is a swing trader who specifically targets EXTREME price movements outside normal patterns:
-
-BUY SIGNALS Bryan looks for:
-• Sudden sharp DROP outside coin's normal trading range
-• Extreme oversold conditions (RSI < 30)
-• Price significantly below recent support
-• Fear/panic selling creating opportunity
-• The bigger and more sudden the drop, the more interesting
-
-SELL SIGNALS Bryan looks for:
-• Sudden sharp PUMP outside coin's normal trading range
-• Extreme overbought conditions (RSI > 70)
-• Price significantly above recent resistance
-• Euphoria/FOMO buying creating exit opportunity
-• The bigger and more sudden the pump, the more interesting
-
-RETRACE STRATEGY:
-• After selling a pump, Bryan waits for retrace
-• Buys back at lower price to repeat the cycle
-• Goal: capture profit on the move, buy back cheaper
-
-LOSS PROTECTION:
-• Will cut losses if coin drops with no recovery catalyst
-• Prefers to redeploy capital into better opportunities
-• Does not hold indefinitely hoping for recovery on weak coins
-
-WHEN GIVING RECOMMENDATIONS:
-• Always identify if current price is an extreme move outside normal range
-• Flag if coin is in buy zone (extreme dip) or sell zone (extreme pump)
-• Suggest specific buy-back prices after recommending sells
-• Suggest profit-taking levels after recommending buys
-• Reference Bryan's swing trading strategy explicitly in advice
-• Example: 'This 15% sudden drop is exactly your buy signal — outside normal range, RSI oversold'
-• Example: 'This 20% pump is your sell signal — take profits here and watch for retrace to $X to buy back'
-
-ALERT CONTEXT:
-• Daily pump alerts = potential SELL signal (extreme move up)
-• Daily drop alerts = potential BUY signal (extreme move down)
-• Always frame alerts in context of Bryan's swing strategy
-
-${holdingsList}
-
-Current baseline prices (set when monitoring started): ${JSON.stringify(basePrices)}
-Active alerts (coins currently above threshold): ${[...alertState.active.keys()].join(', ') || 'none'}${learningContext}${recoveryContext}`,
-          messages,
-        });
-        const timeoutPromise = new Promise((_, reject) =>
-          setTimeout(() => reject(new Error('timeout')), 110000)
-        );
-
-        // FIX 2: Send follow-up messages at 30s and 60s if still processing
-        stillResearchingTimer = setTimeout(async () => {
-          try {
-            await sendReply('🔍 Still researching deeply... complex question needs more time.');
-          } catch (e) { /* ignore */ }
-        }, 30000);
-        stillResearchingTimer2 = setTimeout(async () => {
-          try {
-            await sendReply('⏳ Almost there — pulling together the analysis now...');
-          } catch (e) { /* ignore */ }
-        }, 60000);
-
-        const response = await Promise.race([claudePromise, timeoutPromise]);
-        clearTimeout(stillResearchingTimer);
-        clearTimeout(stillResearchingTimer2);
-
-        // Extract the last text block (web_search may produce tool_use blocks before the final text)
-        const lastTextBlock = [...response.content].reverse().find(b => b.type === 'text');
-        const reply = lastTextBlock ? lastTextBlock.text : '(no response)';
-
-        // Update last recommendation context for intention tracking
-        try {
-          const recCoins = holdings.filter(h => reply.toUpperCase().includes(h.symbol.replace('-USD', ''))).map(h => h.symbol.replace('-USD', ''));
-          const recActionMatch = reply.match(/\*\*(HOLD|SELL|BUY MORE|BUY|REDUCE|ADD)\*\*/i) || reply.match(/\b(HOLD|SELL|BUY|REDUCE|ADD)\b/i);
-          lastRecommendationContext.set(chatIdStr, {
-            coins: recCoins.length > 0 ? recCoins : [],
-            action: recActionMatch ? recActionMatch[1].toUpperCase() : 'HOLD',
-            rawReply: reply,
-            timestamp: Date.now()
-          });
-        } catch (e) { /* ignore */ }
-
-        // Extract recommendation from Claude's reply and save to analysis_history
-        try {
-          const recMatch = reply.match(/\*\*(HOLD|SELL|BUY MORE|BUY|REDUCE|ADD)\*\*/i) || reply.match(/^(HOLD|SELL|BUY MORE|BUY|REDUCE|ADD)\b/im);
-          if (recMatch) {
-            const rec = recMatch[1].toUpperCase();
-            const coinInMsg = userMessage.match(/\b([A-Z]{2,10})\b/);
-            const coinBase = coinInMsg ? coinInMsg[1] : null;
-            const symbol = coinBase && !SKIP_WORDS.has(coinBase) ? `${coinBase}-USD` : null;
-            if (symbol) {
-              const priceNow = await getCurrentPrice(symbol).catch(() => null);
-              const summary = reply.substring(0, 500);
-              await db.execute(
-                'INSERT INTO analysis_history (symbol, analysis_type, price_at_analysis, recommendation, claude_summary) VALUES (?, ?, ?, ?, ?)',
-                [symbol, 'telegram_analysis', priceNow, rec, summary]
-              ).catch(() => {});
-            }
-          }
-        } catch (e) { /* ignore */ }
-
-        // Update in-memory history
-        const updatedHistory = [
-          ...history,
-          { role: 'user', content: userMessage },
-          { role: 'assistant', content: reply }
-        ];
-        // Keep last 10 exchanges (20 messages)
-        const trimmed = updatedHistory.slice(-20);
-        conversationHistory.set(chatIdStr, trimmed);
-
-        // Persist to DB
-        await db.execute('INSERT INTO conversation_history (chat_id, role, content) VALUES (?, ?, ?)', [chatId, 'user', userMessage]);
-        await db.execute('INSERT INTO conversation_history (chat_id, role, content) VALUES (?, ?, ?)', [chatId, 'assistant', reply]);
-
-        // Clean up old rows (keep last 20 per chat)
-        await db.execute('DELETE FROM conversation_history WHERE chat_id = ? AND id NOT IN (SELECT id FROM (SELECT id FROM conversation_history WHERE chat_id = ? ORDER BY created_at DESC LIMIT 20) t)', [chatId, chatId]);
-
-        // Check if Claude's response implies it set a threshold — actually execute it
-        const claudeAlertPatterns = [
-          /(?:alert(?:ing)?\s+you|set\s+(?:up\s+)?(?:an?\s+)?alert|creat(?:ed?)?\s+(?:an?\s+)?alert|threshold\s+set|notify\s+you|notification\s+set)\s+.*?([A-Za-z]{2,10}(?:-USD)?)\s+.*?([\d.]+)\s*%/i,
-          /([A-Za-z]{2,10}(?:-USD)?)\s+.*?(?:alert|threshold|notification)\s+.*?([\d.]+)\s*%/i,
-          /threshold.*?([A-Za-z]{2,10}(?:-USD)?)\s+.*?([\d.]+)\s*%/i,
-        ];
-
-        let actionTaken = null;
-        for (const pattern of claudeAlertPatterns) {
-          const m = reply.match(pattern);
-          if (m) {
-            const coinBase = m[1].toUpperCase();
-            // Skip common false positives
-            if (['THE', 'FOR', 'AND', 'YOU', 'SET', 'GET', 'HAS', 'ARE'].includes(coinBase)) continue;
-            const symbol = coinBase.endsWith('-USD') ? coinBase : `${coinBase}-USD`;
-            const threshold = parseFloat(m[2]) / 100;
-            if (threshold > 0 && threshold <= 1) { // sanity check: 0–100%
-              const { oldThreshold, newThreshold } = await setThreshold(symbol, threshold);
-              const newPct = (newThreshold * 100).toFixed(1);
-              const oldPct = (oldThreshold * 100).toFixed(1);
-              actionTaken = `\n\n✅ Actually saved to server - ${symbol} threshold changed to ${newPct}% (was ${oldPct}%). Old alert cancelled and monitoring restarted fresh from current price.`;
-            }
-            break;
-          }
-        }
-
-        // FIX 5: Log response length before sending
-        const fullReply = reply + (actionTaken || '');
-        console.log('Claude response length:', fullReply.length, 'characters');
-        console.log('Sending in', Math.ceil(fullReply.length / 2500), 'message(s)');
-        console.log('ABOUT TO CHUNK: response length:', fullReply.length);
-        console.log('FULL REPLY STARTS WITH:', fullReply.substring(0, 200).replace(/\n/g, '|'));
-        console.log('CHUNK 1 WILL START WITH:', fullReply.substring(0, 100).replace(/\n/g, '|'));
-
-        // 5s gap after status message so chunks don't collide with it
-        await new Promise(r => setTimeout(r, 5000));
-        await sendTelegramChunked(fullReply);
-      } catch (err) {
-        console.error('Claude AI error:', err.message);
-        clearTimeout(stillResearchingTimer);
-        clearTimeout(stillResearchingTimer2);
-        if (err.message === 'timeout') {
-          // FIX 3: Fallback simpler Claude call — no web search, max 30s, max_tokens 500
-          try {
-            const fallbackPromise = anthropic.messages.create({
-              model: 'claude-sonnet-4-5',
-              max_tokens: 500,
-              system: `You are a crypto advisor. Here are the user's current holdings:\n${holdingsList || 'Portfolio data unavailable'}\nAnswer the user's question briefly in 2-3 sentences. Be direct and actionable.`,
-              messages: [{ role: 'user', content: userMessage }],
-            });
-            const fallbackTimeout = new Promise((_, reject) =>
-              setTimeout(() => reject(new Error('fallback_timeout')), 30000)
-            );
-            const fallbackResponse = await Promise.race([fallbackPromise, fallbackTimeout]);
-            const fallbackBlock = [...fallbackResponse.content].reverse().find(b => b.type === 'text');
-            const fallbackText = fallbackBlock ? fallbackBlock.text : null;
-            if (fallbackText) {
-              await sendReply(`⚡ <b>Quick take</b> (full analysis timed out):\n\n${fallbackText}\n\n<i>Tip: Ask about one specific coin at a time for deeper analysis.</i>`);
-            } else {
-              await sendReply('⏱️ Analysis timed out. Try asking about one specific coin at a time.');
-            }
-          } catch (fallbackErr) {
-            await sendReply('⏱️ Analysis timed out. Try asking about one specific coin at a time.');
-          }
-        } else {
-          await sendReply('❌ Error getting AI response: ' + err.message);
-        }
-      }
-    })();
-
-  } catch (err) {
-    console.error('Telegram webhook error:', err.message);
-    if (!res.headersSent) {
-      res.status(200).json({ ok: true });
-    }
-  }
-});
-
-// GET /telegram-setup — register the webhook URL with Telegram
-app.get('/telegram-setup', async (req, res) => {
-  const token = process.env.TELEGRAM_BOT_TOKEN;
-  const webhookUrl = 'https://revolut-claude-production.up.railway.app/telegram-webhook';
-  const response = await fetch(`https://api.telegram.org/bot${token}/setWebhook?url=${webhookUrl}`);
-  const data = await response.json();
-  res.json(data);
-});
-
-// Seed default trader profile entries if not already set
-const TRADER_PROFILE_DEFAULTS = [
-  { key: 'goal',             value: 'Recover portfolio losses and become a disciplined profitable swing trader' },
-  { key: 'situation',        value: 'Portfolio approximately 50% down from historical highs' },
-  { key: 'style',            value: 'Swing trader - buy dips sell pumps' },
-  { key: 'weakness',         value: 'Past trading decisions led to significant losses - working to improve discipline' },
-  { key: 'strength',         value: 'Good instincts on institutional plays like CC and LINK' },
-  { key: 'core_strategy',    value: 'Swing trader focused on extreme price movements. Buys sudden sharp dips outside normal price pattern. Sells sudden sharp pumps outside normal price pattern. Always looking to capture profit on big moves and buy back on retraces.' },
-  { key: 'buy_signals',      value: 'Sudden extreme drop outside normal trading range — potential dip buy opportunity' },
-  { key: 'sell_signals',     value: 'Sudden extreme pump outside normal trading range — potential profit taking opportunity' },
-  { key: 'retrace_strategy', value: 'After selling a pump, waits for retrace and buys back at lower price to repeat the cycle' },
-  { key: 'loss_protection',  value: 'Will sell to protect against further losses if coin drops significantly with no recovery catalyst' },
-  { key: 'profit_capture',   value: 'Takes profits on substantial rises then looks to buy back on retrace' },
-  { key: 'trading_goal',     value: 'Portfolio recovery from 50% down — building back through disciplined swing trading' },
-  { key: 'risk_approach',    value: 'Protects downside while capturing upside on extreme moves' },
-];
-(async () => {
-  for (const { key, value } of TRADER_PROFILE_DEFAULTS) {
-    await db.execute(
-      'INSERT INTO trader_profile (preference_key, preference_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE preference_key = preference_key',
-      [key, value]
-    ).catch(() => {});
-  }
-  console.log('Trader profile defaults seeded.');
-})();
-
-// GET /api/system/config — read all system config values
-app.get('/api/system/config', async (req, res) => {
-  try {
-    const [rows] = await db.execute(
-      'SELECT config_key, config_value, updated_at FROM system_config ORDER BY config_key'
-    );
-    res.json({ ok: true, config: rows });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// POST /api/system/config — upsert a config key/value
-app.post('/api/system/config', async (req, res) => {
-  try {
-    const { key, value } = req.body;
-    if (!key || !value) return res.status(400).json({ error: 'key and value required' });
-    await db.execute(
-      'INSERT INTO system_config (config_key, config_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)',
-      [key, value]
-    );
-    res.json({ ok: true, key, updated_at: new Date().toISOString() });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// POST /api/revolut/trade — execute a Revolut X trade directly (requires approved: true)
-app.post('/api/revolut/trade', async (req, res) => {
-  try {
-    const { symbol, side, orderType, baseSize, price, approved } = req.body;
-    if (!approved) return res.status(400).json({ error: 'Trade requires approved: true explicitly set' });
-    if (!symbol || !side || !orderType || !baseSize) return res.status(400).json({ error: 'Missing required fields: symbol, side, orderType, baseSize' });
-    const result = await placeRevolutOrder(symbol, side, orderType, parseFloat(baseSize), price ? parseFloat(price) : null);
-    const coinBase = symbol.replace('-USD', '');
-    const executedPrice = price || await getCurrentPrice(symbol).catch(() => 0) || 0;
-    const valueUSD = executedPrice * parseFloat(baseSize);
-    await db.execute(
-      'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      [coinBase, side, executedPrice, baseSize, valueUSD, 'Revolut X trade via dashboard', 'confident']
-    ).catch(e => console.error('[revolut] Journal insert failed:', e.message));
-    await sendTelegram(
-      `✅ <b>REVOLUT X TRADE EXECUTED</b>\n\n` +
-      `${side.toUpperCase()} ${baseSize} ${coinBase} @ ${fmtPriceShort(executedPrice)}\n` +
-      `Value: $${valueUSD.toFixed(2)}\n` +
-      `Order ID: ${result?.client_order_id || 'unknown'}\n\n` +
-      `📝 Journal entry logged automatically`
-    );
-    res.json({ ok: true, result });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// GET /api/debug/link-pairs — temporary diagnostic: all LINK trading pairs on Revolut X
-app.get('/api/debug/link-pairs', async (req, res) => {
-  try {
-    const tickerResponse = await revolutRequest('GET', '/tickers');
-    const tickerList = Array.isArray(tickerResponse) ? tickerResponse : (tickerResponse.data || []);
-    const linkPairs = tickerList.filter(t => t.symbol?.includes('LINK'));
-    res.json({ total_tickers: tickerList.length, link_pairs: linkPairs });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// DELETE /api/cleanup/trade-intentions — one-time cleanup of unmatched intentions
-app.delete('/api/cleanup/trade-intentions', async (req, res) => {
-  try {
-    const [result] = await db.execute(
-      'DELETE FROM trade_intentions WHERE matched_at IS NULL'
-    );
-    res.json({ ok: true, deleted: result.affectedRows });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// ── One-time backfill: sell P&L ──────────────────────────────────────────────
-// POST /api/fix/sell-pnl — calculates realised P&L on existing sell entries missing outcome_pnl
-app.post('/api/fix/sell-pnl', async (req, res) => {
-  try {
-    const [sells] = await db.execute(
-      `SELECT id, symbol, price, quantity
-       FROM trading_journal
-       WHERE action = 'sell'
-       AND outcome_pnl IS NULL
-       AND price IS NOT NULL
-       AND quantity IS NOT NULL`
-    );
-
-    const results = [];
-
-    for (const sell of sells) {
-      const coinBase = sell.symbol.replace('-USD', '');
-      const [entryRows] = await db.execute(
-        'SELECT entry_price FROM entry_prices WHERE symbol = ?',
-        [`${coinBase}-USD`]
-      );
-
-      if (!entryRows.length) {
-        results.push({ id: sell.id, symbol: coinBase, status: 'skipped — no entry price' });
-        continue;
-      }
-
-      const entryPrice    = parseFloat(entryRows[0].entry_price);
-      const salePrice     = parseFloat(sell.price);
-      const qty           = parseFloat(sell.quantity);
-      const realisedPnl   = (salePrice - entryPrice) * qty;
-      const realisedPnlPct = ((salePrice - entryPrice) / entryPrice * 100);
-      const isGain        = realisedPnl > 0;
-
-      await db.execute(
-        `UPDATE trading_journal SET outcome_pnl = ?, outcome_notes = ? WHERE id = ?`,
-        [realisedPnl,
-         `Realised ${isGain ? 'gain' : 'loss'}: ${isGain ? '+' : ''}$${realisedPnl.toFixed(2)} ` +
-         `(${realisedPnlPct.toFixed(1)}%) | Entry: $${entryPrice} | Sale: $${salePrice} | Method: US HIFO`,
-         sell.id]
-      );
-
-      results.push({
-        id: sell.id,
-        symbol: coinBase,
-        entry: entryPrice,
-        sale: salePrice,
-        qty,
-        realised_pnl: realisedPnl.toFixed(2),
-        pnl_pct: realisedPnlPct.toFixed(1),
-        status: isGain ? 'GAIN' : 'LOSS'
-      });
-    }
-
-    const totalGainLoss = results
-      .reduce((s, r) => s + parseFloat(r.realised_pnl || 0), 0)
-      .toFixed(2);
-
-    res.json({ ok: true, processed: results.length, total_gain_loss: totalGainLoss, results });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// ── One-time backfill: payment P&L ───────────────────────────────────────────
-// POST /api/fix/payment-pnl — calculates P&L on existing payment entries missing outcome_pnl
-app.post('/api/fix/payment-pnl', async (req, res) => {
-  try {
-    const [payments] = await db.execute(
-      `SELECT id, symbol, price, quantity, value_usd
-       FROM trading_journal
-       WHERE action = 'payment'
-       AND outcome_pnl IS NULL`
-    );
-
-    const results = [];
-
-    for (const payment of payments) {
-      const coinBase = payment.symbol.replace('-USD', '');
-      const [entryRows] = await db.execute(
-        'SELECT entry_price FROM entry_prices WHERE symbol = ?',
-        [`${coinBase}-USD`]
-      );
-
-      if (!entryRows.length) {
-        results.push({ id: payment.id, symbol: coinBase, status: 'skipped — no entry price' });
-        continue;
-      }
-
-      const entryPrice = parseFloat(entryRows[0].entry_price);
-      const salePrice  = parseFloat(payment.price);
-      const qty        = parseFloat(payment.quantity);
-
-      if (!entryPrice || !salePrice || !qty) {
-        results.push({ id: payment.id, symbol: coinBase, status: 'skipped — missing data' });
-        continue;
-      }
-
-      const gainLoss    = (salePrice - entryPrice) * qty;
-      const gainLossPct = ((salePrice - entryPrice) / entryPrice * 100);
-      const isGain      = gainLoss > 0;
-
-      await db.execute(
-        `UPDATE trading_journal SET outcome_pnl = ?, outcome_notes = ? WHERE id = ?`,
-        [gainLoss,
-         `Payment disposal: ${isGain ? 'GAIN' : 'LOSS'} of $${Math.abs(gainLoss).toFixed(2)} (${gainLossPct.toFixed(1)}%) — taxable event`,
-         payment.id]
-      );
-
-      results.push({
-        id: payment.id,
-        symbol: coinBase,
-        entry: entryPrice,
-        sale: salePrice,
-        qty,
-        gain_loss: gainLoss.toFixed(2),
-        gain_loss_pct: gainLossPct.toFixed(1),
-        status: isGain ? 'GAIN' : 'LOSS'
-      });
-    }
-
-    res.json({ ok: true, processed: results.length, results });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// GET /api/activity — paginated trade feed with optional action filter
-app.get('/api/activity', async (req, res) => {
-  try {
-    const limit  = Math.min(parseInt(req.query.limit) || 50, 200);
-    const filter = req.query.filter || 'all';
-    const params = [limit];
-    const where  = filter !== 'all' ? 'WHERE action = ?' : '';
-    if (filter !== 'all') params.unshift(filter);
-    const [trades] = await db.execute(
-      `SELECT id, symbol, action, price, quantity, value_usd,
-              reasoning, emotion, outcome_pnl,
-              created_at
-       FROM trading_journal
-       ${where}
-       ORDER BY created_at DESC
-       LIMIT ?`,
-      params
-    );
-    res.json({ ok: true, trades, total: trades.length });
-  } catch (e) {
-    console.error('[activity] endpoint error:', e.message);
-    res.status(500).json({ error: e.message, hint: 'Check Railway logs for details' });
-  }
-});
-
-// PATCH /api/activity/:id — edit trade action and/or reasoning
-app.patch('/api/activity/:id', async (req, res) => {
-  try {
-    const id        = parseInt(req.params.id);
-    const { action, reasoning, emotion } = req.body;
-    if (!id || !action) return res.status(400).json({ error: 'id and action required' });
-
-    await db.execute(
-      `UPDATE trading_journal
-       SET action = ?, reasoning = ?, emotion = COALESCE(?, emotion), updated_at = NOW()
-       WHERE id = ?`,
-      [action, reasoning || null, emotion || null, id]
-    );
-
-    // If corrected to 'payment' — deduct from invested capital
-    if (action === 'payment') {
-      const [[trade]] = await db.execute('SELECT value_usd FROM trading_journal WHERE id = ?', [id]);
-      if (trade?.value_usd) {
-        const amount   = Math.abs(parseFloat(trade.value_usd));
-        const newTotal = totalInvestedCapital - amount;
-        await updateInvestedCapital(newTotal, `Payment correction — journal ID ${id}`).catch(e => console.error('[activity] capital update failed:', e.message));
-      }
-    }
-
-    res.json({ ok: true, id });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+          
