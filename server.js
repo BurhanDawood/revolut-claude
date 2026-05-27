@@ -256,7 +256,7 @@ const priceTargets = new Map(); // symbol -> { anchorPrice, thresholdPct, target
 const entryPrices = new Map(); // symbol -> number (DB-backed, persists across restarts)
 let monitoringPaused = false;
 let briefingInProgress = false;
-let lastClaudeCallTime = 0;
+let lastMacroNewsCallTime = 0; // separate rate-limit for macro news Claude calls (1 hour)
 let learningModelCache = ''; // updated by updateLearningModel()
 const pendingJournalState = new Map(); // chatId -> { journalId, step: 'emotion'|'followed', hasClaudeRec, claudeRec, symbol }
 const pendingTradeContext = new Map(); // symbol -> { journalId, detectedAt, timeoutHandle, action, price, valueUsd, qty }
@@ -2537,49 +2537,54 @@ async function checkMacroNews() {
   let keywordsFound = false;
   let alertSent = false;
   try {
-    console.log('Macro check:', new Date().toISOString(), '- Starting...');
+    console.log('[macro] Starting news check:', new Date().toISOString());
 
-    // STEP 1: Identify significant holdings (> $300 USD)
-    const balances = await revolutRequest('GET', '/balances');
-    const tickerResponse = await revolutRequest('GET', '/tickers');
-    const tickerList = Array.isArray(tickerResponse) ? tickerResponse : (tickerResponse.data || []);
-    const priceMap = {};
-    for (const ticker of tickerList) {
-      if (ticker.symbol) {
-        const price = parseFloat(ticker.last_price || ticker.mid || ticker.ask || ticker.bid);
-        if (price) {
-          priceMap[ticker.symbol] = price;
-          priceMap[ticker.symbol.replace('/', '-')] = price;
+    // STEP 1: Identify holdings (>$50 USD — low threshold so we don't miss context)
+    let significantHoldings = [];
+    try {
+      const balances = await revolutRequest('GET', '/balances');
+      const tickerResponse = await revolutRequest('GET', '/tickers');
+      const tickerList = Array.isArray(tickerResponse) ? tickerResponse : (tickerResponse.data || []);
+      const priceMap = {};
+      for (const ticker of tickerList) {
+        if (ticker.symbol) {
+          const price = parseFloat(ticker.last_price || ticker.mid || ticker.ask || ticker.bid);
+          if (price) {
+            priceMap[ticker.symbol] = price;
+            priceMap[ticker.symbol.replace('/', '-')] = price;
+          }
         }
       }
-    }
-    const significantHoldings = [];
-    for (const asset of balances) {
-      if (!asset.currency || SKIP_CURRENCIES.includes(asset.currency)) continue;
-      const available = parseFloat(asset.available);
-      if (available <= 0) continue;
-      const symbol = `${asset.currency}-USD`;
-      const price = priceMap[symbol];
-      if (!price) continue;
-      const valueUSD = available * price;
-      if (valueUSD < 300) continue;
-      const narrative = COIN_NARRATIVES[asset.currency] || `${asset.currency} cryptocurrency`;
-      significantHoldings.push({ coin: asset.currency, symbol, available, price, valueUSD, narrative });
-    }
-    significantHoldings.sort((a, b) => b.valueUSD - a.valueUSD);
-
-    if (significantHoldings.length === 0) {
-      console.log('Macro check:', new Date().toISOString(), '- No significant holdings, skipping.');
-      return;
+      for (const asset of balances) {
+        if (!asset.currency || SKIP_CURRENCIES.includes(asset.currency)) continue;
+        const available = parseFloat(asset.available);
+        if (available <= 0) continue;
+        const symbol = `${asset.currency}-USD`;
+        const price = priceMap[symbol];
+        if (!price) continue;
+        const valueUSD = available * price;
+        if (valueUSD < 50) continue;
+        const narrative = COIN_NARRATIVES[asset.currency] || `${asset.currency} cryptocurrency`;
+        significantHoldings.push({ coin: asset.currency, symbol, available, price, valueUSD, narrative });
+      }
+      significantHoldings.sort((a, b) => b.valueUSD - a.valueUSD);
+    } catch (e) {
+      console.warn('[macro] Could not load holdings, proceeding with static list:', e.message);
     }
 
-    // STEP 2: Fetch free news RSS (no API cost)
-    const rssUrls = [
+    // Always check for major coins even if API fails
+    const ALL_WATCHED_COINS = ['BTC', 'ETH', 'SOL', 'LINK', 'NEAR', 'CC', 'ENA', 'JTO', 'PEPE', 'INJ', 'FET', 'RENDER', 'AVAX', 'ALGO', 'BONK', 'WIF', 'SHIB', 'XRP', 'GHIBLI', 'ZK', 'TAO'];
+
+    // STEP 2: Fetch RSS from multiple sources
+    const RSS_FEEDS = [
       'https://cointelegraph.com/rss',
       'https://www.coindesk.com/arc/outboundfeeds/rss/',
+      'https://decrypt.co/feed',
+      'https://cryptoslate.com/feed/',
     ];
+    let allTitles = [];
     let rawNewsText = '';
-    for (const url of rssUrls) {
+    for (const url of RSS_FEEDS) {
       try {
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), 8000);
@@ -2587,122 +2592,177 @@ async function checkMacroNews() {
         clearTimeout(timeoutId);
         if (response.ok) {
           const xml = await response.text();
-          // Extract CDATA and plain text from <title> and <description> tags
           const extract = (tag) => [...xml.matchAll(new RegExp(`<${tag}>(?:<!\\[CDATA\\[([\\s\\S]*?)\\]\\]>|([^<]*?))</${tag}>`, 'g'))]
-            .map(m => (m[1] || m[2] || '').trim())
-            .filter(Boolean);
-          rawNewsText += extract('title').join(' ') + ' ' + extract('description').join(' ') + ' ';
+            .map(m => (m[1] || m[2] || '').trim()).filter(Boolean);
+          const titles = extract('title');
+          const descs  = extract('description');
+          allTitles.push(...titles);
+          rawNewsText += titles.join(' ') + ' ' + descs.join(' ') + ' ';
+          console.log(`[macro] Feed ${url.split('/')[2]}: ${titles.length} titles`);
+        } else {
+          console.log(`[macro] Feed failed (${response.status}):`, url);
         }
       } catch (e) {
-        console.log('RSS fetch failed for', url, '-', e.message);
+        console.log('[macro] RSS fetch failed for', url, '-', e.message);
       }
     }
 
+    console.log('[macro] Total titles fetched:', allTitles.length);
+    console.log('[macro] Sample headlines:', allTitles.slice(0, 5));
+
     if (!rawNewsText.trim()) {
-      console.log('Macro check:', new Date().toISOString(), '- Keywords found: false - Alert sent: false (no news fetched)');
+      console.log('[macro] No news fetched — aborting');
       return;
     }
 
-    // STEP 3: Keyword check — FREE, no Claude API
-    const HIGH_IMPACT_KEYWORDS = [
-      'war', 'invasion', 'military', 'sanctions', 'conflict',
-      'sec', 'ban', 'regulation', 'legislation', 'congress', 'senate', 'clarity act',
-      'fed rate', 'interest rate', 'inflation', 'recession', 'tariff',
-      'hack', 'exploit', 'crash', 'rally', 'etf', 'institutional'
+    // STEP 3: Broad keyword check (free, no Claude API cost)
+    const MACRO_KEYWORDS = [
+      // Regulatory
+      'sec', 'cftc', 'regulation', 'ban', 'illegal', 'legal', 'congress', 'senate', 'law',
+      'ruling', 'court', 'clarity', 'compliance', 'enforcement',
+      // Security
+      'hack', 'exploit', 'stolen', 'breach', 'attack', 'vulnerability', 'drain',
+      // Market events
+      'crash', 'surge', 'liquidat', 'rally', 'dump', 'pump', 'volatile',
+      'collapse', 'bankrupt', 'insolvency', 'billion', 'meltdown', 'panic',
+      // Macro
+      'fed', 'federal reserve', 'inflation', 'rate hike', 'rate cut', 'gdp',
+      'recession', 'tariff', 'trade war', 'sanctions',
+      // Geopolitical
+      'war', 'invasion', 'military', 'conflict', 'iran', 'russia', 'china', 'strike',
+      // Crypto specific
+      'etf', 'institutional', 'stablecoin', 'defi', 'protocol', 'upgrade', 'fork',
+      'tether', 'usdt', 'usdc', 'binance', 'coinbase', 'kraken', 'ftx',
     ];
-    const coinKeywords = significantHoldings.map(h => h.coin.toLowerCase());
+    const holdingKeywords = significantHoldings.map(h => h.coin.toLowerCase());
+    const watchedKeywords = ALL_WATCHED_COINS.map(c => c.toLowerCase());
+    const allKeywords = [...MACRO_KEYWORDS, ...holdingKeywords, ...watchedKeywords];
     const lowerNews = rawNewsText.toLowerCase();
-    const foundKeywords = [...HIGH_IMPACT_KEYWORDS, ...coinKeywords].filter(kw => lowerNews.includes(kw));
+    const foundKeywords = [...new Set(allKeywords.filter(kw => lowerNews.includes(kw)))];
     keywordsFound = foundKeywords.length > 0;
 
-    if (!keywordsFound) {
-      console.log('Macro check:', new Date().toISOString(), '- Keywords found: false - Alert sent: false');
-      return;
-    }
-    console.log('Macro check:', new Date().toISOString(), '- Keywords found:', foundKeywords.slice(0, 8).join(', '));
+    console.log('[macro] Keywords matched:', foundKeywords.length, '—', foundKeywords.slice(0, 10).join(', '));
 
-    // STEP 4: Call Claude API for impact analysis (only reached if keywords found, max once per 4 hours — FIX 5)
-    if (Date.now() - lastClaudeCallTime < 4 * 60 * 60 * 1000) {
-      console.log('Macro check:', new Date().toISOString(), '- Keywords found: true - Claude rate limited (last call', Math.round((Date.now() - lastClaudeCallTime) / 60000), 'min ago, limit: 240 min)');
+    if (!keywordsFound) {
+      console.log('[macro] No keywords matched — skipping Claude call');
       return;
     }
-    const holdingsList = significantHoldings
-      .map(h => `${h.coin} ($${h.valueUSD.toFixed(0)} — ${h.narrative})`)
-      .join(', ');
-    const newsSnippet = rawNewsText.substring(0, 1500);
-    const totalSignificant = significantHoldings.reduce((s, h) => s + h.valueUSD, 0);
+
+    // STEP 4: Rate limit Claude to 1 hour between macro news calls
+    const timeSinceLastCall = Date.now() - lastMacroNewsCallTime;
+    if (timeSinceLastCall < 60 * 60 * 1000) {
+      console.log('[macro] Claude rate limited — last call', Math.round(timeSinceLastCall / 60000), 'min ago (limit: 60 min)');
+      return;
+    }
+
+    const holdingsList = significantHoldings.length > 0
+      ? significantHoldings.map(h => `${h.coin} ($${h.valueUSD.toFixed(0)})`).join(', ')
+      : ALL_WATCHED_COINS.join(', ');
+    const headlines = allTitles.slice(0, 35).join('\n');
+    const totalValue = significantHoldings.reduce((s, h) => s + h.valueUSD, 0);
 
     const claudeResponse = await anthropic.messages.create({
       model: 'claude-haiku-4-5-20251001',
       max_tokens: 600,
       system: [{
         type: 'text',
-        text: `You are a macro news screener for a crypto portfolio. Analyse whether news could significantly impact crypto holdings.
+        text: `You are a real-time crypto news screener for a portfolio manager named Bryan.
 
-Your holdings to monitor: BTC, ETH, SOL, LINK, NEAR, CC, ENA, JTO, PEPE, INJ, FET, RENDER, AVAX.
+Coins Bryan holds: BTC, ETH, SOL, LINK, NEAR, CC, ENA, JTO, PEPE, INJ, FET, RENDER, AVAX, ALGO, BONK, WIF, SHIB, XRP, GHIBLI, ZK, TAO
 
-Only flag HIGH or MEDIUM impact events. Ignore minor price moves already reflected in markets.
+Alert on ANY of these — be PROACTIVE, Bryan would rather be over-alerted than miss news:
+- Price moves >5% on any held coin
+- Regulatory news from US, UK, EU
+- Exchange hacks or failures (any major exchange)
+- Macro events: Fed decisions, CPI prints, rate changes
+- Geopolitical events: wars, sanctions, strikes affecting markets
+- Market-wide liquidations >$50M
+- Stablecoin de-peg or major protocol failure
+- Institutional moves (ETF flows, Microstrategy buys, etc.)
+- Exchange listings or delistings of held coins
 
-High-impact triggers: regulation/bans, major exchange hacks, institutional ETF/custody news, Fed rate decisions, geopolitical escalation, protocol failures.
+Do NOT alert on: price predictions, minor technical analysis, vague sentiment pieces.
 
-Start your response with EXACTLY one of:
-🚨 MACRO ALERT
-✅ NO SIGNIFICANT ALERTS
-
-If alert, for each issue:
-- What happened
-- Which coins affected and direction (bullish/bearish)
-- Recommended action (1 sentence)
-- Urgency: act now / watch / FYI
-
-Keep total response under 1800 characters.`,
+Respond with JSON only — no extra text:
+{
+  "alert": true,
+  "urgency": "high",
+  "message": "2-3 sentence summary of what happened and why it matters",
+  "coins_affected": ["BTC", "SOL"]
+}
+or:
+{
+  "alert": false
+}`,
         cache_control: { type: 'ephemeral' }
       }],
       messages: [{
         role: 'user',
-        content: `Holdings: ${holdingsList}. Total: $${totalSignificant.toFixed(0)}.\n\nRSS headlines: ${newsSnippet}\n\nKeywords triggering this scan: ${foundKeywords.slice(0, 5).join(', ')}.\n\nAnalyse for significant portfolio impact.`
+        content: `Holdings: ${holdingsList}${totalValue > 0 ? ` (total ~$${totalValue.toFixed(0)})` : ''}\nKeywords triggering this scan: ${foundKeywords.slice(0, 10).join(', ')}\n\nNews headlines to analyse:\n${headlines}`
       }]
     });
 
-    lastClaudeCallTime = Date.now();
+    lastMacroNewsCallTime = Date.now();
     await logClaudeCall('macro news analysis', claudeResponse.model || 'claude-haiku-4-5-20251001', claudeResponse.usage);
-    const lastTextBlock = [...claudeResponse.content].reverse().find(b => b.type === 'text');
-    const analysis = lastTextBlock ? lastTextBlock.text.trim() : '✅ NO SIGNIFICANT ALERTS';
-    console.log('Claude macro response:', analysis.substring(0, 300));
 
-    // STEP 5: Only send if MACRO ALERT and not a duplicate in last 6 hours
-    if (!analysis.includes('🚨 MACRO ALERT')) {
-      console.log('Macro check:', new Date().toISOString(), '- Keywords found: true - Alert sent: false (no significant alert from Claude)');
+    const textBlock = [...claudeResponse.content].reverse().find(b => b.type === 'text');
+    const responseText = textBlock?.text?.trim() || '{}';
+    console.log('[macro] Claude raw response:', responseText.substring(0, 400));
+
+    // Parse JSON — with fallback for any stray text wrapping
+    let parsed = { alert: false };
+    try {
+      const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+      if (jsonMatch) parsed = JSON.parse(jsonMatch[0]);
+    } catch (e) {
+      console.warn('[macro] JSON parse failed, falling back to text detection:', e.message);
+      // Fallback: treat as alert if Claude used the old emoji format
+      if (responseText.includes('🚨') || responseText.toLowerCase().includes('macro alert')) {
+        parsed = { alert: true, urgency: 'medium', message: responseText };
+      }
+    }
+
+    console.log('[macro] Alert decision:', parsed.alert, '| Urgency:', parsed.urgency || 'n/a', '| Coins:', (parsed.coins_affected || []).join(', '));
+
+    if (!parsed.alert) {
+      console.log('[macro] No alert — Claude found nothing significant');
       return;
     }
 
-    const alertHash = createHash('sha256').update(analysis.substring(0, 200)).digest('hex');
+    const alertMessage = parsed.message || 'Significant market event detected.';
+    console.log('[macro] ALERT FIRED:', alertMessage.substring(0, 200));
+
+    // Dedup — suppress identical alerts within 6 hours
+    const alertHash = createHash('sha256').update(alertMessage.substring(0, 200)).digest('hex');
     const [existingRows] = await db.execute(
       'SELECT id FROM macro_alerts_sent WHERE alert_hash = ? AND sent_at > DATE_SUB(NOW(), INTERVAL 6 HOUR)',
       [alertHash]
     );
     if (existingRows.length > 0) {
-      console.log('Macro check:', new Date().toISOString(), '- Duplicate suppressed (hash:', alertHash.substring(0, 8) + ')');
+      console.log('[macro] Duplicate suppressed (hash:', alertHash.substring(0, 8) + ')');
       return;
     }
 
-    // Build affected holdings lines (coins mentioned in Claude's analysis)
+    // Build affected holdings section
+    const affectedCoins = parsed.coins_affected || [];
     const affectedLines = significantHoldings
-      .filter(h => analysis.toUpperCase().includes(h.coin.toUpperCase()))
+      .filter(h => affectedCoins.some(c => c.toUpperCase() === h.coin.toUpperCase()) || affectedCoins.length === 0)
+      .slice(0, 5)
       .map(h => `• ${h.coin}: $${h.valueUSD.toFixed(0)}`);
     const affectedSection = affectedLines.length > 0
       ? `\n\n💼 <b>Your affected holdings:</b>\n${affectedLines.join('\n')}\n\nReply 'analyse [COIN]' for deeper analysis`
       : '';
 
-    const telegramMessage = `🌍 <b>MACRO ALERT — PORTFOLIO IMPACT DETECTED</b>\n\n${analysis}${affectedSection}`;
+    const urgencyIcon = parsed.urgency === 'high' ? '🚨' : parsed.urgency === 'medium' ? '⚠️' : 'ℹ️';
+    const telegramMessage = `${urgencyIcon} <b>MACRO ALERT — PORTFOLIO IMPACT</b>\n\n${alertMessage}${affectedSection}`;
     await sendTelegram(telegramMessage);
     await db.execute('INSERT INTO macro_alerts_sent (alert_hash) VALUES (?)', [alertHash]);
     alertSent = true;
 
   } catch (e) {
-    console.error('checkMacroNews error:', e.message);
+    console.error('[macro] checkMacroNews error:', e.message, e.stack?.split('\n')[1]);
   }
-  console.log('Macro check:', new Date().toISOString(), '- Keywords found:', keywordsFound, '- Alert sent:', alertSent);
+  console.log('[macro] Done — keywords found:', keywordsFound, '| alert sent:', alertSent);
 }
 
 async function recordTradeOutcome(symbol, sellPrice, sellQty, currentQty) {
@@ -6915,6 +6975,20 @@ app.get('/api/auto-rules', async (req, res) => {
     const [rules] = await db.execute('SELECT * FROM auto_trade_rules ORDER BY created_at DESC');
     res.json(rules);
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/test/macro-news — manually trigger a macro news check (deploy & debug)
+app.get('/api/test/macro-news', async (req, res) => {
+  try {
+    console.log('[macro-test] Manual trigger via API');
+    // Reset rate limit so the test always fires Claude
+    lastMacroNewsCallTime = 0;
+    await checkMacroNews();
+    res.json({ ok: true, message: 'Macro news check triggered — check Telegram and Railway logs' });
+  } catch (e) {
+    console.error('[macro-test] Error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // POST /api/auto-rules
