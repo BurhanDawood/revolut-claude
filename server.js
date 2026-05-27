@@ -698,6 +698,20 @@ await safeAddColumn('price_targets',    'direction',       "VARCHAR(4) NOT NULL 
 await safeAddColumn('price_targets',    'note',            'TEXT');
 await safeAddColumn('custom_thresholds','acknowledged_until','TIMESTAMP NULL DEFAULT NULL');
 
+// Track manually deleted auto-rules so seeding logic never recreates them
+await db.execute(`CREATE TABLE IF NOT EXISTS deleted_rules_log (
+  id          INT AUTO_INCREMENT PRIMARY KEY,
+  rule_id     INT NOT NULL,
+  symbol      VARCHAR(20) NOT NULL,
+  exchange    VARCHAR(20),
+  rule_type   VARCHAR(50),
+  order_type  VARCHAR(10),
+  direction   VARCHAR(10),
+  trigger_price DECIMAL(12,4),
+  volume      DECIMAL(12,4),
+  deleted_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)`).catch(e => console.error('[migration] deleted_rules_log:', e.message));
+
 // One-time cleanup: remove ghost symbols created by parser errors (words mistaken for coin names)
 try {
   const ghostSymbols = ['RISES-USD', 'RAISE-USD', 'TRADE-USD'];
@@ -850,22 +864,16 @@ try {
   console.error('Failed to load swing cooldowns:', e.message);
 }
 
-// Seed default SOL auto trade rules if none exist
+// One-time cleanup: remove any lingering SOL Kraken auto-rules that were recreated by the old seed block
 try {
-  const [existingRules] = await db.execute("SELECT id FROM auto_trade_rules WHERE symbol = 'SOL-USD' LIMIT 1");
-  if (existingRules.length === 0) {
-    await db.execute(`INSERT IGNORE INTO auto_trade_rules
-      (symbol, rule_type, trigger_price, direction, order_type, volume, max_position_usd) VALUES
-      ('SOL-USD', 'buy_dip_1',    84.00, 'below', 'buy',  0.3, 200),
-      ('SOL-USD', 'buy_dip_2',    80.00, 'below', 'buy',  0.3, 200),
-      ('SOL-USD', 'sell_pump_1',  93.00, 'above', 'sell', 0.3, null),
-      ('SOL-USD', 'sell_pump_2',  97.00, 'above', 'sell', 0.3, null),
-      ('SOL-USD', 'stop_loss',    79.00, 'below', 'sell', 1.5, null)`
-    );
-    console.log('[auto] Seeded default SOL auto trade rules');
+  const [deleted] = await db.execute(
+    "DELETE FROM auto_trade_rules WHERE symbol = 'SOL-USD' AND exchange = 'kraken'"
+  );
+  if (deleted.affectedRows > 0) {
+    console.log(`[cleanup] Removed ${deleted.affectedRows} stale SOL Kraken auto-rules from DB`);
   }
 } catch (e) {
-  console.error('[auto] Failed to seed SOL rules:', e.message);
+  console.warn('[cleanup] SOL Kraken rule cleanup failed:', e.message);
 }
 
 // Seed system config — always keep project description current
@@ -6477,20 +6485,27 @@ function createMcpServer() {
         if (action === 'remove' && rule_id) {
           const [existing] = await db.execute('SELECT * FROM auto_trade_rules WHERE id = ?', [rule_id]);
           if (existing.length === 0) throw new Error(`Rule ${rule_id} not found`);
+          const rule = existing[0];
           await db.execute('DELETE FROM auto_trade_rules WHERE id = ?', [rule_id]);
+          // Log deletion so seeding logic never recreates this rule
+          await db.execute(
+            `INSERT INTO deleted_rules_log (rule_id, symbol, exchange, rule_type, order_type, direction, trigger_price, volume)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            [rule_id, rule.symbol, rule.exchange || 'kraken', rule.rule_type, rule.order_type, rule.direction, rule.trigger_price, rule.volume]
+          ).catch(e => console.warn('[rules] Failed to log deletion:', e.message));
           // No in-memory rule cache exists — checkAutoTradeRules always reads DB fresh.
           // Clear any related target-reminder state for this symbol just in case.
-          if (existing[0]?.symbol) {
-            targetReminderCount.delete(existing[0].symbol);
+          if (rule.symbol) {
+            targetReminderCount.delete(rule.symbol);
           }
-          console.log(`[rules] Rule ${rule_id} removed from DB — will be absent on next checkAutoTradeRules cycle`);
+          console.log(`[rules] Rule ${rule_id} (${rule.symbol} ${rule.rule_type}) removed and logged to deleted_rules_log`);
           await sendTelegram(
             `🗑 Auto rule [${rule_id}] removed:\n` +
-            `${existing[0].order_type.toUpperCase()} ` +
-            `${existing[0].volume} ${existing[0].symbol.replace('-USD', '')} ` +
-            `${existing[0].direction} $${parseFloat(existing[0].trigger_price).toFixed(2)}`
+            `${rule.order_type.toUpperCase()} ` +
+            `${rule.volume} ${rule.symbol.replace('-USD', '')} ` +
+            `${rule.direction} $${parseFloat(rule.trigger_price).toFixed(2)}`
           );
-          return { content: [{ type: 'text', text: JSON.stringify({ ok: true, removed: rule_id, rule: existing[0] }) }] };
+          return { content: [{ type: 'text', text: JSON.stringify({ ok: true, removed: rule_id, rule }) }] };
         }
         if (action === 'disable' && rule_id) {
           await db.execute('UPDATE auto_trade_rules SET active = 0 WHERE id = ?', [rule_id]);
