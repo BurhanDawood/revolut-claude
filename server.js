@@ -1610,11 +1610,12 @@ function claudeCost(model, inputTokens, outputTokens, cacheReadTokens = 0) {
 }
 
 async function logClaudeCall(reason, model, usage) {
-  const inputTokens     = usage?.input_tokens       || 0;
-  const outputTokens    = usage?.output_tokens      || 0;
-  const cacheReadTokens = usage?.cache_read_input_tokens || 0;
-  const cost            = claudeCost(model, inputTokens, outputTokens, cacheReadTokens);
-  console.log('CLAUDE API CALL:', { reason, model, inputTokens, outputTokens, cacheReadTokens, estimatedCost: cost.toFixed(6) });
+  const inputTokens      = usage?.input_tokens                || 0;
+  const outputTokens     = usage?.output_tokens               || 0;
+  const cacheReadTokens  = usage?.cache_read_input_tokens     || 0;
+  const cacheWriteTokens = usage?.cache_creation_input_tokens || 0;
+  const cost             = claudeCost(model, inputTokens, outputTokens, cacheReadTokens);
+  console.log('CLAUDE API CALL:', { reason, model, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, estimatedCost: cost.toFixed(6) });
   await db.execute(
     'INSERT INTO claude_api_calls (reason, model, input_tokens, output_tokens, cache_read_tokens, estimated_cost) VALUES (?, ?, ?, ?, ?, ?)',
     [reason, model, inputTokens, outputTokens, cacheReadTokens, cost.toFixed(6)]
@@ -1682,14 +1683,14 @@ async function getQuickAiRecommendation(symbol, changePct, currentPrice, directi
       ? 'HOLD, BUY THE DIP, or SELL'
       : 'HOLD, SELL, or BUY MORE';
     const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-5-20251001',
+      model: 'claude-sonnet-4-6',
       max_tokens: 150,
       messages: [{
         role: 'user',
         content: `In 2-3 sentences max, give a quick trading recommendation for ${symbol} which is ${dirText}. Consider current market conditions. Start with ${actionOptions} in bold.`
       }]
     });
-    await logClaudeCall(reason, response.model || 'claude-sonnet-4-5-20251001', response.usage);
+    await logClaudeCall(reason, response.model || 'claude-sonnet-4-6', response.usage);
     const textBlock = response.content.find(b => b.type === 'text');
     return textBlock ? textBlock.text : 'HOLD - Monitor the situation closely.';
   } catch (e) {
@@ -1707,7 +1708,7 @@ async function batchGetRecommendations(alerts) {
     ).join('\n');
     const format = alerts.map(a => `${a.coinBase}: [recommendation]`).join('\n');
     const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-5-20251001',
+      model: 'claude-sonnet-4-6',
       max_tokens: Math.min(80 * alerts.length, 400),
       system: [{
         type: 'text',
@@ -1716,7 +1717,7 @@ async function batchGetRecommendations(alerts) {
       }],
       messages: [{ role: 'user', content: `Quick trading recommendations for these alerts:\n${lines}\n\nFormat exactly:\n${format}` }]
     });
-    await logClaudeCall(`batch alert recommendations (${alerts.length} coins)`, response.model || 'claude-sonnet-4-5-20251001', response.usage);
+    await logClaudeCall(`batch alert recommendations (${alerts.length} coins)`, response.model || 'claude-sonnet-4-6', response.usage);
     const text = response.content.find(b => b.type === 'text')?.text || '';
     for (const a of alerts) {
       const match = text.match(new RegExp(`${a.coinBase}:\\s*([^\\n]+)`, 'i'));
@@ -2233,7 +2234,7 @@ async function sendMorningBriefing() {
     }).join(', ');
 
     const claudeResponse = await anthropic.messages.create({
-      model: 'claude-sonnet-4-5-20251001',
+      model: 'claude-sonnet-4-6',
       max_tokens: 800,  // FIX 6: reduced from 1000
       tools: [{ type: "web_search_20250305", name: "web_search" }],
       messages: [{
@@ -2267,7 +2268,7 @@ Format EXACTLY like this:
 Keep total under 2000 characters. No long paragraphs. Be concise.`
       }]
     });
-    await logClaudeCall('morning briefing', claudeResponse.model || 'claude-sonnet-4-5-20251001', claudeResponse.usage);
+    await logClaudeCall('morning briefing', claudeResponse.model || 'claude-sonnet-4-6', claudeResponse.usage);
 
     const lastTextBlock = [...claudeResponse.content].reverse().find(b => b.type === 'text');
     const msg2 = lastTextBlock ? lastTextBlock.text.trim() : '📰 Market intelligence unavailable — check crypto news manually.';
@@ -3757,7 +3758,7 @@ Consider Bryan's existing winners (CC, HYPE, LINK) and overall balance.
 Be honest, direct and actionable.`;
 
     const claudeResponse = await anthropic.messages.create({
-      model: 'claude-sonnet-4-5-20251001',
+      model: 'claude-sonnet-4-6',
       max_tokens: isSingleCoin ? 1500 : 3500,
       tools: [{ type: "web_search_20250305", name: "web_search" }],
       messages: [{ role: 'user', content: prompt }]
@@ -4062,14 +4063,31 @@ async function analyseTrailingStopAlert(symbol, currentPrice, peakPrice, trailPc
 
     const prefsContext = traderPrefs.map(p => `${p.preference_key}: ${p.preference_value}`).join('\n');
 
-    const dynamicContent =
-`You are analysing a trailing stop alert for a disciplined swing trader.
+    const staticSystemPrompt =
+`You are a disciplined swing trader's AI assistant, analysing trailing stop alerts.
 
-## TRADER PROFILE
-${prefsContext || `Strategy: Extreme move swing trader
-Principles: Trend is friend, trailing stops, ladder out on MSS, never sell 100%
-MSS: Price breaks previous Higher Low after failing to make new Higher High
-Moon bag: Always keep 25% of position`}
+## TRADING STRATEGY (STATIC)
+Strategy: Extreme move swing trader — buys dips, sells pumps on macro moves
+Principles: Trend is friend, trailing stops protect gains, ladder out on MSS, never sell 100%
+MSS definition: Price breaks previous Higher Low after failing to make new Higher High
+Moon bag rule: Always keep 25% of position — never sell everything
+
+## YOUR ANALYSIS TASK
+1. Is this a genuine Market Structure Shift or normal consolidation/pullback?
+2. Does the trade history suggest this coin is in a profitable trend worth holding?
+3. What does the drop size tell you — panic selling or healthy retracement?
+4. Considering the active auto rules, what manual action if any is needed?
+
+Respond in exactly this format:
+RECOMMENDATION: [SELL 25% / HOLD / RESET STOP / BUY MORE / SELL ALL]
+REASON: [one clear sentence referencing the trade history]
+WATCH: [$price — what to monitor next]
+CONFIDENCE: [High/Medium/Low]
+CONTEXT: [one sentence on what the journal history tells you]`;
+
+    const dynamicUserMessage =
+`## TRADER PROFILE (from DB)
+${prefsContext || 'No preferences stored — use strategy defaults above'}
 
 ## CURRENT ALERT — ${coinBase}
 Exchange: ${exchange === 'kraken' ? 'Kraken' : 'Revolut X'}
@@ -4085,36 +4103,25 @@ P&L from entry: ${plPct !== null ? (plPct > 0 ? '+' : '') + plPct.toFixed(1) + '
 ${journalContext}
 
 ## ACTIVE AUTO RULES FOR ${coinBase}
-${rulesContext}
-
-## YOUR ANALYSIS TASK
-1. Is this a genuine Market Structure Shift or normal consolidation/pullback?
-2. Does the trade history suggest this coin is in a profitable trend worth holding?
-3. What does the drop size tell you — panic selling or healthy retracement?
-4. Considering the active auto rules, what manual action if any is needed?
-
-Respond in exactly this format:
-RECOMMENDATION: [SELL 25% / HOLD / RESET STOP / BUY MORE / SELL ALL]
-REASON: [one clear sentence referencing the trade history]
-WATCH: [$price — what to monitor next]
-CONFIDENCE: [High/Medium/Low]
-CONTEXT: [one sentence on what the journal history tells you]`;
+${rulesContext}`;
 
     console.log(`[analysis] Calling Claude API (30s timeout)...`);
 
     // 30-second timeout via Promise.race
     const claudeCall = anthropic.messages.create({
-      model: 'claude-sonnet-4-5-20251001',
+      model: 'claude-sonnet-4-6',
       max_tokens: 400,
-      messages: [{ role: 'user', content: dynamicContent }]
+      system: [{ type: 'text', text: staticSystemPrompt, cache_control: { type: 'ephemeral' } }],
+      messages: [{ role: 'user', content: dynamicUserMessage }]
     });
     const timeoutPromise = new Promise((_, reject) =>
       setTimeout(() => reject(new Error('Claude API timeout after 30s')), 30000)
     );
     const msg = await Promise.race([claudeCall, timeoutPromise]);
 
-    console.log(`[analysis] Claude API responded — usage: in=${msg.usage?.input_tokens} out=${msg.usage?.output_tokens} cache_read=${msg.usage?.cache_read_input_tokens || 0}`);
-    await logClaudeCall(`trailing stop analysis (${coinBase})`, msg.model || 'claude-sonnet-4-5-20251001', msg.usage);
+    console.log(`[analysis] Claude API responded — usage: in=${msg.usage?.input_tokens} out=${msg.usage?.output_tokens} cache_read=${msg.usage?.cache_read_input_tokens || 0} cache_write=${msg.usage?.cache_creation_input_tokens || 0}`);
+    console.log(`[cache] trailing stop (${coinBase}): read=${msg.usage?.cache_read_input_tokens || 0} write=${msg.usage?.cache_creation_input_tokens || 0} uncached=${msg.usage?.input_tokens || 0}`);
+    await logClaudeCall(`trailing stop analysis (${coinBase})`, msg.model || 'claude-sonnet-4-6', msg.usage);
 
     const analysis = msg.content?.[0]?.text;
     if (!analysis) throw new Error(`Claude returned empty content: ${JSON.stringify(msg.content)}`);
@@ -4247,12 +4254,25 @@ async function analyseFixedTargetAlert(symbol, currentPrice, target) {
 
     const prefsContext = traderPrefs.map(p => `${p.preference_key}: ${p.preference_value}`).join('\n');
 
-    const targetPrompt =
-`You are analysing a price target alert for a disciplined swing trader.
+    const staticTargetSystemPrompt =
+`You are a disciplined swing trader's AI assistant, analysing price target alerts.
 
-## TRADER PROFILE
-${prefsContext || `Strategy: Extreme move swing trader — buys dips, sells pumps, never sells 100% (keeps moon bag)
-Moon bag: Always keep 25% of position`}
+## TRADING STRATEGY (STATIC)
+Strategy: Extreme move swing trader — buys dips, sells pumps on macro moves
+Moon bag rule: Always keep 25% of position — never sell everything
+Principles: Ladder out on the way up, never chase, protect gains with trailing stops
+
+Should the trader take profits now, hold for more, or ladder out?
+
+Respond in exactly this format:
+RECOMMENDATION: [SELL / HOLD / LADDER]
+REASON: [one clear sentence referencing the trade history]
+NEXT TARGET: [$price if holding, or 'n/a' if selling]
+CONFIDENCE: [High/Medium/Low]`;
+
+    const dynamicTargetMessage =
+`## TRADER PROFILE (from DB)
+${prefsContext || 'No preferences stored — use strategy defaults above'}
 
 ## TARGET HIT — ${coinBase}
 Direction: ${target.direction}
@@ -4263,29 +4283,23 @@ P&L from entry: ${entryPrice ? ((currentPrice - entryPrice) / entryPrice * 100).
 ${target.note ? 'Note: ' + target.note : ''}
 
 ## LAST 5 TRADES FOR ${coinBase}
-${journalContext}
-
-Should Bryan take profits now, hold for more, or ladder out?
-
-Respond in exactly this format:
-RECOMMENDATION: [SELL / HOLD / LADDER]
-REASON: [one clear sentence referencing the trade history]
-NEXT TARGET: [$price if holding, or 'n/a' if selling]
-CONFIDENCE: [High/Medium/Low]`;
+${journalContext}`;
 
     console.log(`[analysis] Calling Claude API (30s timeout)...`);
     const claudeCall = anthropic.messages.create({
-      model: 'claude-sonnet-4-5-20251001',
+      model: 'claude-sonnet-4-6',
       max_tokens: 300,
-      messages: [{ role: 'user', content: targetPrompt }]
+      system: [{ type: 'text', text: staticTargetSystemPrompt, cache_control: { type: 'ephemeral' } }],
+      messages: [{ role: 'user', content: dynamicTargetMessage }]
     });
     const timeoutPromise = new Promise((_, reject) =>
       setTimeout(() => reject(new Error('Claude API timeout after 30s')), 30000)
     );
     const msg = await Promise.race([claudeCall, timeoutPromise]);
 
-    console.log(`[analysis] Claude API responded — usage: in=${msg.usage?.input_tokens} out=${msg.usage?.output_tokens}`);
-    await logClaudeCall(`fixed target analysis (${coinBase})`, msg.model || 'claude-sonnet-4-5-20251001', msg.usage);
+    console.log(`[analysis] Claude API responded — usage: in=${msg.usage?.input_tokens} out=${msg.usage?.output_tokens} cache_read=${msg.usage?.cache_read_input_tokens || 0} cache_write=${msg.usage?.cache_creation_input_tokens || 0}`);
+    console.log(`[cache] fixed target (${coinBase}): read=${msg.usage?.cache_read_input_tokens || 0} write=${msg.usage?.cache_creation_input_tokens || 0} uncached=${msg.usage?.input_tokens || 0}`);
+    await logClaudeCall(`fixed target analysis (${coinBase})`, msg.model || 'claude-sonnet-4-6', msg.usage);
 
     const analysis = msg.content?.[0]?.text;
     if (!analysis) throw new Error(`Claude returned empty content: ${JSON.stringify(msg.content)}`);
@@ -7066,7 +7080,7 @@ app.post('/api/research-dust', async (req, res) => {
       const price = await getCurrentPrice(`${coin}-USD`).catch(() => null);
       const priceStr = price ? `current price $${price.toFixed(8)}` : 'price not available';
       const response = await anthropic.messages.create({
-        model: 'claude-sonnet-4-5-20251001',
+        model: 'claude-sonnet-4-6',
         max_tokens: 600,
         tools: [{ type: 'web_search_20250305', name: 'web_search' }],
         messages: [{ role: 'user', content: `Research ${coin} crypto (${priceStr}). Bryan holds a small dust position. Search for: current project status, recent news, team activity, any upcoming catalysts. Give a clear verdict: ACCUMULATE / HOLD / DUMP. Under 400 words.` }]
@@ -8613,7 +8627,7 @@ app.post('/telegram-webhook', async (req, res) => {
             try {
               if (swAction === 'sell') {
                 const r = await anthropic.messages.create({
-                  model: 'claude-sonnet-4-5-20251001',
+                  model: 'claude-sonnet-4-6',
                   max_tokens: 600,
                   tools: [{ type: 'web_search_20250305', name: 'web_search' }],
                   messages: [{ role: 'user', content: `Sell advice for ${swSymbol}. Current price: ${fmtPriceShort(currentPrice)}. Extreme pump signal — ${((swCtx.price > 0 ? (currentPrice - swCtx.price) / swCtx.price * 100 : 0)).toFixed(1)}% above baseline. Take profits now or wait? Give specific sell price levels and a buy-back level for re-entry after retrace. Under 250 words.` }]
@@ -8631,7 +8645,7 @@ app.post('/telegram-webhook', async (req, res) => {
 
               } else { // buy
                 const r = await anthropic.messages.create({
-                  model: 'claude-sonnet-4-5-20251001',
+                  model: 'claude-sonnet-4-6',
                   max_tokens: 600,
                   tools: [{ type: 'web_search_20250305', name: 'web_search' }],
                   messages: [{ role: 'user', content: `Buy advice for ${swSymbol}. Current price: ${fmtPriceShort(currentPrice)}. Extreme dip signal — ${((swCtx.price > 0 ? (swCtx.price - currentPrice) / swCtx.price * 100 : 0)).toFixed(1)}% below baseline. Good buy opportunity? Give specific entry levels and a profit-taking target. Under 250 words.` }]
@@ -8675,7 +8689,7 @@ app.post('/telegram-webhook', async (req, res) => {
       (async () => {
         try {
           const response = await anthropic.messages.create({
-            model: 'claude-sonnet-4-5-20251001',
+            model: 'claude-sonnet-4-6',
             max_tokens: 600,
             tools: [{ type: "web_search_20250305", name: "web_search" }],
             messages: [{ role: 'user', content: `Give specific, actionable sell advice for ${symbol}. Search for current price and market conditions. Should I sell now or wait? Give a clear recommendation with 1-2 price levels to target. Under 300 words.` }]
@@ -8711,7 +8725,7 @@ app.post('/telegram-webhook', async (req, res) => {
       (async () => {
         try {
           const response = await anthropic.messages.create({
-            model: 'claude-sonnet-4-5-20251001',
+            model: 'claude-sonnet-4-6',
             max_tokens: 600,
             tools: [{ type: "web_search_20250305", name: "web_search" }],
             messages: [{ role: 'user', content: `Give specific, actionable advice on buying more ${symbol}. Search for current price and market conditions. Is now a good DCA entry? What's the risk/reward? Under 300 words.` }]
@@ -9032,7 +9046,7 @@ app.post('/telegram-webhook', async (req, res) => {
           const price = await getCurrentPrice(symbol).catch(() => null);
           const priceStr = price ? `current price $${price < 0.001 ? price.toFixed(8) : price.toFixed(4)}` : '';
           const response = await anthropic.messages.create({
-            model: 'claude-sonnet-4-5-20251001',
+            model: 'claude-sonnet-4-6',
             max_tokens: 700,
             tools: [{ type: 'web_search_20250305', name: 'web_search' }],
             messages: [{ role: 'user', content: `Research ${coinBase} crypto ${priceStr}. Bryan may hold a dust position. Search for: project fundamentals, team, recent news, tokenomics, upcoming catalysts, any red flags. Give a clear verdict: ACCUMULATE / HOLD / DUMP with reasoning. Under 450 words.` }]
@@ -9402,7 +9416,7 @@ app.post('/telegram-webhook', async (req, res) => {
         ];
 
         const claudePromise = anthropic.messages.create({
-          model: 'claude-sonnet-4-5-20251001',
+          model: 'claude-sonnet-4-6',
           max_tokens: 4000,
           tools: [{
             type: "web_search_20250305",
@@ -9603,7 +9617,7 @@ Active alerts (coins currently above threshold): ${[...alertState.active.keys()]
           // FIX 3: Fallback simpler Claude call — no web search, max 30s, max_tokens 500
           try {
             const fallbackPromise = anthropic.messages.create({
-              model: 'claude-sonnet-4-5-20251001',
+              model: 'claude-sonnet-4-6',
               max_tokens: 500,
               system: `You are a crypto advisor. Here are the user's current holdings:\n${holdingsList || 'Portfolio data unavailable'}\nAnswer the user's question briefly in 2-3 sentences. Be direct and actionable.`,
               messages: [{ role: 'user', content: userMessage }],
