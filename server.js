@@ -1188,17 +1188,10 @@ function startTradeApprovalReminder(exchange) {
       return;
     }
 
-    // Send reminder
-    const minsLeft = ((maxReminders - reminderCount) * 2.5).toFixed(0);
+    // Send reminder using standard approval format
     await sendTelegram(
-      `🔔 <b>TRADE APPROVAL REMINDER ${reminderCount}/${maxReminders}</b>\n\n` +
-      `Exchange: ${exchangeLabel}\n` +
-      `Action: <b>${current.side.toUpperCase()} ${qtyDisplay} ${coinBase}</b>\n` +
-      `Price: ${current.price ? formatPrice(current.price) : 'market'}\n` +
-      `Value: ~${current.valueUSD ? '$' + current.valueUSD.toFixed(2) : 'unknown'}\n\n` +
-      `Reply <b>'approve trade'</b> or 👍 to execute\n` +
-      `Reply <b>'cancel trade'</b> or 👎 to abort\n\n` +
-      `⚠️ Auto-cancels in ${minsLeft} min if no response`
+      formatApprovalRequest(coinBase, current.side, current.volume || current.baseSize, current.price, current.valueUSD, exchange) +
+      `\n\n⏰ Reminder ${reminderCount}/${maxReminders} — auto-cancels in ${((maxReminders - reminderCount) * 2.5).toFixed(0)} min`
     ).catch(e => console.error('[trade reminder] telegram failed:', e.message));
     console.log(`[trade] Reminder ${reminderCount}/${maxReminders} sent for ${exchange} ${coinBase}`);
   }, reminderInterval);
@@ -1626,6 +1619,51 @@ async function logClaudeCall(reason, model, usage) {
     'INSERT INTO claude_api_calls (reason, model, input_tokens, output_tokens, cache_read_tokens, estimated_cost) VALUES (?, ?, ?, ?, ?, ?)',
     [reason, model, inputTokens, outputTokens, cacheReadTokens, cost.toFixed(6)]
   ).catch(e => console.warn('[claude_log]', e.message));
+}
+
+/*
+ * TELEGRAM MESSAGE TYPE RULES — DO NOT VIOLATE
+ *
+ * TYPE 1 — AI AUTO-EXECUTED 🤖
+ *   formatAutoExecuteMessage() — UNDO only, no numbered options
+ *
+ * TYPE 2 — SYSTEM ALERTS ⚠️
+ *   formatSystemAlert() — informational only, no numbered options, no response needed
+ *
+ * TYPE 3 — APPROVAL REQUIRED 🔔
+ *   formatApprovalRequest() — 👍/👎 only, auto-cancels after 12 min
+ *
+ * EXCEPTION — AI ANALYSIS 🧠
+ *   Numbered 1-5 options ONLY here — the ONE place that requests Bryan's decision
+ */
+
+function formatAutoExecuteMessage(coinBase, side, qty, price, valueUsd, reason, confidence) {
+  return (
+    `🤖 <b>AI EXECUTED — ${coinBase}</b>\n\n` +
+    `${side.toUpperCase()} ${formatTradeQty(qty)} ${coinBase} @ ${formatPrice(price)}\n` +
+    `Value: $${parseFloat(valueUsd).toFixed(2)}\n\n` +
+    `Reason: ${reason}\n` +
+    `Confidence: ${confidence}\n\n` +
+    `⏪ Reply <b>UNDO</b> within 2 min to reverse`
+  );
+}
+
+function formatSystemAlert(alertType, coinBase, details) {
+  return `⚠️ <b>${alertType} — ${coinBase}</b>\n\n${details}`;
+}
+
+function formatApprovalRequest(coinBase, side, qty, price, valueUsd, exchange) {
+  const exchangeLabel = exchange === 'revolut' ? 'Revolut X' : 'Kraken';
+  const qtyStr = qty ? `${formatTradeQty(qty)} ${coinBase}` : coinBase;
+  return (
+    `🔔 <b>APPROVAL NEEDED — ${coinBase}</b>\n\n` +
+    `Action: <b>${side.toUpperCase()} ${qtyStr}</b>\n` +
+    `Price: ~${price ? formatPrice(price) : 'market'}\n` +
+    `Value: ~$${valueUsd ? parseFloat(valueUsd).toFixed(2) : '?'}\n` +
+    `Exchange: ${exchangeLabel}\n\n` +
+    `👍 Execute  👎 Cancel\n` +
+    `⏰ Auto-cancels in 12 min if no response`
+  );
 }
 
 // FIX 3: Dust rule — skip API for positions worth < $5
@@ -4125,14 +4163,10 @@ CONTEXT: [one sentence on what the journal history tells you]`;
       pendingAnalysis.set(symbol, { type: 'trailing_stop', recommendation, analysis, price: currentPrice, timestamp: Date.now() });
       lastAlertContext.set(TELEGRAM_CHAT_ID, { symbol, coinBase, alertType: 'claude_analysis_trailing' });
       await sendTelegram(
-        `🧠 <b>CLAUDE ANALYSIS — ${coinBase}</b>\n\n` +
+        `🧠 <b>AI ANALYSIS — ${coinBase}</b>\n\n` +
         `${analysis}\n\n` +
         `─────────────────\n` +
-        `1️⃣ Sell now — take profits\n` +
-        `2️⃣ Hold — reset trailing stop\n` +
-        `3️⃣ Wait — monitor next candle\n` +
-        `4️⃣ Buy more — add to position\n` +
-        `5️⃣ Ignore — dismiss alert`
+        `<b>1</b> Sell  <b>2</b> Hold  <b>3</b> Wait  <b>4</b> Buy  <b>5</b> Dismiss`
       );
       console.log(`[analysis] Analysis sent to Telegram for ${coinBase} ✅`);
     }
@@ -4261,14 +4295,10 @@ CONFIDENCE: [High/Medium/Low]`;
     lastAlertContext.set(TELEGRAM_CHAT_ID, { symbol, coinBase, alertType: 'claude_analysis_target' });
 
     await sendTelegram(
-      `🧠 <b>CLAUDE ANALYSIS — ${coinBase} TARGET HIT</b>\n\n` +
+      `🧠 <b>AI ANALYSIS — ${coinBase} TARGET HIT</b>\n\n` +
       `${analysis}\n\n` +
       `─────────────────\n` +
-      `1️⃣ Sell — take profits\n` +
-      `2️⃣ Hold — wait for more\n` +
-      `3️⃣ Ladder — sell 25% only\n` +
-      `4️⃣ Set new target\n` +
-      `5️⃣ Dismiss`
+      `<b>1</b> Sell  <b>2</b> Hold  <b>3</b> Ladder  <b>4</b> New target  <b>5</b> Dismiss`
     );
     console.log(`[analysis] Fixed target analysis sent to Telegram for ${coinBase} ✅`);
 
@@ -4328,14 +4358,9 @@ async function autoExecuteSell(symbol, maxPct, analysis, confidence) {
     pendingUndo.set(symbol, { action: 'sell', qty: sellQty, price: currentPrice, timestamp: Date.now() });
     setTimeout(() => pendingUndo.delete(symbol), 2 * 60 * 1000);
 
-    await sendTelegram(
-      `🤖 <b>AI AUTO-EXECUTED — ${coinBase}</b>\n\n` +
-      `✅ SELL ${sellQty.toFixed(4)} ${coinBase}\n` +
-      `@ $${currentPrice.toFixed(4)} = $${valueUSD.toFixed(2)}\n\n` +
-      `Confidence: ${confidence}\n` +
-      `${analysis.split('\n')[0]}\n\n` +
-      `Reply UNDO within 2 min to reverse ⏪`
-    );
+    const reasonMatch = analysis.match(/REASON:\s*(.+)/i);
+    const reason = reasonMatch ? reasonMatch[1].trim() : 'Trailing stop triggered';
+    await sendTelegram(formatAutoExecuteMessage(coinBase, 'sell', sellQty, currentPrice, valueUSD, reason, confidence));
     console.log(`[auto-exec] SELL ${sellQty.toFixed(4)} ${coinBase} @ $${currentPrice.toFixed(4)}`);
   } catch (e) {
     console.error('[auto-exec] sell error:', e.message);
@@ -4374,14 +4399,15 @@ async function handleTrailingStopAlert(symbol, currentPrice, ts, exchange = 'rev
     : '';
   const exchLabel = exchange === 'kraken' ? '🦑 Kraken' : '🔄 Revolut X';
 
-  const alertMsg =
-    `⚠️ <b>TRAILING STOP TRIGGERED — ${coinBase}</b>\n\n` +
+  const alertMsg = formatSystemAlert(
+    'TRAILING STOP TRIGGERED', coinBase,
     `Exchange: ${exchLabel}\n` +
     `📉 Drop: ${dropFromPeak}% from peak\n` +
-    `Peak: ${fmtPriceShort(ts.peakPrice)} | Current: ${fmtPriceShort(currentPrice)}\n` +
-    `Trail: ${ts.trailPct}% | Stop level: ${fmtPriceShort(ts.stopPrice)}\n` +
+    `Peak: ${fmtPriceShort(ts.peakPrice)} → Current: ${fmtPriceShort(currentPrice)}\n` +
+    `Trail: ${ts.trailPct}% | Stop: ${fmtPriceShort(ts.stopPrice)}\n` +
     (entryLine ? entryLine + '\n' : '') +
-    `\n🧠 Running AI analysis...`;
+    `\n🧠 Running AI analysis...`
+  );
 
   await sendTelegram(alertMsg);
   lastAlertContext.set(TELEGRAM_CHAT_ID, { symbol, coinBase, alertType: 'trailing_stop' });
@@ -4428,14 +4454,9 @@ async function autoExecuteKrakenSell(symbol, maxPct, analysis, confidence) {
     pendingUndo.set(symbol, { action: 'sell', qty: sellQty, price: currentPrice, exchange: 'kraken', timestamp: Date.now() });
     setTimeout(() => pendingUndo.delete(symbol), 2 * 60 * 1000);
 
-    await sendTelegram(
-      `🤖 <b>AI AUTO-EXECUTED — ${coinBase} (Kraken)</b>\n\n` +
-      `✅ SELL ${sellQty.toFixed(4)} ${coinBase}\n` +
-      `@ $${currentPrice.toFixed(4)} = $${valueUSD.toFixed(2)}\n\n` +
-      `Confidence: ${confidence}\n` +
-      `${analysis.split('\n')[0]}\n\n` +
-      `Reply UNDO within 2 min to reverse ⏪`
-    );
+    const reasonMatch = analysis.match(/REASON:\s*(.+)/i);
+    const reason = reasonMatch ? reasonMatch[1].trim() : 'Trailing stop triggered (Kraken)';
+    await sendTelegram(formatAutoExecuteMessage(coinBase, 'sell', sellQty, currentPrice, valueUSD, reason, confidence));
     console.log(`[auto-exec] Kraken SELL ${sellQty.toFixed(4)} ${coinBase} @ $${currentPrice.toFixed(4)}`);
   } catch (e) {
     console.error('[auto-exec] Kraken sell error:', e.message);
@@ -4692,9 +4713,10 @@ async function checkAutoTradeRules(priceMap) {
           const cashSuffix = remainingUSD !== null && remainingUSD < 20
             ? ` ⚠️ $${remainingUSD.toFixed(0)} cash left`
             : '';
-          await sendTelegram(
-            `${tradeIcon} ${actionTag} ${formatTradeQty(resolvedVolume)} ${coinBase} @ ${formatPrice(currentPrice)} = $${valueUsd.toFixed(2)} ${exchIcon}${cashSuffix}`
-          );
+          await sendTelegram(formatSystemAlert(actionTag, coinBase,
+            `${tradeIcon} ${formatTradeQty(resolvedVolume)} ${coinBase} @ ${formatPrice(currentPrice)} = $${valueUsd.toFixed(2)} ${exchIcon}\n` +
+            `Rule: ${rule.rule_type}${volLabel}${cashSuffix ? '\n' + cashSuffix : ''}`
+          ));
 
           // Part 3: Low cash warning — once per day per exchange after any trade
           if (remainingUSD !== null && remainingUSD < 20) {
@@ -4702,15 +4724,11 @@ async function checkAutoTradeRules(priceMap) {
             const lastLowCashAlert = lowCashAlerted.get(exchange);
             if (lastLowCashAlert !== today) {
               lowCashAlerted.set(exchange, today);
-              await sendTelegram(
-                `💸 <b>LOW CASH WARNING — ${exchangeLabel}</b>\n\n` +
-                `${exchangeLabel} cash: $${remainingUSD.toFixed(2)}\n\n` +
-                `Buy-back rules may not execute if cash runs out. Consider:\n` +
-                `• Enabling USDT sweep on more coins\n` +
-                `• Selling a position to free up cash\n` +
-                `• Depositing additional funds\n\n` +
-                `Current USDT sweep: ${sweepEnabled ? `ON ✅ (${sweepPct}%)` : 'OFF ❌'}`
-              ).catch(() => {});
+              await sendTelegram(formatSystemAlert('LOW CASH WARNING', exchangeLabel,
+                `Balance: $${remainingUSD.toFixed(2)}\n` +
+                `Buy-back rules may not execute.\n` +
+                `USDT sweep: ${sweepEnabled ? `ON ✅ (${sweepPct}%)` : 'OFF ❌'}`
+              )).catch(() => {});
             }
           }
 
@@ -4895,7 +4913,10 @@ async function checkPortfolio() {
               'INSERT INTO balance_snapshots (symbol, quantity) VALUES (?, ?) ON DUPLICATE KEY UPDATE quantity = VALUES(quantity)',
               ['USDT-USD', currentUSDT]
             );
-            await sendTelegram(`💳 PAYMENT $${usdtDecrease.toFixed(2)} — capital updated`);
+            await sendTelegram(formatSystemAlert('PAYMENT DETECTED', 'USDT',
+              `$${usdtDecrease.toFixed(2)} spent via debit card\n` +
+              `Capital: $${totalInvestedCapital.toFixed(2)} → $${newCapital.toFixed(2)}`
+            ));
             console.log(`[usdt] Payment auto-logged — capital $${prevCapital.toFixed(2)} → $${newCapital.toFixed(2)}`);
             } // end dedup guard else
             } // end swap guard else
@@ -6889,17 +6910,7 @@ function createMcpServer() {
         pendingKrakenTrade = { symbol: sym, side, orderType: order_type, volume: volume || 0, price: livePrice, valueUSD: tradeValueUSD, timestamp: Date.now(), source: 'claude_mcp' };
       }
 
-      await sendTelegram(
-        `🔔 <b>TRADE APPROVAL REQUIRED</b>\n\n` +
-        `Exchange: ${exchangeLabel}\n` +
-        `Action: <b>${side.toUpperCase()} ${displayQty}${value_usd ? ` of ${coinBase}` : ''}</b>\n` +
-        `Type: ${order_type}\n` +
-        `Price: ${livePrice ? formatPrice(livePrice) : 'market'}\n` +
-        `Value: ~${tradeValueUSD ? '$' + tradeValueUSD.toFixed(2) : 'unknown'}\n\n` +
-        `Reply <b>'approve trade'</b> or 👍 to execute\n` +
-        `Reply <b>'cancel trade'</b> or 👎 to abort\n\n` +
-        `⏱ Auto-cancels in ~12 minutes if no response`
-      );
+      await sendTelegram(formatApprovalRequest(coinBase, side, volume || null, livePrice, tradeValueUSD, exchange));
 
       // Start reminder cycle — first reminder after 2.5 minutes
       setTimeout(() => startTradeApprovalReminder(exchange), 2.5 * 60 * 1000);
