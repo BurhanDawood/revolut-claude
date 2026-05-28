@@ -277,7 +277,8 @@ const lastSwingAlertContext = new Map();     // symbol -> { direction: 'pump'|'d
 const swingAlertCooldown = new Map();        // symbol -> timestamp — prevents repeated swing signals (4h cooldown, 6h after reply)
 const autoSkipAlerted = new Map();           // symbol -> timestamp — throttles "auto buy skipped" Telegram messages (1h cooldown)
 const lowCashAlerted = new Map();            // exchange -> date string — throttles low-cash warnings to once per day per exchange
-const lastAlertContext = new Map();          // chatId -> { symbol, coinBase, alertType } — powers numbered reply shortcuts
+const alertContextBySymbol = new Map();      // coinBase.toLowerCase() -> { symbol, coinBase, alertType, timestamp } — powers numbered reply shortcuts
+let lastAlertCoin = null;                    // most recently fired alert coin (lowercase) — used for plain number replies
 const ruleApproachAlerted = new Map();       // ruleId -> timestamp — tracks 2% approach alerts so they don't spam
 let mostRecentSwingAlert = null;             // { symbol, coinBase, direction, price, timestamp } — for 👍 / natural language
 const alertRecommendations = new Map();      // symbol -> { rec, timestamp } — reused in reminders, no repeat API calls
@@ -4168,12 +4169,14 @@ ${rulesContext}`;
       }
     } else {
       pendingAnalysis.set(symbol, { type: 'trailing_stop', recommendation, analysis, price: currentPrice, timestamp: Date.now() });
-      lastAlertContext.set(TELEGRAM_CHAT_ID, { symbol, coinBase, alertType: 'claude_analysis_trailing' });
+      alertContextBySymbol.set(coinBase.toLowerCase(), { symbol, coinBase, alertType: 'claude_analysis_trailing', timestamp: Date.now() });
+      lastAlertCoin = coinBase.toLowerCase();
       await sendTelegram(
         `🧠 <b>AI ANALYSIS — ${coinBase}</b>\n\n` +
         `${analysis}\n\n` +
         `─────────────────\n` +
-        `<b>1</b> Sell  <b>2</b> Hold  <b>3</b> Wait  <b>4</b> Buy  <b>5</b> Dismiss`
+        `<b>1</b> Sell  <b>2</b> Hold  <b>3</b> Wait  <b>4</b> Buy  <b>5</b> Dismiss\n` +
+        `💬 Reply number or '<b>${coinBase.toLowerCase()} 2</b>' to target this coin`
       );
       console.log(`[analysis] Analysis sent to Telegram for ${coinBase} ✅`);
     }
@@ -4306,13 +4309,15 @@ ${journalContext}`;
     console.log(`[analysis] Fixed target analysis received: ${analysis.substring(0, 120)}`);
 
     pendingAnalysis.set(symbol, { type: 'fixed_target', analysis, price: currentPrice, timestamp: Date.now() });
-    lastAlertContext.set(TELEGRAM_CHAT_ID, { symbol, coinBase, alertType: 'claude_analysis_target' });
+    alertContextBySymbol.set(coinBase.toLowerCase(), { symbol, coinBase, alertType: 'claude_analysis_target', timestamp: Date.now() });
+    lastAlertCoin = coinBase.toLowerCase();
 
     await sendTelegram(
       `🧠 <b>AI ANALYSIS — ${coinBase} TARGET HIT</b>\n\n` +
       `${analysis}\n\n` +
       `─────────────────\n` +
-      `<b>1</b> Sell  <b>2</b> Hold  <b>3</b> Ladder  <b>4</b> New target  <b>5</b> Dismiss`
+      `<b>1</b> Sell  <b>2</b> Hold  <b>3</b> Ladder  <b>4</b> New target  <b>5</b> Dismiss\n` +
+      `💬 Reply number or '<b>${coinBase.toLowerCase()} 1</b>' to target this coin`
     );
     console.log(`[analysis] Fixed target analysis sent to Telegram for ${coinBase} ✅`);
 
@@ -4424,7 +4429,8 @@ async function handleTrailingStopAlert(symbol, currentPrice, ts, exchange = 'rev
   );
 
   await sendTelegram(alertMsg);
-  lastAlertContext.set(TELEGRAM_CHAT_ID, { symbol, coinBase, alertType: 'trailing_stop' });
+  alertContextBySymbol.set(coinBase.toLowerCase(), { symbol, coinBase, alertType: 'trailing_stop', timestamp: Date.now() });
+  lastAlertCoin = coinBase.toLowerCase();
   await acknowledgeAlert(symbol);
   trailingStopAlerted.set(symbol, Date.now());
   console.log(`[trailing] Stop triggered for ${symbol} @ ${fmtPriceShort(currentPrice)} on ${exchange}`);
@@ -5120,7 +5126,7 @@ async function checkPortfolio() {
         alertFirstSent.set(symbol, now);
         alertState.active.set(symbol, true); // signal to other parts of the code that pump alert is live
         const aiRec = alertRecommendations.get(symbol)?.rec || 'HOLD - Monitor the situation closely.';
-        const replyMenu = `\n\n1️⃣ Hold — acknowledge & set sell target\n2️⃣ Sell — get sell advice\n3️⃣ Buy more — get buy advice\n4️⃣ Analyse — full analysis\n5️⃣ Ignore — never alert again`;
+        const replyMenu = `\n\n1️⃣ Hold  2️⃣ Sell  3️⃣ Buy more  4️⃣ Analyse  5️⃣ Ignore\n💬 Reply number or '<b>${coinBase.toLowerCase()} 2</b>' to target this coin`;
         const swingPumpHint = `\n\n⚡ SWING SIGNAL: This pump may be your sell opportunity!\nCheck if this is outside normal range — if so, consider taking profits and setting a buy-back alert at ${fmtPriceShort(currentPrice * 0.85)} (-15%)`;
         const trailReminderPump = trailingStops.has(symbol)
           ? `\n\n📈 TREND IS YOUR FRIEND — Trailing stop is protecting your profits. Let it run unless structure breaks!`
@@ -5132,7 +5138,8 @@ async function checkPortfolio() {
           `⚡ RECOMMENDATION: ${aiRec}${swingPumpHint}${trailReminderPump}${replyMenu}\n\n` +
           `⏰ One reminder in 10 min if no response`;
         await sendTelegram(alertMessage);
-        lastAlertContext.set(TELEGRAM_CHAT_ID, { symbol, coinBase, alertType: 'pump' });
+        alertContextBySymbol.set(coinBase.toLowerCase(), { symbol, coinBase, alertType: 'pump', timestamp: Date.now() });
+        lastAlertCoin = coinBase.toLowerCase();
         } // end else (hasAgreedStrategy pump suppression)
       }
 
@@ -5177,7 +5184,7 @@ async function checkPortfolio() {
         alertFirstSent.set(symbol, now);
         activeDropAlerts.set(symbol, true); // signal to other parts of the code that drop alert is live
         const aiRec = alertRecommendations.get(symbol)?.rec || 'HOLD - Monitor the situation closely.';
-        const replyMenu = `\n\n1️⃣ Hold — acknowledge & set buy target\n2️⃣ Buy more — get buy the dip advice\n3️⃣ Sell — get sell advice\n4️⃣ Analyse — full analysis\n5️⃣ Ignore — never alert again`;
+        const replyMenu = `\n\n1️⃣ Hold  2️⃣ Buy more  3️⃣ Sell  4️⃣ Analyse  5️⃣ Ignore\n💬 Reply number or '<b>${coinBase.toLowerCase()} 2</b>' to target this coin`;
         const swingDropHint = `\n\n⚡ SWING SIGNAL: This drop may be your buy opportunity!\nCheck if this is outside normal range — if so, consider buying the dip and setting a sell alert at ${fmtPriceShort(currentPrice * 1.20)} (+20%)`;
         const alertMessage =
           `📉 <b>${symbol} DROP ALERT!</b>\n\n` +
@@ -5186,7 +5193,8 @@ async function checkPortfolio() {
           `⚡ RECOMMENDATION: ${aiRec}${swingDropHint}${replyMenu}\n\n` +
           `⏰ One reminder in 10 min if no response`;
         await sendTelegram(alertMessage);
-        lastAlertContext.set(TELEGRAM_CHAT_ID, { symbol, coinBase, alertType: 'drop' });
+        alertContextBySymbol.set(coinBase.toLowerCase(), { symbol, coinBase, alertType: 'drop', timestamp: Date.now() });
+        lastAlertCoin = coinBase.toLowerCase();
         } // end else (hasAgreedStrategy drop suppression)
       }
     }
@@ -5289,13 +5297,14 @@ async function checkPortfolio() {
             `'analyse ${coinBase}' — get fresh analysis before deciding\n` +
             `'hold ${coinBase}' — log decision to hold through this level`;
         } else {
-          const replyMenu = `\n\n1️⃣ Sell — get sell advice\n2️⃣ Hold — keep holding\n3️⃣ Analyse — full analysis\n4️⃣ Acknowledge — dismiss alert`;
+          const replyMenu = `\n\n1️⃣ Sell  2️⃣ Hold  3️⃣ Analyse  4️⃣ Acknowledge\n💬 Reply number or '<b>${coinBase.toLowerCase()} 1</b>' to target this coin`;
           const autoReady = await getAutomationReadiness(symbol, 'buy');
           const autoLine = autoReady ? `\n\n⚡ AUTO-READY: This setup has worked ${autoReady.winRate}% of the time (${autoReady.sampleSize} trades). Could be automated.` : '';
           alertMessage = `🎯 <b>${symbol} FIXED TARGET HIT!</b>\n\nAnchor: $${anchorStr} → Now $${priceStr} (+${changePct.toFixed(1)}%)${entryLine}\n\n⚡ RECOMMENDATION: ${aiRec}${replyMenu}${autoLine}`;
         }
         await sendTelegram(alertMessage);
-        lastAlertContext.set(TELEGRAM_CHAT_ID, { symbol, coinBase, alertType: 'fixed_target_up' });
+        alertContextBySymbol.set(coinBase.toLowerCase(), { symbol, coinBase, alertType: 'fixed_target_up', timestamp: Date.now() });
+        lastAlertCoin = coinBase.toLowerCase();
         // Auto-trigger Claude analysis for non-dust, non-claude_rec alerts
         if (!isDustCoin && !(upNoteData && upNoteData.source === 'claude_rec')) {
           analyseFixedTargetAlert(symbol, currentPrice, target)
@@ -5340,7 +5349,7 @@ async function checkPortfolio() {
 
         const entryPrice = entryPrices.get(symbol) || target.entryPrice;
         const plPct = entryPrice ? ((currentPrice - entryPrice) / entryPrice * 100).toFixed(1) : null;
-        const replyMenu = `\n\n1️⃣ Buy more — get buy the dip advice\n2️⃣ Hold — keep holding\n3️⃣ Sell — get sell advice\n4️⃣ Acknowledge — dismiss alert`;
+        const replyMenu = `\n\n1️⃣ Buy more  2️⃣ Hold  3️⃣ Sell  4️⃣ Acknowledge\n💬 Reply number or '<b>${coinBase.toLowerCase()} 1</b>' to target this coin`;
 
         let alertMessage;
         let noteData = null;
@@ -5370,7 +5379,8 @@ async function checkPortfolio() {
           alertMessage = `📉 <b>${symbol} FIXED FLOOR HIT!</b>\n\nAnchor: ${formatPrice(target.anchorPrice)} → Now ${formatPrice(currentPrice)} (${changePct.toFixed(1)}%)${entryLine}\n\n⚡ RECOMMENDATION: ${aiRec}${replyMenu}${autoLine}`;
         }
         await sendTelegram(alertMessage);
-        lastAlertContext.set(TELEGRAM_CHAT_ID, { symbol, coinBase, alertType: 'fixed_target_down' });
+        alertContextBySymbol.set(coinBase.toLowerCase(), { symbol, coinBase, alertType: 'fixed_target_down', timestamp: Date.now() });
+        lastAlertCoin = coinBase.toLowerCase();
 
         targetReminderCount.set(symbol, 0); // reset counter when first alert fires
         activeFixedAlerts.set(symbol, setInterval(async () => {
@@ -7366,6 +7376,181 @@ app.post('/api/kraken/trade', async (req, res) => {
   }
 });
 
+// ── processAlertChoice — handles numbered responses for any alert type ────────
+// Called from both coin-prefixed ('xlm 1') and plain number ('1') handlers.
+// ctx = { symbol, coinBase, alertType }   choice = integer 1–5
+async function processAlertChoice(ctx, choice, sendReply) {
+  const { symbol, coinBase, alertType } = ctx;
+
+  // ── Claude analysis responses (trailing stop or fixed target) ─────────────
+  if (alertType === 'claude_analysis_trailing' || alertType === 'claude_analysis_target') {
+    const pending = pendingAnalysis.get(symbol);
+    pendingAnalysis.delete(symbol);
+
+    if (choice === 1) {
+      const currentPrice = await getCurrentPrice(symbol).catch(() => null);
+      if (!currentPrice) { await sendReply(`⚠️ Could not fetch ${coinBase} price`); return; }
+      const balancesNow = await revolutRequest('GET', '/balances').catch(() => []);
+      const asset = balancesNow.find(b => b.currency === coinBase);
+      const currentQty = parseFloat(asset?.available || 0);
+      if (currentQty <= 0) { await sendReply(`⚠️ No ${coinBase} balance found — nothing to sell`); return; }
+      const sellQty = currentQty * 0.25;
+      const valueUSD = sellQty * currentPrice;
+      pendingRevolutTrade = { symbol, side: 'sell', orderType: 'market', baseSize: sellQty, price: currentPrice, valueUSD, timestamp: Date.now(), source: 'claude_analysis' };
+      await db.execute(
+        `INSERT INTO trade_intentions (symbol, action, reasoning, emotion, expires_at) VALUES (?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL 1 HOUR))`,
+        [symbol, 'sell', `Claude analysis: SELL after trailing stop alert — ladder 25% out`, 'confident']
+      ).catch(() => {});
+      await sendReply(
+        `🔔 <b>SELL REQUEST — ${coinBase}</b>\n\n` +
+        `Selling 25% = ${sellQty.toFixed(4)} ${coinBase}\n` +
+        `@ ~$${currentPrice.toFixed(4)} = ~$${valueUSD.toFixed(2)}\n\n` +
+        `👍 approve  👎 cancel\n` +
+        `Auto-cancels in 12.5 min if no response`
+      );
+      setTimeout(() => startTradeApprovalReminder('revolut'), 2.5 * 60 * 1000);
+
+    } else if (choice === 2) {
+      const currentPrice = await getCurrentPrice(symbol).catch(() => null);
+      if (currentPrice && trailingStops.has(symbol)) {
+        await setTrailingStop(symbol, trailingStops.get(symbol).trailPct, currentPrice, entryPrices.get(symbol));
+        await sendReply(`✅ Trailing stop reset for ${coinBase}\nNew peak: ${fmtPriceShort(currentPrice)} | Stop: ${fmtPriceShort(trailingStops.get(symbol)?.stopPrice)}`);
+      } else {
+        await sendReply(`✅ ${coinBase} — holding noted`);
+      }
+
+    } else if (choice === 3) {
+      if (pending?.type === 'fixed_target') {
+        const currentPrice = await getCurrentPrice(symbol).catch(() => null);
+        if (!currentPrice) { await sendReply(`⚠️ Could not fetch ${coinBase} price`); return; }
+        const balancesNow = await revolutRequest('GET', '/balances').catch(() => []);
+        const asset = balancesNow.find(b => b.currency === coinBase);
+        const currentQty = parseFloat(asset?.available || 0);
+        const sellQty = currentQty * 0.25;
+        const valueUSD = sellQty * currentPrice;
+        pendingRevolutTrade = { symbol, side: 'sell', orderType: 'market', baseSize: sellQty, price: currentPrice, valueUSD, timestamp: Date.now(), source: 'claude_analysis' };
+        await sendReply(
+          `🔔 <b>LADDER SELL — ${coinBase}</b>\n\n` +
+          `Selling 25% = ${sellQty.toFixed(4)} ${coinBase}\n` +
+          `@ ~$${currentPrice.toFixed(4)} = ~$${valueUSD.toFixed(2)}\n\n` +
+          `👍 approve  👎 cancel`
+        );
+        setTimeout(() => startTradeApprovalReminder('revolut'), 2.5 * 60 * 1000);
+      } else {
+        alertState.acknowledged.set(symbol, Date.now());
+        setTimeout(() => { alertState.acknowledged.delete(symbol); }, 30 * 60 * 1000);
+        await sendReply(`⏳ ${coinBase} — watching for 30 min, then alert resumes`);
+      }
+
+    } else if (choice === 4) {
+      const currentPrice = await getCurrentPrice(symbol).catch(() => null);
+      if (!currentPrice) { await sendReply(`⚠️ Could not fetch ${coinBase} price`); return; }
+      const balancesNow = await revolutRequest('GET', '/balances').catch(() => []);
+      const usdAsset = balancesNow.find(b => b.currency === 'USD' || b.currency === 'USDT');
+      const availableUSD = parseFloat(usdAsset?.available || 0);
+      if (availableUSD < 10) { await sendReply(`⚠️ Insufficient USD to buy ${coinBase}\nAvailable: $${availableUSD.toFixed(2)} (min $10)`); return; }
+      const buyUSD = Math.min(availableUSD * 0.50, availableUSD - 5);
+      const buyQty = buyUSD / currentPrice;
+      pendingRevolutTrade = { symbol, side: 'buy', orderType: 'market', baseSize: buyQty, price: currentPrice, valueUSD: buyUSD, timestamp: Date.now(), source: 'claude_analysis' };
+      await db.execute(
+        `INSERT INTO trade_intentions (symbol, action, reasoning, emotion, expires_at) VALUES (?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL 1 HOUR))`,
+        [symbol, 'buy', `Claude analysis: adding to ${coinBase} after trailing stop consolidation signal`, 'confident']
+      ).catch(() => {});
+      await sendReply(
+        `🔔 <b>BUY REQUEST — ${coinBase}</b>\n\n` +
+        `Buying $${buyUSD.toFixed(2)} worth = ${buyQty.toFixed(4)} ${coinBase}\n` +
+        `@ ~$${currentPrice.toFixed(4)}\n` +
+        `Available USD: $${availableUSD.toFixed(2)}\n\n` +
+        `👍 approve  👎 cancel\n` +
+        `Auto-cancels in 12.5 min if no response`
+      );
+      setTimeout(() => startTradeApprovalReminder('revolut'), 2.5 * 60 * 1000);
+
+    } else if (choice === 5) {
+      await acknowledgeAlert(symbol);
+      await sendReply(`🔕 ${coinBase} alert dismissed`);
+    }
+    return;
+  }
+
+  // ── Pump / drop / trailing_stop / fixed_target alerts ─────────────────────
+  const num = choice.toString();
+  let action = null;
+  if (alertType === 'pump') {
+    action = { '1': 'hold', '2': 'sell', '3': 'buy', '4': 'analyse', '5': 'ignore' }[num];
+  } else if (alertType === 'drop') {
+    action = { '1': 'hold', '2': 'buy', '3': 'sell', '4': 'analyse', '5': 'ignore' }[num];
+  } else if (alertType === 'trailing_stop') {
+    action = { '1': 'hold', '2': 'sell', '3': 'acknowledge' }[num];
+  } else if (alertType === 'fixed_target_up') {
+    action = { '1': 'sell', '2': 'hold', '3': 'analyse', '4': 'acknowledge' }[num];
+  } else if (alertType === 'fixed_target_down') {
+    action = { '1': 'buy', '2': 'hold', '3': 'sell', '4': 'acknowledge' }[num];
+  }
+
+  if (!action) {
+    await sendReply(`⚠️ Option ${choice} not valid for this ${coinBase} ${alertType} alert`);
+    return;
+  }
+
+  console.log(`[alert] choice ${num} → '${action} ${coinBase}' (alertType: ${alertType})`);
+
+  if (action === 'ignore') {
+    ignoredCoins.add(symbol);
+    await sendReply(`🔕 ${coinBase} added to ignore list — no more alerts.`);
+    return;
+  }
+  if (action === 'acknowledge') {
+    alertState.acknowledged.set(symbol, Date.now());
+    await sendReply(`✅ ${coinBase} alert acknowledged.`);
+    return;
+  }
+  if (action === 'hold' && alertType === 'trailing_stop') {
+    const ts = trailingStops.get(symbol);
+    if (ts) {
+      const currentPrice = await getCurrentPrice(symbol).catch(() => null);
+      if (currentPrice) {
+        ts.peakPrice = currentPrice;
+        ts.stopPrice = currentPrice * (1 - ts.trailPct / 100);
+        trailingStops.set(symbol, ts);
+        await sendReply(`📈 ${coinBase} trailing stop reset from ${fmtPriceShort(currentPrice)} — stop now at ${fmtPriceShort(ts.stopPrice)}`);
+      } else {
+        await sendReply(`✅ ${coinBase} hold noted — trail continues.`);
+      }
+    }
+    return;
+  }
+  if (action === 'hold') {
+    alertState.acknowledged.set(symbol, Date.now());
+    await sendReply(`✅ ${coinBase} — holding noted. Alert acknowledged.`);
+    return;
+  }
+  if (action === 'sell') {
+    await sendReply(`📊 Getting sell advice for <b>${coinBase}</b>…`);
+    const currentPrice = await getCurrentPrice(symbol).catch(() => null);
+    const changePct = currentPrice && basePrices[symbol] ? ((currentPrice - basePrices[symbol]) / basePrices[symbol] * 100) : 0;
+    const advice = await getQuickAiRecommendation(symbol, changePct, currentPrice, 'up', 'user requested sell advice via number shortcut');
+    await sendReply(`💡 <b>${coinBase} Sell Advice</b>\n\n${advice}`);
+    return;
+  }
+  if (action === 'buy') {
+    await sendReply(`📊 Getting buy advice for <b>${coinBase}</b>…`);
+    const currentPrice = await getCurrentPrice(symbol).catch(() => null);
+    const changePct = currentPrice && basePrices[symbol] ? ((currentPrice - basePrices[symbol]) / basePrices[symbol] * 100) : 0;
+    const advice = await getQuickAiRecommendation(symbol, changePct, currentPrice, 'down', 'user requested buy advice via number shortcut');
+    await sendReply(`💡 <b>${coinBase} Buy Advice</b>\n\n${advice}`);
+    return;
+  }
+  if (action === 'analyse') {
+    await sendReply(`🔍 Running full analysis for <b>${coinBase}</b>…`);
+    const currentPrice = await getCurrentPrice(symbol).catch(() => null);
+    const changePct = currentPrice && basePrices[symbol] ? ((currentPrice - basePrices[symbol]) / basePrices[symbol] * 100) : 0;
+    const analysis = await getQuickAiRecommendation(symbol, changePct, currentPrice, 'up', 'full analysis requested via number shortcut');
+    await sendReply(`📊 <b>${coinBase} Full Analysis</b>\n\n${analysis}`);
+    return;
+  }
+}
+
 // POST /telegram-webhook — handle incoming Telegram messages
 app.post('/telegram-webhook', async (req, res) => {
   try {
@@ -7389,211 +7574,35 @@ app.post('/telegram-webhook', async (req, res) => {
       });
     };
 
-    // --- Numbered reply shortcuts ---
+    // --- Alert reply shortcuts: coin-prefixed ('xlm 1') or plain number ('1') ---
     const chatIdStr = chatId.toString();
-    const numberReply = commandText.match(/^[1-5]$/);
 
-    // --- Claude Analysis numbered responses (1️⃣–5️⃣ after auto-analysis message) ---
-    if (numberReply && lastAlertContext.has(TELEGRAM_CHAT_ID)) {
-      const ctx = lastAlertContext.get(TELEGRAM_CHAT_ID);
-      if (ctx.alertType === 'claude_analysis_trailing' || ctx.alertType === 'claude_analysis_target') {
-        const { symbol, coinBase } = ctx;
-        const pending = pendingAnalysis.get(symbol);
-        const choice = parseInt(numberReply[0]);
-        pendingAnalysis.delete(symbol);
-        lastAlertContext.delete(TELEGRAM_CHAT_ID);
-
-        if (choice === 1) {
-          // SELL NOW — set up 25% ladder sell pending approval
-          const currentPrice = await getCurrentPrice(symbol).catch(() => null);
-          if (!currentPrice) { await sendReply(`⚠️ Could not fetch ${coinBase} price`); return res.status(200).json({ ok: true }); }
-          const balancesNow = await revolutRequest('GET', '/balances').catch(() => []);
-          const asset = balancesNow.find(b => b.currency === coinBase);
-          const currentQty = parseFloat(asset?.available || 0);
-          if (currentQty <= 0) {
-            await sendReply(`⚠️ No ${coinBase} balance found — nothing to sell`);
-            return res.status(200).json({ ok: true });
-          }
-          const sellQty = currentQty * 0.25;
-          const valueUSD = sellQty * currentPrice;
-          pendingRevolutTrade = { symbol, side: 'sell', orderType: 'market', baseSize: sellQty, price: currentPrice, valueUSD, timestamp: Date.now(), source: 'claude_analysis' };
-          await db.execute(
-            `INSERT INTO trade_intentions (symbol, action, reasoning, emotion, expires_at) VALUES (?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL 1 HOUR))`,
-            [symbol, 'sell', `Claude analysis: SELL after trailing stop alert — ladder 25% out`, 'confident']
-          ).catch(() => {});
-          await sendReply(
-            `🔔 <b>SELL REQUEST — ${coinBase}</b>\n\n` +
-            `Selling 25% = ${sellQty.toFixed(4)} ${coinBase}\n` +
-            `@ ~$${currentPrice.toFixed(4)} = ~$${valueUSD.toFixed(2)}\n\n` +
-            `👍 approve  👎 cancel\n` +
-            `Auto-cancels in 12.5 min if no response`
-          );
-          setTimeout(() => startTradeApprovalReminder('revolut'), 2.5 * 60 * 1000);
-
-        } else if (choice === 2) {
-          // HOLD — reset trailing stop from current price
-          const currentPrice = await getCurrentPrice(symbol).catch(() => null);
-          if (currentPrice && trailingStops.has(symbol)) {
-            await setTrailingStop(symbol, trailingStops.get(symbol).trailPct, currentPrice, entryPrices.get(symbol));
-            await sendReply(`✅ Trailing stop reset for ${coinBase}\nNew peak: ${fmtPriceShort(currentPrice)} | Stop: ${fmtPriceShort(trailingStops.get(symbol)?.stopPrice)}`);
-          } else {
-            await sendReply(`✅ ${coinBase} — holding noted`);
-          }
-
-        } else if (choice === 3) {
-          if (pending?.type === 'fixed_target') {
-            // LADDER SELL 25% for fixed target context
-            const currentPrice = await getCurrentPrice(symbol).catch(() => null);
-            if (!currentPrice) { await sendReply(`⚠️ Could not fetch ${coinBase} price`); return res.status(200).json({ ok: true }); }
-            const balancesNow = await revolutRequest('GET', '/balances').catch(() => []);
-            const asset = balancesNow.find(b => b.currency === coinBase);
-            const currentQty = parseFloat(asset?.available || 0);
-            const sellQty = currentQty * 0.25;
-            const valueUSD = sellQty * currentPrice;
-            pendingRevolutTrade = { symbol, side: 'sell', orderType: 'market', baseSize: sellQty, price: currentPrice, valueUSD, timestamp: Date.now(), source: 'claude_analysis' };
-            await sendReply(
-              `🔔 <b>LADDER SELL — ${coinBase}</b>\n\n` +
-              `Selling 25% = ${sellQty.toFixed(4)} ${coinBase}\n` +
-              `@ ~$${currentPrice.toFixed(4)} = ~$${valueUSD.toFixed(2)}\n\n` +
-              `👍 approve  👎 cancel`
-            );
-            setTimeout(() => startTradeApprovalReminder('revolut'), 2.5 * 60 * 1000);
-          } else {
-            // WAIT 30 min for trailing stop context
-            alertState.acknowledged.set(symbol, Date.now());
-            setTimeout(() => { alertState.acknowledged.delete(symbol); }, 30 * 60 * 1000);
-            await sendReply(`⏳ ${coinBase} — watching for 30 min, then alert resumes`);
-          }
-
-        } else if (choice === 4) {
-          // BUY MORE — check USD, set up pending buy
-          const currentPrice = await getCurrentPrice(symbol).catch(() => null);
-          if (!currentPrice) { await sendReply(`⚠️ Could not fetch ${coinBase} price`); return res.status(200).json({ ok: true }); }
-          const balancesNow = await revolutRequest('GET', '/balances').catch(() => []);
-          const usdAsset = balancesNow.find(b => b.currency === 'USD' || b.currency === 'USDT');
-          const availableUSD = parseFloat(usdAsset?.available || 0);
-          if (availableUSD < 10) {
-            await sendReply(`⚠️ Insufficient USD to buy ${coinBase}\nAvailable: $${availableUSD.toFixed(2)} (min $10)`);
-            return res.status(200).json({ ok: true });
-          }
-          const buyUSD = Math.min(availableUSD * 0.50, availableUSD - 5);
-          const buyQty = buyUSD / currentPrice;
-          pendingRevolutTrade = { symbol, side: 'buy', orderType: 'market', baseSize: buyQty, price: currentPrice, valueUSD: buyUSD, timestamp: Date.now(), source: 'claude_analysis' };
-          await db.execute(
-            `INSERT INTO trade_intentions (symbol, action, reasoning, emotion, expires_at) VALUES (?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL 1 HOUR))`,
-            [symbol, 'buy', `Claude analysis: adding to ${coinBase} after trailing stop consolidation signal`, 'confident']
-          ).catch(() => {});
-          await sendReply(
-            `🔔 <b>BUY REQUEST — ${coinBase}</b>\n\n` +
-            `Buying $${buyUSD.toFixed(2)} worth = ${buyQty.toFixed(4)} ${coinBase}\n` +
-            `@ ~$${currentPrice.toFixed(4)}\n` +
-            `Available USD: $${availableUSD.toFixed(2)}\n\n` +
-            `👍 approve  👎 cancel\n` +
-            `Auto-cancels in 12.5 min if no response`
-          );
-          setTimeout(() => startTradeApprovalReminder('revolut'), 2.5 * 60 * 1000);
-
-        } else if (choice === 5) {
-          // IGNORE — dismiss alert
-          await acknowledgeAlert(symbol);
-          await sendReply(`🔕 ${coinBase} alert dismissed`);
-        }
-
+    // Coin-prefixed reply: 'xlm 1', 'near 2', 'hft 5' etc.
+    const coinPrefixMatch = commandText.match(/^([a-z]+)\s+([1-5])$/);
+    if (coinPrefixMatch) {
+      const targetCoin = coinPrefixMatch[1].toLowerCase();
+      const choice = parseInt(coinPrefixMatch[2]);
+      const ctx = alertContextBySymbol.get(targetCoin);
+      if (!ctx) {
+        const available = [...alertContextBySymbol.keys()].map(c => c.toUpperCase()).join(', ') || 'none';
+        await sendReply(`⚠️ No active alert for <b>${targetCoin.toUpperCase()}</b>\nActive alerts: ${available}`);
         return res.status(200).json({ ok: true });
       }
+      alertContextBySymbol.delete(targetCoin);
+      if (lastAlertCoin === targetCoin) lastAlertCoin = null;
+      await processAlertChoice(ctx, choice, sendReply);
+      return res.status(200).json({ ok: true });
     }
 
-    if (numberReply && lastAlertContext.has(TELEGRAM_CHAT_ID)) {
-      const ctx = lastAlertContext.get(TELEGRAM_CHAT_ID);
-      const { symbol, coinBase, alertType } = ctx;
-      const num = numberReply[0];
-
-      // Map number to action based on alert type
-      let action = null;
-      if (alertType === 'pump') {
-        action = { '1': 'hold', '2': 'sell', '3': 'buy', '4': 'analyse', '5': 'ignore' }[num];
-      } else if (alertType === 'drop') {
-        action = { '1': 'hold', '2': 'buy', '3': 'sell', '4': 'analyse', '5': 'ignore' }[num];
-      } else if (alertType === 'trailing_stop') {
-        action = { '1': 'hold', '2': 'sell', '3': 'acknowledge' }[num];
-      } else if (alertType === 'fixed_target_up') {
-        action = { '1': 'sell', '2': 'hold', '3': 'analyse', '4': 'acknowledge' }[num];
-      } else if (alertType === 'fixed_target_down') {
-        action = { '1': 'buy', '2': 'hold', '3': 'sell', '4': 'acknowledge' }[num];
-      }
-
-      if (action) {
-        console.log(`[alert] Number reply ${num} → '${action} ${coinBase}' (alertType: ${alertType})`);
-        // Rewrite commandText to simulate coin-prefixed command and fall through
-        // We do this by delegating directly to the right handler
-        if (action === 'ignore') {
-          ignoredCoins.add(symbol);
-          await sendReply(`🔕 ${coinBase} added to ignore list — no more alerts.`);
-          lastAlertContext.delete(TELEGRAM_CHAT_ID);
-          return res.status(200).json({ ok: true });
-        }
-        if (action === 'acknowledge') {
-          alertState.acknowledged.set(symbol, Date.now());
-          await sendReply(`✅ ${coinBase} alert acknowledged.`);
-          lastAlertContext.delete(TELEGRAM_CHAT_ID);
-          return res.status(200).json({ ok: true });
-        }
-        if (action === 'hold' && alertType === 'trailing_stop') {
-          // Reset trailing stop from current price
-          const ts = trailingStops.get(symbol);
-          if (ts) {
-            const currentPrice = await getCurrentPrice(symbol).catch(() => null);
-            if (currentPrice) {
-              ts.peakPrice = currentPrice;
-              ts.stopPrice = currentPrice * (1 - ts.trailPct / 100);
-              trailingStops.set(symbol, ts);
-              await sendReply(`📈 ${coinBase} trailing stop reset from ${fmtPriceShort(currentPrice)} — stop now at ${fmtPriceShort(ts.stopPrice)}`);
-            } else {
-              await sendReply(`✅ ${coinBase} hold noted — trail continues.`);
-            }
-          }
-          lastAlertContext.delete(TELEGRAM_CHAT_ID);
-          return res.status(200).json({ ok: true });
-        }
-        if (action === 'hold') {
-          alertState.acknowledged.set(symbol, Date.now());
-          await sendReply(`✅ ${coinBase} — holding noted. Alert acknowledged.`);
-          lastAlertContext.delete(TELEGRAM_CHAT_ID);
-          return res.status(200).json({ ok: true });
-        }
-        // For sell / buy / analyse: synthesise the coin command and let the main handler process it
-        const syntheticCmd = action === 'buy' ? `buy more ${coinBase.toLowerCase()}` : `${action} ${coinBase.toLowerCase()}`;
-        // Reprocess as if the user typed the coin command
-        // Directly handle rather than re-routing to avoid webhook complexity
-        if (action === 'sell') {
-          await sendReply(`📊 Getting sell advice for <b>${coinBase}</b>…`);
-          const currentPrice = await getCurrentPrice(symbol).catch(() => null);
-          const changePct = currentPrice && basePrices[symbol] ? ((currentPrice - basePrices[symbol]) / basePrices[symbol] * 100) : 0;
-          const advice = await getQuickAiRecommendation(symbol, changePct, currentPrice, 'up', 'user requested sell advice via number shortcut');
-          await sendReply(`💡 <b>${coinBase} Sell Advice</b>\n\n${advice}`);
-          lastAlertContext.delete(TELEGRAM_CHAT_ID);
-          return res.status(200).json({ ok: true });
-        }
-        if (action === 'buy') {
-          await sendReply(`📊 Getting buy advice for <b>${coinBase}</b>…`);
-          const currentPrice = await getCurrentPrice(symbol).catch(() => null);
-          const changePct = currentPrice && basePrices[symbol] ? ((currentPrice - basePrices[symbol]) / basePrices[symbol] * 100) : 0;
-          const advice = await getQuickAiRecommendation(symbol, changePct, currentPrice, 'down', 'user requested buy advice via number shortcut');
-          await sendReply(`💡 <b>${coinBase} Buy Advice</b>\n\n${advice}`);
-          lastAlertContext.delete(TELEGRAM_CHAT_ID);
-          return res.status(200).json({ ok: true });
-        }
-        if (action === 'analyse') {
-          await sendReply(`🔍 Running full analysis for <b>${coinBase}</b>…`);
-          const currentPrice = await getCurrentPrice(symbol).catch(() => null);
-          const changePct = currentPrice && basePrices[symbol] ? ((currentPrice - basePrices[symbol]) / basePrices[symbol] * 100) : 0;
-          const analysis = await getQuickAiRecommendation(symbol, changePct, currentPrice, 'up', 'full analysis requested via number shortcut');
-          await sendReply(`📊 <b>${coinBase} Full Analysis</b>\n\n${analysis}`);
-          lastAlertContext.delete(TELEGRAM_CHAT_ID);
-          return res.status(200).json({ ok: true });
-        }
-      }
-      // Unknown number for this alert type — fall through
+    // Plain number reply — targets the most recent alert
+    const numberReply = commandText.match(/^[1-5]$/);
+    if (numberReply && lastAlertCoin && alertContextBySymbol.has(lastAlertCoin)) {
+      const ctx = alertContextBySymbol.get(lastAlertCoin);
+      const choice = parseInt(numberReply[0]);
+      alertContextBySymbol.delete(lastAlertCoin);
+      lastAlertCoin = null;
+      await processAlertChoice(ctx, choice, sendReply);
+      return res.status(200).json({ ok: true });
     }
 
     // --- Pending journal state handler (emotion / followed flow) ---
@@ -8045,6 +8054,25 @@ app.post('/telegram-webhook', async (req, res) => {
           `⏪ <b>UNDO — ${coinBase}</b>\n\n` +
           `Buying back ${undo.qty.toFixed(4)} ${coinBase}\n` +
           `👍 confirm undo  👎 keep as is`
+        );
+      }
+      return res.status(200).json({ ok: true });
+    }
+
+    // --- Command: alerts — list all active alert contexts waiting for a reply ---
+    if (commandText === 'alerts') {
+      if (alertContextBySymbol.size === 0) {
+        await sendReply('📋 No active alerts waiting for a response.');
+      } else {
+        const list = [...alertContextBySymbol.entries()]
+          .sort((a, b) => b[1].timestamp - a[1].timestamp)
+          .map(([coin, ctx]) => {
+            const age = Math.round((Date.now() - ctx.timestamp) / 60000);
+            return `• <b>${coin.toUpperCase()}</b> — ${ctx.alertType} (${age}min ago)`;
+          }).join('\n');
+        await sendReply(
+          `📋 <b>Active alerts waiting for response:</b>\n\n${list}\n\n` +
+          `Reply with number (uses most recent) or '<b>coin number</b>' e.g. 'xlm 2'`
         );
       }
       return res.status(200).json({ ok: true });
