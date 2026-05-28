@@ -724,6 +724,8 @@ await db.execute(`CREATE TABLE IF NOT EXISTS deleted_rules_log (
   deleted_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )`).catch(e => console.error('[migration] deleted_rules_log:', e.message));
 
+await safeAddColumn('macro_alerts_sent', 'message', 'TEXT');
+
 // One-time cleanup: remove ghost symbols created by parser errors (words mistaken for coin names)
 try {
   const ghostSymbols = ['RISES-USD', 'RAISE-USD', 'TRADE-USD'];
@@ -2732,15 +2734,31 @@ or:
     const alertMessage = parsed.message || 'Significant market event detected.';
     console.log('[macro] ALERT FIRED:', alertMessage.substring(0, 200));
 
-    // Dedup — suppress identical alerts within 6 hours
+    // Dedup 1 — exact hash match within 6 hours
     const alertHash = createHash('sha256').update(alertMessage.substring(0, 200)).digest('hex');
     const [existingRows] = await db.execute(
       'SELECT id FROM macro_alerts_sent WHERE alert_hash = ? AND sent_at > DATE_SUB(NOW(), INTERVAL 6 HOUR)',
       [alertHash]
     );
     if (existingRows.length > 0) {
-      console.log('[macro] Duplicate suppressed (hash:', alertHash.substring(0, 8) + ')');
+      console.log('[macro] Duplicate suppressed — exact hash match (', alertHash.substring(0, 8) + ')');
       return;
+    }
+
+    // Dedup 2 — word-similarity check against last 5 alerts in past 2 hours
+    const [recentAlerts] = await db.execute(
+      'SELECT message FROM macro_alerts_sent WHERE sent_at > DATE_SUB(NOW(), INTERVAL 2 HOUR) AND message IS NOT NULL ORDER BY sent_at DESC LIMIT 5'
+    ).catch(() => [[]]);
+    const newWords = new Set(alertMessage.toLowerCase().split(/\s+/).filter(w => w.length > 4));
+    for (const recent of recentAlerts) {
+      if (!recent.message) continue;
+      const recentWords = recent.message.toLowerCase().split(/\s+/).filter(w => w.length > 4);
+      const matches = recentWords.filter(w => newWords.has(w)).length;
+      const similarity = recentWords.length > 0 ? matches / recentWords.length : 0;
+      if (similarity > 0.5) {
+        console.log(`[macro] Duplicate suppressed — ${(similarity * 100).toFixed(0)}% similar to recent alert`);
+        return;
+      }
     }
 
     // Build affected holdings section
@@ -2750,13 +2768,13 @@ or:
       .slice(0, 5)
       .map(h => `• ${h.coin}: $${h.valueUSD.toFixed(0)}`);
     const affectedSection = affectedLines.length > 0
-      ? `\n\n💼 <b>Your affected holdings:</b>\n${affectedLines.join('\n')}\n\nReply 'analyse [COIN]' for deeper analysis`
+      ? `\n\n💼 <b>Your affected holdings:</b>\n${affectedLines.join('\n')}`
       : '';
 
     const urgencyIcon = parsed.urgency === 'high' ? '🚨' : parsed.urgency === 'medium' ? '⚠️' : 'ℹ️';
     const telegramMessage = `${urgencyIcon} <b>MACRO ALERT — PORTFOLIO IMPACT</b>\n\n${alertMessage}${affectedSection}`;
     await sendTelegram(telegramMessage);
-    await db.execute('INSERT INTO macro_alerts_sent (alert_hash) VALUES (?)', [alertHash]);
+    await db.execute('INSERT INTO macro_alerts_sent (alert_hash, message) VALUES (?, ?)', [alertHash, alertMessage.substring(0, 500)]);
     alertSent = true;
 
   } catch (e) {
@@ -5616,6 +5634,9 @@ app.use(express.json());
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 app.use(express.static(join(__dirname, 'public')));
+
+// Clean URL for usage monitor
+app.get('/usage', (req, res) => res.sendFile(join(__dirname, 'public', 'claude-usage-monitor.html')));
 
 // CORS middleware
 app.use((req, res, next) => {

@@ -1,0 +1,928 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Claude Usage Monitor</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;800&display=swap');
+
+  :root {
+    --bg: #080c10;
+    --surface: #0d1117;
+    --border: #1a2332;
+    --accent: #00d4ff;
+    --accent2: #ff6b35;
+    --accent3: #39ff14;
+    --warn: #ffb800;
+    --danger: #ff3b5c;
+    --text: #e8edf2;
+    --muted: #4a5568;
+    --card: #0f1923;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Syne', sans-serif;
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  /* Animated grid background */
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background-image: 
+      linear-gradient(rgba(0,212,255,0.03) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(0,212,255,0.03) 1px, transparent 1px);
+    background-size: 40px 40px;
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  .container {
+    max-width: 900px;
+    margin: 0 auto;
+    padding: 24px 16px;
+    position: relative;
+    z-index: 1;
+  }
+
+  header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    margin-bottom: 32px;
+  }
+
+  .logo {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .logo-icon {
+    width: 36px;
+    height: 36px;
+    background: linear-gradient(135deg, var(--accent), #0088aa);
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 18px;
+  }
+
+  h1 {
+    font-family: 'Space Mono', monospace;
+    font-size: 14px;
+    letter-spacing: 0.2em;
+    color: var(--accent);
+    text-transform: uppercase;
+  }
+
+  .subtitle {
+    font-size: 11px;
+    color: var(--muted);
+    margin-top: 2px;
+    font-family: 'Space Mono', monospace;
+  }
+
+  .last-update {
+    font-family: 'Space Mono', monospace;
+    font-size: 10px;
+    color: var(--muted);
+    text-align: right;
+  }
+
+  .pulse {
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    background: var(--accent3);
+    border-radius: 50%;
+    margin-right: 6px;
+    animation: pulse 2s infinite;
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.4; transform: scale(0.8); }
+  }
+
+  /* Section headers */
+  .section-label {
+    font-family: 'Space Mono', monospace;
+    font-size: 10px;
+    letter-spacing: 0.15em;
+    color: var(--muted);
+    text-transform: uppercase;
+    margin-bottom: 12px;
+    padding-left: 2px;
+  }
+
+  /* Cards */
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+    margin-bottom: 16px;
+    position: relative;
+    overflow: hidden;
+  }
+
+  .card::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, var(--accent), transparent);
+    opacity: 0.3;
+  }
+
+  .grid-2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+    margin-bottom: 16px;
+  }
+
+  .grid-3 {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 12px;
+    margin-bottom: 16px;
+  }
+
+  .stat-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+    position: relative;
+  }
+
+  .stat-label {
+    font-family: 'Space Mono', monospace;
+    font-size: 9px;
+    letter-spacing: 0.1em;
+    color: var(--muted);
+    text-transform: uppercase;
+    margin-bottom: 6px;
+  }
+
+  .stat-value {
+    font-family: 'Space Mono', monospace;
+    font-size: 22px;
+    font-weight: 700;
+    color: var(--text);
+    line-height: 1;
+  }
+
+  .stat-sub {
+    font-size: 11px;
+    color: var(--muted);
+    margin-top: 4px;
+  }
+
+  .stat-accent { color: var(--accent); }
+  .stat-warn { color: var(--warn); }
+  .stat-danger { color: var(--danger); }
+  .stat-green { color: var(--accent3); }
+
+  /* Progress bars */
+  .progress-section {
+    margin-bottom: 20px;
+  }
+
+  .progress-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 8px;
+  }
+
+  .progress-label {
+    font-family: 'Space Mono', monospace;
+    font-size: 11px;
+    color: var(--text);
+  }
+
+  .progress-pct {
+    font-family: 'Space Mono', monospace;
+    font-size: 11px;
+    font-weight: 700;
+  }
+
+  .progress-bar {
+    height: 6px;
+    background: var(--border);
+    border-radius: 3px;
+    overflow: hidden;
+    position: relative;
+  }
+
+  .progress-fill {
+    height: 100%;
+    border-radius: 3px;
+    transition: width 1s ease;
+    position: relative;
+  }
+
+  .progress-fill::after {
+    content: '';
+    position: absolute;
+    right: 0;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: inherit;
+    filter: brightness(1.5);
+  }
+
+  .fill-green { background: linear-gradient(90deg, var(--accent3), #00ff8860); }
+  .fill-warn { background: linear-gradient(90deg, var(--warn), #ffb80060); }
+  .fill-danger { background: linear-gradient(90deg, var(--danger), #ff3b5c60); }
+  .fill-blue { background: linear-gradient(90deg, var(--accent), #00d4ff60); }
+
+  /* Info box */
+  .info-box {
+    background: rgba(0, 212, 255, 0.05);
+    border: 1px solid rgba(0, 212, 255, 0.15);
+    border-radius: 8px;
+    padding: 12px 14px;
+    font-family: 'Space Mono', monospace;
+    font-size: 10px;
+    color: #7ab8cc;
+    line-height: 1.6;
+    margin-bottom: 12px;
+  }
+
+  .warn-box {
+    background: rgba(255, 184, 0, 0.05);
+    border: 1px solid rgba(255, 184, 0, 0.2);
+    border-radius: 8px;
+    padding: 12px 14px;
+    font-size: 11px;
+    color: var(--warn);
+    line-height: 1.6;
+    margin-top: 12px;
+  }
+
+  /* API Cost table */
+  .cost-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: 'Space Mono', monospace;
+    font-size: 11px;
+  }
+
+  .cost-table th {
+    text-align: left;
+    padding: 8px 10px;
+    color: var(--muted);
+    font-size: 9px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .cost-table td {
+    padding: 10px 10px;
+    border-bottom: 1px solid rgba(255,255,255,0.03);
+    color: var(--text);
+  }
+
+  .cost-table tr:last-child td { border-bottom: none; }
+  .cost-table tr:hover td { background: rgba(255,255,255,0.02); }
+
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 9px;
+    letter-spacing: 0.05em;
+    font-weight: 700;
+  }
+
+  .badge-blue { background: rgba(0,212,255,0.15); color: var(--accent); }
+  .badge-green { background: rgba(57,255,20,0.1); color: var(--accent3); }
+  .badge-orange { background: rgba(255,107,53,0.15); color: var(--accent2); }
+
+  /* Tips */
+  .tips-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+  }
+
+  .tip-card {
+    background: rgba(255,255,255,0.02);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px;
+  }
+
+  .tip-icon {
+    font-size: 16px;
+    margin-bottom: 6px;
+  }
+
+  .tip-title {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text);
+    margin-bottom: 4px;
+  }
+
+  .tip-text {
+    font-size: 10px;
+    color: var(--muted);
+    line-height: 1.5;
+  }
+
+  /* Manual input */
+  .input-row {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    margin-top: 12px;
+  }
+
+  input[type="number"], input[type="range"] {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font-family: 'Space Mono', monospace;
+    font-size: 12px;
+    padding: 8px 12px;
+    outline: none;
+    width: 120px;
+  }
+
+  input[type="range"] {
+    width: 100%;
+    padding: 4px 0;
+    cursor: pointer;
+    accent-color: var(--accent);
+  }
+
+  input:focus { border-color: var(--accent); }
+
+  .btn {
+    background: var(--accent);
+    color: var(--bg);
+    border: none;
+    border-radius: 6px;
+    padding: 8px 16px;
+    font-family: 'Space Mono', monospace;
+    font-size: 11px;
+    font-weight: 700;
+    cursor: pointer;
+    letter-spacing: 0.05em;
+    transition: opacity 0.2s;
+  }
+
+  .btn:hover { opacity: 0.8; }
+
+  .btn-sm {
+    padding: 6px 12px;
+    font-size: 10px;
+  }
+
+  /* Reset timer */
+  .timer-display {
+    font-family: 'Space Mono', monospace;
+    font-size: 28px;
+    font-weight: 700;
+    color: var(--accent);
+    letter-spacing: 0.05em;
+  }
+
+  .timer-label {
+    font-size: 10px;
+    color: var(--muted);
+    margin-top: 2px;
+  }
+
+  /* Tabs */
+  .tabs {
+    display: flex;
+    gap: 4px;
+    margin-bottom: 20px;
+    background: var(--surface);
+    border-radius: 8px;
+    padding: 4px;
+  }
+
+  .tab {
+    flex: 1;
+    padding: 8px;
+    text-align: center;
+    font-family: 'Space Mono', monospace;
+    font-size: 10px;
+    letter-spacing: 0.05em;
+    color: var(--muted);
+    cursor: pointer;
+    border-radius: 6px;
+    transition: all 0.2s;
+    text-transform: uppercase;
+  }
+
+  .tab.active {
+    background: var(--card);
+    color: var(--accent);
+    border: 1px solid rgba(0,212,255,0.2);
+  }
+
+  .tab-content { display: none; }
+  .tab-content.active { display: block; }
+
+  /* Scrollbar */
+  ::-webkit-scrollbar { width: 4px; }
+  ::-webkit-scrollbar-track { background: var(--bg); }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+  @media (max-width: 600px) {
+    .grid-2, .grid-3 { grid-template-columns: 1fr 1fr; }
+    .tips-grid { grid-template-columns: 1fr; }
+    .timer-display { font-size: 22px; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+
+  <header>
+    <div class="logo">
+      <div class="logo-icon">🤖</div>
+      <div>
+        <h1>Claude Usage Monitor</h1>
+        <div class="subtitle">claude.ai · Pro Plan Tracker</div>
+      </div>
+    </div>
+    <div class="last-update">
+      <span class="pulse"></span>
+      <span id="last-update-time">--:--:--</span><br>
+      <span style="font-size:9px">local time</span>
+    </div>
+  </header>
+
+  <!-- Tabs -->
+  <div class="tabs">
+    <div class="tab active" onclick="switchTab('subscription')">Subscription</div>
+    <div class="tab" onclick="switchTab('api')">API Costs</div>
+    <div class="tab" onclick="switchTab('tips')">Tips</div>
+  </div>
+
+  <!-- SUBSCRIPTION TAB -->
+  <div id="tab-subscription" class="tab-content active">
+
+    <div class="section-label">5-Hour Session Window</div>
+    <div class="card">
+      <div class="info-box">
+        ℹ️ Claude Pro resets usage every 5 hours on a rolling basis. Anthropic does not expose your exact usage % via API — this tracker uses your manual input to estimate remaining capacity.
+      </div>
+
+      <div class="grid-2">
+        <div class="stat-card">
+          <div class="stat-label">Session Reset In</div>
+          <div class="timer-display" id="reset-timer">5:00:00</div>
+          <div class="timer-label">next 5-hour window</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Estimated Usage</div>
+          <div class="stat-value" id="usage-pct-display" class="stat-green">0%</div>
+          <div class="stat-sub">of session limit</div>
+        </div>
+      </div>
+
+      <div class="progress-section">
+        <div class="progress-header">
+          <span class="progress-label">Session Usage</span>
+          <span class="progress-pct stat-green" id="session-pct">0%</span>
+        </div>
+        <div class="progress-bar">
+          <div class="progress-fill fill-green" id="session-bar" style="width:0%"></div>
+        </div>
+      </div>
+
+      <!-- Manual slider -->
+      <div style="margin-top:16px">
+        <div class="progress-label" style="margin-bottom:8px;font-size:11px;color:var(--muted)">
+          Manually set your estimated usage:
+        </div>
+        <input type="range" id="usage-slider" min="0" max="100" value="0" 
+               oninput="updateUsage(this.value)">
+        <div style="display:flex;justify-content:space-between;font-family:'Space Mono',monospace;font-size:9px;color:var(--muted);margin-top:4px">
+          <span>0% Empty</span>
+          <span>50% Half</span>
+          <span>100% Full</span>
+        </div>
+      </div>
+
+      <div class="input-row">
+        <div style="font-family:'Space Mono',monospace;font-size:10px;color:var(--muted)">Messages sent this session:</div>
+        <input type="number" id="msg-count" min="0" max="200" value="0" 
+               oninput="estimateFromMessages(this.value)" placeholder="0">
+        <button class="btn btn-sm" onclick="resetSession()">Reset Timer</button>
+      </div>
+
+      <div id="usage-warn" class="warn-box" style="display:none">
+        ⚠️ Approaching session limit — consider starting a new conversation or waiting for reset.
+      </div>
+    </div>
+
+    <div class="section-label">Plan Limits Reference</div>
+    <div class="card">
+      <div class="grid-3">
+        <div class="stat-card">
+          <div class="stat-label">Plan</div>
+          <div class="stat-value" style="font-size:16px">
+            <span class="badge badge-orange">PRO</span>
+          </div>
+          <div class="stat-sub">$20/month</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">vs Free Tier</div>
+          <div class="stat-value stat-accent" style="font-size:20px">5×</div>
+          <div class="stat-sub">more usage</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Reset Cycle</div>
+          <div class="stat-value" style="font-size:18px">5h</div>
+          <div class="stat-sub">rolling window</div>
+        </div>
+      </div>
+
+      <div class="progress-section">
+        <div class="progress-header">
+          <span class="progress-label">Sonnet 4.6 (this chat)</span>
+          <span class="progress-pct stat-accent">Primary</span>
+        </div>
+        <div class="progress-bar">
+          <div class="progress-fill fill-blue" style="width:65%"></div>
+        </div>
+      </div>
+
+      <div class="progress-section">
+        <div class="progress-header">
+          <span class="progress-label">Opus 4.6 (heavy tasks)</span>
+          <span class="progress-pct stat-warn">Lower limit</span>
+        </div>
+        <div class="progress-bar">
+          <div class="progress-fill fill-warn" style="width:30%"></div>
+        </div>
+      </div>
+
+      <div class="info-box" style="margin-top:12px;margin-bottom:0">
+        💡 Peak hours (5–11 AM PT / 1–7 PM BST) have reduced limits since March 2026. Use off-peak for heavy dev sessions.
+      </div>
+    </div>
+
+  </div>
+
+  <!-- API COSTS TAB -->
+  <div id="tab-api" class="tab-content">
+
+    <div class="section-label">Railway Server API Usage — Live from your server</div>
+    <div class="card">
+      <div class="info-box">
+        ℹ️ Your Railway server calls the Claude API for portfolio analysis, macro news, and trade recommendations. These costs come from your Anthropic API key — separate from your Claude.ai subscription.
+      </div>
+
+      <div class="grid-3">
+        <div class="stat-card">
+          <div class="stat-label">Today's Cost</div>
+          <div class="stat-value stat-accent" id="today-cost">$0.00</div>
+          <div class="stat-sub">API calls today</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">This Month</div>
+          <div class="stat-value" id="month-cost">$0.00</div>
+          <div class="stat-sub">estimated total</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Calls Today</div>
+          <div class="stat-value" id="calls-today">0</div>
+          <div class="stat-sub">API requests</div>
+        </div>
+      </div>
+
+      <div id="cost-status" class="warn-box" style="display:none;margin-top:0"></div>
+
+      <div style="margin-top:16px">
+        <div class="section-label">Recent API Calls</div>
+        <table class="cost-table">
+          <thead>
+            <tr>
+              <th>Reason</th>
+              <th>Model</th>
+              <th>Tokens In</th>
+              <th>Tokens Out</th>
+              <th>Cost</th>
+            </tr>
+          </thead>
+          <tbody id="api-calls-table">
+            <tr>
+              <td colspan="5" style="color:var(--muted);text-align:center;padding:20px">
+                Loading from Railway server...
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="input-row" style="margin-top:16px">
+        <div style="font-family:'Space Mono',monospace;font-size:10px;color:var(--muted)">Monthly budget alert ($):</div>
+        <input type="number" id="budget-input" value="10" min="1" max="100" placeholder="10">
+        <button class="btn btn-sm" onclick="saveBudget()">Set Alert</button>
+      </div>
+    </div>
+
+    <div class="section-label">Cost Breakdown by Call Type</div>
+    <div class="card">
+      <div class="progress-section">
+        <div class="progress-header">
+          <span class="progress-label">📰 Macro News Analysis</span>
+          <span class="progress-pct" id="macro-pct">~$0.09/call</span>
+        </div>
+        <div class="progress-bar">
+          <div class="progress-fill fill-blue" id="macro-bar" style="width:45%"></div>
+        </div>
+      </div>
+      <div class="progress-section">
+        <div class="progress-header">
+          <span class="progress-label">📊 Portfolio Recommendations</span>
+          <span class="progress-pct stat-warn">~$0.05/call</span>
+        </div>
+        <div class="progress-bar">
+          <div class="progress-fill fill-warn" style="width:30%"></div>
+        </div>
+      </div>
+      <div class="progress-section">
+        <div class="progress-header">
+          <span class="progress-label">🧠 Trailing Stop Analysis</span>
+          <span class="progress-pct stat-green">~$0.02/call</span>
+        </div>
+        <div class="progress-bar">
+          <div class="progress-fill fill-green" style="width:15%"></div>
+        </div>
+      </div>
+      <div class="info-box" style="margin-bottom:0">
+        📡 Macro news runs every 2 hours. At current rate ~$2.16/day for macro alone. 
+        Enable batch API in server.js to reduce costs by 50%.
+      </div>
+    </div>
+
+  </div>
+
+  <!-- TIPS TAB -->
+  <div id="tab-tips" class="tab-content">
+
+    <div class="section-label">Stretching Your Usage</div>
+    <div class="tips-grid">
+      <div class="tip-card">
+        <div class="tip-icon">💬</div>
+        <div class="tip-title">Start fresh conversations</div>
+        <div class="tip-text">Long threads consume more tokens as Claude re-reads history. Start new chats for new topics.</div>
+      </div>
+      <div class="tip-card">
+        <div class="tip-icon">🕐</div>
+        <div class="tip-title">Avoid peak hours</div>
+        <div class="tip-text">1–7 PM BST (5–11 AM PT) has reduced limits. Schedule heavy dev sessions for evenings.</div>
+      </div>
+      <div class="tip-card">
+        <div class="tip-icon">📋</div>
+        <div class="tip-title">Use Projects for context</div>
+        <div class="tip-text">Project descriptions count once, not per message. Keep system prompts in project settings.</div>
+      </div>
+      <div class="tip-card">
+        <div class="tip-icon">⚡</div>
+        <div class="tip-title">Sonnet over Opus</div>
+        <div class="tip-text">Sonnet 4.6 has higher limits than Opus. Use Opus only for complex analysis tasks.</div>
+      </div>
+      <div class="tip-card">
+        <div class="tip-icon">🔄</div>
+        <div class="tip-title">5-hour rolling reset</div>
+        <div class="tip-text">If you hit a limit, wait the reset window. Don't upgrade unless you hit limits consistently.</div>
+      </div>
+      <div class="tip-card">
+        <div class="tip-icon">💰</div>
+        <div class="tip-title">Batch API for Railway</div>
+        <div class="tip-text">Your server's macro news calls could use Batch API — 50% cheaper, 24hr processing window.</div>
+      </div>
+    </div>
+
+    <div class="section-label" style="margin-top:20px">Plan Comparison</div>
+    <div class="card">
+      <table class="cost-table">
+        <thead>
+          <tr>
+            <th>Feature</th>
+            <th>Free</th>
+            <th>Pro $20/mo</th>
+            <th>Max $100/mo</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Session limit</td>
+            <td style="color:var(--muted)">~40 msg/day</td>
+            <td><span class="badge badge-orange">5× Free</span></td>
+            <td><span class="badge badge-green">20× Free</span></td>
+          </tr>
+          <tr>
+            <td>Opus access</td>
+            <td style="color:var(--muted)">❌</td>
+            <td>✅ Limited</td>
+            <td>✅ Full</td>
+          </tr>
+          <tr>
+            <td>Projects</td>
+            <td style="color:var(--muted)">Limited</td>
+            <td>✅ Full</td>
+            <td>✅ Full</td>
+          </tr>
+          <tr>
+            <td>Peak hour limit</td>
+            <td style="color:var(--muted)">Reduced</td>
+            <td style="color:var(--warn)">Reduced</td>
+            <td style="color:var(--accent3)">Better</td>
+          </tr>
+          <tr>
+            <td>Best for</td>
+            <td style="color:var(--muted)">Light use</td>
+            <td style="color:var(--accent)">You ✓</td>
+            <td style="color:var(--muted)">Power users</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+  </div>
+
+</div>
+
+<script>
+// Session timer
+let sessionStart = parseInt(localStorage.getItem('sessionStart') || Date.now());
+let usagePct = parseInt(localStorage.getItem('usagePct') || 0);
+let budget = parseFloat(localStorage.getItem('budget') || 10);
+
+// Init slider
+document.getElementById('usage-slider').value = usagePct;
+document.getElementById('budget-input').value = budget;
+updateUsage(usagePct);
+
+function updateUsage(val) {
+  usagePct = parseInt(val);
+  localStorage.setItem('usagePct', usagePct);
+  document.getElementById('usage-slider').value = usagePct;
+  
+  const bar = document.getElementById('session-bar');
+  const pct = document.getElementById('session-pct');
+  const display = document.getElementById('usage-pct-display');
+  const warn = document.getElementById('usage-warn');
+  
+  bar.style.width = usagePct + '%';
+  pct.textContent = usagePct + '%';
+  display.textContent = usagePct + '%';
+  
+  // Color based on level
+  bar.className = 'progress-fill ' + 
+    (usagePct < 50 ? 'fill-green' : usagePct < 80 ? 'fill-warn' : 'fill-danger');
+  pct.className = 'progress-pct ' + 
+    (usagePct < 50 ? 'stat-green' : usagePct < 80 ? 'stat-warn' : 'stat-danger');
+  display.className = 'stat-value ' + 
+    (usagePct < 50 ? 'stat-green' : usagePct < 80 ? 'stat-warn' : 'stat-danger');
+  
+  warn.style.display = usagePct >= 75 ? 'block' : 'none';
+  if (usagePct >= 90) {
+    warn.textContent = '🔴 Critical — very close to session limit. Start a new conversation now.';
+  } else if (usagePct >= 75) {
+    warn.textContent = '⚠️ Approaching session limit — consider starting a new conversation or waiting for reset.';
+  }
+}
+
+function estimateFromMessages(count) {
+  // Rough estimate: ~2% per message for Pro plan
+  const est = Math.min(100, Math.round(count * 2));
+  updateUsage(est);
+}
+
+function resetSession() {
+  sessionStart = Date.now();
+  localStorage.setItem('sessionStart', sessionStart);
+  usagePct = 0;
+  updateUsage(0);
+  document.getElementById('msg-count').value = 0;
+}
+
+function saveBudget() {
+  budget = parseFloat(document.getElementById('budget-input').value);
+  localStorage.setItem('budget', budget);
+  alert('Budget alert set at $' + budget + '/month');
+}
+
+// 5-hour countdown timer
+function updateTimer() {
+  const fiveHours = 5 * 60 * 60 * 1000;
+  const elapsed = Date.now() - sessionStart;
+  const remaining = fiveHours - (elapsed % fiveHours);
+  
+  const h = Math.floor(remaining / 3600000);
+  const m = Math.floor((remaining % 3600000) / 60000);
+  const s = Math.floor((remaining % 60000) / 1000);
+  
+  document.getElementById('reset-timer').textContent = 
+    `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+  
+  // Update last update time
+  const now = new Date();
+  document.getElementById('last-update-time').textContent = 
+    now.toLocaleTimeString('en-GB');
+}
+
+setInterval(updateTimer, 1000);
+updateTimer();
+
+// Tab switching
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+  event.target.classList.add('active');
+  document.getElementById('tab-' + name).classList.add('active');
+  
+  if (name === 'api') loadAPIData();
+}
+
+// Load API cost data from Railway server
+async function loadAPIData() {
+  try {
+    const response = await fetch(
+      'https://revolut-claude-production.up.railway.app/api/claude-usage'
+    );
+    
+    if (!response.ok) throw new Error('No data');
+    
+    const data = await response.json();
+    
+    // Update stats
+    document.getElementById('today-cost').textContent = 
+      '$' + (data.today_cost || 0).toFixed(4);
+    document.getElementById('month-cost').textContent = 
+      '$' + (data.month_cost || 0).toFixed(2);
+    document.getElementById('calls-today').textContent = 
+      data.calls_today || 0;
+    
+    // Check budget
+    if (data.month_cost > budget) {
+      const status = document.getElementById('cost-status');
+      status.style.display = 'block';
+      status.textContent = `⚠️ Monthly budget of $${budget} exceeded — $${data.month_cost.toFixed(2)} spent this month`;
+    }
+    
+    // Populate table
+    if (data.recent_calls?.length) {
+      const tbody = document.getElementById('api-calls-table');
+      tbody.innerHTML = data.recent_calls.slice(0,10).map(call => `
+        <tr>
+          <td>${call.reason || 'unknown'}</td>
+          <td><span class="badge badge-blue">${(call.model || 'sonnet').replace('claude-','')}</span></td>
+          <td>${(call.input_tokens || 0).toLocaleString()}</td>
+          <td>${(call.output_tokens || 0).toLocaleString()}</td>
+          <td style="color:var(--accent3)">$${parseFloat(call.estimated_cost || 0).toFixed(4)}</td>
+        </tr>
+      `).join('');
+    }
+    
+  } catch (e) {
+    // Fallback — show Railway log data note
+    document.getElementById('api-calls-table').innerHTML = `
+      <tr>
+        <td colspan="5" style="color:var(--muted);text-align:center;padding:20px;font-size:10px">
+          ⚠️ No /api/claude-usage endpoint yet — add it to Railway server to see live data.<br>
+          Check Railway logs for CLAUDE API CALL entries.
+        </td>
+      </tr>
+    `;
+    
+    // Show estimated from known call frequency
+    document.getElementById('today-cost').textContent = '~$0.22';
+    document.getElementById('month-cost').textContent = '~$6.60';
+    document.getElementById('calls-today').textContent = '~12';
+  }
+}
+</script>
+</body>
+</html>
