@@ -3992,58 +3992,82 @@ async function analyseTrailingStopAlert(symbol, currentPrice, peakPrice, trailPc
     const dropFromPeak = ((peakPrice - currentPrice) / peakPrice * 100);
 
     const [recentTrades] = await db.execute(
-      `SELECT action, price, reasoning, created_at FROM trading_journal WHERE symbol = ? ORDER BY created_at DESC LIMIT 5`,
+      `SELECT action, price, quantity, value_usd, reasoning, emotion, outcome_pnl, created_at
+       FROM trading_journal
+       WHERE symbol = ? AND action NOT IN ('payment','transfer')
+       ORDER BY created_at DESC LIMIT 5`,
       [coinBase]
     ).catch(e => { console.error('[analysis] recentTrades query failed:', e.message); return [[]]; });
 
-    const [autoRules] = await db.execute(
-      `SELECT rule_type, trigger_price, order_type, volume FROM auto_trade_rules WHERE symbol = ? AND active = 1`,
+    const [activeRules] = await db.execute(
+      `SELECT rule_type, trigger_price, order_type, volume, volume_type
+       FROM auto_trade_rules WHERE symbol = ? AND active = 1`,
       [symbol]
-    ).catch(e => { console.error('[analysis] autoRules query failed:', e.message); return [[]]; });
+    ).catch(e => { console.error('[analysis] activeRules query failed:', e.message); return [[]]; });
 
-    const [profile] = await db.execute(
-      `SELECT preference_key, preference_value FROM trader_profile LIMIT 20`
-    ).catch(e => { console.error('[analysis] profile query failed:', e.message); return [[]]; });
-    const profileStr = profile.map(p => `${p.preference_key}: ${p.preference_value}`).join('\n');
+    const [traderPrefs] = await db.execute(
+      `SELECT preference_key, preference_value FROM trader_profile
+       WHERE preference_key IN ('trading_strategy','core_principles','mss_definition','moon_bag_rule','risk_tolerance')`
+    ).catch(e => { console.error('[analysis] traderPrefs query failed:', e.message); return [[]]; });
 
-    const traderSystemPrompt = `You are a crypto trading analyst for a swing trader. Strategy:
-- Buys sharp dips, sells sharp pumps
-- Uses trailing stops to protect profits
-- Never sells 100% — always keeps a moon bag
-- Looks for Market Structure Shifts (MSS): break of previous Higher Low after failing to make new Higher High
+    const journalContext = recentTrades.length > 0
+      ? recentTrades.map(t => {
+          const date = new Date(t.created_at).toLocaleDateString('en-GB');
+          const pnl = t.outcome_pnl ? ` | P&L: ${parseFloat(t.outcome_pnl) > 0 ? '+' : ''}$${parseFloat(t.outcome_pnl).toFixed(2)}` : '';
+          return `${date}: ${t.action.toUpperCase()} @ $${parseFloat(t.price).toFixed(6)}${t.quantity ? ' (' + parseFloat(t.quantity).toFixed(2) + ' tokens)' : ''}${pnl}\n  Reason: ${t.reasoning || 'none'} | Emotion: ${t.emotion || 'unknown'}`;
+        }).join('\n')
+      : 'No recent trades';
 
-Trader profile:
-${profileStr}
+    const rulesContext = activeRules.length > 0
+      ? activeRules.map(r => `${r.rule_type}: ${r.order_type} ${r.volume}${r.volume_type === 'pct' ? '%' : ''} @ $${parseFloat(r.trigger_price).toFixed(6)}`).join('\n')
+      : 'No active rules';
 
-Respond in exactly 4 lines:
-RECOMMENDATION: [SELL NOW / HOLD AND RESET / WAIT AND WATCH]
-REASON: [one sentence]
-WATCH: [key price level]
-CONFIDENCE: [High/Medium/Low]`;
+    const prefsContext = traderPrefs.map(p => `${p.preference_key}: ${p.preference_value}`).join('\n');
 
-    const dynamicContent = `TRAILING STOP ALERT: ${coinBase}
-- Exchange: ${exchange === 'kraken' ? 'Kraken' : 'Revolut X'}
-- Current price: $${currentPrice.toFixed(6)}
-- Peak price: $${peakPrice.toFixed(6)}
-- Drop from peak: -${dropFromPeak.toFixed(1)}%
-- Trailing stop: ${trailPct}%
-- Stop price: $${stopPrice.toFixed(6)}
-- Entry price: ${entryPrice ? '$' + entryPrice.toFixed(6) : 'unknown'}
-- P&L from entry: ${plPct !== null ? (plPct > 0 ? '+' : '') + plPct.toFixed(1) + '%' : 'unknown'}
+    const dynamicContent =
+`You are analysing a trailing stop alert for a disciplined swing trader.
 
-RECENT TRADES:
-${recentTrades.map(t => `${t.action.toUpperCase()} @ $${parseFloat(t.price).toFixed(6)} — ${t.reasoning || 'no reason'}`).join('\n') || 'No recent trades'}
+## TRADER PROFILE
+${prefsContext || `Strategy: Extreme move swing trader
+Principles: Trend is friend, trailing stops, ladder out on MSS, never sell 100%
+MSS: Price breaks previous Higher Low after failing to make new Higher High
+Moon bag: Always keep 25% of position`}
 
-ACTIVE AUTO RULES:
-${autoRules.map(r => `${r.rule_type}: ${r.order_type} @ $${parseFloat(r.trigger_price).toFixed(6)}`).join('\n') || 'None'}`;
+## CURRENT ALERT — ${coinBase}
+Exchange: ${exchange === 'kraken' ? 'Kraken' : 'Revolut X'}
+Current price: $${currentPrice.toFixed(6)}
+Peak price: $${peakPrice.toFixed(6)}
+Drop from peak: -${dropFromPeak.toFixed(1)}%
+Trailing stop: ${trailPct}%
+Stop level: $${stopPrice.toFixed(6)}
+Entry price: ${entryPrice ? '$' + entryPrice.toFixed(6) : 'unknown'}
+P&L from entry: ${plPct !== null ? (plPct > 0 ? '+' : '') + plPct.toFixed(1) + '%' : 'unknown'}
+
+## LAST 5 TRADES FOR ${coinBase}
+${journalContext}
+
+## ACTIVE AUTO RULES FOR ${coinBase}
+${rulesContext}
+
+## YOUR ANALYSIS TASK
+1. Is this a genuine Market Structure Shift or normal consolidation/pullback?
+2. Does the trade history suggest this coin is in a profitable trend worth holding?
+3. What does the drop size tell you — panic selling or healthy retracement?
+4. Considering the active auto rules, what manual action if any is needed?
+
+Respond in exactly this format:
+RECOMMENDATION: [SELL 25% / HOLD / RESET STOP / BUY MORE / SELL ALL]
+REASON: [one clear sentence referencing the trade history]
+WATCH: [$price — what to monitor next]
+CONFIDENCE: [High/Medium/Low]
+CONTEXT: [one sentence on what the journal history tells you]`;
 
     console.log(`[analysis] Calling Claude API (30s timeout)...`);
 
     // 30-second timeout via Promise.race
     const claudeCall = anthropic.messages.create({
       model: 'claude-sonnet-4-5-20251001',
-      max_tokens: 300,
-      system: [{ type: 'text', text: traderSystemPrompt, cache_control: { type: 'ephemeral' } }],
+      max_tokens: 400,
       messages: [{ role: 'user', content: dynamicContent }]
     });
     const timeoutPromise = new Promise((_, reject) =>
@@ -4166,16 +4190,60 @@ async function analyseFixedTargetAlert(symbol, currentPrice, target) {
   try {
     const entryPrice = entryPrices.get(symbol) || target.entryPrice;
 
+    const [recentTrades] = await db.execute(
+      `SELECT action, price, quantity, value_usd, reasoning, emotion, outcome_pnl, created_at
+       FROM trading_journal
+       WHERE symbol = ? AND action NOT IN ('payment','transfer')
+       ORDER BY created_at DESC LIMIT 5`,
+      [coinBase]
+    ).catch(e => { console.error('[analysis] recentTrades query failed:', e.message); return [[]]; });
+
+    const [traderPrefs] = await db.execute(
+      `SELECT preference_key, preference_value FROM trader_profile
+       WHERE preference_key IN ('trading_strategy','core_principles','mss_definition','moon_bag_rule','risk_tolerance')`
+    ).catch(e => { console.error('[analysis] traderPrefs query failed:', e.message); return [[]]; });
+
+    const journalContext = recentTrades.length > 0
+      ? recentTrades.map(t => {
+          const date = new Date(t.created_at).toLocaleDateString('en-GB');
+          const pnl = t.outcome_pnl ? ` | P&L: ${parseFloat(t.outcome_pnl) > 0 ? '+' : ''}$${parseFloat(t.outcome_pnl).toFixed(2)}` : '';
+          return `${date}: ${t.action.toUpperCase()} @ $${parseFloat(t.price).toFixed(6)}${t.quantity ? ' (' + parseFloat(t.quantity).toFixed(2) + ' tokens)' : ''}${pnl}\n  Reason: ${t.reasoning || 'none'} | Emotion: ${t.emotion || 'unknown'}`;
+        }).join('\n')
+      : 'No recent trades';
+
+    const prefsContext = traderPrefs.map(p => `${p.preference_key}: ${p.preference_value}`).join('\n');
+
+    const targetPrompt =
+`You are analysing a price target alert for a disciplined swing trader.
+
+## TRADER PROFILE
+${prefsContext || `Strategy: Extreme move swing trader — buys dips, sells pumps, never sells 100% (keeps moon bag)
+Moon bag: Always keep 25% of position`}
+
+## TARGET HIT — ${coinBase}
+Direction: ${target.direction}
+Target price: $${parseFloat(target.targetPrice).toFixed(6)}
+Current price: $${currentPrice.toFixed(6)}
+Entry price: ${entryPrice ? '$' + entryPrice.toFixed(6) : 'unknown'}
+P&L from entry: ${entryPrice ? ((currentPrice - entryPrice) / entryPrice * 100).toFixed(1) + '%' : 'unknown'}
+${target.note ? 'Note: ' + target.note : ''}
+
+## LAST 5 TRADES FOR ${coinBase}
+${journalContext}
+
+Should Bryan take profits now, hold for more, or ladder out?
+
+Respond in exactly this format:
+RECOMMENDATION: [SELL / HOLD / LADDER]
+REASON: [one clear sentence referencing the trade history]
+NEXT TARGET: [$price if holding, or 'n/a' if selling]
+CONFIDENCE: [High/Medium/Low]`;
+
     console.log(`[analysis] Calling Claude API (30s timeout)...`);
     const claudeCall = anthropic.messages.create({
       model: 'claude-sonnet-4-5-20251001',
-      max_tokens: 200,
-      system: [{
-        type: 'text',
-        text: 'You are a crypto trading analyst. Bryan is a swing trader who buys dips and sells pumps, never selling 100% (keeps a moon bag). When a price target hits, advise concisely in 3 lines:\nRECOMMENDATION: [SELL/HOLD/LADDER]\nREASON: [one sentence]\nNEXT TARGET: [price if holding]',
-        cache_control: { type: 'ephemeral' }
-      }],
-      messages: [{ role: 'user', content: `Price target hit for ${coinBase}.\nTarget: $${parseFloat(target.targetPrice).toFixed(6)}\nCurrent: $${currentPrice.toFixed(6)}\nEntry: ${entryPrice ? '$' + entryPrice.toFixed(6) : 'unknown'}\nDirection: ${target.direction}\n\nShould Bryan take profits now, hold for more, or ladder out partially?` }]
+      max_tokens: 300,
+      messages: [{ role: 'user', content: targetPrompt }]
     });
     const timeoutPromise = new Promise((_, reject) =>
       setTimeout(() => reject(new Error('Claude API timeout after 30s')), 30000)
