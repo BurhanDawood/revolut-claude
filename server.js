@@ -12,6 +12,13 @@ import cron from 'node-cron';
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
+// FIX 3: Verify API key present at startup
+if (!process.env.ANTHROPIC_API_KEY) {
+  console.error('[startup] WARNING: ANTHROPIC_API_KEY not set — Claude analysis will fail silently');
+} else {
+  console.log('[startup] ANTHROPIC_API_KEY present ✅');
+}
+
 const API_KEY = process.env.REVOLUTX_API_KEY;
 const PRIVATE_KEY = process.env.REVOLUTX_PRIVATE_KEY;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
@@ -3955,7 +3962,20 @@ async function getAvailableUSD(exchange) {
 // ── Claude Auto-Analysis on Alerts ───────────────────────────────────────────
 
 async function analyseTrailingStopAlert(symbol, currentPrice, peakPrice, trailPct, stopPrice, exchange = 'revolut') {
+  const coinBase = symbol.replace('-USD', '');
   const ONE_HOUR = 60 * 60 * 1000;
+
+  // FIX 4: Check global API rate-limit cooldown (set when a 429 is received)
+  const apiRateLimited = analysisRateLimit.get('api_rate_limited');
+  if (apiRateLimited && Date.now() - apiRateLimited < 60 * 1000) {
+    console.log(`[analysis] Global API rate-limit cooldown active — skipping ${coinBase}`);
+    await sendTelegram(
+      `⚠️ <b>ANALYSIS SKIPPED — ${coinBase}</b>\n` +
+      `Claude API rate-limit cooldown active (60s).\nCheck position manually.`
+    ).catch(() => {});
+    return;
+  }
+
   const lastAnalysis = analysisRateLimit.get(symbol);
   if (lastAnalysis && Date.now() - lastAnalysis < ONE_HOUR) {
     console.log(`[analysis] Rate limited — ${symbol} analysed ${Math.round((Date.now()-lastAnalysis)/60000)}min ago`);
@@ -3963,8 +3983,10 @@ async function analyseTrailingStopAlert(symbol, currentPrice, peakPrice, trailPc
   }
   analysisRateLimit.set(symbol, Date.now());
 
+  console.log(`[analysis] Starting Claude analysis for ${coinBase}`);
+  console.log(`[analysis] Price: $${currentPrice}, Peak: $${peakPrice}, Drop: -${((peakPrice-currentPrice)/peakPrice*100).toFixed(1)}%, Exchange: ${exchange}`);
+
   try {
-    const coinBase = symbol.replace('-USD', '');
     const entryPrice = entryPrices.get(symbol);
     const plPct = entryPrice ? ((currentPrice - entryPrice) / entryPrice * 100) : null;
     const dropFromPeak = ((peakPrice - currentPrice) / peakPrice * 100);
@@ -3972,12 +3994,16 @@ async function analyseTrailingStopAlert(symbol, currentPrice, peakPrice, trailPc
     const [recentTrades] = await db.execute(
       `SELECT action, price, reasoning, created_at FROM trading_journal WHERE symbol = ? ORDER BY created_at DESC LIMIT 5`,
       [coinBase]
-    );
+    ).catch(e => { console.error('[analysis] recentTrades query failed:', e.message); return [[]]; });
+
     const [autoRules] = await db.execute(
       `SELECT rule_type, trigger_price, order_type, volume FROM auto_trade_rules WHERE symbol = ? AND active = 1`,
       [symbol]
-    );
-    const [profile] = await db.execute(`SELECT preference_key, preference_value FROM trader_profile LIMIT 20`);
+    ).catch(e => { console.error('[analysis] autoRules query failed:', e.message); return [[]]; });
+
+    const [profile] = await db.execute(
+      `SELECT preference_key, preference_value FROM trader_profile LIMIT 20`
+    ).catch(e => { console.error('[analysis] profile query failed:', e.message); return [[]]; });
     const profileStr = profile.map(p => `${p.preference_key}: ${p.preference_value}`).join('\n');
 
     const traderSystemPrompt = `You are a crypto trading analyst for a swing trader. Strategy:
@@ -4011,34 +4037,42 @@ ${recentTrades.map(t => `${t.action.toUpperCase()} @ $${parseFloat(t.price).toFi
 ACTIVE AUTO RULES:
 ${autoRules.map(r => `${r.rule_type}: ${r.order_type} @ $${parseFloat(r.trigger_price).toFixed(6)}`).join('\n') || 'None'}`;
 
-    const msg = await anthropic.messages.create({
+    console.log(`[analysis] Calling Claude API (30s timeout)...`);
+
+    // 30-second timeout via Promise.race
+    const claudeCall = anthropic.messages.create({
       model: 'claude-sonnet-4-20250514',
       max_tokens: 300,
-      system: [{
-        type: 'text',
-        text: traderSystemPrompt,
-        cache_control: { type: 'ephemeral' }
-      }],
+      system: [{ type: 'text', text: traderSystemPrompt, cache_control: { type: 'ephemeral' } }],
       messages: [{ role: 'user', content: dynamicContent }]
     });
-    const analysis = msg.content?.[0]?.text || 'Analysis unavailable';
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('Claude API timeout after 30s')), 30000)
+    );
+    const msg = await Promise.race([claudeCall, timeoutPromise]);
+
+    console.log(`[analysis] Claude API responded — usage: in=${msg.usage?.input_tokens} out=${msg.usage?.output_tokens} cache_read=${msg.usage?.cache_read_input_tokens || 0}`);
     await logClaudeCall(`trailing stop analysis (${coinBase})`, msg.model || 'claude-sonnet-4-20250514', msg.usage);
+
+    const analysis = msg.content?.[0]?.text;
+    if (!analysis) throw new Error(`Claude returned empty content: ${JSON.stringify(msg.content)}`);
+    console.log(`[analysis] Analysis received: ${analysis.substring(0, 120)}`);
 
     const recMatch = analysis.match(/RECOMMENDATION:\s*(.+)/i);
     const recommendation = recMatch ? recMatch[1].trim().toUpperCase() : 'REVIEW NEEDED';
     const confMatch = analysis.match(/CONFIDENCE:\s*(High|Medium|Low)/i);
     const confidence = confMatch ? confMatch[1] : 'Low';
 
-    // Check auto-execute config — reads from system_config only
+    // Check auto-execute config
     const [autoExecRows] = await db.execute(
       "SELECT config_value FROM system_config WHERE config_key = 'ai_auto_execute'"
-    );
+    ).catch(() => [[]]);
     const autoExec = autoExecRows.length ? JSON.parse(autoExecRows[0].config_value) : { enabled: false };
     console.log('[auto-exec] Config loaded:', JSON.stringify(autoExec));
 
     const shouldAutoExecute =
       autoExec.enabled &&
-      autoExec.allowed_triggers.includes('trailing_stop') &&
+      autoExec.allowed_triggers?.includes('trailing_stop') &&
       confidence === autoExec.require_confidence &&
       (recommendation.includes('SELL') || recommendation.includes('HOLD'));
 
@@ -4049,8 +4083,7 @@ ${autoRules.map(r => `${r.rule_type}: ${r.order_type} @ $${parseFloat(r.trigger_
         await sendTelegram(
           `🤖 <b>AUTO-EXEC COOLDOWN — ${coinBase}</b>\n` +
           `Last execution ${Math.round((Date.now()-lastExec)/60000)}min ago\n` +
-          `Waiting ${autoExec.cooldown_minutes}min between executions\n\n` +
-          `${analysis}`
+          `Waiting ${autoExec.cooldown_minutes}min between executions\n\n${analysis}`
         );
       } else {
         analysisRateLimit.set(symbol + '_executed', Date.now());
@@ -4065,7 +4098,6 @@ ${autoRules.map(r => `${r.rule_type}: ${r.order_type} @ $${parseFloat(r.trigger_
         }
       }
     } else {
-      // Not auto-executing — show options menu as normal
       pendingAnalysis.set(symbol, { type: 'trailing_stop', recommendation, analysis, price: currentPrice, timestamp: Date.now() });
       lastAlertContext.set(TELEGRAM_CHAT_ID, { symbol, coinBase, alertType: 'claude_analysis_trailing' });
       await sendTelegram(
@@ -4078,14 +4110,50 @@ ${autoRules.map(r => `${r.rule_type}: ${r.order_type} @ $${parseFloat(r.trigger_
         `4️⃣ Buy more — add to position\n` +
         `5️⃣ Ignore — dismiss alert`
       );
+      console.log(`[analysis] Analysis sent to Telegram for ${coinBase} ✅`);
     }
+
   } catch (e) {
-    console.error('[analysis] analyseTrailingStopAlert error:', e.message);
+    // FIX 4: flag 429s so subsequent calls back off
+    if (e.status === 429 || e.message?.includes('429')) {
+      analysisRateLimit.set('api_rate_limited', Date.now());
+      console.error(`[analysis] Claude API rate limit (429) — 60s cooldown set`);
+    }
+    console.error(`[analysis] FAILED for ${coinBase}: ${e.message}`);
+    console.error(`[analysis] Stack: ${e.stack?.split('\n').slice(0,3).join(' | ')}`);
+
+    // Never silent-fail — always notify via Telegram
+    try {
+      await sendTelegram(
+        `⚠️ <b>ANALYSIS FAILED — ${coinBase}</b>\n\n` +
+        `Trailing stop triggered but Claude analysis could not complete.\n\n` +
+        `Error: ${e.message.substring(0, 120)}\n\n` +
+        `Manual review recommended.\n\n` +
+        `1️⃣ Sell now (manual)\n` +
+        `2️⃣ Hold — reset stop\n` +
+        `5️⃣ Dismiss`
+      );
+    } catch (tgErr) {
+      console.error('[analysis] Telegram fallback also failed:', tgErr.message);
+    }
   }
 }
 
 async function analyseFixedTargetAlert(symbol, currentPrice, target) {
+  const coinBase = symbol.replace('-USD', '');
   const ONE_HOUR = 60 * 60 * 1000;
+
+  // FIX 4: Check global API rate-limit cooldown
+  const apiRateLimited = analysisRateLimit.get('api_rate_limited');
+  if (apiRateLimited && Date.now() - apiRateLimited < 60 * 1000) {
+    console.log(`[analysis] Global API rate-limit cooldown active — skipping ${coinBase} target`);
+    await sendTelegram(
+      `⚠️ <b>ANALYSIS SKIPPED — ${coinBase}</b>\n` +
+      `Claude API rate-limit cooldown active (60s).\nCheck position manually.`
+    ).catch(() => {});
+    return;
+  }
+
   const lastAnalysis = analysisRateLimit.get(symbol);
   if (lastAnalysis && Date.now() - lastAnalysis < ONE_HOUR) {
     console.log(`[analysis] Rate limited — ${symbol} analysed ${Math.round((Date.now()-lastAnalysis)/60000)}min ago`);
@@ -4093,11 +4161,13 @@ async function analyseFixedTargetAlert(symbol, currentPrice, target) {
   }
   analysisRateLimit.set(symbol, Date.now());
 
+  console.log(`[analysis] Starting fixed target analysis for ${coinBase} — target $${parseFloat(target.targetPrice).toFixed(6)}, current $${currentPrice}`);
+
   try {
-    const coinBase = symbol.replace('-USD', '');
     const entryPrice = entryPrices.get(symbol) || target.entryPrice;
 
-    const msg = await anthropic.messages.create({
+    console.log(`[analysis] Calling Claude API (30s timeout)...`);
+    const claudeCall = anthropic.messages.create({
       model: 'claude-sonnet-4-20250514',
       max_tokens: 200,
       system: [{
@@ -4107,8 +4177,17 @@ async function analyseFixedTargetAlert(symbol, currentPrice, target) {
       }],
       messages: [{ role: 'user', content: `Price target hit for ${coinBase}.\nTarget: $${parseFloat(target.targetPrice).toFixed(6)}\nCurrent: $${currentPrice.toFixed(6)}\nEntry: ${entryPrice ? '$' + entryPrice.toFixed(6) : 'unknown'}\nDirection: ${target.direction}\n\nShould Bryan take profits now, hold for more, or ladder out partially?` }]
     });
-    const analysis = msg.content?.[0]?.text || 'Analysis unavailable';
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('Claude API timeout after 30s')), 30000)
+    );
+    const msg = await Promise.race([claudeCall, timeoutPromise]);
+
+    console.log(`[analysis] Claude API responded — usage: in=${msg.usage?.input_tokens} out=${msg.usage?.output_tokens}`);
     await logClaudeCall(`fixed target analysis (${coinBase})`, msg.model || 'claude-sonnet-4-20250514', msg.usage);
+
+    const analysis = msg.content?.[0]?.text;
+    if (!analysis) throw new Error(`Claude returned empty content: ${JSON.stringify(msg.content)}`);
+    console.log(`[analysis] Fixed target analysis received: ${analysis.substring(0, 120)}`);
 
     pendingAnalysis.set(symbol, { type: 'fixed_target', analysis, price: currentPrice, timestamp: Date.now() });
     lastAlertContext.set(TELEGRAM_CHAT_ID, { symbol, coinBase, alertType: 'claude_analysis_target' });
@@ -4123,8 +4202,28 @@ async function analyseFixedTargetAlert(symbol, currentPrice, target) {
       `4️⃣ Set new target\n` +
       `5️⃣ Dismiss`
     );
+    console.log(`[analysis] Fixed target analysis sent to Telegram for ${coinBase} ✅`);
+
   } catch (e) {
-    console.error('[analysis] analyseFixedTargetAlert error:', e.message);
+    if (e.status === 429 || e.message?.includes('429')) {
+      analysisRateLimit.set('api_rate_limited', Date.now());
+      console.error(`[analysis] Claude API rate limit (429) — 60s cooldown set`);
+    }
+    console.error(`[analysis] FAILED for ${coinBase} (fixed target): ${e.message}`);
+    console.error(`[analysis] Stack: ${e.stack?.split('\n').slice(0,3).join(' | ')}`);
+
+    try {
+      await sendTelegram(
+        `⚠️ <b>ANALYSIS FAILED — ${coinBase} TARGET HIT</b>\n\n` +
+        `Price target triggered but Claude analysis could not complete.\n\n` +
+        `Error: ${e.message.substring(0, 120)}\n\n` +
+        `Manual review recommended.\n\n` +
+        `1️⃣ Sell now (manual)\n` +
+        `5️⃣ Dismiss`
+      );
+    } catch (tgErr) {
+      console.error('[analysis] Telegram fallback also failed:', tgErr.message);
+    }
   }
 }
 
