@@ -4916,6 +4916,27 @@ async function checkPortfolio() {
     console.log('Price map size:', Object.keys(priceMap).length);
     console.log('Price map sample:', JSON.stringify(Object.entries(priceMap).slice(0, 3)));
 
+    // ── 24h baseline map — prices recorded at midnight (22-26h window) ────────
+    // Used instead of the 7-day rolling average stored in basePrices/baselines.
+    // Ensures alerts fire on genuine 24h moves, not week-old drift.
+    const baseline24hMap = {};
+    try {
+      const [ph24Rows] = await db.execute(`
+        SELECT symbol, MAX(recorded_at) as ts, SUBSTRING_INDEX(GROUP_CONCAT(price ORDER BY recorded_at DESC), ',', 1) as price
+        FROM price_history
+        WHERE recorded_at >= DATE_SUB(NOW(), INTERVAL 26 HOUR)
+          AND recorded_at <= DATE_SUB(NOW(), INTERVAL 22 HOUR)
+        GROUP BY symbol
+      `);
+      for (const r of ph24Rows) {
+        if (r.price) baseline24hMap[r.symbol] = parseFloat(r.price);
+      }
+      console.log(`[baseline24h] Loaded ${Object.keys(baseline24hMap).length} 24h prices from price_history`);
+    } catch (e) {
+      console.warn('[baseline24h] Failed to load 24h prices:', e.message);
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     // ── Pre-load Kraken-only coin prices into priceMap ────────────────────────
     for (const kSym of KRAKEN_MONITORED_COINS) {
       if (priceMap[kSym]) continue; // Revolut X already has it
@@ -5055,7 +5076,9 @@ async function checkPortfolio() {
         const symbol = `${asset.currency}-USD`;
         const currentPrice = priceMap[symbol];
         if (!currentPrice || !basePrices[symbol]) continue;
-        const change = (currentPrice - basePrices[symbol]) / basePrices[symbol];
+        // Use 24h midnight price if available, else fall back to rolling baseline
+        const effectiveBaseline = baseline24hMap[symbol] || basePrices[symbol];
+        const change = (currentPrice - effectiveBaseline) / effectiveBaseline;
         const threshold = customThresholds[symbol] !== undefined ? customThresholds[symbol] : PUMP_THRESHOLD;
         const valueUSD = available * currentPrice;
         const isDust = valueUSD > 0 && valueUSD < 5;
@@ -5143,8 +5166,11 @@ async function checkPortfolio() {
         continue;
       }
 
-      const change = (currentPrice - basePrices[symbol]) / basePrices[symbol];
-      console.log(`${symbol}: $${currentPrice} (${(change * 100).toFixed(1)}% from baseline)`);
+      // Use 24h midnight price if available, else fall back to rolling baseline
+      const effectiveBaseline = baseline24hMap[symbol] || basePrices[symbol];
+      const change = (currentPrice - effectiveBaseline) / effectiveBaseline;
+      const baselineLabel = baseline24hMap[symbol] ? '24h' : 'baseline';
+      console.log(`${symbol}: $${currentPrice} (${(change * 100).toFixed(1)}% from ${baselineLabel} $${effectiveBaseline.toFixed(6)})`);
 
       // Dust position check — suppress pump/drop alerts for positions worth less than $1
       const positionValueUsd = available * currentPrice;
@@ -5152,6 +5178,15 @@ async function checkPortfolio() {
         console.log(`[dust] Skipping ${symbol} — position value $${positionValueUsd.toFixed(4)} below $1 minimum`);
         continue;
       }
+
+      // Entry price context — used in both pump and drop alerts
+      const entryPrice = entryPrices.get(symbol);
+      const plFromEntry = entryPrice ? ((currentPrice - entryPrice) / entryPrice * 100) : null;
+      const isDeepLoss     = plFromEntry !== null && plFromEntry < -50;
+      const isModerateLoss = plFromEntry !== null && plFromEntry < -25;
+      const entryLine = entryPrice
+        ? `Your entry: ${formatPrice(entryPrice)} (${plFromEntry > 0 ? '+' : ''}${plFromEntry.toFixed(1)}%)\n`
+        : '';
 
       // Trigger baseline alert if pumping
       const threshold = customThresholds[symbol] !== undefined ? customThresholds[symbol] : PUMP_THRESHOLD;
@@ -5182,29 +5217,41 @@ async function checkPortfolio() {
             console.log('[alert] Sending final pump reminder for:', symbol);
             await sendTelegram(
               `🔔 <b>REMINDER — ${coinBase} PUMP ALERT</b>\n\n` +
-              `Still up ${pct}% from baseline today.\n` +
+              `Still up ${pct}% in 24h.\n` +
               `This is the final reminder.\n\n` +
               `1️⃣ Hold\n2️⃣ Sell advice\n3️⃣ Buy more\n4️⃣ Analyse\n5️⃣ Acknowledge — stop alerts`
             );
           }
-          // else: within 10 min window — stay silent
           continue;
         }
 
-        // First time firing for this move
+        // First time firing for this move — build entry-aware recommendation
         alertFirstSent.set(symbol, now);
-        alertState.active.set(symbol, true); // signal to other parts of the code that pump alert is live
-        const aiRec = alertRecommendations.get(symbol)?.rec || 'HOLD - Monitor the situation closely.';
+        alertState.active.set(symbol, true);
+        let aiRec = alertRecommendations.get(symbol)?.rec || 'HOLD - Monitor the situation closely.';
         const replyMenu = `\n\n1️⃣ Hold  2️⃣ Sell  3️⃣ Buy more  4️⃣ Analyse  5️⃣ Ignore\n💬 Reply number or '<b>${coinBase.toLowerCase()} 2</b>' to target this coin`;
-        const swingPumpHint = `\n\n⚡ SWING SIGNAL: This pump may be your sell opportunity!\nCheck if this is outside normal range — if so, consider taking profits and setting a buy-back alert at ${fmtPriceShort(currentPrice * 0.85)} (-15%)`;
-        const trailReminderPump = trailingStops.has(symbol)
+        let swingSignal;
+        if (isDeepLoss) {
+          // Pumping but still deeply underwater — don't celebrate, auto rules handle exit
+          aiRec = `HOLD — Pump to ${formatPrice(currentPrice)} still ${plFromEntry.toFixed(0)}% from entry. Auto sell rules handle exit.`;
+          swingSignal = `\n\n⚠️ Deep loss position — auto rules will sell when price targets are reached.`;
+        } else if (plFromEntry !== null && plFromEntry > 20) {
+          // Profitable — real sell opportunity
+          aiRec = aiRec; // keep Claude recommendation
+          swingSignal = `\n\n⚡ SWING SIGNAL: Up ${plFromEntry.toFixed(0)}% from entry. Consider taking profits and setting a buy-back at ${fmtPriceShort(currentPrice * 0.85)} (-15%)`;
+        } else {
+          swingSignal = `\n\n⚡ SWING SIGNAL: This pump may be your sell opportunity!\nConsider taking profits and setting a buy-back alert at ${fmtPriceShort(currentPrice * 0.85)} (-15%)`;
+        }
+        const trailReminder = trailingStops.has(symbol)
           ? `\n\n📈 TREND IS YOUR FRIEND — Trailing stop is protecting your profits. Let it run unless structure breaks!`
           : '';
         const alertMessage =
-          `📈 <b>${symbol} DAILY PUMP ALERT</b>\n\n` +
-          `Baseline: ${formatPrice(basePrices[symbol])} → Now ${formatPrice(currentPrice)} (+${pct}%)\n` +
-          `You hold: ${available} ${coinBase}\n\n` +
-          `⚡ RECOMMENDATION: ${aiRec}${swingPumpHint}${trailReminderPump}${replyMenu}\n\n` +
+          `📈 <b>${coinBase} DAILY PUMP ALERT</b>\n\n` +
+          `24h move: +${pct}%\n` +
+          `Current: ${formatPrice(currentPrice)}\n` +
+          entryLine +
+          `You hold: ${available.toFixed(4)} ${coinBase}\n\n` +
+          `⚡ RECOMMENDATION: ${aiRec}${swingSignal}${trailReminder}${replyMenu}\n\n` +
           `⏰ One reminder in 10 min if no response`;
         await sendTelegram(alertMessage);
         alertContextBySymbol.set(coinBase.toLowerCase(), { symbol, coinBase, alertType: 'pump', timestamp: Date.now() });
@@ -5240,26 +5287,40 @@ async function checkPortfolio() {
             console.log('[alert] Sending final drop reminder for:', symbol);
             await sendTelegram(
               `🔔 <b>REMINDER — ${coinBase} DROP ALERT</b>\n\n` +
-              `Still down ${pct}% from baseline today.\n` +
+              `Still down ${pct}% in 24h.\n` +
               `This is the final reminder.\n\n` +
               `1️⃣ Hold\n2️⃣ Buy more\n3️⃣ Sell advice\n4️⃣ Analyse\n5️⃣ Acknowledge — stop alerts`
             );
           }
-          // else: within 10 min window — stay silent
           continue;
         }
 
-        // First time firing for this move
+        // First time firing for this move — build entry-aware recommendation
         alertFirstSent.set(symbol, now);
-        activeDropAlerts.set(symbol, true); // signal to other parts of the code that drop alert is live
-        const aiRec = alertRecommendations.get(symbol)?.rec || 'HOLD - Monitor the situation closely.';
+        activeDropAlerts.set(symbol, true);
+        let aiRec = alertRecommendations.get(symbol)?.rec || 'HOLD - Monitor the situation closely.';
         const replyMenu = `\n\n1️⃣ Hold  2️⃣ Buy more  3️⃣ Sell  4️⃣ Analyse  5️⃣ Ignore\n💬 Reply number or '<b>${coinBase.toLowerCase()} 2</b>' to target this coin`;
-        const swingDropHint = `\n\n⚡ SWING SIGNAL: This drop may be your buy opportunity!\nCheck if this is outside normal range — if so, consider buying the dip and setting a sell alert at ${fmtPriceShort(currentPrice * 1.20)} (+20%)`;
+        let swingSignal;
+        if (isDeepLoss) {
+          // Deeply underwater — NEVER suggest buying
+          aiRec = `HOLD — Already ${plFromEntry.toFixed(0)}% from entry at ${formatPrice(entryPrice)}. This drop is noise — auto rules handle ${coinBase} automatically.`;
+          swingSignal = `\n\n⚠️ Deep loss position — do not average down without a clear macro catalyst.`;
+        } else if (isModerateLoss) {
+          aiRec = `HOLD — Down ${Math.abs(plFromEntry).toFixed(0)}% from entry. Wait for trend reversal before adding.`;
+          swingSignal = `\n\n👀 Watch for MSS (Market Structure Shift) before considering adding to position.`;
+        } else if (plFromEntry === null) {
+          swingSignal = `\n\n⚡ SWING SIGNAL: This drop may be a buy opportunity — no entry price recorded to assess vs cost basis.`;
+        } else {
+          // Profitable or small loss — genuine dip opportunity
+          swingSignal = `\n\n⚡ SWING SIGNAL: Down ${pct}% but up ${plFromEntry.toFixed(1)}% from entry — consider adding and setting sell at ${fmtPriceShort(currentPrice * 1.20)} (+20%)`;
+        }
         const alertMessage =
-          `📉 <b>${symbol} DROP ALERT!</b>\n\n` +
-          `Baseline: ${formatPrice(basePrices[symbol])} → Now ${formatPrice(currentPrice)} (-${pct}%)\n` +
-          `You hold: ${available} ${coinBase}\n\n` +
-          `⚡ RECOMMENDATION: ${aiRec}${swingDropHint}${replyMenu}\n\n` +
+          `📉 <b>${coinBase} DROP ALERT</b>\n\n` +
+          `24h move: -${pct}%\n` +
+          `Current: ${formatPrice(currentPrice)}\n` +
+          entryLine +
+          `You hold: ${available.toFixed(4)} ${coinBase}\n\n` +
+          `⚡ RECOMMENDATION: ${aiRec}${swingSignal}${replyMenu}\n\n` +
           `⏰ One reminder in 10 min if no response`;
         await sendTelegram(alertMessage);
         alertContextBySymbol.set(coinBase.toLowerCase(), { symbol, coinBase, alertType: 'drop', timestamp: Date.now() });
