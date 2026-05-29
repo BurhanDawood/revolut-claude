@@ -1168,6 +1168,7 @@
   let statusData = {};
   let targetsData = {};
   let entryPricesData = {};
+  let entryDetailData = {};
   let trailingStopsData = {};
   let revolutTotalUSD = 0;
 
@@ -1640,7 +1641,7 @@
       await apiFetch('POST', `/api/trailing-stops/${symbol}`, { trail_pct: pct });
       showToast(`${symbol} trailing stop set to ${pct}%`, 'success');
       trailingStopsData = await apiFetch('GET', '/api/trailing-stops').catch(() => trailingStopsData);
-      renderThresholds(balancesData, statusData, targetsData, entryPricesData, trailingStopsData);
+      renderThresholds(balancesData, statusData, targetsData, entryPricesData, trailingStopsData, entryDetailData);
       renderTrailSummary(trailingStopsData);
     } catch (e) { showToast('Failed: ' + e.message, 'error'); }
   }
@@ -1650,7 +1651,7 @@
       await apiFetch('DELETE', `/api/trailing-stops/${symbol}`);
       showToast(`${symbol} trailing stop removed`, 'success');
       trailingStopsData = await apiFetch('GET', '/api/trailing-stops').catch(() => trailingStopsData);
-      renderThresholds(balancesData, statusData, targetsData, entryPricesData, trailingStopsData);
+      renderThresholds(balancesData, statusData, targetsData, entryPricesData, trailingStopsData, entryDetailData);
       renderTrailSummary(trailingStopsData);
     } catch (e) { showToast('Failed: ' + e.message, 'error'); }
   }
@@ -1708,7 +1709,7 @@
     }
   }
 
-  function renderThresholds(balances, status, targets, entries, trails) {
+  function renderThresholds(balances, status, targets, entries, trails, detail) {
     const el = document.getElementById('threshold-list');
     const trailMap = trails || {};
     const defaultPct = ((status.defaultThreshold || 0.20) * 100).toFixed(0);
@@ -1742,19 +1743,35 @@
 
       // ── Entry + P&L (read-only) ──
       const entry = entries && entries[sym];
+      const ep = detail && detail[sym];
       let entryRow = '';
       if (entry) {
         const pnl = price ? ((price - entry) / entry * 100) : null;
         const pnlColour = pnl == null ? '' : pnl >= 5 ? 'var(--accent)' : pnl >= 0 ? '#9effd8' : pnl >= -20 ? '#ffcc00' : 'var(--danger)';
         const pnlEmoji  = pnl == null ? '' : pnl >= 0 ? '🟢' : '🔴';
         const pnlStr    = pnl != null ? `<span class="tc-pnl" style="color:${pnlColour}">${pnl >= 0 ? '+' : ''}${pnl.toFixed(1)}% ${pnlEmoji}</span>` : '';
+        // Cost basis row for coins with completed cycles
+        const cycleCount = ep ? ep.cycle_count : 0;
+        const origEntry  = ep ? ep.original_entry_price : entry;
+        let costBasisRow = '';
+        if (cycleCount > 0 && origEntry && origEntry !== entry) {
+          const histPnl = price ? ((price - origEntry) / origEntry * 100) : null;
+          const histColour = histPnl == null ? '' : histPnl >= 0 ? '#9effd8' : 'var(--danger)';
+          const histStr = histPnl != null
+            ? `<span style="color:${histColour}">${histPnl >= 0 ? '+' : ''}${histPnl.toFixed(1)}%</span>`
+            : '';
+          costBasisRow = `
+            <div style="font-size:0.73rem;color:var(--text-muted);margin-top:2px;padding-left:4px">
+              📈 Cost basis: ${fmtPrice(origEntry)} ${histStr} · ${cycleCount} cycle${cycleCount !== 1 ? 's' : ''}
+            </div>`;
+        }
         entryRow = `
           <div class="tc-entry-row">
-            <span class="tc-entry-label">Entry</span>
+            <span class="tc-entry-label">${cycleCount > 0 ? '🔄 Cycle entry' : 'Entry'}</span>
             <span class="tc-entry-value">${fmtPrice(entry)}</span>
             <span style="color:var(--text-muted);font-size:0.75rem">→ now ${fmtPrice(price)}</span>
             ${pnlStr}
-          </div>`;
+          </div>${costBasisRow}`;
       }
 
       // ── Daily alert ──
@@ -1902,7 +1919,7 @@
       await apiFetch('POST', `/api/targets/${symbol}`, { threshold_pct: pct });
       showToast(`${symbol} fixed target set to +${pct}% from current price`, 'success');
       targetsData = await apiFetch('GET', '/api/targets');
-      renderThresholds(balancesData, statusData, targetsData, entryPricesData, trailingStopsData);
+      renderThresholds(balancesData, statusData, targetsData, entryPricesData, trailingStopsData, entryDetailData);
     } catch (e) {
       showToast('Failed: ' + e.message, 'error');
     }
@@ -1915,7 +1932,7 @@
       await apiFetch('POST', `/api/targets/${symbol}`, { threshold_pct: pct });
       showToast(`${symbol} fixed target updated to ${pct}%`, 'success');
       targetsData = await apiFetch('GET', '/api/targets');
-      renderThresholds(balancesData, statusData, targetsData, entryPricesData, trailingStopsData);
+      renderThresholds(balancesData, statusData, targetsData, entryPricesData, trailingStopsData, entryDetailData);
     } catch (e) {
       showToast('Failed: ' + e.message, 'error');
     }
@@ -1926,7 +1943,7 @@
       await apiFetch('DELETE', `/api/targets/${symbol}`);
       showToast(`${symbol} fixed target removed`, 'success');
       targetsData = await apiFetch('GET', '/api/targets');
-      renderThresholds(balancesData, statusData, targetsData, entryPricesData, trailingStopsData);
+      renderThresholds(balancesData, statusData, targetsData, entryPricesData, trailingStopsData, entryDetailData);
     } catch (e) {
       showToast('Failed: ' + e.message, 'error');
     }
@@ -1939,7 +1956,7 @@
       await apiFetch('POST', `/api/entryprices/${symbol}`, { entry_price: price });
       showToast(`${symbol} entry price set to $${price}`, 'success');
       entryPricesData = await apiFetch('GET', '/api/entryprices');
-      renderThresholds(balancesData, statusData, targetsData, entryPricesData, trailingStopsData);
+      renderThresholds(balancesData, statusData, targetsData, entryPricesData, trailingStopsData, entryDetailData);
     } catch (e) {
       showToast('Failed: ' + e.message, 'error');
     }
@@ -1968,7 +1985,7 @@
     statusData = data;
     renderAlerts(data.activeAlerts);
     renderMonitorStatus(data.paused);
-    renderThresholds(balancesData, statusData, targetsData, entryPricesData);
+    renderThresholds(balancesData, statusData, targetsData, entryPricesData, trailingStopsData, entryDetailData);
     return data;
   }
 
@@ -2047,10 +2064,11 @@
         return;
       }
       await refreshBalances().catch(e => { console.error('refreshBalances failed:', e); });
-      const [status, targets, entries, capital, tangem, tsData] = await Promise.all([
+      const [status, targets, entries, entryDetail, capital, tangem, tsData] = await Promise.all([
         apiFetch('GET', '/api/status').catch(() => ({})),
         apiFetch('GET', '/api/targets').catch(() => ({})),
         apiFetch('GET', '/api/entryprices').catch(() => ({})),
+        apiFetch('GET', '/api/entryprices/detail').catch(() => ({})),
         apiFetch('GET', '/api/capital').catch(() => null),
         apiFetch('GET', '/api/tangem').catch(() => null),
         apiFetch('GET', '/api/trailing-stops').catch(() => ({})),
@@ -2058,6 +2076,7 @@
       statusData = status || {};
       targetsData = targets || {};
       entryPricesData = entries || {};
+      entryDetailData = entryDetail || {};
       trailingStopsData = tsData || {};
       try { renderAlerts(statusData.activeAlerts); } catch(e) { console.error('renderAlerts:', e); }
       try { renderMonitorStatus(statusData.paused); } catch(e) { console.error('renderMonitorStatus:', e); }

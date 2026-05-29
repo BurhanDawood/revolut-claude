@@ -734,6 +734,20 @@ await db.execute(`CREATE TABLE IF NOT EXISTS deleted_rules_log (
 
 await safeAddColumn('macro_alerts_sent', 'message', 'TEXT');
 
+// Cost basis tracking — preserve original entry price across sell→buyback cycles
+await safeAddColumn('entry_prices', 'original_entry_price', 'DECIMAL(20,10) NULL');
+await safeAddColumn('entry_prices', 'original_entry_date',  'TIMESTAMP NULL');
+await safeAddColumn('entry_prices', 'cycle_count',          'INT DEFAULT 0');
+await safeAddColumn('entry_prices', 'created_at',           'TIMESTAMP DEFAULT CURRENT_TIMESTAMP');
+
+// Backfill: preserve current entry prices as original for all existing positions
+await db.execute(`
+  UPDATE entry_prices
+  SET original_entry_price = entry_price,
+      original_entry_date  = COALESCE(updated_at, NOW())
+  WHERE original_entry_price IS NULL
+`).catch(e => console.warn('[migration] entry_prices backfill:', e.message));
+
 // One-time cleanup: remove ghost symbols created by parser errors (words mistaken for coin names)
 try {
   const ghostSymbols = ['RISES-USD', 'RAISE-USD', 'TRADE-USD'];
@@ -3298,24 +3312,19 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
       try {
         const prevQty = previousBalances.get(symbol) || 0;
         const existingEntry = entryPrices.get(symbol);
+        // Cycle buyback: previous qty was 0 (full sell before this buy)
+        const isCycleBuyback = prevQty === 0 && existingEntry != null;
         if (existingEntry && prevQty > 0) {
           const newQty = prevQty + absQty;
           const newAvgEntry = ((prevQty * existingEntry) + (absQty * price)) / newQty;
-          entryPrices.set(symbol, newAvgEntry);
-          await db.execute(
-            'INSERT INTO entry_prices (symbol, entry_price) VALUES (?, ?) ON DUPLICATE KEY UPDATE entry_price = VALUES(entry_price)',
-            [symbol, newAvgEntry]
-          );
-          console.log(`[entry] ${symbol} avg entry updated: $${existingEntry.toFixed(6)} → $${newAvgEntry.toFixed(6)}`);
+          await updateEntryPrice(symbol, newAvgEntry, false);
           avgEntryLine = `\n📊 Avg entry updated: ${formatPrice(existingEntry)} → ${formatPrice(newAvgEntry)}`;
         } else if (!existingEntry && price > 0) {
-          entryPrices.set(symbol, price);
-          await db.execute(
-            'INSERT INTO entry_prices (symbol, entry_price) VALUES (?, ?) ON DUPLICATE KEY UPDATE entry_price = VALUES(entry_price)',
-            [symbol, price]
-          );
+          await updateEntryPrice(symbol, price, false);
           avgEntryLine = `\n📊 Entry price set: ${formatPrice(price)}`;
-          console.log(`[entry] ${symbol} first entry set: $${price.toFixed(6)}`);
+        } else if (isCycleBuyback) {
+          await updateEntryPrice(symbol, price, true);
+          avgEntryLine = `\n🔄 Cycle buyback entry: ${formatPrice(price)}`;
         }
       } catch (e) {
         console.error('[entry] avg entry update error:', e.message);
@@ -3996,6 +4005,66 @@ async function getAvailableUSD(exchange) {
   } catch (e) {
     console.error('[cash] getAvailableUSD error:', e.message);
     return 0;
+  }
+}
+
+// ── Entry price + cost basis tracker ─────────────────────────────────────────
+// Preserves the original cost basis (original_entry_price) across sell→buyback cycles.
+// isCycleBuyback=true increments cycle_count and sends a Telegram cycle summary.
+async function updateEntryPrice(symbol, newPrice, isCycleBuyback = false) {
+  try {
+    const coinBase = symbol.replace('-USD', '');
+    const [existing] = await db.execute(
+      'SELECT entry_price, original_entry_price, cycle_count FROM entry_prices WHERE symbol = ?',
+      [symbol]
+    );
+
+    if (existing.length === 0) {
+      // First time — set both current and original
+      await db.execute(
+        `INSERT INTO entry_prices (symbol, entry_price, original_entry_price, original_entry_date, cycle_count)
+         VALUES (?, ?, ?, NOW(), 0)`,
+        [symbol, newPrice, newPrice]
+      );
+      entryPrices.set(symbol, newPrice);
+      console.log(`[entry] ${symbol} first entry set: $${newPrice} (original & cycle both = $${newPrice})`);
+      return;
+    }
+
+    const row = existing[0];
+    const originalEntry = parseFloat(row.original_entry_price || row.entry_price);
+    const newCycleCount = isCycleBuyback
+      ? (parseInt(row.cycle_count) || 0) + 1
+      : (parseInt(row.cycle_count) || 0);
+
+    await db.execute(
+      `UPDATE entry_prices SET
+         entry_price          = ?,
+         original_entry_price = COALESCE(original_entry_price, ?),
+         cycle_count          = ?
+       WHERE symbol = ?`,
+      [newPrice, originalEntry, newCycleCount, symbol]
+    );
+    entryPrices.set(symbol, newPrice);
+
+    console.log(`[entry] ${symbol} updated: cycle=$${newPrice.toFixed(6)} | original=$${originalEntry.toFixed(6)} | cycles=${newCycleCount}`);
+
+    if (isCycleBuyback) {
+      const recoveryNeeded = ((originalEntry / newPrice - 1) * 100).toFixed(1);
+      const nextSellTarget  = (newPrice * 1.055).toFixed(6);
+      await sendTelegram(
+        `🔄 <b>CYCLE COMPLETE — ${coinBase}</b>\n\n` +
+        `Cycles completed: ${newCycleCount}\n` +
+        `New cycle entry: $${newPrice.toFixed(6)}\n` +
+        `Cost basis: $${originalEntry.toFixed(6)}\n` +
+        `Recovery needed: ${recoveryNeeded}%\n\n` +
+        `Next sell target: $${nextSellTarget}`
+      ).catch(() => {});
+    }
+  } catch (e) {
+    console.error('[entry] updateEntryPrice error:', e.message);
+    // Fallback: at minimum update in-memory cache so alerts keep working
+    entryPrices.set(symbol, newPrice);
   }
 }
 
@@ -6207,11 +6276,33 @@ app.get('/api/learning', async (req, res) => {
   }
 });
 
-// GET /api/entryprices — all average entry prices
+// GET /api/entryprices — all average entry prices (simple map for legacy consumers)
 app.get('/api/entryprices', (req, res) => {
   const out = {};
   for (const [sym, price] of entryPrices) out[sym] = price;
   res.json(out);
+});
+
+// GET /api/entryprices/detail — full cost basis data including original entry and cycle count
+app.get('/api/entryprices/detail', async (req, res) => {
+  try {
+    const [rows] = await db.execute(
+      'SELECT symbol, entry_price, original_entry_price, original_entry_date, cycle_count, updated_at FROM entry_prices'
+    );
+    const out = {};
+    for (const r of rows) {
+      out[r.symbol] = {
+        entry_price:           parseFloat(r.entry_price),
+        original_entry_price:  r.original_entry_price ? parseFloat(r.original_entry_price) : parseFloat(r.entry_price),
+        original_entry_date:   r.original_entry_date,
+        cycle_count:           parseInt(r.cycle_count || 0),
+        updated_at:            r.updated_at,
+      };
+    }
+    res.json(out);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // GET /api/claude-usage — Claude API call history and cost summary
@@ -6234,16 +6325,12 @@ app.get('/api/claude-usage', async (req, res) => {
   });
 });
 
-// POST /api/entryprices/:symbol — set average entry price
+// POST /api/entryprices/:symbol — set average entry price (manual override, never cycle)
 app.post('/api/entryprices/:symbol', async (req, res) => {
   const symbol = req.params.symbol.toUpperCase();
   const { entry_price } = req.body;
   if (!entry_price || entry_price <= 0) return res.status(400).json({ error: 'entry_price must be > 0' });
-  entryPrices.set(symbol, entry_price);
-  await db.execute(
-    'INSERT INTO entry_prices (symbol, entry_price) VALUES (?, ?) ON DUPLICATE KEY UPDATE entry_price = VALUES(entry_price)',
-    [symbol, entry_price]
-  );
+  await updateEntryPrice(symbol, parseFloat(entry_price), false);
   res.json({ ok: true, symbol, entry_price });
 });
 
@@ -6317,6 +6404,11 @@ function createMcpServer() {
           }
           let totalValue = 0;
           const positions = [];
+          const [epDetailRows] = await db.execute(
+            'SELECT symbol, entry_price, original_entry_price, cycle_count, original_entry_date FROM entry_prices'
+          ).catch(() => [[]]);
+          const epDetail = {};
+          for (const r of epDetailRows) epDetail[r.symbol] = r;
           for (const asset of balances) {
             if (!asset.currency || SKIP_CURRENCIES.includes(asset.currency)) continue;
             const qty = parseFloat(asset.available);
@@ -6326,8 +6418,18 @@ function createMcpServer() {
             const valueUsd = price ? qty * price : null;
             if (valueUsd) totalValue += valueUsd;
             const entry = entryPrices.get(sym) || null;
+            const ep = epDetail[sym];
+            const originalEntry = ep?.original_entry_price ? parseFloat(ep.original_entry_price) : entry;
+            const cycleCount = parseInt(ep?.cycle_count || 0);
             const plPct = entry && price ? ((price - entry) / entry * 100).toFixed(2) : null;
-            positions.push({ symbol: sym, currency: asset.currency, quantity: qty, price, value_usd: valueUsd?.toFixed(2), entry_price: entry, pl_pct: plPct });
+            const historicalPlPct = originalEntry && price ? ((price - originalEntry) / originalEntry * 100).toFixed(2) : null;
+            positions.push({
+              symbol: sym, currency: asset.currency, quantity: qty, price,
+              value_usd: valueUsd?.toFixed(2),
+              entry_price: entry, pl_pct: plPct,
+              original_entry_price: originalEntry, historical_pl_pct: historicalPlPct,
+              cycle_count: cycleCount
+            });
           }
           positions.sort((a, b) => (parseFloat(b.value_usd) || 0) - (parseFloat(a.value_usd) || 0));
           const cap = getCapitalSummary(totalValue);
@@ -6636,11 +6738,7 @@ function createMcpServer() {
     },
     async ({ symbol, entry_price }) => {
       const sym = symbol.includes('-USD') ? symbol : `${symbol}-USD`;
-      entryPrices.set(sym, entry_price);
-      await db.execute(
-        'INSERT INTO entry_prices (symbol, entry_price) VALUES (?, ?) ON DUPLICATE KEY UPDATE entry_price = VALUES(entry_price)',
-        [sym, entry_price]
-      );
+      await updateEntryPrice(sym, entry_price, false);
       const currentPrice = await getCurrentPrice(sym).catch(() => null);
       const plPct = currentPrice ? ((currentPrice - entry_price) / entry_price * 100).toFixed(2) : null;
       return { content: [{ type: 'text', text: JSON.stringify({ ok: true, symbol: sym, entry_price, current_price: currentPrice, pl_pct: plPct }) }] };
@@ -6681,6 +6779,11 @@ function createMcpServer() {
 
       let totalValue = 0;
       const positions = [];
+      const [epSummaryRows] = await db.execute(
+        'SELECT symbol, entry_price, original_entry_price, cycle_count, original_entry_date FROM entry_prices'
+      ).catch(() => [[]]);
+      const epSummary = {};
+      for (const r of epSummaryRows) epSummary[r.symbol] = r;
       for (const asset of balances) {
         if (!asset.currency || SKIP_CURRENCIES.includes(asset.currency)) continue;
         const qty = parseFloat(asset.available);
@@ -6690,8 +6793,12 @@ function createMcpServer() {
         const valueUsd = price ? qty * price : null;
         if (valueUsd) totalValue += valueUsd;
         const entry = entryPrices.get(sym) || null;
+        const ep = epSummary[sym];
+        const originalEntry = ep?.original_entry_price ? parseFloat(ep.original_entry_price) : entry;
+        const cycleCount = parseInt(ep?.cycle_count || 0);
         const plPct = entry && price ? ((price - entry) / entry * 100).toFixed(2) : null;
         const plUsd = entry && price && qty ? ((price - entry) * qty).toFixed(2) : null;
+        const historicalPlPct = originalEntry && price ? ((price - originalEntry) / originalEntry * 100).toFixed(2) : null;
         const threshold = customThresholds[sym] !== undefined ? customThresholds[sym] : PUMP_THRESHOLD;
         const basePrice = basePrices[sym] || null;
         const changeFromBase = basePrice && price ? ((price - basePrice) / basePrice * 100).toFixed(2) : null;
@@ -6706,6 +6813,8 @@ function createMcpServer() {
         positions.push({
           symbol: sym, currency: asset.currency, quantity: qty, price, value_usd: valueUsd ? valueUsd.toFixed(2) : null,
           entry_price: entry, pl_pct: plPct, pl_usd: plUsd,
+          original_entry_price: originalEntry, historical_pl_pct: historicalPlPct,
+          cycle_count: cycleCount,
           baseline_price: basePrice, change_from_baseline_pct: changeFromBase,
           alert_threshold_pct: (threshold * 100).toFixed(1),
           pump_alert_active: alertState.active.has(sym),
@@ -8257,15 +8366,19 @@ app.post('/telegram-webhook', async (req, res) => {
               await db.execute('UPDATE trade_intentions SET matched_at = NOW() WHERE id = ?', [matchedIntention.id]).catch(() => {});
             }
 
-            // Update avg entry price on buy
+            // Update avg entry price on buy (respecting cost basis)
             if (t.side.toLowerCase() === 'buy') {
               const prevQty = previousBalances.get(t.symbol) || 0;
               const existingEntry = entryPrices.get(t.symbol);
+              const isCycleBuyback = prevQty === 0 && existingEntry != null;
               if (existingEntry && prevQty > 0) {
                 const newQty = prevQty + parseFloat(t.baseSize);
                 const newAvgEntry = ((prevQty * existingEntry) + (parseFloat(t.baseSize) * executedPrice)) / newQty;
-                entryPrices.set(t.symbol, newAvgEntry);
-                await db.execute('INSERT INTO entry_prices (symbol, entry_price) VALUES (?, ?) ON DUPLICATE KEY UPDATE entry_price = VALUES(entry_price)', [t.symbol, newAvgEntry]).catch(() => {});
+                await updateEntryPrice(t.symbol, newAvgEntry, false);
+              } else if (isCycleBuyback) {
+                await updateEntryPrice(t.symbol, executedPrice, true);
+              } else if (!existingEntry) {
+                await updateEntryPrice(t.symbol, executedPrice, false);
               }
             }
 
@@ -8777,11 +8890,7 @@ app.post('/telegram-webhook', async (req, res) => {
       const coinBase = entryMatch[1].toUpperCase();
       const symbol = `${coinBase}-USD`;
       const price = parseFloat(entryMatch[2]);
-      entryPrices.set(symbol, price);
-      await db.execute(
-        'INSERT INTO entry_prices (symbol, entry_price) VALUES (?, ?) ON DUPLICATE KEY UPDATE entry_price = VALUES(entry_price)',
-        [symbol, price]
-      );
+      await updateEntryPrice(symbol, price, false);
       const currentPrice = await getCurrentPrice(symbol);
       const plStr = currentPrice
         ? ` Current price $${currentPrice.toFixed(4)} = ${((currentPrice - price) / price * 100).toFixed(1)}% from your entry.`
