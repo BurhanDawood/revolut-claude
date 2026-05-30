@@ -3179,7 +3179,12 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
         [coinBase, action, price, price]
       );
       if (recentSourced.length > 0) {
-        console.log(`[autoLog] Suppressing — trade already logged (source=${recentSourced[0].source}, id=${recentSourced[0].id})`);
+        const src = recentSourced[0].source;
+        console.log(`[autoLog] Suppressing — trade already logged (source=${src}, id=${recentSourced[0].id})`);
+        const srcEmoji = src === 'claude_mcp' ? '✓' : '🤖';
+        await sendTelegram(
+          `✅ ${action.toUpperCase()} ${formatTradeQty(absQty)} ${coinBase} @ ${formatPrice(price)} = $${valueUsd.toFixed(2)} ${srcEmoji}`
+        ).catch(() => {});
         return;
       }
     } catch (e) { console.error('[autoLog] Source suppression check error:', e.message); }
@@ -3430,6 +3435,48 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
       console.log(`[autoLog] ${symbol} ${action} — non-manual source, skipping context question`);
       return;
     }
+
+    // ── USDT/USD sweep auto-detection ──────────────────────────────────────────
+    // If a sell is detected and USDT or USD balance increased by a similar amount
+    // in the same cycle, auto-classify as an internal cash conversion — no question.
+    if (action === 'sell') {
+      try {
+        const freshBalances = await revolutRequest('GET', '/balances').catch(() => []);
+        const usdtAsset = freshBalances.find(b => b.currency === 'USDT');
+        const usdAsset  = freshBalances.find(b => b.currency === 'USD');
+        const currentUSDT = parseFloat(usdtAsset?.available || 0);
+        const currentUSD  = parseFloat(usdAsset?.available  || 0);
+        const prevUSDT    = previousBalances.get('USDT-USD') || 0;
+        const prevUSD     = previousBalances.get('USD-USD')  || 0;
+        const usdtIncrease = Math.max(0, currentUSDT - prevUSDT);
+        const usdIncrease  = Math.max(0, currentUSD  - prevUSD);
+        const cashIncrease = Math.max(usdtIncrease, usdIncrease);
+        const cashType     = usdtIncrease >= usdIncrease ? 'USDT' : 'USD';
+        const similarity   = valueUsd > 0 ? Math.abs(cashIncrease - valueUsd) / valueUsd : 1;
+
+        if (cashIncrease > 0.50 && similarity < 0.05) {
+          console.log(`[autoLog] ${coinBase} sell → ${cashType} +$${cashIncrease.toFixed(2)} detected — auto-classifying as sweep`);
+          await db.execute(
+            'UPDATE trading_journal SET reasoning = ?, emotion = ? WHERE id = ?',
+            [`Auto-detected: ${coinBase} converted to ${cashType} reserve. Value: $${valueUsd.toFixed(2)}`, 'neutral', journalId]
+          );
+          if (cashType === 'USDT') previousBalances.set('USDT-USD', currentUSDT);
+          else                     previousBalances.set('USD-USD',  currentUSD);
+          await sendTelegram(
+            `✅ <b>AUTO-LOGGED — ${coinBase} → ${cashType}</b>\n\n` +
+            `SELL ${formatTradeQty(absQty)} ${coinBase} @ ${formatPrice(price)}\n` +
+            `Value: $${valueUsd.toFixed(2)}\n` +
+            `${cashType} reserve: +$${cashIncrease.toFixed(2)}\n\n` +
+            `📝 Logged as ${cashType} sweep — no action needed`
+          );
+          await updateLearningModel().catch(() => {});
+          return; // Skip the Telegram question entirely
+        }
+      } catch (e) {
+        console.warn('[autoLog] Cash sweep detection error:', e.message);
+      }
+    }
+    // ──────────────────────────────────────────────────────────────────────────
 
     const actionLabel = action === 'buy' ? 'BOUGHT' : action === 'sell' ? 'SOLD' : action.toUpperCase();
 
