@@ -6754,41 +6754,43 @@ app.get('/api/thresholds', (req, res) => {
 });
 
 // GET /api/activity — trading journal feed for dashboard activity tab
+// Uses INFORMATION_SCHEMA to discover actual column names before querying,
+// so the endpoint never 500s due to a missing column.
 app.get('/api/activity', async (req, res) => {
   try {
+    // Discover real column names — never assume schema
+    const [colRows] = await db.execute(
+      `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'trading_journal'`
+    );
+    const columnNames = colRows.map(c => c.COLUMN_NAME);
+    console.log('[activity] Available columns:', columnNames.join(', '));
+
+    const safeColumns = [
+      'id','symbol','action','price','quantity',
+      'value_usd','reasoning','emotion','outcome_pnl','created_at'
+    ].filter(col => columnNames.includes(col));
+    console.log('[activity] Safe columns:', safeColumns.join(', '));
+
     const limit  = Math.min(parseInt(req.query.limit) || 50, 100);
     const filter = req.query.filter || 'all';
-    console.log(`[activity] Request: filter=${filter} limit=${limit}`);
+    const validFilters = ['buy','sell','payment','transfer','sweep','rebalance','skip'];
 
-    // Verify DB connection first
-    const [testRows] = await db.execute('SELECT COUNT(*) as total FROM trading_journal');
-    console.log(`[activity] Total journal entries: ${testRows[0].total}`);
-
-    let query = `
-      SELECT id, symbol, action, price, quantity, value_usd,
-             reasoning, emotion, outcome_pnl, source, created_at
-      FROM trading_journal
-    `;
+    let query = `SELECT ${safeColumns.join(', ')} FROM trading_journal`;
     const params = [];
-    const validFilters = ['buy','sell','payment','transfer','sweep','rebalance'];
-
     if (filter !== 'all' && validFilters.includes(filter)) {
       query += ' WHERE action = ?';
       params.push(filter);
     }
-
     query += ' ORDER BY created_at DESC LIMIT ?';
     params.push(limit);
 
-    console.log(`[activity] Params: ${JSON.stringify(params)}`);
     const [trades] = await db.execute(query, params);
-    console.log(`[activity] Results: ${trades.length} trades`);
-
-    res.json({ ok: true, trades: trades || [], total: trades?.length || 0 });
+    console.log(`[activity] Returning ${trades.length} trades`);
+    res.json({ ok: true, trades, total: trades.length });
   } catch (e) {
-    console.error('[activity] FULL ERROR:', e.message, '| code:', e.code);
-    console.error('[activity] Stack:', e.stack);
-    res.status(500).json({ ok: false, error: e.message, code: e.code });
+    console.error('[activity] Error:', e.code, e.message);
+    res.status(500).json({ ok: false, error: e.message, code: e.code, hint: 'Check Railway logs for [activity] lines' });
   }
 });
 
@@ -6822,27 +6824,6 @@ app.get('/api/debug/balance-check', async (req, res) => {
       changed:   result.filter(r => r.change !== null && Math.abs(r.change) > 0.0001),
     });
   } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// PATCH /api/activity/:id — update reasoning/action for a journal entry
-app.patch('/api/activity/:id', async (req, res) => {
-  try {
-    const id = parseInt(req.params.id);
-    const { action, reasoning } = req.body;
-    if (!id || isNaN(id)) return res.status(400).json({ error: 'Invalid id' });
-    const sets = [];
-    const vals = [];
-    if (action)    { sets.push('action = ?');    vals.push(action); }
-    if (reasoning !== undefined) { sets.push('reasoning = ?'); vals.push(reasoning); }
-    if (sets.length === 0) return res.status(400).json({ error: 'Nothing to update' });
-    vals.push(id);
-    await db.execute(`UPDATE trading_journal SET ${sets.join(', ')} WHERE id = ?`, vals);
-    await updateLearningModel().catch(() => {});
-    res.json({ ok: true });
-  } catch (e) {
-    console.error('[activity] PATCH error:', e.message);
     res.status(500).json({ error: e.message });
   }
 });
@@ -10642,30 +10623,6 @@ app.post('/api/fix/payment-pnl', async (req, res) => {
   }
 });
 
-// GET /api/activity — paginated trade feed with optional action filter
-app.get('/api/activity', async (req, res) => {
-  try {
-    const limit  = Math.min(parseInt(req.query.limit) || 50, 200);
-    const filter = req.query.filter || 'all';
-    const params = [limit];
-    const where  = filter !== 'all' ? 'WHERE action = ?' : '';
-    if (filter !== 'all') params.unshift(filter);
-    const [trades] = await db.execute(
-      `SELECT id, symbol, action, price, quantity, value_usd,
-              reasoning, emotion, outcome_pnl,
-              created_at
-       FROM trading_journal
-       ${where}
-       ORDER BY created_at DESC
-       LIMIT ?`,
-      params
-    );
-    res.json({ ok: true, trades, total: trades.length });
-  } catch (e) {
-    console.error('[activity] endpoint error:', e.message);
-    res.status(500).json({ error: e.message, hint: 'Check Railway logs for details' });
-  }
-});
 
 // PATCH /api/activity/:id — edit trade action and/or reasoning
 app.patch('/api/activity/:id', async (req, res) => {
