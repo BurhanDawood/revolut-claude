@@ -494,7 +494,17 @@ await db.execute(`CREATE TABLE IF NOT EXISTS price_ranges (
 
 await db.execute(`CREATE TABLE IF NOT EXISTS ignored_coins (
   symbol VARCHAR(50) PRIMARY KEY,
-  ignored_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  ignored_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  ignore_type VARCHAR(20) DEFAULT 'permanent',
+  expires_at TIMESTAMP NULL
+)`);
+
+await db.execute(`CREATE TABLE IF NOT EXISTS alert_reminders (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  symbol VARCHAR(50) NOT NULL,
+  alert_date DATE NOT NULL,
+  count INT DEFAULT 0,
+  UNIQUE KEY unique_symbol_date (symbol, alert_date)
 )`);
 
 await db.execute(`CREATE TABLE IF NOT EXISTS swing_cooldowns (
@@ -732,7 +742,11 @@ await db.execute(`CREATE TABLE IF NOT EXISTS deleted_rules_log (
   deleted_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )`).catch(e => console.error('[migration] deleted_rules_log:', e.message));
 
-await safeAddColumn('macro_alerts_sent', 'message', 'TEXT');
+await safeAddColumn('macro_alerts_sent', 'message',    'TEXT');
+await safeAddColumn('macro_alerts_sent', 'symbol',     'VARCHAR(50) NULL');
+await safeAddColumn('macro_alerts_sent', 'alert_type', "VARCHAR(30) DEFAULT 'macro'");
+await safeAddColumn('ignored_coins',     'ignore_type', "VARCHAR(20) DEFAULT 'permanent'");
+await safeAddColumn('ignored_coins',     'expires_at',  'TIMESTAMP NULL');
 
 // Cost basis tracking — preserve original entry price across sell→buyback cycles
 await safeAddColumn('entry_prices', 'original_entry_price', 'DECIMAL(20,10) NULL');
@@ -770,11 +784,42 @@ try {
 
 // Load permanently ignored coins from DB
 try {
-  const [ignoredRows] = await db.execute('SELECT symbol FROM ignored_coins');
+  const [ignoredRows] = await db.execute("SELECT symbol FROM ignored_coins WHERE ignore_type = 'permanent' OR ignore_type IS NULL");
   for (const row of ignoredRows) ignoredCoins.add(row.symbol);
   if (ignoredRows.length > 0) console.log(`[ignore] Loaded ${ignoredRows.length} ignored coin(s):`, [...ignoredCoins].join(', '));
 } catch (e) { console.warn('[ignore] Could not load ignored coins:', e.message); }
-// Note: acknowledged coins are session-only — server restart resets them (baselines also reset)
+
+// Restore session-acknowledged coins from DB (24h window — survives redeploy)
+try {
+  const [ackedRows] = await db.execute(
+    "SELECT symbol FROM ignored_coins WHERE ignore_type = 'session' AND expires_at > NOW()"
+  );
+  for (const row of ackedRows) alertState.acknowledged.add(row.symbol);
+  if (ackedRows.length > 0) console.log(`[ack] Restored ${ackedRows.length} acknowledged coin(s) from DB:`, ackedRows.map(r => r.symbol).join(', '));
+} catch (e) { console.warn('[ack] Could not restore acknowledged coins:', e.message); }
+
+// Restore recently acknowledged fixed-target alerts (4h window)
+try {
+  const [targetAckRows] = await db.execute(
+    "SELECT symbol FROM macro_alerts_sent WHERE alert_type = 'target_acknowledged' AND created_at > DATE_SUB(NOW(), INTERVAL 4 HOUR) AND symbol IS NOT NULL"
+  );
+  for (const row of targetAckRows) {
+    alertState.acknowledged.add(row.symbol);
+    console.log(`[ack] Restored target ack: ${row.symbol}`);
+  }
+} catch (e) { console.warn('[ack] Could not restore target acks:', e.message); }
+
+// Restore today's alert reminder counts (pump/drop) so redeploy doesn't double-remind
+try {
+  const [reminderRows] = await db.execute(
+    'SELECT symbol, count FROM alert_reminders WHERE alert_date = CURDATE()'
+  );
+  for (const row of reminderRows) {
+    if (parseInt(row.count) >= 1) alertReminderSent.set(row.symbol, Date.now());
+    if (parseInt(row.count) >= 1) alertFirstSent.set(row.symbol, Date.now() - 15 * 60 * 1000); // set as if sent 15 min ago
+  }
+  if (reminderRows.length > 0) console.log(`[reminder] Restored ${reminderRows.length} reminder state(s) from DB`);
+} catch (e) { console.warn('[reminder] Could not restore reminder counts:', e.message); }
 
 const [rows] = await db.execute('SELECT symbol, price FROM baselines');
 for (const row of rows) {
@@ -1857,6 +1902,14 @@ async function acknowledgeAlert(symbol) {
   // Mark as acknowledged — blocks all new alerts for this symbol this session
   alertState.acknowledged.add(symbol);
 
+  // Persist to DB with 24h expiry so redeploy doesn't re-fire dismissed alerts
+  await db.execute(
+    `INSERT INTO ignored_coins (symbol, ignore_type, expires_at)
+     VALUES (?, 'session', DATE_ADD(NOW(), INTERVAL 24 HOUR))
+     ON DUPLICATE KEY UPDATE ignore_type = 'session', expires_at = DATE_ADD(NOW(), INTERVAL 24 HOUR)`,
+    [symbol]
+  ).catch(e => console.error('[ack] DB persist error:', e.message));
+
   // Clear pump alert interval
   if (alertState.active.has(symbol)) {
     clearInterval(alertState.active.get(symbol));
@@ -1888,6 +1941,14 @@ async function acknowledgeAlert(symbol) {
   alertFirstSent.delete(symbol);
   alertReminderSent.delete(symbol);
 
+  // Log target acknowledgement for fixed-target cooldown recovery across restarts
+  if (activeFixedAlerts.has(symbol) || priceTargets.has(symbol)) {
+    await db.execute(
+      "INSERT INTO macro_alerts_sent (symbol, alert_type, alert_hash, message) VALUES (?, 'target_acknowledged', ?, 'User acknowledged')",
+      [symbol, `target_ack_${symbol}_${Date.now()}`]
+    ).catch(() => {});
+  }
+
   console.log('[ack] Complete for:', symbol,
     '| Active pump:', alertState.active.size,
     '| Active drop:', activeDropAlerts.size,
@@ -1907,7 +1968,10 @@ async function ignoreCoin(symbol) {
   alertFirstSent.delete(symbol);
   alertReminderSent.delete(symbol);
   try {
-    await db.execute('INSERT INTO ignored_coins (symbol) VALUES (?) ON DUPLICATE KEY UPDATE ignored_at = CURRENT_TIMESTAMP', [symbol]);
+    await db.execute(
+      "INSERT INTO ignored_coins (symbol, ignore_type, expires_at) VALUES (?, 'permanent', NULL) ON DUPLICATE KEY UPDATE ignore_type = 'permanent', expires_at = NULL, ignored_at = CURRENT_TIMESTAMP",
+      [symbol]
+    );
     console.log('[ignore] Permanently ignored:', symbol);
   } catch (e) { console.warn('[ignore] DB persist failed for', symbol, ':', e.message); }
 }
@@ -1917,6 +1981,7 @@ async function resumeAlerts(symbol) {
   ignoredCoins.delete(symbol);
   alertState.acknowledged.delete(symbol);
   try {
+    // Delete both permanent and session entries so the coin fires fresh
     await db.execute('DELETE FROM ignored_coins WHERE symbol = ?', [symbol]);
     console.log('[watch] Resumed alerts for:', symbol);
   } catch (e) { console.warn('[watch] DB delete failed for', symbol, ':', e.message); }
@@ -5222,6 +5287,10 @@ async function checkPortfolio() {
               `This is the final reminder.\n\n` +
               `1️⃣ Hold\n2️⃣ Sell advice\n3️⃣ Buy more\n4️⃣ Analyse\n5️⃣ Acknowledge — stop alerts`
             );
+            await db.execute(
+              'INSERT INTO alert_reminders (symbol, alert_date, count) VALUES (?, CURDATE(), 1) ON DUPLICATE KEY UPDATE count = count + 1',
+              [symbol]
+            ).catch(() => {});
           }
           continue;
         }
@@ -5229,6 +5298,10 @@ async function checkPortfolio() {
         // First time firing for this move — build entry-aware recommendation
         alertFirstSent.set(symbol, now);
         alertState.active.set(symbol, true);
+        await db.execute(
+          'INSERT INTO alert_reminders (symbol, alert_date, count) VALUES (?, CURDATE(), 0) ON DUPLICATE KEY UPDATE count = count',
+          [symbol]
+        ).catch(() => {});
         let aiRec = alertRecommendations.get(symbol)?.rec || 'HOLD - Monitor the situation closely.';
         const replyMenu = `\n\n1️⃣ Hold  2️⃣ Sell  3️⃣ Buy more  4️⃣ Analyse  5️⃣ Ignore\n💬 Reply number or '<b>${coinBase.toLowerCase()} 2</b>' to target this coin`;
         let swingSignal;
@@ -5292,6 +5365,10 @@ async function checkPortfolio() {
               `This is the final reminder.\n\n` +
               `1️⃣ Hold\n2️⃣ Buy more\n3️⃣ Sell advice\n4️⃣ Analyse\n5️⃣ Acknowledge — stop alerts`
             );
+            await db.execute(
+              'INSERT INTO alert_reminders (symbol, alert_date, count) VALUES (?, CURDATE(), 1) ON DUPLICATE KEY UPDATE count = count + 1',
+              [symbol]
+            ).catch(() => {});
           }
           continue;
         }
@@ -5299,6 +5376,10 @@ async function checkPortfolio() {
         // First time firing for this move — build entry-aware recommendation
         alertFirstSent.set(symbol, now);
         activeDropAlerts.set(symbol, true);
+        await db.execute(
+          'INSERT INTO alert_reminders (symbol, alert_date, count) VALUES (?, CURDATE(), 0) ON DUPLICATE KEY UPDATE count = count',
+          [symbol]
+        ).catch(() => {});
         let aiRec = alertRecommendations.get(symbol)?.rec || 'HOLD - Monitor the situation closely.';
         const replyMenu = `\n\n1️⃣ Hold  2️⃣ Buy more  3️⃣ Sell  4️⃣ Analyse  5️⃣ Ignore\n💬 Reply number or '<b>${coinBase.toLowerCase()} 2</b>' to target this coin`;
         let swingSignal;
@@ -5373,6 +5454,18 @@ async function checkPortfolio() {
         const changePct = ((currentPrice - target.anchorPrice) / target.anchorPrice) * 100;
         const coinBase = symbol.replace('-USD', '');
 
+        // Cooldown: skip if this target alert was sent or acknowledged within the last 4 hours
+        // Protects against redeploy re-firing acknowledged alerts when DB ack hasn't loaded yet
+        const [recentTargetRows] = await db.execute(
+          "SELECT id FROM macro_alerts_sent WHERE symbol = ? AND alert_type IN ('target','target_acknowledged') AND created_at > DATE_SUB(NOW(), INTERVAL 4 HOUR) LIMIT 1",
+          [symbol]
+        ).catch(() => [[]]);
+        if (recentTargetRows.length > 0) {
+          console.log(`[target] ${symbol} — alert sent/acked within 4h, skipping`);
+          alertState.acknowledged.add(symbol); // restore in-memory ack silently
+          continue;
+        }
+
         // Max-2-reminders: if already sent 2+ reminders, auto-acknowledge and delete target
         const remindersSent = targetReminderCount.get(symbol) || 0;
         if (remindersSent >= 2) {
@@ -5434,6 +5527,11 @@ async function checkPortfolio() {
           alertMessage = `🎯 <b>${symbol} FIXED TARGET HIT!</b>\n\nAnchor: $${anchorStr} → Now $${priceStr} (+${changePct.toFixed(1)}%)${entryLine}\n\n⚡ RECOMMENDATION: ${aiRec}${replyMenu}${autoLine}`;
         }
         await sendTelegram(alertMessage);
+        // Log send to macro_alerts_sent for cooldown tracking across restarts
+        await db.execute(
+          "INSERT INTO macro_alerts_sent (symbol, alert_type, alert_hash, message) VALUES (?, 'target', ?, ?)",
+          [symbol, `target_up_${symbol}_${Date.now()}`, `Fixed target hit @ ${currentPrice}`]
+        ).catch(() => {});
         alertContextBySymbol.set(coinBase.toLowerCase(), { symbol, coinBase, alertType: 'fixed_target_up', timestamp: Date.now() });
         lastAlertCoin = coinBase.toLowerCase();
         // Auto-trigger Claude analysis for non-dust, non-claude_rec alerts
@@ -5466,6 +5564,17 @@ async function checkPortfolio() {
       if (direction === 'down' && currentPrice <= target.targetPrice && !activeFixedAlerts.has(symbol) && !alertState.acknowledged.has(symbol) && !ignoredCoins.has(symbol)) {
         const changePct = ((currentPrice - target.anchorPrice) / target.anchorPrice) * 100;
         const coinBase = symbol.replace('-USD', '');
+
+        // Cooldown: skip if this target alert was sent or acknowledged within the last 4 hours
+        const [recentTargetRowsDown] = await db.execute(
+          "SELECT id FROM macro_alerts_sent WHERE symbol = ? AND alert_type IN ('target','target_acknowledged') AND created_at > DATE_SUB(NOW(), INTERVAL 4 HOUR) LIMIT 1",
+          [symbol]
+        ).catch(() => [[]]);
+        if (recentTargetRowsDown.length > 0) {
+          console.log(`[target] ${symbol} — floor alert sent/acked within 4h, skipping`);
+          alertState.acknowledged.add(symbol);
+          continue;
+        }
 
         // Max-2-reminders: if already sent 2+ reminders, auto-acknowledge and delete target
         const remindersSentDown = targetReminderCount.get(symbol) || 0;
@@ -5510,6 +5619,11 @@ async function checkPortfolio() {
           alertMessage = `📉 <b>${symbol} FIXED FLOOR HIT!</b>\n\nAnchor: ${formatPrice(target.anchorPrice)} → Now ${formatPrice(currentPrice)} (${changePct.toFixed(1)}%)${entryLine}\n\n⚡ RECOMMENDATION: ${aiRec}${replyMenu}${autoLine}`;
         }
         await sendTelegram(alertMessage);
+        // Log send for cooldown tracking across restarts
+        await db.execute(
+          "INSERT INTO macro_alerts_sent (symbol, alert_type, alert_hash, message) VALUES (?, 'target', ?, ?)",
+          [symbol, `target_down_${symbol}_${Date.now()}`, `Fixed floor hit @ ${currentPrice}`]
+        ).catch(() => {});
         alertContextBySymbol.set(coinBase.toLowerCase(), { symbol, coinBase, alertType: 'fixed_target_down', timestamp: Date.now() });
         lastAlertCoin = coinBase.toLowerCase();
 
