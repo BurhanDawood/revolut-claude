@@ -3402,6 +3402,7 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
       `Action: ${actionLabel} ~${formatTradeQty(absQty)} tokens at ${formatPrice(price)} ($${valueUsd.toFixed(2)})${pnlLine}${avgEntryLine}${recLine}${reentryLine}\n\n` +
       `Just reply:\n` +
       `'<b>taking profits, confident</b>' — reason + emotion, done\n` +
+      `'<b>rebalance [coin]</b>' — bought with proceeds from selling [coin]\n` +
       `'<b>payment</b>' — Revolut payment (excluded from stats)\n` +
       `'<b>transfer</b>' — internal transfer (excluded from stats)\n` +
       `'<b>skip</b>' — log without details\n\n` +
@@ -7874,6 +7875,85 @@ app.post('/telegram-webhook', async (req, res) => {
           if (!isKnownCommand) {
             matchedPending.push({ symbol, pending, skip: false });
           }
+        }
+      }
+
+      // --- Simple rebalance reply: 'rebalance [SOLD_COIN]' ---
+      // When one trade is pending and user names the coin they sold to fund it.
+      // e.g. pending BUY of NEAR, user types 'rebalance CC' → bought NEAR with CC proceeds.
+      const simpleRebalanceMatch = rawText.match(/^rebalance\s+([A-Za-z0-9]{2,10})$/i);
+      if (simpleRebalanceMatch && pendingTradeContext.size === 1) {
+        const fromCoin = simpleRebalanceMatch[1].toUpperCase();
+        const [[symbol, pending]] = pendingTradeContext;
+        const coinBase = symbol.replace('-USD', '');
+        clearTimeout(pending.timeoutHandle);
+        pendingTradeContext.delete(symbol);
+        const reasoning = `Rebalancing — bought ${coinBase} with proceeds from selling ${fromCoin}`;
+        await db.execute(
+          'UPDATE trading_journal SET reasoning = ?, emotion = ? WHERE id = ?',
+          [reasoning, 'confident', pending.journalId]
+        );
+        // Try to find and pair the matching sell entry
+        const [fromRows] = await db.execute(
+          "SELECT id, price, value_usd, quantity FROM trading_journal WHERE symbol = ? AND action = 'sell' AND created_at > DATE_SUB(NOW(), INTERVAL 4 HOUR) ORDER BY created_at DESC LIMIT 1",
+          [`${fromCoin}-USD`]
+        ).catch(() => [[]]);
+        if (fromRows.length > 0) {
+          const fr = fromRows[0];
+          await logRebalancePair({
+            sellSymbol: fromCoin, sellJournalId: fr.id, sellPrice: parseFloat(fr.price),
+            sellValueUsd: Math.abs(parseFloat(fr.value_usd || 0)), sellQty: parseFloat(fr.quantity || 0),
+            buySymbol: coinBase, buyJournalId: pending.journalId, buyPrice: pending.price,
+            buyValueUsd: pending.valueUsd, buyQty: pending.qty,
+          }).catch(() => {});
+        }
+        await updateLearningModel().catch(() => {});
+        await sendReply(
+          `✅ <b>REBALANCE LOGGED — ${coinBase}</b>\n\n` +
+          `📤 OUT: ${fromCoin} → 📥 IN: ${coinBase}\n` +
+          `📝 Journal: "${reasoning}"\n` +
+          `🧠 Learning model updated`
+        );
+        return res.status(200).json({ ok: true });
+      }
+
+      // --- Coin-prefixed rebalance: '[BOUGHT_COIN] rebalance [SOLD_COIN]' ---
+      // e.g. 'near rebalance cc' — bought NEAR using CC proceeds.
+      const coinRebalanceMatch = rawText.match(/^([A-Za-z0-9]{2,10})\s+rebalance\s+([A-Za-z0-9]{2,10})$/i);
+      if (coinRebalanceMatch) {
+        const boughtCoin = coinRebalanceMatch[1].toUpperCase();
+        const soldCoin   = coinRebalanceMatch[2].toUpperCase();
+        const buySymbol  = `${boughtCoin}-USD`;
+        const pending    = pendingTradeContext.get(buySymbol);
+        if (pending) {
+          clearTimeout(pending.timeoutHandle);
+          pendingTradeContext.delete(buySymbol);
+          const reasoning = `Rebalancing — bought ${boughtCoin} with proceeds from selling ${soldCoin}`;
+          await db.execute(
+            'UPDATE trading_journal SET reasoning = ?, emotion = ? WHERE id = ?',
+            [reasoning, 'confident', pending.journalId]
+          );
+          const [fromRows2] = await db.execute(
+            "SELECT id, price, value_usd, quantity FROM trading_journal WHERE symbol = ? AND action = 'sell' AND created_at > DATE_SUB(NOW(), INTERVAL 4 HOUR) ORDER BY created_at DESC LIMIT 1",
+            [`${soldCoin}-USD`]
+          ).catch(() => [[]]);
+          if (fromRows2.length > 0) {
+            const fr2 = fromRows2[0];
+            await logRebalancePair({
+              sellSymbol: soldCoin, sellJournalId: fr2.id, sellPrice: parseFloat(fr2.price),
+              sellValueUsd: Math.abs(parseFloat(fr2.value_usd || 0)), sellQty: parseFloat(fr2.quantity || 0),
+              buySymbol: boughtCoin, buyJournalId: pending.journalId, buyPrice: pending.price,
+              buyValueUsd: pending.valueUsd, buyQty: pending.qty,
+            }).catch(() => {});
+          }
+          await updateLearningModel().catch(() => {});
+          await sendReply(
+            `✅ <b>REBALANCE LOGGED — ${boughtCoin}</b>\n\n` +
+            `📤 OUT: ${soldCoin} → 📥 IN: ${boughtCoin}\n` +
+            `📝 Journal: "${reasoning}"\n` +
+            `🧠 Learning model updated`
+          );
+          return res.status(200).json({ ok: true });
         }
       }
 
