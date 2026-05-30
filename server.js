@@ -5069,9 +5069,15 @@ async function checkPortfolio() {
     }
     if (portfolioCheckCount > 1) {
       try {
-        const usdtAsset = balances.find(b => b.currency === 'USDT');
-        const currentUSDT = usdtAsset ? parseFloat(usdtAsset.available) : 0;
+        const usdtAsset   = balances.find(b => b.currency === 'USDT');
+        const usdAsset2   = balances.find(b => b.currency === 'USD');
+        const currentUSDT = usdtAsset  ? parseFloat(usdtAsset.available)  : 0;
+        const currentUSD2 = usdAsset2  ? parseFloat(usdAsset2.available)  : 0;
         const prevUSDT    = previousBalances.get('USDT-USD') ?? null;
+        const prevUSD2    = previousBalances.get('USD-USD')  ?? currentUSD2; // default to current so delta = 0 on first check
+
+        // Track USD baseline so we catch non-USDT card payments
+        previousBalances.set('USD-USD', currentUSD2);
 
         if (prevUSDT !== null) {
           const usdtDecrease = prevUSDT - currentUSDT;
@@ -5163,6 +5169,49 @@ async function checkPortfolio() {
       } catch (e) {
         console.error('[usdt] Payment detection error:', e.message);
       }
+
+      // ── USD balance decrease detection — CC→USD card payment pattern ─────────
+      // When USD decreases without a corresponding crypto buy, and a recent CC sell
+      // exists, it's likely the CC→USD→card-payment flow from Revolut.
+      try {
+        const usdDecrease = prevUSD2 - currentUSD2;
+        if (usdDecrease > 0.50) {
+          console.log(`[usd] USD decreased by $${usdDecrease.toFixed(2)} — checking for CC→USD card payment`);
+
+          // Check if a CC sell happened in the last 10 minutes that could have funded this
+          const [recentCCSell] = await db.execute(
+            `SELECT id, value_usd FROM trading_journal
+             WHERE symbol = 'CC' AND action = 'sell'
+             AND created_at > DATE_SUB(NOW(), INTERVAL 10 MINUTE)
+             LIMIT 1`
+          ).catch(() => [[]]);
+
+          if (recentCCSell.length > 0) {
+            const ccValue = Math.abs(parseFloat(recentCCSell[0].value_usd || 0));
+            const similarity = ccValue > 0 ? Math.abs(usdDecrease - ccValue) / ccValue : 1;
+            if (similarity < 0.10) {
+              console.log(`[usd] CC sell $${ccValue.toFixed(2)} matches USD decrease $${usdDecrease.toFixed(2)} — reclassifying as card payment`);
+              await db.execute(
+                `UPDATE trading_journal
+                 SET action = 'payment',
+                     reasoning = CONCAT(COALESCE(reasoning,''), ' — funded Revolut card payment')
+                 WHERE id = ?`,
+                [recentCCSell[0].id]
+              ).catch(() => {});
+              const newCapital = totalInvestedCapital - ccValue;
+              await updateInvestedCapital(newCapital, `CC→USD card payment: -$${ccValue.toFixed(2)}`);
+              await sendTelegram(
+                formatSystemAlert('PAYMENT DETECTED', 'CC',
+                  `$${ccValue.toFixed(2)} CC converted to USD for card payment\n` +
+                  `Capital: $${totalInvestedCapital.toFixed(2)} → $${newCapital.toFixed(2)}`)
+              ).catch(() => {});
+            }
+          }
+        }
+      } catch (e) {
+        console.error('[usd] USD payment detection error:', e.message);
+      }
+      // ─────────────────────────────────────────────────────────────────────────
     }
     // ─────────────────────────────────────────────────────────────────────────
 
@@ -6560,6 +6609,57 @@ app.post('/api/entryprices/:symbol', async (req, res) => {
 // GET /api/thresholds — all custom daily thresholds
 app.get('/api/thresholds', (req, res) => {
   res.json({ customThresholds, defaultThreshold: PUMP_THRESHOLD });
+});
+
+// GET /api/activity — trading journal feed for dashboard activity tab
+app.get('/api/activity', async (req, res) => {
+  try {
+    const limit  = Math.min(parseInt(req.query.limit) || 50, 100);
+    const filter = req.query.filter || 'all';
+
+    // Only reference columns that definitely exist in trading_journal
+    let query = `
+      SELECT id, symbol, action, price, quantity, value_usd,
+             reasoning, emotion, outcome_pnl, source, created_at
+      FROM trading_journal
+    `;
+    const params = [];
+
+    if (filter !== 'all') {
+      query += ' WHERE action = ?';
+      params.push(filter);
+    }
+
+    query += ' ORDER BY created_at DESC LIMIT ?';
+    params.push(limit);
+
+    const [trades] = await db.execute(query, params);
+    res.json({ ok: true, trades: trades || [], total: trades?.length || 0 });
+  } catch (e) {
+    console.error('[activity] Error:', e.message);
+    res.json({ ok: true, trades: [], total: 0, error: e.message });
+  }
+});
+
+// PATCH /api/activity/:id — update reasoning/action for a journal entry
+app.patch('/api/activity/:id', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const { action, reasoning } = req.body;
+    if (!id || isNaN(id)) return res.status(400).json({ error: 'Invalid id' });
+    const sets = [];
+    const vals = [];
+    if (action)    { sets.push('action = ?');    vals.push(action); }
+    if (reasoning !== undefined) { sets.push('reasoning = ?'); vals.push(reasoning); }
+    if (sets.length === 0) return res.status(400).json({ error: 'Nothing to update' });
+    vals.push(id);
+    await db.execute(`UPDATE trading_journal SET ${sets.join(', ')} WHERE id = ?`, vals);
+    await updateLearningModel().catch(() => {});
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[activity] PATCH error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // GET /api/tradehistory — probe Revolut X API paths for position/entry price data
