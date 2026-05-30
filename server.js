@@ -7781,8 +7781,8 @@ async function processAlertChoice(ctx, choice, sendReply) {
   console.log(`[alert] choice ${num} → '${action} ${coinBase}' (alertType: ${alertType})`);
 
   if (action === 'ignore') {
-    ignoredCoins.add(symbol);
-    await sendReply(`🔕 ${coinBase} added to ignore list — no more alerts.`);
+    await ignoreCoin(symbol);
+    await sendReply(`🔕 ${coinBase} permanently ignored.`);
     return;
   }
   if (action === 'acknowledge') {
@@ -7879,15 +7879,19 @@ app.post('/telegram-webhook', async (req, res) => {
       return res.status(200).json({ ok: true });
     }
 
-    // Plain number reply — targets the most recent alert
+    // Plain number reply — targets the OLDEST pending alert (most natural sequential order)
     const numberReply = commandText.match(/^[1-5]$/);
-    if (numberReply && lastAlertCoin && alertContextBySymbol.has(lastAlertCoin)) {
-      const ctx = alertContextBySymbol.get(lastAlertCoin);
-      const choice = parseInt(numberReply[0]);
-      alertContextBySymbol.delete(lastAlertCoin);
-      lastAlertCoin = null;
-      await processAlertChoice(ctx, choice, sendReply);
-      return res.status(200).json({ ok: true });
+    if (numberReply && alertContextBySymbol.size > 0) {
+      const oldestEntry = [...alertContextBySymbol.entries()]
+        .sort((a, b) => a[1].timestamp - b[1].timestamp)[0];
+      if (oldestEntry) {
+        const [oldestCoin, ctx] = oldestEntry;
+        const choice = parseInt(numberReply[0]);
+        alertContextBySymbol.delete(oldestCoin);
+        if (lastAlertCoin === oldestCoin) lastAlertCoin = null;
+        await processAlertChoice(ctx, choice, sendReply);
+        return res.status(200).json({ ok: true });
+      }
     }
 
     // --- Pending journal state handler (emotion / followed flow) ---
@@ -8364,21 +8368,13 @@ app.post('/telegram-webhook', async (req, res) => {
     // --- Command: acknowledge [COIN] or acknowledge/ack (generic) ---
     const ackMatch = commandText.match(/^(?:acknowledge|ack)(?:\s+([a-z0-9]{2,10}))?$/);
     if (ackMatch) {
-      const buildAckOptions = (coinBase) =>
-        `\nWhat would you like to do next?\n` +
-        `• 'sell target ${coinBase} 0.05' — alert when price hits a level\n` +
-        `• 'buy target ${coinBase} 0.04' — alert when price drops to a level\n` +
-        `• 'watch ${coinBase} 20%' — alert on next 20% move\n` +
-        `• 'ignore ${coinBase}' — no more alerts on this coin (permanent)\n` +
-        `• Nothing — alerts stay silent until you restart or set a new alert`;
-
       if (ackMatch[1]) {
         // Specific coin
         const coinBase = ackMatch[1].toUpperCase();
         const symbol = `${coinBase}-USD`;
         console.log('[telegram] Acknowledge command for:', symbol);
         await acknowledgeAlert(symbol);
-        await sendReply(`✅ <b>${coinBase} alerts stopped.</b>\n${buildAckOptions(coinBase)}`);
+        await sendReply(`✅ ${coinBase} alerts stopped.`);
       } else {
         // Generic ack — clear the first active alert found across all types
         const symbol =
@@ -8389,7 +8385,7 @@ app.post('/telegram-webhook', async (req, res) => {
           const coinBase = symbol.replace('-USD', '');
           console.log('[telegram] Generic acknowledge — targeting:', symbol);
           await acknowledgeAlert(symbol);
-          await sendReply(`✅ <b>${coinBase} alerts stopped.</b>\n${buildAckOptions(coinBase)}`);
+          await sendReply(`✅ ${coinBase} alerts stopped.`);
         } else {
           await sendReply('✅ No active alerts to acknowledge.');
         }
@@ -8449,10 +8445,7 @@ app.post('/telegram-webhook', async (req, res) => {
       const symbol = `${coinBase}-USD`;
       console.log('[telegram] Ignore command for:', symbol);
       await ignoreCoin(symbol);
-      await sendReply(
-        `🚫 <b>${coinBase} ignored</b> — no more alerts on this coin.\n\n` +
-        `This survives restarts. Send 'watch ${coinBase}' to re-enable anytime.`
-      );
+      await sendReply(`🔕 ${coinBase} permanently ignored.`);
       return res.status(200).json({ ok: true });
     }
 
@@ -8934,13 +8927,7 @@ app.post('/telegram-webhook', async (req, res) => {
           const currentPrice = await getCurrentPrice(swSymbol).catch(() => swCtx.price);
 
           if (swAction === 'ack') {
-            await sendReply(
-              `✅ <b>${swCoinBase} alerts stopped.</b>\n\n` +
-              `What would you like to do next?\n` +
-              `• 'watch ${swCoinBase} 20%' — alert on next 20% move\n` +
-              `• 'ignore ${swCoinBase}' — no more alerts on this coin\n` +
-              `• Nothing — silent until you restart or set a new alert`
-            );
+            await sendReply(`✅ ${swCoinBase} alerts stopped.`);
             return res.status(200).json({ ok: true });
           }
 
