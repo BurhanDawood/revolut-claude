@@ -279,6 +279,8 @@ const autoSkipAlerted = new Map();           // symbol -> timestamp — throttle
 const lowCashAlerted = new Map();            // exchange -> date string — throttles low-cash warnings to once per day per exchange
 const alertContextBySymbol = new Map();      // coinBase.toLowerCase() -> { symbol, coinBase, alertType, timestamp } — powers numbered reply shortcuts
 let lastAlertCoin = null;                    // most recently fired alert coin (lowercase) — used for plain number replies
+let preCycleUSDT  = null;                    // USDT balance at start of last checkPortfolio cycle (before USDT block updates it)
+let preCycleUSD   = null;                    // USD balance at start of last checkPortfolio cycle
 const ruleApproachAlerted = new Map();       // ruleId -> timestamp — tracks 2% approach alerts so they don't spam
 let mostRecentSwingAlert = null;             // { symbol, coinBase, direction, price, timestamp } — for 👍 / natural language
 const alertRecommendations = new Map();      // symbol -> { rec, timestamp } — reused in reminders, no repeat API calls
@@ -3460,15 +3462,18 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
         const usdAsset  = freshBalances.find(b => b.currency === 'USD');
         const currentUSDT = parseFloat(usdtAsset?.available || 0);
         const currentUSD  = parseFloat(usdAsset?.available  || 0);
-        const prevUSDT    = previousBalances.get('USDT-USD') || 0;
-        const prevUSD     = previousBalances.get('USD-USD')  || 0;
+        // Use preCycleUSDT/USD (captured before checkPortfolio updated previousBalances)
+        // so the delta reflects the actual change this cycle, not zero.
+        const prevUSDT    = preCycleUSDT ?? previousBalances.get('USDT-USD') ?? currentUSDT;
+        const prevUSD     = preCycleUSD  ?? previousBalances.get('USD-USD')  ?? currentUSD;
         const usdtIncrease = Math.max(0, currentUSDT - prevUSDT);
         const usdIncrease  = Math.max(0, currentUSD  - prevUSD);
         const cashIncrease = Math.max(usdtIncrease, usdIncrease);
         const cashType     = usdtIncrease >= usdIncrease ? 'USDT' : 'USD';
         const similarity   = valueUsd > 0 ? Math.abs(cashIncrease - valueUsd) / valueUsd : 1;
+        console.log(`[sweep] ${coinBase} sell $${valueUsd.toFixed(2)} | USDT: ${prevUSDT}→${currentUSDT} (+${usdtIncrease.toFixed(2)}) | USD: ${prevUSD}→${currentUSD} (+${usdIncrease.toFixed(2)}) | sim=${similarity.toFixed(3)}`);
 
-        if (cashIncrease > 0.50 && similarity < 0.05) {
+        if (cashIncrease > 0.50 && similarity < 0.10) {
           console.log(`[autoLog] ${coinBase} sell → ${cashType} +$${cashIncrease.toFixed(2)} detected — auto-classifying as sweep`);
           await db.execute(
             'UPDATE trading_journal SET reasoning = ?, emotion = ? WHERE id = ?',
@@ -5184,6 +5189,12 @@ async function checkPortfolio() {
         const currentUSD2 = usdAsset2  ? parseFloat(usdAsset2.available)  : 0;
         const prevUSDT    = previousBalances.get('USDT-USD') ?? null;
         const prevUSD2    = previousBalances.get('USD-USD')  ?? currentUSD2; // default to current so delta = 0 on first check
+
+        // Snapshot pre-update stable balances for autoLogTrade sweep detection.
+        // autoLogTrade runs AFTER this block updates previousBalances, so without
+        // these snapshots the delta would always be zero when it compares.
+        preCycleUSDT = prevUSDT ?? currentUSDT;
+        preCycleUSD  = prevUSD2;
 
         // Track USD baseline so we catch non-USDT card payments
         previousBalances.set('USD-USD', currentUSD2);
