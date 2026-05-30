@@ -7780,57 +7780,63 @@ async function processAlertChoice(ctx, choice, sendReply) {
 
   console.log(`[alert] choice ${num} → '${action} ${coinBase}' (alertType: ${alertType})`);
 
+  // Fetch price once for use in confirmations below
+  const currentPriceForConfirm = await getCurrentPrice(symbol).catch(() => null);
+  const priceStr = currentPriceForConfirm ? formatPrice(currentPriceForConfirm) : 'unknown';
+
   if (action === 'ignore') {
     await ignoreCoin(symbol);
     await sendReply(`🔕 ${coinBase} permanently ignored.`);
     return;
   }
   if (action === 'acknowledge') {
-    alertState.acknowledged.set(symbol, Date.now());
-    await sendReply(`✅ ${coinBase} alert acknowledged.`);
+    await acknowledgeAlert(symbol);
+    await sendReply(`✅ ${coinBase} alerts stopped.`);
     return;
   }
   if (action === 'hold' && alertType === 'trailing_stop') {
     const ts = trailingStops.get(symbol);
-    if (ts) {
-      const currentPrice = await getCurrentPrice(symbol).catch(() => null);
-      if (currentPrice) {
-        ts.peakPrice = currentPrice;
-        ts.stopPrice = currentPrice * (1 - ts.trailPct / 100);
-        trailingStops.set(symbol, ts);
-        await sendReply(`📈 ${coinBase} trailing stop reset from ${fmtPriceShort(currentPrice)} — stop now at ${fmtPriceShort(ts.stopPrice)}`);
-      } else {
-        await sendReply(`✅ ${coinBase} hold noted — trail continues.`);
-      }
+    if (ts && currentPriceForConfirm) {
+      ts.peakPrice = currentPriceForConfirm;
+      ts.stopPrice = currentPriceForConfirm * (1 - ts.trailPct / 100);
+      trailingStops.set(symbol, ts);
+      await sendReply(
+        `✅ <b>HOLD — ${coinBase}</b>\n` +
+        `Trailing stop reset @ ${priceStr}\n` +
+        `New stop: ${fmtPriceShort(ts.stopPrice)} (-${ts.trailPct}%)`
+      );
+    } else {
+      await sendReply(`✅ <b>HOLD — ${coinBase}</b>\nTrail continues — monitoring silently.`);
     }
     return;
   }
   if (action === 'hold') {
-    alertState.acknowledged.set(symbol, Date.now());
-    await sendReply(`✅ ${coinBase} — holding noted. Alert acknowledged.`);
+    await acknowledgeAlert(symbol);
+    await sendReply(
+      `✅ <b>HOLD — ${coinBase}</b>\n` +
+      `Acknowledged @ ${priceStr}\n` +
+      `Monitoring continues silently.`
+    );
     return;
   }
   if (action === 'sell') {
-    await sendReply(`📊 Getting sell advice for <b>${coinBase}</b>…`);
-    const currentPrice = await getCurrentPrice(symbol).catch(() => null);
-    const changePct = currentPrice && basePrices[symbol] ? ((currentPrice - basePrices[symbol]) / basePrices[symbol] * 100) : 0;
-    const advice = await getQuickAiRecommendation(symbol, changePct, currentPrice, 'up', 'user requested sell advice via number shortcut');
+    await sendReply(`📊 <b>SELL ADVICE — ${coinBase}</b>\nFetching analysis @ ${priceStr}…`);
+    const changePct = currentPriceForConfirm && basePrices[symbol] ? ((currentPriceForConfirm - basePrices[symbol]) / basePrices[symbol] * 100) : 0;
+    const advice = await getQuickAiRecommendation(symbol, changePct, currentPriceForConfirm, 'up', 'user requested sell advice via number shortcut');
     await sendReply(`💡 <b>${coinBase} Sell Advice</b>\n\n${advice}`);
     return;
   }
   if (action === 'buy') {
-    await sendReply(`📊 Getting buy advice for <b>${coinBase}</b>…`);
-    const currentPrice = await getCurrentPrice(symbol).catch(() => null);
-    const changePct = currentPrice && basePrices[symbol] ? ((currentPrice - basePrices[symbol]) / basePrices[symbol] * 100) : 0;
-    const advice = await getQuickAiRecommendation(symbol, changePct, currentPrice, 'down', 'user requested buy advice via number shortcut');
+    await sendReply(`📊 <b>BUY ADVICE — ${coinBase}</b>\nFetching analysis @ ${priceStr}…`);
+    const changePct = currentPriceForConfirm && basePrices[symbol] ? ((currentPriceForConfirm - basePrices[symbol]) / basePrices[symbol] * 100) : 0;
+    const advice = await getQuickAiRecommendation(symbol, changePct, currentPriceForConfirm, 'down', 'user requested buy advice via number shortcut');
     await sendReply(`💡 <b>${coinBase} Buy Advice</b>\n\n${advice}`);
     return;
   }
   if (action === 'analyse') {
-    await sendReply(`🔍 Running full analysis for <b>${coinBase}</b>…`);
-    const currentPrice = await getCurrentPrice(symbol).catch(() => null);
-    const changePct = currentPrice && basePrices[symbol] ? ((currentPrice - basePrices[symbol]) / basePrices[symbol] * 100) : 0;
-    const analysis = await getQuickAiRecommendation(symbol, changePct, currentPrice, 'up', 'full analysis requested via number shortcut');
+    await sendReply(`🧠 <b>ANALYSING — ${coinBase}</b>\nRunning full AI analysis @ ${priceStr}…`);
+    const changePct = currentPriceForConfirm && basePrices[symbol] ? ((currentPriceForConfirm - basePrices[symbol]) / basePrices[symbol] * 100) : 0;
+    const analysis = await getQuickAiRecommendation(symbol, changePct, currentPriceForConfirm, 'up', 'full analysis requested via number shortcut');
     await sendReply(`📊 <b>${coinBase} Full Analysis</b>\n\n${analysis}`);
     return;
   }
