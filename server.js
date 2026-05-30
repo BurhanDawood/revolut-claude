@@ -6766,34 +6766,42 @@ app.get('/api/thresholds', (req, res) => {
 });
 
 // GET /api/activity — trading journal feed for dashboard activity tab
-// Uses INFORMATION_SCHEMA to discover actual column names before querying,
-// so the endpoint never 500s due to a missing column.
+// NOTE: LIMIT uses template literal, NOT a bound parameter — MySQL2 throws
+// ER_WRONG_ARGUMENTS when an integer is passed as a bound param to LIMIT.
 app.get('/api/activity', async (req, res) => {
-  // Columns confirmed via /api/activity-debug on 2026-05-30
-  // id, symbol, action, price, quantity, value_usd, reasoning, emotion,
-  // claude_recommendation, outcome_pnl, outcome_notes, source, created_at
   try {
-    const limit  = Math.min(parseInt(req.query.limit) || 50, 100);
     const filter = req.query.filter || 'all';
-    const validFilters = ['buy','sell','payment','transfer','sweep','rebalance','skip'];
+    const limit  = Math.min(parseInt(req.query.limit) || 50, 100);
+    const validFilters = ['buy','sell','payment','transfer','sweep','rebalance'];
 
-    let query = `
-      SELECT id, symbol, action, price, quantity, value_usd,
-             reasoning, emotion, claude_recommendation,
-             outcome_pnl, outcome_notes, source, created_at
-      FROM trading_journal
-    `;
+    let query;
     const params = [];
+
     if (filter !== 'all' && validFilters.includes(filter)) {
-      query += ' WHERE action = ?';
+      query = `
+        SELECT id, symbol, action, price, quantity, value_usd,
+               reasoning, emotion, claude_recommendation,
+               outcome_pnl, outcome_notes, source, created_at
+        FROM trading_journal
+        WHERE action = ?
+        ORDER BY created_at DESC
+        LIMIT ${limit}
+      `;
       params.push(filter);
+    } else {
+      query = `
+        SELECT id, symbol, action, price, quantity, value_usd,
+               reasoning, emotion, claude_recommendation,
+               outcome_pnl, outcome_notes, source, created_at
+        FROM trading_journal
+        ORDER BY created_at DESC
+        LIMIT ${limit}
+      `;
     }
-    query += ' ORDER BY created_at DESC LIMIT ?';
-    params.push(limit);
 
     const [trades] = await db.execute(query, params);
     console.log(`[activity] Returning ${trades.length} trades (filter=${filter})`);
-    res.json({ ok: true, trades, total: trades.length });
+    res.json({ ok: true, trades: trades || [], total: trades?.length || 0 });
   } catch (e) {
     console.error('[activity] Error:', e.code, e.message);
     res.status(500).json({ ok: false, error: e.message, code: e.code });
