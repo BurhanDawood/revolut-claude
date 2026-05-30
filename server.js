@@ -5403,17 +5403,33 @@ async function checkPortfolio() {
       // ── Auto trade detection ──────────────────────────────────────────────
       if (portfolioCheckCount > 1) { // skip first check (baseline establishment)
         const prevQty = previousBalances.get(symbol);
-        if (prevQty !== undefined && prevQty > 0) {
+        if (prevQty !== undefined) {
           const qtyChange = available - prevQty;
-          const changePct = (qtyChange / prevQty) * 100;
-          if (Math.abs(changePct) >= 1) { // ignore dust < 1%
-            const action = qtyChange > 0 ? 'buy' : 'sell';
-            console.log(`Balance change detected: ${symbol} from ${prevQty} to ${available} action: ${action} (${changePct.toFixed(1)}%)`);
-            autoLogTrade(symbol, action, currentPrice, qtyChange, available).catch(e => console.error('autoLogTrade failed:', e.message));
+          // Log all meaningful qty changes for debugging
+          if (Math.abs(qtyChange) > 0.0001) {
+            const changePct = prevQty > 0 ? (qtyChange / prevQty) * 100 : 100;
+            console.log(`[balance] ${symbol}: ${prevQty} → ${available} (${qtyChange > 0 ? '+' : ''}${qtyChange.toFixed(6)}, ${changePct.toFixed(1)}%)`);
+          }
+          if (prevQty > 0 && Math.abs(qtyChange) > 0.0001) {
+            const valueUsd = Math.abs(qtyChange) * currentPrice;
+            if (valueUsd >= 0.10) { // minimum $0.10 to avoid fee-dust noise
+              const action = qtyChange > 0 ? 'buy' : 'sell';
+              console.log(`[detect] ${symbol} ${action}: ${prevQty} → ${available} ($${valueUsd.toFixed(2)})`);
+              autoLogTrade(symbol, action, currentPrice, qtyChange, available).catch(e => console.error('autoLogTrade failed:', e.message));
+            } else {
+              console.log(`[balance] ${symbol} change $${(Math.abs(qtyChange) * currentPrice).toFixed(4)} below $0.10 threshold — skipping`);
+            }
+          } else if (prevQty === 0 && available > 0) {
+            // Coin reappeared (bought back after full exit)
+            const valueUsd = available * currentPrice;
+            if (valueUsd >= 0.10) {
+              console.log(`[detect] ${symbol} buy (re-entry): 0 → ${available} ($${valueUsd.toFixed(2)})`);
+              autoLogTrade(symbol, 'buy', currentPrice, available, available).catch(e => console.error('autoLogTrade failed:', e.message));
+            }
           }
         } else if (prevQty === undefined && available > 0) {
-          // New coin appearing
-          console.log(`Balance change detected: ${symbol} from 0 to ${available} action: buy (new position)`);
+          // New coin appearing for the first time this session
+          console.log(`[detect] ${symbol} buy (new position): 0 → ${available}`);
           autoLogTrade(symbol, 'buy', currentPrice, available, available).catch(e => console.error('autoLogTrade failed:', e.message));
         }
       }
@@ -6742,16 +6758,21 @@ app.get('/api/activity', async (req, res) => {
   try {
     const limit  = Math.min(parseInt(req.query.limit) || 50, 100);
     const filter = req.query.filter || 'all';
+    console.log(`[activity] Request: filter=${filter} limit=${limit}`);
 
-    // Only reference columns that definitely exist in trading_journal
+    // Verify DB connection first
+    const [testRows] = await db.execute('SELECT COUNT(*) as total FROM trading_journal');
+    console.log(`[activity] Total journal entries: ${testRows[0].total}`);
+
     let query = `
       SELECT id, symbol, action, price, quantity, value_usd,
              reasoning, emotion, outcome_pnl, source, created_at
       FROM trading_journal
     `;
     const params = [];
+    const validFilters = ['buy','sell','payment','transfer','sweep','rebalance'];
 
-    if (filter !== 'all') {
+    if (filter !== 'all' && validFilters.includes(filter)) {
       query += ' WHERE action = ?';
       params.push(filter);
     }
@@ -6759,11 +6780,49 @@ app.get('/api/activity', async (req, res) => {
     query += ' ORDER BY created_at DESC LIMIT ?';
     params.push(limit);
 
+    console.log(`[activity] Params: ${JSON.stringify(params)}`);
     const [trades] = await db.execute(query, params);
+    console.log(`[activity] Results: ${trades.length} trades`);
+
     res.json({ ok: true, trades: trades || [], total: trades?.length || 0 });
   } catch (e) {
-    console.error('[activity] Error:', e.message);
-    res.json({ ok: true, trades: [], total: 0, error: e.message });
+    console.error('[activity] FULL ERROR:', e.message, '| code:', e.code);
+    console.error('[activity] Stack:', e.stack);
+    res.status(500).json({ ok: false, error: e.message, code: e.code });
+  }
+});
+
+// GET /api/debug/balance-check — show current vs cached balances to debug detection gaps
+app.get('/api/debug/balance-check', async (req, res) => {
+  try {
+    const balances = await revolutRequest('GET', '/balances');
+    const result = [];
+    for (const asset of balances) {
+      const sym = `${asset.currency}-USD`;
+      const currentQty = parseFloat(asset.available || 0);
+      const prevQty    = previousBalances.get(sym) ?? null;
+      const change     = prevQty !== null ? currentQty - prevQty : null;
+      const price      = SKIP_CURRENCIES.includes(asset.currency) ? 1 : (basePrices[sym] || null);
+      const valueUsd   = change !== null && price ? Math.abs(change) * price : null;
+      result.push({
+        symbol:        sym,
+        current:       currentQty,
+        previous:      prevQty,
+        change:        change,
+        value_usd:     valueUsd ? parseFloat(valueUsd.toFixed(2)) : null,
+        would_detect:  change !== null && Math.abs(change) > 0.0001 && (valueUsd === null || valueUsd >= 0.10),
+        in_skip_list:  SKIP_CURRENCIES.includes(asset.currency),
+      });
+    }
+    res.json({
+      ok:        true,
+      timestamp: new Date().toISOString(),
+      check_count: portfolioCheckCount,
+      all_balances: result,
+      changed:   result.filter(r => r.change !== null && Math.abs(r.change) > 0.0001),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
