@@ -3376,19 +3376,18 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
       } catch (e) { /* ignore */ }
     }
 
-    // If buy: recalculate weighted average entry price
+    // If buy: set entry from internal calculation first, then attempt exchange sync
     let avgEntryLine = '';
     if (action === 'buy') {
       try {
         const prevQty = previousBalances.get(symbol) || 0;
         const existingEntry = entryPrices.get(symbol);
-        // Cycle buyback: previous qty was 0 (full sell before this buy)
         const isCycleBuyback = prevQty === 0 && existingEntry != null;
         if (existingEntry && prevQty > 0) {
           const newQty = prevQty + absQty;
           const newAvgEntry = ((prevQty * existingEntry) + (absQty * price)) / newQty;
           await updateEntryPrice(symbol, newAvgEntry, false);
-          avgEntryLine = `\n📊 Avg entry updated: ${formatPrice(existingEntry)} → ${formatPrice(newAvgEntry)}`;
+          avgEntryLine = `\n📊 Avg entry: ${formatPrice(newAvgEntry)} (internal)`;
         } else if (!existingEntry && price > 0) {
           await updateEntryPrice(symbol, price, false);
           avgEntryLine = `\n📊 Entry price set: ${formatPrice(price)}`;
@@ -3398,6 +3397,20 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
         }
       } catch (e) {
         console.error('[entry] avg entry update error:', e.message);
+      }
+
+      // Attempt live sync from the exchange — overwrites internal estimate if exchange has data
+      try {
+        const isKraken = KRAKEN_MONITORED_COINS.includes(symbol);
+        const syncedPrice = isKraken
+          ? await syncEntryPriceFromKraken(symbol)
+          : await syncEntryPriceFromRevolutX(symbol);
+        if (syncedPrice) {
+          avgEntryLine = `\n📊 Avg entry synced from exchange: ${formatPrice(syncedPrice)}`;
+          console.log(`[entry-sync] ✅ ${symbol} entry synced: $${syncedPrice}`);
+        }
+      } catch (e) {
+        console.warn('[entry-sync] Sync failed, keeping internal estimate:', e.message);
       }
     }
 
@@ -4178,6 +4191,101 @@ async function updateEntryPrice(symbol, newPrice, isCycleBuyback = false) {
     console.error('[entry] updateEntryPrice error:', e.message);
     // Fallback: at minimum update in-memory cache so alerts keep working
     entryPrices.set(symbol, newPrice);
+  }
+}
+
+// ── Exchange entry-price sync ─────────────────────────────────────────────────
+// Queries the exchange for actual cost basis data and stores it.
+// Returns the verified price, or null if the exchange has no data.
+
+async function syncEntryPriceFromRevolutX(symbol) {
+  try {
+    const coinBase = symbol.replace('-USD', '');
+    const positions = await revolutRequest('GET', '/balances');
+    const asset = positions.find(b => b.currency === coinBase);
+    if (!asset) {
+      console.log(`[entry-sync] ${coinBase} not found in Revolut X balances`);
+      return null;
+    }
+
+    // Check every field Revolut X might expose for cost basis
+    const avgCost = asset.average_cost || asset.avg_cost ||
+                    asset.cost_basis   || asset.average_entry ||
+                    asset.avg_entry    || asset.average_buy_price;
+
+    if (avgCost && parseFloat(avgCost) > 0) {
+      const price = parseFloat(avgCost);
+      console.log(`[entry-sync] ${coinBase} avg entry from Revolut X API: $${price}`);
+      await updateEntryPrice(symbol, price, false);
+      return price;
+    }
+
+    // Fallback: derive from total_cost / quantity if available
+    const qty       = parseFloat(asset.available || 0);
+    const totalCost = parseFloat(asset.total_cost || asset.book_cost || 0);
+    if (qty > 0 && totalCost > 0) {
+      const calculatedAvg = totalCost / qty;
+      console.log(`[entry-sync] ${coinBase} calculated avg from cost/qty: $${calculatedAvg.toFixed(6)}`);
+      await updateEntryPrice(symbol, calculatedAvg, false);
+      return calculatedAvg;
+    }
+
+    console.log(`[entry-sync] ${coinBase} — Revolut X has no cost basis fields`);
+    return null;
+  } catch (e) {
+    console.error('[entry-sync] Revolut X sync error:', e.message);
+    return null;
+  }
+}
+
+async function syncEntryPriceFromKraken(symbol) {
+  try {
+    const coinBase = symbol.replace('-USD', '');
+    const tradesHistory = await krakenRequest('/0/private/TradesHistory', {});
+    if (tradesHistory.error?.length > 0) {
+      console.error('[entry-sync] Kraken TradesHistory error:', tradesHistory.error);
+      return null;
+    }
+
+    const trades = Object.values(tradesHistory.result?.trades || {});
+    const assetTrades = trades.filter(t => {
+      const pair = (t.pair || '').toUpperCase();
+      return pair.includes(coinBase.toUpperCase()) || pair.includes(coinBase.toUpperCase() + 'USD');
+    });
+
+    if (assetTrades.length === 0) {
+      console.log(`[entry-sync] No Kraken trades found for ${coinBase}`);
+      return null;
+    }
+
+    // Weighted-average FIFO from trade history
+    let totalQty = 0, totalCost = 0;
+    assetTrades.sort((a, b) => a.time - b.time);
+    for (const trade of assetTrades) {
+      const qty   = parseFloat(trade.vol);
+      const price = parseFloat(trade.price);
+      if (trade.type === 'buy') {
+        totalCost += qty * price;
+        totalQty  += qty;
+      } else if (trade.type === 'sell' && totalQty > 0) {
+        const avgCost = totalCost / totalQty;
+        totalCost -= qty * avgCost;
+        totalQty  -= qty;
+        if (totalQty < 0) { totalCost = 0; totalQty = 0; }
+      }
+    }
+
+    if (totalQty > 0) {
+      const avgEntry = totalCost / totalQty;
+      console.log(`[entry-sync] ${coinBase} avg entry from Kraken history: $${avgEntry.toFixed(6)}`);
+      await updateEntryPrice(symbol, avgEntry, false);
+      return avgEntry;
+    }
+
+    return null;
+  } catch (e) {
+    console.error('[entry-sync] Kraken sync error:', e.message);
+    return null;
   }
 }
 
@@ -6174,6 +6282,24 @@ cron.schedule('10 9 * * 1', async () => {
       ['weekly_snapshot', JSON.stringify(weeklySnapshot, null, 2)]
     );
     console.log('[config] Weekly snapshot saved to system_config');
+
+    // Weekly entry price sync — refresh cost basis from exchanges
+    try {
+      console.log('[entry-sync] Weekly entry price sync starting…');
+      const rvBals = await revolutRequest('GET', '/balances');
+      let syncCount = 0;
+      for (const asset of rvBals) {
+        if (!asset.currency || SKIP_CURRENCIES.includes(asset.currency)) continue;
+        const qty = parseFloat(asset.available || 0);
+        if (qty < 0.001) continue;
+        const sym = `${asset.currency}-USD`;
+        const synced = await syncEntryPriceFromRevolutX(sym).catch(() => null);
+        if (synced) syncCount++;
+      }
+      console.log(`[entry-sync] Weekly sync complete — ${syncCount} Revolut X positions refreshed`);
+    } catch (e) {
+      console.error('[entry-sync] Weekly sync error:', e.message);
+    }
   } catch (e) {
     console.error('[config] Weekly snapshot error:', e.message);
   }
@@ -7048,6 +7174,41 @@ function createMcpServer() {
           `Triggers: ${config.allowed_triggers.join(', ')}`
         );
         return { content: [{ type: 'text', text: JSON.stringify({ ok: true, config, saved_to: 'system_config' }) }] };
+
+      } else if (action === 'sync_entry_prices') {
+        const results = [];
+
+        // Sync all Revolut X positions
+        const rvBalances = await revolutRequest('GET', '/balances');
+        for (const asset of rvBalances) {
+          if (!asset.currency || SKIP_CURRENCIES.includes(asset.currency)) continue;
+          const qty = parseFloat(asset.available || 0);
+          if (qty < 0.001) continue;
+          const sym = `${asset.currency}-USD`;
+          const synced = await syncEntryPriceFromRevolutX(sym);
+          results.push({ symbol: sym, synced, source: 'revolut' });
+        }
+
+        // Sync Kraken positions
+        const krakenData = await getKrakenBalances();
+        for (const asset of (krakenData.balances || [])) {
+          if (!asset.symbol) continue;
+          const synced = await syncEntryPriceFromKraken(asset.symbol);
+          results.push({ symbol: asset.symbol, synced, source: 'kraken' });
+        }
+
+        const synced  = results.filter(r => r.synced);
+        const failed  = results.filter(r => !r.synced);
+
+        const syncLines = synced.map(r => `${r.symbol.replace('-USD','')}: ${formatPrice(r.synced)}`).join('\n');
+        await sendTelegram(
+          `🔄 <b>ENTRY PRICES SYNCED</b>\n\n` +
+          `✅ Synced: ${synced.length} coins\n` +
+          `⚠️ Fallback: ${failed.length} coins\n\n` +
+          (syncLines || 'No exchange data available')
+        ).catch(() => {});
+
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, synced: synced.length, failed: failed.length, results }) }] };
       }
     }
   );
