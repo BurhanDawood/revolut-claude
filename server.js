@@ -6800,6 +6800,11 @@ app.get('/api/activity', async (req, res) => {
   }
 });
 
+// GET /api/ping-activity — dead-simple liveness check for activity endpoint
+app.get('/api/ping-activity', (req, res) => {
+  res.json({ ok: true, message: 'activity endpoint alive' });
+});
+
 // GET /api/activity-debug — step-by-step DB diagnostics for activity feed failures
 app.get('/api/activity-debug', async (req, res) => {
   const results = {};

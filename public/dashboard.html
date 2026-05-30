@@ -2647,11 +2647,34 @@
     if (!feedEl) return;
     feedEl.innerHTML = '<div class="empty-state">Loading…</div>';
     try {
-      const data = await apiFetch('GET', `/api/activity?limit=50&filter=${filter}`);
+      // Bypass apiFetch so we can read the actual error body on non-2xx responses
+      const url = `/api/activity?limit=50&filter=${encodeURIComponent(filter)}`;
+      const response = await fetch(BASE + url);
+      const text = await response.text();
+
+      if (!response.ok) {
+        // Show the actual server error, not just the status code
+        feedEl.innerHTML = `<p style="color:var(--danger);text-align:center;padding:16px;font-size:0.8rem">
+          HTTP ${response.status}: ${text.substring(0, 300)}</p>`;
+        console.error('[activity] Server error', response.status, text.substring(0, 300));
+        return;
+      }
+
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch (parseErr) {
+        feedEl.innerHTML = `<p style="color:var(--danger);text-align:center;padding:16px;font-size:0.8rem">
+          JSON parse error: ${text.substring(0, 200)}</p>`;
+        console.error('[activity] JSON parse error:', parseErr.message, text.substring(0, 200));
+        return;
+      }
+
       if (!data.trades?.length) {
         feedEl.innerHTML = '<p style="color:var(--text-muted);text-align:center;padding:20px">No activity yet</p>';
         return;
       }
+
       feedEl.innerHTML = data.trades.map(t => {
         const date    = new Date(t.created_at);
         const timeStr = date.toLocaleDateString('en-GB', { day: '2-digit', month: 'short' })
@@ -2698,8 +2721,8 @@
         </div>`;
       }).join('');
     } catch (e) {
-      console.error('Activity load error:', e);
-      feedEl.innerHTML = `<p style="color:var(--danger);text-align:center;padding:16px">Failed to load: ${e.message}</p>`;
+      console.error('[activity] JS error:', e);
+      feedEl.innerHTML = `<p style="color:var(--danger);text-align:center;padding:16px">JS Error: ${e.message}</p>`;
     }
   }
 
