@@ -3144,19 +3144,20 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
     const absQty = Math.abs(qtyChange);
     const valueUsd = absQty * price;
 
-    // Auto-handle USDT buys/sells — always internal sweeps or conversions, never trading decisions
-    if (coinBase === 'USDT') {
-      const usdtReasoning = action === 'sell'
-        ? 'USDT conversion — auto-logged as payment'
-        : 'USDT sweep — auto-converted from sell proceeds';
-      const usdtAction  = action === 'sell' ? 'payment' : 'buy';
-      const usdtSource  = action === 'sell' ? 'auto_detected' : 'auto_rule';
-      await db.execute(
-        'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-        ['USDT', usdtAction, price, absQty, valueUsd, usdtReasoning, 'neutral', usdtSource]
-      ).catch(e => console.error('[autoLog] USDT journal insert error:', e.message));
-      console.log(`[autoLog] USDT ${action} auto-logged as ${usdtAction} — suppressing Telegram`);
-      return;
+    // Auto-handle USDT/USD movements — always internal, never ask for context
+    if (coinBase === 'USDT' || coinBase === 'USD') {
+      if (action === 'sell') {
+        // USDT/USD sold = funds used for crypto purchase — log silently
+        await db.execute(
+          'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+          [coinBase, 'sell', price || 1, absQty, valueUsd, `${coinBase} converted for crypto purchase — internal`, 'neutral', 'auto_internal']
+        ).catch(e => console.error(`[autoLog] ${coinBase} sell log error:`, e.message));
+        console.log(`[autoLog] ${coinBase} sell auto-logged silently: ${absQty} ${coinBase}`);
+      } else {
+        // USDT/USD bought = sweep from sell proceeds — already handled by USDT sweep system
+        console.log(`[autoLog] ${coinBase} buy detected — handled by sweep system, skipping`);
+      }
+      return; // Never ask for Telegram context
     }
 
     // Debounce: if same symbol detected within 10 minutes, skip
@@ -6792,6 +6793,39 @@ app.get('/api/activity', async (req, res) => {
     console.error('[activity] Error:', e.code, e.message);
     res.status(500).json({ ok: false, error: e.message, code: e.code, hint: 'Check Railway logs for [activity] lines' });
   }
+});
+
+// GET /api/activity-debug — step-by-step DB diagnostics for activity feed failures
+app.get('/api/activity-debug', async (req, res) => {
+  const results = {};
+  try {
+    await db.execute('SELECT 1 as ok');
+    results.db_connection = 'ok';
+  } catch (e) { results.db_connection = e.message; return res.json(results); }
+  try {
+    const [tables] = await db.execute(
+      `SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'trading_journal'`
+    );
+    results.table_exists = tables.length > 0;
+  } catch (e) { results.table_check = e.message; }
+  try {
+    const [cols] = await db.execute(
+      `SELECT COLUMN_NAME, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'trading_journal'
+       ORDER BY ORDINAL_POSITION`
+    );
+    results.columns = cols.map(c => `${c.COLUMN_NAME} (${c.DATA_TYPE})`);
+  } catch (e) { results.columns_check = e.message; }
+  try {
+    const [count] = await db.execute('SELECT COUNT(*) as total FROM trading_journal');
+    results.row_count = count[0].total;
+  } catch (e) { results.count_check = e.message; }
+  try {
+    const [one] = await db.execute('SELECT * FROM trading_journal LIMIT 1');
+    results.sample_row = one[0] ? Object.keys(one[0]) : 'no rows';
+  } catch (e) { results.sample_check = e.message; }
+  res.json(results);
 });
 
 // GET /api/debug/balance-check — show current vs cached balances to debug detection gaps
