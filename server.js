@@ -6758,26 +6758,20 @@ app.get('/api/thresholds', (req, res) => {
 // Uses INFORMATION_SCHEMA to discover actual column names before querying,
 // so the endpoint never 500s due to a missing column.
 app.get('/api/activity', async (req, res) => {
+  // Columns confirmed via /api/activity-debug on 2026-05-30
+  // id, symbol, action, price, quantity, value_usd, reasoning, emotion,
+  // claude_recommendation, outcome_pnl, outcome_notes, source, created_at
   try {
-    // Discover real column names — never assume schema
-    const [colRows] = await db.execute(
-      `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
-       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'trading_journal'`
-    );
-    const columnNames = colRows.map(c => c.COLUMN_NAME);
-    console.log('[activity] Available columns:', columnNames.join(', '));
-
-    const safeColumns = [
-      'id','symbol','action','price','quantity',
-      'value_usd','reasoning','emotion','outcome_pnl','created_at'
-    ].filter(col => columnNames.includes(col));
-    console.log('[activity] Safe columns:', safeColumns.join(', '));
-
     const limit  = Math.min(parseInt(req.query.limit) || 50, 100);
     const filter = req.query.filter || 'all';
     const validFilters = ['buy','sell','payment','transfer','sweep','rebalance','skip'];
 
-    let query = `SELECT ${safeColumns.join(', ')} FROM trading_journal`;
+    let query = `
+      SELECT id, symbol, action, price, quantity, value_usd,
+             reasoning, emotion, claude_recommendation,
+             outcome_pnl, outcome_notes, source, created_at
+      FROM trading_journal
+    `;
     const params = [];
     if (filter !== 'all' && validFilters.includes(filter)) {
       query += ' WHERE action = ?';
@@ -6787,11 +6781,11 @@ app.get('/api/activity', async (req, res) => {
     params.push(limit);
 
     const [trades] = await db.execute(query, params);
-    console.log(`[activity] Returning ${trades.length} trades`);
+    console.log(`[activity] Returning ${trades.length} trades (filter=${filter})`);
     res.json({ ok: true, trades, total: trades.length });
   } catch (e) {
     console.error('[activity] Error:', e.code, e.message);
-    res.status(500).json({ ok: false, error: e.message, code: e.code, hint: 'Check Railway logs for [activity] lines' });
+    res.status(500).json({ ok: false, error: e.message, code: e.code });
   }
 });
 
