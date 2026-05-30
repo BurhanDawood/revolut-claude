@@ -959,6 +959,32 @@ try {
   console.warn('[cleanup] SOL Kraken rule cleanup failed:', e.message);
 }
 
+// One-time cleanup: remove duplicate USDT auto_internal entries from 2026-05-30
+// (caused by previousBalances not updating after logging, now fixed)
+try {
+  const [dupeClean] = await db.execute(`
+    DELETE FROM trading_journal
+    WHERE symbol = 'USDT'
+    AND source IN ('auto_internal', 'auto_payment')
+    AND created_at > '2026-05-30 21:00:00'
+    AND id NOT IN (
+      SELECT min_id FROM (
+        SELECT MIN(id) AS min_id
+        FROM trading_journal
+        WHERE symbol = 'USDT'
+        AND source IN ('auto_internal', 'auto_payment')
+        AND created_at > '2026-05-30 21:00:00'
+        GROUP BY DATE_FORMAT(created_at, '%Y-%m-%d %H:%i')
+      ) AS keep
+    )
+  `);
+  if (dupeClean.affectedRows > 0) {
+    console.log(`[cleanup] Removed ${dupeClean.affectedRows} duplicate USDT journal entries`);
+  }
+} catch (e) {
+  console.warn('[cleanup] USDT dupe cleanup:', e.message);
+}
+
 // Seed system config — always keep project description current
 try {
   await db.execute(
@@ -5187,104 +5213,101 @@ async function checkPortfolio() {
         const usdAsset2   = balances.find(b => b.currency === 'USD');
         const currentUSDT = usdtAsset  ? parseFloat(usdtAsset.available)  : 0;
         const currentUSD2 = usdAsset2  ? parseFloat(usdAsset2.available)  : 0;
-        const prevUSDT    = previousBalances.get('USDT-USD') ?? null;
-        const prevUSD2    = previousBalances.get('USD-USD')  ?? currentUSD2; // default to current so delta = 0 on first check
+        // prevUSDT: use stored value if set, otherwise treat first run as baseline (delta = 0)
+        const prevUSDT = previousBalances.get('USDT-USD') ?? null;
+        const prevUSD2 = previousBalances.get('USD-USD')  ?? currentUSD2;
 
-        // Snapshot pre-update stable balances for autoLogTrade sweep detection.
-        // autoLogTrade runs AFTER this block updates previousBalances, so without
-        // these snapshots the delta would always be zero when it compares.
+        console.log(`[usdt] prev=${prevUSDT ?? 'unset'} current=${currentUSDT}`);
+
+        // Snapshot pre-update values for autoLogTrade sweep detection
         preCycleUSDT = prevUSDT ?? currentUSDT;
         preCycleUSD  = prevUSD2;
 
-        // Track USD baseline so we catch non-USDT card payments
+        // Track USD baseline
         previousBalances.set('USD-USD', currentUSD2);
 
-        if (prevUSDT !== null) {
-          const usdtDecrease = prevUSDT - currentUSDT;
-          const usdtIncrease = currentUSDT - prevUSDT;
-
-          if (usdtDecrease > 0.50) {
-            // Debit card payment — auto-log and deduct capital
-            console.log(`[usdt] USDT decreased by $${usdtDecrease.toFixed(2)} — checking if swap or real payment`);
-
-            // Swap guard: if a crypto balance increased by ~same USD value in this cycle,
-            // it's a USDT→crypto internal swap — not a card payment
-            let isCryptoSwap = false;
-            for (const asset of balances) {
-              if (!asset.currency || SKIP_CURRENCIES.includes(asset.currency)) continue;
-              const sym = `${asset.currency}-USD`;
-              const prevQty = previousBalances.get(sym) || 0;
-              const currQty = parseFloat(asset.available || 0);
-              const increase = currQty - prevQty;
-              if (increase <= 0) continue;
-              const coinPrice = priceMap[sym] || 0;
-              const increaseUSD = increase * coinPrice;
-              if (increaseUSD > 0 && Math.abs(increaseUSD - usdtDecrease) / usdtDecrease < 0.10) {
-                isCryptoSwap = true;
-                console.log(`[usdt] USDT decrease matched ${sym} increase of $${increaseUSD.toFixed(2)} — internal swap, not payment`);
-                break;
-              }
-            }
-
-            if (isCryptoSwap) {
-              // Just update the snapshot — the crypto buy will be logged by autoLogTrade
-              previousBalances.set('USDT-USD', currentUSDT);
-              await db.execute(
-                'INSERT INTO balance_snapshots (symbol, quantity) VALUES (?, ?) ON DUPLICATE KEY UPDATE quantity = VALUES(quantity)',
-                ['USDT-USD', currentUSDT]
-              ).catch(() => {});
-            } else {
-
-            // Dedup guard: don't double-log if already recorded in last 10 min
-            const [recentLog] = await db.execute(
-              `SELECT id FROM trading_journal
-               WHERE symbol = 'USDT' AND action = 'payment'
-               AND source IN ('auto_payment', 'revolut_card')
-               AND created_at > DATE_SUB(NOW(), INTERVAL 10 MINUTE)
-               LIMIT 1`
-            );
-            if (recentLog.length > 0) {
-              console.log('[usdt] Payment already logged in last 10 min — skipping duplicate');
-              previousBalances.set('USDT-USD', currentUSDT);
-            } else {
-
-            await db.execute(
-              `INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-              ['USDT', 'payment', 1.00, usdtDecrease, usdtDecrease,
-               'Revolut debit card payment — USDT spent', 'neutral', 'auto_payment']
-            );
-            const prevCapital = totalInvestedCapital;
-            const newCapital  = totalInvestedCapital - usdtDecrease;
-            await updateInvestedCapital(newCapital, `Auto-deducted: USDT debit card payment $${usdtDecrease.toFixed(2)}`);
-            previousBalances.set('USDT-USD', currentUSDT);
-            await db.execute(
-              'INSERT INTO balance_snapshots (symbol, quantity) VALUES (?, ?) ON DUPLICATE KEY UPDATE quantity = VALUES(quantity)',
-              ['USDT-USD', currentUSDT]
-            );
-            await sendTelegram(formatSystemAlert('PAYMENT DETECTED', 'USDT',
-              `$${usdtDecrease.toFixed(2)} spent via debit card\n` +
-              `Capital: $${totalInvestedCapital.toFixed(2)} → $${newCapital.toFixed(2)}`
-            ));
-            console.log(`[usdt] Payment auto-logged — capital $${prevCapital.toFixed(2)} → $${newCapital.toFixed(2)}`);
-            } // end dedup guard else
-            } // end swap guard else
-          } else if (usdtIncrease > 0.50) {
-            // USDT increased (sweep deposit or manual top-up) — just update snapshot silently
-            console.log(`[usdt] USDT increased by $${usdtIncrease.toFixed(2)} — dry powder reserve updated (no journal entry)`);
-            previousBalances.set('USDT-USD', currentUSDT);
-            await db.execute(
-              'INSERT INTO balance_snapshots (symbol, quantity) VALUES (?, ?) ON DUPLICATE KEY UPDATE quantity = VALUES(quantity)',
-              ['USDT-USD', currentUSDT]
-            );
-          }
-        } else {
-          // First time seeing USDT — just record the baseline
+        if (prevUSDT === null) {
+          // First run — set baseline and stop; no detection possible yet
+          console.log('[usdt] First run — setting baseline, no detection this cycle');
           previousBalances.set('USDT-USD', currentUSDT);
           await db.execute(
             'INSERT INTO balance_snapshots (symbol, quantity) VALUES (?, ?) ON DUPLICATE KEY UPDATE quantity = VALUES(quantity)',
             ['USDT-USD', currentUSDT]
           ).catch(() => {});
+        } else {
+          const usdtDecrease = prevUSDT - currentUSDT;
+          const usdtIncrease = currentUSDT - prevUSDT;
+          console.log(`[usdt] decrease=${usdtDecrease.toFixed(4)} increase=${usdtIncrease.toFixed(4)}`);
+
+          if (usdtDecrease > 0.50) {
+            console.log(`[usdt] USDT decreased by $${usdtDecrease.toFixed(2)} — checking if swap or payment`);
+
+            // CRITICAL: Update snapshot immediately so the next 5-min cycle doesn't re-detect
+            previousBalances.set('USDT-USD', currentUSDT);
+            await db.execute(
+              'INSERT INTO balance_snapshots (symbol, quantity) VALUES (?, ?) ON DUPLICATE KEY UPDATE quantity = VALUES(quantity)',
+              ['USDT-USD', currentUSDT]
+            ).catch(() => {});
+            console.log(`[usdt] Balance snapshot updated to ${currentUSDT} — next cycle will not re-detect`);
+
+            // Swap guard: crypto balance increased by ~same USD value → internal swap
+            let isCryptoSwap = false;
+            for (const asset of balances) {
+              if (!asset.currency || SKIP_CURRENCIES.includes(asset.currency)) continue;
+              const sym = `${asset.currency}-USD`;
+              const prevQty     = previousBalances.get(sym) || 0;
+              const currQty     = parseFloat(asset.available || 0);
+              const increase    = currQty - prevQty;
+              if (increase <= 0) continue;
+              const coinPrice   = priceMap[sym] || 0;
+              const increaseUSD = increase * coinPrice;
+              if (increaseUSD > 0 && Math.abs(increaseUSD - usdtDecrease) / usdtDecrease < 0.10) {
+                isCryptoSwap = true;
+                console.log(`[usdt] Decrease matched ${sym} increase $${increaseUSD.toFixed(2)} — internal swap`);
+                break;
+              }
+            }
+
+            if (!isCryptoSwap) {
+              // Dedup: skip if same quantity already logged in the last 10 minutes
+              const [recentDupe] = await db.execute(
+                `SELECT id FROM trading_journal
+                 WHERE symbol = 'USDT'
+                 AND action IN ('sell','payment')
+                 AND ABS(quantity - ?) < 0.01
+                 AND created_at > DATE_SUB(NOW(), INTERVAL 10 MINUTE)
+                 LIMIT 1`,
+                [usdtDecrease]
+              ).catch(() => [[]]);
+
+              if (recentDupe.length > 0) {
+                console.log(`[usdt] Duplicate detected (qty=${usdtDecrease.toFixed(4)}) — skipping`);
+              } else {
+                await db.execute(
+                  `INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+                  ['USDT', 'payment', 1.00, usdtDecrease, usdtDecrease,
+                   'Revolut debit card payment — USDT spent', 'neutral', 'auto_payment']
+                );
+                const prevCapital = totalInvestedCapital;
+                const newCapital  = totalInvestedCapital - usdtDecrease;
+                await updateInvestedCapital(newCapital, `Auto-deducted: USDT debit card payment $${usdtDecrease.toFixed(2)}`);
+                await sendTelegram(formatSystemAlert('PAYMENT DETECTED', 'USDT',
+                  `$${usdtDecrease.toFixed(2)} spent via debit card\n` +
+                  `Capital: $${prevCapital.toFixed(2)} → $${newCapital.toFixed(2)}`
+                ));
+                console.log(`[usdt] Payment logged $${usdtDecrease.toFixed(2)} — capital $${prevCapital.toFixed(2)} → $${newCapital.toFixed(2)}`);
+              }
+            }
+
+          } else if (usdtIncrease > 0.50) {
+            console.log(`[usdt] USDT increased by $${usdtIncrease.toFixed(2)} — dry powder updated`);
+            previousBalances.set('USDT-USD', currentUSDT);
+            await db.execute(
+              'INSERT INTO balance_snapshots (symbol, quantity) VALUES (?, ?) ON DUPLICATE KEY UPDATE quantity = VALUES(quantity)',
+              ['USDT-USD', currentUSDT]
+            ).catch(() => {});
+          }
         }
       } catch (e) {
         console.error('[usdt] Payment detection error:', e.message);
