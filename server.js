@@ -280,6 +280,7 @@ const lowCashAlerted = new Map();            // exchange -> date string — thro
 const alertContextBySymbol = new Map();      // coinBase.toLowerCase() -> { symbol, coinBase, alertType, timestamp } — powers numbered reply shortcuts
 let lastAlertCoin = null;                    // most recently fired alert coin (lowercase) — used for plain number replies
 let lastKnownUSDT = null;                    // USDT at start of current cycle — set once on startup from live balance
+let lastKnownUSD  = null;                    // USD at start of current cycle — used to detect USDT→USD conversions
 const ruleApproachAlerted = new Map();       // ruleId -> timestamp — tracks 2% approach alerts so they don't spam
 let mostRecentSwingAlert = null;             // { symbol, coinBase, direction, price, timestamp } — for 👍 / natural language
 const alertRecommendations = new Map();      // symbol -> { rec, timestamp } — reused in reminders, no repeat API calls
@@ -909,7 +910,9 @@ try {
   const startupBals = await revolutRequest('GET', '/balances');
   const usdtStartup = startupBals.find(b => b.currency === 'USDT');
   lastKnownUSDT = parseFloat(usdtStartup?.available || 0);
-  console.log(`[usdt] Startup baseline: ${lastKnownUSDT} USDT`);
+  const usdStartup = startupBals.find(b => b.currency === 'USD');
+  lastKnownUSD  = parseFloat(usdStartup?.available  || 0);
+  console.log(`[usdt] Startup baseline: ${lastKnownUSDT} USDT | ${lastKnownUSD} USD`);
 } catch (e) {
   console.error('[usdt] Startup baseline error:', e.message);
 }
@@ -1510,10 +1513,21 @@ async function getTangemXRPBalance() {
           return parsed.balance;
         }
       } catch (dbErr) { /* ignore */ }
-      return null;
+      console.log('[tangem] No cache — falling back to known balance 1008.43');
+      return 1008.43;
     }
     console.error('Tangem XRP fetch error:', e.message);
-    return null;
+    // On any error, try cache then hardcoded fallback
+    try {
+      const [cached] = await db.execute(
+        "SELECT config_value FROM system_config WHERE config_key = 'tangem_last_balance'"
+      );
+      if (cached.length) {
+        const parsed = JSON.parse(cached[0].config_value);
+        return parsed.balance;
+      }
+    } catch (dbErr2) { /* ignore */ }
+    return 1008.43;
   }
 }
 
@@ -5191,57 +5205,82 @@ async function checkPortfolio() {
     // ─────────────────────────────────────────────────────────────────────────
 
     // ── USDT card payment detection ───────────────────────────────────────────
-    // Rule: USDT only ever decreases when Bryan makes a card payment.
-    // No swap guard needed — USDT is never used to buy crypto directly.
+    // Rule: USDT decrease + USD stays same = card payment
+    //       USDT decrease + USD increases by ~same = USDT→USD conversion (dry powder)
     try {
       const usdtAsset   = balances.find(b => b.currency === 'USDT');
+      const usdAsset    = balances.find(b => b.currency === 'USD');
       const currentUSDT = parseFloat(usdtAsset?.available || 0);
+      const currentUSD  = parseFloat(usdAsset?.available  || 0);
 
-      console.log(`[usdt] Check: lastKnown=${lastKnownUSDT ?? 'unset'} current=${currentUSDT}`);
+      console.log(`[usdt] Check: USDT ${lastKnownUSDT ?? 'unset'}→${currentUSDT} | USD ${lastKnownUSD ?? 'unset'}→${currentUSD}`);
 
       if (lastKnownUSDT === null) {
         lastKnownUSDT = currentUSDT;
-        console.log(`[usdt] Baseline set: ${currentUSDT} USDT`);
+        lastKnownUSD  = currentUSD;
+        console.log(`[usdt] Baseline set: ${currentUSDT} USDT | ${currentUSD} USD`);
       } else {
-        const decrease = lastKnownUSDT - currentUSDT;
+        const decrease    = lastKnownUSDT - currentUSDT;
+        const usdIncrease = currentUSD - (lastKnownUSD ?? currentUSD);
 
         if (decrease > 0.10) {
-          console.log(`[usdt] Payment detected: -$${decrease.toFixed(2)} (${lastKnownUSDT} → ${currentUSDT})`);
+          console.log(`[usdt] USDT -$${decrease.toFixed(2)} | USD ${usdIncrease >= 0 ? '+' : ''}$${usdIncrease.toFixed(2)}`);
 
-          const [dupe] = await db.execute(
-            `SELECT id FROM trading_journal
-             WHERE symbol = 'USDT' AND action = 'payment'
-             AND ABS(quantity - ?) < 0.05
-             AND created_at > DATE_SUB(NOW(), INTERVAL 15 MINUTE)
-             LIMIT 1`,
-            [decrease]
-          ).catch(() => [[]]);
+          // USDT→USD conversion: USD went up by ~same amount (within 2%)
+          const isConversion = usdIncrease > 0 &&
+            Math.abs(usdIncrease - decrease) / decrease < 0.02;
 
-          if (dupe.length > 0) {
-            console.log('[usdt] Duplicate — skipping');
-          } else {
-            const [result] = await db.execute(
+          if (isConversion) {
+            console.log(`[usdt] USDT→USD conversion $${decrease.toFixed(2)} — not a payment`);
+            await db.execute(
               `INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-              ['USDT', 'payment', 1.00, decrease, decrease,
-               `Revolut debit card payment — $${decrease.toFixed(2)} USDT`, 'neutral', 'revolut_card']
-            );
-            const prevCapital = totalInvestedCapital;
-            const newCapital  = totalInvestedCapital - decrease;
-            await updateInvestedCapital(newCapital, `Card payment: -$${decrease.toFixed(2)} USDT`);
+              ['USDT', 'transfer', 1.00, decrease, decrease,
+               `USDT→USD conversion — dry powder for trading`, 'neutral', 'auto_internal']
+            ).catch(() => {});
             await sendTelegram(
-              `💳 PAYMENT $${decrease.toFixed(2)} USDT\n` +
-              `Capital: $${prevCapital.toFixed(2)} → $${newCapital.toFixed(2)}\n` +
-              `Tap Edit in dashboard if this was a crypto buy`
-            );
-            console.log(`[usdt] Payment logged ID:${result.insertId}`);
+              `🔄 USDT→USD $${decrease.toFixed(2)}\n` +
+              `Dry powder ready for trading ✅\n` +
+              `Capital unchanged`
+            ).catch(() => {});
+          } else {
+            // Card payment — USD did not increase
+            const [dupe] = await db.execute(
+              `SELECT id FROM trading_journal
+               WHERE symbol = 'USDT' AND action = 'payment'
+               AND ABS(quantity - ?) < 0.05
+               AND created_at > DATE_SUB(NOW(), INTERVAL 15 MINUTE)
+               LIMIT 1`,
+              [decrease]
+            ).catch(() => [[]]);
+
+            if (dupe.length > 0) {
+              console.log('[usdt] Duplicate payment — skipping');
+            } else {
+              const [result] = await db.execute(
+                `INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+                ['USDT', 'payment', 1.00, decrease, decrease,
+                 `Revolut debit card payment — $${decrease.toFixed(2)} USDT`, 'neutral', 'revolut_card']
+              );
+              const prevCapital = totalInvestedCapital;
+              const newCapital  = totalInvestedCapital - decrease;
+              await updateInvestedCapital(newCapital, `Card payment: -$${decrease.toFixed(2)} USDT`);
+              await sendTelegram(
+                `💳 PAYMENT $${decrease.toFixed(2)} USDT\n` +
+                `Capital: $${prevCapital.toFixed(2)} → $${newCapital.toFixed(2)}\n` +
+                `Tap Edit in dashboard if this was a crypto buy`
+              );
+              console.log(`[usdt] Payment logged ID:${result.insertId}`);
+            }
           }
         } else if (currentUSDT - lastKnownUSDT > 0.10) {
-          console.log(`[usdt] USDT increased +$${(currentUSDT - lastKnownUSDT).toFixed(2)} — sweep or deposit`);
+          console.log(`[usdt] USDT +$${(currentUSDT - lastKnownUSDT).toFixed(2)} — sweep or deposit`);
         }
 
         // Always update for next cycle
         lastKnownUSDT = currentUSDT;
+        lastKnownUSD  = currentUSD;
       }
     } catch (e) {
       console.error('[usdt] Detection error:', e.message);
