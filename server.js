@@ -986,6 +986,32 @@ try {
   console.warn('[cleanup] USDT cleanup error:', e.message);
 }
 
+// Cleanup: remove '-USD' suffixed duplicate journal entries that have no real reasoning
+// (these are autoLogTrade duplicates of intention-matched entries logged without suffix)
+try {
+  const [symDupes] = await db.execute(`
+    DELETE t1 FROM trading_journal t1
+    WHERE t1.symbol LIKE '%-USD'
+    AND (t1.reasoning IS NULL OR t1.reasoning = '' OR t1.reasoning = 'no reason provided' OR t1.reasoning = 'auto-detected')
+    AND t1.created_at > '2026-05-01 00:00:00'
+    AND EXISTS (
+      SELECT 1 FROM (
+        SELECT id FROM trading_journal t2
+        WHERE REPLACE(t2.symbol, '-USD', '') = REPLACE(t1.symbol, '-USD', '')
+        AND t2.action = t1.action
+        AND ABS(t2.quantity - t1.quantity) < 0.01
+        AND ABS(TIMESTAMPDIFF(MINUTE, t2.created_at, t1.created_at)) < 5
+        AND t2.id != t1.id
+      ) match_check
+    )
+  `);
+  if (symDupes.affectedRows > 0) {
+    console.log(`[cleanup] Removed ${symDupes.affectedRows} symbol-suffix duplicate journal entries`);
+  }
+} catch (e) {
+  console.warn('[cleanup] Symbol dedup cleanup error:', e.message);
+}
+
 // Seed system config — always keep project description current
 try {
   await db.execute(
@@ -3199,17 +3225,35 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
       return;
     }
 
-    // Suppress if trade was already logged by Claude MCP or an auto rule within the last 5 minutes
+    // ── Deduplication: three-stage check before logging ──────────────────────
+
+    // CHECK 1: Already logged by intention match (symbol stored without -USD)?
     try {
-      const [recentSourced] = await db.execute(
-        `SELECT id, source FROM trading_journal
+      const [intentionLog] = await db.execute(
+        `SELECT id FROM trading_journal
          WHERE symbol = ?
          AND action = ?
-         AND source IN ('claude_mcp', 'auto_rule')
          AND ABS(CAST(price AS DECIMAL(20,10)) - ?) < (? * 0.01 + 0.000001)
          AND created_at > DATE_SUB(NOW(), INTERVAL 5 MINUTE)
          LIMIT 1`,
         [coinBase, action, price, price]
+      );
+      if (intentionLog.length > 0) {
+        console.log(`[autoLog] ${coinBase} already logged by intention match (id=${intentionLog[0].id}) — skipping`);
+        return;
+      }
+    } catch (e) { console.error('[autoLog] Intention dedup check error:', e.message); }
+
+    // CHECK 2: Already logged by Claude MCP / auto rule?
+    try {
+      const [recentSourced] = await db.execute(
+        `SELECT id, source FROM trading_journal
+         WHERE symbol IN (?, ?)
+         AND action = ?
+         AND source IN ('claude_mcp', 'auto_rule', 'ai_auto')
+         AND created_at > DATE_SUB(NOW(), INTERVAL 5 MINUTE)
+         LIMIT 1`,
+        [coinBase, symbol, action]
       );
       if (recentSourced.length > 0) {
         const src = recentSourced[0].source;
@@ -3221,6 +3265,24 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
         return;
       }
     } catch (e) { console.error('[autoLog] Source suppression check error:', e.message); }
+
+    // CHECK 3: Quantity match against either symbol format (catches NEAR vs NEAR-USD duplicates)?
+    try {
+      const [anyLog] = await db.execute(
+        `SELECT id FROM trading_journal
+         WHERE (symbol = ? OR symbol = ?)
+         AND action = ?
+         AND ABS(quantity - ?) < 0.01
+         AND created_at > DATE_SUB(NOW(), INTERVAL 5 MINUTE)
+         LIMIT 1`,
+        [coinBase, symbol, action, absQty]
+      );
+      if (anyLog.length > 0) {
+        console.log(`[autoLog] ${coinBase} quantity-match duplicate (id=${anyLog[0].id}) — skipping`);
+        return;
+      }
+    } catch (e) { console.error('[autoLog] Quantity dedup check error:', e.message); }
+    // ──────────────────────────────────────────────────────────────────────────
 
     // Look up most recent Claude recommendation for this coin
     let claudeRec = null;
@@ -3249,10 +3311,10 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
       }
     }
 
-    // Insert journal entry
+    // Insert journal entry — always use coinBase (no -USD suffix) to match intention-logged entries
     const [result] = await db.execute(
       'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, claude_recommendation) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-      [symbol, action, price, absQty, valueUsd, reasoning, 'pending', claudeRec]
+      [coinBase, action, price, absQty, valueUsd, reasoning, 'pending', claudeRec]
     );
     const journalId = result.insertId;
 
