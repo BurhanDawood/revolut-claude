@@ -986,24 +986,21 @@ try {
   console.warn('[cleanup] USDT cleanup error:', e.message);
 }
 
-// Cleanup: remove '-USD' suffixed duplicate journal entries that have no real reasoning
-// (these are autoLogTrade duplicates of intention-matched entries logged without suffix)
+// Cleanup: remove '-USD' suffixed duplicates where a better-reasoned non-USD entry exists
 try {
   const [symDupes] = await db.execute(`
     DELETE t1 FROM trading_journal t1
+    INNER JOIN trading_journal t2 ON (
+      REPLACE(t1.symbol, '-USD', '') = REPLACE(t2.symbol, '-USD', '')
+      AND t1.action = t2.action
+      AND ABS(CAST(t1.quantity AS DECIMAL(20,8)) - CAST(t2.quantity AS DECIMAL(20,8))) < 0.01
+      AND ABS(TIMESTAMPDIFF(SECOND, t1.created_at, t2.created_at)) < 300
+      AND t1.id > t2.id
+    )
     WHERE t1.symbol LIKE '%-USD'
     AND (t1.reasoning IS NULL OR t1.reasoning = '' OR t1.reasoning = 'no reason provided' OR t1.reasoning = 'auto-detected')
+    AND t2.reasoning IS NOT NULL AND LENGTH(t2.reasoning) > 5
     AND t1.created_at > '2026-05-01 00:00:00'
-    AND EXISTS (
-      SELECT 1 FROM (
-        SELECT id FROM trading_journal t2
-        WHERE REPLACE(t2.symbol, '-USD', '') = REPLACE(t1.symbol, '-USD', '')
-        AND t2.action = t1.action
-        AND ABS(t2.quantity - t1.quantity) < 0.01
-        AND ABS(TIMESTAMPDIFF(MINUTE, t2.created_at, t1.created_at)) < 5
-        AND t2.id != t1.id
-      ) match_check
-    )
   `);
   if (symDupes.affectedRows > 0) {
     console.log(`[cleanup] Removed ${symDupes.affectedRows} symbol-suffix duplicate journal entries`);
@@ -3266,16 +3263,16 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
       }
     } catch (e) { console.error('[autoLog] Source suppression check error:', e.message); }
 
-    // CHECK 3: Quantity match against either symbol format (catches NEAR vs NEAR-USD duplicates)?
+    // CHECK 3: Quantity match against all three symbol formats within 10 minutes
     try {
       const [anyLog] = await db.execute(
         `SELECT id FROM trading_journal
-         WHERE (symbol = ? OR symbol = ?)
+         WHERE (symbol = ? OR symbol = ? OR symbol = ?)
          AND action = ?
-         AND ABS(quantity - ?) < 0.01
-         AND created_at > DATE_SUB(NOW(), INTERVAL 5 MINUTE)
+         AND ABS(CAST(quantity AS DECIMAL(20,8)) - ?) < 0.01
+         AND created_at > DATE_SUB(NOW(), INTERVAL 10 MINUTE)
          LIMIT 1`,
-        [coinBase, symbol, action, absQty]
+        [coinBase, symbol, coinBase + '-USD', action, parseFloat(absQty)]
       );
       if (anyLog.length > 0) {
         console.log(`[autoLog] ${coinBase} quantity-match duplicate (id=${anyLog[0].id}) — skipping`);
@@ -5288,25 +5285,53 @@ async function checkPortfolio() {
         if (decrease > 0.10) {
           console.log(`[usdt] USDT -$${decrease.toFixed(2)} | USD ${usdIncrease >= 0 ? '+' : ''}$${usdIncrease.toFixed(2)}`);
 
-          // USDT→USD conversion: USD went up by ~same amount (within 2%)
-          const isConversion = usdIncrease > 0 &&
+          // Guard 1: USDT→USD conversion (dry powder) — USD increased by ~same amount
+          const isUSDConversion = usdIncrease > 0 &&
             Math.abs(usdIncrease - decrease) / decrease < 0.02;
 
-          if (isConversion) {
-            console.log(`[usdt] USDT→USD conversion $${decrease.toFixed(2)} — not a payment`);
+          // Guard 2: USDT→crypto swap — any crypto balance increased by ~same USD value
+          let isCryptoPurchase = false;
+          let swapCoin = '';
+          if (!isUSDConversion) {
+            for (const asset of balances) {
+              if (SKIP_CURRENCIES.includes(asset.currency)) continue;
+              const sym      = `${asset.currency}-USD`;
+              const currQty  = parseFloat(asset.available || 0);
+              const prevQty  = previousBalances.get(sym) || 0;
+              const increase = currQty - prevQty;
+              if (increase <= 0) continue;
+              const coinPrice   = priceMap[sym] || priceMap[`${asset.currency}/USD`] || 0;
+              const increaseUSD = increase * coinPrice;
+              if (increaseUSD > 0 && Math.abs(increaseUSD - decrease) / decrease < 0.03) {
+                isCryptoPurchase = true;
+                swapCoin = asset.currency;
+                console.log(`[usdt] USDT→${asset.currency} swap detected: $${decrease.toFixed(2)} USDT → ${increase.toFixed(4)} ${asset.currency} (+$${increaseUSD.toFixed(2)}) — NOT a card payment`);
+                break;
+              }
+            }
+          }
+
+          if (isUSDConversion) {
+            console.log(`[usdt] USDT→USD conversion $${decrease.toFixed(2)} — dry powder, no capital change`);
             await db.execute(
               `INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
               ['USDT', 'transfer', 1.00, decrease, decrease,
                `USDT→USD conversion — dry powder for trading`, 'neutral', 'auto_internal']
             ).catch(() => {});
-            await sendTelegram(
-              `🔄 USDT→USD $${decrease.toFixed(2)}\n` +
-              `Dry powder ready for trading ✅\n` +
-              `Capital unchanged`
+            await sendTelegram(`🔄 USDT→USD $${decrease.toFixed(2)}\nDry powder ready ✅\nCapital unchanged`).catch(() => {});
+
+          } else if (isCryptoPurchase) {
+            console.log(`[usdt] USDT→${swapCoin} crypto purchase — capital unchanged`);
+            await db.execute(
+              `INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+              ['USDT', 'transfer', 1.00, decrease, decrease,
+               `USDT→${swapCoin} swap — internal rebalancing`, 'neutral', 'auto_internal']
             ).catch(() => {});
+
           } else {
-            // Card payment — USD did not increase
+            // No matching crypto or USD increase = real debit card payment
             const [dupe] = await db.execute(
               `SELECT id FROM trading_journal
                WHERE symbol = 'USDT' AND action = 'payment'
@@ -5331,9 +5356,9 @@ async function checkPortfolio() {
               await sendTelegram(
                 `💳 PAYMENT $${decrease.toFixed(2)} USDT\n` +
                 `Capital: $${prevCapital.toFixed(2)} → $${newCapital.toFixed(2)}\n` +
-                `Tap Edit in dashboard if this was a crypto buy`
+                `Tap Edit in dashboard if incorrect`
               );
-              console.log(`[usdt] Payment logged ID:${result.insertId}`);
+              console.log(`[usdt] Card payment logged ID:${result.insertId}`);
             }
           }
         } else if (currentUSDT - lastKnownUSDT > 0.10) {
@@ -6825,6 +6850,21 @@ app.get('/api/activity', async (req, res) => {
 // GET /api/ping-activity — dead-simple liveness check for activity endpoint
 app.get('/api/ping-activity', (req, res) => {
   res.json({ ok: true, message: 'activity endpoint alive' });
+});
+
+// GET /api/debug/usdt-payments — show all USDT/USD journal entries for debugging
+app.get('/api/debug/usdt-payments', async (req, res) => {
+  try {
+    const [rows] = await db.execute(
+      `SELECT id, symbol, action, quantity, value_usd, source, reasoning, created_at
+       FROM trading_journal
+       WHERE symbol IN ('USDT','USD','USDT-USD','USD-USD')
+       ORDER BY created_at DESC LIMIT 50`
+    );
+    res.json({ ok: true, count: rows.length, rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // GET /api/activity-debug — step-by-step DB diagnostics for activity feed failures
