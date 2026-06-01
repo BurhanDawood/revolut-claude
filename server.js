@@ -971,17 +971,29 @@ try {
   console.warn('[cleanup] SOL Kraken rule cleanup failed:', e.message);
 }
 
-// Cleanup: remove USDT false-positive entries from broken detection (wrong source/quantity)
+// Cleanup: remove all USDT false-positive entries (auto_detected conversions + auto_internal sweeps)
 try {
-  const [dupeClean] = await db.execute(`
+  const [c1] = await db.execute(`
     DELETE FROM trading_journal
     WHERE symbol = 'USDT'
-    AND source IN ('auto_internal', 'revolut_card')
+    AND source = 'auto_detected'
+    AND reasoning LIKE 'USDT conversion%'
+  `);
+  const [c2] = await db.execute(`
+    DELETE FROM trading_journal
+    WHERE symbol = 'USDT'
+    AND source = 'auto_internal'
+  `);
+  const [c3] = await db.execute(`
+    DELETE FROM trading_journal
+    WHERE symbol = 'USDT'
+    AND source IN ('revolut_card')
     AND created_at > '2026-05-30 00:00:00'
   `);
-  if (dupeClean.affectedRows > 0) {
-    console.log(`[cleanup] Removed ${dupeClean.affectedRows} USDT false-positive journal entries`);
-  }
+  const total = (c1.affectedRows || 0) + (c2.affectedRows || 0) + (c3.affectedRows || 0);
+  if (total > 0) console.log(`[cleanup] Removed ${total} USDT false-positive entries (auto_detected:${c1.affectedRows} auto_internal:${c2.affectedRows} revolut_card:${c3.affectedRows})`);
+  const [remaining] = await db.execute(`SELECT COUNT(*) as cnt FROM trading_journal WHERE symbol = 'USDT'`);
+  console.log(`[cleanup] USDT entries remaining: ${remaining[0].cnt}`);
 } catch (e) {
   console.warn('[cleanup] USDT cleanup error:', e.message);
 }
