@@ -279,8 +279,9 @@ const autoSkipAlerted = new Map();           // symbol -> timestamp — throttle
 const lowCashAlerted = new Map();            // exchange -> date string — throttles low-cash warnings to once per day per exchange
 const alertContextBySymbol = new Map();      // coinBase.toLowerCase() -> { symbol, coinBase, alertType, timestamp } — powers numbered reply shortcuts
 let lastAlertCoin = null;                    // most recently fired alert coin (lowercase) — used for plain number replies
-let lastKnownUSDT = null;                    // USDT at start of current cycle — set once on startup from live balance
-let lastKnownUSD  = null;                    // USD at start of current cycle — used to detect USDT→USD conversions
+let lastKnownUSDT  = null;                   // USDT at start of current cycle — set once on startup from live balance
+let lastKnownUSD   = null;                   // USD at start of current cycle — used to detect USDT→USD conversions
+let previousBTCPrice = null;                 // BTC price from last checkPortfolio cycle — used for key-level crossing alerts
 const ruleApproachAlerted = new Map();       // ruleId -> timestamp — tracks 2% approach alerts so they don't spam
 let mostRecentSwingAlert = null;             // { symbol, coinBase, direction, price, timestamp } — for 👍 / natural language
 const alertRecommendations = new Map();      // symbol -> { rec, timestamp } — reused in reminders, no repeat API calls
@@ -2795,10 +2796,19 @@ async function checkMacroNews() {
 
     // STEP 2: Fetch RSS from multiple sources
     const RSS_FEEDS = [
+      // Crypto news
       'https://cointelegraph.com/rss',
       'https://www.coindesk.com/arc/outboundfeeds/rss/',
       'https://decrypt.co/feed',
       'https://cryptoslate.com/feed/',
+      'https://cryptobriefing.com/feed/',
+      'https://bitcoinmagazine.com/.rss/full/',
+      // Macro / financial
+      'https://feeds.reuters.com/reuters/businessNews',
+      'https://www.cnbc.com/id/10000664/device/rss/rss.html',
+      // Geopolitical
+      'https://feeds.bbci.co.uk/news/world/rss.xml',
+      'https://rss.cnn.com/rss/cnn_world.rss',
     ];
     let allTitles = [];
     let rawNewsText = '';
@@ -2835,22 +2845,32 @@ async function checkMacroNews() {
 
     // STEP 3: Broad keyword check (free, no Claude API cost)
     const MACRO_KEYWORDS = [
+      // BTC price levels
+      'bitcoin', 'btc', '$70,000', '$70k', '$69k', '$68k', '$65k', '$60k',
+      '70000', '68000', '65000', 'all-time high', 'ath', 'support', 'resistance',
+      // Market structure
+      'etf', 'outflow', 'inflow', 'institutional', 'microstrategy', 'blackrock',
+      'liquidat', 'leverage', 'fear and greed', 'fear greed', 'open interest',
+      // Macro economic
+      'federal reserve', 'fed rate', 'inflation', 'cpi', 'fomc', 'interest rate',
+      'recession', 'gdp', 'unemployment', 'dollar', 'dxy', 'rate hike', 'rate cut',
+      // Geopolitical — critical
+      'iran', 'strait of hormuz', 'hormuz', 'oil', 'crude', 'opec', 'energy crisis',
+      'sanctions', 'war', 'conflict', 'nuclear', 'invasion', 'military', 'strike',
+      'trade war', 'tariff', 'china', 'russia', 'middle east', 'ukraine',
       // Regulatory
-      'sec', 'cftc', 'regulation', 'ban', 'illegal', 'legal', 'congress', 'senate', 'law',
-      'ruling', 'court', 'clarity', 'compliance', 'enforcement',
+      'sec', 'cftc', 'regulation', 'ban', 'illegal', 'legal', 'congress', 'senate',
+      'ruling', 'court', 'clarity', 'compliance', 'enforcement', 'legislation',
       // Security
       'hack', 'exploit', 'stolen', 'breach', 'attack', 'vulnerability', 'drain',
       // Market events
       'crash', 'surge', 'liquidat', 'rally', 'dump', 'pump', 'volatile',
       'collapse', 'bankrupt', 'insolvency', 'billion', 'meltdown', 'panic',
-      // Macro
-      'fed', 'federal reserve', 'inflation', 'rate hike', 'rate cut', 'gdp',
-      'recession', 'tariff', 'trade war', 'sanctions',
-      // Geopolitical
-      'war', 'invasion', 'military', 'conflict', 'iran', 'russia', 'china', 'strike',
-      // Crypto specific
-      'etf', 'institutional', 'stablecoin', 'defi', 'protocol', 'upgrade', 'fork',
-      'tether', 'usdt', 'usdc', 'binance', 'coinbase', 'kraken', 'ftx',
+      // Exchanges
+      'binance', 'coinbase', 'kraken', 'ftx', 'bybit', 'okx',
+      // Specific coins watched
+      'chainlink', 'near protocol', 'canton network', 'dtcc', 'injective',
+      'render', 'fetch.ai', 'ethena', 'algorand', 'floki', 'stellar', 'boba',
     ];
     const holdingKeywords = significantHoldings.map(h => h.coin.toLowerCase());
     const watchedKeywords = ALL_WATCHED_COINS.map(c => c.toLowerCase());
@@ -2884,34 +2904,43 @@ async function checkMacroNews() {
       max_tokens: 600,
       system: [{
         type: 'text',
-        text: `You are a real-time crypto news screener for a portfolio manager named Bryan.
+        text: `You are monitoring financial and geopolitical news for a crypto swing trader named Bryan. Flag ANYTHING that could significantly move crypto markets in the next 24-72 hours.
 
-Coins Bryan holds: BTC, ETH, SOL, LINK, NEAR, CC, ENA, JTO, PEPE, INJ, FET, RENDER, AVAX, ALGO, BONK, WIF, SHIB, XRP, GHIBLI, ZK, TAO
+Coins Bryan holds: LINK/Chainlink, NEAR Protocol, CC/Canton Network, ENA/Ethena, JTO, INJ/Injective, RENDER, FET/Fetch.ai, ALGO/Algorand, FLOKI, BOBA, XLM/Stellar, GHIBLI, BTC, ETH, SOL, XRP, AVAX, ADA
 
-Alert on ANY of these — be PROACTIVE, Bryan would rather be over-alerted than miss news:
-- Price moves >5% on any held coin
-- Regulatory news from US, UK, EU
-- Exchange hacks or failures (any major exchange)
-- Macro events: Fed decisions, CPI prints, rate changes
-- Geopolitical events: wars, sanctions, strikes affecting markets
-- Market-wide liquidations >$50M
+ALWAYS alert on:
+- BTC price approaching or breaking key levels ($70K, $65K, $60K support)
+- ETF inflows/outflows exceeding $500M
+- Federal Reserve news, FOMC decisions, CPI prints, rate changes
+- Major geopolitical escalation — wars, oil supply threats (Strait of Hormuz), nuclear threats, major sanctions
+- Crypto exchange hacks or failures (any major exchange)
+- Major regulatory decisions (SEC, CFTC, EU, UK FCA)
+- Institutional buying/selling signals (Microstrategy, BlackRock ETF flows)
+- S&P 500 vs BTC unusual divergence
+- Oil price spikes >5% (affects risk appetite)
+- Dollar strength spikes (DXY moves affect BTC)
+- Market-wide liquidations >$100M
 - Stablecoin de-peg or major protocol failure
-- Institutional moves (ETF flows, Microstrategy buys, etc.)
-- Exchange listings or delistings of held coins
+- News about any of Bryan's specific coins above
 
-Do NOT alert on: price predictions, minor technical analysis, vague sentiment pieces.
+URGENCY LEVELS:
+- high: Imminent market impact (geopolitical escalation, major hack, BTC near key support, large liquidations)
+- medium: Important but not immediate (regulatory updates, ETF flow data, macro prints)
+- low: Interesting context (sentiment shifts, minor regulatory commentary)
+
+Do NOT alert on: price predictions, technical analysis opinions, vague market sentiment.
 
 Respond with JSON only — no extra text:
 {
   "alert": true,
   "urgency": "high",
-  "message": "2-3 sentence summary of what happened and why it matters",
-  "coins_affected": ["BTC", "SOL"]
+  "headline": "one line summary under 15 words",
+  "message": "2-3 sentences — what happened and why it matters for crypto",
+  "coins_affected": ["BTC", "LINK"],
+  "action_needed": "what the trader should consider doing"
 }
 or:
-{
-  "alert": false
-}`,
+{ "alert": false }`,
         cache_control: { type: 'ephemeral' }
       }],
       messages: [{
@@ -2986,9 +3015,29 @@ or:
     const affectedSection = affectedLines.length > 0
       ? `\n\n💼 <b>Your affected holdings:</b>\n${affectedLines.join('\n')}`
       : '';
+    const headline = parsed.headline || '';
+    const actionNeeded = parsed.action_needed || '';
 
-    const urgencyIcon = parsed.urgency === 'high' ? '🚨' : parsed.urgency === 'medium' ? '⚠️' : 'ℹ️';
-    const telegramMessage = `${urgencyIcon} <b>MACRO ALERT — PORTFOLIO IMPACT</b>\n\n${alertMessage}${affectedSection}`;
+    let telegramMessage;
+    if (parsed.urgency === 'high') {
+      telegramMessage =
+        `🚨 <b>URGENT MACRO ALERT</b>\n\n` +
+        (headline ? `<b>${headline}</b>\n\n` : '') +
+        `${alertMessage}` +
+        (affectedCoins.length ? `\n\n⚠️ Affected: ${affectedCoins.join(', ')}` : '') +
+        affectedSection +
+        (actionNeeded ? `\n\n💡 Consider: ${actionNeeded}` : '');
+    } else if (parsed.urgency === 'medium') {
+      telegramMessage =
+        `⚠️ <b>MACRO UPDATE</b>\n\n` +
+        (headline ? `${headline}\n\n` : '') +
+        `${alertMessage}` +
+        affectedSection;
+    } else {
+      telegramMessage =
+        `📰 <b>MARKET NEWS</b>\n\n` +
+        (headline || alertMessage);
+    }
     await sendTelegram(telegramMessage);
     await db.execute('INSERT INTO macro_alerts_sent (alert_hash, message) VALUES (?, ?)', [alertHash, alertMessage.substring(0, 500)]);
     alertSent = true;
@@ -5416,6 +5465,51 @@ async function checkPortfolio() {
       }
     } catch (e) {
       console.error('[usdt] Detection error:', e.message);
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // ── BTC key-level crossing alert ─────────────────────────────────────────
+    try {
+      const btcPrice = priceMap['BTC-USD'] || priceMap['BTC/USD'];
+      if (btcPrice && previousBTCPrice) {
+        const BTC_KEY_LEVELS = [90000, 85000, 80000, 75000, 72000, 70000, 68000, 65000, 60000];
+        for (const level of BTC_KEY_LEVELS) {
+          const crossedBelow = previousBTCPrice > level && btcPrice <= level;
+          const crossedAbove = previousBTCPrice < level && btcPrice >= level;
+          if (crossedBelow || crossedAbove) {
+            const dir = crossedBelow ? 'below' : 'above';
+            const [recentBTCAlert] = await db.execute(
+              `SELECT id FROM macro_alerts_sent WHERE alert_hash LIKE ? AND sent_at > DATE_SUB(NOW(), INTERVAL 4 HOUR) LIMIT 1`,
+              [`btc_level_${level}_%`]
+            ).catch(() => [[]]);
+            if (recentBTCAlert.length === 0) {
+              const hash = `btc_level_${level}_${dir}_${Date.now()}`;
+              await db.execute('INSERT INTO macro_alerts_sent (alert_hash, message) VALUES (?, ?)',
+                [hash, `BTC crossed ${dir} $${level.toLocaleString()}`]).catch(() => {});
+              if (crossedBelow) {
+                await sendTelegram(
+                  `🚨 <b>BTC KEY LEVEL BROKEN — $${level.toLocaleString()}</b>\n\n` +
+                  `Bitcoin just fell below $${level.toLocaleString()}\n` +
+                  `Current: $${Math.round(btcPrice).toLocaleString()}\n\n` +
+                  `⚠️ Monitor your trailing stops — altcoins typically follow with 2-4h lag.\n` +
+                  `AI is watching your positions.`
+                );
+              } else if (level >= 70000) {
+                await sendTelegram(
+                  `✅ <b>BTC RECLAIMED $${level.toLocaleString()}</b>\n\n` +
+                  `Bitcoin back above key level. Current: $${Math.round(btcPrice).toLocaleString()}\n` +
+                  `Positive signal for altcoin recovery.`
+                );
+              }
+              console.log(`[btc] Key level alert: ${dir} $${level.toLocaleString()} (prev $${Math.round(previousBTCPrice).toLocaleString()} → now $${Math.round(btcPrice).toLocaleString()})`);
+            }
+            break; // Only fire one level per cycle
+          }
+        }
+      }
+      previousBTCPrice = btcPrice || previousBTCPrice;
+    } catch (e) {
+      console.error('[btc] Key level check error:', e.message);
     }
     // ─────────────────────────────────────────────────────────────────────────
 
