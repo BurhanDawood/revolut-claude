@@ -1099,20 +1099,35 @@ set_auto_trade_rule, get_auto_rules, get_prices
   console.error('[config] Failed to seed project_description:', e.message);
 }
 
-// Seed AI auto-execute config (ON CONFLICT DO NOTHING — preserves user settings)
+// Seed AI auto-execute config — preserve existing settings but add hodl_symbols if missing
 try {
-  await db.execute(
-    'INSERT INTO system_config (config_key, config_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE config_key = config_key',
-    ['ai_auto_execute', JSON.stringify({
-      enabled: false,
-      max_sell_pct: 25,
-      max_buy_usd: 100,
-      allowed_triggers: ['trailing_stop', 'fixed_target', 'pump_alert'],
-      require_confidence: 'High',
-      cooldown_minutes: 60
-    })]
+  const [existingAE] = await db.execute(
+    "SELECT config_value FROM system_config WHERE config_key = 'ai_auto_execute'"
   );
-  console.log('[config] AI auto-execute config seeded');
+  const defaultHodl = ['ENA','JTO','RENDER','INJ','FET','ALGO','AVAX','ADA','HBAR','ILV','PYTH','SUPER','SEI','MOG','HFT','CRO','FLR','POL','XLM','BONK'];
+  if (existingAE.length > 0) {
+    // Patch hodl_symbols into existing config without touching other settings
+    const existing = JSON.parse(existingAE[0].config_value);
+    if (!existing.hodl_symbols) {
+      existing.hodl_symbols = defaultHodl;
+      await db.execute(
+        "UPDATE system_config SET config_value = ? WHERE config_key = 'ai_auto_execute'",
+        [JSON.stringify(existing)]
+      );
+      console.log('[config] hodl_symbols patched into existing ai_auto_execute config');
+    }
+  } else {
+    await db.execute(
+      'INSERT INTO system_config (config_key, config_value) VALUES (?, ?)',
+      ['ai_auto_execute', JSON.stringify({
+        enabled: false, max_sell_pct: 25, max_buy_usd: 100,
+        allowed_triggers: ['trailing_stop', 'fixed_target', 'pump_alert'],
+        require_confidence: 'High', cooldown_minutes: 60,
+        hodl_symbols: defaultHodl
+      })]
+    );
+    console.log('[config] AI auto-execute config seeded with hodl_symbols');
+  }
 } catch (e) {
   console.error('[config] Failed to seed ai_auto_execute:', e.message);
 }
@@ -4536,6 +4551,24 @@ ${rulesContext}`;
     const autoExec = autoExecRows.length ? JSON.parse(autoExecRows[0].config_value) : { enabled: false };
     console.log('[auto-exec] Config loaded:', JSON.stringify(autoExec));
 
+    // HODL check — these coins always go to manual review regardless of confidence
+    const isHodlCoin = (autoExec.hodl_symbols || []).includes(coinBase);
+    if (isHodlCoin) {
+      console.log(`[auto-exec] ${coinBase} is a HODL coin — analysis only, no auto-execute`);
+      pendingAnalysis.set(symbol, { type: 'trailing_stop', recommendation, analysis, price: currentPrice, timestamp: Date.now() });
+      alertContextBySymbol.set(coinBase.toLowerCase(), { symbol, coinBase, alertType: 'claude_analysis_trailing', timestamp: Date.now() });
+      lastAlertCoin = coinBase.toLowerCase();
+      await sendTelegram(
+        `🧠 <b>AI ANALYSIS — ${coinBase}</b>\n\n` +
+        `${analysis}\n\n` +
+        `⚠️ HODL position — your decision only\n\n` +
+        `─────────────────\n` +
+        `<b>1</b> Sell  <b>2</b> Hold  <b>3</b> Wait  <b>4</b> Buy  <b>5</b> Dismiss\n` +
+        `💬 Reply number or '<b>${coinBase.toLowerCase()} 2</b>' to target this coin`
+      );
+      return;
+    }
+
     const shouldAutoExecute =
       autoExec.enabled &&
       autoExec.allowed_triggers?.includes('trailing_stop') &&
@@ -7235,8 +7268,11 @@ function createMcpServer() {
       allowed_triggers:       z.array(z.string()).optional().describe('Alert types that can trigger auto-exec: trailing_stop, fixed_target, pump_alert'),
       require_confidence:     z.enum(['High', 'Medium', 'Low']).optional().describe('Minimum Claude confidence level to auto-execute'),
       cooldown_minutes:       z.number().optional().describe('Minutes to wait between auto-executions for same coin'),
+      hodl_symbols:           z.array(z.string()).optional().describe('Coins where AI analyses only and never auto-executes — Bryan decides. e.g. ["ENA","INJ","ALGO"]'),
     },
-    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, max_buy_usd, allowed_triggers, require_confidence, cooldown_minutes }) => {
+    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, max_buy_usd, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam }) => {
+      // Make hodl_symbols accessible in configure_auto_execute via params object
+      const params = { hodl_symbols: hodlSymbolsParam };
 
       if (action === 'log_journal') {
         const sym      = symbol?.includes('-USD') ? symbol.toUpperCase() : `${symbol?.toUpperCase()}-USD`;
@@ -7308,13 +7344,21 @@ function createMcpServer() {
         return { content: [{ type: 'text', text: JSON.stringify({ ok: true, config: sweepConfig }) }] };
 
       } else if (action === 'configure_auto_execute') {
+        // Preserve hodl_symbols from existing config if not provided in this call
+        const [existingCfgRows] = await db.execute(
+          "SELECT config_value FROM system_config WHERE config_key = 'ai_auto_execute'"
+        ).catch(() => [[]]);
+        const existingCfg = existingCfgRows.length ? JSON.parse(existingCfgRows[0].config_value) : {};
+
+        const defaultHodl = ['ENA','JTO','RENDER','INJ','FET','ALGO','AVAX','ADA','HBAR','ILV','PYTH','SUPER','SEI','MOG','HFT','CRO','FLR','POL','XLM','BONK'];
         const config = {
-          enabled: enabled ?? false,
-          max_sell_pct: max_sell_pct || 25,
-          max_buy_usd: max_buy_usd || 100,
-          allowed_triggers: allowed_triggers || ['trailing_stop', 'fixed_target', 'pump_alert'],
-          require_confidence: require_confidence || 'High',
-          cooldown_minutes: cooldown_minutes || 60,
+          enabled: enabled ?? existingCfg.enabled ?? false,
+          max_sell_pct: max_sell_pct || existingCfg.max_sell_pct || 25,
+          max_buy_usd: max_buy_usd || existingCfg.max_buy_usd || 100,
+          allowed_triggers: allowed_triggers || existingCfg.allowed_triggers || ['trailing_stop', 'fixed_target', 'pump_alert'],
+          require_confidence: require_confidence || existingCfg.require_confidence || 'High',
+          cooldown_minutes: cooldown_minutes || existingCfg.cooldown_minutes || 60,
+          hodl_symbols: params?.hodl_symbols ?? existingCfg.hodl_symbols ?? defaultHodl,
           updated_at: new Date().toISOString()
         };
         // Always saves to system_config — NOT trader_profile
@@ -7329,7 +7373,8 @@ function createMcpServer() {
           `Max buy: $${config.max_buy_usd}\n` +
           `Confidence required: ${config.require_confidence}\n` +
           `Cooldown: ${config.cooldown_minutes} min\n` +
-          `Triggers: ${config.allowed_triggers.join(', ')}`
+          `Triggers: ${config.allowed_triggers.join(', ')}\n` +
+          `HODL (analysis-only): ${(config.hodl_symbols || []).join(', ')}`
         );
         return { content: [{ type: 'text', text: JSON.stringify({ ok: true, config, saved_to: 'system_config' }) }] };
 
