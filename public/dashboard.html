@@ -1287,9 +1287,22 @@
     const overnight = h.overnightChangePct != null
       ? `<span class="overnight-badge ${h.overnightChangePct >= 0 ? 'pos' : 'neg'}">${h.overnightChangePct >= 0 ? '+' : ''}${h.overnightChangePct.toFixed(1)}% overnight</span>`
       : '';
-    const pnlLine = (h.entryPrice != null && h.unrealisedPnlPct != null)
-      ? `<div class="hc-pnl-line ${pnlClass(h.unrealisedPnlPct)}">Entry: ${fmtPrice(h.entryPrice)} | Now: ${fmtPrice(price)} | ${h.unrealisedPnlPct >= 0 ? '+' : ''}${h.unrealisedPnlPct.toFixed(1)}% (${h.unrealisedPnlUsd >= 0 ? '+' : ''}${fmt(h.unrealisedPnlUsd)}) ${h.unrealisedPnlPct >= 0 ? '🟢' : '🔴'}</div>`
-      : `<div class="entry-inline"><span style="color:var(--text-muted);font-size:0.75rem">No entry set</span> <button class="btn-outline btn-sm" onclick="showQuickEntry('${h.currency}')">Set entry</button><div class="alert-inline" id="quick-entry-${h.currency}" style="display:none"><input type="number" id="qe-input-${h.currency}" placeholder="Entry $" step="any" class="threshold-input" style="width:90px"><button class="btn-accent btn-sm" onclick="submitQuickEntry('${sym}','${h.currency}')">SET</button><button class="btn-outline btn-sm" onclick="hideQuickEntry('${h.currency}')">✕</button></div></div>`;
+    const epDetail = (typeof entryDetailData !== 'undefined') ? entryDetailData[sym] : null;
+    const cycleCount = epDetail ? epDetail.cycle_count : 0;
+    const origEntry  = epDetail ? (epDetail.original_entry_price || h.entryPrice) : h.entryPrice;
+    const entriesDiffer = h.entryPrice && origEntry && Math.abs(h.entryPrice - origEntry) > 0.000001;
+    let pnlLine;
+    if (h.entryPrice != null && h.unrealisedPnlPct != null) {
+      const cycleLine = `<div class="hc-pnl-line ${pnlClass(h.unrealisedPnlPct)}">${cycleCount > 0 ? '🔄 Cycle' : 'Entry'}: ${fmtPrice(h.entryPrice)} | Now: ${fmtPrice(price)} | ${h.unrealisedPnlPct >= 0 ? '+' : ''}${h.unrealisedPnlPct.toFixed(1)}% (${h.unrealisedPnlUsd >= 0 ? '+' : ''}${fmt(h.unrealisedPnlUsd)}) ${h.unrealisedPnlPct >= 0 ? '🟢' : '🔴'}</div>`;
+      const basisLine = (cycleCount > 0 && entriesDiffer) ? (() => {
+        const basisPl = ((price - origEntry) / origEntry * 100);
+        const basisCol = basisPl >= 0 ? 'var(--accent)' : 'var(--danger)';
+        return `<div style="font-size:0.72rem;color:#666;padding:2px 0 0 2px">📈 Cost basis: ${fmtPrice(origEntry)} <span style="color:${basisCol}">${basisPl >= 0 ? '+' : ''}${basisPl.toFixed(1)}%</span> · ${cycleCount} cycle${cycleCount>1?'s':''}</div>`;
+      })() : '';
+      pnlLine = cycleLine + basisLine;
+    } else {
+      pnlLine = `<div class="entry-inline"><span style="color:var(--text-muted);font-size:0.75rem">No entry set</span> <button class="btn-outline btn-sm" onclick="showQuickEntry('${h.currency}')">Set entry</button><div class="alert-inline" id="quick-entry-${h.currency}" style="display:none"><input type="number" id="qe-input-${h.currency}" placeholder="Entry $" step="any" class="threshold-input" style="width:90px"><button class="btn-accent btn-sm" onclick="submitQuickEntry('${sym}','${h.currency}')">SET</button><button class="btn-outline btn-sm" onclick="hideQuickEntry('${h.currency}')">✕</button></div></div>`;
+    }
     return `
       <div class="hc-top">
         <div class="hc-main">
@@ -1885,8 +1898,8 @@
                     title="Remove from history">🗑️</button>
                 </div>
               </div>
-              ${soldPrice ? `<div style="font-size:0.72rem;color:#555;margin-top:3px">Sold @ ${fmtPrice(soldPrice)}${origEntry && origEntry !== soldPrice ? ` · Basis: ${fmtPrice(origEntry)}` : ''}${cycleStr}</div>` :
-                origEntry ? `<div style="font-size:0.72rem;color:#555;margin-top:3px">Cost basis: ${fmtPrice(origEntry)}${cycleStr}</div>` : ''}
+              ${soldPrice ? `<div style="font-size:0.72rem;color:#555;margin-top:3px">Sold @ ${fmtPrice(soldPrice)}${cycleStr}</div>` : ''}
+              ${origEntry ? `<div style="font-size:0.72rem;color:#444;margin-top:2px">📈 Original basis: ${fmtPrice(origEntry)}</div>` : ''}
             </div>`;
         }).join('');
         soldHtml = `
