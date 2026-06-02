@@ -1860,7 +1860,61 @@
         </div>`;
     }
 
-    el.innerHTML = sigHtml + dustHtml;
+    // Sold coins section — from /api/entryprices/detail (last_sold_at set)
+    let soldHtml = '';
+    try {
+      const soldPositions = Object.entries(entryDetailData || {})
+        .filter(([, ep]) => ep.last_sold_at)
+        .sort((a, b) => new Date(b[1].last_sold_at) - new Date(a[1].last_sold_at));
+      if (soldPositions.length > 0) {
+        const soldCards = soldPositions.map(([sym, ep]) => {
+          const coin     = sym.replace('-USD', '');
+          const soldDate = new Date(ep.last_sold_at).toLocaleDateString('en-GB', { day:'2-digit', month:'short' });
+          const origEntry  = ep.original_entry_price || ep.entry_price;
+          const soldPrice  = ep.last_sold_price;
+          const cycleStr   = ep.cycle_count > 0 ? ` · ${ep.cycle_count} cycle${ep.cycle_count>1?'s':''}` : '';
+          return `
+            <div id="sold-${coin}" style="opacity:0.55;border-left:3px solid #444;padding:8px 12px;margin-bottom:6px;background:#111;border-radius:6px">
+              <div style="display:flex;justify-content:space-between;align-items:center">
+                <span style="color:#888;font-weight:700;font-size:0.8rem">
+                  🔴 ${coin} <span style="font-size:0.65rem;color:#555;background:#1a1a1a;padding:1px 5px;border-radius:3px;margin-left:4px">SOLD ${soldDate}</span>
+                </span>
+                <div style="display:flex;gap:6px;align-items:center">
+                  <button onclick="deleteSoldCoin('${sym}')"
+                    style="background:none;border:1px solid #333;color:#444;padding:1px 7px;border-radius:4px;font-size:10px;cursor:pointer"
+                    title="Remove from history">🗑️</button>
+                </div>
+              </div>
+              ${soldPrice ? `<div style="font-size:0.72rem;color:#555;margin-top:3px">Sold @ ${fmtPrice(soldPrice)}${origEntry && origEntry !== soldPrice ? ` · Basis: ${fmtPrice(origEntry)}` : ''}${cycleStr}</div>` :
+                origEntry ? `<div style="font-size:0.72rem;color:#555;margin-top:3px">Cost basis: ${fmtPrice(origEntry)}${cycleStr}</div>` : ''}
+            </div>`;
+        }).join('');
+        soldHtml = `
+          <div style="margin-top:14px">
+            <div style="font-size:0.65rem;text-transform:uppercase;letter-spacing:0.08em;color:#444;margin-bottom:6px">Recently sold</div>
+            ${soldCards}
+          </div>`;
+      }
+    } catch(e) {}
+
+    el.innerHTML = sigHtml + dustHtml + soldHtml;
+  }
+
+  async function deleteSoldCoin(symbol) {
+    const coin = symbol.replace('-USD', '');
+    if (!confirm(`Remove ${coin} from history?\n\nThis cannot be undone. Only remove if you never plan to buy back.`)) return;
+    try {
+      const res = await fetch(`/api/entry-prices/${symbol}`, { method: 'DELETE' });
+      if (res.ok) {
+        const card = document.getElementById(`sold-${coin}`);
+        if (card) { card.style.transition = 'opacity 0.3s'; card.style.opacity = '0'; setTimeout(() => card.remove(), 300); }
+        else { renderThresholds(balancesData, statusData, targetsData, entryPricesData, trailingStopsData, entryDetailData); }
+        delete entryDetailData[symbol];
+        showToast(`${coin} removed from history`, 'success');
+      } else {
+        showToast('Failed to delete — try again', 'error');
+      }
+    } catch (e) { showToast('Error: ' + e.message, 'error'); }
   }
 
   function toggleTcDust() {

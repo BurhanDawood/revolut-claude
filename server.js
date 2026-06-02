@@ -753,6 +753,8 @@ await safeAddColumn('ignored_coins',     'expires_at',  'TIMESTAMP NULL');
 
 // Cost basis tracking — preserve original entry price across sell→buyback cycles
 await safeAddColumn('entry_prices', 'original_entry_price', 'DECIMAL(20,10) NULL');
+await safeAddColumn('entry_prices', 'last_sold_price',     'DECIMAL(20,10) NULL');
+await safeAddColumn('entry_prices', 'last_sold_at',        'TIMESTAMP NULL');
 await safeAddColumn('entry_prices', 'original_entry_date',  'TIMESTAMP NULL');
 await safeAddColumn('entry_prices', 'cycle_count',          'INT DEFAULT 0');
 await safeAddColumn('entry_prices', 'created_at',           'TIMESTAMP DEFAULT CURRENT_TIMESTAMP');
@@ -1021,6 +1023,19 @@ try {
 } catch (e) {
   console.warn('[cleanup] Symbol dedup cleanup error:', e.message);
 }
+
+// Seed XLM sold history if last_sold_at is not set (one-time backfill for known sell on 2026-06-02)
+try {
+  await db.execute(`
+    UPDATE entry_prices
+    SET last_sold_price       = COALESCE(last_sold_price, 0.2341),
+        last_sold_at          = COALESCE(last_sold_at,    '2026-06-02 02:07:18'),
+        cycle_count           = GREATEST(COALESCE(cycle_count, 0), 1),
+        original_entry_price  = COALESCE(original_entry_price, 0.386)
+    WHERE symbol = 'XLM-USD'
+    AND last_sold_at IS NULL
+  `);
+} catch (e) { console.warn('[seed] XLM sold history seed:', e.message); }
 
 // Seed system config — always keep project description current
 try {
@@ -3522,6 +3537,26 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
       }
     }
 
+    // If full sell: preserve cost basis with last_sold_price / last_sold_at
+    if (action === 'sell') {
+      try {
+        const currentEntry = entryPrices.get(symbol);
+        if (currentEntry) {
+          // Check remaining balance after this sell
+          const freshBals = await revolutRequest('GET', '/balances').catch(() => []);
+          const asset = freshBals.find(b => b.currency === coinBase);
+          const remainingQty = parseFloat(asset?.available || 0);
+          if (remainingQty < 0.001) {
+            await db.execute(
+              `UPDATE entry_prices SET last_sold_price = ?, last_sold_at = NOW() WHERE symbol = ?`,
+              [currentEntry, symbol]
+            ).catch(() => {});
+            console.log(`[entry] ${coinBase} fully sold — cost basis $${currentEntry.toFixed(6)} preserved`);
+          }
+        }
+      } catch (e) { console.warn('[entry] Full-sell preservation error:', e.message); }
+    }
+
     // If buy: detect re-entry (previous sell with outcome exists)
     let reentryNote = '';
     if (action === 'buy') {
@@ -3561,6 +3596,10 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
           avgEntryLine = `\n📊 Entry price set: ${formatPrice(price)}`;
         } else if (isCycleBuyback) {
           await updateEntryPrice(symbol, price, true);
+          // Clear last_sold_at so this coin is no longer shown as "sold"
+          await db.execute(
+            'UPDATE entry_prices SET last_sold_at = NULL WHERE symbol = ?', [symbol]
+          ).catch(() => {});
           avgEntryLine = `\n🔄 Cycle buyback entry: ${formatPrice(price)}`;
         }
       } catch (e) {
@@ -6887,11 +6926,27 @@ app.get('/api/entryprices', (req, res) => {
   res.json(out);
 });
 
+// DELETE /api/entry-prices/:symbol — remove sold coin history (only coins with zero live balance)
+app.delete('/api/entry-prices/:symbol', async (req, res) => {
+  try {
+    const symbol = req.params.symbol.toUpperCase().replace('_', '-');
+    await db.execute('DELETE FROM entry_prices  WHERE symbol = ?', [symbol]);
+    await db.execute('DELETE FROM price_targets WHERE symbol = ?', [symbol]);
+    await db.execute('DELETE FROM trailing_stops WHERE symbol = ?', [symbol]).catch(() => {});
+    entryPrices.delete(symbol);
+    console.log(`[entry] Deleted history for ${symbol}`);
+    res.json({ ok: true, deleted: symbol });
+  } catch (e) {
+    console.error('[entry] Delete error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // GET /api/entryprices/detail — full cost basis data including original entry and cycle count
 app.get('/api/entryprices/detail', async (req, res) => {
   try {
     const [rows] = await db.execute(
-      'SELECT symbol, entry_price, original_entry_price, original_entry_date, cycle_count, updated_at FROM entry_prices'
+      'SELECT symbol, entry_price, original_entry_price, original_entry_date, cycle_count, last_sold_price, last_sold_at, updated_at FROM entry_prices'
     );
     const out = {};
     for (const r of rows) {
@@ -6900,6 +6955,8 @@ app.get('/api/entryprices/detail', async (req, res) => {
         original_entry_price:  r.original_entry_price ? parseFloat(r.original_entry_price) : parseFloat(r.entry_price),
         original_entry_date:   r.original_entry_date,
         cycle_count:           parseInt(r.cycle_count || 0),
+        last_sold_price:       r.last_sold_price ? parseFloat(r.last_sold_price) : null,
+        last_sold_at:          r.last_sold_at || null,
         updated_at:            r.updated_at,
       };
     }
@@ -7613,6 +7670,32 @@ function createMcpServer() {
         });
       }
       positions.sort((a, b) => (parseFloat(b.value_usd) || 0) - (parseFloat(a.value_usd) || 0));
+
+      // Append sold coins (last_sold_at set, no live balance) — last 30 days
+      try {
+        const [soldCoins] = await db.execute(
+          `SELECT symbol, entry_price, original_entry_price, cycle_count, last_sold_price, last_sold_at
+           FROM entry_prices WHERE last_sold_at IS NOT NULL AND last_sold_at > DATE_SUB(NOW(), INTERVAL 30 DAY)
+           ORDER BY last_sold_at DESC`
+        );
+        console.log('[portfolio] Sold coins found:', soldCoins.map(c => c.symbol).join(', ') || 'none');
+        for (const sold of soldCoins) {
+          if (positions.find(p => p.symbol === sold.symbol)) continue; // already in live positions
+          const coinBase    = sold.symbol.replace('-USD', '');
+          const currentPrice = priceMap[sold.symbol] || priceMap[`${coinBase}/USD`] || null;
+          const origEntry   = sold.original_entry_price ? parseFloat(sold.original_entry_price) : parseFloat(sold.entry_price);
+          const plPct       = origEntry && currentPrice ? ((currentPrice - origEntry) / origEntry * 100).toFixed(2) : null;
+          positions.push({
+            symbol: sold.symbol, currency: coinBase, quantity: 0, price: currentPrice,
+            value_usd: '0.00', entry_price: parseFloat(sold.entry_price),
+            original_entry_price: origEntry, historical_pl_pct: plPct,
+            cycle_count: parseInt(sold.cycle_count || 0),
+            last_sold_price: sold.last_sold_price ? parseFloat(sold.last_sold_price) : null,
+            last_sold_at: sold.last_sold_at, status: 'sold',
+          });
+        }
+      } catch (e) { console.warn('[portfolio] Sold coins fetch error:', e.message); }
+
       const cap = getCapitalSummary(totalValue);
 
       // Filter: remove dust (<$1) and ignored coins
