@@ -1,839 +1,524 @@
-// dashboard.js — v2.0.0
-// Atomic rewrite — all element IDs matched exactly to dashboard.html
-// ─────────────────────────────────────────────────────────────────
+// dashboard.js v3.0.0 — matched to dashboard.html
 
-const API = '';          // same origin
-let refreshTimer = null;
-let monitorPaused = false;
+var DASHBOARD_VERSION = '3.0.0';
+console.log('Dashboard v' + DASHBOARD_VERSION);
+
+window.onerror = function(msg, src, line) {
+  var b = document.getElementById('error-banner');
+  if (b) { b.textContent = 'JS Error line '+line+': '+msg; b.style.display = 'block'; }
+};
 
 // ── Helpers ───────────────────────────────────────────────────────
 
 function $(id) { return document.getElementById(id); }
 
-function fmt(n, dp = 2) {
-  if (n == null || isNaN(n)) return '—';
-  return Number(n).toLocaleString('en-US', { minimumFractionDigits: dp, maximumFractionDigits: dp });
-}
-
 function fmtUSD(n) {
-  if (n == null || isNaN(n)) return '—';
-  const abs = Math.abs(n);
-  const str = abs.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-  return (n < 0 ? '-$' : '$') + str;
+  n = parseFloat(n);
+  if (isNaN(n)) return '—';
+  var abs = Math.abs(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2});
+  return (n < 0 ? '-$' : '$') + abs;
 }
 
 function fmtPct(n) {
-  if (n == null || isNaN(n)) return '—';
-  return (n >= 0 ? '+' : '') + Number(n).toFixed(2) + '%';
+  n = parseFloat(n);
+  if (isNaN(n)) return '—';
+  return (n >= 0 ? '+' : '') + n.toFixed(2) + '%';
 }
 
-function colorClass(n) {
-  if (n == null || isNaN(n)) return '';
-  return n >= 0 ? 'positive' : 'negative';
+function fmtQty(n, dp) {
+  n = parseFloat(n);
+  dp = dp || 4;
+  if (isNaN(n)) return '—';
+  if (n >= 1000000000) return (n/1000000000).toFixed(2) + 'B';
+  if (n >= 1000000) return (n/1000000).toFixed(2) + 'M';
+  if (n >= 1000) return (n/1000).toFixed(2) + 'K';
+  if (n < 0.000001) return n.toFixed(10);
+  if (n < 0.0001) return n.toFixed(8);
+  if (n < 0.01) return n.toFixed(6);
+  return n.toFixed(dp);
 }
 
-function setText(id, val) {
-  const el = $(id);
-  if (el) el.textContent = val ?? '—';
+function fmtPrice(n) {
+  n = parseFloat(n);
+  if (isNaN(n) || n === 0) return '$0';
+  if (n < 0.000001) return '$' + n.toFixed(10);
+  if (n < 0.0001) return '$' + n.toFixed(8);
+  if (n < 0.01) return '$' + n.toFixed(6);
+  if (n < 1) return '$' + n.toFixed(4);
+  return '$' + n.toFixed(2);
 }
 
-function setHTML(id, val) {
-  const el = $(id);
-  if (el) el.innerHTML = val ?? '';
+function setText(id, val, color) {
+  var el = $(id);
+  if (!el) return;
+  el.textContent = (val !== undefined && val !== null) ? val : '—';
+  if (color) el.style.color = color;
 }
 
-function showToast(msg, isError = false) {
-  const t = $('toast');
+function showEl(id) { var el = $(id); if (el) el.style.display = ''; }
+function hideEl(id) { var el = $(id); if (el) el.style.display = 'none'; }
+
+function showToast(msg, isError) {
+  var t = $('toast');
   if (!t) return;
   t.textContent = msg;
   t.className = 'toast ' + (isError ? 'error' : 'success') + ' show';
-  setTimeout(() => t.className = 'toast', 3000);
+  setTimeout(function() { t.className = 'toast'; }, 3000);
 }
 
-function timeAgo(iso) {
-  if (!iso) return '—';
-  const diff = Date.now() - new Date(iso).getTime();
-  const m = Math.floor(diff / 60000);
-  if (m < 1) return 'just now';
-  if (m < 60) return `${m}m ago`;
-  const h = Math.floor(m / 60);
-  if (h < 24) return `${h}h ago`;
-  return `${Math.floor(h / 24)}d ago`;
+function fetchData(url) {
+  return fetch(url).then(function(r) {
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return r.json();
+  }).catch(function(e) {
+    console.error('Fetch error ' + url + ':', e.message);
+    return null;
+  });
 }
 
 // ── Tab switching ─────────────────────────────────────────────────
 
-function initTabs() {
-  const tabs = ['tab-portfolio', 'tab-activity', 'tab-journal', 'tab-rebalancing', 'tab-kraken'];
-  tabs.forEach(tabId => {
-    const el = $(tabId);
-    if (!el) return;
-    el.addEventListener('click', () => {
-      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-      document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
-      el.classList.add('active');
-      const panelId = tabId.replace('tab-', 'panel-');
-      const panel = $(panelId);
-      if (panel) panel.classList.add('active');
+function switchTab(name) {
+  document.querySelectorAll('.tab-btn').forEach(function(b) { b.classList.remove('active'); });
+  document.querySelectorAll('.tab-content').forEach(function(p) { p.classList.remove('active'); });
+  var pane = $('tab-' + name);
+  if (pane) pane.classList.add('active');
+  document.querySelectorAll('.tab-btn').forEach(function(b) {
+    if (b.getAttribute('onclick') && b.getAttribute('onclick').indexOf("'" + name + "'") > -1) {
+      b.classList.add('active');
+    }
+  });
+  if (name === 'activity') loadActivity('all');
+  if (name === 'kraken') loadKraken();
+  if (name === 'rebalancing') loadRebalancing();
+  if (name === 'journal') { loadJournalEntries(); loadJournalStats(); }
+}
+
+// ── Portfolio ─────────────────────────────────────────────────────
+
+function loadPortfolio() {
+  fetchData('/portfolio/summary').then(function(data) {
+    if (!data) { setText('portfolio-value', 'Error'); return; }
+
+    var revCrypto = parseFloat(data.total_value_usd || 0);
+    var cashObj = data.cash_available || {};
+    var revCashUSD = parseFloat(cashObj.revolut_usd || data.cash_usd || 0);
+    var revCashUSDT = parseFloat(cashObj.revolut_usdt || data.cash_usdt || 0);
+    var revCash = revCashUSD + revCashUSDT;
+    var krakenCrypto = parseFloat(data.kraken_total_usd || 0);
+    var krakenCash = parseFloat(cashObj.kraken_usd || 0);
+
+    var tangemVal = 0, tangemXRP = 0, tangemPrice = 0, tangemEntry = 2.65;
+    if (data.tangem) {
+      tangemVal = parseFloat(data.tangem.valueUSD || 0);
+      tangemXRP = parseFloat(data.tangem.balance || 0);
+      tangemPrice = tangemXRP > 0 ? tangemVal / tangemXRP : 0;
+      tangemEntry = parseFloat(data.tangem.entryPrice || 2.65);
+    }
+    var tangemUSD = parseFloat(data.tangem_value_usd || 0);
+    if (tangemUSD) tangemVal = tangemUSD;
+    if (!tangemVal && tangemXRP === 0) { tangemXRP = 1008.43; tangemPrice = 1.2175; tangemVal = tangemXRP * tangemPrice; }
+
+    var totalCrypto = revCrypto + krakenCrypto + tangemVal;
+    var totalCash = revCash + krakenCash;
+    var grandTotal = totalCrypto + totalCash;
+
+    setText('portfolio-value', fmtUSD(grandTotal));
+    showEl('portfolio-totals');
+    setText('revolut-crypto-subtotal', fmtUSD(revCrypto));
+    setText('revolut-cash-subtotal', fmtUSD(revCash));
+    setText('kraken-crypto-subtotal', fmtUSD(krakenCrypto));
+    setText('kraken-cash-subtotal', fmtUSD(krakenCash));
+    setText('tangem-subtotal', fmtUSD(tangemVal));
+    setText('portfolio-crypto-sum', fmtUSD(totalCrypto));
+    setText('portfolio-cash-sum', fmtUSD(totalCash));
+    setText('portfolio-total-sum', fmtUSD(grandTotal));
+
+    showEl('capital-bar');
+    var inv = parseFloat(data.invested || 0);
+    var plUsd = parseFloat(data.pl_usd || 0);
+    var plPct = parseFloat(data.pl_pct || 0);
+    var breakEven = (inv > 0 && grandTotal > 0) ? ((inv - grandTotal) / grandTotal * 100) : 0;
+    setText('cap-invested', fmtUSD(inv));
+    setText('cap-current', fmtUSD(grandTotal));
+    setText('cap-pnl',
+      (plUsd >= 0 ? '+' : '') + '$' + Math.abs(plUsd).toFixed(2) + ' (' + fmtPct(plPct) + ')',
+      plUsd >= 0 ? '#00ff88' : '#ff4444');
+    setText('cap-breakeven', '+' + breakEven.toFixed(1) + '% needed', '#ffaa00');
+
+    showEl('pnl-summary-bar');
+    var positions = data.positions || [];
+    var winners = 0, losers = 0, totalUnreal = 0;
+    positions.forEach(function(p) {
+      var ep = parseFloat(p.entry_price || 0), cp = parseFloat(p.current_price || 0), qty = parseFloat(p.quantity || 0);
+      var pl = (ep && cp && qty) ? (cp - ep) * qty : 0;
+      totalUnreal += pl;
+      if (pl > 0) winners++; else if (pl < 0) losers++;
     });
+    setText('pnl-tracked', positions.length);
+    setText('pnl-winners', winners, '#00ff88');
+    setText('pnl-losers', losers, '#ff4444');
+    setText('pnl-total-unreal', (totalUnreal >= 0 ? '+' : '') + '$' + Math.abs(totalUnreal).toFixed(2), totalUnreal >= 0 ? '#00ff88' : '#ff4444');
+
+    hideEl('tangem-loading'); showEl('tangem-content');
+    setText('tangem-value-usd', fmtUSD(tangemVal));
+    setText('tangem-xrp-qty', fmtQty(tangemXRP, 2) + ' XRP');
+    setText('tangem-address', 'r4E3rtCa4FT4HxTQV2iw3yQHRTrAHMYS3v');
+    if (tangemEntry > 0 && tangemPrice > 0) {
+      var tPlUsd = tangemXRP * (tangemPrice - tangemEntry);
+      var tPlPct = ((tangemPrice - tangemEntry) / tangemEntry * 100);
+      setText('tangem-pnl-usd', (tPlUsd >= 0 ? '+' : '') + '$' + Math.abs(tPlUsd).toFixed(2), tPlUsd >= 0 ? '#00ff88' : '#ff4444');
+      setText('tangem-pnl-pct', fmtPct(tPlPct), tPlPct >= 0 ? '#00ff88' : '#ff4444');
+      setText('tangem-entry-line', 'Entry: $' + tangemEntry.toFixed(4));
+    }
+
+    positions.sort(function(a, b) { return parseFloat(b.value_usd || 0) - parseFloat(a.value_usd || 0); });
+    var html = '';
+    for (var i = 0; i < positions.length; i++) {
+      var pos = positions[i];
+      var val = parseFloat(pos.value_usd || 0);
+      if (val < 1) continue;
+      var cp = parseFloat(pos.current_price || 0), ep = parseFloat(pos.entry_price || 0);
+      var pl = ep > 0 ? ((cp - ep) / ep * 100) : 0, plc = pl >= 0 ? '#00ff88' : '#ff4444';
+      var overnight = parseFloat(pos.change_from_baseline_pct || 0);
+      var oColor = overnight >= 0 ? 'pos' : 'neg';
+      var entryLine = ep > 0
+        ? 'Entry: ' + fmtPrice(ep) + ' | Now: ' + fmtPrice(cp) + ' | <span style="color:' + plc + '">' + fmtPct(pl) + '</span>'
+        : 'Now: ' + fmtPrice(cp);
+      var hb = parseFloat(pos.historical_basis || 0), histLine = '';
+      if (hb > 0 && ep > 0 && Math.abs(hb - ep) > 0.000001) {
+        var hpl = ((cp - hb) / hb * 100), hc = hpl >= 0 ? '#00ff88' : '#ff4444';
+        histLine = '<br><span style="color:#555;font-size:10px">Hist: ' + fmtPrice(hb) + ' <span style="color:' + hc + '">' + fmtPct(hpl) + '</span></span>';
+      }
+      var cy = parseInt(pos.cycle_count || 0);
+      var cyLine = cy > 0 ? '<br><span style="color:#444;font-size:10px">' + cy + ' cycle(s)</span>' : '';
+      html += '<div style="border-left:3px solid ' + plc + ';padding:10px 12px;margin-bottom:8px;background:#1a1a1a;border-radius:4px">'
+        + '<div style="display:flex;justify-content:space-between;margin-bottom:4px">'
+        + '<span style="color:white;font-weight:bold">' + pos.currency + '</span>'
+        + '<div style="text-align:right"><span style="color:white;font-weight:bold">$' + val.toFixed(2) + '</span>'
+        + (overnight !== 0 ? '<br><span class="overnight-badge ' + oColor + '" style="font-size:10px">' + (overnight >= 0 ? '+' : '') + overnight.toFixed(1) + '% overnight</span>' : '')
+        + '</div></div><div style="font-size:11px;color:#888">' + entryLine + histLine + cyLine + '</div></div>';
+    }
+    var holdEl = $('holdings-list');
+    if (holdEl) holdEl.innerHTML = html || '<div class="empty-state">No positions</div>';
+    setText('last-updated', 'Updated ' + new Date().toLocaleTimeString('en-GB'));
   });
 }
 
-// ── Portfolio summary (Revolut X) ─────────────────────────────────
+// ── USDT Sweep ────────────────────────────────────────────────────
 
-async function loadPortfolioSummary() {
-  try {
-    const res = await fetch(`${API}/api/portfolio`);
-    const data = await res.json();
-
-    // Holdings list
-    const holdings = data.holdings || data.balances || [];
-    const holdingsEl = $('holdings-list');
-    if (holdingsEl) {
-      if (holdings.length === 0) {
-        holdingsEl.innerHTML = '<p class="muted">No holdings found.</p>';
-      } else {
-        holdingsEl.innerHTML = holdings.map(h => {
-          const pnlPct = h.pnl_pct ?? h.pnlPct ?? null;
-          const pnlUsd = h.pnl_usd ?? h.pnlUsd ?? null;
-          const cls = colorClass(pnlPct);
-          return `
-            <div class="holding-row">
-              <span class="coin">${h.symbol ?? h.coin ?? '?'}</span>
-              <span class="value">${fmtUSD(h.value_usd ?? h.valueUsd)}</span>
-              <span class="qty muted">${fmt(h.quantity ?? h.qty, 4)}</span>
-              <span class="pnl ${cls}">${fmtPct(pnlPct)}</span>
-              <span class="pnl-usd ${cls}">${fmtUSD(pnlUsd)}</span>
-            </div>`;
-        }).join('');
-      }
-    }
-
-    // Portfolio value (top-level)
-    const totalValue = data.total_value ?? data.totalValue ?? data.total ?? null;
-    setText('portfolio-value', totalValue != null ? fmtUSD(totalValue) : '—');
-
-    // Revolut subtotals
-    setText('revolut-crypto-subtotal', fmtUSD(data.crypto_value ?? data.cryptoValue));
-    setText('revolut-cash-subtotal', fmtUSD(data.cash_value ?? data.cashValue ?? data.usd_balance ?? data.usdBalance));
-
-    // Last updated
-    setText('last-updated', timeAgo(data.last_updated ?? data.lastUpdated ?? new Date().toISOString()));
-
-  } catch (e) {
-    console.error('loadPortfolioSummary:', e);
-    setText('portfolio-value', 'Error');
-  }
+function loadSweep() {
+  fetchData('/api/sweep/config').then(function(data) {
+    if (!data) return;
+    hideEl('sweep-loading'); showEl('sweep-content');
+    var tog = $('sweep-enabled-toggle'), pct = $('sweep-pct-input');
+    var min = $('sweep-min-input'), bal = $('sweep-usdt-balance'), lbl = $('sweep-status-label');
+    if (tog) tog.checked = data.enabled !== false;
+    if (pct) pct.value = data.sweep_pct || 25;
+    if (min) min.value = data.min_trade_value_usd || 10;
+    if (bal) bal.textContent = '$' + parseFloat(data.usdt_reserve || 0).toFixed(2);
+    if (lbl) lbl.textContent = (data.enabled !== false) ? 'ON' : 'OFF';
+  });
 }
 
-// ── Full portfolio data (all accounts) ───────────────────────────
-
-async function loadPortfolioData() {
-  try {
-    const res = await fetch(`${API}/api/portfolio/all`);
-    const data = await res.json();
-
-    // Portfolio totals panel
-    const revolut  = data.revolut  ?? {};
-    const kraken   = data.kraken   ?? {};
-    const tangem   = data.tangem   ?? {};
-    const totals   = data.totals   ?? {};
-
-    setText('revolut-crypto-subtotal', fmtUSD(revolut.crypto ?? revolut.crypto_value));
-    setText('revolut-cash-subtotal',   fmtUSD(revolut.cash  ?? revolut.cash_value));
-    setText('kraken-crypto-subtotal',  fmtUSD(kraken.crypto ?? kraken.crypto_value));
-    setText('kraken-cash-subtotal',    fmtUSD(kraken.cash   ?? kraken.cash_value));
-    setText('tangem-subtotal',         fmtUSD(tangem.value  ?? tangem.value_usd));
-    setText('portfolio-crypto-sum',    fmtUSD(totals.crypto ?? totals.total_crypto));
-    setText('portfolio-cash-sum',      fmtUSD(totals.cash   ?? totals.total_cash));
-    setText('portfolio-total-sum',     fmtUSD(totals.total  ?? totals.grand_total));
-
-    // Capital panel
-    const capital = data.capital ?? {};
-    const invested = capital.invested ?? data.invested_capital ?? null;
-    const current  = capital.current  ?? totals.total ?? null;
-    const pnl      = (current != null && invested != null) ? current - invested : null;
-    const pnlPct   = (pnl != null && invested) ? (pnl / invested) * 100 : null;
-    const breakeven = (pnl != null && current) ? ((invested - current) / current) * 100 : null;
-
-    setText('cap-invested', fmtUSD(invested));
-    setText('cap-current',  fmtUSD(current));
-
-    const pnlEl = $('cap-pnl');
-    if (pnlEl) {
-      pnlEl.textContent = pnl != null ? `${fmtUSD(pnl)} (${fmtPct(pnlPct)})` : '—';
-      pnlEl.className = colorClass(pnl);
-    }
-    setText('cap-breakeven', breakeven != null ? fmtPct(breakeven) : '—');
-
-    // Tangem panel
-    loadTangem(tangem);
-
-  } catch (e) {
-    console.error('loadPortfolioData:', e);
-  }
+function saveSweepConfig() {
+  var tog = $('sweep-enabled-toggle'), pct = $('sweep-pct-input'), min = $('sweep-min-input');
+  fetch('/api/sweep/config', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled: tog ? tog.checked : true, sweep_pct: parseFloat((pct && pct.value) || 25), min_trade_value_usd: parseFloat((min && min.value) || 10) })
+  }).then(function(r) { if (r.ok) { showToast('Sweep config saved'); loadSweep(); } else showToast('Failed to save', true); });
 }
 
-// ── Tangem panel ─────────────────────────────────────────────────
+// ── Monitoring ────────────────────────────────────────────────────
 
-function loadTangem(data) {
-  const loading = $('tangem-loading');
-  const content = $('tangem-content');
-  if (loading) loading.style.display = 'none';
-  if (content) content.style.display = '';
+var monitorPaused = false;
 
-  setText('tangem-xrp-qty',   fmt(data.xrp_qty   ?? data.quantity, 4));
-  setText('tangem-value-usd', fmtUSD(data.value   ?? data.value_usd));
-  setText('tangem-address',   data.address ?? 'r4E3rtCa4FT4HxTQV2iw3yQHRTrAHMYS3v');
-
-  const pnlUsd = data.pnl_usd ?? data.pnl ?? null;
-  const pnlPct = data.pnl_pct ?? null;
-  const pnlUsdEl = $('tangem-pnl-usd');
-  const pnlPctEl = $('tangem-pnl-pct');
-  if (pnlUsdEl) { pnlUsdEl.textContent = fmtUSD(pnlUsd); pnlUsdEl.className = colorClass(pnlUsd); }
-  if (pnlPctEl) { pnlPctEl.textContent = fmtPct(pnlPct); pnlPctEl.className = colorClass(pnlPct); }
-
-  const entryEl = $('tangem-entry-line');
-  if (entryEl && data.entry_price) {
-    entryEl.textContent = `Entry: $${fmt(data.entry_price, 4)}`;
-  }
+function loadMonitorStatus() {
+  fetchData('/api/status').then(function(data) {
+    if (!data) return;
+    monitorPaused = data.paused || false;
+    var text = $('monitor-status-text'), btn = $('pause-resume-btn');
+    if (text) text.textContent = monitorPaused ? 'Paused' : 'Running';
+    if (btn) btn.textContent = monitorPaused ? 'Resume' : 'Pause';
+  });
 }
 
-// ── USDT Sweep panel ──────────────────────────────────────────────
-
-async function loadSweep() {
-  const loading = $('sweep-loading');
-  const content = $('sweep-content');
-  try {
-    const res = await fetch(`${API}/api/sweep/config`);
-    const data = await res.json();
-    if (loading) loading.style.display = 'none';
-    if (content) content.style.display = '';
-
-    const toggle = $('sweep-enabled-toggle');
-    if (toggle) toggle.checked = data.enabled ?? false;
-
-    const pctEl = $('sweep-pct-input');
-    if (pctEl) pctEl.value = data.sweep_pct ?? 20;
-
-    const minEl = $('sweep-min-input');
-    if (minEl) minEl.value = data.min_trade_value_usd ?? 50;
-
-    const labelEl = $('sweep-status-label');
-    if (labelEl) labelEl.textContent = data.enabled ? 'Auto-sweep ON' : 'Auto-sweep OFF';
-
-    setText('sweep-usdt-balance', fmtUSD(data.usdt_balance ?? data.usdtBalance));
-  } catch (e) {
-    console.error('loadSweep:', e);
-    if (loading) loading.textContent = 'Failed to load sweep config.';
-  }
-}
-
-async function saveSweep() {
-  const enabled = $('sweep-enabled-toggle')?.checked ?? false;
-  const sweep_pct = parseFloat($('sweep-pct-input')?.value ?? 20);
-  const min_trade_value_usd = parseFloat($('sweep-min-input')?.value ?? 50);
-  try {
-    await fetch(`${API}/api/sweep/config`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ enabled, sweep_pct, min_trade_value_usd })
-    });
-    showToast('Sweep config saved ✅');
-    loadSweep();
-  } catch (e) {
-    showToast('Failed to save sweep config', true);
-  }
+function toggleMonitoring() {
+  var action = monitorPaused ? 'resume' : 'pause';
+  fetch('/api/' + action, { method: 'POST' }).then(function() {
+    loadMonitorStatus(); showToast('Monitoring ' + action + 'd');
+  }).catch(function() { showToast('Failed to toggle monitor', true); });
 }
 
 // ── Alerts ────────────────────────────────────────────────────────
 
-async function loadAlerts() {
-  try {
-    const res = await fetch(`${API}/api/alerts`);
-    const data = await res.json();
-    const alerts = data.alerts ?? data ?? [];
-    const el = $('alerts-list');
+function loadAlerts() {
+  fetchData('/api/status').then(function(data) {
+    var el = $('alerts-list');
     if (!el) return;
-    if (alerts.length === 0) {
-      el.innerHTML = '<p class="muted">None</p>';
-      return;
-    }
-    el.innerHTML = alerts.map(a => `
-      <div class="alert-row">
-        <span class="coin">${a.symbol ?? a.coin}</span>
-        <span class="type muted">${a.type ?? ''}</span>
-        <span class="value">${a.value != null ? fmtUSD(a.value) : (a.pct != null ? fmtPct(a.pct) : '—')}</span>
-        <span class="status ${a.status}">${a.status ?? ''}</span>
-      </div>`).join('');
-  } catch (e) {
-    console.error('loadAlerts:', e);
-  }
-}
-
-// ── Trailing stops ────────────────────────────────────────────────
-
-async function loadTrailingStops() {
-  try {
-    const res = await fetch(`${API}/api/trailing-stops`);
-    const data = await res.json();
-    const stops = data.stops ?? data ?? [];
-    const summaryEl = $('trail-summary');
-    const listEl    = $('trail-summary-list');
-
-    if (summaryEl) summaryEl.textContent = `${stops.length} active`;
-    if (!listEl) return;
-
-    if (stops.length === 0) {
-      listEl.innerHTML = '<p class="muted">No trailing stops active.</p>';
-      return;
-    }
-    listEl.innerHTML = stops.map(s => `
-      <div class="trail-row">
-        <span class="coin">${s.symbol ?? s.coin}</span>
-        <span>${s.trail_pct ?? s.trailPct ?? '—'}%</span>
-        <span class="muted">High: ${fmtUSD(s.high_price ?? s.highPrice)}</span>
-        <span class="muted">Stop: ${fmtUSD(s.stop_price ?? s.stopPrice)}</span>
-      </div>`).join('');
-  } catch (e) {
-    console.error('loadTrailingStops:', e);
-  }
-}
-
-// ── Thresholds ────────────────────────────────────────────────────
-
-async function loadThresholds() {
-  try {
-    const res = await fetch(`${API}/api/thresholds`);
-    const data = await res.json();
-    const thresholds = data.thresholds ?? data ?? [];
-    const el = $('threshold-list');
-    if (!el) return;
-    if (thresholds.length === 0) {
-      el.innerHTML = '<p class="muted">No custom thresholds set.</p>';
-      return;
-    }
-    el.innerHTML = thresholds.map(t => `
-      <div class="threshold-row">
-        <span class="coin">${t.symbol ?? t.coin}</span>
-        <span>${t.threshold_pct ?? t.pct ?? '—'}%</span>
-      </div>`).join('');
-  } catch (e) {
-    console.error('loadThresholds:', e);
-  }
-}
-
-// ── Kraken panel ──────────────────────────────────────────────────
-
-async function loadKraken() {
-  try {
-    const res = await fetch(`${API}/api/kraken/portfolio`);
-    const data = await res.json();
-    const statusEl = $('kraken-status');
-    if (statusEl) {
-      statusEl.textContent = data.connected ? 'Connected ✅' : 'Disconnected ❌';
-    }
-    setText('kraken-total',          fmtUSD(data.total ?? data.total_value));
-    setText('kraken-crypto-subtotal', fmtUSD(data.crypto ?? data.crypto_value));
-    setText('kraken-cash-subtotal',   fmtUSD(data.cash  ?? data.cash_value));
-
-    const holdingsEl = $('kraken-holdings');
-    if (!holdingsEl) return;
-    const holdings = data.holdings ?? data.balances ?? [];
-    if (holdings.length === 0) {
-      holdingsEl.innerHTML = '<p class="muted">No Kraken holdings.</p>';
-      return;
-    }
-    holdingsEl.innerHTML = holdings.map(h => {
-      const pnlPct = h.pnl_pct ?? h.pnlPct ?? null;
-      const pnlUsd = h.pnl_usd ?? h.pnlUsd ?? null;
-      const cls = colorClass(pnlPct);
-      return `
-        <div class="holding-row">
-          <span class="coin">${h.symbol ?? h.coin ?? '?'}</span>
-          <span class="value">${fmtUSD(h.value_usd ?? h.valueUsd)}</span>
-          <span class="qty muted">${fmt(h.quantity ?? h.qty, 4)}</span>
-          <span class="pnl ${cls}">${fmtPct(pnlPct)}</span>
-          <span class="pnl-usd ${cls}">${fmtUSD(pnlUsd)}</span>
-        </div>`;
-    }).join('');
-  } catch (e) {
-    console.error('loadKraken:', e);
-    setText('kraken-status', 'Error loading Kraken data');
-  }
-}
-
-// ── Kraken trade form ─────────────────────────────────────────────
-
-async function submitKrakenTrade() {
-  const symbol    = $('k-symbol')?.value?.trim();
-  const side      = $('k-side')?.value;
-  const orderType = $('k-ordertype')?.value;
-  const volume    = $('k-volume')?.value?.trim();
-  const price     = $('k-price')?.value?.trim();
-  const preview   = $('k-trade-preview');
-
-  if (!symbol || !volume) { showToast('Symbol and volume required', true); return; }
-
-  const body = { exchange: 'kraken', symbol, side, order_type: orderType, volume };
-  if (orderType === 'limit' && price) body.price = price;
-
-  if (preview) {
-    preview.textContent = `Sending to Telegram: ${side.toUpperCase()} ${volume} ${symbol} (${orderType})…`;
-  }
-
-  try {
-    const res = await fetch(`${API}/api/trade/execute`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
+    var alerts = (data && data.activeAlerts) || [];
+    if (!alerts.length) { el.innerHTML = '<div class="empty-state">None</div>'; return; }
+    var html = '';
+    alerts.forEach(function(a) {
+      html += '<div class="alert-row"><span class="alert-symbol">' + (a.symbol || '?') + '</span>'
+        + '<span style="color:#888;font-size:0.8rem">' + (a.type || '') + '</span></div>';
     });
-    const data = await res.json();
-    if (preview) preview.textContent = data.message ?? 'Trade request sent to Telegram ✅';
-    showToast('Trade sent to Telegram for approval ✅');
-  } catch (e) {
-    showToast('Failed to submit trade', true);
-    if (preview) preview.textContent = 'Error submitting trade.';
-  }
-}
-
-// ── Activity feed ─────────────────────────────────────────────────
-
-let activityFilter = 'all';
-
-async function loadActivityFeed(filter = activityFilter) {
-  activityFilter = filter;
-  // Highlight active filter button
-  ['all', 'sells', 'buys', 'payments', 'transfers'].forEach(f => {
-    const btn = document.querySelector(`[data-filter="${f}"]`);
-    if (btn) btn.classList.toggle('active', f === filter);
+    el.innerHTML = html;
   });
-
-  try {
-    const url = filter === 'all' ? `${API}/api/activity` : `${API}/api/activity?type=${filter}`;
-    const res = await fetch(url);
-    const data = await res.json();
-    const entries = data.entries ?? data.activity ?? data ?? [];
-    const el = $('activity-feed');
-    if (!el) return;
-    if (entries.length === 0) {
-      el.innerHTML = '<p class="muted">No activity yet.</p>';
-      return;
-    }
-    el.innerHTML = entries.map(e => `
-      <div class="activity-row" data-id="${e.id ?? ''}">
-        <span class="activity-date muted">${new Date(e.created_at ?? e.date ?? '').toLocaleDateString()}</span>
-        <span class="activity-coin coin">${e.symbol ?? e.coin ?? '?'}</span>
-        <span class="activity-type tag ${e.type}">${e.type ?? ''}</span>
-        <span class="activity-value">${fmtUSD(e.value_usd ?? e.amount_usd ?? e.amount)}</span>
-        <span class="activity-reason muted">${e.reason ?? ''}</span>
-        <button class="btn-sm" onclick="editActivity(${e.id})">Edit</button>
-      </div>`).join('');
-  } catch (e) {
-    console.error('loadActivityFeed:', e);
-  }
 }
 
-async function editActivity(id) {
-  const reason = prompt('Update reason/type for this entry:');
-  if (!reason) return;
-  try {
-    await fetch(`${API}/api/activity/${id}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ reason })
+// ── Kraken ────────────────────────────────────────────────────────
+
+function loadKraken() {
+  fetchData('/api/kraken/balances').then(function(data) {
+    if (!data) return;
+    var total = parseFloat(data.totalUSD || data.total_usd || 0);
+    setText('kraken-total', fmtUSD(total));
+    setText('kraken-status', total > 0 ? 'Connected' : 'No data');
+    var el = $('kraken-holdings');
+    if (!el) return;
+    var bals = (data.balances || []).filter(function(b) { return parseFloat(b.valueUSD || 0) >= 1; });
+    bals.sort(function(a, b) { return parseFloat(b.valueUSD || 0) - parseFloat(a.valueUSD || 0); });
+    if (!bals.length) { el.innerHTML = '<div class="empty-state">No Kraken holdings</div>'; return; }
+    var html = '';
+    bals.forEach(function(b) {
+      var val = parseFloat(b.valueUSD || 0), ep = parseFloat(b.entryPrice || 0), cp = parseFloat(b.price || 0);
+      var pl = ep > 0 ? ((cp - ep) / ep * 100) : 0, plc = pl >= 0 ? '#00ff88' : '#ff4444';
+      html += '<div style="border-left:3px solid ' + plc + ';padding:10px 12px;margin-bottom:8px;background:#1a1a1a;border-radius:4px">'
+        + '<div style="display:flex;justify-content:space-between"><span style="color:white;font-weight:bold">' + (b.standard || b.asset) + '</span>'
+        + '<span style="color:white">$' + val.toFixed(2) + '</span></div>'
+        + (ep > 0 ? '<div style="color:#888;font-size:11px">Entry: ' + fmtPrice(ep) + ' | Now: ' + fmtPrice(cp) + ' | <span style="color:' + plc + '">' + fmtPct(pl) + '</span></div>' : '')
+        + '</div>';
     });
-    showToast('Entry updated ✅');
-    loadActivityFeed();
-  } catch (e) {
-    showToast('Failed to update entry', true);
-  }
+    el.innerHTML = html;
+  });
+}
+
+function submitKrakenTrade() {
+  var symbol = ($('k-symbol') || {}).value || '';
+  var side = ($('k-side') || {}).value || 'buy';
+  var orderType = ($('k-ordertype') || {}).value || 'market';
+  var volume = ($('k-volume') || {}).value || '';
+  var price = ($('k-price') || {}).value || '';
+  var preview = $('k-trade-preview');
+  if (!symbol || !volume) { showToast('Symbol and volume required', true); return; }
+  var body = { exchange: 'kraken', symbol: symbol, side: side, order_type: orderType, volume: volume };
+  if (orderType === 'limit' && price) body.price = price;
+  if (preview) preview.textContent = 'Sending to Telegram...';
+  fetch('/api/trade/execute', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+    .then(function(r) { return r.json(); }).then(function(d) {
+      showToast('Trade sent to Telegram');
+      if (preview) preview.textContent = d.message || 'Sent for approval';
+    }).catch(function() { showToast('Failed to submit trade', true); });
+}
+
+// ── Activity ──────────────────────────────────────────────────────
+
+var currentFilter = 'all';
+
+function filterActivity(filter, event) {
+  currentFilter = filter || 'all';
+  document.querySelectorAll('.filter-btn').forEach(function(b) { b.classList.remove('active'); });
+  if (event && event.target) event.target.classList.add('active');
+  loadActivity(currentFilter);
+}
+
+function loadActivity(filter) {
+  filter = filter || currentFilter || 'all';
+  var el = $('activity-feed');
+  if (!el) return;
+  el.innerHTML = '<div class="empty-state">Loading...</div>';
+  fetchData('/api/activity?limit=50&filter=' + encodeURIComponent(filter)).then(function(data) {
+    if (!data || !data.trades || !data.trades.length) { el.innerHTML = '<div class="empty-state">No activity yet</div>'; return; }
+    var colors = { buy:'#00ff88', sell:'#ff4444', payment:'#ffaa00', transfer:'#888888', sweep:'#4488ff', rebalance:'#aa44ff' };
+    var html = '';
+    data.trades.forEach(function(t) {
+      var color = colors[t.action] || '#888';
+      var ds = new Date(t.created_at).toLocaleDateString('en-GB', {day:'2-digit', month:'short', hour:'2-digit', minute:'2-digit'});
+      var qty = parseFloat(t.quantity || 0);
+      var qs = qty >= 1000000 ? (qty/1000000).toFixed(2)+'M' : qty >= 1000 ? (qty/1000).toFixed(2)+'K' : qty.toFixed(4);
+      var val = t.value_usd ? '$' + parseFloat(t.value_usd).toFixed(2) : '';
+      var pnl = t.outcome_pnl ? parseFloat(t.outcome_pnl) : null;
+      var pnlStr = pnl !== null ? '<span class="pnl-badge" style="color:' + (pnl>=0?'#00ff88':'#ff4444') + '">' + (pnl>=0?'+':'') + '$' + Math.abs(pnl).toFixed(2) + '</span>' : '';
+      html += '<div class="activity-item" style="border-left-color:' + color + '">'
+        + '<div class="activity-header"><div><span class="activity-action" style="color:' + color + '">' + t.action.toUpperCase() + '</span>'
+        + '<span class="activity-symbol">' + t.symbol + '</span>' + pnlStr + '</div>'
+        + '<span class="activity-time">' + ds + '</span></div>'
+        + '<div class="activity-details">' + qs + ' @ ' + fmtPrice(t.price) + (val ? ' = ' + val : '') + '</div>'
+        + '<div class="activity-reason"><span class="activity-reason-text">' + (t.reasoning || 'No reason logged') + '</span></div></div>';
+    });
+    el.innerHTML = html;
+  });
 }
 
 // ── Journal ───────────────────────────────────────────────────────
 
-async function loadJournalEntries() {
-  try {
-    const res = await fetch(`${API}/api/journal?limit=20`);
-    const data = await res.json();
-    const entries = data.entries ?? data ?? [];
-    const el = $('journal-entries-list');
+function loadJournalEntries() {
+  fetchData('/api/activity?limit=20&filter=all').then(function(data) {
+    var el = $('journal-entries-list');
     if (!el) return;
-    if (entries.length === 0) {
-      el.innerHTML = '<p class="muted">No journal entries yet.</p>';
-      return;
-    }
-    el.innerHTML = entries.map(e => `
-      <div class="journal-row">
-        <span class="coin">${e.symbol ?? e.coin}</span>
-        <span class="tag ${e.action?.toLowerCase()}">${e.action}</span>
-        <span>${fmtUSD(e.price)}</span>
-        <span class="muted">${e.quantity ? fmt(e.quantity, 4) : ''}</span>
-        <span class="muted">${e.reasoning ?? ''}</span>
-        <span class="emotion muted">${e.emotion ?? ''}</span>
-        <span class="date muted">${timeAgo(e.created_at ?? e.date)}</span>
-      </div>`).join('');
-  } catch (e) {
-    console.error('loadJournalEntries:', e);
-  }
+    if (!data || !data.trades) { el.innerHTML = '<div class="empty-state">No entries</div>'; return; }
+    var trades = data.trades.filter(function(t) { return t.action === 'buy' || t.action === 'sell'; });
+    if (!trades.length) { el.innerHTML = '<div class="empty-state">No trades yet</div>'; return; }
+    var html = '';
+    trades.forEach(function(t) {
+      var color = t.action === 'buy' ? '#00ff88' : '#ff4444';
+      var date = new Date(t.created_at).toLocaleDateString('en-GB');
+      html += '<div class="journal-entry"><div class="je-header">'
+        + '<span class="je-action ' + t.action + '">' + t.action.toUpperCase() + '</span>'
+        + '<span class="je-coin">' + t.symbol + '</span>'
+        + '<span class="je-price">' + fmtPrice(t.price) + '</span>'
+        + '<span class="je-emotion">' + (t.emotion || 'neutral') + '</span></div>'
+        + '<div style="font-size:0.82rem;color:#888">' + (t.reasoning || '') + '</div></div>';
+    });
+    el.innerHTML = html;
+  });
 }
 
-async function submitJournalEntry() {
-  const coin     = $('j-coin')?.value?.trim();
-  const price    = parseFloat($('j-price')?.value);
-  const qty      = parseFloat($('j-qty')?.value) || null;
-  const reasoning = $('j-reasoning')?.value?.trim() || null;
+function loadJournalStats() {
+  fetchData('/api/journal/stats').then(function(data) {
+    if (!data) return;
+    setText('j-win-rate', data.win_rate != null ? data.win_rate.toFixed(1) + '%' : '—');
+    setText('j-total-trades', data.total_trades || '—');
+    setText('j-avg-profit', data.avg_profit != null ? fmtPct(data.avg_profit) : '—');
+    setText('j-claude-acc', data.claude_accuracy != null ? data.claude_accuracy.toFixed(1) + '%' : '—');
+  });
+}
 
-  const actionEl  = document.querySelector('#j-action-group .selected, #j-action-group button.active');
-  const emotionEl = document.querySelector('#j-emotion-group .selected, #j-emotion-group button.active');
-  const followedEl = document.querySelector('#j-followed-group .selected, #j-followed-group button.active');
+function selectAction(val) {
+  document.querySelectorAll('#j-action-group .action-btn').forEach(function(b) {
+    b.classList.toggle('selected', b.getAttribute('onclick') && b.getAttribute('onclick').indexOf("'" + val + "'") > -1);
+  });
+}
+function selectEmotion(val) {
+  document.querySelectorAll('#j-emotion-group .emotion-btn').forEach(function(b) {
+    b.classList.toggle('selected', b.getAttribute('onclick') && b.getAttribute('onclick').indexOf("'" + val + "'") > -1);
+  });
+}
+function selectFollowed(val) {
+  document.querySelectorAll('#j-followed-group .action-btn').forEach(function(b) {
+    b.classList.toggle('selected', b.getAttribute('onclick') && b.getAttribute('onclick').indexOf("'" + val + "'") > -1);
+  });
+}
 
-  const action   = actionEl?.dataset?.value  ?? actionEl?.textContent?.trim();
-  const emotion  = emotionEl?.dataset?.value ?? emotionEl?.textContent?.trim();
-  const followed = followedEl?.dataset?.value ?? null;
-
+function submitJournalEntry() {
+  var coin = ($('j-coin') || {}).value || '';
+  var price = parseFloat(($('j-price') || {}).value);
+  var qty = parseFloat(($('j-qty') || {}).value) || null;
+  var reasoning = ($('j-reasoning') || {}).value || null;
+  var actionEl = document.querySelector('#j-action-group .action-btn.selected');
+  var emotionEl = document.querySelector('#j-emotion-group .emotion-btn.selected');
+  var action = actionEl ? (actionEl.getAttribute('onclick').match(/'([^']+)'/) || [])[1] : null;
+  var emotion = emotionEl ? (emotionEl.getAttribute('onclick').match(/'([^']+)'/) || [])[1] : 'neutral';
   if (!coin || !action || !price) { showToast('Coin, action and price required', true); return; }
-
-  try {
-    await fetch(`${API}/api/journal`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ symbol: coin, action, price, quantity: qty, reasoning, emotion, followed_claude: followed })
-    });
-    showToast('Trade logged ✅');
-    loadJournalEntries();
-    loadJournalStats();
-  } catch (e) {
-    showToast('Failed to log trade', true);
-  }
+  fetch('/api/journal', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ symbol: coin, action: action, price: price, quantity: qty, reasoning: reasoning, emotion: emotion })
+  }).then(function(r) {
+    if (r.ok) { showToast('Trade logged'); loadJournalEntries(); loadJournalStats(); }
+    else showToast('Failed to log trade', true);
+  }).catch(function() { showToast('Failed to log trade', true); });
 }
 
-async function loadJournalStats() {
-  try {
-    const res = await fetch(`${API}/api/journal/stats`);
-    const s = await res.json();
-    setText('j-win-rate',    s.win_rate   != null ? s.win_rate.toFixed(1) + '%' : '—');
-    setText('j-total-trades', s.total_trades ?? '—');
-    setText('j-avg-profit',  s.avg_profit  != null ? fmtPct(s.avg_profit) : '—');
-    setText('j-claude-acc',  s.claude_accuracy != null ? s.claude_accuracy.toFixed(1) + '%' : '—');
-  } catch (e) {
-    console.error('loadJournalStats:', e);
-  }
-}
+// ── Profile ───────────────────────────────────────────────────────
 
-// ── Trader profile / preferences ──────────────────────────────────
-
-async function loadProfile() {
-  try {
-    const res = await fetch(`${API}/api/profile`);
-    const data = await res.json();
-    const prefs = data.preferences ?? data ?? [];
-    const el = $('profile-list');
+function loadProfile() {
+  fetchData('/api/profile').then(function(data) {
+    var el = $('profile-list');
     if (!el) return;
-    if (!prefs.length) {
-      el.innerHTML = '<p class="muted">No preferences saved yet.</p>';
-      return;
-    }
-    el.innerHTML = prefs.map(p => `
-      <div class="pref-row">
-        <span>${p.key ?? p.preference}</span>
-        <span class="muted">${p.value}</span>
-      </div>`).join('');
-
-    const learningEl = $('learning-text');
-    if (learningEl && data.learning_model) {
-      learningEl.textContent = data.learning_model;
-    }
-  } catch (e) {
-    console.error('loadProfile:', e);
-  }
+    var prefs = (data && (data.preferences || data)) || [];
+    if (!prefs.length) { el.innerHTML = '<div class="empty-state">No preferences saved yet.</div>'; return; }
+    var html = '';
+    prefs.forEach(function(p) {
+      html += '<div class="profile-item"><span>' + (p.key || p.preference_key || '') + '</span>'
+        + '<span style="color:#888;font-size:0.8rem;max-width:60%;text-align:right">' + (p.value || p.preference_value || '') + '</span></div>';
+    });
+    el.innerHTML = html;
+    if (data && data.learning_model) setText('learning-text', data.learning_model);
+  });
 }
 
-async function savePreference() {
-  const val = $('pref-input')?.value?.trim();
+function addPreference() {
+  var input = $('pref-input');
+  var val = input ? input.value.trim() : '';
   if (!val) return;
-  try {
-    await fetch(`${API}/api/profile/preference`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ preference: val })
-    });
-    showToast('Preference saved ✅');
-    $('pref-input').value = '';
-    loadProfile();
-  } catch (e) {
-    showToast('Failed to save preference', true);
-  }
+  fetch('/api/profile/preference', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ preference: val }) })
+    .then(function(r) {
+      if (r.ok) { showToast('Preference saved'); if (input) input.value = ''; loadProfile(); }
+      else showToast('Failed', true);
+    }).catch(function() { showToast('Failed', true); });
 }
 
 // ── Rebalancing ───────────────────────────────────────────────────
 
-async function loadRebalancing() {
-  try {
-    const res = await fetch(`${API}/api/rebalancing`);
-    const data = await res.json();
-
-    // Stats
-    setText('rebal-accuracy-pct', data.accuracy_pct != null ? data.accuracy_pct.toFixed(1) + '%' : '—');
-    setText('rebal-accuracy-sub', data.accuracy_decisions != null ? `${data.accuracy_decisions} decisions` : '—');
-    setText('rebal-avg-pnl',      data.avg_7d_gain != null ? fmtPct(data.avg_7d_gain) : '—');
-
-    const bar = $('rebal-accuracy-bar');
-    if (bar) bar.style.width = (data.accuracy_pct ?? 0) + '%';
-
-    // Tracker table
-    const trackerBody = $('rebal-tracker-body');
-    if (trackerBody) {
-      const rows = data.history ?? [];
-      trackerBody.innerHTML = rows.length === 0
-        ? '<tr><td colspan="6" class="muted">No rebalances logged yet</td></tr>'
-        : rows.map(r => `
-            <tr>
-              <td>${new Date(r.date ?? r.created_at).toLocaleDateString()}</td>
-              <td>${r.sold ?? '—'}</td>
-              <td>${r.bought ?? '—'}</td>
-              <td class="${colorClass(r.result_7d)}">${fmtPct(r.result_7d)}</td>
-              <td class="${colorClass(r.result_30d)}">${fmtPct(r.result_30d)}</td>
-              <td class="tag ${r.outcome?.toLowerCase()}">${r.outcome ?? '—'}</td>
-            </tr>`).join('');
-    }
-
-    // Portfolio health donut legend
-    const health = data.health ?? {};
-    setText('leg-winning',  health.winning  ?? 0);
-    setText('leg-small',    health.small    ?? 0);
-    setText('leg-moderate', health.moderate ?? 0);
-    setText('leg-severe',   health.severe   ?? 0);
-    setText('leg-none',     health.no_entry ?? 0);
-
-    // Rebalancing analysis panel
-    setText('rb-total-value',   fmtUSD(data.total_value));
-    setText('rb-total-loss',    fmtUSD(data.total_loss));
-    setText('rb-recovery-pct',  data.recovery_pct != null ? fmtPct(data.recovery_pct) : '—');
-    setText('rb-analysis-date', data.analysis_date ? new Date(data.analysis_date).toLocaleDateString() : '—');
-
-    const analysisText = $('rb-analysis-text');
-    if (analysisText && data.analysis) {
-      analysisText.textContent = data.analysis;
-    }
-
-    // Positions table
-    const posBody = $('rb-positions-body');
-    if (posBody) {
-      const positions = data.positions ?? [];
-      posBody.innerHTML = positions.length === 0
-        ? '<tr><td colspan="8">Loading…</td></tr>'
-        : positions.map(p => `
-            <tr>
-              <td class="coin">${p.symbol ?? p.coin}</td>
-              <td>${fmtUSD(p.value)}</td>
-              <td>${p.entry != null ? fmtUSD(p.entry) : '—'}</td>
-              <td class="${colorClass(p.pnl_pct)}">${fmtPct(p.pnl_pct)}</td>
-              <td class="${colorClass(p.pnl_usd)}">${fmtUSD(p.pnl_usd)}</td>
-              <td>${p.recovery_needed != null ? fmtPct(p.recovery_needed) : '—'}</td>
-              <td><span class="tag ${p.status?.toLowerCase()}">${p.status ?? '—'}</span></td>
-              <td><input type="checkbox" class="cap-calc-cb" data-value="${p.value ?? 0}" data-coin="${p.symbol ?? p.coin}"></td>
-            </tr>`).join('');
-
-      // Wire up freed capital calculator checkboxes
-      posBody.querySelectorAll('.cap-calc-cb').forEach(cb => {
-        cb.addEventListener('change', updateFreedCapital);
-      });
-    }
-
-    // PnL summary bar
-    const pnlBar = $('pnl-summary-bar');
-    if (pnlBar && data.health) {
-      const total = Object.values(data.health).reduce((a, b) => a + b, 0) || 1;
-      const winPct = ((data.health.winning ?? 0) / total) * 100;
-      pnlBar.style.setProperty('--win-pct', winPct + '%');
-    }
-
-    setText('pnl-winners',   health.winning  ?? 0);
-    setText('pnl-losers',    (health.small ?? 0) + (health.moderate ?? 0) + (health.severe ?? 0));
-    setText('pnl-tracked',   data.tracked_count ?? 0);
+function loadRebalancing() {
+  fetchData('/api/rebalancing').then(function(data) {
+    if (!data) return;
+    setText('rb-total-value', fmtUSD(data.total_value));
+    setText('rb-total-loss', fmtUSD(data.total_loss));
+    setText('rb-recovery-pct', data.recovery_pct != null ? fmtPct(data.recovery_pct) : '—');
+    setText('rb-analysis-date', data.analysis_date ? new Date(data.analysis_date).toLocaleDateString() : 'No analysis yet');
+    if (data.analysis) setText('rb-analysis-text', data.analysis);
+    var h = data.health || {};
+    setText('leg-winning', 'Winning — ' + (h.winning || 0));
+    setText('leg-small', 'Small loss (0–20%) — ' + (h.small || 0));
+    setText('leg-moderate', 'Moderate loss (20–50%) — ' + (h.moderate || 0));
+    setText('leg-severe', 'Severe loss (50%+) — ' + (h.severe || 0));
+    setText('leg-none', 'No entry set — ' + (h.no_entry || 0));
+    setText('pnl-winners', h.winning || 0);
+    setText('pnl-losers', (h.small || 0) + (h.moderate || 0) + (h.severe || 0));
     setText('pnl-total-unreal', fmtUSD(data.total_unrealised));
-
-    // Freed capital calculator initial state
-    const capListEl = $('cap-calc-list');
-    if (capListEl) capListEl.innerHTML = '<p class="muted">Loading positions…</p>';
-
-  } catch (e) {
-    console.error('loadRebalancing:', e);
-  }
+  });
 }
 
-function updateFreedCapital() {
-  const checkboxes = document.querySelectorAll('.cap-calc-cb:checked');
-  let total = 0;
-  checkboxes.forEach(cb => { total += parseFloat(cb.dataset.value ?? 0); });
-  setText('freed-count',  checkboxes.length + ' positions selected');
-  setText('freed-amount', fmtUSD(total));
-  const box = $('freed-total-box');
-  if (box) box.textContent = fmtUSD(total);
-}
-
-async function refreshRebalancingAnalysis() {
-  const btn = $('rb-refresh-btn');
-  if (btn) { btn.disabled = true; btn.textContent = 'Analysing…'; }
-  try {
-    await fetch(`${API}/api/rebalancing/analyse`, { method: 'POST' });
-    showToast('Analysis requested — refresh in a moment');
+function runRebalancingAnalysis() {
+  var btn = $('rb-refresh-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Analysing...'; }
+  fetch('/api/rebalancing/analyse', { method: 'POST' }).then(function() {
+    showToast('Analysis requested');
     setTimeout(loadRebalancing, 3000);
-  } catch (e) {
-    showToast('Failed to trigger analysis', true);
-  } finally {
-    if (btn) { btn.disabled = false; btn.textContent = 'Refresh Analysis'; }
-  }
+  }).catch(function() { showToast('Failed', true); })
+    .finally(function() { if (btn) { btn.disabled = false; btn.textContent = 'Refresh Analysis'; } });
 }
 
-// ── Monitor status ────────────────────────────────────────────────
+// ── Trailing stops ────────────────────────────────────────────────
 
-async function loadMonitorStatus() {
-  try {
-    const res = await fetch(`${API}/api/monitor/status`);
-    const data = await res.json();
-    monitorPaused = data.paused ?? false;
-    const pill = $('monitor-status-pill');
-    const text = $('monitor-status-text');
-    const btn  = $('pause-resume-btn');
-    if (pill) pill.className = 'status-pill ' + (monitorPaused ? 'paused' : 'running');
-    if (text) text.textContent = monitorPaused ? 'Paused' : 'Running';
-    if (btn)  btn.textContent  = monitorPaused ? 'Resume' : 'Pause';
-  } catch (e) {
-    console.error('loadMonitorStatus:', e);
-  }
-}
-
-async function toggleMonitor() {
-  const action = monitorPaused ? 'resume' : 'pause';
-  try {
-    await fetch(`${API}/api/monitor/${action}`, { method: 'POST' });
-    loadMonitorStatus();
-    showToast(`Monitoring ${action}d ✅`);
-  } catch (e) {
-    showToast('Failed to toggle monitor', true);
-  }
-}
-
-// ── Error banner ──────────────────────────────────────────────────
-
-function showError(msg) {
-  const el = $('error-banner');
-  if (!el) return;
-  el.textContent = msg;
-  el.style.display = msg ? 'block' : 'none';
-}
-
-// ── Spinner ───────────────────────────────────────────────────────
-
-function setLoading(on) {
-  const el = $('spinner');
-  if (el) el.style.display = on ? 'block' : 'none';
-}
-
-// ── Button group helper (journal form) ────────────────────────────
-
-function initButtonGroups() {
-  document.querySelectorAll('.btn-group, [id$="-group"]').forEach(group => {
-    group.querySelectorAll('button').forEach(btn => {
-      btn.addEventListener('click', () => {
-        group.querySelectorAll('button').forEach(b => b.classList.remove('active'));
-        btn.classList.add('active');
-      });
+function loadTrailingStops() {
+  fetchData('/api/trailing-stops').then(function(data) {
+    if (!data) return;
+    var stops = data.stops || data || [];
+    var summaryEl = $('trail-summary'), listEl = $('trail-summary-list');
+    if (!stops.length || !Array.isArray(stops)) return;
+    if (summaryEl) summaryEl.style.display = '';
+    if (!listEl) return;
+    var html = '';
+    stops.forEach(function(s) {
+      html += '<div class="trail-summary-row">'
+        + '<span class="trail-summary-coin">' + (s.symbol || s.coin) + '</span>'
+        + '<span class="trail-summary-detail">' + (s.trail_pct || s.trailPct || '—') + '% trail</span>'
+        + '<span class="trail-summary-stop">Stop: ' + fmtPrice(s.stop_price || s.stopPrice) + '</span>'
+        + '</div>';
     });
+    listEl.innerHTML = html;
   });
-}
-
-// ── Activity filter buttons ───────────────────────────────────────
-
-function initActivityFilters() {
-  document.querySelectorAll('[data-filter]').forEach(btn => {
-    btn.addEventListener('click', () => {
-      loadActivityFeed(btn.dataset.filter);
-    });
-  });
-}
-
-// ── Wire up all static buttons ────────────────────────────────────
-
-function initButtons() {
-  // Sweep save
-  const sweepSave = $('sweep-save-btn');
-  if (sweepSave) sweepSave.addEventListener('click', saveSweep);
-
-  // Sweep toggle label update
-  const sweepToggle = $('sweep-enabled-toggle');
-  if (sweepToggle) sweepToggle.addEventListener('change', () => {
-    const label = $('sweep-status-label');
-    if (label) label.textContent = sweepToggle.checked ? 'Auto-sweep ON' : 'Auto-sweep OFF';
-  });
-
-  // Monitor pause/resume
-  const pauseBtn = $('pause-resume-btn');
-  if (pauseBtn) pauseBtn.addEventListener('click', toggleMonitor);
-
-  // Rebalancing refresh
-  const rbRefresh = $('rb-refresh-btn');
-  if (rbRefresh) rbRefresh.addEventListener('click', refreshRebalancingAnalysis);
-
-  // Kraken trade submit — look for a submit button near the kraken trade form
-  const kTradeBtn = document.querySelector('#panel-kraken .trade-submit-btn, button[data-action="kraken-trade"]');
-  if (kTradeBtn) kTradeBtn.addEventListener('click', submitKrakenTrade);
-
-  // Journal log
-  const jLogBtn = document.querySelector('button[data-action="log-trade"], .log-trade-btn');
-  if (jLogBtn) jLogBtn.addEventListener('click', submitJournalEntry);
-
-  // Profile preference add
-  const prefBtn = document.querySelector('button[data-action="add-pref"], .pref-add-btn');
-  if (prefBtn) prefBtn.addEventListener('click', savePreference);
 }
 
 // ── Full refresh ──────────────────────────────────────────────────
 
-async function refreshAll() {
-  setLoading(true);
-  try {
-    await Promise.allSettled([
-      loadPortfolioSummary(),
-      loadPortfolioData(),
-      loadSweep(),
-      loadAlerts(),
-      loadTrailingStops(),
-      loadThresholds(),
-      loadKraken(),
-      loadJournalEntries(),
-      loadJournalStats(),
-      loadProfile(),
-      loadRebalancing(),
-      loadActivityFeed(),
-      loadMonitorStatus(),
-    ]);
-    setText('last-updated', 'just now');
-    showError('');
-  } catch (e) {
-    showError('Some data failed to load — retrying in 5 min');
-  } finally {
-    setLoading(false);
-  }
-}
-
-// ── Auto-refresh every 5 minutes ──────────────────────────────────
-
-function startAutoRefresh() {
-  if (refreshTimer) clearInterval(refreshTimer);
-  refreshTimer = setInterval(refreshAll, 5 * 60 * 1000);
+function refreshAll() {
+  var spinner = $('spinner');
+  if (spinner) spinner.classList.add('active');
+  loadPortfolio();
+  loadSweep();
+  loadAlerts();
+  loadMonitorStatus();
+  loadTrailingStops();
+  if (spinner) setTimeout(function() { spinner.classList.remove('active'); }, 3000);
 }
 
 // ── Init ──────────────────────────────────────────────────────────
 
-document.addEventListener('DOMContentLoaded', () => {
-  console.log('dashboard.js v2.0.0 — initialising');
-  initTabs();
-  initButtons();
-  initButtonGroups();
-  initActivityFilters();
+document.addEventListener('DOMContentLoaded', function() {
+  console.log('Dashboard v' + DASHBOARD_VERSION + ' initialising');
   refreshAll();
-  startAutoRefresh();
+  setInterval(refreshAll, 5 * 60 * 1000);
 });
