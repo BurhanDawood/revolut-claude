@@ -1628,3 +1628,8 @@
     }
   }
   
+  // ── Bootstrap ──────────────────────────────────────────────────────────────
+  document.addEventListener('DOMContentLoaded', function() {
+    refreshAll();
+    setInterval(refreshAll, REFRESH_MS);
+  });
