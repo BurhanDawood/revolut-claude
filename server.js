@@ -8326,10 +8326,29 @@ app.get('/portfolio/summary', async (req, res) => {
       });
     }
     positions.sort((a, b) => parseFloat(b.value_usd) - parseFloat(a.value_usd));
-    const cap = getCapitalSummary(totalValue);
+
+    // Enrich with Kraken, Tangem, USD/USDT cash for full grand total
+    let krakenTotal = 0, tangemValue = 0, cashUSD = 0, cashUSDT = 0;
+    try { const kd = await getKrakenBalances(); krakenTotal = kd.totalUSD || 0; } catch (e) { /* ignore */ }
+    try {
+      const xrpBal = await getTangemXRPBalance();
+      const xrpPx  = priceMap['XRP-USD'] || priceMap['XRP/USD'] || 0;
+      if (xrpBal && xrpPx) tangemValue = xrpBal * xrpPx;
+    } catch (e) { /* ignore */ }
+    const usdAsset  = balancesRaw.find(b => b.currency === 'USD');
+    const usdtAsset = balancesRaw.find(b => b.currency === 'USDT');
+    cashUSD  = parseFloat(usdAsset?.available  || 0);
+    cashUSDT = parseFloat(usdtAsset?.available || 0);
+    const grandTotal = totalValue + krakenTotal + tangemValue + cashUSD + cashUSDT;
+    const cap = getCapitalSummary(grandTotal);
+
     res.json({
       total_value_usd: totalValue.toFixed(2),
-      grand_total_usd: totalValue.toFixed(2),
+      grand_total_usd: grandTotal.toFixed(2),
+      kraken_total_usd: krakenTotal.toFixed(2),
+      tangem_value_usd: tangemValue.toFixed(2),
+      cash_usd: cashUSD.toFixed(2),
+      cash_usdt: cashUSDT.toFixed(2),
       invested: cap.invested,
       pl_usd: cap.pnl.toFixed(2),
       pl_pct: cap.pnlPct.toFixed(2),
