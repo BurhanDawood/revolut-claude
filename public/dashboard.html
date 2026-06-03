@@ -1313,7 +1313,7 @@
       pnlLine = `<div class="entry-inline"><span style="color:var(--text-muted);font-size:0.75rem">No entry set</span> <button class="btn-outline btn-sm" onclick="showQuickEntry('${h.currency}')">Set entry</button><div class="alert-inline" id="quick-entry-${h.currency}" style="display:none"><input type="number" id="qe-input-${h.currency}" placeholder="Entry $" step="any" class="threshold-input" style="width:90px"><button class="btn-accent btn-sm" onclick="submitQuickEntry('${sym}','${h.currency}')">SET</button><button class="btn-outline btn-sm" onclick="hideQuickEntry('${h.currency}')">✕</button></div></div>`;
     }
     return `
-      <div class="hc-top" onclick="openCoinModal('${sym}')" style="cursor:pointer">
+      <div class="hc-top" data-coin="COIN">
         <div class="hc-main">
           <div class="hc-left">
             <span class="hc-medal">${MEDALS[index]}</span>
@@ -1330,7 +1330,7 @@
           </div>
         </div>
         ${pnlLine}
-        <div class="hc-actions" onclick="event.stopPropagation()">
+        <div class="hc-actions">
           <button class="btn-outline btn-sm" onclick="showSetAlert('${sym}','${h.currency}',${price})">🔔 Set Alert</button>
           <div class="alert-inline" id="alert-inline-${h.currency}" style="display:none">
             <input type="number" id="alert-pct-${h.currency}" value="10" min="1" max="1000" step="0.5" class="threshold-input" style="width:65px">
@@ -1352,7 +1352,7 @@
       : `<button class="btn-outline btn-sm" style="font-size:0.7rem;padding:2px 6px" onclick="showQuickEntry('${h.currency}')">Set entry</button>`;
     const quickEntryForm = `<div class="alert-inline" id="quick-entry-${h.currency}" style="display:none;padding:6px 0"><input type="number" id="qe-input-${h.currency}" placeholder="Entry $" step="any" class="threshold-input" style="width:90px"><button class="btn-accent btn-sm" onclick="submitQuickEntry('${sym}','${h.currency}')">SET</button><button class="btn-outline btn-sm" onclick="hideQuickEntry('${h.currency}')">✕</button></div>`;
     return `
-      <div class="holding-row" onclick="openCoinModal('${sym}')" style="cursor:pointer">
+      <div class="holding-row">
         <div class="holding-left">
           <div class="coin-icon">${h.currency.slice(0,3)}</div>
           <div>
@@ -2790,121 +2790,5 @@
     }
   }
   </script>
-
-  <!-- Coin Detail Modal -->
-  <div id="coin-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.88);z-index:1000;overflow-y:auto;padding:20px" onclick="if(event.target.id==='coin-modal')closeCoinModalBtn()">
-    <div style="background:#0f1923;border:1px solid #1a2332;border-radius:16px;max-width:500px;margin:40px auto;padding:24px;position:relative">
-      <button onclick="closeCoinModalBtn()" style="position:absolute;top:12px;right:12px;background:none;border:none;color:#666;font-size:20px;cursor:pointer;line-height:1">&#x2715;</button>
-      <div id="coin-modal-body"><p style="color:#888;text-align:center;padding:20px">Loading&#8230;</p></div>
-    </div>
   </div>
-
-  <script>
-  function closeCoinModalBtn() { document.getElementById('coin-modal').style.display = 'none'; }
-  document.addEventListener('keydown', function(e) { if (e.key === 'Escape') closeCoinModalBtn(); });
-
-  async function openCoinModal(symbol) {
-    var modal = document.getElementById('coin-modal');
-    var body  = document.getElementById('coin-modal-body');
-    modal.style.display = 'block';
-    body.innerHTML = '<p style="color:#888;text-align:center;padding:20px">Loading&#8230;</p>';
-    try {
-      var coinBase = symbol.replace('-USD','');
-      var hLive = (balancesData || []).find(function(b){ return b.currency === coinBase || b.symbol === symbol; });
-      var epDetail = (typeof entryDetailData !== 'undefined') ? (entryDetailData[symbol] || null) : null;
-      var isSold = !hLive && epDetail && epDetail.last_sold_at;
-      var currentPrice = hLive ? (hLive.price || 0) : 0;
-      var entryPrice   = hLive ? (hLive.entryPrice || 0) : (epDetail ? (epDetail.entry_price || 0) : 0);
-      var originalEntry = epDetail ? (epDetail.original_entry_price || entryPrice) : entryPrice;
-      var qty      = hLive ? (hLive.available || 0) : 0;
-      var valueUsd = hLive ? (hLive.valueUSD || 0) : 0;
-      var cycleCount = epDetail ? (epDetail.cycle_count || 0) : 0;
-      var entriesDiffer = Math.abs(entryPrice - originalEntry) > 0.000001;
-      var pl = entryPrice > 0 ? ((currentPrice - entryPrice) / entryPrice * 100) : 0;
-      var plUsd = entryPrice > 0 ? (currentPrice - entryPrice) * qty : 0;
-      var originalPl = originalEntry > 0 ? ((currentPrice - originalEntry) / originalEntry * 100) : 0;
-      var plColor = pl >= 0 ? '#00ff88' : '#ff4444';
-      var origPlColor = originalPl >= 0 ? '#00ff88' : '#ff4444';
-
-      function fp(v) { return fmtPrice(v); }
-      function fq(q) {
-        q = parseFloat(q || 0);
-        if (q >= 1e9) return (q/1e9).toFixed(2)+'B';
-        if (q >= 1e6) return (q/1e6).toFixed(2)+'M';
-        if (q >= 1000) return (q/1000).toFixed(2)+'K';
-        if (q < 1e-6) return q.toExponential(4);
-        return q.toFixed(4);
-      }
-      function fPct(v, sign) { return (sign && v >= 0 ? '+' : '') + v.toFixed(2) + '%'; }
-
-      var html = '<div style="display:flex;align-items:center;gap:12px;margin-bottom:20px">'
-        + '<div style="width:48px;height:48px;background:#1a2332;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:800;color:#00d4ff">' + coinBase.slice(0,2) + '</div>'
-        + '<div><div style="font-size:22px;font-weight:800;color:white">' + coinBase + '</div>'
-        + '<div style="font-size:12px;color:#666">' + (isSold ? 'SOLD POSITION' : cycleCount > 0 ? cycleCount + ' cycle(s)' : 'Active') + '</div></div>'
-        + '<div style="margin-left:auto;text-align:right">'
-        + '<div style="font-size:20px;font-weight:800;color:white">' + fp(currentPrice) + '</div>'
-        + '<div style="font-size:12px;color:' + plColor + '">' + fPct(pl, true) + '</div></div></div>'
-        + '<div style="border-top:1px solid #1a2332;margin-bottom:16px"></div>';
-
-      if (!isSold) {
-        html += '<div style="background:#1a2332;border-radius:8px;padding:14px;margin-bottom:12px">'
-          + '<div style="color:#666;font-size:11px;text-transform:uppercase;letter-spacing:0.1em;margin-bottom:8px">Position Value</div>'
-          + '<div style="font-size:28px;font-weight:800;color:white">$' + valueUsd.toFixed(2) + '</div>'
-          + '<div style="color:#888;font-size:12px;margin-top:4px">' + fq(qty) + ' ' + coinBase + '</div></div>';
-      }
-
-      html += '<div style="background:#1a2332;border-radius:8px;padding:14px;margin-bottom:12px">'
-        + '<div style="color:#666;font-size:11px;text-transform:uppercase;letter-spacing:0.1em;margin-bottom:12px">Entry &amp; P&amp;L</div>'
-        + '<div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #0f1923">'
-        + '<span style="color:#aaa;font-size:13px">' + (cycleCount > 0 && entriesDiffer ? 'Cycle entry' : 'Entry price') + '</span>'
-        + '<div><span style="color:white;font-size:13px;font-weight:600">' + fp(entryPrice) + '</span>'
-        + '<span style="color:' + plColor + ';font-size:11px;margin-left:8px">' + fPct(pl,true) + ' (' + (plUsd>=0?'+':'') + '$' + Math.abs(plUsd).toFixed(2) + ')</span></div></div>';
-
-      if (cycleCount > 0 && entriesDiffer) {
-        html += '<div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #0f1923">'
-          + '<span style="color:#aaa;font-size:13px">Original basis</span>'
-          + '<div><span style="color:white;font-size:13px;font-weight:600">' + fp(originalEntry) + '</span>'
-          + '<span style="color:' + origPlColor + ';font-size:11px;margin-left:8px">' + fPct(originalPl,true) + '</span></div></div>';
-      }
-
-      html += '<div style="display:flex;justify-content:space-between;padding:8px 0">'
-        + '<span style="color:#aaa;font-size:13px">Current price</span>'
-        + '<span style="color:white;font-size:13px;font-weight:600">' + fp(currentPrice) + '</span></div>';
-
-      if (isSold && epDetail && epDetail.last_sold_price) {
-        html += '<div style="display:flex;justify-content:space-between;padding:8px 0;border-top:1px solid #0f1923">'
-          + '<span style="color:#aaa;font-size:13px">Sold at</span>'
-          + '<div><span style="color:white;font-size:13px">' + fp(epDetail.last_sold_price) + '</span>'
-          + '<span style="color:#666;font-size:11px;margin-left:6px">'
-          + new Date(epDetail.last_sold_at).toLocaleDateString('en-GB',{day:'2-digit',month:'short',year:'numeric'})
-          + '</span></div></div>';
-      }
-      html += '</div>';
-
-      if (!isSold && revolutTotalUSD > 0) {
-        var wt = Math.min(100,(valueUsd/revolutTotalUSD)*100).toFixed(1);
-        html += '<div style="background:#1a2332;border-radius:8px;padding:14px;margin-bottom:12px">'
-          + '<div style="color:#666;font-size:11px;text-transform:uppercase;letter-spacing:0.1em;margin-bottom:8px">Portfolio Weight</div>'
-          + '<div style="display:flex;align-items:center;gap:12px">'
-          + '<div style="flex:1;height:6px;background:#0f1923;border-radius:3px;overflow:hidden">'
-          + '<div style="height:100%;border-radius:3px;background:#00d4ff;width:' + wt + '%"></div></div>'
-          + '<span style="color:white;font-size:13px;font-weight:600;min-width:40px">' + wt + '%</span></div></div>';
-      }
-
-      html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:4px">';
-      if (isSold) {
-        html += '<button onclick="deleteSoldCoin(this.dataset.sym)" data-sym="' + symbol + '" style="grid-column:1/-1;background:#1a1a1a;border:1px solid #333;color:#666;padding:12px;border-radius:8px;font-size:13px;cursor:pointer">Remove from history</button>';
-      } else {
-        html += '<button onclick="switchTab(\"journal\");closeCoinModalBtn()" style="background:#00d4ff22;border:1px solid #00d4ff44;color:#00d4ff;padding:12px;border-radius:8px;font-size:13px;cursor:pointer">Journal</button>'
-             + '<button onclick="closeCoinModalBtn()" style="background:#1a2332;border:none;color:#888;padding:12px;border-radius:8px;font-size:13px;cursor:pointer">Close</button>';
-      }
-      html += '</div>';
-
-      body.innerHTML = html;
-    } catch(e) {
-      body.innerHTML = '<p style="color:red;text-align:center;padding:20px">Error: ' + e.message + '</p>';
-      console.error('openCoinModal error:', e);
-    }
-  }
-  </script>
 </body></html>
