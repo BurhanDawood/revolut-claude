@@ -8293,6 +8293,55 @@ app.get('/api/tangem', async (req, res) => {
 });
 
 // GET /api/capital — current invested capital and P&L summary
+// GET /portfolio/summary — combined portfolio data for dashboard.js
+app.get('/portfolio/summary', async (req, res) => {
+  try {
+    const balancesRaw = await revolutRequest('GET', '/balances');
+    const tickerResponse = await revolutRequest('GET', '/tickers');
+    const tickerList = Array.isArray(tickerResponse) ? tickerResponse : (tickerResponse.data || []);
+    const priceMap = {};
+    for (const t of tickerList) {
+      if (t.symbol) {
+        const p = parseFloat(t.last_price || t.mid || t.ask || t.bid);
+        if (p) { priceMap[t.symbol] = p; priceMap[t.symbol.replace('/', '-')] = p; }
+      }
+    }
+    let totalValue = 0;
+    const positions = [];
+    for (const asset of balancesRaw) {
+      if (!asset.currency || SKIP_CURRENCIES.includes(asset.currency)) continue;
+      const qty = parseFloat(asset.available);
+      if (qty <= 0) continue;
+      const sym = `${asset.currency}-USD`;
+      const price = priceMap[sym] || null;
+      const valueUsd = price ? qty * price : null;
+      if (valueUsd) totalValue += valueUsd;
+      const entry = entryPrices.get(sym) || null;
+      const plPct = entry && price ? ((price - entry) / entry * 100).toFixed(2) : null;
+      positions.push({
+        symbol: sym, currency: asset.currency,
+        quantity: qty, current_price: price,
+        value_usd: valueUsd ? valueUsd.toFixed(2) : '0.00',
+        entry_price: entry, pl_pct: plPct
+      });
+    }
+    positions.sort((a, b) => parseFloat(b.value_usd) - parseFloat(a.value_usd));
+    const cap = getCapitalSummary(totalValue);
+    res.json({
+      total_value_usd: totalValue.toFixed(2),
+      grand_total_usd: totalValue.toFixed(2),
+      invested: cap.invested,
+      pl_usd: cap.pnl.toFixed(2),
+      pl_pct: cap.pnlPct.toFixed(2),
+      break_even_pct: cap.breakEvenPct > 0 ? cap.breakEvenPct.toFixed(1) : null,
+      positions
+    });
+  } catch (e) {
+    console.error('[portfolio/summary] Error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/api/capital', async (req, res) => {
   try {
     const portfolioValue = await getCurrentPortfolioValue();
