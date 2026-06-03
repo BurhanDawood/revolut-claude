@@ -49,6 +49,9 @@ function showTab(name) {
   if(name==='kraken') loadKraken();
 }
 
+// Alias — dashboard.html calls switchTab(), showTab() is the implementation
+function switchTab(name) { showTab(name); }
+
 function filterActivity(f) {
   loadActivity(f);
 }
