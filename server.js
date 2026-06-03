@@ -908,16 +908,22 @@ for (const row of snapRows) {
 }
 console.log(`Loaded ${snapRows.length} balance snapshots from database`);
 
-// Set lastKnownUSDT from live balance on startup so first cycle never fires a false positive
+// Load USDT/USD baseline — DB first (survives redeployments), live balance as fallback
 try {
-  const startupBals = await revolutRequest('GET', '/balances');
-  const usdtStartup = startupBals.find(b => b.currency === 'USDT');
-  lastKnownUSDT = parseFloat(usdtStartup?.available || 0);
-  const usdStartup = startupBals.find(b => b.currency === 'USD');
-  lastKnownUSD  = parseFloat(usdStartup?.available  || 0);
-  console.log(`[usdt] Startup baseline: ${lastKnownUSDT} USDT | ${lastKnownUSD} USD`);
+  const [baseRows] = await db.execute(
+    "SELECT config_key, config_value FROM system_config WHERE config_key IN ('last_known_usdt','last_known_usd')"
+  );
+  for (const row of baseRows) {
+    if (row.config_key === 'last_known_usdt') { lastKnownUSDT = parseFloat(row.config_value); console.log(`[usdt] Loaded USDT baseline from DB: ${lastKnownUSDT}`); }
+    if (row.config_key === 'last_known_usd')  { lastKnownUSD  = parseFloat(row.config_value); console.log(`[usdt] Loaded USD baseline from DB: ${lastKnownUSD}`); }
+  }
+  if (lastKnownUSDT === null || lastKnownUSD === null) {
+    const startupBals = await revolutRequest('GET', '/balances');
+    if (lastKnownUSDT === null) { const a = startupBals.find(b => b.currency === 'USDT'); lastKnownUSDT = parseFloat(a?.available || 0); console.log(`[usdt] USDT baseline from live: ${lastKnownUSDT}`); }
+    if (lastKnownUSD  === null) { const a = startupBals.find(b => b.currency === 'USD');  lastKnownUSD  = parseFloat(a?.available || 0); console.log(`[usdt] USD baseline from live: ${lastKnownUSD}`); }
+  }
 } catch (e) {
-  console.error('[usdt] Startup baseline error:', e.message);
+  console.error('[usdt] Baseline load error:', e.message);
 }
 
 // Load invested capital — insert initial record on first run
@@ -5498,9 +5504,30 @@ async function checkPortfolio() {
           console.log(`[usdt] USDT +$${(currentUSDT - lastKnownUSDT).toFixed(2)} — sweep or deposit`);
         }
 
-        // Always update for next cycle
+        // ── USD→USDT conversion detection ──────────────────────────────────
+        const usdDecrease  = (lastKnownUSD ?? currentUSD) - currentUSD;
+        const usdtIncrease = currentUSDT - (lastKnownUSDT ?? currentUSDT);
+        if (usdDecrease > 0.50 && usdtIncrease > 0.50) {
+          const sim = Math.abs(usdDecrease - usdtIncrease) / usdDecrease;
+          if (sim < 0.02) {
+            console.log(`[usdt] USD→USDT conversion detected: $${usdDecrease.toFixed(2)}`);
+            await db.execute(
+              `INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+              ['USDT', 'transfer', 1.00, usdtIncrease, usdtIncrease, 'USD converted to USDT — dry powder reserve', 'neutral', 'auto_internal']
+            ).catch(() => {});
+            await sendTelegram(`🔄 USD→USDT $${usdDecrease.toFixed(2)}\nDry powder ready. Capital unchanged.`).catch(() => {});
+          }
+        }
+        // ──────────────────────────────────────────────────────────────────
+
+        // Always update for next cycle and persist to DB so redeployments don't reset
         lastKnownUSDT = currentUSDT;
         lastKnownUSD  = currentUSD;
+        await db.execute(
+          `INSERT INTO system_config (config_key, config_value) VALUES ('last_known_usdt', ?), ('last_known_usd', ?)
+           ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)`,
+          [currentUSDT.toString(), currentUSD.toString()]
+        ).catch(() => {});
       }
     } catch (e) {
       console.error('[usdt] Detection error:', e.message);
