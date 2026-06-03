@@ -1,3 +1,5 @@
+var DASHBOARD_VERSION = '1.0.4';
+console.log('Dashboard loaded v' + DASHBOARD_VERSION);
 
   window.onerror = function(msg, src, line, col, err) {
     const bar = document.getElementById('js-error-bar') || document.createElement('div');
@@ -16,8 +18,8 @@
   let targetsData = {};
   let entryPricesData = {};
   let entryDetailData = {};
-  let historicalBasisData = {};
   let trailingStopsData = {};
+  let historicalBasisData = {};
   let revolutTotalUSD = 0;
 
   window.journalLoaded = false;
@@ -135,23 +137,37 @@
     const overnight = h.overnightChangePct != null
       ? `<span class="overnight-badge ${h.overnightChangePct >= 0 ? 'pos' : 'neg'}">${h.overnightChangePct >= 0 ? '+' : ''}${h.overnightChangePct.toFixed(1)}% overnight</span>`
       : '';
-    const epDetail = (typeof entryDetailData !== 'undefined') ? entryDetailData[sym] : null;
-    const cycleCount = epDetail ? epDetail.cycle_count : 0;
-    const origEntry  = epDetail ? (epDetail.original_entry_price || h.entryPrice) : h.entryPrice;
-    const histBasisEntry = (typeof historicalBasisData !== 'undefined') ? (historicalBasisData[h.currency] || null) : null;
-    const entriesDiffer = h.entryPrice && origEntry && Math.abs(h.entryPrice - origEntry) > 0.000001;
-    let pnlLine;
+    var epDetail = (typeof entryDetailData !== 'undefined') ? entryDetailData[sym] : null;
+    var cycleCount = epDetail ? epDetail.cycle_count : 0;
+    var origEntry  = epDetail ? (epDetail.original_entry_price || h.entryPrice) : h.entryPrice;
+    var histBasisEntry = (typeof historicalBasisData !== 'undefined') ? (historicalBasisData[h.currency] || null) : null;
+    var entriesDiffer = h.entryPrice && origEntry && Math.abs(h.entryPrice - origEntry) > 0.000001;
+    var pnlLine;
     if (h.entryPrice != null && h.unrealisedPnlPct != null) {
-      const cycleLine = `<div class="hc-pnl-line ${pnlClass(h.unrealisedPnlPct)}">${cycleCount > 0 ? '🔄 Cycle' : 'Entry'}: ${fmtPrice(h.entryPrice)} | Now: ${fmtPrice(price)} | ${h.unrealisedPnlPct >= 0 ? '+' : ''}${h.unrealisedPnlPct.toFixed(1)}% (${h.unrealisedPnlUsd >= 0 ? '+' : ''}${fmt(h.unrealisedPnlUsd)}) ${h.unrealisedPnlPct >= 0 ? '🟢' : '🔴'}</div>`;
-      // Prefer cash-flow historical basis over simple original_entry_price when available
-      const histBasis = histBasisEntry ? histBasisEntry.historical_basis : (entriesDiffer ? origEntry : null);
-      const basisLine = histBasis ? (() => {
-        const basisPl = ((price - histBasis) / histBasis * 100);
-        const basisCol = basisPl >= 0 ? 'var(--accent)' : 'var(--danger)';
-        const netDep = histBasisEntry ? ` · $${histBasisEntry.net_deployed.toFixed(0)} net in` : (cycleCount > 0 ? ` · ${cycleCount} cycle${cycleCount>1?'s':''}` : '');
-        return `<div style="font-size:0.72rem;color:#666;padding:2px 0 0 2px">Historical basis: ${fmtPrice(histBasis)} <span style="color:${basisCol}">${basisPl >= 0 ? '+' : ''}${basisPl.toFixed(1)}%</span>${netDep}</div>`;
-      })() : '';
-      pnlLine = cycleLine + basisLine;
+      // Cycle entry line (existing template literal — unchanged, already validated)
+      var cycleLabel = cycleCount > 0 ? 'Cycle' : 'Entry';
+      var plSign = h.unrealisedPnlPct >= 0 ? '+' : '';
+      var plUsdSign = h.unrealisedPnlUsd >= 0 ? '+' : '';
+      var plEmoji = h.unrealisedPnlPct >= 0 ? '🟢' : '🔴';
+      var cycleLine = '<div class="hc-pnl-line ' + pnlClass(h.unrealisedPnlPct) + '">' +
+        cycleLabel + ': ' + fmtPrice(h.entryPrice) + ' | Now: ' + fmtPrice(price) + ' | ' +
+        plSign + h.unrealisedPnlPct.toFixed(1) + '% (' +
+        plUsdSign + fmt(h.unrealisedPnlUsd) + ') ' + plEmoji + '</div>';
+
+      // Historical basis line — string concat only, no template literals
+      var histLine = '';
+      var hb = histBasisEntry ? histBasisEntry.historical_basis : (entriesDiffer ? origEntry : null);
+      if (hb && Math.abs(hb - h.entryPrice) > 0.000001) {
+        var hbPl = ((price - hb) / hb * 100);
+        var hbCol = hbPl >= 0 ? 'var(--accent)' : 'var(--danger)';
+        var hbSign = hbPl >= 0 ? '+' : '';
+        var netStr = histBasisEntry ? (' - $' + histBasisEntry.net_deployed.toFixed(0) + ' net') : '';
+        histLine = '<div style="font-size:0.72rem;color:#666;padding:2px 0 0 2px">' +
+          'Historical basis: ' + fmtPrice(hb) +
+          ' <span style="color:' + hbCol + '">' + hbSign + hbPl.toFixed(1) + '%</span>' +
+          netStr + '</div>';
+      }
+      pnlLine = cycleLine + histLine;
     } else {
       pnlLine = `<div class="entry-inline"><span style="color:var(--text-muted);font-size:0.75rem">No entry set</span> <button class="btn-outline btn-sm" onclick="showQuickEntry('${h.currency}')">Set entry</button><div class="alert-inline" id="quick-entry-${h.currency}" style="display:none"><input type="number" id="qe-input-${h.currency}" placeholder="Entry $" step="any" class="threshold-input" style="width:90px"><button class="btn-accent btn-sm" onclick="submitQuickEntry('${sym}','${h.currency}')">SET</button><button class="btn-outline btn-sm" onclick="hideQuickEntry('${h.currency}')">✕</button></div></div>`;
     }
@@ -1640,20 +1656,20 @@
     refreshAll();
     setInterval(refreshAll, REFRESH_MS);
   });
-on>
+/option>`).join('')}</select>
+            <textarea id="reason-input-${t.id}" rows="2">${t.reasoning || ''}</textarea>
+            <div class="activity-edit-actions"><button class="activity-save-btn" onclick="saveActivity(${t.id})">Save</button><button class="activity-cancel-btn" onclick="cancelEdit(${t.id})">Cancel</button></div>
           </div>
         </div>`;
       }).join('');
     } catch (e) {
       console.error('[activity] JS error:', e);
-      feedEl.innerHTML = `<p style="color:var(--danger);text-align:center;padding:16px">JS Error: ${e.message}</p>`;
+      feedEl.innerHTML = '<p style="color:var(--danger);text-align:center;padding:16px">JS Error: ' + e.message + '</p>';
     }
   }
 
-  // ── Bootstrap ──────────────────────────────────────────────────────────────
+  // Bootstrap
   document.addEventListener('DOMContentLoaded', function() {
     refreshAll();
     setInterval(refreshAll, REFRESH_MS);
   });
-  });
-
