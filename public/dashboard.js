@@ -16,6 +16,7 @@
   let targetsData = {};
   let entryPricesData = {};
   let entryDetailData = {};
+  let historicalBasisData = {};
   let trailingStopsData = {};
   let revolutTotalUSD = 0;
 
@@ -137,14 +138,18 @@
     const epDetail = (typeof entryDetailData !== 'undefined') ? entryDetailData[sym] : null;
     const cycleCount = epDetail ? epDetail.cycle_count : 0;
     const origEntry  = epDetail ? (epDetail.original_entry_price || h.entryPrice) : h.entryPrice;
+    const histBasisEntry = (typeof historicalBasisData !== 'undefined') ? (historicalBasisData[h.currency] || null) : null;
     const entriesDiffer = h.entryPrice && origEntry && Math.abs(h.entryPrice - origEntry) > 0.000001;
     let pnlLine;
     if (h.entryPrice != null && h.unrealisedPnlPct != null) {
       const cycleLine = `<div class="hc-pnl-line ${pnlClass(h.unrealisedPnlPct)}">${cycleCount > 0 ? '🔄 Cycle' : 'Entry'}: ${fmtPrice(h.entryPrice)} | Now: ${fmtPrice(price)} | ${h.unrealisedPnlPct >= 0 ? '+' : ''}${h.unrealisedPnlPct.toFixed(1)}% (${h.unrealisedPnlUsd >= 0 ? '+' : ''}${fmt(h.unrealisedPnlUsd)}) ${h.unrealisedPnlPct >= 0 ? '🟢' : '🔴'}</div>`;
-      const basisLine = (cycleCount > 0 && entriesDiffer) ? (() => {
-        const basisPl = ((price - origEntry) / origEntry * 100);
+      // Prefer cash-flow historical basis over simple original_entry_price when available
+      const histBasis = histBasisEntry ? histBasisEntry.historical_basis : (entriesDiffer ? origEntry : null);
+      const basisLine = histBasis ? (() => {
+        const basisPl = ((price - histBasis) / histBasis * 100);
         const basisCol = basisPl >= 0 ? 'var(--accent)' : 'var(--danger)';
-        return `<div style="font-size:0.72rem;color:#666;padding:2px 0 0 2px">📈 Cost basis: ${fmtPrice(origEntry)} <span style="color:${basisCol}">${basisPl >= 0 ? '+' : ''}${basisPl.toFixed(1)}%</span> · ${cycleCount} cycle${cycleCount>1?'s':''}</div>`;
+        const netDep = histBasisEntry ? ` · $${histBasisEntry.net_deployed.toFixed(0)} net in` : (cycleCount > 0 ? ` · ${cycleCount} cycle${cycleCount>1?'s':''}` : '');
+        return `<div style="font-size:0.72rem;color:#666;padding:2px 0 0 2px">Historical basis: ${fmtPrice(histBasis)} <span style="color:${basisCol}">${basisPl >= 0 ? '+' : ''}${basisPl.toFixed(1)}%</span>${netDep}</div>`;
       })() : '';
       pnlLine = cycleLine + basisLine;
     } else {
@@ -978,7 +983,7 @@
         return;
       }
       await refreshBalances().catch(e => { console.error('refreshBalances failed:', e); });
-      const [status, targets, entries, entryDetail, capital, tangem, tsData] = await Promise.all([
+      const [status, targets, entries, entryDetail, capital, tangem, tsData, histBasis] = await Promise.all([
         apiFetch('GET', '/api/status').catch(() => ({})),
         apiFetch('GET', '/api/targets').catch(() => ({})),
         apiFetch('GET', '/api/entryprices').catch(() => ({})),
@@ -986,12 +991,14 @@
         apiFetch('GET', '/api/capital').catch(() => null),
         apiFetch('GET', '/api/tangem').catch(() => null),
         apiFetch('GET', '/api/trailing-stops').catch(() => ({})),
+        apiFetch('GET', '/api/historical-basis').catch(() => ({})),
       ]);
       statusData = status || {};
       targetsData = targets || {};
       entryPricesData = entries || {};
       entryDetailData = entryDetail || {};
       trailingStopsData = tsData || {};
+      historicalBasisData = histBasis || {};
       try { renderAlerts(statusData.activeAlerts); } catch(e) { console.error('renderAlerts:', e); }
       try { renderMonitorStatus(statusData.paused); } catch(e) { console.error('renderMonitorStatus:', e); }
       try { renderThresholds(balancesData, statusData, targetsData, entryPricesData, trailingStopsData, entryDetailData); } catch(e) { console.error('renderThresholds:', e); }
@@ -1633,3 +1640,20 @@
     refreshAll();
     setInterval(refreshAll, REFRESH_MS);
   });
+on>
+          </div>
+        </div>`;
+      }).join('');
+    } catch (e) {
+      console.error('[activity] JS error:', e);
+      feedEl.innerHTML = `<p style="color:var(--danger);text-align:center;padding:16px">JS Error: ${e.message}</p>`;
+    }
+  }
+
+  // ── Bootstrap ──────────────────────────────────────────────────────────────
+  document.addEventListener('DOMContentLoaded', function() {
+    refreshAll();
+    setInterval(refreshAll, REFRESH_MS);
+  });
+  });
+

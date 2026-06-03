@@ -510,6 +510,19 @@ await db.execute(`CREATE TABLE IF NOT EXISTS alert_reminders (
   UNIQUE KEY unique_symbol_date (symbol, alert_date)
 )`);
 
+await db.execute(`CREATE TABLE IF NOT EXISTS coin_cash_flows (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  symbol VARCHAR(50) NOT NULL,
+  flow_type ENUM('buy','sell') NOT NULL,
+  cash_amount DECIMAL(20,8) NOT NULL,
+  token_quantity DECIMAL(20,8) NOT NULL,
+  price DECIMAL(20,10) NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  journal_id INT NULL,
+  UNIQUE KEY unique_journal (journal_id, flow_type)
+)`);
+await db.execute(`CREATE INDEX IF NOT EXISTS idx_cash_flows_symbol ON coin_cash_flows(symbol)`).catch(() => {});
+
 await db.execute(`CREATE TABLE IF NOT EXISTS swing_cooldowns (
   symbol VARCHAR(50) PRIMARY KEY,
   last_alert_at TIMESTAMP NOT NULL,
@@ -1043,6 +1056,30 @@ try {
   `);
 } catch (e) { console.warn('[seed] XLM sold history seed:', e.message); }
 
+// Backfill coin_cash_flows from existing trading_journal (idempotent — ON DUPLICATE KEY ignores already-loaded rows)
+try {
+  const [bfResult] = await db.execute(`
+    INSERT IGNORE INTO coin_cash_flows
+      (symbol, flow_type, cash_amount, token_quantity, price, journal_id, created_at)
+    SELECT
+      symbol,
+      action,
+      ABS(CAST(value_usd AS DECIMAL(20,8))),
+      ABS(CAST(quantity AS DECIMAL(20,8))),
+      ABS(CAST(price AS DECIMAL(20,10))),
+      id,
+      created_at
+    FROM trading_journal
+    WHERE action IN ('buy','sell')
+      AND symbol NOT IN ('USDT','USD','USDT-USD','USD-USD')
+      AND value_usd IS NOT NULL
+      AND quantity IS NOT NULL
+      AND price IS NOT NULL
+      AND price > 0
+  `);
+  if (bfResult.affectedRows > 0) console.log(`[cash-flows] Backfilled ${bfResult.affectedRows} rows from trading_journal`);
+} catch (e) { console.warn('[cash-flows] Backfill error:', e.message); }
+
 // Seed system config — always keep project description current
 try {
   await db.execute(
@@ -1494,6 +1531,21 @@ function getCapitalSummary(portfolioValue) {
 }
 
 async function updateInvestedCapital(newTotal, note) {
+  const change = newTotal - totalInvestedCapital;
+  // Block suspicious single-cycle drops > $200 — real payments are rarely this large
+  if (change < -200) {
+    console.error(`[capital] SUSPICIOUS DROP BLOCKED: $${totalInvestedCapital.toFixed(2)} → $${newTotal.toFixed(2)} (-$${Math.abs(change).toFixed(2)}) | reason: ${note}`);
+    await sendTelegram(
+      `⚠️ <b>CAPITAL CHANGE BLOCKED</b>\n\n` +
+      `Old: $${totalInvestedCapital.toFixed(2)}\n` +
+      `New: $${newTotal.toFixed(2)}\n` +
+      `Change: -$${Math.abs(change).toFixed(2)}\n` +
+      `Reason: ${note || 'unknown'}\n\n` +
+      `Reply '<b>confirm capital ${newTotal.toFixed(2)}</b>' to approve\n` +
+      `Or '<b>skip capital</b>' to cancel`
+    ).catch(() => {});
+    return; // Block the change — do not update DB or in-memory value
+  }
   totalInvestedCapital = newTotal;
   await db.execute('INSERT INTO invested_capital (total_invested, note) VALUES (?, ?)', [newTotal, note || null]);
 }
@@ -2230,6 +2282,17 @@ async function recordDailyPrices() {
       await db.execute('INSERT INTO price_history (symbol, price) VALUES (?, ?)', [symbol, price]);
     }
     console.log('Daily prices recorded.');
+
+    // Save capital snapshot so corrupted values can be recovered
+    try {
+      const portfolioValue = await getCurrentPortfolioValue().catch(() => 0);
+      await db.execute(
+        `INSERT INTO system_config (config_key, config_value) VALUES ('capital_daily_snapshot', ?)
+         ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)`,
+        [JSON.stringify({ amount: totalInvestedCapital, date: new Date().toISOString(), portfolio_value: portfolioValue })]
+      );
+      console.log(`[capital] Daily snapshot saved: $${totalInvestedCapital.toFixed(2)}`);
+    } catch (e) { console.warn('[capital] Snapshot save error:', e.message); }
   } catch (e) {
     console.error('recordDailyPrices error:', e.message);
   }
@@ -3422,6 +3485,15 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
       }
     } catch (e) { /* non-critical — ignore */ }
 
+    // Record cash flow for historical cost basis tracking
+    if ((action === 'buy' || action === 'sell') && valueUsd > 0 && absQty > 0) {
+      await db.execute(
+        `INSERT IGNORE INTO coin_cash_flows (symbol, flow_type, cash_amount, token_quantity, price, journal_id)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [coinBase, action, valueUsd, absQty, price, journalId]
+      ).catch(e => console.warn('[cash-flows] Insert error:', e.message));
+    }
+
     // Tax lot tracking — US HIFO disposal / buy lot recording
     if (action === 'buy') {
       await addTaxLot(
@@ -4346,6 +4418,34 @@ async function getAvailableUSD(exchange) {
   } catch (e) {
     console.error('[cash] getAvailableUSD error:', e.message);
     return 0;
+  }
+}
+
+// ── Historical cost basis (cash-flow method) ──────────────────────────────────
+// Formula: (total cash ever put in − cash received back) / current tokens held
+// Unlike simple average entry, this survives full sells and buybacks correctly.
+async function getHistoricalCostBasis(symbol) {
+  try {
+    const coinBase = symbol.replace('-USD', '');
+    const [flows] = await db.execute(
+      `SELECT flow_type, SUM(cash_amount) as total_cash, SUM(token_quantity) as total_tokens
+       FROM coin_cash_flows WHERE symbol = ? GROUP BY flow_type`,
+      [coinBase]
+    );
+    let totalCashIn = 0, totalCashOut = 0;
+    for (const f of flows) {
+      if (f.flow_type === 'buy')  totalCashIn  = parseFloat(f.total_cash);
+      if (f.flow_type === 'sell') totalCashOut = parseFloat(f.total_cash);
+    }
+    if (totalCashIn <= 0) return null;
+    const currentQty = parseFloat(previousBalances.get(symbol) || 0);
+    if (currentQty <= 0) return null;
+    const netDeployed = totalCashIn - totalCashOut;
+    const historicalBasis = netDeployed / currentQty;
+    return { historical_basis: historicalBasis, total_cash_in: totalCashIn, total_cash_out: totalCashOut, net_deployed: netDeployed, current_qty: currentQty };
+  } catch (e) {
+    console.error('[basis] getHistoricalCostBasis error:', e.message);
+    return null;
   }
 }
 
@@ -5423,6 +5523,25 @@ async function checkPortfolio() {
 
         if (decrease > 0.10) {
           console.log(`[usdt] USDT -$${decrease.toFixed(2)} | USD ${usdIncrease >= 0 ? '+' : ''}$${usdIncrease.toFixed(2)}`);
+
+          // Safety cap: payments > $100 need manual confirmation — auto-detection shouldn't deduct large amounts
+          if (decrease > 100) {
+            console.warn(`[usdt] Large USDT decrease $${decrease.toFixed(2)} — requesting confirmation, not auto-logging`);
+            await sendTelegram(
+              `⚠️ Large USDT decrease detected: $${decrease.toFixed(2)}\n` +
+              `Was this a card payment?\n\n` +
+              `Reply '<b>confirm payment ${decrease.toFixed(2)}</b>' to log\n` +
+              `Or '<b>skip payment</b>' to ignore`
+            ).catch(() => {});
+            lastKnownUSDT = currentUSDT; // Update baseline so it doesn't re-fire
+            lastKnownUSD  = currentUSD;
+            await db.execute(
+              `INSERT INTO system_config (config_key, config_value) VALUES ('last_known_usdt', ?), ('last_known_usd', ?)
+               ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)`,
+              [currentUSDT.toString(), currentUSD.toString()]
+            ).catch(() => {});
+            return; // Wait for manual confirmation
+          }
 
           // Guard 1: USDT→USD conversion (dry powder) — USD increased by ~same amount
           const isUSDConversion = usdIncrease > 0 &&
@@ -6969,6 +7088,34 @@ app.delete('/api/entry-prices/:symbol', async (req, res) => {
   }
 });
 
+// GET /api/historical-basis — cash-flow cost basis for all coins with trade history
+app.get('/api/historical-basis', async (req, res) => {
+  try {
+    const [flows] = await db.execute(
+      `SELECT symbol, flow_type, SUM(cash_amount) as total_cash, SUM(token_quantity) as total_tokens
+       FROM coin_cash_flows GROUP BY symbol, flow_type`
+    );
+    const bySymbol = {};
+    for (const f of flows) {
+      if (!bySymbol[f.symbol]) bySymbol[f.symbol] = { buy: 0, sell: 0 };
+      bySymbol[f.symbol][f.flow_type] = parseFloat(f.total_cash);
+    }
+    const out = {};
+    for (const [sym, data] of Object.entries(bySymbol)) {
+      const symbol  = sym + '-USD';
+      const qty     = parseFloat(previousBalances.get(symbol) || 0);
+      const netDep  = data.buy - data.sell;
+      const basis   = qty > 0 ? netDep / qty : null;
+      if (basis !== null && basis > 0) {
+        out[sym] = { historical_basis: parseFloat(basis.toFixed(6)), net_deployed: parseFloat(netDep.toFixed(2)), total_cash_in: parseFloat(data.buy.toFixed(2)), total_cash_out: parseFloat(data.sell.toFixed(2)) };
+      }
+    }
+    res.json(out);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // GET /api/entryprices/detail — full cost basis data including original entry and cycle count
 app.get('/api/entryprices/detail', async (req, res) => {
   try {
@@ -7728,6 +7875,21 @@ function createMcpServer() {
       // Filter: remove dust (<$1) and ignored coins
       const ignoredCount = positions.filter(p => ignoredCoins.has(p.symbol)).length;
       const dustCount    = positions.filter(p => !ignoredCoins.has(p.symbol) && parseFloat(p.value_usd || 0) > 0 && parseFloat(p.value_usd || 0) < 1.00).length;
+      // Enrich positions with historical cost basis
+      for (const pos of positions) {
+        try {
+          const basis = await getHistoricalCostBasis(pos.symbol);
+          if (basis && basis.historical_basis > 0) {
+            const curPrice = parseFloat(pos.price || 0);
+            pos.historical_basis     = parseFloat(basis.historical_basis.toFixed(6));
+            pos.historical_pl_pct    = curPrice > 0 ? parseFloat(((curPrice - basis.historical_basis) / basis.historical_basis * 100).toFixed(2)) : null;
+            pos.net_cash_deployed    = parseFloat(basis.net_deployed.toFixed(2));
+            pos.total_cash_in        = parseFloat(basis.total_cash_in.toFixed(2));
+            pos.has_cycle_history    = true;
+          }
+        } catch (e) { /* non-critical */ }
+      }
+
       const cleanPositions = positions.filter(p =>
         !ignoredCoins.has(p.symbol) && parseFloat(p.value_usd || 0) >= 1.00
       );
@@ -9053,6 +9215,80 @@ app.post('/telegram-webhook', async (req, res) => {
         await sendReply(confirmMsg);
         return res.status(200).json({ ok: true });
       }
+    }
+
+    // --- Commands: capital recovery from daily snapshot ---
+    if (/^restore capital$/i.test(commandText)) {
+      try {
+        const [snap] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'capital_daily_snapshot'");
+        if (snap.length > 0) {
+          const data = JSON.parse(snap[0].config_value);
+          await sendReply(
+            `📊 <b>Last capital snapshot:</b>\n\n` +
+            `Amount: $${parseFloat(data.amount).toFixed(2)}\n` +
+            `Saved: ${new Date(data.date).toLocaleDateString('en-GB', { day:'2-digit', month:'short', year:'numeric' })}\n` +
+            `Portfolio at time: $${parseFloat(data.portfolio_value || 0).toFixed(2)}\n\n` +
+            `Reply '<b>confirm restore capital</b>' to restore`
+          );
+        } else {
+          await sendReply('No capital snapshot found — snapshot saves daily at midnight.');
+        }
+      } catch (e) { await sendReply('Error fetching snapshot: ' + e.message); }
+      return res.status(200).json({ ok: true });
+    }
+
+    if (/^confirm restore capital$/i.test(commandText)) {
+      try {
+        const [snap] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'capital_daily_snapshot'");
+        if (snap.length > 0) {
+          const data = JSON.parse(snap[0].config_value);
+          totalInvestedCapital = parseFloat(data.amount);
+          await db.execute('INSERT INTO invested_capital (total_invested, note) VALUES (?, ?)', [totalInvestedCapital, 'Restored from daily snapshot']);
+          await sendReply(`✅ Capital restored to <b>$${totalInvestedCapital.toFixed(2)}</b>\nFrom snapshot dated ${new Date(data.date).toLocaleDateString('en-GB')}`);
+        } else {
+          await sendReply('No snapshot to restore from.');
+        }
+      } catch (e) { await sendReply('Restore error: ' + e.message); }
+      return res.status(200).json({ ok: true });
+    }
+
+    // Handle 'confirm capital X.XX' — approve a blocked large capital change
+    const confirmCapitalMatch = commandText.match(/^confirm capital\s+([\d.]+)$/i);
+    if (confirmCapitalMatch) {
+      const newAmt = parseFloat(confirmCapitalMatch[1]);
+      if (!isNaN(newAmt)) {
+        totalInvestedCapital = newAmt;
+        await db.execute('INSERT INTO invested_capital (total_invested, note) VALUES (?, ?)', [newAmt, 'Manually confirmed via Telegram']);
+        await sendReply(`✅ Capital updated to <b>$${newAmt.toFixed(2)}</b>`);
+      }
+      return res.status(200).json({ ok: true });
+    }
+
+    if (/^skip capital$/i.test(commandText)) {
+      await sendReply('✅ Capital change cancelled — no update made.');
+      return res.status(200).json({ ok: true });
+    }
+
+    // Handle 'confirm payment X.XX' — approve a blocked large USDT payment
+    const confirmPaymentMatch = commandText.match(/^confirm payment\s+([\d.]+)$/i);
+    if (confirmPaymentMatch) {
+      const payAmt = parseFloat(confirmPaymentMatch[1]);
+      if (!isNaN(payAmt)) {
+        await db.execute(
+          `INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          ['USDT', 'payment', 1.00, payAmt, payAmt, `Revolut debit card payment — $${payAmt.toFixed(2)} USDT (manually confirmed)`, 'neutral', 'revolut_card']
+        );
+        const prevCap = totalInvestedCapital;
+        const newCap  = totalInvestedCapital - payAmt;
+        await updateInvestedCapital(newCap, `Card payment confirmed: -$${payAmt.toFixed(2)}`);
+        await sendReply(`✅ Payment $${payAmt.toFixed(2)} logged\nCapital: $${prevCap.toFixed(2)} → $${newCap.toFixed(2)}`);
+      }
+      return res.status(200).json({ ok: true });
+    }
+
+    if (/^skip payment$/i.test(commandText)) {
+      await sendReply('✅ Payment detection cancelled — capital unchanged.');
+      return res.status(200).json({ ok: true });
     }
 
     // --- Commands: invested capital tracking ---
