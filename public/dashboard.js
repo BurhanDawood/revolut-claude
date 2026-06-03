@@ -1,4 +1,4 @@
-var DASHBOARD_VERSION = '1.0.6';
+var DASHBOARD_VERSION = '1.0.7';
 
 window.onerror = function(msg, src, line) {
   var b = document.createElement('div');
@@ -28,6 +28,21 @@ function fmtQty(qty) {
   return q.toFixed(4);
 }
 
+function setEl(id, val) {
+  var el = document.getElementById(id);
+  if (el) el.textContent = val;
+}
+
+function setElHtml(id, val) {
+  var el = document.getElementById(id);
+  if (el) el.innerHTML = val;
+}
+
+function setElColor(id, val, color) {
+  var el = document.getElementById(id);
+  if (el) { el.textContent = val; el.style.color = color; }
+}
+
 function fetchData(url) {
   return fetch(url)
     .then(function(r) {
@@ -40,18 +55,22 @@ function fetchData(url) {
     });
 }
 
-function showTab(name, el) {
+// Tab switching — HTML uses class="tab-content", toggled by .active
+function switchTab(name) {
   var tabs = document.querySelectorAll('.tab-btn');
   for (var i = 0; i < tabs.length; i++) {
     tabs[i].classList.remove('active');
   }
-  var panes = document.querySelectorAll('.tab-pane');
+  var panes = document.querySelectorAll('.tab-content');
   for (var j = 0; j < panes.length; j++) {
-    panes[j].style.display = 'none';
+    panes[j].classList.remove('active');
   }
-  if (el) el.classList.add('active');
+  // Mark the clicked button active
+  if (event && event.currentTarget) {
+    event.currentTarget.classList.add('active');
+  }
   var pane = document.getElementById('tab-' + name);
-  if (pane) pane.style.display = 'block';
+  if (pane) pane.classList.add('active');
   if (name === 'activity') loadActivity('all');
   if (name === 'portfolio') loadPortfolio();
   if (name === 'journal') loadJournal();
@@ -67,64 +86,45 @@ function filterActivity(filter, el) {
 }
 
 function loadPortfolio() {
+  console.log('[dashboard] loadPortfolio called');
   fetchData('/portfolio/summary').then(function(data) {
     if (!data) {
-      var el = document.getElementById('total-value');
-      if (el) el.textContent = 'Error loading';
+      console.error('[dashboard] /portfolio/summary returned null');
+      setEl('portfolio-value', 'Error');
       return;
     }
+    console.log('[dashboard] Portfolio data received');
 
-    var totalEl = document.getElementById('total-value');
-    if (totalEl) {
-      totalEl.textContent = '$' + parseFloat(
-        data.grand_total_usd || data.total_value_usd || 0
-      ).toFixed(2);
+    // Big total value
+    var total = parseFloat(data.grand_total_usd || data.total_value_usd || 0);
+    setEl('portfolio-value', '$' + total.toFixed(2));
+    setEl('last-updated', 'Updated just now');
+
+    // Capital bar stats
+    if (data.invested !== undefined) {
+      setEl('cap-invested', '$' + parseFloat(data.invested).toFixed(0));
     }
-
-    var invEl = document.getElementById('invested');
-    if (invEl && data.invested) {
-      invEl.textContent = '$' + parseFloat(data.invested).toFixed(2);
+    if (data.total_value_usd !== undefined) {
+      setEl('cap-current', '$' + parseFloat(data.total_value_usd).toFixed(0));
     }
-
-    var plUsdEl = document.getElementById('pl-usd');
-    if (plUsdEl && data.pl_usd !== undefined) {
+    if (data.pl_usd !== undefined) {
       var plUsd = parseFloat(data.pl_usd);
-      plUsdEl.textContent = (plUsd >= 0 ? '+' : '') + '$' + Math.abs(plUsd).toFixed(2);
-      plUsdEl.style.color = plUsd >= 0 ? '#00ff88' : '#ff4444';
+      var plPct = parseFloat(data.pl_pct || 0);
+      var plColor = plUsd >= 0 ? 'var(--accent)' : 'var(--danger)';
+      setElColor('cap-pnl',
+        (plUsd >= 0 ? '+' : '') + '$' + Math.abs(plUsd).toFixed(0) +
+        ' (' + (plPct >= 0 ? '+' : '') + plPct.toFixed(1) + '%)',
+        plColor);
+    }
+    if (data.break_even_pct !== undefined) {
+      setEl('cap-breakeven', '+' + parseFloat(data.break_even_pct).toFixed(1) + '%');
     }
 
-    var plPctEl = document.getElementById('pl-pct');
-    if (plPctEl && data.pl_pct !== undefined) {
-      var plPct = parseFloat(data.pl_pct);
-      plPctEl.textContent = (plPct >= 0 ? '+' : '') + plPct.toFixed(1) + '%';
-      plPctEl.style.color = plPct >= 0 ? '#00ff88' : '#ff4444';
-    }
+    // Portfolio totals breakdown
+    var totalsEl = document.getElementById('portfolio-totals');
+    if (totalsEl) totalsEl.style.display = '';
 
-    var breakEl = document.getElementById('break-even');
-    if (breakEl && data.break_even_pct) {
-      breakEl.textContent = '+' + parseFloat(data.break_even_pct).toFixed(1) + '%';
-    }
-
-    var cashEl = document.getElementById('cash-available');
-    if (cashEl && data.cash_available) {
-      var c = data.cash_available;
-      cashEl.textContent = '$' + parseFloat(c.total_cash || c.revolut_usd || 0).toFixed(2);
-    }
-
-    var sweepEl = document.getElementById('usdt-reserve');
-    if (sweepEl && data.usdt_reserve !== undefined) {
-      sweepEl.textContent = '$' + parseFloat(data.usdt_reserve).toFixed(2);
-    }
-
-    var tangemEl = document.getElementById('tangem-value');
-    if (tangemEl) {
-      if (data.tangem && data.tangem.valueUSD) {
-        tangemEl.textContent = '$' + parseFloat(data.tangem.valueUSD).toFixed(2);
-      } else {
-        tangemEl.textContent = 'Unavailable';
-      }
-    }
-
+    // Holdings list
     var holdingsEl = document.getElementById('holdings-list');
     if (!holdingsEl) return;
 
@@ -143,40 +143,34 @@ function loadPortfolio() {
       var ep = parseFloat(pos.entry_price || 0);
       var pl = ep > 0 ? ((cp - ep) / ep * 100) : 0;
       var plColor = pl >= 0 ? '#00ff88' : '#ff4444';
-      var borderColor = pl >= 0 ? '#00ff88' : '#ff4444';
       var isSold = pos.status === 'sold';
 
       var entryLine = '';
       if (ep > 0) {
-        entryLine = 'Entry: ' + fmt(ep) +
-          ' | Now: ' + fmt(cp) +
+        entryLine = 'Entry: ' + fmt(ep) + ' | Now: ' + fmt(cp) +
           ' | <span style="color:' + plColor + '">' +
           (pl >= 0 ? '+' : '') + pl.toFixed(1) + '%</span>';
-
         var hb = parseFloat(pos.historical_basis || 0);
         if (hb > 0 && Math.abs(hb - ep) > 0.000001) {
           var hpl = ((cp - hb) / hb * 100);
           var hc = hpl >= 0 ? '#00ff88' : '#ff4444';
-          entryLine += '<br><span style="color:#555;font-size:10px">Hist basis: ' + fmt(hb) +
+          entryLine += '<br><span style="color:#555;font-size:10px">Hist: ' + fmt(hb) +
             ' <span style="color:' + hc + '">' + (hpl >= 0 ? '+' : '') + hpl.toFixed(1) + '%</span></span>';
         }
       }
 
-      var cardStyle = isSold
-        ? 'opacity:0.4;border-left:3px solid #444;'
-        : 'border-left:3px solid ' + borderColor + ';';
-
-      html += '<div style="' + cardStyle + 'padding:10px 12px;margin-bottom:8px;background:#1a1a1a;border-radius:4px">' +
+      html += '<div style="border-left:3px solid ' + (isSold ? '#444' : plColor) + ';' +
+        'padding:10px 12px;margin-bottom:8px;background:var(--surface2);border-radius:8px;' +
+        (isSold ? 'opacity:0.45;' : '') + '">' +
         '<div style="display:flex;justify-content:space-between;margin-bottom:4px">' +
-        '<span style="color:' + (isSold ? '#555' : 'white') + ';font-weight:bold">' + pos.currency +
-        (isSold ? ' <span style="font-size:9px;color:#444">[SOLD]</span>' : '') + '</span>' +
-        '<span style="color:' + (isSold ? '#555' : 'white') + ';font-weight:bold">' +
-        (isSold ? '' : '$' + val.toFixed(2)) + '</span></div>' +
-        '<div style="font-size:11px;color:#888">' + entryLine + '</div>' +
+        '<span style="font-weight:600">' + pos.currency +
+        (isSold ? ' <span style="font-size:9px;color:#555">[SOLD]</span>' : '') + '</span>' +
+        '<span style="font-weight:600">' + (isSold ? '' : '$' + val.toFixed(2)) + '</span></div>' +
+        (entryLine ? '<div style="font-size:11px;color:var(--text-muted)">' + entryLine + '</div>' : '') +
         '</div>';
     }
 
-    holdingsEl.innerHTML = html || '<p style="color:#888">No positions</p>';
+    holdingsEl.innerHTML = html || '<p style="color:var(--text-muted)">No positions found</p>';
   });
 }
 
@@ -184,113 +178,71 @@ function loadActivity(filter) {
   filter = filter || 'all';
   var feedEl = document.getElementById('activity-feed');
   if (!feedEl) return;
-  feedEl.innerHTML = '<p style="color:#888">Loading...</p>';
+  feedEl.innerHTML = '<p style="color:var(--text-muted)">Loading...</p>';
 
   fetchData('/api/activity?limit=50&filter=' + encodeURIComponent(filter)).then(function(data) {
     if (!data || !data.trades || !data.trades.length) {
-      feedEl.innerHTML = '<p style="color:#888">No activity yet</p>';
+      feedEl.innerHTML = '<p style="color:var(--text-muted)">No activity yet</p>';
       return;
     }
 
-    var colors = {
-      buy: '#00ff88', sell: '#ff4444',
-      payment: '#ffaa00', transfer: '#888888',
-      sweep: '#4488ff', rebalance: '#aa44ff'
-    };
-
+    var colors = { buy: '#00ff88', sell: '#ff4444', payment: '#ffaa00', transfer: '#888', sweep: '#4488ff' };
     var html = '';
     for (var i = 0; i < data.trades.length; i++) {
       var t = data.trades[i];
-      var color = colors[t.action] || '#888';
+      var col = colors[t.action] || '#888';
       var date = new Date(t.created_at);
-      var dateStr = date.toLocaleDateString('en-GB', {
-        day: '2-digit', month: 'short',
-        hour: '2-digit', minute: '2-digit'
-      });
+      var dateStr = date.toLocaleDateString('en-GB', { day: '2-digit', month: 'short' }) +
+        ' ' + date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
       var qty = parseFloat(t.quantity || 0);
-      var qtyStr = qty >= 1000000
-        ? (qty / 1000000).toFixed(2) + 'M'
-        : qty >= 1000
-        ? (qty / 1000).toFixed(2) + 'K'
-        : qty.toFixed(4);
-      var val = t.value_usd ? '$' + parseFloat(t.value_usd).toFixed(2) : '';
+      var qs = qty >= 1000000 ? (qty / 1000000).toFixed(2) + 'M'
+        : qty >= 1000 ? (qty / 1000).toFixed(2) + 'K' : qty.toFixed(4);
+      var val = t.value_usd ? ' = $' + parseFloat(t.value_usd).toFixed(2) : '';
       var pnl = t.outcome_pnl ? parseFloat(t.outcome_pnl) : null;
       var pnlStr = pnl !== null
-        ? '<span style="color:' + (pnl >= 0 ? '#00ff88' : '#ff4444') +
-          ';margin-left:8px;font-size:11px">' +
+        ? '<span style="color:' + (pnl >= 0 ? '#00ff88' : '#ff4444') + ';margin-left:8px;font-size:11px">' +
           (pnl >= 0 ? '+' : '') + '$' + Math.abs(pnl).toFixed(2) + '</span>'
         : '';
 
-      html += '<div style="border-left:3px solid ' + color +
-        ';padding:10px 12px;margin-bottom:8px;background:#1a1a1a;border-radius:4px">' +
+      html += '<div style="border-left:3px solid ' + col +
+        ';padding:10px 12px;margin-bottom:8px;background:var(--surface2);border-radius:8px">' +
         '<div style="display:flex;justify-content:space-between;margin-bottom:4px">' +
-        '<div><span style="color:' + color + ';font-weight:bold;font-size:11px;text-transform:uppercase">' +
-        t.action + '</span><span style="color:white;font-weight:bold;margin-left:6px">' +
-        t.symbol + '</span>' + pnlStr + '</div>' +
-        '<span style="color:#666;font-size:11px">' + dateStr + '</span></div>' +
-        '<div style="color:#aaa;font-size:12px;margin-bottom:4px">' +
-        qtyStr + ' @ ' + fmt(t.price) + (val ? ' = ' + val : '') + '</div>' +
+        '<div><span style="color:' + col + ';font-weight:700;font-size:11px;text-transform:uppercase">' +
+        t.action + '</span><span style="font-weight:600;margin-left:6px">' + t.symbol + '</span>' + pnlStr + '</div>' +
+        '<span style="color:var(--text-muted);font-size:11px">' + dateStr + '</span></div>' +
+        '<div style="color:var(--text-muted);font-size:12px;margin-bottom:4px">' + qs + ' @ ' + fmt(t.price) + val + '</div>' +
         '<div style="color:#666;font-size:11px">' + (t.reasoning || 'No reason logged') + '</div>' +
         '</div>';
     }
-
     feedEl.innerHTML = html;
   });
 }
 
 function loadJournal() {
-  var el = document.getElementById('journal-list');
+  var el = document.getElementById('journal-entries-list');
   if (!el) return;
-  el.innerHTML = '<p style="color:#888">Loading...</p>';
-  fetchData('/api/activity?limit=20&filter=all').then(function(data) {
-    if (!data || !data.trades) {
-      el.innerHTML = '<p style="color:#888">No data</p>';
-      return;
-    }
-    var trades = data.trades.filter(function(t) {
-      return t.action === 'buy' || t.action === 'sell';
-    });
-    if (!trades.length) {
-      el.innerHTML = '<p style="color:#888">No trades yet</p>';
-      return;
-    }
+  el.innerHTML = '<p style="color:var(--text-muted)">Loading...</p>';
+  fetchData('/api/activity?limit=20').then(function(data) {
+    if (!data || !data.trades) { el.innerHTML = '<p style="color:var(--text-muted)">No data</p>'; return; }
+    var trades = data.trades.filter(function(t) { return t.action === 'buy' || t.action === 'sell'; });
+    if (!trades.length) { el.innerHTML = '<p style="color:var(--text-muted)">No trades yet</p>'; return; }
     var html = '';
     for (var i = 0; i < trades.length; i++) {
       var t = trades[i];
-      var color = t.action === 'buy' ? '#00ff88' : '#ff4444';
+      var col = t.action === 'buy' ? '#00ff88' : '#ff4444';
       var date = new Date(t.created_at).toLocaleDateString('en-GB');
-      html += '<div style="padding:10px;margin-bottom:8px;background:#1a1a1a;border-radius:4px;border-left:3px solid ' + color + '">' +
-        '<div style="color:white;font-weight:bold">' + t.symbol + ' ' + t.action.toUpperCase() +
-        ' <span style="color:#666;font-size:11px">' + date + '</span></div>' +
-        '<div style="color:#aaa;font-size:11px;margin-top:4px">' + (t.reasoning || 'No reasoning') + '</div>' +
+      html += '<div style="padding:10px;margin-bottom:8px;background:var(--surface2);border-radius:8px;border-left:3px solid ' + col + '">' +
+        '<div style="font-weight:600">' + t.symbol + ' ' + t.action.toUpperCase() +
+        ' <span style="color:var(--text-muted);font-size:11px">' + date + '</span></div>' +
+        '<div style="color:var(--text-muted);font-size:11px;margin-top:4px">' + (t.reasoning || 'No reasoning') + '</div>' +
         '</div>';
     }
     el.innerHTML = html;
   });
 }
 
-function saveSweepConfig() {
-  var pct = document.getElementById('sweep-pct');
-  var min = document.getElementById('sweep-min');
-  var enabled = document.getElementById('sweep-enabled');
-  if (!pct || !min) return;
-  fetch('/api/sweep/config', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      sweep_pct: parseFloat(pct.value),
-      min_trade_value_usd: parseFloat(min.value),
-      enabled: enabled ? enabled.checked : true
-    })
-  }).then(function(r) {
-    if (r.ok) alert('Sweep config saved');
-  }).catch(function(e) {
-    console.error('Save sweep error:', e);
-  });
-}
-
 document.addEventListener('DOMContentLoaded', function() {
-  console.log('DOM ready — loading portfolio');
+  console.log('[dashboard] DOMContentLoaded — starting loadPortfolio');
   loadPortfolio();
   setInterval(loadPortfolio, 300000);
 });
