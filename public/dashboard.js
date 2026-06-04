@@ -221,6 +221,29 @@ function loadSweep() {
   });
 }
 
+function loadThresholds() {
+  fetchData('/api/thresholds').then(function(data) {
+    if (!data) return;
+    var el = document.getElementById('threshold-list');
+    if (!el) return;
+    var custom = data.customThresholds || {};
+    var def = parseFloat(data.defaultThreshold || 0.12);
+    var keys = Object.keys(custom);
+    if (!keys.length) {
+      el.innerHTML = '<div class="empty-state">Default: ' + (def * 100).toFixed(0) + '% for all coins</div>';
+      return;
+    }
+    var html = '<div style="color:#666;font-size:11px;margin-bottom:8px">Default: ' + (def * 100).toFixed(0) + '%</div>';
+    keys.forEach(function(sym) {
+      var pct = (parseFloat(custom[sym]) * 100).toFixed(1);
+      html += '<div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid #222">'
+        + '<span style="color:#aaa">' + sym.replace('-USD','') + '</span>'
+        + '<span style="color:white">' + pct + '%</span></div>';
+    });
+    el.innerHTML = html;
+  });
+}
+
 function saveSweepConfig() {
   var tog = $('sweep-enabled-toggle'), pct = $('sweep-pct-input'), min = $('sweep-min-input');
   fetch('/api/sweep/config', {
@@ -507,11 +530,12 @@ function loadTrailingStops() {
 function refreshAll() {
   var spinner = $('spinner');
   if (spinner) spinner.classList.add('active');
-  loadPortfolio();
-  loadSweep();
-  loadAlerts();
-  loadMonitorStatus();
-  loadTrailingStops();
+  try { loadPortfolio(); } catch(e){ console.error('loadPortfolio FAILED', e); }
+  try { loadSweep(); } catch(e){ console.error('loadSweep FAILED', e); }
+  try { loadThresholds(); } catch(e){ console.error('loadThresholds FAILED', e); }
+  try { loadAlerts(); } catch(e){ console.error('loadAlerts FAILED', e); }
+  try { loadMonitorStatus(); } catch(e){ console.error('loadMonitorStatus FAILED', e); }
+  try { loadTrailingStops(); } catch(e){ console.error('loadTrailingStops FAILED', e); }
   if (spinner) setTimeout(function() { spinner.classList.remove('active'); }, 3000);
 }
 
