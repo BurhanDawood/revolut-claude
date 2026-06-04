@@ -8212,10 +8212,12 @@ function createMcpServer() {
       const exchangeLabel = exchange === 'revolut' ? 'Revolut X' : 'Kraken';
       const displayQty    = value_usd ? `$${value_usd}` : `${formatTradeQty(volume)} ${coinBase}`;
 
+      // When only value_usd is given, estimate token quantity for display/journal purposes
+      const estBaseSize = volume || (value_usd && livePrice ? value_usd / livePrice : 0);
       if (exchange === 'revolut') {
-        pendingRevolutTrade = { symbol: sym, side, orderType: order_type, baseSize: volume || 0, valueUsd: value_usd || null, price: livePrice, valueUSD: tradeValueUSD, timestamp: Date.now(), source: 'claude_mcp' };
+        pendingRevolutTrade = { symbol: sym, side, orderType: order_type, baseSize: estBaseSize, valueUsd: value_usd || null, price: livePrice, valueUSD: tradeValueUSD, timestamp: Date.now(), source: 'claude_mcp', qtyEstimated: !volume && !!value_usd };
       } else {
-        pendingKrakenTrade = { symbol: sym, side, orderType: order_type, volume: volume || 0, price: livePrice, valueUSD: tradeValueUSD, timestamp: Date.now(), source: 'claude_mcp' };
+        pendingKrakenTrade = { symbol: sym, side, orderType: order_type, volume: estBaseSize, price: livePrice, valueUSD: tradeValueUSD, timestamp: Date.now(), source: 'claude_mcp', qtyEstimated: !volume && !!value_usd };
       }
 
       await sendTelegram(formatApprovalRequest(coinBase, side, volume || null, livePrice, tradeValueUSD, exchange));
@@ -9791,9 +9793,13 @@ app.post('/telegram-webhook', async (req, res) => {
             const result = await executeKrakenTrade(t.symbol, t.side, t.orderType, t.volume, t.price);
             const coinBase = t.symbol.replace('-USD', '');
             const krakenSource = t.source === 'claude_mcp' ? 'claude_mcp' : 'manual';
+            // Prefer explicit valueUSD; derive qty when volume was estimated from value_usd
+            const kQtyForJournal = parseFloat(t.volume) || (t.valueUSD && t.price ? t.valueUSD / t.price : 0);
+            const kValueUSD = t.valueUSD ? parseFloat(t.valueUSD) : (t.price * kQtyForJournal);
+            const kReasoning = 'Kraken trade approved via Telegram' + (t.qtyEstimated ? ' [qty estimated from value_usd]' : '');
             await db.execute(
               'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-              [coinBase, t.side, t.price, t.volume, t.valueUSD, 'Kraken trade approved via Telegram', 'confident', krakenSource]
+              [coinBase, t.side, t.price, kQtyForJournal, kValueUSD, kReasoning, 'confident', krakenSource]
             ).catch(e => console.error('[kraken] Journal insert failed:', e.message));
 
             // Tranche tracking
@@ -9801,14 +9807,14 @@ app.post('/telegram-webhook', async (req, res) => {
               await db.execute(
                 `INSERT INTO position_tranches (symbol, exchange, quantity, entry_price, entry_date, remaining_quantity, is_legacy, notes)
                  VALUES (?, 'kraken', ?, ?, NOW(), ?, 0, ?)`,
-                [coinBase, parseFloat(t.volume), t.price, parseFloat(t.volume), `Buy via Claude approval — Kraken`]
+                [coinBase, kQtyForJournal, t.price, kQtyForJournal, `Buy via Claude approval — Kraken`]
               ).catch(e => console.error('[tranches] Insert failed:', e.message));
             } else if (t.side.toLowerCase() === 'sell') {
-              await reduceTranches(coinBase, 'kraken', parseFloat(t.volume))
+              await reduceTranches(coinBase, 'kraken', kQtyForJournal)
                 .catch(e => console.error('[tranches] Reduce failed:', e.message));
             }
 
-            await sendTelegram(`${t.side === 'sell' ? '✅' : '🟢'} MCP ${t.side.toUpperCase()} ${formatTradeQty(t.volume)} ${coinBase} @ ${formatPrice(t.price)} = $${t.valueUSD?.toFixed(2)} 🦑 ✓`);
+            await sendTelegram(`${t.side === 'sell' ? '✅' : '🟢'} MCP ${t.side.toUpperCase()} ${formatTradeQty(kQtyForJournal)} ${coinBase} @ ${formatPrice(t.price)} = $${kValueUSD?.toFixed(2)} 🦑 ✓${t.qtyEstimated ? ' (qty est)' : ''}`);
           } catch (e) {
             await sendTelegram(`❌ Kraken trade failed: ${e.message}`);
           }
@@ -9827,16 +9833,19 @@ app.post('/telegram-webhook', async (req, res) => {
             const result = await placeRevolutOrder(t.symbol, t.side, t.orderType, t.baseSize, t.price, t.valueUsd);
             const coinBase = t.symbol.replace('-USD', '');
             const executedPrice = t.price || await getCurrentPrice(t.symbol).catch(() => 0) || 0;
-            const valueUSD = executedPrice * parseFloat(t.baseSize);
+            // Prefer explicit value_usd for value; derive quantity from it when baseSize was estimated
+            const qtyForJournal = parseFloat(t.baseSize) || (t.valueUsd && executedPrice ? t.valueUsd / executedPrice : 0);
+            const valueUSD = t.valueUsd ? parseFloat(t.valueUsd) : (executedPrice * qtyForJournal);
 
             // Check for matching trade intention
             const matchedIntention = await findMatchingIntention(t.symbol, t.side);
-            const reasoning = matchedIntention ? matchedIntention.reasoning : 'Revolut X trade approved via Telegram';
+            const baseReasoning = matchedIntention ? matchedIntention.reasoning : 'Revolut X trade approved via Telegram';
+            const reasoning = t.qtyEstimated ? baseReasoning + ' [qty estimated from value_usd]' : baseReasoning;
 
             const revolutSource = t.source === 'claude_mcp' ? 'claude_mcp' : 'manual';
             await db.execute(
               'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-              [coinBase, t.side, executedPrice, t.baseSize, valueUSD, reasoning, 'confident', revolutSource]
+              [coinBase, t.side, executedPrice, qtyForJournal, valueUSD, reasoning, 'confident', revolutSource]
             ).catch(e => console.error('[revolut] Journal insert failed:', e.message));
 
             if (matchedIntention) {
@@ -9849,8 +9858,8 @@ app.post('/telegram-webhook', async (req, res) => {
               const existingEntry = entryPrices.get(t.symbol);
               const isCycleBuyback = prevQty === 0 && existingEntry != null;
               if (existingEntry && prevQty > 0) {
-                const newQty = prevQty + parseFloat(t.baseSize);
-                const newAvgEntry = ((prevQty * existingEntry) + (parseFloat(t.baseSize) * executedPrice)) / newQty;
+                const newQty = prevQty + qtyForJournal;
+                const newAvgEntry = ((prevQty * existingEntry) + (qtyForJournal * executedPrice)) / newQty;
                 await updateEntryPrice(t.symbol, newAvgEntry, false);
               } else if (isCycleBuyback) {
                 await updateEntryPrice(t.symbol, executedPrice, true);
@@ -9864,15 +9873,15 @@ app.post('/telegram-webhook', async (req, res) => {
               await db.execute(
                 `INSERT INTO position_tranches (symbol, exchange, quantity, entry_price, entry_date, remaining_quantity, is_legacy, notes)
                  VALUES (?, 'revolut', ?, ?, NOW(), ?, 0, ?)`,
-                [coinBase, parseFloat(t.baseSize), executedPrice, parseFloat(t.baseSize),
+                [coinBase, qtyForJournal, executedPrice, qtyForJournal,
                  `Buy via Claude approval — Order ${result?.client_order_id || 'unknown'}`]
               ).catch(e => console.error('[tranches] Insert failed:', e.message));
             } else if (t.side.toLowerCase() === 'sell') {
-              await reduceTranches(coinBase, 'revolut', parseFloat(t.baseSize))
+              await reduceTranches(coinBase, 'revolut', qtyForJournal)
                 .catch(e => console.error('[tranches] Reduce failed:', e.message));
             }
 
-            await sendTelegram(`${t.side === 'sell' ? '✅' : '🟢'} MCP ${t.side.toUpperCase()} ${formatTradeQty(t.baseSize)} ${coinBase} @ ${formatPrice(executedPrice)} = $${valueUSD.toFixed(2)} 🔄 ✓`);
+            await sendTelegram(`${t.side === 'sell' ? '✅' : '🟢'} MCP ${t.side.toUpperCase()} ${formatTradeQty(qtyForJournal)} ${coinBase} @ ${formatPrice(executedPrice)} = $${valueUSD.toFixed(2)} 🔄 ✓${t.qtyEstimated ? ' (qty est)' : ''}`);
 
             // USDT sweep — convert a % of sell proceeds to USDT for dry-powder reserves
             if (t.side.toLowerCase() === 'sell') {
@@ -11504,16 +11513,7 @@ app.patch('/api/activity/:id', async (req, res) => {
   try {
     const id        = parseInt(req.params.id);
     const { action, reasoning, emotion } = req.body;
-    if (!id || !action) return res.status(400).json({ error: 'id and action required' });
-
-    await db.execute(
-      `UPDATE trading_journal
-       SET action = ?, reasoning = ?, emotion = COALESCE(?, emotion), updated_at = NOW()
-       WHERE id = ?`,
-      [action, reasoning || null, emotion || null, id]
-    );
-
-    // If corrected to 'payment' — deduct from invested capital
+       // If corrected to 'payment' — deduct from invested capital
     if (action === 'payment') {
       const [[trade]] = await db.execute('SELECT value_usd FROM trading_journal WHERE id = ?', [id]);
       if (trade?.value_usd) {
