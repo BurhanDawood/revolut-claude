@@ -110,6 +110,7 @@ function loadPortfolio() {
 
     var tangemVal = 0, tangemXRP = 0, tangemPrice = 0, tangemEntry = 2.65;
     if (data.tangem) {
+      console.log('[tangem] raw object=', data.tangem);
       tangemVal = parseFloat(data.tangem.valueUSD || 0);
       tangemXRP = parseFloat(data.tangem.balance || 0);
       tangemPrice = tangemXRP > 0 ? tangemVal / tangemXRP : 0;
@@ -208,7 +209,12 @@ function loadPortfolio() {
 // ── USDT Sweep ────────────────────────────────────────────────────
 
 function loadSweep() {
-  fetchData('/api/sweep/config').then(function(data) {
+  var url = '/api/sweep/config';
+  fetch(url).then(function(r) {
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return r.json();
+  }).then(function(data) {
+    console.log('[sweep] url=' + url + ' resp=', data);
     if (!data) return;
     hideEl('sweep-loading'); showEl('sweep-content');
     var tog = $('sweep-enabled-toggle'), pct = $('sweep-pct-input');
@@ -218,6 +224,36 @@ function loadSweep() {
     if (min) min.value = data.min_trade_value_usd || 10;
     if (bal) bal.textContent = '$' + parseFloat(data.usdt_reserve || 0).toFixed(2);
     if (lbl) lbl.textContent = (data.enabled !== false) ? 'ON' : 'OFF';
+  }).catch(function(e) {
+    console.error('[sweep] FAILED:', e);
+    var sc = $('sweep-content');
+    if (sc) sc.textContent = 'Error: ' + e.message;
+  });
+}
+
+function loadThresholds() {
+  var url = '/api/thresholds';
+  fetch(url).then(function(r) {
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return r.json();
+  }).then(function(data) {
+    console.log('[thresholds] url=' + url + ' resp=', data);
+    var el = $('threshold-list');
+    if (!el || !data) return;
+    var thresholds = data.customThresholds || data.thresholds || data || {};
+    var keys = Object.keys(thresholds);
+    if (!keys.length) { el.innerHTML = '<div class="empty-state">No custom thresholds set</div>'; return; }
+    var html = '';
+    keys.forEach(function(sym) {
+      html += '<div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #222">'
+        + '<span style="color:#aaa">' + sym + '</span>'
+        + '<span style="color:white">' + (parseFloat(thresholds[sym]) * 100).toFixed(1) + '%</span></div>';
+    });
+    el.innerHTML = html;
+  }).catch(function(e) {
+    console.error('[thresholds] FAILED:', e);
+    var tc = $('threshold-list');
+    if (tc) tc.textContent = 'Error: ' + e.message;
   });
 }
 
@@ -509,6 +545,44 @@ function refreshAll() {
   if (spinner) spinner.classList.add('active');
   loadPortfolio();
   loadSweep();
+  loadThresholds();
+  loadAlerts();
+  loadMonitorStatus();
+  loadTrailingStops();
+  if (spinner) setTimeout(function() { spinner.classList.remove('active'); }, 3000);
+}
+
+// ── Init ──────────────────────────────────────────────────────────
+
+document.addEventListener('DOMContentLoaded', function() {
+  console.log('Dashboard v' + DASHBOARD_VERSION + ' initialising');
+  refreshAll();
+  setInterval(refreshAll, 5 * 60 * 1000);
+});
+l-summary-list');
+    if (!stops.length || !Array.isArray(stops)) return;
+    if (summaryEl) summaryEl.style.display = '';
+    if (!listEl) return;
+    var html = '';
+    stops.forEach(function(s) {
+      html += '<div class="trail-summary-row">'
+        + '<span class="trail-summary-coin">' + (s.symbol || s.coin) + '</span>'
+        + '<span class="trail-summary-detail">' + (s.trail_pct || s.trailPct || '—') + '% trail</span>'
+        + '<span class="trail-summary-stop">Stop: ' + fmtPrice(s.stop_price || s.stopPrice) + '</span>'
+        + '</div>';
+    });
+    listEl.innerHTML = html;
+  });
+}
+
+// ── Full refresh ──────────────────────────────────────────────────
+
+function refreshAll() {
+  var spinner = $('spinner');
+  if (spinner) spinner.classList.add('active');
+  loadPortfolio();
+  loadSweep();
+  loadThresholds();
   loadAlerts();
   loadMonitorStatus();
   loadTrailingStops();
