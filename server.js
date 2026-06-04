@@ -524,6 +524,19 @@ await db.execute(`CREATE TABLE IF NOT EXISTS coin_cash_flows (
 )`);
 await db.execute(`CREATE INDEX IF NOT EXISTS idx_cash_flows_symbol ON coin_cash_flows(symbol)`).catch(() => {});
 
+await db.execute(`CREATE TABLE IF NOT EXISTS dev_log (
+  id INT PRIMARY KEY AUTO_INCREMENT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  source VARCHAR(32) DEFAULT 'bryan',
+  category VARCHAR(32) DEFAULT 'note',
+  status VARCHAR(20) DEFAULT 'open',
+  title VARCHAR(255) NOT NULL,
+  detail TEXT,
+  related_symbol VARCHAR(20),
+  resolved_at TIMESTAMP NULL
+)`).catch(e => console.error('[migration] dev_log:', e.message));
+
 await db.execute(`CREATE TABLE IF NOT EXISTS swing_cooldowns (
   symbol VARCHAR(50) PRIMARY KEY,
   last_alert_at TIMESTAMP NOT NULL,
@@ -7454,7 +7467,7 @@ function createMcpServer() {
   server.tool('get_trading_data',
     'Get trading journal entries, active alerts, trader context/profile, and rebalancing history',
     {
-      include: z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'all'])).optional()
+      include: z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'all'])).optional()
         .describe('What data to fetch — defaults to all'),
       symbol: z.string().optional().describe('Filter journal by coin e.g. NEAR'),
       limit:  z.number().optional().describe('Max journal entries to return, default 10'),
@@ -7517,6 +7530,18 @@ function createMcpServer() {
           const s = stats[0];
           result.rebalancing = { history: rows, accuracy: s.total > 0 ? Math.round(s.good / s.total * 100) + '%' : 'No completed rebalances yet', stats: s };
         } catch (e) { result.rebalancing = { error: e.message }; }
+      }
+
+      if (fetchAll || fetch.includes('dev_log')) {
+        try {
+          const [devRows] = await db.execute(
+            `SELECT id, created_at, updated_at, source, category, status, title, detail, related_symbol, resolved_at
+             FROM dev_log
+             ORDER BY CASE status WHEN 'open' THEN 0 WHEN 'in_progress' THEN 1 ELSE 2 END, created_at DESC
+             LIMIT 30`
+          );
+          result.dev_log = devRows;
+        } catch (e) { result.dev_log = { error: e.message }; }
       }
 
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
@@ -7598,7 +7623,7 @@ function createMcpServer() {
   server.tool('manage_trading',
     'Log journal entries, trade intentions, trader preferences, update invested capital, or configure USDT sweep',
     {
-      action:                 z.enum(['log_journal', 'log_intention', 'save_preference', 'update_capital', 'configure_sweep', 'configure_auto_execute']).describe('What trading action to perform'),
+      action:                 z.enum(['log_journal', 'log_intention', 'save_preference', 'update_capital', 'configure_sweep', 'configure_auto_execute', 'log_dev_issue']).describe('What trading action to perform'),
       symbol:                 z.string().optional().describe('Coin e.g. NEAR-USD or NEAR'),
       trade_action:           z.enum(['buy', 'sell', 'hold', 'add', 'reduce', 'payment', 'transfer']).optional().describe('Trade action for log_journal or log_intention'),
       price:                  z.number().optional().describe('Price for log_journal'),
@@ -7622,8 +7647,15 @@ function createMcpServer() {
       require_confidence:     z.enum(['High', 'Medium', 'Low']).optional().describe('Minimum Claude confidence level to auto-execute'),
       cooldown_minutes:       z.number().optional().describe('Minutes to wait between auto-executions for same coin'),
       hodl_symbols:           z.array(z.string()).optional().describe('Coins where AI analyses only and never auto-executes — Bryan decides. e.g. ["ENA","INJ","ALGO"]'),
+      title:                  z.string().optional().describe('Title for log_dev_issue (required when creating)'),
+      detail:                 z.string().optional().describe('Detail/description for log_dev_issue'),
+      category:               z.string().optional().describe('Category for log_dev_issue e.g. bug, feature, note'),
+      status:                 z.string().optional().describe('Status for log_dev_issue: open, in_progress, resolved'),
+      source:                 z.string().optional().describe('Source author for log_dev_issue, defaults to developer'),
+      related_symbol:         z.string().optional().describe('Related coin symbol for log_dev_issue e.g. NEAR'),
+      dev_log_id:             z.number().optional().describe('Dev log row id to update (omit to create new)'),
     },
-    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, max_buy_usd, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam }) => {
+    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, max_buy_usd, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam, title, detail, category, status: devStatus, source: devSource, related_symbol: relSymbol, dev_log_id }) => {
       // Make hodl_symbols accessible in configure_auto_execute via params object
       const params = { hodl_symbols: hodlSymbolsParam };
 
@@ -7765,6 +7797,32 @@ function createMcpServer() {
         ).catch(() => {});
 
         return { content: [{ type: 'text', text: JSON.stringify({ ok: true, synced: synced.length, failed: failed.length, results }) }] };
+
+      } else if (action === 'log_dev_issue') {
+        if (dev_log_id) {
+          // UPDATE existing row
+          const sets = [];
+          const vals = [];
+          if (devStatus !== undefined) { sets.push('status = ?'); vals.push(devStatus); }
+          if (detail    !== undefined) { sets.push('detail = ?'); vals.push(detail); }
+          if (category  !== undefined) { sets.push('category = ?'); vals.push(category); }
+          if (relSymbol !== undefined) { sets.push('related_symbol = ?'); vals.push(relSymbol); }
+          if (devStatus === 'resolved') { sets.push('resolved_at = NOW()'); }
+          if (!sets.length) return { content: [{ type: 'text', text: JSON.stringify({ error: 'Nothing to update — provide status or detail' }) }] };
+          vals.push(dev_log_id);
+          await db.execute(`UPDATE dev_log SET ${sets.join(', ')} WHERE id = ?`, vals);
+          const [updated] = await db.execute('SELECT * FROM dev_log WHERE id = ?', [dev_log_id]);
+          return { content: [{ type: 'text', text: JSON.stringify({ ok: true, dev_log_id, action: 'updated', row: updated[0] }) }] };
+        } else {
+          // INSERT new row
+          if (!title) return { content: [{ type: 'text', text: JSON.stringify({ error: 'title is required to create a dev log entry' }) }] };
+          const [res] = await db.execute(
+            `INSERT INTO dev_log (title, detail, category, status, source, related_symbol)
+             VALUES (?, ?, ?, ?, ?, ?)`,
+            [title, detail || null, category || 'note', devStatus || 'open', devSource || 'developer', relSymbol || null]
+          );
+          return { content: [{ type: 'text', text: JSON.stringify({ ok: true, dev_log_id: res.insertId, action: 'created', title }) }] };
+        }
       }
     }
   );
