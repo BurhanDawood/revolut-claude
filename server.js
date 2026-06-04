@@ -266,6 +266,7 @@ let briefingInProgress = false;
 let lastMacroNewsCallTime = 0; // separate rate-limit for macro news Claude calls (1 hour)
 let learningModelCache = ''; // updated by updateLearningModel()
 const pendingJournalState = new Map(); // chatId -> { journalId, step: 'emotion'|'followed', hasClaudeRec, claudeRec, symbol }
+let pendingJournalDelete = null; // { id, summary, expiresAt } — admin two-step delete guard
 const pendingTradeContext = new Map(); // symbol -> { journalId, detectedAt, timeoutHandle, action, price, valueUsd, qty }
 const pendingRebalanceConfirm = new Map(); // chatId -> { sellSymbol, sellJournalId, sellPrice, sellValueUsd, buySymbol, buyJournalId, buyPrice, buyValueUsd }
 const previousBalances = new Map(); // symbol -> quantity (DB-backed)
@@ -7169,6 +7170,33 @@ app.post('/api/entryprices/:symbol', async (req, res) => {
   res.json({ ok: true, symbol, entry_price });
 });
 
+// GET /api/sweep/config — USDT sweep configuration for dashboard
+app.get('/api/sweep/config', async (req, res) => {
+  try {
+    const [rows] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'usdt_sweep_config'");
+    const cfg = rows.length ? JSON.parse(rows[0].config_value) : { enabled: false, sweep_pct: 25, min_trade_value_usd: 10 };
+    // Add current USDT balance as usdt_reserve so dashboard can show it
+    const usdtBal = lastKnownUSDT || 0;
+    res.json({ ...cfg, usdt_reserve: usdtBal });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/sweep/config — save USDT sweep configuration
+app.post('/api/sweep/config', async (req, res) => {
+  try {
+    const { enabled, sweep_pct, min_trade_value_usd, excluded_symbols } = req.body;
+    const [existing] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'usdt_sweep_config'");
+    const current = existing.length ? JSON.parse(existing[0].config_value) : {};
+    const updated = { ...current, enabled: enabled !== false, sweep_pct: sweep_pct || 25, min_trade_value_usd: min_trade_value_usd || 10, excluded_symbols: excluded_symbols || current.excluded_symbols || [] };
+    await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('usdt_sweep_config', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)", [JSON.stringify(updated)]);
+    res.json({ ok: true, config: updated });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // GET /api/thresholds — all custom daily thresholds
 app.get('/api/thresholds', (req, res) => {
   res.json({ customThresholds, defaultThreshold: PUMP_THRESHOLD });
@@ -8329,11 +8357,18 @@ app.get('/portfolio/summary', async (req, res) => {
 
     // Enrich with Kraken, Tangem, USD/USDT cash for full grand total
     let krakenTotal = 0, tangemValue = 0, cashUSD = 0, cashUSDT = 0;
+    let tangemObj = null;
     try { const kd = await getKrakenBalances(); krakenTotal = kd.totalUSD || 0; } catch (e) { /* ignore */ }
     try {
       const xrpBal = await getTangemXRPBalance();
       const xrpPx  = priceMap['XRP-USD'] || priceMap['XRP/USD'] || 0;
-      if (xrpBal && xrpPx) tangemValue = xrpBal * xrpPx;
+      if (xrpBal && xrpPx) {
+        tangemValue = xrpBal * xrpPx;
+        const plPct = ((xrpPx - TANGEM_XRP_ENTRY) / TANGEM_XRP_ENTRY * 100);
+        const plUsd = (xrpPx - TANGEM_XRP_ENTRY) * xrpBal;
+        // structured tangem object for dashboard.js data.tangem.* access
+        tangemObj = { balance: xrpBal, price: xrpPx, valueUSD: tangemValue, entryPrice: TANGEM_XRP_ENTRY, unrealisedPnlPct: plPct, unrealisedPnlUsd: plUsd, address: TANGEM_XRP_ADDRESS };
+      }
     } catch (e) { /* ignore */ }
     const usdAsset  = balancesRaw.find(b => b.currency === 'USD');
     const usdtAsset = balancesRaw.find(b => b.currency === 'USDT');
@@ -8347,6 +8382,7 @@ app.get('/portfolio/summary', async (req, res) => {
       grand_total_usd: grandTotal.toFixed(2),
       kraken_total_usd: krakenTotal.toFixed(2),
       tangem_value_usd: tangemValue.toFixed(2),
+      tangem: tangemObj,    // structured object with balance/valueUSD/entryPrice for dashboard
       cash_usd: cashUSD.toFixed(2),
       cash_usdt: cashUSDT.toFixed(2),
       invested: cap.invested,
@@ -8809,6 +8845,80 @@ app.post('/telegram-webhook', async (req, res) => {
         body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML' })
       });
     };
+
+    // ── Admin journal delete — two-step guarded command ───────────────────────
+    // Authorized chat only: TELEGRAM_CHAT_ID (same constant the bot always uses)
+    const isAuthorizedAdmin = chatId.toString() === TELEGRAM_CHAT_ID.toString();
+
+    // Step 4: implicit cancel — if a delete is armed and this message is NOT the
+    // confirmation, cancel it BEFORE normal routing so other commands still work.
+    if (pendingJournalDelete && isAuthorizedAdmin) {
+      if (commandText !== 'admin confirm delete') {
+        const cancelledId = pendingJournalDelete.id;
+        pendingJournalDelete = null;
+        await sendReply(`Delete cancelled (row ${cancelledId} is safe).`);
+        // fall through — do not return; let the actual command still execute below
+      }
+    }
+
+    // Step 2: arm — "admin del journal <id>"
+    const adminDelMatch = commandText.match(/^admin\s+del\s+journal\s+(\d+)$/i);
+    if (adminDelMatch) {
+      if (!isAuthorizedAdmin) { await sendReply('Unauthorized'); return res.status(200).json({ ok: true }); }
+      const rowId = parseInt(adminDelMatch[1], 10);
+      if (!Number.isInteger(rowId) || rowId <= 0) {
+        await sendReply('Usage: admin del journal &lt;id&gt;');
+        return res.status(200).json({ ok: true });
+      }
+      try {
+        const [rows] = await db.execute(
+          'SELECT id, symbol, action, price, quantity, value_usd, reasoning, created_at FROM trading_journal WHERE id = ? LIMIT 1',
+          [rowId]
+        );
+        if (!rows.length) {
+          pendingJournalDelete = null;
+          await sendReply(`No journal row with id ${rowId}.`);
+          return res.status(200).json({ ok: true });
+        }
+        const r = rows[0];
+        const summary = `${r.action} ${r.symbol} qty=${r.quantity} price=${r.price} val=$${r.value_usd} @ ${r.created_at}`;
+        pendingJournalDelete = { id: rowId, summary, expiresAt: Date.now() + 60000 };
+        await sendReply(
+          `<b>Journal row ${rowId}:</b>\n` +
+          `Action: ${r.action} | Symbol: ${r.symbol}\n` +
+          `Price: ${r.price} | Qty: ${r.quantity} | Value: $${r.value_usd}\n` +
+          `Reasoning: ${r.reasoning || '—'}\n` +
+          `Created: ${r.created_at}\n\n` +
+          `Reply '<b>admin confirm delete</b>' within 60s to permanently delete this row. Reply anything else to cancel.`
+        );
+      } catch (e) {
+        console.error('[admin] del journal lookup error:', e.message);
+        await sendReply('Error fetching row: ' + e.message);
+      }
+      return res.status(200).json({ ok: true });
+    }
+
+    // Step 3: confirm — "admin confirm delete"
+    if (commandText === 'admin confirm delete') {
+      if (!isAuthorizedAdmin) { await sendReply('Unauthorized'); return res.status(200).json({ ok: true }); }
+      if (!pendingJournalDelete || Date.now() > pendingJournalDelete.expiresAt) {
+        pendingJournalDelete = null;
+        await sendReply('No pending delete (expired or none armed).');
+        return res.status(200).json({ ok: true });
+      }
+      const { id: deleteId, summary: deleteSummary } = pendingJournalDelete;
+      pendingJournalDelete = null;
+      try {
+        const [result] = await db.execute('DELETE FROM trading_journal WHERE id = ?', [deleteId]);
+        console.log(`[admin] journal row deleted id=${deleteId} affectedRows=${result.affectedRows}`);
+        await sendReply(`Deleted journal row ${deleteId} (${deleteSummary}). affectedRows=${result.affectedRows}`);
+      } catch (e) {
+        console.error('[admin] del journal execute error:', e.message);
+        await sendReply('Delete failed: ' + e.message);
+      }
+      return res.status(200).json({ ok: true });
+    }
+    // ─────────────────────────────────────────────────────────────────────────
 
     // --- Alert reply shortcuts: coin-prefixed ('xlm 1') or plain number ('1') ---
     const chatIdStr = chatId.toString();
