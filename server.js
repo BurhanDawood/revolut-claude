@@ -7378,9 +7378,12 @@ function createMcpServer() {
   server.tool('get_prices', 'Get current crypto prices',
     { symbol: z.string().describe('Trading pair e.g. BTC-USD') },
     async ({ symbol }) => {
-      const data = await revolutRequest('GET', '/market/tickers');
-      const ticker = Array.isArray(data) ? data.find(t => t.symbol === symbol) : data;
-      return { content: [{ type: 'text', text: JSON.stringify(ticker || data, null, 2) }] };
+      var sym = symbol.includes('-USD') ? symbol.toUpperCase() : symbol.toUpperCase() + '-USD';
+      var price = await getCurrentPrice(sym).catch(function(){ return null; });
+      if (price === null || price === undefined) {
+        return { content: [{ type: 'text', text: JSON.stringify({ symbol: sym, error: 'Price unavailable from Revolut X or Kraken' }) }] };
+      }
+      return { content: [{ type: 'text', text: JSON.stringify({ symbol: sym, price: price, source: 'live' }) }] };
     }
   );
 
