@@ -7671,17 +7671,13 @@ function createMcpServer() {
             `SELECT id FROM trading_journal
              WHERE symbol IN (?, ?)
              AND action = ?
-             AND created_at > DATE_SUB(NOW(), INTERVAL 15 MINUTE)
-             AND (
-               (? IS NOT NULL AND ABS(CAST(quantity AS DECIMAL(20,8)) - ?) < 0.01)
-               OR
-               (? IS NOT NULL AND ABS(CAST(price AS DECIMAL(20,10)) - ?) < (? * 0.01 + 0.000001))
-             )
+             AND ? IS NOT NULL
+             AND ABS(CAST(quantity AS DECIMAL(20,8)) - ?) < 0.0001
+             AND created_at > DATE_SUB(NOW(), INTERVAL 6 HOUR)
              ORDER BY created_at DESC
              LIMIT 1`,
             [coinBase, sym, trade_action,
-             quantity ?? null, quantity ?? null,
-             price ?? null, price ?? null, price ?? null]
+             quantity ?? null, quantity ?? null]
           );
           if (dupe.length > 0) existingId = dupe[0].id;
         } catch (e) {
