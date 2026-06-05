@@ -524,6 +524,29 @@ await db.execute(`CREATE TABLE IF NOT EXISTS coin_cash_flows (
 )`);
 await db.execute(`CREATE INDEX IF NOT EXISTS idx_cash_flows_symbol ON coin_cash_flows(symbol)`).catch(() => {});
 
+await db.execute(`CREATE TABLE IF NOT EXISTS session_state (
+  id INT PRIMARY KEY AUTO_INCREMENT,
+  active_workstream TEXT,
+  progress JSON,
+  open_threads JSON,
+  next_action TEXT,
+  recent_decisions JSON,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+)`).catch(e => console.error('[migration] session_state:', e.message));
+
+await db.execute(`CREATE TABLE IF NOT EXISTS session_history (
+  id INT PRIMARY KEY AUTO_INCREMENT,
+  snapshot JSON,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)`).catch(e => console.error('[migration] session_history:', e.message));
+
+// Seed exactly one current row if none exists
+await db.execute(
+  `INSERT INTO session_state (id, active_workstream, progress, open_threads, next_action, recent_decisions)
+   SELECT 1, NULL, NULL, NULL, NULL, NULL
+   WHERE NOT EXISTS (SELECT 1 FROM session_state WHERE id = 1)`
+).catch(e => console.error('[migration] session_state seed:', e.message));
+
 await db.execute(`CREATE TABLE IF NOT EXISTS dev_log (
   id INT PRIMARY KEY AUTO_INCREMENT,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -536,6 +559,29 @@ await db.execute(`CREATE TABLE IF NOT EXISTS dev_log (
   related_symbol VARCHAR(20),
   resolved_at TIMESTAMP NULL
 )`).catch(e => console.error('[migration] dev_log:', e.message));
+
+await db.execute(`CREATE TABLE IF NOT EXISTS session_state (
+  id INT PRIMARY KEY AUTO_INCREMENT,
+  active_workstream TEXT,
+  progress JSON,
+  open_threads JSON,
+  next_action TEXT,
+  recent_decisions JSON,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+)`).catch(e => console.error('[migration] session_state:', e.message));
+
+await db.execute(`CREATE TABLE IF NOT EXISTS session_history (
+  id INT PRIMARY KEY AUTO_INCREMENT,
+  snapshot JSON,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)`).catch(e => console.error('[migration] session_history:', e.message));
+
+// Seed exactly one current row if none exists
+await db.execute(
+  `INSERT INTO session_state (id, active_workstream, progress, open_threads, next_action, recent_decisions)
+   SELECT 1, NULL, NULL, NULL, NULL, NULL
+   WHERE NOT EXISTS (SELECT 1 FROM session_state WHERE id = 1)`
+).catch(e => console.error('[migration] session_state seed:', e.message));
 
 await db.execute(`CREATE TABLE IF NOT EXISTS swing_cooldowns (
   symbol VARCHAR(50) PRIMARY KEY,
@@ -7626,7 +7672,7 @@ function createMcpServer() {
   server.tool('manage_trading',
     'Log journal entries, trade intentions, trader preferences, update invested capital, or configure USDT sweep',
     {
-      action:                 z.enum(['log_journal', 'log_intention', 'save_preference', 'update_capital', 'configure_sweep', 'configure_auto_execute', 'log_dev_issue']).describe('What trading action to perform'),
+      action:                 z.enum(['log_journal', 'log_intention', 'save_preference', 'update_capital', 'configure_sweep', 'configure_auto_execute', 'log_dev_issue', 'update_session_state']).describe('What trading action to perform'),
       symbol:                 z.string().optional().describe('Coin e.g. NEAR-USD or NEAR'),
       trade_action:           z.enum(['buy', 'sell', 'hold', 'add', 'reduce', 'payment', 'transfer']).optional().describe('Trade action for log_journal or log_intention'),
       price:                  z.number().optional().describe('Price for log_journal'),
@@ -7657,8 +7703,14 @@ function createMcpServer() {
       source:                 z.string().optional().describe('Source author for log_dev_issue, defaults to developer'),
       related_symbol:         z.string().optional().describe('Related coin symbol for log_dev_issue e.g. NEAR'),
       dev_log_id:             z.number().optional().describe('Dev log row id to update (omit to create new)'),
+      active_workstream:      z.string().optional().describe('Current active workstream for update_session_state'),
+      progress:               z.any().optional().describe('Progress object for update_session_state'),
+      open_threads:           z.any().optional().describe('Open threads array for update_session_state'),
+      next_action:            z.string().optional().describe('Next recommended action for update_session_state'),
+      recent_decision:        z.string().optional().describe('Single new decision to prepend to recent_decisions list (update_session_state)'),
+      recent_decisions:       z.array(z.string()).optional().describe('Full recent_decisions array replacement, capped at 5 (update_session_state)'),
     },
-    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, max_buy_usd, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam, title, detail, category, status: devStatus, source: devSource, related_symbol: relSymbol, dev_log_id }) => {
+    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, max_buy_usd, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam, title, detail, category, status: devStatus, source: devSource, related_symbol: relSymbol, dev_log_id, active_workstream, progress, open_threads, next_action, recent_decision, recent_decisions }) => {
       // Make hodl_symbols accessible in configure_auto_execute via params object
       const params = { hodl_symbols: hodlSymbolsParam };
 
@@ -7862,6 +7914,43 @@ function createMcpServer() {
           );
           return { content: [{ type: 'text', text: JSON.stringify({ ok: true, dev_log_id: res.insertId, action: 'created', title }) }] };
         }
+
+      } else if (action === 'update_session_state') {
+        const [curRows] = await db.execute('SELECT * FROM session_state WHERE id = 1');
+        const cur = curRows[0] || {};
+
+        function parseJ(v, fallback) {
+          if (v === null || v === undefined) return fallback;
+          try { return typeof v === 'string' ? JSON.parse(v) : v; } catch (e) { return fallback; }
+        }
+
+        const newWorkstream   = (active_workstream !== undefined && active_workstream !== null) ? active_workstream : cur.active_workstream;
+        const newProgress     = (progress     !== undefined && progress     !== null) ? progress     : parseJ(cur.progress,     null);
+        const newOpenThreads  = (open_threads !== undefined && open_threads !== null) ? open_threads : parseJ(cur.open_threads, null);
+        const newNextAction   = (next_action  !== undefined && next_action  !== null) ? next_action  : cur.next_action;
+
+        let decisions = parseJ(cur.recent_decisions, []);
+        if (!Array.isArray(decisions)) decisions = [];
+        if (recent_decision) {
+          decisions.unshift(recent_decision);
+          decisions = decisions.slice(0, 5);
+        } else if (recent_decisions !== undefined && recent_decisions !== null) {
+          decisions = Array.isArray(recent_decisions) ? recent_decisions.slice(0, 5) : decisions;
+        }
+
+        await db.execute(
+          `UPDATE session_state SET active_workstream = ?, progress = ?, open_threads = ?, next_action = ?, recent_decisions = ? WHERE id = 1`,
+          [newWorkstream,
+           newProgress     !== null ? JSON.stringify(newProgress)    : null,
+           newOpenThreads  !== null ? JSON.stringify(newOpenThreads) : null,
+           newNextAction,
+           JSON.stringify(decisions)]
+        );
+
+        const [snapRows] = await db.execute('SELECT * FROM session_state WHERE id = 1');
+        await db.execute('INSERT INTO session_history (snapshot) VALUES (?)', [JSON.stringify(snapRows[0] || {})]);
+
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, action: 'update_session_state', updated: snapRows[0] || {} }) }] };
       }
     }
   );
@@ -8170,6 +8259,8 @@ function createMcpServer() {
       const [recentTrades]   = await db.execute('SELECT * FROM trading_journal ORDER BY created_at DESC LIMIT 5');
       const [intentionRows]  = await db.execute('SELECT * FROM intention_tracking ORDER BY intention_date DESC LIMIT 3');
       const [configRows]     = await db.execute('SELECT config_key, config_value FROM system_config');
+      const [sessionRows]    = await db.execute('SELECT * FROM session_state WHERE id = 1');
+      const sessionState     = sessionRows[0] || null;
       const [statsRows]      = await db.execute(
         `SELECT
            COUNT(*) AS total_completed,
@@ -8189,6 +8280,7 @@ function createMcpServer() {
         recentIntentions:  intentionRows,
         tradingStats: { totalCompleted, winRate: winRate ? `${winRate}%` : 'n/a' },
         systemConfig:      configRows,
+        working_notes_unverified: sessionState,
       };
       console.log('[mcp] get_context called');
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
