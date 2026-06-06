@@ -5043,6 +5043,12 @@ async function autoExecuteSell(symbol, maxPct, analysis, confidence) {
     const sellQty = currentQty * (maxPct / 100);
     const valueUSD = sellQty * currentPrice;
 
+    // Dust guard: skip if the sell is negligible
+    if (sellQty <= 0 || !isFinite(sellQty) || valueUSD < 1) {
+      await sendTelegram('⚠️ AUTO-EXEC skipped: ' + coinBase + ' position is dust (qty ' + currentQty + ', sell value $' + (valueUSD || 0).toFixed(4) + '). Nothing to sell.');
+      return;
+    }
+
     await db.execute(
       `INSERT INTO trade_intentions (symbol, action, reasoning, emotion, expires_at) VALUES (?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL 1 HOUR))`,
       [symbol, 'sell', `AI auto-execution [${confidence}]: ${analysis.substring(0, 150)}`, 'confident']
@@ -5139,6 +5145,12 @@ async function autoExecuteKrakenSell(symbol, maxPct, analysis, confidence) {
 
     const sellQty = currentQty * (maxPct / 100);
     const valueUSD = sellQty * currentPrice;
+
+    // Dust guard: skip if the sell is negligible
+    if (sellQty <= 0 || !isFinite(sellQty) || valueUSD < 1) {
+      await sendTelegram('⚠️ AUTO-EXEC skipped: ' + coinBase + ' Kraken position is dust (qty ' + currentQty + ', sell value $' + (valueUSD || 0).toFixed(4) + '). Nothing to sell.');
+      return;
+    }
 
     await db.execute(
       `INSERT INTO trade_intentions (symbol, action, reasoning, emotion, expires_at) VALUES (?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL 1 HOUR))`,
