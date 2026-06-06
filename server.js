@@ -1218,22 +1218,32 @@ set_auto_trade_rule, get_auto_rules, get_prices
   console.error('[config] Failed to seed project_description:', e.message);
 }
 
-// Seed AI auto-execute config — preserve existing settings but add hodl_symbols if missing
+// Seed AI auto-execute config — preserve existing settings but add hodl_symbols / manual_only_symbols if missing
 try {
   const [existingAE] = await db.execute(
     "SELECT config_value FROM system_config WHERE config_key = 'ai_auto_execute'"
   );
-  const defaultHodl = ['ENA','JTO','RENDER','INJ','FET','ALGO','AVAX','ADA','HBAR','ILV','PYTH','SUPER','SEI','MOG','HFT','CRO','FLR','POL','XLM','BONK'];
+  const defaultHodl       = ['ENA','JTO','RENDER','INJ','FET','ALGO','AVAX','ADA','HBAR','ILV','PYTH','SUPER','SEI','MOG','HFT','CRO','FLR','POL','XLM','BONK'];
+  const defaultManualOnly = ['CC','XRP','NEAR'];
   if (existingAE.length > 0) {
-    // Patch hodl_symbols into existing config without touching other settings
+    // Patch hodl_symbols and manual_only_symbols into existing config without touching other settings
     const existing = JSON.parse(existingAE[0].config_value);
+    let changed = false;
     if (!existing.hodl_symbols) {
       existing.hodl_symbols = defaultHodl;
+      changed = true;
+      console.log('[config] hodl_symbols patched into existing ai_auto_execute config');
+    }
+    if (!existing.manual_only_symbols) {
+      existing.manual_only_symbols = defaultManualOnly;
+      changed = true;
+      console.log('[config] manual_only_symbols patched into existing ai_auto_execute config');
+    }
+    if (changed) {
       await db.execute(
         "UPDATE system_config SET config_value = ? WHERE config_key = 'ai_auto_execute'",
         [JSON.stringify(existing)]
       );
-      console.log('[config] hodl_symbols patched into existing ai_auto_execute config');
     }
   } else {
     await db.execute(
@@ -1242,10 +1252,11 @@ try {
         enabled: false, max_sell_pct: 25, max_buy_usd: 100,
         allowed_triggers: ['trailing_stop', 'fixed_target', 'pump_alert'],
         require_confidence: 'High', cooldown_minutes: 60,
-        hodl_symbols: defaultHodl
+        hodl_symbols: defaultHodl,
+        manual_only_symbols: defaultManualOnly
       })]
     );
-    console.log('[config] AI auto-execute config seeded with hodl_symbols');
+    console.log('[config] AI auto-execute config seeded with hodl_symbols and manual_only_symbols');
   }
 } catch (e) {
   console.error('[config] Failed to seed ai_auto_execute:', e.message);
@@ -4816,6 +4827,24 @@ ${rulesContext}`;
         `🧠 <b>AI ANALYSIS — ${coinBase}</b>\n\n` +
         `${analysis}\n\n` +
         `⚠️ HODL position — your decision only\n\n` +
+        `─────────────────\n` +
+        `<b>1</b> Sell  <b>2</b> Hold  <b>3</b> Wait  <b>4</b> Buy  <b>5</b> Dismiss\n` +
+        `💬 Reply number or '<b>${coinBase.toLowerCase()} 2</b>' to target this coin`
+      );
+      return;
+    }
+
+    // Manual-only check — these coins run analysis but NEVER auto-execute; always go to Telegram
+    const isManualOnly = (autoExec.manual_only_symbols || []).includes(coinBase);
+    if (isManualOnly) {
+      console.log(`[auto-exec] ${coinBase} is manual-only — sending analysis to Telegram, skipping auto-execute`);
+      pendingAnalysis.set(symbol, { type: 'trailing_stop', recommendation, analysis, price: currentPrice, timestamp: Date.now() });
+      alertContextBySymbol.set(coinBase.toLowerCase(), { symbol, coinBase, alertType: 'claude_analysis_trailing', timestamp: Date.now() });
+      lastAlertCoin = coinBase.toLowerCase();
+      await sendTelegram(
+        `🧠 <b>AI ANALYSIS — ${coinBase}</b>\n\n` +
+        `${analysis}\n\n` +
+        `⚠️ Manual-only position — your decision only\n\n` +
         `─────────────────\n` +
         `<b>1</b> Sell  <b>2</b> Hold  <b>3</b> Wait  <b>4</b> Buy  <b>5</b> Dismiss\n` +
         `💬 Reply number or '<b>${coinBase.toLowerCase()} 2</b>' to target this coin`
