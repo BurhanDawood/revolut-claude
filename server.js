@@ -5584,30 +5584,12 @@ async function checkPortfolio() {
         if (decrease > 0.10) {
           console.log(`[usdt] USDT -$${decrease.toFixed(2)} | USD ${usdIncrease >= 0 ? '+' : ''}$${usdIncrease.toFixed(2)}`);
 
-          // Safety cap: payments > $100 need manual confirmation — auto-detection shouldn't deduct large amounts
-          if (decrease > 100) {
-            console.warn(`[usdt] Large USDT decrease $${decrease.toFixed(2)} — requesting confirmation, not auto-logging`);
-            await sendTelegram(
-              `⚠️ Large USDT decrease detected: $${decrease.toFixed(2)}\n` +
-              `Was this a card payment?\n\n` +
-              `Reply '<b>confirm payment ${decrease.toFixed(2)}</b>' to log\n` +
-              `Or '<b>skip payment</b>' to ignore`
-            ).catch(() => {});
-            lastKnownUSDT = currentUSDT; // Update baseline so it doesn't re-fire
-            lastKnownUSD  = currentUSD;
-            await db.execute(
-              `INSERT INTO system_config (config_key, config_value) VALUES ('last_known_usdt', ?), ('last_known_usd', ?)
-               ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)`,
-              [currentUSDT.toString(), currentUSD.toString()]
-            ).catch(() => {});
-            return; // Wait for manual confirmation
-          }
-
-          // Guard 1: USDT→USD conversion (dry powder) — USD increased by ~same amount
+          // Guard 1: USDT→USD conversion (dry powder) — check BEFORE the >$100 cap
+          // so large conversions are never mis-flagged as suspected card payments
           const isUSDConversion = usdIncrease > 0 &&
             Math.abs(usdIncrease - decrease) / decrease < 0.02;
 
-          // Guard 2: USDT→crypto swap — any crypto balance increased by ~same USD value
+          // Guard 2: USDT→crypto swap — also checked before the cap
           let isCryptoPurchase = false;
           let swapCoin = '';
           if (!isUSDConversion) {
@@ -5630,6 +5612,7 @@ async function checkPortfolio() {
           }
 
           if (isUSDConversion) {
+            // Confirmed conversion — auto-classify regardless of amount
             console.log(`[usdt] USDT→USD conversion $${decrease.toFixed(2)} — dry powder, no capital change`);
             await db.execute(
               `INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source)
@@ -5640,6 +5623,7 @@ async function checkPortfolio() {
             await sendTelegram(`🔄 USDT→USD $${decrease.toFixed(2)}\nDry powder ready ✅\nCapital unchanged`).catch(() => {});
 
           } else if (isCryptoPurchase) {
+            // Confirmed crypto swap — auto-classify regardless of amount
             console.log(`[usdt] USDT→${swapCoin} crypto purchase — capital unchanged`);
             await db.execute(
               `INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source)
@@ -5648,8 +5632,26 @@ async function checkPortfolio() {
                `USDT→${swapCoin} swap — internal rebalancing`, 'neutral', 'auto_internal']
             ).catch(() => {});
 
+          } else if (decrease > 100) {
+            // Unexplained large decrease (no matching USD or crypto increase) — ask for confirmation
+            console.warn(`[usdt] Large USDT decrease $${decrease.toFixed(2)} — requesting confirmation, not auto-logging`);
+            await sendTelegram(
+              `⚠️ Large USDT decrease detected: $${decrease.toFixed(2)}\n` +
+              `Was this a card payment?\n\n` +
+              `Reply '<b>confirm payment ${decrease.toFixed(2)}</b>' to log\n` +
+              `Or '<b>skip payment</b>' to ignore`
+            ).catch(() => {});
+            lastKnownUSDT = currentUSDT; // Update baseline so it doesn't re-fire
+            lastKnownUSD  = currentUSD;
+            await db.execute(
+              `INSERT INTO system_config (config_key, config_value) VALUES ('last_known_usdt', ?), ('last_known_usd', ?)
+               ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)`,
+              [currentUSDT.toString(), currentUSD.toString()]
+            ).catch(() => {});
+            return; // Wait for manual confirmation
+
           } else {
-            // No matching crypto or USD increase = real debit card payment
+            // Unexplained decrease ≤$100 = likely card payment — auto-log
             const [dupe] = await db.execute(
               `SELECT id FROM trading_journal
                WHERE symbol = 'USDT' AND action = 'payment'
