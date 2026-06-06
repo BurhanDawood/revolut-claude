@@ -7489,8 +7489,29 @@ function createMcpServer() {
             });
           }
           positions.sort((a, b) => (parseFloat(b.value_usd) || 0) - (parseFloat(a.value_usd) || 0));
+
+          // Surface USDT/USD cash without adding to crypto positions[]
+          var revolutUsdt = 0, revolutUsd = 0;
+          for (var i = 0; i < balances.length; i++) {
+            var cashCurrency = balances[i].currency;
+            var cashAmt = parseFloat(balances[i].available || 0);
+            if (cashCurrency === 'USDT' || cashCurrency === 'USDC') revolutUsdt += cashAmt;
+            else if (cashCurrency === 'USD') revolutUsd += cashAmt;
+          }
+          var revolutCash = revolutUsdt + revolutUsd;
+
           const cap = getCapitalSummary(totalValue);
-          result.revolut = { total_value_usd: totalValue.toFixed(2), invested: cap.invested, pl_usd: cap.pnl.toFixed(2), pl_pct: cap.pnlPct.toFixed(2), positions };
+          result.revolut = {
+            total_value_usd: totalValue.toFixed(2),        // crypto-only (backward-compat)
+            usdt_balance: revolutUsdt.toFixed(2),
+            usd_balance: revolutUsd.toFixed(2),
+            cash_balance: revolutCash.toFixed(2),
+            total_with_cash_usd: (totalValue + revolutCash).toFixed(2),
+            invested: cap.invested,
+            pl_usd: cap.pnl.toFixed(2),
+            pl_pct: cap.pnlPct.toFixed(2),
+            positions
+          };
         } catch (e) { result.revolut = { error: e.message }; }
       }
 
