@@ -288,6 +288,7 @@ let mostRecentSwingAlert = null;             // { symbol, coinBase, direction, p
 const alertRecommendations = new Map();      // symbol -> { rec, timestamp } — reused in reminders, no repeat API calls
 const responseCache = new Map();             // 'type:symbol' -> { response, timestamp } — 30-min cache for sell/buy advice
 const trailingStops = new Map();             // symbol -> { trailPct, peakPrice, stopPrice, entryPrice }
+const targetExtremes = new Map();            // symbol -> { high, low } — high-water/low-water per target across polls (resets on fire/ack/remove)
 const trailingStopAlerted = new Map();       // symbol -> timestamp — tracks recently-triggered trailing stops for hold reply
 const pendingAnalysis = new Map();           // symbol -> { type, recommendation, analysis, price, timestamp }
 const analysisRateLimit = new Map();         // symbol -> timestamp of last Claude analysis (rate-limit: 1/hr)
@@ -2175,6 +2176,9 @@ async function acknowledgeAlert(symbol) {
   // Clear pump/drop/swing alert timing so they can fire fresh if the move recurs
   alertFirstSent.delete(symbol);
   alertReminderSent.delete(symbol);
+
+  // Reset the between-poll extremes accumulator so a stale high/low can't re-fire after ack
+  targetExtremes.delete(symbol);
 
   // Log target acknowledgement for fixed-target cooldown recovery across restarts
   if (activeFixedAlerts.has(symbol) || priceTargets.has(symbol)) {
@@ -5571,6 +5575,20 @@ async function checkPortfolio() {
     console.log('Price map size:', Object.keys(priceMap).length);
     console.log('Price map sample:', JSON.stringify(Object.entries(priceMap).slice(0, 3)));
 
+    // ── High-water / low-water accumulator for fixed-target wicks ────────────
+    // Mirrors trailing-stop peakPrice pattern. Only symbols with active targets
+    // need tracking, but it's cheap to update all priceMap entries and let
+    // targetExtremes grow no larger than the priceMap itself.
+    for (const sym in priceMap) {
+      const p = priceMap[sym];
+      if (!p || !isFinite(p)) continue;
+      const ex = targetExtremes.get(sym) || { high: p, low: p };
+      if (p > ex.high) ex.high = p;
+      if (p < ex.low)  ex.low  = p;
+      targetExtremes.set(sym, ex);
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     // ── 24h baseline map — prices recorded at midnight (22-26h window) ────────
     // Used instead of the 7-day rolling average stored in basePrices/baselines.
     // Ensures alerts fire on genuine 24h moves, not week-old drift.
@@ -6148,7 +6166,12 @@ async function checkPortfolio() {
 
       const direction = target.direction || 'up';
 
-      if (direction === 'up' && currentPrice >= target.targetPrice && !activeFixedAlerts.has(symbol) && !alertState.acknowledged.has(symbol) && !ignoredCoins.has(symbol)) {
+      // Use accumulated high/low so fast wicks between polls can still trigger
+      const ex = targetExtremes.get(symbol) || { high: currentPrice, low: currentPrice };
+      const effHigh = Math.max(currentPrice, ex.high);
+      const effLow  = Math.min(currentPrice, ex.low);
+
+      if (direction === 'up' && effHigh >= target.targetPrice && !activeFixedAlerts.has(symbol) && !alertState.acknowledged.has(symbol) && !ignoredCoins.has(symbol)) {
         const changePct = ((currentPrice - target.anchorPrice) / target.anchorPrice) * 100;
         const coinBase = symbol.replace('-USD', '');
 
@@ -6170,6 +6193,7 @@ async function checkPortfolio() {
           console.log(`[targets] Auto-acknowledging ${symbol} — ${remindersSent} reminders already sent`);
           priceTargets.delete(symbol);
           targetReminderCount.delete(symbol);
+          targetExtremes.delete(symbol); // reset accumulator — target gone
           await db.execute('DELETE FROM price_targets WHERE symbol = ?', [symbol]).catch(() => {});
           await sendTelegram(`🔕 <b>Target auto-dismissed: ${coinBase}</b>\nNo response after 2 reminders — target removed. Set a new one when ready.`).catch(() => {});
           continue;
@@ -6225,6 +6249,7 @@ async function checkPortfolio() {
           alertMessage = `🎯 <b>${symbol} FIXED TARGET HIT!</b>\n\nAnchor: $${anchorStr} → Now $${priceStr} (+${changePct.toFixed(1)}%)${entryLine}\n\n⚡ RECOMMENDATION: ${aiRec}${replyMenu}${autoLine}`;
         }
         await sendTelegram(alertMessage);
+        targetExtremes.delete(symbol); // reset accumulator — target fired
         // Log send to macro_alerts_sent for cooldown tracking across restarts
         await db.execute(
           "INSERT INTO macro_alerts_sent (symbol, alert_type, alert_hash, message) VALUES (?, 'target', ?, ?)",
@@ -6259,7 +6284,7 @@ async function checkPortfolio() {
         }, ALERT_INTERVAL_MS));
       }
 
-      if (direction === 'down' && currentPrice <= target.targetPrice && !activeFixedAlerts.has(symbol) && !alertState.acknowledged.has(symbol) && !ignoredCoins.has(symbol)) {
+      if (direction === 'down' && effLow <= target.targetPrice && !activeFixedAlerts.has(symbol) && !alertState.acknowledged.has(symbol) && !ignoredCoins.has(symbol)) {
         const changePct = ((currentPrice - target.anchorPrice) / target.anchorPrice) * 100;
         const coinBase = symbol.replace('-USD', '');
 
@@ -6280,6 +6305,7 @@ async function checkPortfolio() {
           console.log(`[targets] Auto-acknowledging ${symbol} (down) — ${remindersSentDown} reminders already sent`);
           priceTargets.delete(symbol);
           targetReminderCount.delete(symbol);
+          targetExtremes.delete(symbol); // reset accumulator — target gone
           await db.execute('DELETE FROM price_targets WHERE symbol = ?', [symbol]).catch(() => {});
           await sendTelegram(`🔕 <b>Target auto-dismissed: ${coinBase}</b>\nNo response after 2 reminders — target removed. Set a new one when ready.`).catch(() => {});
           continue;
@@ -6317,6 +6343,7 @@ async function checkPortfolio() {
           alertMessage = `📉 <b>${symbol} FIXED FLOOR HIT!</b>\n\nAnchor: ${formatPrice(target.anchorPrice)} → Now ${formatPrice(currentPrice)} (${changePct.toFixed(1)}%)${entryLine}\n\n⚡ RECOMMENDATION: ${aiRec}${replyMenu}${autoLine}`;
         }
         await sendTelegram(alertMessage);
+        targetExtremes.delete(symbol); // reset accumulator — floor fired
         // Log send for cooldown tracking across restarts
         await db.execute(
           "INSERT INTO macro_alerts_sent (symbol, alert_type, alert_hash, message) VALUES (?, 'target', ?, ?)",
