@@ -7690,9 +7690,9 @@ function createMcpServer() {
 
   // ── Tool: manage_alerts ────────────────────────────────────────────────────
   server.tool('manage_alerts',
-    'Set or manage all alert types — fixed price targets, daily thresholds, trailing stops, acknowledge or ignore coins',
+    'Set or manage all alert types — fixed price targets, daily thresholds, trailing stops, acknowledge, ignore or unignore coins',
     {
-      action:        z.enum(['set_target', 'set_threshold', 'set_trailing', 'acknowledge', 'ignore', 'remove_trailing']).describe('What alert action to perform'),
+      action:        z.enum(['set_target', 'set_threshold', 'set_trailing', 'acknowledge', 'ignore', 'unignore', 'remove_trailing']).describe('What alert action to perform'),
       symbol:        z.string().describe('Trading pair e.g. NEAR-USD or NEAR'),
       direction:     z.enum(['up', 'down']).optional().describe('Alert direction for set_target'),
       threshold_pct: z.number().optional().describe('Percentage for set_target or set_threshold'),
@@ -7749,6 +7749,10 @@ function createMcpServer() {
       } else if (action === 'ignore') {
         await ignoreCoin(sym);
         result = { ok: true, action: 'ignore', symbol: sym, message: `${coinBase} permanently ignored` };
+
+      } else if (action === 'unignore') {
+        await resumeAlerts(sym);
+        result = { ok: true, action: 'unignore', symbol: sym, message: `${coinBase} alerts re-enabled — removed from ignored list` };
 
       } else if (action === 'remove_trailing') {
         await removeTrailingStop(sym);
