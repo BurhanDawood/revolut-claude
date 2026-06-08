@@ -58,6 +58,24 @@ const COIN_NARRATIVES = {
 };
 const SKIP_WORDS = new Set(['SET', 'AND', 'THE', 'FOR', 'ALL', 'GET', 'PUT', 'LET', 'CAN', 'ARE', 'NOT', 'BUT', 'USE', 'NEW', 'OLD', 'ANY', 'TWO', 'ONE', 'HIT', 'TOP', 'LOW', 'MAX', 'MIN', 'NOW', 'BUY', 'FROM']);
 
+// ── Coin context helper — resolves project name + trading role for AI prompts ──
+// Used by getQuickAiRecommendation and batchGetRecommendations (A1 / dev_log #35 + #31)
+async function getCoinContext(coinBase) {
+  const narrative = COIN_NARRATIVES[coinBase] || null;
+  let role = 'normal';
+  try {
+    const [aeRows] = await db.execute(
+      "SELECT config_value FROM system_config WHERE config_key = 'ai_auto_execute'"
+    );
+    if (aeRows.length) {
+      const ae = JSON.parse(aeRows[0].config_value);
+      if ((ae.hodl_symbols || []).includes(coinBase)) role = 'hodl';
+      else if ((ae.manual_only_symbols || []).includes(coinBase)) role = 'manual_only';
+    }
+  } catch (e) { /* ignore — default role 'normal' */ }
+  return { narrative, role };
+}
+
 async function revolutRequest(method, path, body = null) {
   const timestamp = Date.now().toString();
   // For POST requests include minified JSON body in signature — critical for match
@@ -1972,18 +1990,36 @@ function getDustRecommendation(direction) {
 
 async function getQuickAiRecommendation(symbol, changePct, currentPrice, direction = 'up', reason = 'alert') {
   try {
+    const coinBase = symbol.replace('-USD', '');
+    // A1 (dev_log #35 + #31): inject project name + role so model doesn't guess
+    const { narrative, role } = await getCoinContext(coinBase);
+    const projectLabel = narrative
+      ? `${symbol} (${narrative})`
+      : `${symbol} (project unknown — do not guess the project; give a price-action-only view)`;
     const dirText = direction === 'down'
       ? `down ${Math.abs(changePct).toFixed(1)}% to $${currentPrice.toFixed(4)}`
       : `up ${changePct.toFixed(1)}% to $${currentPrice.toFixed(4)}`;
-    const actionOptions = direction === 'down'
-      ? 'HOLD, BUY THE DIP, or SELL'
-      : 'HOLD, SELL, or BUY MORE';
+    let roleInstruction;
+    let startInstruction;
+    if (role === 'hodl') {
+      roleInstruction = 'This is a HOLD-only anchor/long-term hold. DO NOT recommend buying or selling. Frame as HOLD and what to watch.';
+      startInstruction = 'Start with HOLD in bold.';
+    } else if (role === 'manual_only') {
+      roleInstruction = 'This is a manual-decision anchor. DO NOT give a directive BUY or SELL — present it as HOLD/analysis for the user to decide.';
+      startInstruction = 'Start with HOLD in bold.';
+    } else {
+      roleInstruction = '';
+      startInstruction = direction === 'down'
+        ? 'Start with HOLD, BUY THE DIP, or SELL in bold.'
+        : 'Start with HOLD, SELL, or BUY MORE in bold.';
+    }
+    const roleClause = roleInstruction ? ` ${roleInstruction}` : '';
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-6',
       max_tokens: 150,
       messages: [{
         role: 'user',
-        content: `In 2-3 sentences max, give a quick trading recommendation for ${symbol} which is ${dirText}. Consider current market conditions. Start with ${actionOptions} in bold.`
+        content: `In 2-3 sentences max, give a quick trading recommendation for ${projectLabel} which is ${dirText}. Consider current market conditions.${roleClause} ${startInstruction}`
       }]
     });
     await logClaudeCall(reason, response.model || 'claude-sonnet-4-6', response.usage);
@@ -1996,19 +2032,36 @@ async function getQuickAiRecommendation(symbol, changePct, currentPrice, directi
 }
 
 // FIX 2: Batch recommendations for multiple simultaneous alerts — one API call instead of N
+// A1 (dev_log #35 + #31): one config read for the whole batch, then per-coin project name + role tag
 async function batchGetRecommendations(alerts) {
   if (alerts.length === 0) return;
   try {
-    const lines = alerts.map(a =>
-      `- ${a.symbol}: ${a.direction === 'up' ? 'UP' : 'DOWN'} ${Math.abs(a.changePct).toFixed(1)}% to ${fmtPriceShort(a.currentPrice)} (holding value ~$${a.valueUSD.toFixed(0)})`
-    ).join('\n');
+    // One DB read for the batch — avoids N hits per coin
+    let aeConfig = { hodl_symbols: [], manual_only_symbols: [] };
+    try {
+      const [aeRows] = await db.execute(
+        "SELECT config_value FROM system_config WHERE config_key = 'ai_auto_execute'"
+      );
+      if (aeRows.length) aeConfig = JSON.parse(aeRows[0].config_value);
+    } catch (e) { /* ignore — default empty role lists */ }
+
+    const lines = alerts.map(a => {
+      const narrative = COIN_NARRATIVES[a.coinBase] || null;
+      const projectLabel = narrative
+        ? `${a.coinBase} (${narrative})`
+        : `${a.coinBase} (project unknown — no guess)`;
+      let roleTag = '';
+      if ((aeConfig.hodl_symbols || []).includes(a.coinBase)) roleTag = ' [HODL]';
+      else if ((aeConfig.manual_only_symbols || []).includes(a.coinBase)) roleTag = ' [MANUAL]';
+      return `- ${projectLabel}${roleTag}: ${a.direction === 'up' ? 'UP' : 'DOWN'} ${Math.abs(a.changePct).toFixed(1)}% to ${fmtPriceShort(a.currentPrice)} (holding value ~$${a.valueUSD.toFixed(0)})`;
+    }).join('\n');
     const format = alerts.map(a => `${a.coinBase}: [recommendation]`).join('\n');
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-6',
       max_tokens: Math.min(80 * alerts.length, 400),
       system: [{
         type: 'text',
-        text: 'You are a concise crypto trading assistant. For each alert give ONE short line — HOLD/SELL/BUY + brief reason. Use the exact format provided by the user.',
+        text: 'You are a concise crypto trading assistant. For each alert give ONE short line — HOLD/SELL/BUY + brief reason. Use the exact format provided by the user. For any coin tagged [HODL] or [MANUAL], do NOT say BUY or SELL — say HOLD/monitor only. Never invent project fundamentals; if a project name is given use it, otherwise comment on price action only.',
         cache_control: { type: 'ephemeral' }
       }],
       messages: [{ role: 'user', content: `Quick trading recommendations for these alerts:\n${lines}\n\nFormat exactly:\n${format}` }]
