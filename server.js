@@ -6592,6 +6592,17 @@ async function checkPortfolio() {
           const entryLine = entryPrice
             ? `Entry: ${fmtPriceShort(entryPrice)} | P&L: ${((currentPrice - entryPrice) / entryPrice * 100).toFixed(1)}%\n`
             : '';
+          // A2 (dev_log #31): role-aware rec — hodl/manual_only coins are not dip-buy candidates
+          const { narrative: dipNarrative, role: dipRole } = await getCoinContext(coinBase);
+          let dipRecLine;
+          if (dipRole === 'hodl' || dipRole === 'manual_only') {
+            dipRecLine =
+              `⚡ This is a HOLD position (${dipNarrative || coinBase}). Per your strategy this is NOT a buy-the-dip candidate — it's a hold/exit bag. Watch for strength to trim into, not a dip to add. No action suggested.`;
+          } else {
+            dipRecLine =
+              `⚡ <b>RECOMMENDATION:</b> Strong buy signal based on your swing strategy.\n` +
+              `Consider buying here and setting sell alert at ${buyBackSell} (+20%)`;
+          }
           const swingMsg =
             `🎯 <b>SWING TRADE SIGNAL — ${symbol}</b>\n` +
             `⬇️ <b>EXTREME DIP DETECTED</b>\n\n` +
@@ -6602,8 +6613,7 @@ async function checkPortfolio() {
             `• Outside normal range: ✅ (-${dropPct}% from avg)\n` +
             `• RSI likely oversold at this level ✅\n\n` +
             entryLine +
-            `⚡ <b>RECOMMENDATION:</b> Strong buy signal based on your swing strategy.\n` +
-            `Consider buying here and setting sell alert at ${buyBackSell} (+20%)\n\n` +
+            dipRecLine + `\n\n` +
             `Reply:\n` +
             `'buy ${coinBase}' - get buy advice + auto-set buy and sell alerts\n` +
             `'hold ${coinBase}' - already holding, set recovery alerts\n` +
