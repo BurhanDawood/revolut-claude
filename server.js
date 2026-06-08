@@ -2299,6 +2299,24 @@ async function removeTrailingStop(symbol) {
   await db.execute('DELETE FROM trailing_stops WHERE symbol = ?', [symbol]);
 }
 
+async function removeFixedTarget(symbol) {
+  priceTargets.delete(symbol);
+  targetReminderCount.delete(symbol);
+  targetExtremes.delete(symbol);
+  alertFirstSent.delete(symbol);
+  alertReminderSent.delete(symbol);
+  if (activeFixedAlerts.has(symbol)) {
+    clearInterval(activeFixedAlerts.get(symbol));
+    activeFixedAlerts.delete(symbol);
+  }
+  await db.execute('DELETE FROM price_targets WHERE symbol = ?', [symbol]);
+}
+
+async function removeThreshold(symbol) {
+  delete customThresholds[symbol];
+  await db.execute('DELETE FROM custom_thresholds WHERE symbol = ?', [symbol]);
+}
+
 async function updateTrailingStop(symbol, currentPrice) {
   const ts = trailingStops.get(symbol);
   if (!ts) return null;
@@ -7755,7 +7773,7 @@ function createMcpServer() {
   server.tool('manage_alerts',
     'Set or manage all alert types — fixed price targets, daily thresholds, trailing stops, acknowledge, ignore or unignore coins',
     {
-      action:        z.enum(['set_target', 'set_threshold', 'set_trailing', 'acknowledge', 'ignore', 'unignore', 'remove_trailing']).describe('What alert action to perform'),
+      action:        z.enum(['set_target', 'set_threshold', 'set_trailing', 'acknowledge', 'ignore', 'unignore', 'remove_trailing', 'remove_target', 'remove_threshold']).describe('What alert action to perform'),
       symbol:        z.string().describe('Trading pair e.g. NEAR-USD or NEAR'),
       direction:     z.enum(['up', 'down']).optional().describe('Alert direction for set_target'),
       threshold_pct: z.number().optional().describe('Percentage for set_target or set_threshold'),
@@ -7820,6 +7838,16 @@ function createMcpServer() {
       } else if (action === 'remove_trailing') {
         await removeTrailingStop(sym);
         result = { ok: true, action: 'remove_trailing', symbol: sym, message: `Trailing stop removed for ${coinBase}` };
+
+      } else if (action === 'remove_target') {
+        const hadTarget = priceTargets.has(sym);
+        await removeFixedTarget(sym);
+        result = { ok: true, action: 'remove_target', symbol: sym, message: hadTarget ? `Price target removed for ${coinBase}` : `No active target for ${coinBase} — any DB row cleared` };
+
+      } else if (action === 'remove_threshold') {
+        const hadThreshold = customThresholds[sym] !== undefined;
+        await removeThreshold(sym);
+        result = { ok: true, action: 'remove_threshold', symbol: sym, message: hadThreshold ? `Custom threshold removed for ${coinBase} — reverts to default` : `No custom threshold for ${coinBase} — any DB row cleared` };
       }
 
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
