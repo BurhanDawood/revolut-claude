@@ -809,6 +809,38 @@ await db.execute(`CREATE TABLE IF NOT EXISTS uk_s104_pool (
 
 await safeAddColumn('price_targets',    'direction',       "VARCHAR(4) NOT NULL DEFAULT 'up'");
 await safeAddColumn('price_targets',    'note',            'TEXT');
+
+// ── dev_log #38 Part 1 — price_targets multi-target schema migration ──────────
+// Idempotent: checks for 'id' column before running. Safe to repeat on every boot.
+try {
+  const [idColRows] = await db.execute(`
+    SELECT COLUMN_NAME FROM information_schema.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE()
+      AND TABLE_NAME   = 'price_targets'
+      AND COLUMN_NAME  = 'id'
+  `);
+  if (idColRows.length > 0) {
+    console.log('[migration] price_targets multi-target PK already applied — skipping');
+  } else {
+    // Single ALTER: DROP symbol PK + ADD id column + ADD id PK — table never without a PK
+    await db.execute(`
+      ALTER TABLE price_targets
+        DROP PRIMARY KEY,
+        ADD COLUMN id BIGINT NOT NULL AUTO_INCREMENT FIRST,
+        ADD PRIMARY KEY (id)
+    `);
+    // Separate ALTER: add unique constraint on (symbol, direction, target_price)
+    // 21 existing rows are each unique on this triple — no collision risk
+    await db.execute(`
+      ALTER TABLE price_targets
+        ADD UNIQUE KEY uq_target (symbol, direction, target_price)
+    `);
+    console.log('[migration] price_targets migrated to multi-target (id PK + unique symbol/direction/target_price)');
+  }
+} catch (e) {
+  console.error('[migration] price_targets multi-target FAILED:', e.message);
+}
+
 await safeAddColumn('custom_thresholds','acknowledged_until','TIMESTAMP NULL DEFAULT NULL');
 
 // Track Claude API usage and costs
