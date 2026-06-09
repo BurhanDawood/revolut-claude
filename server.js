@@ -399,6 +399,16 @@ await db.execute(`CREATE TABLE IF NOT EXISTS custom_thresholds (
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 )`);
 
+await db.execute(`CREATE TABLE IF NOT EXISTS dev_bridge (
+  id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  type VARCHAR(32) NOT NULL,
+  ref_devlog_id INT DEFAULT NULL,
+  payload LONGTEXT NOT NULL,
+  consumed TINYINT(1) NOT NULL DEFAULT 0,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  consumed_at TIMESTAMP NULL DEFAULT NULL
+)`);
+
 await db.execute(`CREATE TABLE IF NOT EXISTS price_targets (
   symbol VARCHAR(50) PRIMARY KEY,
   anchor_price DECIMAL(20,10) NOT NULL,
@@ -7110,6 +7120,31 @@ app.post('/api/targets/:symbol', async (req, res) => {
     }
   } catch (e) {
     res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/bridge — dev_bridge ingestion (Claude→Railway). Token-protected.
+app.post('/api/bridge', async (req, res) => {
+  // AUTH — required, unlike the other open routes
+  if (req.headers['x-bridge-token'] !== process.env.BRIDGE_TOKEN) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  const { type, payload, ref_devlog_id } = req.body;
+  if (!type || !payload) {
+    return res.status(400).json({ error: 'type and payload required' });
+  }
+  // size guard — reject absurdly large payloads
+  if (typeof payload !== 'string' || payload.length > 500000) {
+    return res.status(400).json({ error: 'payload must be a string under 500k chars' });
+  }
+  try {
+    const [r] = await db.execute(
+      'INSERT INTO dev_bridge (type, ref_devlog_id, payload) VALUES (?, ?, ?)',
+      [String(type).slice(0, 32), ref_devlog_id || null, payload]
+    );
+    return res.json({ ok: true, id: r.insertId, type, bytes: payload.length });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
   }
 });
 
