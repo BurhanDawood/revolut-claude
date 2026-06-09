@@ -982,18 +982,23 @@ for (const row of thresholdRows) {
 }
 console.log(`Loaded ${thresholdRows.length} custom thresholds from database`);
 
-const [ptRows] = await db.execute('SELECT symbol, anchor_price, threshold_pct, target_price, entry_price, direction, note FROM price_targets');
+const [ptRows] = await db.execute('SELECT id, symbol, anchor_price, threshold_pct, target_price, entry_price, direction, note FROM price_targets');
 for (const row of ptRows) {
-  priceTargets.set(row.symbol, {
+  const t = {
+    id: row.id,
     anchorPrice: parseFloat(row.anchor_price),
     thresholdPct: parseFloat(row.threshold_pct),
     targetPrice: parseFloat(row.target_price),
     entryPrice: row.entry_price ? parseFloat(row.entry_price) : null,
     direction: row.direction || 'up',
     note: row.note || null
-  });
+  };
+  const arr = priceTargets.get(row.symbol) || [];
+  arr.push(t);
+  priceTargets.set(row.symbol, arr);
 }
-console.log(`Loaded ${ptRows.length} price targets from database`);
+const totalTargets = [...priceTargets.values()].reduce((s, arr) => s + arr.length, 0);
+console.log(`Loaded ${totalTargets} price targets from database (${priceTargets.size} symbol(s))`);
 
 // Startup cross-check: remove price_targets that are already covered by an active auto rule
 // e.g. if SOL-USD has a sell rule at $150 and a 'up' price target at $150 — target is redundant
@@ -1002,7 +1007,8 @@ try {
     "SELECT symbol, order_type, trigger_price FROM auto_trade_rules WHERE active = 1"
   );
   let removedCount = 0;
-  for (const [symbol, target] of priceTargets) {
+  for (const [symbol, targetArr] of priceTargets) {
+    for (const target of [...targetArr]) { // #38 B1: iterate each element; copy so in-loop deletes are safe
     const dir = target.direction || 'up';
     const tPrice = target.targetPrice;
     // Check if any active rule makes this target redundant
@@ -1019,11 +1025,15 @@ try {
       return false;
     });
     if (redundant) {
-      console.log(`[startup] Removing redundant price target for ${symbol} — already covered by auto rule`);
-      priceTargets.delete(symbol);
-      await db.execute('DELETE FROM price_targets WHERE symbol = ?', [symbol]).catch(e => console.error('[startup] Delete target failed:', e.message));
+      console.log(`[startup] Removing redundant price target for ${symbol} id=${target.id} — already covered by auto rule`);
+      const arr38cc = priceTargets.get(symbol) || [];
+      const filtered38cc = arr38cc.filter(t => t.id !== target.id);
+      if (filtered38cc.length) priceTargets.set(symbol, filtered38cc);
+      else priceTargets.delete(symbol);
+      await db.execute('DELETE FROM price_targets WHERE id = ?', [target.id]).catch(e => console.error('[startup] Delete target failed:', e.message));
       removedCount++;
     }
+    } // end inner target loop — #38 B1
   }
   if (removedCount > 0) console.log(`[startup] Removed ${removedCount} redundant price target(s)`);
 } catch (e) {
@@ -2124,6 +2134,24 @@ async function batchGetRecommendations(alerts) {
   }
 }
 
+// #38 B2 — array-aware upsert for priceTargets Map (symbol → array of target objects)
+// Match key mirrors DB uq_target: direction + targetPrice. If found, update in-place (preserving id).
+// If not found, append. All 6 setters call this instead of priceTargets.set(symbol, {...}).
+function upsertPriceTarget(symbol, newTarget) {
+  const arr = priceTargets.get(symbol) || [];
+  const idx = arr.findIndex(function(t) {
+    return t.direction === newTarget.direction &&
+      Math.abs(t.targetPrice - newTarget.targetPrice) < 1e-12;
+  });
+  if (idx >= 0) {
+    arr[idx] = Object.assign({}, arr[idx], newTarget); // update in place, preserve existing id
+  } else {
+    arr.push(newTarget);
+  }
+  priceTargets.set(symbol, arr);
+  return arr[idx >= 0 ? idx : arr.length - 1];
+}
+
 async function setFixedTarget(symbol, thresholdPct, direction = 'up', note = null) {
   const tickerResponse = await revolutRequest('GET', '/tickers');
   const tickerList = Array.isArray(tickerResponse) ? tickerResponse : (tickerResponse.data || []);
@@ -2146,8 +2174,7 @@ async function setFixedTarget(symbol, thresholdPct, direction = 'up', note = nul
     'INSERT INTO price_targets (symbol, anchor_price, threshold_pct, target_price, direction, note) VALUES (?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE anchor_price=VALUES(anchor_price), threshold_pct=VALUES(threshold_pct), target_price=VALUES(target_price), direction=VALUES(direction), note=VALUES(note), updated_at=CURRENT_TIMESTAMP',
     [symbol, anchorPrice, thresholdPct, targetPrice, direction, note]
   );
-  const existing = priceTargets.get(symbol) || {};
-  priceTargets.set(symbol, { ...existing, anchorPrice, thresholdPct, targetPrice, direction, note });
+  upsertPriceTarget(symbol, { anchorPrice, thresholdPct, targetPrice, direction, note }); // #38 B2
   // Setting a new alert clears acknowledged so the new target can fire
   alertState.acknowledged.delete(symbol);
   return { anchorPrice, thresholdPct, targetPrice, direction };
@@ -2162,8 +2189,7 @@ async function setAbsolutePriceTarget(symbol, absoluteTargetPrice, direction = '
     'INSERT INTO price_targets (symbol, anchor_price, threshold_pct, target_price, direction, note) VALUES (?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE anchor_price=VALUES(anchor_price), threshold_pct=VALUES(threshold_pct), target_price=VALUES(target_price), direction=VALUES(direction), note=VALUES(note), updated_at=CURRENT_TIMESTAMP',
     [symbol, currentPrice, thresholdPct, absoluteTargetPrice, direction, note]
   );
-  const existing = priceTargets.get(symbol) || {};
-  priceTargets.set(symbol, { ...existing, anchorPrice: currentPrice, thresholdPct, targetPrice: absoluteTargetPrice, direction, note });
+  upsertPriceTarget(symbol, { anchorPrice: currentPrice, thresholdPct, targetPrice: absoluteTargetPrice, direction, note }); // #38 B2
   // Setting a new alert re-enables this coin (clears acknowledged)
   alertState.acknowledged.delete(symbol);
   return { anchorPrice: currentPrice, thresholdPct, targetPrice: absoluteTargetPrice, direction };
@@ -6261,9 +6287,10 @@ async function checkPortfolio() {
     }
 
     // Check fixed price targets (direction-aware)
-    for (const [symbol, target] of priceTargets) {
+    for (const [symbol, targetArr] of priceTargets) {
       const currentPrice = priceMap[symbol];
       if (!currentPrice) continue;
+      for (const target of [...targetArr]) { // #38 B1: iterate each element; copy so in-loop deletes are safe
 
       // Dust check — suppress fixed target alerts for positions < $1
       // (but allow through if no position held — might be a watch for buy entry)
@@ -6303,11 +6330,14 @@ async function checkPortfolio() {
         // Max-2-reminders: if already sent 2+ reminders, auto-acknowledge and delete target
         const remindersSent = targetReminderCount.get(symbol) || 0;
         if (remindersSent >= 2) {
-          console.log(`[targets] Auto-acknowledging ${symbol} — ${remindersSent} reminders already sent`);
-          priceTargets.delete(symbol);
+          console.log(`[targets] Auto-acknowledging ${symbol} id=${target.id} — ${remindersSent} reminders already sent`);
+          const arr38up = priceTargets.get(symbol) || [];
+          const filtered38up = arr38up.filter(t => t.id !== target.id);
+          if (filtered38up.length) priceTargets.set(symbol, filtered38up);
+          else priceTargets.delete(symbol);
           targetReminderCount.delete(symbol);
           targetExtremes.delete(symbol); // reset accumulator — target gone
-          await db.execute('DELETE FROM price_targets WHERE symbol = ?', [symbol]).catch(() => {});
+          await db.execute('DELETE FROM price_targets WHERE id = ?', [target.id]).catch(() => {});
           await sendTelegram(`🔕 <b>Target auto-dismissed: ${coinBase}</b>\nNo response after 2 reminders — target removed. Set a new one when ready.`).catch(() => {});
           continue;
         }
@@ -6415,11 +6445,14 @@ async function checkPortfolio() {
         // Max-2-reminders: if already sent 2+ reminders, auto-acknowledge and delete target
         const remindersSentDown = targetReminderCount.get(symbol) || 0;
         if (remindersSentDown >= 2) {
-          console.log(`[targets] Auto-acknowledging ${symbol} (down) — ${remindersSentDown} reminders already sent`);
-          priceTargets.delete(symbol);
+          console.log(`[targets] Auto-acknowledging ${symbol} (down) id=${target.id} — ${remindersSentDown} reminders already sent`);
+          const arr38dn = priceTargets.get(symbol) || [];
+          const filtered38dn = arr38dn.filter(t => t.id !== target.id);
+          if (filtered38dn.length) priceTargets.set(symbol, filtered38dn);
+          else priceTargets.delete(symbol);
           targetReminderCount.delete(symbol);
           targetExtremes.delete(symbol); // reset accumulator — target gone
-          await db.execute('DELETE FROM price_targets WHERE symbol = ?', [symbol]).catch(() => {});
+          await db.execute('DELETE FROM price_targets WHERE id = ?', [target.id]).catch(() => {});
           await sendTelegram(`🔕 <b>Target auto-dismissed: ${coinBase}</b>\nNo response after 2 reminders — target removed. Set a new one when ready.`).catch(() => {});
           continue;
         }
@@ -6485,6 +6518,7 @@ async function checkPortfolio() {
           await sendTelegram(`⚠️ <b>REMINDER: ${symbol} FIXED FLOOR STILL ACTIVE!</b>${reminderSuffix}\n\nFloor: ${formatPrice(target.targetPrice)} | Now: ${formatPrice(currentPrice)}\nReply 'acknowledge ${coinBase}' to stop`);
         }, ALERT_INTERVAL_MS));
       }
+      } // end inner target loop — #38 B1
     }
     // ── Trailing stop checks ──────────────────────────────────────────────────
     for (const [symbol, ts] of trailingStops) {
@@ -6738,7 +6772,8 @@ async function checkPortfolio() {
     // ── Secondary alert check: sell levels stored in note JSON ──────────────
     // These are sell/profit levels from a recommendation where a buy alert is the primary target.
     // We check them here so both buy and sell levels fire automatically.
-    for (const [symbol, target] of priceTargets) {
+    for (const [symbol, targetArr] of priceTargets) {
+      for (const target of [...targetArr]) { // #38 B1: iterate each element
       if (target.direction !== 'down') continue; // only check buy-primary entries for secondary sell levels
       let noteData = null;
       try { if (target.note) noteData = JSON.parse(target.note); } catch (e) {}
@@ -6774,6 +6809,7 @@ async function checkPortfolio() {
           console.log(`Secondary sell alert fired for ${symbol} at $${sl.price} (current: $${currentPrice})`);
         }
       }
+      } // end inner target loop — #38 B1
     }
 
     // ── Kraken exchange monitoring ────────────────────────────────────────────
@@ -7098,21 +7134,21 @@ app.post('/api/targets/:symbol', async (req, res) => {
         'INSERT INTO price_targets (symbol, anchor_price, threshold_pct, target_price) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE anchor_price = VALUES(anchor_price), threshold_pct = VALUES(threshold_pct), target_price = VALUES(target_price), updated_at = CURRENT_TIMESTAMP',
         [symbol, anchor_price, threshold_pct, targetPrice]
       );
-      const existing = priceTargets.get(symbol) || {};
-      priceTargets.set(symbol, { ...existing, anchorPrice: anchor_price, thresholdPct: threshold_pct, targetPrice });
+      upsertPriceTarget(symbol, { anchorPrice: anchor_price, thresholdPct: threshold_pct, targetPrice, direction: 'up', note: null }); // #38 B2
       if (activeFixedAlerts.has(symbol)) { clearInterval(activeFixedAlerts.get(symbol)); activeFixedAlerts.delete(symbol); }
       return res.json({ ok: true, symbol, anchorPrice: anchor_price, targetPrice, thresholdPct: threshold_pct });
     } else if (priceTargets.has(symbol)) {
-      // Use existing anchor, update threshold
-      const existing = priceTargets.get(symbol);
-      const targetPrice = existing.anchorPrice * (1 + threshold_pct / 100);
+      // Use existing anchor, update threshold — #38 B2: read anchor from array[0]
+      const existingArr38b2 = priceTargets.get(symbol) || [];
+      const anchorSrc38b2 = existingArr38b2[0] || {};
+      const targetPrice = (anchorSrc38b2.anchorPrice || 0) * (1 + threshold_pct / 100);
       await db.execute(
         'INSERT INTO price_targets (symbol, anchor_price, threshold_pct, target_price) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE threshold_pct = VALUES(threshold_pct), target_price = VALUES(target_price), updated_at = CURRENT_TIMESTAMP',
-        [symbol, existing.anchorPrice, threshold_pct, targetPrice]
+        [symbol, anchorSrc38b2.anchorPrice, threshold_pct, targetPrice]
       );
-      priceTargets.set(symbol, { ...existing, thresholdPct: threshold_pct, targetPrice });
+      upsertPriceTarget(symbol, { anchorPrice: anchorSrc38b2.anchorPrice, thresholdPct: threshold_pct, targetPrice, direction: anchorSrc38b2.direction || 'up', note: anchorSrc38b2.note || null }); // #38 B2
       if (activeFixedAlerts.has(symbol)) { clearInterval(activeFixedAlerts.get(symbol)); activeFixedAlerts.delete(symbol); }
-      return res.json({ ok: true, symbol, anchorPrice: existing.anchorPrice, targetPrice, thresholdPct: threshold_pct });
+      return res.json({ ok: true, symbol, anchorPrice: anchorSrc38b2.anchorPrice, targetPrice, thresholdPct: threshold_pct });
     } else {
       // No anchor — fetch current price
       const { anchorPrice, targetPrice } = await setFixedTarget(symbol, threshold_pct);
@@ -7894,7 +7930,7 @@ function createMcpServer() {
             'INSERT INTO price_targets (symbol, anchor_price, threshold_pct, target_price, direction) VALUES (?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE anchor_price=VALUES(anchor_price), threshold_pct=VALUES(threshold_pct), target_price=VALUES(target_price), direction=VALUES(direction), updated_at=CURRENT_TIMESTAMP',
             [sym, anchor_price, threshold_pct, targetPrice, dir]
           );
-          priceTargets.set(sym, { anchorPrice: anchor_price, thresholdPct: threshold_pct, targetPrice, direction: dir, note: null });
+          upsertPriceTarget(sym, { anchorPrice: anchor_price, thresholdPct: threshold_pct, targetPrice, direction: dir, note: null }); // #38 B2
           alertState.acknowledged.delete(sym);
           r = { anchorPrice: anchor_price, targetPrice, direction: dir };
         } else {
@@ -10827,17 +10863,18 @@ app.post('/telegram-webhook', async (req, res) => {
         await sendReply(`❌ Invalid percentage. Use e.g. 'target CC 5%'`);
         return res.status(200).json({ ok: true });
       }
-      const existing = priceTargets.get(symbol);
-      if (existing) {
-        // Update threshold from same anchor
-        const newTargetPrice = existing.anchorPrice * (1 + thresholdPct / 100);
+      const existingArr38b2 = priceTargets.get(symbol) || []; // #38 B2
+      const anchorSrc38b2 = existingArr38b2[0] || null;
+      if (anchorSrc38b2) {
+        // Update threshold from same anchor — #38 B2: read anchor from array[0]
+        const newTargetPrice = anchorSrc38b2.anchorPrice * (1 + thresholdPct / 100);
         if (activeFixedAlerts.has(symbol)) { clearInterval(activeFixedAlerts.get(symbol)); activeFixedAlerts.delete(symbol); }
         await db.execute(
           'INSERT INTO price_targets (symbol, anchor_price, threshold_pct, target_price) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE threshold_pct = VALUES(threshold_pct), target_price = VALUES(target_price), updated_at = CURRENT_TIMESTAMP',
-          [symbol, existing.anchorPrice, thresholdPct, newTargetPrice]
+          [symbol, anchorSrc38b2.anchorPrice, thresholdPct, newTargetPrice]
         );
-        priceTargets.set(symbol, { ...existing, thresholdPct, targetPrice: newTargetPrice });
-        await sendReply(`✅ ${symbol} fixed target updated to ${thresholdPct}%. New target: $${newTargetPrice.toFixed(4)} from anchor $${existing.anchorPrice.toFixed(4)}`);
+        upsertPriceTarget(symbol, { anchorPrice: anchorSrc38b2.anchorPrice, thresholdPct, targetPrice: newTargetPrice, direction: anchorSrc38b2.direction || 'up', note: anchorSrc38b2.note || null }); // #38 B2
+        await sendReply(`✅ ${symbol} fixed target updated to ${thresholdPct}%. New target: $${newTargetPrice.toFixed(4)} from anchor $${anchorSrc38b2.anchorPrice.toFixed(4)}`);
       } else {
         // No existing anchor — create new fixed target from current price
         try {
