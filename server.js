@@ -2367,7 +2367,39 @@ async function removeTrailingStop(symbol) {
   await db.execute('DELETE FROM trailing_stops WHERE symbol = ?', [symbol]);
 }
 
-async function removeFixedTarget(symbol) {
+async function removeFixedTarget(symbol, targetPrice = null) {
+  // #38 B3 — if targetPrice given, remove only that rung; else whole symbol
+  if (targetPrice !== null && targetPrice !== undefined) {
+    const arr = priceTargets.get(symbol) || [];
+    const match = arr.find(t => Math.abs(t.targetPrice - targetPrice) < 1e-9);
+    if (!match) {
+      await db.execute('DELETE FROM price_targets WHERE symbol = ? AND ABS(target_price - ?) < 0.000000001', [symbol, targetPrice]);
+      return false;
+    }
+    const remaining = arr.filter(t => !(Math.abs(t.targetPrice - targetPrice) < 1e-9));
+    if (remaining.length > 0) {
+      priceTargets.set(symbol, remaining);
+    } else {
+      priceTargets.delete(symbol);
+    }
+    if (match.id !== undefined && match.id !== null) {
+      await db.execute('DELETE FROM price_targets WHERE id = ?', [match.id]);
+    } else {
+      await db.execute('DELETE FROM price_targets WHERE symbol = ? AND ABS(target_price - ?) < 0.000000001', [symbol, targetPrice]);
+    }
+    if (remaining.length === 0) {
+      targetReminderCount.delete(symbol);
+      targetExtremes.delete(symbol);
+      alertFirstSent.delete(symbol);
+      alertReminderSent.delete(symbol);
+      if (activeFixedAlerts.has(symbol)) {
+        clearInterval(activeFixedAlerts.get(symbol));
+        activeFixedAlerts.delete(symbol);
+      }
+    }
+    return true;
+  }
+  // whole-symbol delete (original behaviour)
   priceTargets.delete(symbol);
   targetReminderCount.delete(symbol);
   targetExtremes.delete(symbol);
@@ -4423,36 +4455,40 @@ Be honest, direct and actionable.`;
 // e.g. a buy rule fired at $1.80 — any 'down' target at or above $1.80 is now moot.
 async function cancelObsoleteTargets(symbol, executedPrice, action) {
   try {
-    const target = priceTargets.get(symbol);
-    if (!target) return;
+    const arr = priceTargets.get(symbol);
+    if (!arr || !Array.isArray(arr) || arr.length === 0) return;
 
-    const tPrice = target.targetPrice;
-    const dir    = target.direction || 'up';
+    const obsolete = arr.filter(t => {
+      const dir = t.direction || 'up';
+      if (action === 'sell' && dir === 'up' && t.targetPrice <= executedPrice) return true;
+      if (action === 'buy'  && dir === 'down' && t.targetPrice >= executedPrice) return true;
+      return false;
+    });
+    if (obsolete.length === 0) return;
 
-    let isObsolete = false;
-    if (action === 'sell' && dir === 'up' && tPrice <= executedPrice) {
-      isObsolete = true; // sell happened at or above the 'up' target — target is already passed
-    } else if (action === 'buy' && dir === 'down' && tPrice >= executedPrice) {
-      isObsolete = true; // buy happened at or below the 'down' target — target is already passed
+    const remaining = arr.filter(t => !obsolete.includes(t));
+    if (remaining.length > 0) {
+      priceTargets.set(symbol, remaining);
+    } else {
+      priceTargets.delete(symbol);
+      targetReminderCount.delete(symbol);
+      if (activeFixedAlerts.has(symbol)) {
+        clearInterval(activeFixedAlerts.get(symbol));
+        activeFixedAlerts.delete(symbol);
+      }
     }
-
-    if (!isObsolete) return;
-
-    console.log(`[targets] Cancelling obsolete ${dir} target for ${symbol} — target ${tPrice}, exec ${executedPrice}, action ${action}`);
-    priceTargets.delete(symbol);
-    targetReminderCount.delete(symbol);
-
-    // Clear any active interval
-    if (activeFixedAlerts.has(symbol)) {
-      clearInterval(activeFixedAlerts.get(symbol));
-      activeFixedAlerts.delete(symbol);
-    }
-
-    // Remove from DB
-    await db.execute('DELETE FROM price_targets WHERE symbol = ?', [symbol]).catch(e => console.error('[targets] Delete failed:', e.message));
 
     const coinBase = symbol.replace('-USD', '');
-    await sendTelegram(`🗑️ <b>Target auto-cancelled: ${coinBase}</b>\nObsolete after ${action} executed at ${formatPrice(executedPrice)} — target was ${formatPrice(tPrice)} (${dir})`).catch(() => {});
+    for (const t of obsolete) {
+      const dir = t.direction || 'up';
+      console.log(`[targets] Cancelling obsolete ${dir} target for ${symbol} — target ${t.targetPrice}, exec ${executedPrice}, action ${action}`);
+      if (t.id !== undefined && t.id !== null) {
+        await db.execute('DELETE FROM price_targets WHERE id = ?', [t.id]).catch(e => console.error('[targets] Delete failed:', e.message));
+      } else {
+        await db.execute('DELETE FROM price_targets WHERE symbol = ? AND ABS(target_price - ?) < 0.000000001', [symbol, t.targetPrice]).catch(e => console.error('[targets] Delete failed:', e.message));
+      }
+      await sendTelegram(`🗑️ <b>Target auto-cancelled: ${coinBase}</b>\nObsolete after ${action} executed at ${formatPrice(executedPrice)} — target was ${formatPrice(t.targetPrice)} (${dir})`).catch(() => {});
+    }
   } catch (e) {
     console.error('[targets] cancelObsoleteTargets error:', e.message);
   }
@@ -7913,8 +7949,9 @@ function createMcpServer() {
       anchor_price:  z.number().optional().describe('Anchor price for set_target'),
       trail_pct:     z.number().optional().describe('Trailing percentage e.g. 10 for 10%'),
       current_price: z.number().optional().describe('Manual price override for set_trailing — useful for Kraken-only coins if auto-fetch fails'),
+      target_price:  z.number().optional().describe('For remove_target — remove only the rung at this exact target price; omit to remove ALL targets for the symbol'),
     },
-    async ({ action, symbol, direction, threshold_pct, anchor_price, trail_pct, current_price }) => {
+    async ({ action, symbol, direction, threshold_pct, anchor_price, trail_pct, current_price, target_price }) => {
       const sym      = symbol.includes('-USD') ? symbol.toUpperCase() : `${symbol.toUpperCase()}-USD`;
       const coinBase = sym.replace('-USD', '');
       let result = {};
@@ -7974,8 +8011,14 @@ function createMcpServer() {
 
       } else if (action === 'remove_target') {
         const hadTarget = priceTargets.has(sym);
-        await removeFixedTarget(sym);
-        result = { ok: true, action: 'remove_target', symbol: sym, message: hadTarget ? `Price target removed for ${coinBase}` : `No active target for ${coinBase} — any DB row cleared` };
+        const removedOne = await removeFixedTarget(sym, target_price);
+        let msg;
+        if (target_price !== undefined && target_price !== null) {
+          msg = removedOne ? `Removed ${coinBase} target at ${target_price}` : `No ${coinBase} target found at ${target_price} — nothing removed`;
+        } else {
+          msg = hadTarget ? `All price targets removed for ${coinBase}` : `No active target for ${coinBase} — any DB row cleared`;
+        }
+        result = { ok: true, action: 'remove_target', symbol: sym, message: msg };
 
       } else if (action === 'remove_threshold') {
         const hadThreshold = customThresholds[sym] !== undefined;
