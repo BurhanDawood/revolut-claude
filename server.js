@@ -940,7 +940,7 @@ try {
 // Restore recently acknowledged fixed-target alerts (4h window)
 try {
   const [targetAckRows] = await db.execute(
-    "SELECT symbol FROM macro_alerts_sent WHERE alert_type = 'target_acknowledged' AND created_at > DATE_SUB(NOW(), INTERVAL 4 HOUR) AND symbol IS NOT NULL"
+    "SELECT symbol FROM macro_alerts_sent WHERE alert_type = 'target_acknowledged' AND sent_at > DATE_SUB(NOW(), INTERVAL 4 HOUR) AND symbol IS NOT NULL"
   );
   for (const row of targetAckRows) {
     alertState.acknowledged.add(row.symbol);
@@ -1248,12 +1248,13 @@ set_auto_trade_rule, get_auto_rules, get_prices
     'INSERT INTO system_config (config_key, config_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)',
     ['system_capabilities', JSON.stringify({
       last_updated: new Date().toISOString(),
-      total_mcp_tools: 11,
+      total_mcp_tools: 13,
       tools: [
         'get_portfolio_summary', 'get_portfolio_data', 'get_trading_data',
         'get_context', 'manage_alerts', 'manage_trading',
         'set_entry_price', 'execute_kraken_trade',
-        'set_auto_trade_rule', 'get_auto_rules', 'get_prices'
+        'set_auto_trade_rule', 'get_auto_rules', 'get_prices',
+        'get_tranches', 'manage_auto_rules'
       ],
       trade_execution: {
         revolut_x: true,
@@ -1427,7 +1428,7 @@ async function seedLegacyTranches() {
     for (const row of entries) {
       const coinBase = row.symbol.replace('-USD', '');
       const [balRow] = await db.execute(
-        'SELECT quantity FROM balance_snapshots WHERE symbol = ? ORDER BY created_at DESC LIMIT 1',
+        'SELECT quantity FROM balance_snapshots WHERE symbol = ? ORDER BY recorded_at DESC LIMIT 1',
         [row.symbol]
       );
       const qty = parseFloat(balRow[0]?.quantity || 0);
@@ -6354,7 +6355,7 @@ async function checkPortfolio() {
         // Cooldown: skip if this target alert was sent or acknowledged within the last 4 hours
         // Protects against redeploy re-firing acknowledged alerts when DB ack hasn't loaded yet
         const [recentTargetRows] = await db.execute(
-          "SELECT id FROM macro_alerts_sent WHERE symbol = ? AND alert_type IN ('target','target_acknowledged') AND created_at > DATE_SUB(NOW(), INTERVAL 4 HOUR) LIMIT 1",
+          "SELECT id FROM macro_alerts_sent WHERE symbol = ? AND alert_type IN ('target','target_acknowledged') AND sent_at > DATE_SUB(NOW(), INTERVAL 4 HOUR) LIMIT 1",
           [symbol]
         ).catch(() => [[]]);
         if (recentTargetRows.length > 0) {
@@ -6469,7 +6470,7 @@ async function checkPortfolio() {
 
         // Cooldown: skip if this target alert was sent or acknowledged within the last 4 hours
         const [recentTargetRowsDown] = await db.execute(
-          "SELECT id FROM macro_alerts_sent WHERE symbol = ? AND alert_type IN ('target','target_acknowledged') AND created_at > DATE_SUB(NOW(), INTERVAL 4 HOUR) LIMIT 1",
+          "SELECT id FROM macro_alerts_sent WHERE symbol = ? AND alert_type IN ('target','target_acknowledged') AND sent_at > DATE_SUB(NOW(), INTERVAL 4 HOUR) LIMIT 1",
           [symbol]
         ).catch(() => [[]]);
         if (recentTargetRowsDown.length > 0) {
