@@ -7753,14 +7753,18 @@ function createMcpServer() {
 
   // ── Tool: get_trading_data ─────────────────────────────────────────────────
   server.tool('get_trading_data',
-    'Get trading journal entries, active alerts, trader context/profile, and rebalancing history',
+    'Get trading journal entries, active alerts, trader context/profile, rebalancing history, and dev_bridge messages',
     {
-      include: z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'all'])).optional()
-        .describe('What data to fetch — defaults to all'),
-      symbol: z.string().optional().describe('Filter journal by coin e.g. NEAR'),
-      limit:  z.number().optional().describe('Max journal entries to return, default 10'),
+      include: z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'dev_bridge', 'all'])).optional()
+        .describe('What data to fetch — defaults to all. dev_bridge is never included in all; request it explicitly'),
+      symbol:           z.string().optional().describe('Filter journal by coin e.g. NEAR'),
+      limit:            z.number().optional().describe('Max journal entries to return, default 10'),
+      bridge_id:        z.number().optional().describe('Fetch a specific dev_bridge row by id'),
+      ref_devlog_id:    z.number().optional().describe('Filter dev_bridge by referenced dev_log id'),
+      include_consumed: z.boolean().optional().describe('Include consumed dev_bridge rows (default false)'),
+      mark_consumed:    z.boolean().optional().describe('Mark returned dev_bridge rows consumed (default false)'),
     },
-    async ({ include, symbol, limit } = {}) => {
+    async ({ include, symbol, limit, bridge_id, ref_devlog_id, include_consumed, mark_consumed } = {}) => {
       const fetch = include || ['all'];
       const fetchAll = fetch.includes('all');
       const limitInt = parseInt(limit) || 10;
@@ -7830,6 +7834,32 @@ function createMcpServer() {
           );
           result.dev_log = devRows;
         } catch (e) { result.dev_log = { error: e.message }; }
+      }
+
+      // dev_bridge — explicitly excluded from fetchAll; must be requested by name
+      if (fetch.includes('dev_bridge')) {
+        try {
+          const bridgeLim = 20; // small fixed cap; bridge payloads can be large
+          const where = [];
+          const params = [];
+          if (bridge_id)     { where.push('id = ?');            params.push(bridge_id); }
+          if (ref_devlog_id) { where.push('ref_devlog_id = ?'); params.push(ref_devlog_id); }
+          if (!include_consumed && !bridge_id) { where.push('consumed = 0'); }
+          const whereClause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+          // LIMIT uses template literal — MySQL rejects bound LIMIT params (ER_WRONG_ARGUMENTS)
+          const [bridgeRows] = await db.execute(
+            `SELECT id, type, ref_devlog_id, payload, consumed, created_at FROM dev_bridge ${whereClause} ORDER BY id DESC LIMIT ${bridgeLim}`,
+            params
+          );
+          if (mark_consumed && bridgeRows.length) {
+            const ids = bridgeRows.map(r => r.id);
+            await db.execute(
+              `UPDATE dev_bridge SET consumed = 1, consumed_at = CURRENT_TIMESTAMP WHERE id IN (${ids.map(() => '?').join(',')})`,
+              ids
+            );
+          }
+          result.dev_bridge = { count: bridgeRows.length, rows: bridgeRows };
+        } catch (e) { result.dev_bridge = { error: e.message }; }
       }
 
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
@@ -8646,45 +8676,6 @@ function createMcpServer() {
         });
 
         return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
-      } catch (e) {
-        return { content: [{ type: 'text', text: JSON.stringify({ error: e.message }) }] };
-      }
-    }
-  );
-
-  // ── Tool: get_bridge ─────────────────────────────────────────────────────
-  server.tool('get_bridge',
-    'Read dev_bridge messages posted by Cowork (file reads, read-backs). Returns unconsumed rows by default, newest first. Use mark_consumed to flag rows as read.',
-    {
-      id:               z.number().optional().describe('Fetch a specific bridge row by id'),
-      ref_devlog_id:    z.number().optional().describe('Filter by referenced dev_log id'),
-      include_consumed: z.boolean().optional().describe('Include already-consumed rows (default false)'),
-      mark_consumed:    z.boolean().optional().describe('Mark the returned rows as consumed (default false)'),
-      limit:            z.number().optional().describe('Max rows, default 5'),
-    },
-    async ({ id, ref_devlog_id, include_consumed, mark_consumed, limit }) => {
-      try {
-        const lim = limit && limit > 0 ? Math.min(limit, 20) : 5;
-        const where = [];
-        const params = [];
-        if (id)            { where.push('id = ?');            params.push(id); }
-        if (ref_devlog_id) { where.push('ref_devlog_id = ?'); params.push(ref_devlog_id); }
-        if (!include_consumed && !id) { where.push('consumed = 0'); }
-        const whereClause = where.length ? `WHERE ${where.join(' AND ')}` : '';
-        // LIMIT uses template literal — MySQL rejects bound LIMIT params (ER_WRONG_ARGUMENTS).
-        // lim is clamped to <=20 and comes from a number, injection-safe.
-        const [rows] = await db.execute(
-          `SELECT id, type, ref_devlog_id, payload, consumed, created_at FROM dev_bridge ${whereClause} ORDER BY id DESC LIMIT ${lim}`,
-          params
-        );
-        if (mark_consumed && rows.length) {
-          const ids = rows.map(r => r.id);
-          await db.execute(
-            `UPDATE dev_bridge SET consumed = 1, consumed_at = CURRENT_TIMESTAMP WHERE id IN (${ids.map(() => '?').join(',')})`,
-            ids
-          );
-        }
-        return { content: [{ type: 'text', text: JSON.stringify({ count: rows.length, rows }, null, 2) }] };
       } catch (e) {
         return { content: [{ type: 'text', text: JSON.stringify({ error: e.message }) }] };
       }
