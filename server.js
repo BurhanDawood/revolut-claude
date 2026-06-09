@@ -8652,6 +8652,45 @@ function createMcpServer() {
     }
   );
 
+  // ── Tool: get_bridge ─────────────────────────────────────────────────────
+  server.tool('get_bridge',
+    'Read dev_bridge messages posted by Cowork (file reads, read-backs). Returns unconsumed rows by default, newest first. Use mark_consumed to flag rows as read.',
+    {
+      id:               z.number().optional().describe('Fetch a specific bridge row by id'),
+      ref_devlog_id:    z.number().optional().describe('Filter by referenced dev_log id'),
+      include_consumed: z.boolean().optional().describe('Include already-consumed rows (default false)'),
+      mark_consumed:    z.boolean().optional().describe('Mark the returned rows as consumed (default false)'),
+      limit:            z.number().optional().describe('Max rows, default 5'),
+    },
+    async ({ id, ref_devlog_id, include_consumed, mark_consumed, limit }) => {
+      try {
+        const lim = limit && limit > 0 ? Math.min(limit, 20) : 5;
+        const where = [];
+        const params = [];
+        if (id)            { where.push('id = ?');            params.push(id); }
+        if (ref_devlog_id) { where.push('ref_devlog_id = ?'); params.push(ref_devlog_id); }
+        if (!include_consumed && !id) { where.push('consumed = 0'); }
+        const whereClause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+        // LIMIT uses template literal — MySQL rejects bound LIMIT params (ER_WRONG_ARGUMENTS).
+        // lim is clamped to <=20 and comes from a number, injection-safe.
+        const [rows] = await db.execute(
+          `SELECT id, type, ref_devlog_id, payload, consumed, created_at FROM dev_bridge ${whereClause} ORDER BY id DESC LIMIT ${lim}`,
+          params
+        );
+        if (mark_consumed && rows.length) {
+          const ids = rows.map(r => r.id);
+          await db.execute(
+            `UPDATE dev_bridge SET consumed = 1, consumed_at = CURRENT_TIMESTAMP WHERE id IN (${ids.map(() => '?').join(',')})`,
+            ids
+          );
+        }
+        return { content: [{ type: 'text', text: JSON.stringify({ count: rows.length, rows }, null, 2) }] };
+      } catch (e) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: e.message }) }] };
+      }
+    }
+  );
+
   return server;
 }
 
