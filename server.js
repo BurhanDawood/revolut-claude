@@ -7027,6 +7027,23 @@ console.log('Cron jobs scheduled: midnight price recording + 9 AM morning briefi
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// #43 — auth gate on state-changing API routes.
+// GETs stay open (dashboard reads). Fail-closed if
+// API_TOKEN unset. /mcp + /telegram-webhook unaffected
+// (different path prefix). /api/bridge exempt (own
+// BRIDGE_TOKEN check).
+const API_WRITE_EXEMPT = ['/api/pause', '/api/resume', '/api/sweep/config', '/api/bridge'];
+app.use((req, res, next) => {
+  if (!req.path.startsWith('/api/')) return next();
+  if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
+  if (API_WRITE_EXEMPT.includes(req.path)) return next();
+  if (!process.env.API_TOKEN || req.headers['x-api-token'] !== process.env.API_TOKEN) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  return next();
+});
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 app.use(express.static(join(__dirname, 'public')));
