@@ -1363,19 +1363,6 @@ seedLegacyTranches().catch(e => console.error('[tranches] Startup seed failed:',
     if (rows.length) {
       const cfg = JSON.parse(rows[0].config_value);
 
-      // Fix 3: force-enable if still at seeded default (disabled)
-      if (!cfg.enabled) {
-        cfg.enabled = true;
-        cfg.max_sell_pct = cfg.max_sell_pct || 25;
-        cfg.require_confidence = cfg.require_confidence || 'High';
-        cfg.cooldown_minutes = cfg.cooldown_minutes || 60;
-        cfg.updated_at = new Date().toISOString();
-        await db.execute(
-          "INSERT INTO system_config (config_key, config_value) VALUES ('ai_auto_execute', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)",
-          [JSON.stringify(cfg)]
-        );
-        console.log('[auto-exec] Enabled via startup patch:', JSON.stringify(cfg));
-      }
 
       // Fix 4: status log every startup
       const reloaded = JSON.parse((await db.execute(
