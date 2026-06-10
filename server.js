@@ -589,6 +589,16 @@ await db.execute(`CREATE TABLE IF NOT EXISTS dev_log (
   resolved_at TIMESTAMP NULL
 )`).catch(e => console.error('[migration] dev_log:', e.message));
 
+await db.execute(`CREATE TABLE IF NOT EXISTS coin_strategy (
+  symbol VARCHAR(20) PRIMARY KEY,
+  status VARCHAR(20),
+  role VARCHAR(20),
+  theme VARCHAR(100),
+  strategy_md TEXT,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  updated_by VARCHAR(40)
+)`).catch(e => console.error('[migration] coin_strategy:', e.message));
+
 await db.execute(`CREATE TABLE IF NOT EXISTS session_state (
   id INT PRIMARY KEY AUTO_INCREMENT,
   active_workstream TEXT,
@@ -1286,6 +1296,20 @@ set_auto_trade_rule, get_auto_rules, get_prices
     }, null, 2)]
   );
   console.log('[config] Project description seeded to system_config');
+  const [csCount] = await db.execute('SELECT COUNT(*) AS n FROM coin_strategy');
+  if (csCount[0].n === 0) {
+    const [csPrefs] = await db.execute(
+      "SELECT preference_key, preference_value FROM trader_profile WHERE preference_key LIKE 'coin_strategy_%' AND preference_key != 'coin_strategy_INDEX'"
+    );
+    for (const p of csPrefs) {
+      const csSym = p.preference_key.replace('coin_strategy_', '').toUpperCase();
+      await db.execute(
+        'INSERT IGNORE INTO coin_strategy (symbol, strategy_md, updated_by) VALUES (?, ?, ?)',
+        [csSym, p.preference_value, 'seed_migration']
+      );
+    }
+    console.log(`[config] coin_strategy seeded: ${csPrefs.length} rows from preferences`);
+  }
 } catch (e) {
   console.error('[config] Failed to seed project_description:', e.message);
 }
@@ -7832,8 +7856,8 @@ function createMcpServer() {
   server.tool('get_trading_data',
     'Get trading journal entries, active alerts, trader context/profile, rebalancing history, and dev_bridge messages',
     {
-      include: z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'dev_bridge', 'all'])).optional()
-        .describe('What data to fetch — defaults to all. dev_bridge is never included in all; request it explicitly'),
+      include: z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'dev_bridge', 'coin_strategy', 'all'])).optional()
+        .describe('What data to fetch — defaults to all. dev_bridge and coin_strategy are never included in all; request them explicitly'),
       symbol:           z.string().optional().describe('Filter journal by coin e.g. NEAR'),
       limit:            z.number().optional().describe('Max journal entries to return, default 10'),
       bridge_id:        z.number().optional().describe('Fetch a specific dev_bridge row by id'),
@@ -7939,6 +7963,17 @@ function createMcpServer() {
         } catch (e) { result.dev_bridge = { error: e.message }; }
       }
 
+      // coin_strategy -- explicitly excluded from fetchAll; must be requested by name
+      if (fetch.includes('coin_strategy')) {
+        try {
+          const csQ = symbol
+            ? ['SELECT * FROM coin_strategy WHERE symbol = ?', [symbol.toUpperCase().replace('-USD','')]]
+            : ['SELECT * FROM coin_strategy ORDER BY symbol', []];
+          const [csRows] = await db.execute(csQ[0], csQ[1]);
+          result.coin_strategy = csRows;
+        } catch (e) { result.coin_strategy = { error: e.message }; }
+      }
+
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
     }
   );
@@ -7955,8 +7990,9 @@ function createMcpServer() {
       trail_pct:     z.number().optional().describe('Trailing percentage e.g. 10 for 10%'),
       current_price: z.number().optional().describe('Manual price override for set_trailing — useful for Kraken-only coins if auto-fetch fails'),
       target_price:  z.number().optional().describe('For remove_target — remove only the rung at this exact target price; omit to remove ALL targets for the symbol'),
+      description:   z.string().optional().describe('For set_target -- human note stored on the rung, surfaced when the alert fires'),
     },
-    async ({ action, symbol, direction, threshold_pct, anchor_price, trail_pct, current_price, target_price }) => {
+    async ({ action, symbol, direction, threshold_pct, anchor_price, trail_pct, current_price, target_price, description }) => {
       const sym      = symbol.includes('-USD') ? symbol.toUpperCase() : `${symbol.toUpperCase()}-USD`;
       const coinBase = sym.replace('-USD', '');
       let result = {};
@@ -7969,16 +8005,16 @@ function createMcpServer() {
             ? anchor_price * (1 - threshold_pct / 100)
             : anchor_price * (1 + threshold_pct / 100);
           await db.execute(
-            'INSERT INTO price_targets (symbol, anchor_price, threshold_pct, target_price, direction) VALUES (?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE anchor_price=VALUES(anchor_price), threshold_pct=VALUES(threshold_pct), target_price=VALUES(target_price), direction=VALUES(direction), updated_at=CURRENT_TIMESTAMP',
-            [sym, anchor_price, threshold_pct, targetPrice, dir]
+            'INSERT INTO price_targets (symbol, anchor_price, threshold_pct, target_price, direction, note) VALUES (?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE anchor_price=VALUES(anchor_price), threshold_pct=VALUES(threshold_pct), target_price=VALUES(target_price), direction=VALUES(direction), note=VALUES(note), updated_at=CURRENT_TIMESTAMP',
+            [sym, anchor_price, threshold_pct, targetPrice, dir, description ?? null]
           );
-          upsertPriceTarget(sym, { anchorPrice: anchor_price, thresholdPct: threshold_pct, targetPrice, direction: dir, note: null }); // #38 B2
+          upsertPriceTarget(sym, { anchorPrice: anchor_price, thresholdPct: threshold_pct, targetPrice, direction: dir, note: description ?? null }); // #38 B2
           alertState.acknowledged.delete(sym);
           r = { anchorPrice: anchor_price, targetPrice, direction: dir };
         } else {
-          r = await setFixedTarget(sym, threshold_pct, dir);
+          r = await setFixedTarget(sym, threshold_pct, dir, description ?? null);
         }
-        result = { ok: true, action: 'set_target', symbol: sym, ...r, message: `Alert set — fires when ${sym} ${dir === 'down' ? 'drops to' : 'hits'} $${r.targetPrice?.toFixed(6)}` };
+        result = { ok: true, action: 'set_target', symbol: sym, ...r, description: description ?? null, message: `Alert set — fires when ${sym} ${dir === 'down' ? 'drops to' : 'hits'} $${r.targetPrice?.toFixed(6)}` };
 
       } else if (action === 'set_threshold') {
         const { oldThreshold, newThreshold } = await setThreshold(sym, threshold_pct / 100);
@@ -8039,7 +8075,7 @@ function createMcpServer() {
   server.tool('manage_trading',
     'Log journal entries, trade intentions, trader preferences, update invested capital, or configure USDT sweep',
     {
-      action:                 z.enum(['log_journal', 'log_intention', 'save_preference', 'update_capital', 'configure_sweep', 'configure_auto_execute', 'log_dev_issue', 'update_session_state']).describe('What trading action to perform'),
+      action:                 z.enum(['log_journal', 'log_intention', 'save_preference', 'update_capital', 'configure_sweep', 'configure_auto_execute', 'log_dev_issue', 'update_session_state', 'upsert_coin_strategy']).describe('What trading action to perform'),
       symbol:                 z.string().optional().describe('Coin e.g. NEAR-USD or NEAR'),
       trade_action:           z.enum(['buy', 'sell', 'hold', 'add', 'reduce', 'payment', 'transfer']).optional().describe('Trade action for log_journal or log_intention'),
       price:                  z.number().optional().describe('Price for log_journal'),
@@ -8076,8 +8112,12 @@ function createMcpServer() {
       next_action:            z.string().optional().describe('Next recommended action for update_session_state'),
       recent_decision:        z.string().optional().describe('Single new decision to prepend to recent_decisions list (update_session_state)'),
       recent_decisions:       z.array(z.string()).optional().describe('Full recent_decisions array replacement, capped at 5 (update_session_state)'),
+      cs_status:            z.string().optional().describe('upsert_coin_strategy: active_holding|dust|watchlist|exited|radar'),
+      cs_role:              z.string().optional().describe('upsert_coin_strategy: anchor|swing|hodl|lotto|watch_entry|radar|dead_bag'),
+      cs_theme:             z.string().optional().describe('upsert_coin_strategy: theme tags e.g. DTCC,L1,DeFi'),
+      cs_strategy_md:       z.string().optional().describe('upsert_coin_strategy: freeform strategy notes'),
     },
-    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, max_buy_usd, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam, title, detail, category, status: devStatus, source: devSource, related_symbol: relSymbol, dev_log_id, active_workstream, progress, open_threads, next_action, recent_decision, recent_decisions }) => {
+    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, max_buy_usd, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam, title, detail, category, status: devStatus, source: devSource, related_symbol: relSymbol, dev_log_id, active_workstream, progress, open_threads, next_action, recent_decision, recent_decisions, cs_status, cs_role, cs_theme, cs_strategy_md }) => {
       // Make hodl_symbols accessible in configure_auto_execute via params object
       const params = { hodl_symbols: hodlSymbolsParam };
 
@@ -8318,6 +8358,21 @@ function createMcpServer() {
         await db.execute('INSERT INTO session_history (snapshot) VALUES (?)', [JSON.stringify(snapRows[0] || {})]);
 
         return { content: [{ type: 'text', text: JSON.stringify({ ok: true, action: 'update_session_state', updated: snapRows[0] || {} }) }] };
+      } else if (action === 'upsert_coin_strategy') {
+        const csSym = (symbol || '').toUpperCase().replace('-USD','');
+        if (!csSym) return { content: [{ type:'text', text: JSON.stringify({ ok:false, error:'symbol required' }) }] };
+        await db.execute(
+          `INSERT INTO coin_strategy (symbol, status, role, theme, strategy_md, updated_by)
+           VALUES (?, ?, ?, ?, ?, 'claude_mcp')
+           ON DUPLICATE KEY UPDATE
+             status = COALESCE(VALUES(status), status),
+             role = COALESCE(VALUES(role), role),
+             theme = COALESCE(VALUES(theme), theme),
+             strategy_md = COALESCE(VALUES(strategy_md), strategy_md),
+             updated_by = 'claude_mcp'`,
+          [csSym, cs_status ?? null, cs_role ?? null, cs_theme ?? null, cs_strategy_md ?? null]
+        );
+        return { content: [{ type:'text', text: JSON.stringify({ ok:true, action:'upsert_coin_strategy', symbol: csSym }) }] };
       }
     }
   );
