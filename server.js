@@ -7776,15 +7776,51 @@ app.get('/api/tradehistory', async (req, res) => {
 function createMcpServer() {
   const server = new McpServer({ name: 'revolut-x', version: '1.0.0' });
 
-  server.tool('get_prices', 'Get current crypto prices',
-    { symbol: z.string().describe('Trading pair e.g. BTC-USD') },
-    async ({ symbol }) => {
-      var sym = symbol.includes('-USD') ? symbol.toUpperCase() : symbol.toUpperCase() + '-USD';
-      var price = await getCurrentPrice(sym).catch(function(){ return null; });
-      if (price === null || price === undefined) {
-        return { content: [{ type: 'text', text: JSON.stringify({ symbol: sym, error: 'Price unavailable from Revolut X or Kraken' }) }] };
+  server.tool('get_prices', 'Get current crypto price(s). Pass symbol for one, or symbols[] for many in a single call.',
+    {
+      symbol:  z.string().optional().describe('Single trading pair e.g. BTC-USD'),
+      symbols: z.array(z.string()).optional().describe('Multiple trading pairs e.g. ["BTC-USD","ENA-USD"] — batched in one call'),
+    },
+    async ({ symbol, symbols } = {}) => {
+      const raw = (symbols && symbols.length) ? symbols : (symbol ? [symbol] : []);
+      if (!raw.length) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: 'Provide symbol or symbols[]' }) }] };
       }
-      return { content: [{ type: 'text', text: JSON.stringify({ symbol: sym, price: price, source: 'live' }) }] };
+      const norm = raw.map(s => s.toUpperCase().includes('-USD') ? s.toUpperCase() : s.toUpperCase() + '-USD');
+
+      // Fetch the full Revolut ticker list ONCE, map all requested symbols against it
+      const priceMap = {};
+      try {
+        const tickerResponse = await revolutRequest('GET', '/tickers');
+        const tickerList = Array.isArray(tickerResponse) ? tickerResponse : (tickerResponse.data || []);
+        for (const t of tickerList) {
+          if (!t.symbol) continue;
+          const p = parseFloat(t.last_price || t.mid || t.ask || t.bid);
+          if (p) priceMap[t.symbol.replace('/', '-').toUpperCase()] = p;
+        }
+      } catch (e) { /* fall through to per-symbol */ }
+
+      const results = {};
+      for (const sym of norm) {
+        let price = priceMap[sym] || null;
+        if (price === null) {
+          // Kraken fallback for symbols not on Revolut (GHIBLI, XPL, TAO, etc.)
+          price = await getCurrentPrice(sym).catch(() => null);
+        }
+        results[sym] = price !== null && price !== undefined
+          ? { price, source: priceMap[sym] ? 'revolut' : 'kraken' }
+          : { error: 'unavailable' };
+      }
+
+      // Single-symbol call: preserve the original flat response shape
+      if (norm.length === 1 && !(symbols && symbols.length)) {
+        const only = results[norm[0]];
+        return { content: [{ type: 'text', text: JSON.stringify(
+          only.error ? { symbol: norm[0], error: 'Price unavailable from Revolut X or Kraken' }
+                     : { symbol: norm[0], price: only.price, source: 'live' }
+        ) }] };
+      }
+      return { content: [{ type: 'text', text: JSON.stringify({ prices: results }) }] };
     }
   );
 
