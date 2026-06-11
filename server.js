@@ -2057,6 +2057,15 @@ async function getQuickAiRecommendation(symbol, changePct, currentPrice, directi
     const coinBase = symbol.replace('-USD', '');
     // A1 (dev_log #35 + #31): inject project name + role so model doesn't guess
     const { narrative, role } = await getCoinContext(coinBase);
+    // #36/S3 — plan-aware: saved strategy is the PRIMARY consideration
+    let planClause = ' No saved plan exists for this coin — give generic price-action analysis and explicitly say "no saved plan — generic analysis".';
+    try {
+      const [csRows] = await db.execute('SELECT strategy_md FROM coin_strategy WHERE symbol = ?', [coinBase]);
+      if (csRows.length && csRows[0].strategy_md) {
+        const planText = csRows[0].strategy_md.length > 900 ? csRows[0].strategy_md.slice(0, 900) + '…' : csRows[0].strategy_md;
+        planClause = ` The user has a SAVED PLAN for this coin — it is the PRIMARY consideration; generic TA is secondary. If the current price maps to a level named in the plan, name that level and quote the planned action. NEVER recommend an action that contradicts the plan or the coin's role. SAVED PLAN: """${planText}"""`;
+      }
+    } catch (e) { /* plan read failed — proceed without */ }
     const projectLabel = narrative
       ? `${symbol} (${narrative})`
       : `${symbol} (project unknown — do not guess the project; give a price-action-only view)`;
@@ -2080,10 +2089,10 @@ async function getQuickAiRecommendation(symbol, changePct, currentPrice, directi
     const roleClause = roleInstruction ? ` ${roleInstruction}` : '';
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-6',
-      max_tokens: 150,
+      max_tokens: 220,
       messages: [{
         role: 'user',
-        content: `In 2-3 sentences max, give a quick trading recommendation for ${projectLabel} which is ${dirText}. Consider current market conditions.${roleClause} ${startInstruction}`
+        content: `In 2-3 sentences max, give a quick trading recommendation for ${projectLabel} which is ${dirText}. Consider current market conditions.${roleClause}${planClause} Never invent or guess product names, partnerships, or technical specifics — only reference facts present in the saved plan. ${startInstruction}`
       }]
     });
     await logClaudeCall(reason, response.model || 'claude-sonnet-4-6', response.usage);
@@ -2109,6 +2118,17 @@ async function batchGetRecommendations(alerts) {
       if (aeRows.length) aeConfig = JSON.parse(aeRows[0].config_value);
     } catch (e) { /* ignore — default empty role lists */ }
 
+    // #36/S3 — one plan read for the whole batch
+    const csMap = new Map();
+    try {
+      const symList = alerts.map(a => a.coinBase);
+      if (symList.length) {
+        const placeholders = symList.map(() => '?').join(',');
+        const [csRows] = await db.execute(`SELECT symbol, strategy_md FROM coin_strategy WHERE symbol IN (${placeholders})`, symList);
+        for (const r of csRows) csMap.set(r.symbol, r.strategy_md || '');
+      }
+    } catch (e) { /* ignore — proceed without plans */ }
+
     const lines = alerts.map(a => {
       const narrative = COIN_NARRATIVES[a.coinBase] || null;
       const projectLabel = narrative
@@ -2117,15 +2137,17 @@ async function batchGetRecommendations(alerts) {
       let roleTag = '';
       if ((aeConfig.hodl_symbols || []).includes(a.coinBase)) roleTag = ' [HODL]';
       else if ((aeConfig.manual_only_symbols || []).includes(a.coinBase)) roleTag = ' [MANUAL]';
-      return `- ${projectLabel}${roleTag}: ${a.direction === 'up' ? 'UP' : 'DOWN'} ${Math.abs(a.changePct).toFixed(1)}% to ${fmtPriceShort(a.currentPrice)} (holding value ~$${a.valueUSD.toFixed(0)})`;
+      const csPlan = csMap.get(a.coinBase);
+      const planTag = csPlan ? ` | PLAN: ${csPlan.slice(0, 300).replace(/\n/g, ' ')}${csPlan.length > 300 ? '…' : ''}` : ' | (no saved plan)';
+      return `- ${projectLabel}${roleTag}: ${a.direction === 'up' ? 'UP' : 'DOWN'} ${Math.abs(a.changePct).toFixed(1)}% to ${fmtPriceShort(a.currentPrice)} (holding value ~$${a.valueUSD.toFixed(0)})${planTag}`;
     }).join('\n');
     const format = alerts.map(a => `${a.coinBase}: [recommendation]`).join('\n');
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-6',
-      max_tokens: Math.min(80 * alerts.length, 400),
+      max_tokens: Math.min(100 * alerts.length, 600),
       system: [{
         type: 'text',
-        text: 'You are a concise crypto trading assistant. For each alert give ONE short line — HOLD/SELL/BUY + brief reason. Use the exact format provided by the user. For any coin tagged [HODL] or [MANUAL], do NOT say BUY or SELL — say HOLD/monitor only. Never invent project fundamentals; if a project name is given use it, otherwise comment on price action only.',
+        text: 'You are a concise crypto trading assistant. For each alert give ONE short line — HOLD/SELL/BUY + brief reason. Use the exact format provided by the user. For any coin tagged [HODL] or [MANUAL], do NOT say BUY or SELL — say HOLD/monitor only. Never invent project fundamentals, product names, or specifics; if a project name is given use it, otherwise comment on price action only. When a PLAN is provided for a coin, the recommendation MUST follow the plan — name the matching plan level if one applies and never contradict it. For coins marked (no saved plan), say "no saved plan".',
         cache_control: { type: 'ephemeral' }
       }],
       messages: [{ role: 'user', content: `Quick trading recommendations for these alerts:\n${lines}\n\nFormat exactly:\n${format}` }]
