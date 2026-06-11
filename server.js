@@ -2182,6 +2182,11 @@ async function setFixedTarget(symbol, thresholdPct, direction = 'up', note = nul
   const targetPrice = direction === 'down'
     ? anchorPrice * (1 - thresholdPct / 100)
     : anchorPrice * (1 + thresholdPct / 100);
+  const impliedDirF = targetPrice >= anchorPrice ? 'up' : 'down';
+  if (direction !== impliedDirF) {
+    console.log(`[targets] ${symbol} direction auto-corrected ${direction} -> ${impliedDirF} (target ${targetPrice} vs anchor ${anchorPrice})`);
+    direction = impliedDirF;
+  }
   await db.execute(
     'INSERT INTO price_targets (symbol, anchor_price, threshold_pct, target_price, direction, note) VALUES (?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE anchor_price=VALUES(anchor_price), threshold_pct=VALUES(threshold_pct), target_price=VALUES(target_price), direction=VALUES(direction), note=VALUES(note), updated_at=CURRENT_TIMESTAMP',
     [symbol, anchorPrice, thresholdPct, targetPrice, direction, note]
@@ -2196,6 +2201,11 @@ async function setFixedTarget(symbol, thresholdPct, direction = 'up', note = nul
 async function setAbsolutePriceTarget(symbol, absoluteTargetPrice, direction = 'down', note = null) {
   const currentPrice = await getCurrentPrice(symbol);
   if (!currentPrice) throw new Error(`No price for ${symbol}`);
+  const impliedDirA = absoluteTargetPrice >= currentPrice ? 'up' : 'down';
+  if (direction !== impliedDirA) {
+    console.log(`[targets] ${symbol} direction auto-corrected ${direction} -> ${impliedDirA} (target ${absoluteTargetPrice} vs current ${currentPrice})`);
+    direction = impliedDirA;
+  }
   const thresholdPct = Math.abs((absoluteTargetPrice - currentPrice) / currentPrice * 100);
   await db.execute(
     'INSERT INTO price_targets (symbol, anchor_price, threshold_pct, target_price, direction, note) VALUES (?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE anchor_price=VALUES(anchor_price), threshold_pct=VALUES(threshold_pct), target_price=VALUES(target_price), direction=VALUES(direction), note=VALUES(note), updated_at=CURRENT_TIMESTAMP',
@@ -6409,6 +6419,8 @@ async function checkPortfolio() {
         // Check if this was auto-set from a Claude sell recommendation
         let upNoteData = null;
         try { if (target.note) upNoteData = JSON.parse(target.note); } catch (e) {}
+        const upDescLine = (target.note && !upNoteData) ? `\n📝 <i>${target.note}</i>` : '';
+        const upWickLine = (currentPrice < target.targetPrice) ? `\n⚡ Wick trigger: high ${formatPrice(effHigh)} touched your level between checks — price now back below it` : '';
 
         if (isDustCoin) {
           const newValueStr = `$${assetValueUSD.toFixed(2)}`;
@@ -6425,7 +6437,7 @@ async function checkPortfolio() {
             : (assetQty > 0 ? `You hold ${assetQty.toLocaleString('en-US', { maximumFractionDigits: 6 })} ${coinBase}` : '');
           alertMessage =
             `🎯 <b>${coinBase} HIT YOUR PROFIT TARGET!</b>\n\n` +
-            `Price: $${priceStr} (your Claude-recommended sell zone)\n` +
+            `Price: $${priceStr} (your Claude-recommended sell zone)${upWickLine}\n` +
             `Original advice: '<i>${upNoteData.snippet}</i>'\n` +
             (positionLine ? positionLine + '\n' : '') +
             `\n⚡ <b>RECOMMENDATION:</b> This is your planned profit zone.\n` +
@@ -6437,7 +6449,7 @@ async function checkPortfolio() {
           const replyMenu = `\n\n1️⃣ Sell  2️⃣ Hold  3️⃣ Analyse  4️⃣ Acknowledge\n💬 Reply number or '<b>${coinBase.toLowerCase()} 1</b>' to target this coin`;
           const autoReady = await getAutomationReadiness(symbol, 'buy');
           const autoLine = autoReady ? `\n\n⚡ AUTO-READY: This setup has worked ${autoReady.winRate}% of the time (${autoReady.sampleSize} trades). Could be automated.` : '';
-          alertMessage = `🎯 <b>${symbol} FIXED TARGET HIT!</b>\n\nAnchor: $${anchorStr} → Now $${priceStr} (+${changePct.toFixed(1)}%)${entryLine}\n\n⚡ RECOMMENDATION: ${aiRec}${replyMenu}${autoLine}`;
+          alertMessage = `🎯 <b>${symbol} FIXED TARGET HIT!</b>\n\nAnchor: $${anchorStr} → Now $${priceStr} (+${changePct.toFixed(1)}%)${entryLine}${upDescLine}${upWickLine}\n\n⚡ RECOMMENDATION: ${aiRec}${replyMenu}${autoLine}`;
         }
         await sendTelegram(alertMessage);
         targetExtremes.delete(symbol); // reset accumulator — target fired
@@ -6512,6 +6524,8 @@ async function checkPortfolio() {
         let alertMessage;
         let noteData = null;
         try { if (target.note) noteData = JSON.parse(target.note); } catch (e) {}
+        const dnDescLine = (target.note && !noteData) ? `\n📝 <i>${target.note}</i>` : '';
+        const dnWickLine = (currentPrice > target.targetPrice) ? `\n⚡ Wick trigger: low ${formatPrice(effLow)} touched your floor between checks — price has bounced since` : '';
 
         if (noteData && noteData.source === 'claude_rec') {
           // Enhanced message: this was auto-set from Bryan's thumbs-up on a recommendation
@@ -6522,7 +6536,7 @@ async function checkPortfolio() {
             : (qty > 0 ? `You hold: ${qty.toLocaleString('en-US', { maximumFractionDigits: 6 })} ${coinBase}` : '');
           alertMessage =
             `📊 <b>${coinBase} HIT YOUR BUY LEVEL!</b>\n\n` +
-            `Price: ${formatPrice(currentPrice)} (your Claude-recommended buy zone)\n` +
+            `Price: ${formatPrice(currentPrice)} (your Claude-recommended buy zone)${dnWickLine}\n` +
             `Original advice: '<i>${noteData.snippet}</i>'\n` +
             (positionLine ? positionLine + '\n' : '') +
             `\n⚡ <b>RECOMMENDATION:</b> This is your planned buy zone.\n` +
@@ -6534,7 +6548,7 @@ async function checkPortfolio() {
           const entryLine = plPct !== null ? `\nEntry: ${formatPrice(entryPrice)} | P&L: ${plPct}%` : '';
           const autoReady = await getAutomationReadiness(symbol, 'sell');
           const autoLine = autoReady ? `\n\n⚡ AUTO-READY: This setup has worked ${autoReady.winRate}% of the time (${autoReady.sampleSize} trades). Could be automated.` : '';
-          alertMessage = `📉 <b>${symbol} FIXED FLOOR HIT!</b>\n\nAnchor: ${formatPrice(target.anchorPrice)} → Now ${formatPrice(currentPrice)} (${changePct.toFixed(1)}%)${entryLine}\n\n⚡ RECOMMENDATION: ${aiRec}${replyMenu}${autoLine}`;
+          alertMessage = `📉 <b>${symbol} FIXED FLOOR HIT!</b>\n\nAnchor: ${formatPrice(target.anchorPrice)} → Now ${formatPrice(currentPrice)} (${changePct.toFixed(1)}%)${entryLine}${dnDescLine}${dnWickLine}\n\n⚡ RECOMMENDATION: ${aiRec}${replyMenu}${autoLine}`;
         }
         await sendTelegram(alertMessage);
         targetExtremes.delete(symbol); // reset accumulator — floor fired
@@ -7998,12 +8012,17 @@ function createMcpServer() {
       let result = {};
 
       if (action === 'set_target') {
-        const dir = direction || 'up';
+        let dir = direction || 'up';
         let r;
         if (anchor_price) {
           const targetPrice = dir === 'down'
             ? anchor_price * (1 - threshold_pct / 100)
             : anchor_price * (1 + threshold_pct / 100);
+          const impliedDirM = targetPrice >= anchor_price ? 'up' : 'down';
+          if (dir !== impliedDirM) {
+            console.log(`[targets] ${sym} direction auto-corrected ${dir} -> ${impliedDirM} (target ${targetPrice} vs anchor ${anchor_price})`);
+            dir = impliedDirM;
+          }
           await db.execute(
             'INSERT INTO price_targets (symbol, anchor_price, threshold_pct, target_price, direction, note) VALUES (?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE anchor_price=VALUES(anchor_price), threshold_pct=VALUES(threshold_pct), target_price=VALUES(target_price), direction=VALUES(direction), note=VALUES(note), updated_at=CURRENT_TIMESTAMP',
             [sym, anchor_price, threshold_pct, targetPrice, dir, description ?? null]
