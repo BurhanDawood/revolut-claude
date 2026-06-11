@@ -3703,12 +3703,7 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
         [coinBase, symbol, action]
       );
       if (recentSourced.length > 0) {
-        const src = recentSourced[0].source;
-        console.log(`[autoLog] Suppressing — trade already logged (source=${src}, id=${recentSourced[0].id})`);
-        const srcEmoji = src === 'claude_mcp' ? '✓' : '🤖';
-        await sendTelegram(
-          `✅ ${action.toUpperCase()} ${formatTradeQty(absQty)} ${coinBase} @ ${formatPrice(price)} = $${valueUsd.toFixed(2)} ${srcEmoji}`
-        ).catch(() => {});
+        console.log(`[autoLog] Suppressing — trade already logged (source=${recentSourced[0].source}, id=${recentSourced[0].id}). No Telegram sent — balance change may be a limit-order reservation, not a fill (#47).`);
         return;
       }
     } catch (e) { console.error('[autoLog] Source suppression check error:', e.message); }
