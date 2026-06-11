@@ -794,6 +794,19 @@ try {
   await db.execute(`CREATE INDEX idx_tranches_symbol ON position_tranches(symbol)`);
 } catch (e) { /* index already exists */ }
 
+await db.execute(`CREATE TABLE IF NOT EXISTS reconciliation_log (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  run_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+  symbol VARCHAR(20) NOT NULL,
+  exchange VARCHAR(20) NOT NULL DEFAULT 'revolut',
+  exchange_qty DECIMAL(20,8),
+  system_qty DECIMAL(20,8),
+  tranche_sum DECIMAL(20,8),
+  drift_pct DECIMAL(10,4),
+  drift_type VARCHAR(40),
+  acknowledged TINYINT(1) DEFAULT 0
+)`);
+
 await db.execute(`CREATE TABLE IF NOT EXISTS tax_lots (
   id INT AUTO_INCREMENT PRIMARY KEY,
   symbol VARCHAR(50) NOT NULL,
@@ -2540,6 +2553,82 @@ async function getCurrentPrice(symbol) {
 
   console.warn(`[price] No price found for ${sym} on Revolut X or Kraken`);
   return null;
+}
+
+async function runReconciliation() {
+  try {
+    const TOL = 0.5; // % tolerance for fees/dust
+    const drifts = [];
+    let checked = 0;
+
+    // --- gather system positions from Revolut /balances (available) ---
+    const revBals = await revolutRequest('GET', '/balances').catch(() => []);
+    const revMap = new Map();
+    for (const b of (revBals || [])) {
+      if (['USD','USDT','USDC','GBP','EUR'].includes(b.currency)) continue;
+      revMap.set(`${b.currency}-USD`, parseFloat(b.available || 0));
+    }
+
+    // --- Kraken positions ---
+    const kData = await getKrakenBalances().catch(() => ({ balances: [] }));
+    const kMap = new Map();
+    for (const k of (kData.balances || [])) kMap.set(k.symbol, parseFloat(k.quantity || 0));
+
+    // --- non-legacy tranche sums (symbol stored as coinBase) ---
+    const [trSums] = await db.execute(
+      `SELECT symbol, exchange, SUM(remaining_quantity) AS tranche_sum
+       FROM position_tranches WHERE is_legacy = 0 GROUP BY symbol, exchange`
+    );
+    const trMap = new Map();
+    for (const t of trSums) trMap.set(`${t.symbol}-USD::${t.exchange}`, parseFloat(t.tranche_sum || 0));
+
+    // --- build the union of symbols to check, per exchange ---
+    const checks = [];
+    for (const [sym, qty] of revMap) checks.push({ sym, exchange: 'revolut', exchangeQty: qty });
+    for (const [sym, qty] of kMap)   checks.push({ sym, exchange: 'kraken',  exchangeQty: qty });
+
+    for (const c of checks) {
+      checked++;
+      const trancheSum = trMap.get(`${c.sym}::${c.exchange}`) ?? null;
+      // system "position" reference = tranche sum when present, else exchange qty
+      const systemQty = trancheSum;
+      if (systemQty === null) continue; // no tranche record to compare -- skip (dust/untracked)
+      const base = c.exchangeQty || 0.00000001;
+      const driftPct = ((systemQty - c.exchangeQty) / base) * 100;
+      if (Math.abs(driftPct) <= TOL) continue;
+
+      // tag possible open-order reservation (Revolut available reads low when reserved)
+      const driftType = (c.exchange === 'revolut' && systemQty > c.exchangeQty)
+        ? 'system_high_maybe_open_order'
+        : (systemQty > c.exchangeQty ? 'system_high' : 'exchange_high');
+
+      // suppress repeats: skip if an unacknowledged row for this sym+exchange already exists from a prior run
+      const [[prior]] = await db.execute(
+        `SELECT COUNT(*) AS n FROM reconciliation_log
+         WHERE symbol = ? AND exchange = ? AND acknowledged = 0
+         AND run_date > DATE_SUB(NOW(), INTERVAL 7 DAY)`,
+        [c.sym, c.exchange]
+      );
+      await db.execute(
+        `INSERT INTO reconciliation_log (symbol, exchange, exchange_qty, system_qty, tranche_sum, drift_pct, drift_type)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [c.sym, c.exchange, c.exchangeQty, systemQty, trancheSum, driftPct.toFixed(4), driftType]
+      );
+      if (prior.n === 0) {
+        const tag = driftType === 'system_high_maybe_open_order' ? ' (may be open order)' : '';
+        drifts.push(`${c.sym} ${c.exchange}: sys ${systemQty.toFixed(4)} vs exch ${c.exchangeQty.toFixed(4)} (${driftPct > 0 ? '+' : ''}${driftPct.toFixed(1)}%)${tag}`);
+      }
+    }
+
+    if (drifts.length) {
+      await sendTelegram(`⚠️ <b>RECONCILIATION — ${drifts.length} new drift(s)</b>\n\n${drifts.join('\n')}\n\n<i>Checked ${checked} positions. Reply to investigate.</i>`).catch(() => {});
+    } else {
+      console.log(`[reconciliation] Clean — ${checked} positions checked, no new drift`);
+    }
+    console.log(`[reconciliation] Run complete: ${checked} checked, ${drifts.length} new drift(s)`);
+  } catch (e) {
+    console.error('[reconciliation] error:', e.message);
+  }
 }
 
 async function recordDailyPrices() {
@@ -6965,6 +7054,7 @@ setTimeout(async () => {
 
 // Record prices at midnight every day (UK time)
 cron.schedule('0 0 * * *', recordDailyPrices, { timezone: 'Europe/London' });
+cron.schedule('0 3 * * *', runReconciliation, { timezone: 'Europe/London' });
 
 // Morning briefing disabled — sendMorningBriefing() kept for manual use
 // cron.schedule('5 9 * * *', async () => {
@@ -7923,8 +8013,8 @@ function createMcpServer() {
   server.tool('get_trading_data',
     'Get trading journal entries, active alerts, trader context/profile, rebalancing history, and dev_bridge messages',
     {
-      include: z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'dev_bridge', 'coin_strategy', 'all'])).optional()
-        .describe('What data to fetch — defaults to all. dev_bridge and coin_strategy are never included in all; request them explicitly'),
+      include: z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'dev_bridge', 'coin_strategy', 'reconciliation', 'all'])).optional()
+        .describe('What data to fetch — defaults to all. dev_bridge, coin_strategy and reconciliation are never included in all; request them explicitly'),
       symbol:           z.string().optional().describe('Filter journal by coin e.g. NEAR'),
       limit:            z.number().optional().describe('Max journal entries to return, default 10'),
       bridge_id:        z.number().optional().describe('Fetch a specific dev_bridge row by id'),
@@ -8039,6 +8129,17 @@ function createMcpServer() {
           const [csRows] = await db.execute(csQ[0], csQ[1]);
           result.coin_strategy = csRows;
         } catch (e) { result.coin_strategy = { error: e.message }; }
+      }
+
+      // reconciliation -- explicitly excluded from fetchAll; must be requested by name
+      if (fetch.includes('reconciliation')) {
+        try {
+          const [recRows] = await db.execute(
+            `SELECT symbol, exchange, exchange_qty, system_qty, drift_pct, drift_type, acknowledged, run_date
+             FROM reconciliation_log ORDER BY run_date DESC LIMIT 50`
+          );
+          result.reconciliation = recRows;
+        } catch (e) { result.reconciliation = { error: e.message }; }
       }
 
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
