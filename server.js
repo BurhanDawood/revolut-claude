@@ -469,6 +469,23 @@ await db.execute(`CREATE TABLE IF NOT EXISTS trading_journal (
   INDEX idx_created (created_at)
 )`);
 
+// #48 v1: forward-outcome columns (idempotent)
+for (const [col, ddl] of [
+  ['outcome_7d_pct', 'ADD COLUMN outcome_7d_pct DECIMAL(10,4) NULL'],
+  ['outcome_30d_pct', 'ADD COLUMN outcome_30d_pct DECIMAL(10,4) NULL'],
+  ['outcome_grade_source', "ADD COLUMN outcome_grade_source VARCHAR(20) NULL"],
+]) {
+  try {
+    const [rows] = await db.execute(
+      `SELECT COUNT(*) AS c FROM information_schema.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'trading_journal' AND COLUMN_NAME = ?`, [col]);
+    if (rows[0].c === 0) {
+      await db.execute(`ALTER TABLE trading_journal ${ddl}`);
+      console.log(`[migrate] #48 added column ${col}`);
+    }
+  } catch (e) { console.warn(`[migrate] #48 ${col}:`, e.message); }
+}
+
 await db.execute(`CREATE TABLE IF NOT EXISTS trader_profile (
   id INT AUTO_INCREMENT PRIMARY KEY,
   preference_key VARCHAR(100) UNIQUE NOT NULL,
@@ -4440,6 +4457,62 @@ async function checkIntentionOutcomes() {
   }
 }
 
+// #48 v1: forward trade-outcome grader (writes only new columns)
+async function gradeTradeOutcomes() {
+  try {
+    let priceMap = {};
+    try {
+      const tr = await revolutRequest('GET', '/tickers');
+      const list = Array.isArray(tr) ? tr : (tr.data || []);
+      for (const t of list) {
+        if (!t.symbol) continue;
+        const p = parseFloat(t.last_price || t.mid || t.ask || t.bid);
+        if (p) { priceMap[t.symbol] = p; priceMap[t.symbol.replace('/', '-')] = p; }
+      }
+    } catch (e) { console.warn('[grade] ticker prefetch failed:', e.message); }
+
+    const priceFor = async (symbol) => {
+      const sym = symbol.includes('-USD') ? symbol : `${symbol}-USD`;
+      if (priceMap[sym]) return priceMap[sym];
+      return await getCurrentPrice(sym).catch(() => null);
+    };
+    const gradeRow = (action, entry, now) => {
+      const rawMove = ((now - entry) / entry) * 100;
+      const a = (action || '').toLowerCase();
+      return (a === 'sell' || a === 'reduce') ? -rawMove : rawMove; // sells inverse: price down after = good exit
+    };
+
+    const [d7] = await db.execute(
+      `SELECT id, symbol, action, price FROM trading_journal
+       WHERE action IN ('buy','sell','add','reduce') AND price > 0 AND outcome_7d_pct IS NULL
+         AND created_at <  DATE_SUB(NOW(), INTERVAL 7 DAY)
+         AND created_at >= DATE_SUB(NOW(), INTERVAL 9 DAY)`);
+    let g7 = 0;
+    for (const r of d7) {
+      const now = await priceFor(r.symbol); const entry = parseFloat(r.price);
+      if (!now || !entry) continue;
+      await db.execute(
+        `UPDATE trading_journal SET outcome_7d_pct = ?, outcome_grade_source = 'forward_live' WHERE id = ?`,
+        [gradeRow(r.action, entry, now).toFixed(4), r.id]); g7++;
+    }
+
+    const [d30] = await db.execute(
+      `SELECT id, symbol, action, price FROM trading_journal
+       WHERE action IN ('buy','sell','add','reduce') AND price > 0 AND outcome_30d_pct IS NULL
+         AND created_at <  DATE_SUB(NOW(), INTERVAL 30 DAY)
+         AND created_at >= DATE_SUB(NOW(), INTERVAL 32 DAY)`);
+    let g30 = 0;
+    for (const r of d30) {
+      const now = await priceFor(r.symbol); const entry = parseFloat(r.price);
+      if (!now || !entry) continue;
+      await db.execute(
+        `UPDATE trading_journal SET outcome_30d_pct = ?, outcome_grade_source = COALESCE(outcome_grade_source,'forward_live') WHERE id = ?`,
+        [gradeRow(r.action, entry, now).toFixed(4), r.id]); g30++;
+    }
+    console.log(`[grade] #48 forward grader: ${g7} @7d, ${g30} @30d`);
+  } catch (e) { console.error('[grade] gradeTradeOutcomes error:', e.message); }
+}
+
 // ── Portfolio Rebalancing Analysis ───────────────────────────────────────────
 
 async function buildPositions() {
@@ -7107,6 +7180,7 @@ cron.schedule('0 2 * * *', async () => {
 
 // Daily rebalancing outcome checks — 10:05 AM (7-day + 30-day)
 cron.schedule('5 10 * * *', checkRebalancingOutcomes, { timezone: 'Europe/London' });
+cron.schedule('10 10 * * *', gradeTradeOutcomes, { timezone: 'Europe/London' });
 
 // Weekly snapshot — every Monday 9:10 AM, saves portfolio state to system_config
 cron.schedule('10 9 * * 1', async () => {
