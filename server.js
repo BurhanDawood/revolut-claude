@@ -9318,6 +9318,34 @@ app.delete('/api/trailing-stops/:symbol', async (req, res) => {
   res.json({ ok: true, symbol });
 });
 
+// #57 S4: expose coin_strategy to the dashboard (read-only)
+app.get('/api/coin-strategy', async (req, res) => {
+  try {
+    const [rows] = await db.execute(
+      'SELECT symbol, status, role, theme, strategy_md, updated_at FROM coin_strategy ORDER BY symbol'
+    );
+    res.json({ strategies: rows });
+  } catch (e) {
+    console.error('[api] /api/coin-strategy error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// #57 S4: per-coin tranche/lot breakdown for the card (read-only)
+app.get('/api/tranches/:symbol', async (req, res) => {
+  try {
+    const base = req.params.symbol.toUpperCase().replace('-USD', '');
+    const [rows] = await db.execute(
+      'SELECT symbol, exchange, remaining_quantity, entry_price, cost_basis, entry_date, is_legacy, notes FROM position_tranches WHERE symbol = ? AND remaining_quantity > 0 ORDER BY entry_date DESC',
+      [base]
+    );
+    res.json({ symbol: base, tranches: rows });
+  } catch (e) {
+    console.error('[api] /api/tranches error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // GET /api/auto-rules
 app.get('/api/auto-rules', async (req, res) => {
   try {
