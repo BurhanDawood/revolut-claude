@@ -1,6 +1,7 @@
-// dashboard.js v3.0.0 — matched to dashboard.html
+// dashboard.js v3.1.0 — matched to dashboard.html
 
-var DASHBOARD_VERSION = '3.0.0';
+var DASHBOARD_VERSION = '3.1.0';
+var csMap = {};
 console.log('Dashboard v' + DASHBOARD_VERSION);
 
 window.onerror = function(msg, src, line) {
@@ -172,36 +173,196 @@ function loadPortfolio() {
       setText('tangem-entry-line', 'Entry: $' + tangemEntry.toFixed(4));
     }
 
-    positions.sort(function(a, b) { return parseFloat(b.value_usd || 0) - parseFloat(a.value_usd || 0); });
-    var html = '';
-    for (var i = 0; i < positions.length; i++) {
-      var pos = positions[i];
-      var val = parseFloat(pos.value_usd || 0);
-      if (val < 1) continue;
-      var cp = parseFloat(pos.current_price || 0), ep = parseFloat(pos.entry_price || 0);
-      var pl = ep > 0 ? ((cp - ep) / ep * 100) : 0, plc = pl >= 0 ? '#00ff88' : '#ff4444';
-      var overnight = parseFloat(pos.change_from_baseline_pct || 0);
-      var oColor = overnight >= 0 ? 'pos' : 'neg';
-      var entryLine = ep > 0
-        ? 'Entry: ' + fmtPrice(ep) + ' | Now: ' + fmtPrice(cp) + ' | <span style="color:' + plc + '">' + fmtPct(pl) + '</span>'
-        : 'Now: ' + fmtPrice(cp);
-      var hb = parseFloat(pos.historical_basis || 0), histLine = '';
-      if (hb > 0 && ep > 0 && Math.abs(hb - ep) > 0.000001) {
-        var hpl = ((cp - hb) / hb * 100), hc = hpl >= 0 ? '#00ff88' : '#ff4444';
-        histLine = '<br><span style="color:#555;font-size:10px">Hist: ' + fmtPrice(hb) + ' <span style="color:' + hc + '">' + fmtPct(hpl) + '</span></span>';
-      }
-      var cy = parseInt(pos.cycle_count || 0);
-      var cyLine = cy > 0 ? '<br><span style="color:#444;font-size:10px">' + cy + ' cycle(s)</span>' : '';
-      html += '<div style="border-left:3px solid ' + plc + ';padding:10px 12px;margin-bottom:8px;background:#1a1a1a;border-radius:4px">'
-        + '<div style="display:flex;justify-content:space-between;margin-bottom:4px">'
-        + '<span style="color:white;font-weight:bold">' + pos.currency + '</span>'
-        + '<div style="text-align:right"><span style="color:white;font-weight:bold">$' + val.toFixed(2) + '</span>'
-        + (overnight !== 0 ? '<br><span class="overnight-badge ' + oColor + '" style="font-size:10px">' + (overnight >= 0 ? '+' : '') + overnight.toFixed(1) + '% overnight</span>' : '')
-        + '</div></div><div style="font-size:11px;color:#888">' + entryLine + histLine + cyLine + '</div></div>';
-    }
-    var holdEl = $('holdings-list');
-    if (holdEl) holdEl.innerHTML = html || '<div class="empty-state">No positions</div>';
+    // #57 S4: fetch strategy registry, then render the two-section card grid
+    fetchData('/api/coin-strategy').then(function(csData) {
+      csMap = {};
+      var arr = (csData && csData.strategies) || [];
+      for (var ci = 0; ci < arr.length; ci++) csMap[arr[ci].symbol] = arr[ci];
+      renderHoldingsGrid(positions);
+    });
     setText('last-updated', 'Updated ' + new Date().toLocaleTimeString('en-GB'));
+  });
+}
+
+// ── #57 S4: asset cards ───────────────────────────────────────────
+
+var META_ROWS = { DEAD_BAGS: 1, EXITED: 1 };
+var WATCH_ROLES = { watch_entry: 1, radar: 1 };
+
+function esc(x) {
+  return String(x == null ? '' : x).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function roleBadge(role) {
+  if (!role) return '';
+  var colors = { anchor:'#ffd700', swing:'#4488ff', hodl:'#aa44ff', lotto:'#ff8800', dead_bag:'#777777', watch_entry:'#00bbcc', radar:'#888888' };
+  var c = colors[role] || '#888888';
+  return ' <span style="font-size:9px;padding:1px 6px;border-radius:8px;background:' + c + '22;color:' + c + ';border:1px solid ' + c + '55">' + esc(role.replace('_', ' ')) + '</span>';
+}
+
+function posPL(pos) {
+  if (!pos) return null;
+  var ep = parseFloat(pos.entry_price || 0), cp = parseFloat(pos.current_price || 0);
+  return ep > 0 ? ((cp - ep) / ep * 100) : null;
+}
+
+function sectionHeader(label, n) {
+  return '<div style="color:#666;font-size:11px;font-weight:bold;letter-spacing:1px;margin:14px 0 8px;text-transform:uppercase">' + label + ' <span style="color:#444">(' + n + ')</span></div>';
+}
+
+function renderHoldingsGrid(positions) {
+  var holdEl = $('holdings-list');
+  if (!holdEl) return;
+  var posMap = {};
+  for (var i = 0; i < positions.length; i++) posMap[positions[i].currency] = positions[i];
+
+  var btc = null, featured = [], watching = [], deadbags = [];
+  for (var sym in csMap) {
+    if (!csMap.hasOwnProperty(sym) || META_ROWS[sym]) continue;
+    var cs = csMap[sym];
+    var e = { sym: sym, cs: cs, pos: posMap[sym] || null };
+    if (sym === 'BTC') btc = e;
+    else if (WATCH_ROLES[cs.role]) watching.push(e);
+    else featured.push(e);
+  }
+  for (var j = 0; j < positions.length; j++) {
+    var p = positions[j];
+    if (csMap[p.currency] || META_ROWS[p.currency]) continue;
+    deadbags.push({ sym: p.currency, cs: null, pos: p });
+  }
+
+  var byVal = function(a, b) { return parseFloat((b.pos && b.pos.value_usd) || 0) - parseFloat((a.pos && a.pos.value_usd) || 0); };
+  featured.sort(byVal); deadbags.sort(byVal); watching.sort(byVal);
+
+  var html = '';
+
+  if (btc) {
+    var bp = btc.pos ? fmtPrice(btc.pos.current_price) : '';
+    html += '<div onclick="toggleCard(\'BTC\')" style="cursor:pointer;display:flex;justify-content:space-between;align-items:center;padding:8px 12px;margin-bottom:10px;background:#15171c;border:1px solid #333;border-radius:4px">'
+      + '<span style="color:#9aa0aa;font-weight:bold;font-size:12px">\u{1F4E1} BTC \u00B7 MACRO RADAR</span>'
+      + '<span style="color:#aaa;font-size:12px">' + bp + ' \u25BE</span></div>'
+      + '<div id="card-detail-BTC" style="display:none;margin:-6px 0 12px;padding:0 12px 10px"></div>';
+  }
+
+  html += sectionHeader('Holdings', featured.length + (deadbags.length ? 1 : 0));
+  for (var f = 0; f < featured.length; f++) html += makeCard(featured[f], false);
+
+  if (deadbags.length) {
+    var dbVal = 0;
+    for (var d = 0; d < deadbags.length; d++) dbVal += parseFloat((deadbags[d].pos && deadbags[d].pos.value_usd) || 0);
+    html += '<div onclick="toggleDeadbags()" style="cursor:pointer;display:flex;justify-content:space-between;padding:10px 12px;margin-bottom:8px;background:#161616;border-left:3px solid #555;border-radius:4px">'
+      + '<span style="color:#999;font-weight:bold">\u{1F480} Dead bags (' + deadbags.length + ')</span>'
+      + '<span style="color:#999">$' + dbVal.toFixed(2) + ' \u25BE</span></div>'
+      + '<div id="deadbags-list" style="display:none">';
+    for (var dd = 0; dd < deadbags.length; dd++) html += makeCard(deadbags[dd], false);
+    html += '</div>';
+  }
+
+  html += sectionHeader('Watching for entry', watching.length);
+  if (!watching.length) html += '<div class="empty-state">None</div>';
+  for (var w = 0; w < watching.length; w++) html += makeCard(watching[w], true);
+
+  holdEl.innerHTML = html || '<div class="empty-state">No positions</div>';
+}
+
+function makeCard(e, isWatch) {
+  var sym = e.sym, cs = e.cs, pos = e.pos;
+  var val = parseFloat((pos && pos.value_usd) || 0);
+  var pl = posPL(pos);
+  var plc = (pl == null) ? '#555555' : (pl >= 0 ? '#00ff88' : '#ff4444');
+  var border = isWatch ? '#00bbcc' : plc;
+  var overnight = parseFloat((pos && pos.change_from_baseline_pct) || 0);
+
+  var right;
+  if (isWatch) {
+    right = (val >= 0.01)
+      ? '<span style="color:#888;font-size:11px">dust $' + val.toFixed(2) + '</span>'
+      : '<span style="color:#00bbcc;font-size:11px">watching</span>';
+  } else {
+    right = '<span style="color:white;font-weight:bold">$' + val.toFixed(2) + '</span>'
+      + (pl != null ? '<br><span style="color:' + plc + ';font-size:11px">' + fmtPct(pl) + '</span>' : '');
+  }
+  if (overnight !== 0) {
+    right += '<br><span style="font-size:9px;color:' + (overnight >= 0 ? '#00ff88' : '#ff4444') + '">' + (overnight >= 0 ? '+' : '') + overnight.toFixed(1) + '% o/n</span>';
+  }
+
+  return '<div style="border-left:3px solid ' + border + ';margin-bottom:8px;background:#1a1a1a;border-radius:4px">'
+    + '<div onclick="toggleCard(\'' + sym + '\')" style="cursor:pointer;display:flex;justify-content:space-between;align-items:flex-start;padding:10px 12px">'
+    + '<span style="color:white;font-weight:bold">' + esc(sym) + (cs ? roleBadge(cs.role) : '') + '</span>'
+    + '<div style="text-align:right">' + right + ' <span style="color:#666">\u25BE</span></div>'
+    + '</div>'
+    + '<div id="card-detail-' + sym + '" style="display:none;padding:0 12px 12px;border-top:1px solid #2a2a2a"></div>'
+    + '</div>';
+}
+
+function toggleDeadbags() {
+  var el = $('deadbags-list');
+  if (el) el.style.display = (el.style.display === 'none') ? 'block' : 'none';
+}
+
+function toggleCard(sym) {
+  var el = $('card-detail-' + sym);
+  if (!el) return;
+  if (el.style.display === 'none' || !el.style.display) {
+    el.style.display = 'block';
+    if (!el.getAttribute('data-loaded')) { el.setAttribute('data-loaded', '1'); loadCardDetail(sym, el); }
+  } else {
+    el.style.display = 'none';
+  }
+}
+
+function loadCardDetail(sym, el) {
+  var cs = csMap[sym];
+  var h = '';
+  if (cs) {
+    h += '<div style="font-size:10px;color:#9aa0aa;margin:8px 0 6px">'
+      + (cs.status ? 'STATUS: ' + esc(cs.status) + '  ' : '')
+      + (cs.role ? '\u00B7 ROLE: ' + esc(cs.role) + '  ' : '')
+      + (cs.theme ? '\u00B7 THEME: ' + esc(cs.theme) : '') + '</div>';
+  } else {
+    h += '<div style="font-size:10px;color:#888;margin:8px 0 6px">No saved plan \u2014 dead-bag / untracked holding</div>';
+  }
+  h += '<div style="font-size:10px;color:#ffaa00;margin-bottom:6px">Cycle P&amp;L \u2014 pending #8</div>';
+  if (cs && cs.strategy_md) {
+    h += '<div style="white-space:pre-wrap;font-size:11px;color:#bbb;line-height:1.45;background:#141414;padding:8px;border-radius:4px;margin-bottom:8px">' + esc(cs.strategy_md) + '</div>';
+  }
+  h += '<div id="cd-tranches-' + sym + '" style="font-size:11px;color:#888;margin-bottom:8px">Loading lots\u2026</div>';
+  h += '<div id="cd-journal-' + sym + '" style="font-size:11px;color:#888">Loading journal\u2026</div>';
+  el.innerHTML = h;
+
+  fetchData('/api/tranches/' + encodeURIComponent(sym)).then(function(t) {
+    var c = $('cd-tranches-' + sym);
+    if (!c) return;
+    var rows = (t && t.tranches) || [];
+    if (!rows.length) { c.innerHTML = '<span style="color:#666">No tracked lots</span>'; return; }
+    var s = '<div style="color:#666;font-weight:bold;margin-bottom:3px">LOTS</div>';
+    for (var i = 0; i < rows.length; i++) {
+      var r = rows[i];
+      s += '<div style="display:flex;justify-content:space-between;padding:2px 0;border-bottom:1px solid #222">'
+        + '<span>' + fmtQty(r.remaining_quantity) + ' @ ' + fmtPrice(r.entry_price) + (parseInt(r.is_legacy) ? ' <span style="color:#a70">\u00B7legacy</span>' : '') + '</span>'
+        + '<span style="color:#777">$' + parseFloat(r.cost_basis || 0).toFixed(2) + '</span></div>';
+    }
+    c.innerHTML = s;
+  });
+
+  fetchData('/api/activity?limit=100&filter=all').then(function(j) {
+    var c = $('cd-journal-' + sym);
+    if (!c) return;
+    var all = (j && j.trades) || [];
+    var rows = [];
+    for (var i = 0; i < all.length && rows.length < 6; i++) { if (all[i].symbol === sym) rows.push(all[i]); }
+    if (!rows.length) { c.innerHTML = '<span style="color:#666">No recent journal entries</span>'; return; }
+    var s = '<div style="color:#666;font-weight:bold;margin:6px 0 3px">RECENT JOURNAL</div>';
+    for (var k = 0; k < rows.length; k++) {
+      var r = rows[k];
+      var col = r.action === 'buy' ? '#00ff88' : (r.action === 'sell' ? '#ff4444' : '#888');
+      var dt = new Date(r.created_at).toLocaleDateString('en-GB', { day: '2-digit', month: 'short' });
+      s += '<div style="padding:2px 0;border-bottom:1px solid #222">'
+        + '<span style="color:' + col + '">' + (r.action || '').toUpperCase() + '</span> '
+        + fmtQty(r.quantity) + ' @ ' + fmtPrice(r.price) + ' <span style="color:#555">' + dt + '</span>'
+        + (r.reasoning ? '<br><span style="color:#777">' + esc(r.reasoning).slice(0, 90) + '</span>' : '') + '</div>';
+    }
+    c.innerHTML = s;
   });
 }
 
