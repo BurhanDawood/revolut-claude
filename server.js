@@ -2385,12 +2385,10 @@ async function acknowledgeAlert(symbol) {
   targetExtremes.delete(symbol);
 
   // Log target acknowledgement for fixed-target cooldown recovery across restarts
-  if (activeFixedAlerts.has(symbol) || priceTargets.has(symbol)) {
-    await db.execute(
-      "INSERT INTO macro_alerts_sent (symbol, alert_type, alert_hash, message) VALUES (?, 'target_acknowledged', ?, 'User acknowledged')",
-      [symbol, `target_ack_${symbol}_${Date.now()}`]
-    ).catch(() => {});
-  }
+  await db.execute(
+    "INSERT INTO macro_alerts_sent (symbol, alert_type, alert_hash, message) VALUES (?, 'target_acknowledged', ?, 'User acknowledged')",
+    [symbol, `target_ack_${symbol}_${Date.now()}`]
+  ).catch(() => {});
 
   console.log('[ack] Complete for:', symbol,
     '| Active pump:', alertState.active.size,
@@ -6591,14 +6589,13 @@ async function checkPortfolio() {
         const changePct = ((currentPrice - target.anchorPrice) / target.anchorPrice) * 100;
         const coinBase = symbol.replace('-USD', '');
 
-        // Cooldown: skip if this target alert was sent or acknowledged within the last 4 hours
-        // Protects against redeploy re-firing acknowledged alerts when DB ack hasn't loaded yet
+        // #70: 24h window matches ignored_coins expiry — covers redeployments within 24h of ack
         const [recentTargetRows] = await db.execute(
-          "SELECT id FROM macro_alerts_sent WHERE symbol = ? AND alert_type IN ('target','target_acknowledged') AND sent_at > DATE_SUB(NOW(), INTERVAL 4 HOUR) LIMIT 1",
+          "SELECT id FROM macro_alerts_sent WHERE symbol = ? AND alert_type IN ('target','target_acknowledged') AND sent_at > DATE_SUB(NOW(), INTERVAL 24 HOUR) LIMIT 1",
           [symbol]
         ).catch(() => [[]]);
         if (recentTargetRows.length > 0) {
-          console.log(`[target] ${symbol} — alert sent/acked within 4h, skipping`);
+          console.log(`[target] ${symbol} — alert sent/acked within 24h, skipping`);
           alertState.acknowledged.add(symbol); // restore in-memory ack silently
           continue;
         }
@@ -6709,13 +6706,13 @@ async function checkPortfolio() {
         const changePct = ((currentPrice - target.anchorPrice) / target.anchorPrice) * 100;
         const coinBase = symbol.replace('-USD', '');
 
-        // Cooldown: skip if this target alert was sent or acknowledged within the last 4 hours
+        // #70: 24h window matches ignored_coins expiry — covers redeployments within 24h of ack
         const [recentTargetRowsDown] = await db.execute(
-          "SELECT id FROM macro_alerts_sent WHERE symbol = ? AND alert_type IN ('target','target_acknowledged') AND sent_at > DATE_SUB(NOW(), INTERVAL 4 HOUR) LIMIT 1",
+          "SELECT id FROM macro_alerts_sent WHERE symbol = ? AND alert_type IN ('target','target_acknowledged') AND sent_at > DATE_SUB(NOW(), INTERVAL 24 HOUR) LIMIT 1",
           [symbol]
         ).catch(() => [[]]);
         if (recentTargetRowsDown.length > 0) {
-          console.log(`[target] ${symbol} — floor alert sent/acked within 4h, skipping`);
+          console.log(`[target] ${symbol} — floor alert sent/acked within 24h, skipping`);
           alertState.acknowledged.add(symbol);
           continue;
         }
