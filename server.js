@@ -29,6 +29,7 @@ const TANGEM_XRP_ADDRESS = 'r4E3rtCa4FT4HxTQV2iw3yQHRTrAHMYS3v';
 const TANGEM_XRP_ENTRY   = 2.65; // average entry price for Tangem XRP position
 const XRPL_API = 'https://xrplcluster.com';
 const CHECK_INTERVAL_MS = 5 * 60 * 1000;
+const CAPTURE_INTERVAL_MS = 2 * 60 * 1000;   // #50: intraday price capture cadence (decoupled from alert loop)
 const ALERT_INTERVAL_MS = 60 * 1000;
 const PUMP_THRESHOLD = 0.20;
 const SKIP_CURRENCIES = ['USD', 'USDT', 'USDC', 'EUR', 'GBP'];
@@ -431,6 +432,14 @@ await db.execute(`CREATE TABLE IF NOT EXISTS price_history (
   price DECIMAL(20,10) NOT NULL,
   recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   INDEX idx_symbol_recorded (symbol, recorded_at)
+)`);
+
+await db.execute(`CREATE TABLE IF NOT EXISTS price_intraday (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  symbol VARCHAR(50) NOT NULL,
+  price DECIMAL(20,10) NOT NULL,
+  recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_intraday_symbol_time (symbol, recorded_at)
 )`);
 
 await db.execute(`CREATE TABLE IF NOT EXISTS balance_snapshots (
@@ -2645,6 +2654,36 @@ async function runReconciliation() {
     console.log(`[reconciliation] Run complete: ${checked} checked, ${drifts.length} new drift(s)`);
   } catch (e) {
     console.error('[reconciliation] error:', e.message);
+  }
+}
+
+async function captureIntradayPrices() {
+  try {
+    const tickerResponse = await revolutRequest('GET', '/tickers');
+    const tickerList = Array.isArray(tickerResponse) ? tickerResponse : (tickerResponse.data || []);
+    const priceMap = {};
+    for (const ticker of tickerList) {
+      if (!ticker.symbol) continue;
+      const price = parseFloat(ticker.last_price || ticker.mid || ticker.ask || ticker.bid);
+      if (price) { priceMap[ticker.symbol] = price; priceMap[ticker.symbol.replace('/', '-')] = price; }
+    }
+    const [csRows] = await db.execute("SELECT symbol FROM coin_strategy WHERE symbol NOT IN ('DEAD_BAGS','EXITED')");
+    const values = [];
+    for (const r of csRows) {
+      const sym = `${r.symbol}-USD`;
+      const price = priceMap[sym];
+      if (price) values.push(sym, price);
+    }
+    if (values.length) {
+      const rows = values.length / 2;
+      const placeholders = Array(rows).fill('(?, ?)').join(', ');
+      await db.execute(`INSERT INTO price_intraday (symbol, price) VALUES ${placeholders}`, values);
+      console.log(`[intraday] Captured ${rows} prices`);
+    } else {
+      console.log('[intraday] Captured 0 prices (no ticker matches)');
+    }
+  } catch (e) {
+    console.error('[intraday] capture error:', e.message);
   }
 }
 
@@ -7123,6 +7162,8 @@ setTimeout(async () => {
   await sendTelegram('🤖 Revolut X monitor started! Checking your portfolio every 5 minutes.');
   await checkPortfolio();
   monitoringInterval = setInterval(checkPortfolio, CHECK_INTERVAL_MS);
+  captureIntradayPrices();
+  setInterval(captureIntradayPrices, CAPTURE_INTERVAL_MS);
 }, 5000);
 
 // Record prices at midnight every day (UK time)
@@ -7169,6 +7210,14 @@ cron.schedule('5 9 * * 1', async () => {
 
 // Daily intention outcome checks — 10 AM, checks for 7-day and 30-day pending follow-ups
 cron.schedule('0 10 * * *', checkIntentionOutcomes, { timezone: 'Europe/London' });
+
+// #50: prune intraday prices older than 30 days
+cron.schedule('15 2 * * *', async () => {
+  try {
+    const [r] = await db.execute('DELETE FROM price_intraday WHERE recorded_at < DATE_SUB(NOW(), INTERVAL 30 DAY)');
+    if (r.affectedRows > 0) console.log(`[intraday] Pruned ${r.affectedRows} row(s) older than 30d`);
+  } catch (e) { console.error('[intraday] prune error:', e.message); }
+}, { timezone: 'Europe/London' });
 
 // Daily cleanup — 2 AM: delete expired unmatched trade intentions
 cron.schedule('0 2 * * *', async () => {
