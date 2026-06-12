@@ -6010,8 +6010,7 @@ async function checkPortfolio() {
       const [ph24Rows] = await db.execute(`
         SELECT symbol, MAX(recorded_at) as ts, SUBSTRING_INDEX(GROUP_CONCAT(price ORDER BY recorded_at DESC), ',', 1) as price
         FROM price_history
-        WHERE recorded_at >= DATE_SUB(NOW(), INTERVAL 26 HOUR)
-          AND recorded_at <= DATE_SUB(NOW(), INTERVAL 22 HOUR)
+        WHERE recorded_at >= DATE_SUB(NOW(), INTERVAL 28 HOUR)
         GROUP BY symbol
       `);
       for (const r of ph24Rows) {
@@ -7617,7 +7616,7 @@ app.post('/api/journal/entry', async (req, res) => {
 // GET /api/journal/:symbol — last 20 entries for that symbol (must be after /api/journal/stats and /api/journal)
 app.get('/api/journal/:symbol', async (req, res) => {
   try {
-    const sym = req.params.symbol.toUpperCase().includes('-USD') ? req.params.symbol.toUpperCase() : `${req.params.symbol.toUpperCase()}-USD`;
+    const sym = req.params.symbol.toUpperCase().replace('-USD', '');
     const [rows] = await db.execute('SELECT * FROM trading_journal WHERE symbol = ? ORDER BY created_at DESC LIMIT 20', [sym]);
     res.json(rows);
   } catch (e) {
