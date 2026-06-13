@@ -9,6 +9,7 @@ import { dirname, join } from 'path';
 import mysql from 'mysql2/promise';
 import Anthropic from '@anthropic-ai/sdk';
 import cron from 'node-cron';
+import { gzipSync } from 'zlib';
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
@@ -17,6 +18,7 @@ if (!process.env.ANTHROPIC_API_KEY) {
   console.error('[startup] WARNING: ANTHROPIC_API_KEY not set — Claude analysis will fail silently');
 } else {
   console.log('[startup] ANTHROPIC_API_KEY present ✅');
+  console.log(process.env.GDRIVE_SERVICE_ACCOUNT_JSON && process.env.GDRIVE_BACKUP_FOLDER_ID ? '[backup] Google Drive backup configured ✅' : '[backup] Google Drive backup NOT configured (env vars missing) — backups disabled');
 }
 
 const API_KEY = process.env.REVOLUTX_API_KEY;
@@ -2682,6 +2684,120 @@ async function captureIntradayPrices() {
     }
   } catch (e) {
     console.error('[intraday] capture error:', e.message);
+  }
+}
+
+// ── #12: Nightly DB backup to Google Drive (service-account JWT, no deps) ────
+function bkBase64url(input) {
+  return Buffer.from(input).toString('base64').replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+}
+
+async function getGoogleAccessToken() {
+  const raw = process.env.GDRIVE_SERVICE_ACCOUNT_JSON;
+  if (!raw) throw new Error('GDRIVE_SERVICE_ACCOUNT_JSON not set');
+  const creds = JSON.parse(raw);
+  const now = Math.floor(Date.now() / 1000);
+  const header = { alg: 'RS256', typ: 'JWT' };
+  const claim = {
+    iss: creds.client_email,
+    scope: 'https://www.googleapis.com/auth/drive',
+    aud: 'https://oauth2.googleapis.com/token',
+    iat: now,
+    exp: now + 3600,
+  };
+  const signingInput = bkBase64url(JSON.stringify(header)) + '.' + bkBase64url(JSON.stringify(claim));
+  const { createSign } = await import('crypto');
+  const signer = createSign('RSA-SHA256');
+  signer.update(signingInput);
+  signer.end();
+  const signature = signer.sign(creds.private_key).toString('base64').replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+  const assertion = signingInput + '.' + signature;
+  const resp = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${assertion}`,
+  });
+  if (!resp.ok) throw new Error(`token exchange failed: ${resp.status} ${await resp.text()}`);
+  const data = await resp.json();
+  return data.access_token;
+}
+
+async function dumpDatabase() {
+  const dbName = process.env.DB_NAME;
+  const [tables] = await db.execute(
+    'SELECT TABLE_NAME as t FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = ?',
+    [dbName, 'BASE TABLE']
+  );
+  let out = `-- Revolut X DB backup\n-- Generated: ${new Date().toISOString()}\n-- Database: ${dbName}\n-- Tables: ${tables.length}\n\nSET FOREIGN_KEY_CHECKS=0;\n\n`;
+  for (const { t } of tables) {
+    const [rows] = await db.query('SELECT * FROM `' + t + '`');
+    out += `\n-- ${t}: ${rows.length} rows\n`;
+    if (!rows.length) continue;
+    const cols = Object.keys(rows[0]);
+    const colList = cols.map(c => '`' + c + '`').join(', ');
+    for (const row of rows) {
+      const vals = cols.map(c => {
+        const v = row[c];
+        if (v === null || v === undefined) return 'NULL';
+        if (v instanceof Date) return mysql.escape(v.toISOString().slice(0, 19).replace('T', ' '));
+        if (Buffer.isBuffer(v)) return mysql.escape(v.toString());
+        return mysql.escape(v);
+      });
+      out += `INSERT INTO \`${t}\` (${colList}) VALUES (${vals.join(', ')});\n`;
+    }
+  }
+  out += `\nSET FOREIGN_KEY_CHECKS=1;\n`;
+  return out;
+}
+
+async function backupDatabaseToDrive() {
+  if (!process.env.GDRIVE_SERVICE_ACCOUNT_JSON || !process.env.GDRIVE_BACKUP_FOLDER_ID) {
+    console.log('[backup] disabled — env vars missing');
+    return;
+  }
+  const folderId = process.env.GDRIVE_BACKUP_FOLDER_ID;
+  try {
+    console.log('[backup] starting DB dump...');
+    const sqlText = await dumpDatabase();
+    const gz = gzipSync(Buffer.from(sqlText, 'utf8'));
+    const now = new Date();
+    const stamp = now.toISOString().slice(0, 16).replace('T', '-').replace(/:/g, '');
+    const filename = `revolut-db-${stamp}.sql.gz`;
+
+    const token = await getGoogleAccessToken();
+    const boundary = 'bk_boundary_' + Date.now();
+    const metadata = { name: filename, parents: [folderId] };
+    const head = `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(metadata)}\r\n--${boundary}\r\nContent-Type: application/gzip\r\n\r\n`;
+    const tail = `\r\n--${boundary}--`;
+    const body = Buffer.concat([Buffer.from(head, 'utf8'), gz, Buffer.from(tail, 'utf8')]);
+
+    const upResp = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': `multipart/related; boundary=${boundary}` },
+      body,
+    });
+    if (!upResp.ok) throw new Error(`upload failed: ${upResp.status} ${await upResp.text()}`);
+    const uploaded = await upResp.json();
+    console.log(`[backup] uploaded ${filename} (${(gz.length / 1024).toFixed(1)} KB) id=${uploaded.id}`);
+
+    // Retention: keep newest 14, delete older
+    const listResp = await fetch(
+      `https://www.googleapis.com/drive/v3/files?q='${folderId}'+in+parents+and+trashed=false&orderBy=createdTime+desc&fields=files(id,name,createdTime)&pageSize=100`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    if (listResp.ok) {
+      const { files } = await listResp.json();
+      const old = (files || []).slice(14);
+      for (const f of old) {
+        await fetch(`https://www.googleapis.com/drive/v3/files/${f.id}`, { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } }).catch(() => {});
+      }
+      if (old.length) console.log(`[backup] pruned ${old.length} old backup(s)`);
+    }
+
+    await sendTelegram(`✅ <b>DB backup complete</b>\n${filename} (${(gz.length / 1024).toFixed(1)} KB) → Google Drive`).catch(() => {});
+  } catch (e) {
+    console.error('[backup] FAILED:', e.message);
+    await sendTelegram(`⚠️ <b>DB backup FAILED</b>\n${e.message}`).catch(() => {});
   }
 }
 
@@ -7165,6 +7281,7 @@ setTimeout(async () => {
 // Record prices at midnight every day (UK time)
 cron.schedule('0 0 * * *', recordDailyPrices, { timezone: 'Europe/London' });
 cron.schedule('0 3 * * *', runReconciliation, { timezone: 'Europe/London' });
+cron.schedule('30 3 * * *', backupDatabaseToDrive, { timezone: 'Europe/London' }); // #12 nightly DB backup
 
 // Morning briefing disabled — sendMorningBriefing() kept for manual use
 // cron.schedule('5 9 * * *', async () => {
