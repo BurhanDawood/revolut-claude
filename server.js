@@ -8785,6 +8785,26 @@ function createMcpServer() {
           return { content: [{ type: 'text', text: JSON.stringify({ ok: true, dev_log_id: res.insertId, action: 'created', title }) }] };
         }
 
+      } else if (action === 'export_dev_log') {
+          // #79: dump full dev_log to markdown — on-demand, read-only, no schema change
+          const [rows] = await db.execute(
+            'SELECT * FROM dev_log ORDER BY id ASC'
+          );
+          const now = new Date().toISOString().slice(0, 10);
+          let md = `# dev_log export — ${now}\n\n`;
+          md += `> Generated: ${new Date().toISOString()} | Total tickets: ${rows.length}\n\n---\n\n`;
+          for (const r of rows) {
+            const status = r.status === 'resolved' ? '\u2705 resolved' : r.status === 'open' ? '\ud83d\udd35 open' : r.status;
+            md += `## #${r.id} \u2014 ${r.title}\n\n`;
+            md += `**Status:** ${status} | **Category:** ${r.category || 'note'} | **Source:** ${r.source || 'developer'}\n\n`;
+            md += `**Created:** ${r.created_at ? new Date(r.created_at).toISOString().slice(0, 10) : 'n/a'}`;
+            if (r.resolved_at) md += ` | **Resolved:** ${new Date(r.resolved_at).toISOString().slice(0, 10)}`;
+            if (r.related_symbol) md += ` | **Symbol:** ${r.related_symbol}`;
+            md += `\n\n`;
+            if (r.detail) md += `${r.detail}\n\n`;
+            md += `---\n\n`;
+          }
+          return { content: [{ type: 'text', text: JSON.stringify({ ok: true, ticket_count: rows.length, export_date: now, markdown: md }) }] };
       } else if (action === 'update_session_state') {
         const [curRows] = await db.execute('SELECT * FROM session_state WHERE id = 1');
         const cur = curRows[0] || {};
