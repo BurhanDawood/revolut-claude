@@ -18,7 +18,7 @@ if (!process.env.ANTHROPIC_API_KEY) {
   console.error('[startup] WARNING: ANTHROPIC_API_KEY not set — Claude analysis will fail silently');
 } else {
   console.log('[startup] ANTHROPIC_API_KEY present ✅');
-  console.log(process.env.GDRIVE_SERVICE_ACCOUNT_JSON && process.env.GDRIVE_BACKUP_FOLDER_ID ? '[backup] Google Drive backup configured ✅' : '[backup] Google Drive backup NOT configured (env vars missing) — backups disabled');
+  console.log(process.env.GOOGLE_OAUTH_REFRESH_TOKEN && process.env.GDRIVE_BACKUP_FOLDER_ID ? '[backup] Google Drive backup configured ✅' : '[backup] Google Drive backup NOT configured (env vars missing) — backups disabled');
 }
 
 const API_KEY = process.env.REVOLUTX_API_KEY;
@@ -2693,31 +2693,22 @@ function bkBase64url(input) {
 }
 
 async function getGoogleAccessToken() {
-  const raw = process.env.GDRIVE_SERVICE_ACCOUNT_JSON;
-  if (!raw) throw new Error('GDRIVE_SERVICE_ACCOUNT_JSON not set');
-  const creds = JSON.parse(raw);
-  const now = Math.floor(Date.now() / 1000);
-  const header = { alg: 'RS256', typ: 'JWT' };
-  const claim = {
-    iss: creds.client_email,
-    scope: 'https://www.googleapis.com/auth/drive',
-    aud: 'https://oauth2.googleapis.com/token',
-    iat: now,
-    exp: now + 3600,
-  };
-  const signingInput = bkBase64url(JSON.stringify(header)) + '.' + bkBase64url(JSON.stringify(claim));
-  const { createSign } = await import('crypto');
-  const signer = createSign('RSA-SHA256');
-  signer.update(signingInput);
-  signer.end();
-  const signature = signer.sign(creds.private_key).toString('base64').replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
-  const assertion = signingInput + '.' + signature;
+  const clientId = process.env.GOOGLE_OAUTH_CLIENT_ID;
+  const clientSecret = process.env.GOOGLE_OAUTH_CLIENT_SECRET;
+  const refreshToken = process.env.GOOGLE_OAUTH_REFRESH_TOKEN;
+  if (!clientId || !clientSecret || !refreshToken) throw new Error('Google OAuth env vars not set');
+  const params = new URLSearchParams({
+    client_id: clientId,
+    client_secret: clientSecret,
+    refresh_token: refreshToken,
+    grant_type: 'refresh_token',
+  });
   const resp = await fetch('https://oauth2.googleapis.com/token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${assertion}`,
+    body: params.toString(),
   });
-  if (!resp.ok) throw new Error(`token exchange failed: ${resp.status} ${await resp.text()}`);
+  if (!resp.ok) throw new Error(`token refresh failed: ${resp.status} ${await resp.text()}`);
   const data = await resp.json();
   return data.access_token;
 }
@@ -2751,7 +2742,7 @@ async function dumpDatabase() {
 }
 
 async function backupDatabaseToDrive() {
-  if (!process.env.GDRIVE_SERVICE_ACCOUNT_JSON || !process.env.GDRIVE_BACKUP_FOLDER_ID) {
+  if (!process.env.GOOGLE_OAUTH_REFRESH_TOKEN || !process.env.GDRIVE_BACKUP_FOLDER_ID) {
     console.log('[backup] disabled — env vars missing');
     return;
   }
