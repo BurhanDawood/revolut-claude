@@ -2,7 +2,7 @@
 
 > **Purpose of this document.** This is the single durable reference for how the system is built, how data flows through it, what each subsystem does, and *why* the major design decisions were made. It exists because the build history was previously fragmented across 70+ dev_log tickets, git commits, Claude's cross-session memory, and conversation logs — making "how does X work / why is it this way" a reconstruction job. Maintain this file: when a major subsystem ships or a load-bearing decision changes, update the relevant section. The live ticket board remains the `dev_log` (see §7); this document is the map, not the changelog.
 >
-> **Owner:** Bryan. **Last updated:** 2026-06-13.
+> **Owner:** Bryan. **Last updated:** 2026-06-14.
 
 ---
 
