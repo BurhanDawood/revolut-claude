@@ -1295,18 +1295,19 @@ set_auto_trade_rule, get_auto_rules, get_prices
 9. Portfolio rebalancing automation PENDING
 10. Auto compound profits PENDING`]
   );
+  const MCP_TOOL_NAMES = [
+    'get_portfolio_summary', 'get_portfolio_data', 'get_trading_data',
+    'get_context', 'manage_alerts', 'manage_trading',
+    'set_entry_price', 'execute_kraken_trade',
+    'set_auto_trade_rule', 'get_auto_rules', 'get_prices',
+    'get_tranches', 'manage_auto_rules', 'research_asset'
+  ];
   await db.execute(
     'INSERT INTO system_config (config_key, config_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)',
     ['system_capabilities', JSON.stringify({
       last_updated: new Date().toISOString(),
-      total_mcp_tools: 13,
-      tools: [
-        'get_portfolio_summary', 'get_portfolio_data', 'get_trading_data',
-        'get_context', 'manage_alerts', 'manage_trading',
-        'set_entry_price', 'execute_kraken_trade',
-        'set_auto_trade_rule', 'get_auto_rules', 'get_prices',
-        'get_tranches', 'manage_auto_rules'
-      ],
+      total_mcp_tools: MCP_TOOL_NAMES.length,
+      tools: MCP_TOOL_NAMES,
       trade_execution: {
         revolut_x: true,
         kraken: true,
@@ -1325,7 +1326,7 @@ set_auto_trade_rule, get_auto_rules, get_prices
         'Tangem XRP wallet integration',
         'SOL fully automated trading with cascading rules',
         'Trade intention system',
-        'MCP tools consolidated to 11',
+        'MCP tools consolidated (14 active incl. research_asset)',
         'Revolut X trade execution',
         'Tax lot tracking US HIFO and UK S104'
       ],
@@ -7319,6 +7320,7 @@ setTimeout(async () => {
 cron.schedule('0 0 * * *', recordDailyPrices, { timezone: 'Europe/London' });
 cron.schedule('0 3 * * *', runReconciliation, { timezone: 'Europe/London' });
 cron.schedule('30 3 * * *', backupDatabaseToDrive, { timezone: 'Europe/London' }); // #12 nightly DB backup
+setTimeout(() => { console.log('[backup] MANUAL TEST RUN (temporary)'); backupDatabaseToDrive(); }, 20000); // #12 TEMP test — REMOVE after verifying
 
 // Morning briefing disabled — sendMorningBriefing() kept for manual use
 // cron.schedule('5 9 * * *', async () => {
