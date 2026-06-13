@@ -7320,6 +7320,15 @@ setTimeout(async () => {
 cron.schedule('0 0 * * *', recordDailyPrices, { timezone: 'Europe/London' });
 cron.schedule('0 3 * * *', runReconciliation, { timezone: 'Europe/London' });
 cron.schedule('30 3 * * *', backupDatabaseToDrive, { timezone: 'Europe/London' }); // #12 nightly DB backup
+setTimeout(() => {
+  const id = process.env.GOOGLE_OAUTH_CLIENT_ID || '';
+  const sec = process.env.GOOGLE_OAUTH_CLIENT_SECRET || '';
+  const rt = process.env.GOOGLE_OAUTH_REFRESH_TOKEN || '';
+  const tail = s => s.length ? s.charCodeAt(s.length - 1) : 'EMPTY';
+  console.log(`[diag] CLIENT_ID len=${id.length} startsOK=${id.startsWith('908546365024-')} endsOK=${id.endsWith('.apps.googleusercontent.com')} lastChar=${tail(id)}`);
+  console.log(`[diag] SECRET len=${sec.length} startsGOCSPX=${sec.startsWith('GOCSPX-')} lastChar=${tail(sec)}`);
+  console.log(`[diag] REFRESH len=${rt.length} starts=${rt.slice(0,2)} lastChar=${tail(rt)}`);
+}, 10000); // #12 TEMP diagnostic — REMOVE after
 setTimeout(() => { console.log('[backup] MANUAL TEST RUN (temporary)'); backupDatabaseToDrive(); }, 20000); // #12 TEMP test — REMOVE after verifying
 
 // Morning briefing disabled — sendMorningBriefing() kept for manual use
