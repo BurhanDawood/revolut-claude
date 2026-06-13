@@ -2792,6 +2792,52 @@ async function backupDatabaseToDrive() {
   }
 }
 
+// ── #72: Researcher primitive — deep web research on one asset, evaluated vs its live plan ──
+async function researchAsset(symbol) {
+  const base = symbol.toUpperCase().replace('-USD', '');
+  const pair = base + '-USD';
+  // live plan (coin_strategy) + live price for reality-check
+  let plan = null;
+  try {
+    const [csRows] = await db.execute('SELECT * FROM coin_strategy WHERE symbol = ? LIMIT 1', [base]);
+    plan = csRows[0] || null;
+  } catch (e) { /* plan optional */ }
+  let livePrice = null;
+  try {
+    const tickerResponse = await revolutRequest('GET', '/tickers');
+    const tickerList = Array.isArray(tickerResponse) ? tickerResponse : (tickerResponse.data || []);
+    for (const t of tickerList) {
+      if (t.symbol && t.symbol.replace('/', '-').toUpperCase() === pair) {
+        livePrice = parseFloat(t.last_price || t.mid || t.ask || t.bid); break;
+      }
+    }
+    if (livePrice === null) livePrice = await getCurrentPrice(pair).catch(() => null);
+  } catch (e) { /* price optional */ }
+
+  const planBlock = plan
+    ? `CURRENT SAVED PLAN for ${base}:\n- Status: ${plan.status || 'n/a'}\n- Role: ${plan.role || 'n/a'}\n- Theme: ${plan.theme || 'n/a'}\n- Strategy notes: ${(plan.strategy_md || '').slice(0, 1200)}`
+    : `No saved plan on record for ${base}.`;
+  const priceBlock = livePrice !== null ? `LIVE PRICE (just fetched): $${livePrice}` : 'Live price unavailable.';
+
+  const prompt = `You are a crypto research analyst for Bryan, a disciplined swing trader in portfolio-recovery mode (no leverage, never sell below entry on anchors, ladder out on MSS, 25% moon bags). Research ${base} and evaluate reality AGAINST his saved plan below.\n\n${planBlock}\n\n${priceBlock}\n\nSearch the web for CURRENT information and produce a concise structured report:\n\n1) FUNDAMENTALS / THESIS — is the original thesis intact, strengthening, or broken?\n2) CATALYSTS — upcoming dated events (give DATE + expected impact + priced-in / sell-the-news risk). Flag any that already hit/missed/delayed.\n3) MATERIAL NEWS — only genuinely material items from the last ~2 weeks.\n4) PRICE vs THESIS — does current price action align with or diverge from the plan?\n5) PLAN-DRIFT VERDICT — has anything shifted enough to warrant a strategy adjustment? If yes, state the specific suggested adjustment (re-ladder / role change / cap change / exit-or-add thesis change). If no, say \"plan intact\".\n\nRULES: cite SOURCE + DATE for every factual claim. TAG any promotional/affiliate/leverage/influencer-pumped content and discount it. Reality-check every price/figure against the live price above — never relay a stale number as fact. You RECOMMEND only — never suggest auto-execution. Be concise; this is a notify/decision aid, not an essay.`;
+
+  const response = await anthropic.messages.create({
+    model: 'claude-sonnet-4-6',
+    max_tokens: 1500,
+    tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 5 }],
+    messages: [{ role: 'user', content: prompt }],
+  });
+  await logClaudeCall(`research_asset ${base}`, 'claude-sonnet-4-6', response.usage);
+
+  const textOut = (response.content || [])
+    .filter(b => b.type === 'text')
+    .map(b => b.text)
+    .join('\n')
+    .trim();
+
+  return { symbol: base, pair, livePrice, hadPlan: !!plan, report: textOut || '(no text returned)' };
+}
+
 async function recordDailyPrices() {
   try {
     console.log('Recording daily prices for price_history...');
@@ -8087,6 +8133,22 @@ app.get('/api/tradehistory', async (req, res) => {
 
 function createMcpServer() {
   const server = new McpServer({ name: 'revolut-x', version: '1.0.0' });
+
+  // ── Tool: research_asset (#72) ──────────────────────────────────────────────
+  server.tool('research_asset', 'Deep web research on one asset evaluated against its saved plan — fundamentals, catalysts, news, price-vs-thesis, and a plan-drift verdict. Recommends only, never executes. On-demand (costs an API web-search call).',
+    {
+      symbol: z.string().describe('Asset to research, e.g. NEAR or NEAR-USD'),
+    },
+    async ({ symbol } = {}) => {
+      if (!symbol) return { content: [{ type: 'text', text: JSON.stringify({ error: 'Provide symbol' }) }] };
+      try {
+        const result = await researchAsset(symbol);
+        return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+      } catch (e) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: e.message }) }] };
+      }
+    }
+  );
 
   server.tool('get_prices', 'Get current crypto price(s). Pass symbol for one, or symbols[] for many in a single call.',
     {
