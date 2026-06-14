@@ -2,7 +2,7 @@
 
 > **Purpose of this document.** This is the single durable reference for how the system is built, how data flows through it, what each subsystem does, and *why* the major design decisions were made. It exists because the build history was previously fragmented across 70+ dev_log tickets, git commits, Claude's cross-session memory, and conversation logs — making "how does X work / why is it this way" a reconstruction job. Maintain this file: when a major subsystem ships or a load-bearing decision changes, update the relevant section. The live ticket board remains the `dev_log` (see §7); this document is the map, not the changelog.
 >
-> **Owner:** Bryan. **Last updated:** 2026-06-14. (Added docs/ — CHANGELOG snapshots + export script)
+> **Owner:** Bryan. **Last updated:** 2026-06-14. (#72 Build 2 research persistence shipped)
 
 ---
 
@@ -49,6 +49,7 @@ This separation is deliberate: the Dev thread reasons and verifies but cannot pu
 - `*/5 * * * *` — `checkMacroNews` (RSS macro/news scan).
 - `5 9 * * 1` — Monday rebalancing check.
 - `10 9 * * 1` — Monday weekly snapshot.
+- `15 9 * * 1` — `weeklyResearchSweep` (#72 Build 2: research 11 held/watch coins, diff vs prior, Telegram drift summary).
 - `0 10 * * *` — `checkIntentionOutcomes`.
 - `5 10 * * *` — `checkRebalancingOutcomes`.
 - `10 10 * * *` — `gradeTradeOutcomes` (#48: forward +7d/+30d grading).
@@ -75,7 +76,7 @@ Nightly at 3 AM: compares Revolut `/balances` (available) + Kraken balances agai
 - **USDT sweep:** optional auto-conversion of trade proceeds (currently disabled).
 - **Dashboard (`public/dashboard.js`):** read views + a few control POSTs (pause/resume/sweep config). Tappable asset cards (#57). Surgical edits allowed (#66) with a `.bak` backup; `node --check` always before push.
 - **Backups (#12):** nightly pure-JS DB dump → gzip → Google Drive via OAuth-delegated upload (uploads as the owner's Drive — service accounts have no Drive quota). 14-file retention, Telegram confirmation.
-- **Research layer (#72, #68 umbrella):** `researchAsset()` + `research_asset` MCP tool — on-demand, plan-aware deep web research using the Anthropic web-search tool, evaluated against the saved `coin_strategy` plan, recommend-only. Build 1 proven; persistence/diff/strategy-link is Build 2 (event-driven, not daily — cost ~$0.22/call makes a daily full-book sweep uneconomic). This is one engine with pluggable sources (catalyst #40, YouTube #61, social #69) under the #68 intelligence-layer framing.
+- **Research layer (#72 — Build 1 + Build 2 shipped):** `researchAsset(symbol, triggeredBy)` + `research_asset` MCP tool — plan-aware deep web research (Anthropic web-search), evaluated against the saved `coin_strategy` plan, recommend-only. **Build 2 adds persistence + diff:** every pass is stored to the `research_history` table (thesis_status, drift_verdict, live_price, report); each new pass diffs against the prior snapshot (thesis change, new drift, >10% price move). Three entry points share one timeline: (1) **in-chat** — Claude researches with its own web_search (free, no API cost) and writes the snapshot via the `log_research` action on `manage_trading`; (2) **on-demand API** — `research_asset` tool; (3) **automated** — `weeklyResearchSweep()` cron, Mondays 9:15 AM, researches 11 held/watch coins (CC, ENA, NEAR, JTO, TON, AERO, LINK, XLM, XRP, HYPE, RSC), diffs each, sends one Telegram drift summary. Cost ~$0.22/API call → weekly sweep ~$10/mo; in-chat is free. Daily full-book deliberately not built (~$130/mo). HARD RULE: recommend-only, proposes `coin_strategy` changes, never auto-applies — Bryan approves in PM. One engine with pluggable sources (catalyst #40, YouTube #61, social #69) under the #68 framing.
 
 ---
 
@@ -118,6 +119,9 @@ Reconstructed from git history and the dev_log. Not exhaustive — the `dev_log`
 - **#70 / #60 / #65** — alert re-fire-after-redeploy fix; baseline24h window fix; journal symbol-format fix. *Resolved.*
 - **#12** — nightly DB backup to Google Drive (OAuth-delegated, gzip, 14-file retention). *Deployed/verified — last Tier-1 safety item.*
 - **#72 Build 1** — `researchAsset()` primitive + `research_asset` MCP tool (plan-aware web research). *Deployed/proven.*
+- **#72 Build 2** — research persistence: `research_history` table, snapshot+diff on every pass, `log_research` action (free in-chat path), `weeklyResearchSweep()` Monday cron. *Deployed/tested.*
+- **#79** — `export_dev_log` action + `docs/export-changelog.js` + dated CHANGELOG snapshots. *Shipped.*
+- **#78** — front-door `README.md`. *Shipped.*
 
 ---
 
