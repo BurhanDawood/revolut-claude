@@ -617,6 +617,20 @@ await db.execute(`CREATE TABLE IF NOT EXISTS dev_log (
   resolved_at TIMESTAMP NULL
 )`).catch(e => console.error('[migration] dev_log:', e.message));
 
+  await db.execute(`CREATE TABLE IF NOT EXISTS research_history (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    symbol VARCHAR(20) NOT NULL,
+    researched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    triggered_by VARCHAR(20) DEFAULT 'manual',
+    live_price DECIMAL(20,8),
+    thesis_status VARCHAR(20),
+    drift_verdict VARCHAR(200),
+    catalysts_summary TEXT,
+    report_text MEDIUMTEXT,
+    had_plan BOOLEAN DEFAULT FALSE,
+    INDEX idx_research_symbol_time (symbol, researched_at)
+  )`).catch(e => console.error('[migration] research_history:', e.message));
+
 await db.execute(`CREATE TABLE IF NOT EXISTS coin_strategy (
   symbol VARCHAR(20) PRIMARY KEY,
   status VARCHAR(20),
