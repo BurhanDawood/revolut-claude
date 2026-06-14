@@ -4090,7 +4090,7 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
          WHERE symbol = ?
          AND action = ?
          AND ABS(CAST(price AS DECIMAL(20,10)) - ?) < (? * 0.01 + 0.000001)
-         AND created_at > DATE_SUB(NOW(), INTERVAL 5 MINUTE)
+         AND created_at > DATE_SUB(NOW(), INTERVAL 10 MINUTE)
          LIMIT 1`,
         [coinBase, action, price, price]
       );
@@ -4107,7 +4107,7 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
          WHERE symbol IN (?, ?)
          AND action = ?
          AND source IN ('claude_mcp', 'auto_rule', 'ai_auto')
-         AND created_at > DATE_SUB(NOW(), INTERVAL 5 MINUTE)
+         AND created_at > DATE_SUB(NOW(), INTERVAL 10 MINUTE)
          LIMIT 1`,
         [coinBase, symbol, action]
       );
