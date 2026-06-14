@@ -624,7 +624,7 @@ await db.execute(`CREATE TABLE IF NOT EXISTS dev_log (
     triggered_by VARCHAR(20) DEFAULT 'manual',
     live_price DECIMAL(20,8),
     thesis_status VARCHAR(20),
-    drift_verdict VARCHAR(200),
+    drift_verdict TEXT,
     catalysts_summary TEXT,
     report_text MEDIUMTEXT,
     had_plan BOOLEAN DEFAULT FALSE,
@@ -737,6 +737,9 @@ await safeAddColumn('auto_trade_rules', 'cascade_parent_id', 'INT NULL');
 await safeAddColumn('auto_trade_rules', 'proceeds_reserved', 'DECIMAL(12,2) NULL');
 await safeAddColumn('trading_journal',  'source',          "VARCHAR(20) DEFAULT 'auto_detected'");
 await safeAddColumn('trading_journal',  'updated_at',      'TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP');
+  await db.execute("ALTER TABLE research_history MODIFY COLUMN drift_verdict TEXT")
+    .then(() => console.log('[migration] research_history.drift_verdict widened to TEXT'))
+    .catch(e => console.error('[migration] research_history.drift_verdict:', e.message));
 
 // One-time data corrections
 try {
