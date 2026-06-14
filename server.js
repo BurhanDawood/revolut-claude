@@ -6388,34 +6388,54 @@ async function checkPortfolio() {
             return; // Wait for manual confirmation
 
           } else {
-            // Unexplained decrease ≤$100 = likely card payment — auto-log
-            const [dupe] = await db.execute(
+            // Fix A+B (#82): never silently mutate invested capital.
+            // Fix B: if a crypto trade happened in last 10 min, this is trade-funding — not a payment
+            const [recentTrade] = await db.execute(
               `SELECT id FROM trading_journal
-               WHERE symbol = 'USDT' AND action = 'payment'
-               AND ABS(quantity - ?) < 0.05
-               AND created_at > DATE_SUB(NOW(), INTERVAL 15 MINUTE)
-               LIMIT 1`,
-              [decrease]
+               WHERE action IN ('buy', 'add')
+               AND source IN ('claude_mcp', 'auto_detected', 'manual')
+               AND created_at > DATE_SUB(NOW(), INTERVAL 10 MINUTE)
+               LIMIT 1`
             ).catch(() => [[]]);
 
-            if (dupe.length > 0) {
-              console.log('[usdt] Duplicate payment — skipping');
-            } else {
-              const [result] = await db.execute(
+            if (recentTrade.length > 0) {
+              console.log(`[usdt] USDT decrease $${decrease.toFixed(2)} — recent trade detected, treating as trade-funding (no capital change)`);
+              await db.execute(
                 `INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-                ['USDT', 'payment', 1.00, decrease, decrease,
-                 `Revolut debit card payment — $${decrease.toFixed(2)} USDT`, 'neutral', 'revolut_card']
-              );
-              const prevCapital = totalInvestedCapital;
-              const newCapital  = totalInvestedCapital - decrease;
-              await updateInvestedCapital(newCapital, `Card payment: -$${decrease.toFixed(2)} USDT`);
-              await sendTelegram(
-                `💳 PAYMENT $${decrease.toFixed(2)} USDT\n` +
-                `Capital: $${prevCapital.toFixed(2)} → $${newCapital.toFixed(2)}\n` +
-                `Tap Edit in dashboard if incorrect`
-              );
-              console.log(`[usdt] Card payment logged ID:${result.insertId}`);
+                ['USDT', 'transfer', 1.00, decrease, decrease,
+                 `USDT used for trade funding — no capital change (#82 fix B)`, 'neutral', 'auto_internal']
+              ).catch(() => {});
+            } else {
+              // Fix A: unexplained small decrease with no recent trade — ask for confirmation, never auto-deduct
+              const [dupe] = await db.execute(
+                `SELECT id FROM trading_journal
+                 WHERE symbol = 'USDT' AND action = 'payment'
+                 AND ABS(quantity - ?) < 0.05
+                 AND created_at > DATE_SUB(NOW(), INTERVAL 15 MINUTE)
+                 LIMIT 1`,
+                [decrease]
+              ).catch(() => [[]]);
+
+              if (dupe.length > 0) {
+                console.log('[usdt] Duplicate payment check — skipping');
+              } else {
+                // Ask for confirmation — never auto-deduct capital (#82 fix A)
+                console.warn(`[usdt] Unexplained USDT decrease $${decrease.toFixed(2)} — requesting confirmation (no auto-deduct)`);
+                await sendTelegram(
+                  `⚠️ USDT decrease detected: $${decrease.toFixed(2)}\n` +
+                  `Was this a card payment?\n\n` +
+                  `Reply '<b>confirm payment ${decrease.toFixed(2)}</b>' to log\n` +
+                  `Or '<b>skip payment</b>' to ignore`
+                ).catch(() => {});
+                lastKnownUSDT = currentUSDT;
+                lastKnownUSD  = currentUSD;
+                await db.execute(
+                  `INSERT INTO system_config (config_key, config_value) VALUES ('last_known_usdt', ?), ('last_known_usd', ?)
+                   ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)`,
+                  [currentUSDT.toString(), currentUSD.toString()]
+                ).catch(() => {});
+              }
             }
           }
         } else if (currentUSDT - lastKnownUSDT > 0.10) {
