@@ -2808,10 +2808,42 @@ async function backupDatabaseToDrive() {
 }
 
 // ── #72: Researcher primitive — deep web research on one asset, evaluated vs its live plan ──
-async function researchAsset(symbol) {
+// ── #72 Build 2 helpers: parse research output + diff vs prior ─────────────
+function extractThesisStatus(report) {
+  const m = report.match(/1\).*?THESIS[^\n]*?[-—–]\s*(STRENGTHENING|INTACT|WEAKENING|BROKEN)/i);
+  if (m) return m[1].toUpperCase();
+  const head = report.slice(0, 500);
+  if (/strengthening/i.test(head)) return 'STRENGTHENING';
+  if (/weakening/i.test(head)) return 'WEAKENING';
+  if (/broken/i.test(head)) return 'BROKEN';
+  return 'INTACT';
+}
+
+function extractDriftVerdict(report) {
+  const m = report.match(/5\).*?VERDICT[^\n]*?[-—–]\s*([^\n]{0,200})/i);
+  if (!m) return 'unknown';
+  const v = m[1].trim();
+  if (/plan intact/i.test(v)) return 'plan intact';
+  return v.slice(0, 120);
+}
+
+function buildResearchDiff(prev, curr) {
+  const lines = [];
+  if (prev.thesis_status && prev.thesis_status !== curr.thesisStatus)
+    lines.push(`Thesis: ${prev.thesis_status} → ${curr.thesisStatus}`);
+  if (prev.drift_verdict === 'plan intact' && curr.driftVerdict && curr.driftVerdict !== 'plan intact')
+    lines.push(`New drift: ${curr.driftVerdict.slice(0, 80)}`);
+  if (prev.live_price && curr.livePrice) {
+    const delta = ((curr.livePrice - parseFloat(prev.live_price)) / parseFloat(prev.live_price) * 100);
+    if (Math.abs(delta) > 10)
+      lines.push(`Price ${delta > 0 ? '+' : ''}${delta.toFixed(1)}% since last research ($${parseFloat(prev.live_price)} → $${curr.livePrice})`);
+  }
+  return lines.length ? lines.join('; ') : null;
+}
+
+async function researchAsset(symbol, triggeredBy = 'manual') {
   const base = symbol.toUpperCase().replace('-USD', '');
   const pair = base + '-USD';
-  // live plan (coin_strategy) + live price for reality-check
   let plan = null;
   try {
     const [csRows] = await db.execute('SELECT * FROM coin_strategy WHERE symbol = ? LIMIT 1', [base]);
@@ -2834,7 +2866,7 @@ async function researchAsset(symbol) {
     : `No saved plan on record for ${base}.`;
   const priceBlock = livePrice !== null ? `LIVE PRICE (just fetched): $${livePrice}` : 'Live price unavailable.';
 
-  const prompt = `You are a crypto research analyst for Bryan, a disciplined swing trader in portfolio-recovery mode (no leverage, never sell below entry on anchors, ladder out on MSS, 25% moon bags). Research ${base} and evaluate reality AGAINST his saved plan below.\n\n${planBlock}\n\n${priceBlock}\n\nSearch the web for CURRENT information and produce a concise structured report:\n\n1) FUNDAMENTALS / THESIS — is the original thesis intact, strengthening, or broken?\n2) CATALYSTS — upcoming dated events (give DATE + expected impact + priced-in / sell-the-news risk). Flag any that already hit/missed/delayed.\n3) MATERIAL NEWS — only genuinely material items from the last ~2 weeks.\n4) PRICE vs THESIS — does current price action align with or diverge from the plan?\n5) PLAN-DRIFT VERDICT — has anything shifted enough to warrant a strategy adjustment? If yes, state the specific suggested adjustment (re-ladder / role change / cap change / exit-or-add thesis change). If no, say \"plan intact\".\n\nRULES: cite SOURCE + DATE for every factual claim. TAG any promotional/affiliate/leverage/influencer-pumped content and discount it. Reality-check every price/figure against the live price above — never relay a stale number as fact. You RECOMMEND only — never suggest auto-execution. Be concise; this is a notify/decision aid, not an essay.`;
+  const prompt = `You are a crypto research analyst for Bryan, a disciplined swing trader in portfolio-recovery mode (no leverage, never sell below entry on anchors, ladder out on MSS, 25% moon bags). Research ${base} and evaluate reality AGAINST his saved plan below.\n\n${planBlock}\n\n${priceBlock}\n\nSearch the web for CURRENT information and produce a concise structured report:\n\n1) FUNDAMENTALS / THESIS — is the original thesis intact, strengthening, or broken?\n2) CATALYSTS — upcoming dated events (give DATE + expected impact + priced-in / sell-the-news risk). Flag any that already hit/missed/delayed.\n3) MATERIAL NEWS — only genuinely material items from the last ~2 weeks.\n4) PRICE vs THESIS — does current price action align with or diverge from the plan?\n5) PLAN-DRIFT VERDICT — has anything shifted enough to warrant a strategy adjustment? If yes, state the specific suggested adjustment (re-ladder / role change / cap change / exit-or-add thesis change). If no, say "plan intact".\n\nRULES: cite SOURCE + DATE for every factual claim. TAG any promotional/affiliate/leverage/influencer-pumped content and discount it. Reality-check every price/figure against the live price above — never relay a stale number as fact. You RECOMMEND only — never suggest auto-execution. Be concise; this is a notify/decision aid, not an essay.`;
 
   const response = await anthropic.messages.create({
     model: 'claude-sonnet-4-6',
@@ -2850,7 +2882,34 @@ async function researchAsset(symbol) {
     .join('\n')
     .trim();
 
-  return { symbol: base, pair, livePrice, hadPlan: !!plan, report: textOut || '(no text returned)' };
+  const thesisStatus = extractThesisStatus(textOut);
+  const driftVerdict = extractDriftVerdict(textOut);
+
+  let priorRow = null, diff = null;
+  try {
+    const [priorRows] = await db.execute(
+      'SELECT * FROM research_history WHERE symbol = ? ORDER BY researched_at DESC LIMIT 1', [base]
+    );
+    if (priorRows.length) {
+      priorRow = priorRows[0];
+      diff = buildResearchDiff(priorRow, { thesisStatus, driftVerdict, livePrice });
+    }
+  } catch (e) { /* diff optional */ }
+
+  try {
+    await db.execute(
+      `INSERT INTO research_history (symbol, triggered_by, live_price, thesis_status, drift_verdict, report_text, had_plan)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [base, triggeredBy, livePrice, thesisStatus, driftVerdict, textOut, !!plan]
+    );
+  } catch (e) { console.error('[research] store failed:', e.message); }
+
+  return {
+    symbol: base, pair, livePrice, hadPlan: !!plan,
+    thesisStatus, driftVerdict, diff,
+    priorResearchedAt: priorRow ? priorRow.researched_at : null,
+    report: textOut || '(no text returned)'
+  };
 }
 
 async function recordDailyPrices() {
@@ -8552,7 +8611,7 @@ function createMcpServer() {
   server.tool('manage_trading',
     'Log journal entries, trade intentions, trader preferences, update invested capital, or configure USDT sweep',
     {
-      action:                 z.enum(['log_journal', 'log_intention', 'save_preference', 'update_capital', 'configure_sweep', 'configure_auto_execute', 'log_dev_issue', 'update_session_state', 'upsert_coin_strategy', 'export_dev_log']).describe('What trading action to perform'),
+      action:                 z.enum(['log_journal', 'log_intention', 'save_preference', 'update_capital', 'configure_sweep', 'configure_auto_execute', 'log_dev_issue', 'update_session_state', 'upsert_coin_strategy', 'export_dev_log', 'log_research']).describe('What trading action to perform'),
       symbol:                 z.string().optional().describe('Coin e.g. NEAR-USD or NEAR'),
       trade_action:           z.enum(['buy', 'sell', 'hold', 'add', 'reduce', 'payment', 'transfer']).optional().describe('Trade action for log_journal or log_intention'),
       price:                  z.number().optional().describe('Price for log_journal'),
@@ -8819,6 +8878,27 @@ function createMcpServer() {
             md += `---\n\n`;
           }
           return { content: [{ type: 'text', text: JSON.stringify({ ok: true, ticket_count: rows.length, export_date: now, markdown: md }) }] };
+      } else if (action === 'log_research') {
+        // #72 Build 2: store a chat-based research snapshot + return diff vs prior
+        const rBase = (symbol || '').toUpperCase().replace('-USD', '');
+        if (!rBase) return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'symbol required' }) }] };
+        const rThesis = (value || 'INTACT').toUpperCase();
+        const rDrift = note || 'plan intact';
+        const rReport = reasoning || '';
+        const rPrice = (typeof price === 'number') ? price : null;
+        let rPrior = null, rDiff = null;
+        try {
+          const [pr] = await db.execute('SELECT * FROM research_history WHERE symbol = ? ORDER BY researched_at DESC LIMIT 1', [rBase]);
+          if (pr.length) { rPrior = pr[0]; rDiff = buildResearchDiff(rPrior, { thesisStatus: rThesis, driftVerdict: rDrift, livePrice: rPrice }); }
+        } catch (e) { /* diff optional */ }
+        try {
+          await db.execute(
+            `INSERT INTO research_history (symbol, triggered_by, live_price, thesis_status, drift_verdict, report_text, had_plan)
+             VALUES (?, 'chat', ?, ?, ?, ?, FALSE)`,
+            [rBase, rPrice, rThesis, rDrift, rReport]
+          );
+        } catch (e) { return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: e.message }) }] }; }
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, symbol: rBase, stored: true, thesis_status: rThesis, drift_verdict: rDrift, diff_vs_prior: rDiff, prior_researched_at: rPrior ? rPrior.researched_at : null }) }] };
       } else if (action === 'update_session_state') {
         const [curRows] = await db.execute('SELECT * FROM session_state WHERE id = 1');
         const cur = curRows[0] || {};
