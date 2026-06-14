@@ -2912,6 +2912,42 @@ async function researchAsset(symbol, triggeredBy = 'manual') {
   };
 }
 
+// ── #72 Build 2: weekly automated research sweep ──────────────────────────
+async function weeklyResearchSweep() {
+  const WEEKLY_COINS = ['CC', 'ENA', 'NEAR', 'JTO', 'TON', 'AERO', 'LINK', 'XLM', 'XRP', 'HYPE', 'RSC'];
+  console.log(`[research-sweep] Starting weekly sweep for ${WEEKLY_COINS.length} coins...`);
+  const results = [];
+  for (const sym of WEEKLY_COINS) {
+    try {
+      console.log(`[research-sweep] Researching ${sym}...`);
+      const r = await researchAsset(sym, 'weekly_sweep');
+      results.push({ symbol: sym, thesisStatus: r.thesisStatus, driftVerdict: r.driftVerdict, diff: r.diff });
+    } catch (e) {
+      console.error(`[research-sweep] ${sym} failed:`, e.message);
+      results.push({ symbol: sym, error: e.message });
+    }
+    // 30s spacing between calls — rate-limit friendly + spreads cost
+    await new Promise(res => setTimeout(res, 30000));
+  }
+  const drifted = results.filter(r => !r.error && r.driftVerdict && r.driftVerdict !== 'plan intact');
+  const changed = results.filter(r => !r.error && r.diff);
+  const errors  = results.filter(r => r.error);
+  let msg = `📊 <b>Weekly research sweep complete</b>\n${WEEKLY_COINS.length} coins checked`;
+  if (drifted.length) {
+    msg += `\n\n⚠️ <b>Plan drift detected (${drifted.length}):</b>`;
+    for (const r of drifted) msg += `\n• <b>${r.symbol}</b> [${r.thesisStatus}] — ${String(r.driftVerdict).slice(0, 80)}`;
+  }
+  if (changed.length) {
+    msg += `\n\n🔄 <b>Changes vs last research (${changed.length}):</b>`;
+    for (const r of changed) msg += `\n• <b>${r.symbol}</b>: ${String(r.diff).slice(0, 80)}`;
+  }
+  if (!drifted.length && !changed.length) msg += `\n\n✅ All plans intact — no material changes vs last research.`;
+  if (errors.length) msg += `\n\n❌ Failed: ${errors.map(r => r.symbol).join(', ')}`;
+  msg += `\n\nReview flagged coins in the PM thread.`;
+  try { await sendTelegram(msg); } catch (e) { console.error('[research-sweep] telegram failed:', e.message); }
+  console.log(`[research-sweep] Done. Drifted: ${drifted.length}, changed: ${changed.length}, errors: ${errors.length}`);
+}
+
 async function recordDailyPrices() {
   try {
     console.log('Recording daily prices for price_history...');
@@ -7501,7 +7537,9 @@ cron.schedule('10 9 * * 1', async () => {
   }
 }, { timezone: 'Europe/London' });
 
-console.log('Cron jobs scheduled: midnight price recording + 9 AM morning briefing + every-2h macro news + Monday 9:05 rebalancing check + 10 AM intention outcomes + 10:02 AM rebalance checks (Europe/London)');
+cron.schedule('15 9 * * 1', weeklyResearchSweep, { timezone: 'Europe/London' }); // #72 Build 2: weekly research sweep, Mondays 9:15 AM
+
+console.log('Cron jobs scheduled: midnight price recording + 9 AM morning briefing + every-2h macro news + Monday 9:05 rebalancing check + 9:15 AM research sweep + 10 AM intention outcomes + 10:02 AM rebalance checks (Europe/London)');
 
 const app = express();
 app.use(cors());
