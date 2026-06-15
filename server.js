@@ -8508,13 +8508,24 @@ function createMcpServer() {
 
       if (fetchAll || fetch.includes('dev_log')) {
         try {
-          const [devRows] = await db.execute(
+          // #84 fix: always return ALL open/in_progress + last 20 resolved — no artificial cap on live board
+          const [openRows] = await db.execute(
             `SELECT id, created_at, updated_at, source, category, status, title, detail, related_symbol, resolved_at
              FROM dev_log
-             ORDER BY CASE status WHEN 'open' THEN 0 WHEN 'in_progress' THEN 1 ELSE 2 END, created_at DESC
-             LIMIT 30`
+             WHERE status IN ('open', 'in_progress')
+             ORDER BY created_at DESC`
           );
-          result.dev_log = devRows;
+          const [resolvedRows] = await db.execute(
+            `SELECT id, created_at, updated_at, source, category, status, title, detail, related_symbol, resolved_at
+             FROM dev_log
+             WHERE status = 'resolved'
+             ORDER BY resolved_at DESC, updated_at DESC
+             LIMIT 20`
+          );
+          result.dev_log = [
+            ...openRows,
+            ...resolvedRows
+          ];
         } catch (e) { result.dev_log = { error: e.message }; }
       }
 
