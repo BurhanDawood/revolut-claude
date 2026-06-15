@@ -5652,24 +5652,48 @@ async function analyseFixedTargetAlert(symbol, currentPrice, target) {
 
     const prefsContext = traderPrefs.map(p => `${p.preference_key}: ${p.preference_value}`).join('\n');
 
+    // #36 A3 — plan-aware: load the coin's SAVED PLAN + role so the rec respects increase/hodl posture
+    const { role: csRole } = await getCoinContext(coinBase);
+    let planContext = 'No saved plan exists for this coin.';
+    let planRoleLine = '';
+    try {
+      const [csRows] = await db.execute('SELECT status, role, theme, strategy_md FROM coin_strategy WHERE symbol = ? LIMIT 1', [coinBase]);
+      if (csRows.length) {
+        const cs = csRows[0];
+        const md = (cs.strategy_md || '').length > 1200 ? cs.strategy_md.slice(0, 1200) + '\u2026' : (cs.strategy_md || '');
+        planContext = `Status: ${cs.status || 'n/a'} | Role: ${cs.role || 'n/a'} | Theme: ${cs.theme || 'n/a'}\nStrategy notes:\n${md || 'none'}`;
+        planRoleLine = `${cs.role || ''}`.toLowerCase();
+      }
+    } catch (e) { console.error('[analysis] coin_strategy read failed:', e.message); }
+    // Role gate: increase/accumulation/hodl/anchor/watch coins must NEVER get a SELL/LADDER rec
+    const noTrimRole = /increase|accumulat|hodl|anchor|watch|dead|radar/.test(planRoleLine) || csRole === 'hodl' || csRole === 'manual_only';
+
+    // #36 A3 — the SAVED PLAN is the primary authority; generic swing heuristics are secondary and must never override it
+    const recMenu = noTrimRole ? '[HOLD / ADD]' : '[SELL / HOLD / LADDER / ADD]';
+    const roleGuardrail = noTrimRole
+      ? 'This coin is in an INCREASE/HODL/WATCH posture per its saved plan \u2014 it has NO upside trim rungs. NEVER recommend SELL or LADDER on this coin. The only valid recommendations are HOLD or (on a genuine dip to a named add level) ADD.'
+      : 'Honour the saved plan: only recommend SELL/LADDER if the current price is at or above a trim/harvest level NAMED in the plan. If no named trim level is in play, default to HOLD.';
     const staticTargetSystemPrompt =
-`You are a disciplined swing trader's AI assistant, analysing price target alerts.
+`You are a disciplined swing trader's AI assistant, analysing a price-target alert.
 
-## TRADING STRATEGY (STATIC)
-Strategy: Extreme move swing trader — buys dips, sells pumps on macro moves
-Moon bag rule: Always keep 25% of position — never sell everything
-Principles: Ladder out on the way up, never chase, protect gains with trailing stops
-
-Should the trader take profits now, hold for more, or ladder out?
+## DECISION RULES (in priority order)
+1. The SAVED PLAN for this coin (provided in the user message) is the PRIMARY authority. If the current price maps to a level named in the plan, name that level and quote the planned action.
+2. ${roleGuardrail}
+3. Suppress action on noise: if the move is small and price is not at a named plan level, recommend HOLD.
+4. NEVER invent project fundamentals, partnerships, catalysts, or price levels not present in the saved plan or trade history.
+5. Generic swing heuristics ('ladder out on pumps', 'keep 25% moon bag') apply ONLY to coins in a harvest/trim posture \u2014 do NOT apply them to increase/hodl/watch coins.
 
 Respond in exactly this format:
-RECOMMENDATION: [SELL / HOLD / LADDER]
-REASON: [one clear sentence referencing the trade history]
-NEXT TARGET: [$price if holding, or 'n/a' if selling]
+RECOMMENDATION: ${recMenu}
+REASON: [one clear sentence grounded in the saved plan and trade history]
+NEXT TARGET: [$price from the plan if holding/adding, or 'n/a']
 CONFIDENCE: [High/Medium/Low]`;
 
     const dynamicTargetMessage =
-`## TRADER PROFILE (from DB)
+`## SAVED PLAN for ${coinBase} (PRIMARY AUTHORITY)
+${planContext}
+
+## TRADER PROFILE (from DB)
 ${prefsContext || 'No preferences stored — use strategy defaults above'}
 
 ## TARGET HIT — ${coinBase}
