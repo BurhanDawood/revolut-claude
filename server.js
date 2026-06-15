@@ -2809,20 +2809,37 @@ async function backupDatabaseToDrive() {
 // ── #72: Researcher primitive — deep web research on one asset, evaluated vs its live plan ──
 // ── #72 Build 2 helpers: parse research output + diff vs prior ─────────────
 function extractThesisStatus(report) {
-  const m = report.match(/1\).*?THESIS[^\n]*?[-—–]\s*(STRENGTHENING|INTACT|WEAKENING|BROKEN)/i);
-  if (m) return m[1].toUpperCase();
+  if (!report) return 'INTACT';
+  // Format-tolerant: find THESIS/FUNDAMENTALS section, scan its content for a status keyword.
+  // Tolerates markdown headers, bold, "1)"/"1."/":" numbering, and content on same or next line.
+  const secMatch = report.match(/(?:THESIS|FUNDAMENTALS)[^\n]*([\s\S]{0,300})/i);
+  const scope = secMatch ? secMatch[0] : report.slice(0, 500);
+  if (/\bSTRENGTHENING\b/i.test(scope)) return 'STRENGTHENING';
+  if (/\bBROKEN\b/i.test(scope)) return 'BROKEN';
+  if (/\bWEAKENING\b/i.test(scope)) return 'WEAKENING';
+  if (/\bINTACT\b/i.test(scope)) return 'INTACT';
   const head = report.slice(0, 500);
   if (/strengthening/i.test(head)) return 'STRENGTHENING';
-  if (/weakening/i.test(head)) return 'WEAKENING';
   if (/broken/i.test(head)) return 'BROKEN';
+  if (/weakening/i.test(head)) return 'WEAKENING';
   return 'INTACT';
 }
 
 function extractDriftVerdict(report) {
-  const m = report.match(/5\).*?VERDICT[^\n]*?[-—–]\s*([^\n]{0,200})/i);
+  if (!report) return 'unknown';
+  // Prefer explicit "PLAN-DRIFT VERDICT" heading; fall back to a line-anchored "VERDICT".
+  // Captures content inline OR on the following line(s); strips markdown/leading punctuation.
+  let m = report.match(/PLAN[-\s]?DRIFT\s+VERDICT\b\s*[:\-—–]?\s*([\s\S]{0,300})/i)
+       || report.match(/(?:^|\n)[^\n]*?\bVERDICT\b\s*[:\-—–]?\s*([\s\S]{0,300})/i);
   if (!m) return 'unknown';
-  const v = m[1].trim();
-  if (/plan intact/i.test(v)) return 'plan intact';
+  let v = m[1]
+    .replace(/^[\s>*#_:\-—–]+/, '')
+    .split(/\n\s*\n/)[0]
+    .replace(/\n+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!v) return 'unknown';
+  if (/\bplan intact\b/i.test(v)) return 'plan intact';
   return v.slice(0, 120);
 }
 
