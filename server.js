@@ -6493,6 +6493,43 @@ async function checkPortfolio() {
             await sendTelegram(`🔄 USD→USDT $${usdDecrease.toFixed(2)}\nDry powder ready. Capital unchanged.`).catch(() => {});
           }
         }
+
+        // ── #86: crypto→personal USD withdrawal detection (notify-only, never auto-deducts) ──
+        // USD dropped, NOT absorbed by a USDT conversion, and no recent crypto buy to fund.
+        // That residual = money likely left to a personal/external account. Flag for Bryan's tap.
+        const usdtAbsorbed = usdtIncrease > 0 && Math.abs(usdDecrease - usdtIncrease) / usdDecrease < 0.10;
+        if (usdDecrease > 5.00 && !usdtAbsorbed) {
+          const [recentBuy86] = await db.execute(
+            `SELECT id FROM trading_journal
+             WHERE action IN ('buy', 'add')
+             AND source IN ('claude_mcp', 'auto_detected', 'manual')
+             AND created_at > DATE_SUB(NOW(), INTERVAL 10 MINUTE)
+             LIMIT 1`
+          ).catch(() => [[]]);
+          if (recentBuy86.length > 0) {
+            console.log(`[withdrawal] USD -$${usdDecrease.toFixed(2)} — recent buy detected, treating as trade-funding (no flag)`);
+          } else {
+            const [dupe86] = await db.execute(
+              `SELECT id FROM trading_journal
+               WHERE action IN ('payment','transfer')
+               AND ABS(value_usd - ?) < 0.05
+               AND created_at > DATE_SUB(NOW(), INTERVAL 15 MINUTE)
+               LIMIT 1`,
+              [usdDecrease]
+            ).catch(() => [[]]);
+            if (dupe86.length > 0) {
+              console.log('[withdrawal] Duplicate/handled cash move — skipping flag');
+            } else {
+              console.warn(`[withdrawal] Unexplained USD decrease $${usdDecrease.toFixed(2)} — possible crypto→personal withdrawal (notify-only, no auto-deduct)`);
+              await sendTelegram(
+                `⚠️ <b>USD left the account: $${usdDecrease.toFixed(2)}</b>\n` +
+                `No USDT conversion and no recent buy — looks like a withdrawal to a personal/external account.\n\n` +
+                `If you withdrew it, reply '<b>withdrew ${usdDecrease.toFixed(2)}</b>' to deduct it from invested capital.\n` +
+                `Or reply '<b>skip payment</b>' to dismiss (capital unchanged).`
+              ).catch(() => {});
+            }
+          }
+        }
         // ──────────────────────────────────────────────────────────────────
 
         // Always update for next cycle and persist to DB so redeployments don't reset
