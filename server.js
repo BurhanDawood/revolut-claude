@@ -2159,6 +2159,44 @@ async function getQuickAiRecommendation(symbol, changePct, currentPrice, directi
   }
 }
 
+// ── #36 v1: plan-aware swing-signal gate (LOCAL only — no API; aiRec above already handles the plan-aware API rec) ──
+// Returns { mode, text }. mode 'KEEP_DEEPLOSS' = caller keeps its own deep-loss swingSignal branch unchanged.
+async function buildPlanAwareSwingSignal({ coinBase, direction, isDeepLoss }) {
+  if (isDeepLoss) return { mode: 'KEEP_DEEPLOSS', text: null };
+  let role = 'normal';
+  let strategyMd = '';
+  try {
+    const [csRows] = await db.execute('SELECT role, strategy_md FROM coin_strategy WHERE symbol = ? LIMIT 1', [coinBase]);
+    if (csRows.length) {
+      role = (csRows[0].role || 'normal').toLowerCase();
+      strategyMd = (csRows[0].strategy_md || '');
+    }
+  } catch (e) { console.error('[swingGate] coin_strategy read failed:', e.message); }
+  let configHodl = false, configManual = false;
+  try {
+    const ctx = await getCoinContext(coinBase);
+    if (ctx.role === 'hodl') configHodl = true;
+    else if (ctx.role === 'manual_only') configManual = true;
+  } catch (e) { /* ignore */ }
+  const NO_TRIM_ROLES = ['hodl','anchor','dead_bag','lotto','radar','watch_entry'];
+  const md = strategyMd.toLowerCase();
+  const planSaysNoTrim = /never sell below|no trim|do not round-trip|ignore daily pump|hold through pumps|never auto-sell|no upside rung/.test(md);
+  const isStructuralNoTrim = NO_TRIM_ROLES.includes(role) || configHodl || configManual;
+  if (isStructuralNoTrim) {
+    return direction === 'up'
+      ? { mode: 'SUPPRESS_TRIM', text: `\n\n📋 Plan posture: ${role} — no upside trim rungs; holding per saved plan.` }
+      : { mode: 'SUPPRESS_DIP',  text: `\n\n📋 Plan posture: ${role} — adds only at named plan levels, not generic dips.` };
+  }
+  if (planSaysNoTrim) {
+    return direction === 'up'
+      ? { mode: 'SWING_NOTRIM_NOW', text: `\n\n📋 Swing coin — plan says no trim at current level; check your named rung before acting.` }
+      : { mode: 'SWING_NEUTRAL_DOWN', text: `\n\n📋 Swing coin — adds only at named plan levels; check before averaging.` };
+  }
+  return direction === 'up'
+    ? { mode: 'SWING_NEUTRAL', text: `\n\n📋 Swing coin — let your saved plan rungs govern; no generic trim applied.` }
+    : { mode: 'SWING_NEUTRAL_DOWN', text: `\n\n📋 Swing coin — adds only at named plan levels; check before averaging.` };
+}
+
 // FIX 2: Batch recommendations for multiple simultaneous alerts — one API call instead of N
 // A1 (dev_log #35 + #31): one config read for the whole batch, then per-coin project name + role tag
 async function batchGetRecommendations(alerts) {
@@ -6797,12 +6835,11 @@ async function checkPortfolio() {
           // Pumping but still deeply underwater — don't celebrate, auto rules handle exit
           aiRec = `HOLD — Pump to ${formatPrice(currentPrice)} still ${plFromEntry.toFixed(0)}% from entry. Auto sell rules handle exit.`;
           swingSignal = `\n\n⚠️ Deep loss position — auto rules will sell when price targets are reached.`;
-        } else if (plFromEntry !== null && plFromEntry > 20) {
-          // Profitable — real sell opportunity
-          aiRec = aiRec; // keep Claude recommendation
-          swingSignal = `\n\n⚡ SWING SIGNAL: Up ${plFromEntry.toFixed(0)}% from entry. Consider taking profits and setting a buy-back at ${fmtPriceShort(currentPrice * 0.85)} (-15%)`;
         } else {
-          swingSignal = `\n\n⚡ SWING SIGNAL: This pump may be your sell opportunity!\nConsider taking profits and setting a buy-back alert at ${fmtPriceShort(currentPrice * 0.85)} (-15%)`;
+          // #36 v1: plan-aware gate replaces the old generic "take profits" lines
+          const gate = await buildPlanAwareSwingSignal({ coinBase, direction: 'up', isDeepLoss: false });
+          swingSignal = gate.text || '';
+          console.log(`[swingGate] ${coinBase} pump → ${gate.mode}`);
         }
         const trailReminder = trailingStops.has(symbol)
           ? `\n\n📈 TREND IS YOUR FRIEND — Trailing stop is protecting your profits. Let it run unless structure breaks!`
