@@ -32,6 +32,7 @@ const TANGEM_XRP_ENTRY   = 2.65; // average entry price for Tangem XRP position
 const XRPL_API = 'https://xrplcluster.com';
 const CHECK_INTERVAL_MS = 5 * 60 * 1000;
 const CAPTURE_INTERVAL_MS = 2 * 60 * 1000;   // #50: intraday price capture cadence (decoupled from alert loop)
+const FAST_SCAN_INTERVAL_MS = 30 * 1000;      // #94: fast-cadence trailing-stop scan for volatile meme/lotto coins (30s)
 const ALERT_INTERVAL_MS = 60 * 1000;
 const PUMP_THRESHOLD = 0.20;
 const SKIP_CURRENCIES = ['USD', 'USDT', 'USDC', 'EUR', 'GBP'];
@@ -311,6 +312,7 @@ const responseCache = new Map();             // 'type:symbol' -> { response, tim
 const trailingStops = new Map();             // symbol -> { trailPct, peakPrice, stopPrice, entryPrice }
 const targetExtremes = new Map();            // symbol -> { high, low } — high-water/low-water per target across polls (resets on fire/ack/remove)
 const trailingStopAlerted = new Map();       // symbol -> timestamp — tracks recently-triggered trailing stops for hold reply
+const fastScanLastPrice  = new Map();         // #94: symbol -> last price seen by fast scan (dedup — skip if unchanged)
 const pendingAnalysis = new Map();           // symbol -> { type, recommendation, analysis, price, timestamp }
 const analysisRateLimit = new Map();         // symbol -> timestamp of last Claude analysis (rate-limit: 1/hr)
 const pendingUndo = new Map();               // symbol -> { action, qty, price, timestamp } — 2-min undo window after AI auto-exec
@@ -2760,6 +2762,37 @@ async function captureIntradayPrices() {
     console.error('[intraday] capture error:', e.message);
   }
 }
+// ── #94: fast-cadence trailing-stop scan for volatile meme/lotto coins ────────
+// Runs every 30s (decoupled from the 5-min alert loop). Only evaluates coins in
+// FAST_SCAN_SYMBOLS that have an armed trailing stop — silent otherwise.
+// Reuses updateTrailingStop (peak-ratchet + breach detection + analyseTrailingStopAlert).
+// getCurrentPrice() handles exchange routing: Revolut X first, Kraken fallback.
+const FAST_SCAN_SYMBOLS = ['GHIBLI-USD', 'FLOKI-USD', 'BOBA-USD'];
+
+async function runFastScan() {
+  try {
+    for (const symbol of FAST_SCAN_SYMBOLS) {
+      // Only run if a trailing stop is armed — silent if not
+      if (!trailingStops.has(symbol)) continue;
+      // Skip if already acknowledged or ignored this cycle
+      if (alertState.acknowledged.has(symbol) || ignoredCoins.has(symbol)) continue;
+
+      // Fetch current price (tries Revolut X first, falls back to Kraken)
+      const price = await getCurrentPrice(symbol).catch(() => null);
+      if (!price) continue;
+
+      // Dedup: skip if price hasn't changed since last fast-scan cycle
+      if (fastScanLastPrice.get(symbol) === price) continue;
+      fastScanLastPrice.set(symbol, price);
+
+      console.log(`[fast-scan] ${symbol} @ ${fmtPriceShort(price)} — evaluating trailing stop`);
+      await updateTrailingStop(symbol, price);
+    }
+  } catch (e) {
+    console.error('[fast-scan] error:', e.message);
+  }
+}
+
 
 // ── #12: Nightly DB backup to Google Drive (service-account JWT, no deps) ────
 function bkBase64url(input) {
@@ -7581,6 +7614,8 @@ setTimeout(async () => {
   monitoringInterval = setInterval(checkPortfolio, CHECK_INTERVAL_MS);
   captureIntradayPrices();
   setInterval(captureIntradayPrices, CAPTURE_INTERVAL_MS);
+  runFastScan();
+  setInterval(runFastScan, FAST_SCAN_INTERVAL_MS);
 }, 5000);
 
 // Record prices at midnight every day (UK time)
