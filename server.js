@@ -2161,7 +2161,7 @@ async function getQuickAiRecommendation(symbol, changePct, currentPrice, directi
 
 // ── #36 v1: plan-aware swing-signal gate (LOCAL only — no API; aiRec above already handles the plan-aware API rec) ──
 // Returns { mode, text }. mode 'KEEP_DEEPLOSS' = caller keeps its own deep-loss swingSignal branch unchanged.
-async function buildPlanAwareSwingSignal({ coinBase, direction, isDeepLoss }) {
+async function buildPlanAwareSwingSignal({ coinBase, direction, isDeepLoss, currentPrice = 0 }) {
   if (isDeepLoss) return { mode: 'KEEP_DEEPLOSS', text: null };
   let role = 'normal';
   let strategyMd = '';
@@ -2187,14 +2187,36 @@ async function buildPlanAwareSwingSignal({ coinBase, direction, isDeepLoss }) {
       ? { mode: 'SUPPRESS_TRIM', text: `\n\n📋 Plan posture: ${role} — no upside trim rungs; holding per saved plan.` }
       : { mode: 'SUPPRESS_DIP',  text: `\n\n📋 Plan posture: ${role} — adds only at named plan levels, not generic dips.` };
   }
-  if (planSaysNoTrim) {
-    return direction === 'up'
-      ? { mode: 'SWING_NOTRIM_NOW', text: `\n\n📋 Swing coin — plan says no trim at current level; check your named rung before acting.` }
-      : { mode: 'SWING_NEUTRAL_DOWN', text: `\n\n📋 Swing coin — adds only at named plan levels; check before averaging.` };
+  // #36 v2: rung-surfacing for swing coins — read priceTargets Map (already in memory, no extra DB query)
+  const symbol = coinBase + '-USD';
+  const targets = priceTargets.get(symbol) || [];
+  const relevant = targets.filter(t => t.direction === direction);
+  let nearestRung = null;
+  if (direction === 'up') {
+    const above = relevant.filter(t => t.targetPrice > currentPrice).sort((a, b) => a.targetPrice - b.targetPrice);
+    nearestRung = above[0] || null;
+  } else {
+    const below = relevant.filter(t => t.targetPrice < currentPrice).sort((a, b) => b.targetPrice - a.targetPrice);
+    nearestRung = below[0] || null;
   }
+  function buildRungLine(rung) {
+    if (!rung) return null;
+    const pct = Math.abs((rung.targetPrice - currentPrice) / currentPrice * 100).toFixed(1);
+    const arrow = direction === 'up' ? '📈' : '📉';
+    const dirStr = direction === 'up' ? `+${pct}%` : `-${pct}%`;
+    const label = (rung.note || '').slice(0, 80);
+    return `\n\n${arrow} Next plan level: $${rung.targetPrice.toFixed(4)} (${dirStr})${label ? ` — ${label}` : ''}`;
+  }
+  if (planSaysNoTrim) {
+    const rungLine = buildRungLine(nearestRung);
+    return direction === 'up'
+      ? { mode: 'SWING_NOTRIM_NOW', text: rungLine || `\n\n📋 Swing coin — plan says no trim/add at current level; check your named rung before acting.` }
+      : { mode: 'SWING_NEUTRAL_DOWN', text: rungLine || `\n\n📋 Swing coin — adds only at named plan levels; check before averaging.` };
+  }
+  const rungLine = buildRungLine(nearestRung);
   return direction === 'up'
-    ? { mode: 'SWING_NEUTRAL', text: `\n\n📋 Swing coin — let your saved plan rungs govern; no generic trim applied.` }
-    : { mode: 'SWING_NEUTRAL_DOWN', text: `\n\n📋 Swing coin — adds only at named plan levels; check before averaging.` };
+    ? { mode: 'SWING_NEUTRAL', text: rungLine || `\n\n📋 Swing coin — let your saved plan rungs govern; no generic trim applied.` }
+    : { mode: 'SWING_NEUTRAL_DOWN', text: rungLine || `\n\n📋 Swing coin — adds only at named plan levels; check before averaging.` };
 }
 
 // FIX 2: Batch recommendations for multiple simultaneous alerts — one API call instead of N
@@ -6837,7 +6859,7 @@ async function checkPortfolio() {
           swingSignal = `\n\n⚠️ Deep loss position — auto rules will sell when price targets are reached.`;
         } else {
           // #36 v1: plan-aware gate replaces the old generic "take profits" lines
-          const gate = await buildPlanAwareSwingSignal({ coinBase, direction: 'up', isDeepLoss: false });
+          const gate = await buildPlanAwareSwingSignal({ coinBase, direction: 'up', isDeepLoss: false, currentPrice });
           swingSignal = gate.text || '';
           console.log(`[swingGate] ${coinBase} pump → ${gate.mode}`);
         }
@@ -6915,11 +6937,11 @@ async function checkPortfolio() {
         } else if (isModerateLoss) {
           aiRec = `HOLD — Down ${Math.abs(plFromEntry).toFixed(0)}% from entry. Wait for trend reversal before adding.`;
           swingSignal = `\n\n👀 Watch for MSS (Market Structure Shift) before considering adding to position.`;
-        } else if (plFromEntry === null) {
-          swingSignal = `\n\n⚡ SWING SIGNAL: This drop may be a buy opportunity — no entry price recorded to assess vs cost basis.`;
         } else {
-          // Profitable or small loss — genuine dip opportunity
-          swingSignal = `\n\n⚡ SWING SIGNAL: Down ${pct}% but up ${plFromEntry.toFixed(1)}% from entry — consider adding and setting sell at ${fmtPriceShort(currentPrice * 1.20)} (+20%)`;
+          // #36 v2: plan-aware gate replaces the old generic "buy the dip at +20%" lines
+          const gate = await buildPlanAwareSwingSignal({ coinBase, direction: 'down', isDeepLoss: false, currentPrice });
+          swingSignal = gate.text || '';
+          console.log(`[swingGate] ${coinBase} drop → ${gate.mode}`);
         }
         const alertMessage =
           `📉 <b>${coinBase} DROP ALERT</b>\n\n` +
@@ -7513,11 +7535,13 @@ async function checkPortfolio() {
           const trailReminderKraken = trailingStops.has(symbol)
             ? `\n\n📈 TREND IS YOUR FRIEND — Trailing stop active at ${fmtPriceShort(trailingStops.get(symbol).stopPrice)}.`
             : '';
+          const krakenGate = await buildPlanAwareSwingSignal({ coinBase, direction: 'up', isDeepLoss: false, currentPrice: asset.price });
+          console.log(`[swingGate] ${coinBase} kraken pump → ${krakenGate.mode}`);
           await sendTelegram(
             `📈 <b>${symbol} DAILY PUMP ALERT (Kraken)</b>\n\n` +
             `Baseline: ${fmtPriceShort(basePrices[symbol])} → Now ${fmtPriceShort(asset.price)} (+${pct}%)\n` +
             `You hold: ${asset.quantity.toFixed(4)} ${coinBase} on Kraken\n\n` +
-            `⚡ RECOMMENDATION: ${aiRec}` + trailReminderKraken + `\n\n` +
+            `⚡ RECOMMENDATION: ${aiRec}${krakenGate.text || ''}` + trailReminderKraken + `\n\n` +
             `Reply 'acknowledge ${coinBase}' to stop alerts`
           );
         }
