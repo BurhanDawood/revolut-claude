@@ -5,6 +5,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { z } from 'zod';
 import { createPrivateKey, sign, createHash, createHmac, randomUUID } from 'crypto';
 import { fileURLToPath } from 'url';
+import { readFileSync } from 'fs';
 import { dirname, join } from 'path';
 import mysql from 'mysql2/promise';
 import Anthropic from '@anthropic-ai/sdk';
@@ -2846,6 +2847,68 @@ async function dumpDatabase() {
   }
   out += `\nSET FOREIGN_KEY_CHECKS=1;\n`;
   return out;
+}
+
+
+// ── Automated nightly server.js snapshot → revolut-claude-backups on Google Drive ──────────────
+async function backupServerJsToDrive() {
+  if (!process.env.GOOGLE_OAUTH_REFRESH_TOKEN) {
+    console.log('[server-backup] disabled — GOOGLE_OAUTH_REFRESH_TOKEN missing');
+    return;
+  }
+  const SNAPSHOTS_FOLDER_ID = '1q7QrDkDXWJmaKyeOuId9TeG2f6t8-MIJ'; // revolut-claude-backups on Drive
+  try {
+    console.log('[server-backup] starting server.js snapshot...');
+    const token = await getGoogleAccessToken();
+
+    // Step 1: create a dated subfolder (YYYY-MM-DD-auto)
+    const date = new Date().toISOString().slice(0, 10);
+    const folderName = `${date}-auto`;
+    const folderResp = await fetch('https://www.googleapis.com/drive/v3/files', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: folderName, mimeType: 'application/vnd.google-apps.folder', parents: [SNAPSHOTS_FOLDER_ID] }),
+    });
+    if (!folderResp.ok) throw new Error(`folder create failed: ${folderResp.status} ${await folderResp.text()}`);
+    const { id: newFolderId } = await folderResp.json();
+    console.log(`[server-backup] created folder ${folderName} (${newFolderId})`);
+
+    // Step 2: upload server.js into the new folder
+    const serverPath = join(dirname(fileURLToPath(import.meta.url)), 'server.js');
+    const fileContent = readFileSync(serverPath);
+    const boundary = 'srv_boundary_' + Date.now();
+    const meta = JSON.stringify({ name: 'server.js', parents: [newFolderId] });
+    const head = `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${meta}\r\n--${boundary}\r\nContent-Type: text/javascript\r\n\r\n`;
+    const tail = `\r\n--${boundary}--`;
+    const body = Buffer.concat([Buffer.from(head, 'utf8'), fileContent, Buffer.from(tail, 'utf8')]);
+    const upResp = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': `multipart/related; boundary=${boundary}` },
+      body,
+    });
+    if (!upResp.ok) throw new Error(`upload failed: ${upResp.status} ${await upResp.text()}`);
+    const uploaded = await upResp.json();
+    console.log(`[server-backup] uploaded server.js (${(fileContent.length / 1024).toFixed(1)} KB) id=${uploaded.id}`);
+
+    // Step 3: retention — keep newest 14 snapshot folders, delete older
+    const listResp = await fetch(
+      `https://www.googleapis.com/drive/v3/files?q='${SNAPSHOTS_FOLDER_ID}'+in+parents+and+trashed=false+and+mimeType='application/vnd.google-apps.folder'&orderBy=createdTime+desc&fields=files(id,name,createdTime)&pageSize=100`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    if (listResp.ok) {
+      const { files } = await listResp.json();
+      const old = (files || []).slice(14);
+      for (const f of old) {
+        await fetch(`https://www.googleapis.com/drive/v3/files/${f.id}`, { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } }).catch(() => {});
+        console.log(`[server-backup] pruned old snapshot: ${f.name}`);
+      }
+    }
+
+    await sendTelegram(`✅ <b>server.js snapshot</b>\n${folderName}/server.js (${(fileContent.length / 1024).toFixed(1)} KB) → Google Drive`).catch(() => {});
+  } catch (e) {
+    console.error('[server-backup] FAILED:', e.message);
+    await sendTelegram(`⚠️ <b>server.js snapshot FAILED</b>\n${e.message}`).catch(() => {});
+  }
 }
 
 async function backupDatabaseToDrive() {
@@ -7621,6 +7684,7 @@ setTimeout(async () => {
 // Record prices at midnight every day (UK time)
 cron.schedule('0 0 * * *', recordDailyPrices, { timezone: 'Europe/London' });
 cron.schedule('0 3 * * *', runReconciliation, { timezone: 'Europe/London' });
+cron.schedule('55 2 * * *', backupServerJsToDrive, { timezone: 'Europe/London' }); // nightly server.js snapshot → revolut-claude-backups
 cron.schedule('30 3 * * *', backupDatabaseToDrive, { timezone: 'Europe/London' }); // #12 nightly DB backup
 
 // Morning briefing disabled — sendMorningBriefing() kept for manual use
