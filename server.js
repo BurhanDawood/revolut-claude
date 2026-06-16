@@ -705,6 +705,20 @@ await db.execute(`CREATE TABLE IF NOT EXISTS trailing_stops (
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 )`);
+await db.execute(`CREATE TABLE IF NOT EXISTS pump_armed_rules (
+  symbol VARCHAR(50) PRIMARY KEY,
+  arm_pump_pct DECIMAL(10,4) NOT NULL,
+  arm_window_min INT NOT NULL DEFAULT 60,
+  trail_pct DECIMAL(10,4) NOT NULL,
+  sell_pct DECIMAL(10,4) NOT NULL DEFAULT 50,
+  entry_floor DECIMAL(20,10),
+  armed TINYINT(1) NOT NULL DEFAULT 0,
+  baseline_price DECIMAL(20,10),
+  baseline_at BIGINT,
+  active TINYINT(1) NOT NULL DEFAULT 1,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+)`);
 
 await db.execute(`CREATE TABLE IF NOT EXISTS auto_trade_rules (
   id INT AUTO_INCREMENT PRIMARY KEY,
@@ -2770,10 +2784,55 @@ async function captureIntradayPrices() {
 // getCurrentPrice() handles exchange routing: Revolut X first, Kraken fallback.
 const FAST_SCAN_SYMBOLS = ['GHIBLI-USD', 'FLOKI-USD', 'BOBA-USD'];
 
+
+// ── #95 Stage 1: pump-arm detector — arms a dormant trailing stop when a coin pumps. SELLS NOTHING. ──
+async function checkPumpArm(symbol, currentPrice) {
+  try {
+    const [rows] = await db.execute('SELECT * FROM pump_armed_rules WHERE symbol = ? AND active = 1 AND armed = 0 LIMIT 1', [symbol]);
+    if (!rows.length) return;
+    const rule = rows[0];
+    const now = Date.now();
+    const windowMs = (rule.arm_window_min || 60) * 60 * 1000;
+
+    // No baseline yet, or window expired → (re)set baseline
+    if (!rule.baseline_price || !rule.baseline_at || (now - Number(rule.baseline_at)) > windowMs) {
+      await db.execute('UPDATE pump_armed_rules SET baseline_price = ?, baseline_at = ? WHERE symbol = ?', [currentPrice, now, symbol]);
+      console.log(`[pump-arm] ${symbol} baseline set ${fmtPriceShort(currentPrice)}`);
+      return;
+    }
+
+    // Pump check
+    const pumpPct = ((currentPrice - parseFloat(rule.baseline_price)) / parseFloat(rule.baseline_price)) * 100;
+    if (pumpPct >= parseFloat(rule.arm_pump_pct)) {
+      // ARM — set a trailing stop, mark armed. NO SELL (Stage 1).
+      const entryFloor = rule.entry_floor != null ? parseFloat(rule.entry_floor) : null;
+      await setTrailingStop(symbol, parseFloat(rule.trail_pct), currentPrice, entryFloor);
+      await db.execute('UPDATE pump_armed_rules SET armed = 1 WHERE symbol = ?', [symbol]);
+      console.log(`[pump-arm] ${symbol} ARMED — pumped +${pumpPct.toFixed(1)}% to ${fmtPriceShort(currentPrice)}, trailing stop set ${rule.trail_pct}%`);
+      await sendTelegram(
+        `🎯 <b>PUMP-ARMED — ${symbol.replace('-USD','')}</b>\n\n` +
+        `Pumped +${pumpPct.toFixed(1)}% to ${fmtPriceShort(currentPrice)}\n` +
+        `Trailing stop now ACTIVE at ${rule.trail_pct}% below peak\n` +
+        `${entryFloor ? `Floor: never sell below ${fmtPriceShort(entryFloor)}\n` : ''}` +
+        `\n⚠️ Stage 1 — monitoring only, no auto-sell yet. You'll be alerted if the trail breaches.`
+      ).catch(() => {});
+    } else {
+      console.log(`[pump-arm] ${symbol} watching — +${pumpPct.toFixed(1)}% of ${rule.arm_pump_pct}% needed`);
+    }
+  } catch (e) {
+    console.error('[pump-arm] error:', e.message);
+  }
+}
+
 async function runFastScan() {
   try {
     for (const symbol of FAST_SCAN_SYMBOLS) {
-      // Only run if a trailing stop is armed — silent if not
+      // #95 Stage 1: check pump-arm rules FIRST (these are dormant — no trailing stop yet)
+      {
+        const armPrice = await getCurrentPrice(symbol).catch(() => null);
+        if (armPrice) await checkPumpArm(symbol, armPrice);
+      }
+      // Only run trailing-stop logic if a trailing stop is armed — silent if not
       if (!trailingStops.has(symbol)) continue;
       // Skip if already acknowledged or ignored this cycle
       if (alertState.acknowledged.has(symbol) || ignoredCoins.has(symbol)) continue;
@@ -9636,6 +9695,40 @@ function createMcpServer() {
   );
 
   // ── Tool: get_tranches ────────────────────────────────────────────────────
+  server.tool('set_pump_armed_rule',
+    'Set a pump-armed trailing stop rule (#95 Stage 1). Dormant until the coin pumps arm_pump_pct within arm_window_min, then arms a trailing stop. Stage 1 only arms + alerts — does NOT auto-sell.',
+    {
+      symbol:         z.string().describe('Trading pair e.g. GHIBLI-USD'),
+      arm_pump_pct:   z.number().describe('Pump %% that arms the trailing stop (e.g. 25 = +25%)'),
+      trail_pct:      z.number().describe('Trailing stop %% below peak once armed (e.g. 8)'),
+      sell_pct:       z.number().optional().describe('%% of position to sell when trail breaches (Stage 2 — stored now, default 50)'),
+      entry_floor:    z.number().optional().describe('Never sell below this price (the hard floor; Stage 2)'),
+      arm_window_min: z.number().optional().describe('Window in minutes for the pump to count (default 60)'),
+    },
+    async ({ symbol, arm_pump_pct, trail_pct, sell_pct, entry_floor, arm_window_min }) => {
+      try {
+        const sym = symbol.includes('-USD') ? symbol.toUpperCase() : `${symbol.toUpperCase()}-USD`;
+        await db.execute(
+          `INSERT INTO pump_armed_rules (symbol, arm_pump_pct, arm_window_min, trail_pct, sell_pct, entry_floor, armed, baseline_price, baseline_at, active)
+           VALUES (?, ?, ?, ?, ?, ?, 0, NULL, NULL, 1)
+           ON DUPLICATE KEY UPDATE arm_pump_pct=VALUES(arm_pump_pct), arm_window_min=VALUES(arm_window_min), trail_pct=VALUES(trail_pct), sell_pct=VALUES(sell_pct), entry_floor=VALUES(entry_floor), armed=0, baseline_price=NULL, baseline_at=NULL, active=1, updated_at=CURRENT_TIMESTAMP`,
+          [sym, arm_pump_pct, arm_window_min || 60, trail_pct, sell_pct ?? 50, entry_floor ?? null]
+        );
+        await sendTelegram(
+          `🎯 <b>PUMP-ARM RULE SET — ${sym.replace('-USD','')}</b>\n\n` +
+          `Arms when +${arm_pump_pct}% within ${arm_window_min || 60}min\n` +
+          `Then trails ${trail_pct}% below peak\n` +
+          `${entry_floor ? `Floor: ${entry_floor}\n` : ''}` +
+          `Sell %% (Stage 2): ${sell_pct ?? 50}%\n\n` +
+          `⚠️ Stage 1 active — arms + alerts only, no auto-sell yet.`
+        ).catch(() => {});
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, symbol: sym, arm_pump_pct, trail_pct, arm_window_min: arm_window_min || 60, sell_pct: sell_pct ?? 50, entry_floor: entry_floor ?? null, note: 'Stage 1 — arms trailing stop on pump, no auto-sell' }) }] };
+      } catch (e) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: e.message }) }] };
+      }
+    }
+  );
+
   server.tool('get_tranches',
     'Get tranche breakdown for one or all positions. Shows each buy lot separately with entry price, quantity, cost basis and P&L per tranche.',
     {
