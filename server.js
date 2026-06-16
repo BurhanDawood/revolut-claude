@@ -9035,7 +9035,7 @@ function createMcpServer() {
       pm_principle_tag:     z.string().optional().describe('log_pm_decision: short tag e.g. position-sizing / risk-management'),
       pm_conviction:        z.enum(['high','medium','low']).optional().describe('log_pm_decision: conviction level'),
       pm_captured_by:       z.string().optional().describe('log_pm_decision: who captured this — claude / manual'),
-      pm_supersedes_id:     z.number().int().optional().describe('log_pm_decision: id of an older decision this replaces'),
+      pm_supersedes_id:     z.number().optional().describe('log_pm_decision: id of an older decision this replaces'),
     },
     async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, max_buy_usd, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam, title, detail, category, status: devStatus, source: devSource, related_symbol: relSymbol, dev_log_id, active_workstream, progress, open_threads, next_action, recent_decision, recent_decisions, cs_status, cs_role, cs_theme, cs_strategy_md, pm_decision, pm_principle_tag, pm_conviction, pm_captured_by, pm_supersedes_id }) => {
       // Make hodl_symbols accessible in configure_auto_execute via params object
