@@ -720,6 +720,20 @@ await db.execute(`CREATE TABLE IF NOT EXISTS pump_armed_rules (
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 )`);
 
+await db.execute(`CREATE TABLE IF NOT EXISTS pm_decisions (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  decision TEXT NOT NULL,
+  reasoning TEXT,
+  principle_tag VARCHAR(80),
+  related_symbol VARCHAR(50),
+  conviction ENUM('high','medium','low'),
+  captured_by VARCHAR(50) NOT NULL DEFAULT 'manual',
+  status ENUM('active','superseded') NOT NULL DEFAULT 'active',
+  supersedes_id INT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+)`);
+
 await db.execute(`CREATE TABLE IF NOT EXISTS auto_trade_rules (
   id INT AUTO_INCREMENT PRIMARY KEY,
   symbol VARCHAR(50) NOT NULL,
@@ -8976,7 +8990,7 @@ function createMcpServer() {
   server.tool('manage_trading',
     'Log journal entries, trade intentions, trader preferences, update invested capital, or configure USDT sweep',
     {
-      action:                 z.enum(['log_journal', 'log_intention', 'save_preference', 'update_capital', 'configure_sweep', 'configure_auto_execute', 'log_dev_issue', 'update_session_state', 'upsert_coin_strategy', 'export_dev_log', 'log_research']).describe('What trading action to perform'),
+      action:                 z.enum(['log_journal', 'log_intention', 'save_preference', 'update_capital', 'configure_sweep', 'configure_auto_execute', 'log_dev_issue', 'update_session_state', 'upsert_coin_strategy', 'export_dev_log', 'log_research', 'log_pm_decision']).describe('What trading action to perform'),
       symbol:                 z.string().optional().describe('Coin e.g. NEAR-USD or NEAR'),
       trade_action:           z.enum(['buy', 'sell', 'hold', 'add', 'reduce', 'payment', 'transfer']).optional().describe('Trade action for log_journal or log_intention'),
       price:                  z.number().optional().describe('Price for log_journal'),
@@ -9017,8 +9031,13 @@ function createMcpServer() {
       cs_role:              z.string().optional().describe('upsert_coin_strategy: anchor|swing|hodl|lotto|watch_entry|radar|dead_bag'),
       cs_theme:             z.string().optional().describe('upsert_coin_strategy: theme tags e.g. DTCC,L1,DeFi'),
       cs_strategy_md:       z.string().optional().describe('upsert_coin_strategy: freeform strategy notes'),
+      pm_decision:          z.string().optional().describe('log_pm_decision: the decision text to record'),
+      pm_principle_tag:     z.string().optional().describe('log_pm_decision: short tag e.g. position-sizing / risk-management'),
+      pm_conviction:        z.enum(['high','medium','low']).optional().describe('log_pm_decision: conviction level'),
+      pm_captured_by:       z.string().optional().describe('log_pm_decision: who captured this — claude / manual'),
+      pm_supersedes_id:     z.number().int().optional().describe('log_pm_decision: id of an older decision this replaces'),
     },
-    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, max_buy_usd, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam, title, detail, category, status: devStatus, source: devSource, related_symbol: relSymbol, dev_log_id, active_workstream, progress, open_threads, next_action, recent_decision, recent_decisions, cs_status, cs_role, cs_theme, cs_strategy_md }) => {
+    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, max_buy_usd, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam, title, detail, category, status: devStatus, source: devSource, related_symbol: relSymbol, dev_log_id, active_workstream, progress, open_threads, next_action, recent_decision, recent_decisions, cs_status, cs_role, cs_theme, cs_strategy_md, pm_decision, pm_principle_tag, pm_conviction, pm_captured_by, pm_supersedes_id }) => {
       // Make hodl_symbols accessible in configure_auto_execute via params object
       const params = { hodl_symbols: hodlSymbolsParam };
 
@@ -9243,6 +9262,19 @@ function createMcpServer() {
             md += `---\n\n`;
           }
           return { content: [{ type: 'text', text: JSON.stringify({ ok: true, ticket_count: rows.length, export_date: now, markdown: md }) }] };
+      } else if (action === 'log_pm_decision') {
+        if (!pm_decision) return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'pm_decision text is required' }) }] };
+        const pmSym = relSymbol ? (relSymbol.includes('-USD') ? relSymbol.toUpperCase() : `${relSymbol.toUpperCase()}-USD`) : (symbol ? (symbol.includes('-USD') ? symbol.toUpperCase() : `${symbol.toUpperCase()}-USD`) : null);
+        const [pmRes] = await db.execute(
+          `INSERT INTO pm_decisions (decision, reasoning, principle_tag, related_symbol, conviction, captured_by, supersedes_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [pm_decision, reasoning || null, pm_principle_tag || null, pmSym, pm_conviction || null, pm_captured_by || 'manual', pm_supersedes_id || null]
+        );
+        // If this supersedes an earlier decision, mark the old one
+        if (pm_supersedes_id) {
+          await db.execute(`UPDATE pm_decisions SET status = 'superseded' WHERE id = ?`, [pm_supersedes_id]).catch(() => {});
+        }
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, pm_decision_id: pmRes.insertId, captured_by: pm_captured_by || 'manual', supersedes: pm_supersedes_id || null }) }] };
       } else if (action === 'log_research') {
         // #72 Build 2: store a chat-based research snapshot + return diff vs prior
         const rBase = (symbol || '').toUpperCase().replace('-USD', '');
@@ -9625,6 +9657,21 @@ function createMcpServer() {
       const [configRows]     = await db.execute('SELECT config_key, config_value FROM system_config');
       const [sessionRows]    = await db.execute('SELECT * FROM session_state WHERE id = 1');
       const sessionState     = sessionRows[0] || null;
+      // #105 PM Build 1: decision memory + "since last session" digest
+      const [pmDecRows] = await db.execute("SELECT id, created_at, decision, reasoning, principle_tag, related_symbol, conviction, captured_by, status, supersedes_id FROM pm_decisions WHERE status = 'active' ORDER BY created_at DESC LIMIT 25").catch(() => [[]]);
+      let pmDecLastSeen = null;
+      try {
+        const [lsRows] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'pm_decisions_last_seen'");
+        if (lsRows.length) pmDecLastSeen = lsRows[0].config_value;
+      } catch (e) { /* first run */ }
+      const pmDecisionsSinceLastSession = pmDecLastSeen
+        ? pmDecRows.filter(r => new Date(r.created_at) > new Date(pmDecLastSeen))
+        : pmDecRows.filter(r => r.captured_by === 'auto');
+      // Update the last-seen marker to now (so next session's digest is fresh)
+      await db.execute(
+        "INSERT INTO system_config (config_key, config_value) VALUES ('pm_decisions_last_seen', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)",
+        [new Date().toISOString()]
+      ).catch(() => {});
       const [statsRows]      = await db.execute(
         `SELECT
            COUNT(*) AS total_completed,
@@ -9645,6 +9692,8 @@ function createMcpServer() {
         tradingStats: { totalCompleted, winRate: winRate ? `${winRate}%` : 'n/a' },
         systemConfig:      configRows,
         working_notes_unverified: sessionState,
+        pmDecisions:       pmDecRows || [],
+        pmDecisionsDigest: pmDecisionsSinceLastSession || [],
       };
       console.log('[mcp] get_context called');
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
