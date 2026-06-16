@@ -1232,14 +1232,10 @@ try {
     AND source = 'auto_detected'
     AND reasoning LIKE 'USDT conversion%'
   `);
-  const [c3] = await db.execute(`
-    DELETE FROM trading_journal
-    WHERE symbol = 'USDT'
-    AND source IN ('revolut_card')
-    AND created_at > '2026-05-30 00:00:00'
-  `);
-  const total = (c1.affectedRows || 0) + (c3.affectedRows || 0);
-  if (total > 0) console.log(`[cleanup] Removed ${total} USDT false-positive entries (auto_detected:${c1.affectedRows} revolut_card:${c3.affectedRows})`);
+  // c3 (revolut_card deletion) REMOVED 2026-06-16: it had no upper date bound and deleted every
+  // legitimate card payment on every boot, undermining the auto-log payment feature. Card payments must persist.
+  const total = (c1.affectedRows || 0);
+  if (total > 0) console.log(`[cleanup] Removed ${total} USDT false-positive entries (auto_detected:${c1.affectedRows})`);
   const [remaining] = await db.execute(`SELECT COUNT(*) as cnt FROM trading_journal WHERE symbol = 'USDT'`);
   console.log(`[cleanup] USDT entries remaining: ${remaining[0].cnt}`);
 } catch (e) {
