@@ -9791,6 +9791,12 @@ function createMcpServer() {
         [new Date().toISOString()]
       ).catch(() => {});
 
+      // #105 follow-up: cross_thread dev_decisions — governing principles that span PM + Dev
+      // Surfaced in PM briefing so both threads see the same durable constraints
+      const [crossThreadDecRows] = await db.execute(
+        "SELECT id, created_at, decision, principle_tag, reasoning FROM dev_decisions WHERE cross_thread = 1 AND status IN ('active','revisited') ORDER BY created_at DESC LIMIT 15"
+      ).catch(() => [[]]);
+
       // #105 PM Build 2: recommendation engine — held positions + research + principles
       let pmRecommendations = [];
       try {
@@ -9918,6 +9924,7 @@ function createMcpServer() {
         pmDecisions:       pmDecRows || [],
         pmDecisionsDigest: pmDecisionsSinceLastSession || [],
         pmRecommendations: pmRecommendations,
+        crossThreadPrinciples: crossThreadDecRows || [],
       };
       console.log('[mcp] get_context called');
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
