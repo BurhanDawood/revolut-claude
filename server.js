@@ -1788,7 +1788,7 @@ async function getCurrentPortfolioValue() {
     let total = 0;
     for (const asset of balances) {
       if (!asset.currency || SKIP_CURRENCIES.includes(asset.currency)) continue;
-      const qty = parseFloat(asset.available);
+      const qty = parseFloat(asset.available || 0) + parseFloat(asset.reserved || 0); // #71: total = free + reserved-in-orders
       if (qty <= 0) continue;
       const price = priceMap[`${asset.currency}-USD`];
       if (price) total += qty * price;
@@ -2663,12 +2663,12 @@ async function runReconciliation() {
     const drifts = [];
     let checked = 0;
 
-    // --- gather system positions from Revolut /balances (available) ---
+    // --- gather system positions from Revolut /balances (available + reserved = total holdings) --- #71
     const revBals = await revolutRequest('GET', '/balances').catch(() => []);
     const revMap = new Map();
     for (const b of (revBals || [])) {
       if (['USD','USDT','USDC','GBP','EUR'].includes(b.currency)) continue;
-      revMap.set(`${b.currency}-USD`, parseFloat(b.available || 0));
+      revMap.set(`${b.currency}-USD`, parseFloat(b.available || 0) + parseFloat(b.reserved || 0)); // #71: total holdings
     }
 
     // --- Kraken positions ---
@@ -6739,7 +6739,7 @@ async function checkPortfolio() {
 
     for (const asset of balances) {
       if (!asset.currency || SKIP_CURRENCIES.includes(asset.currency)) continue;
-      const available = parseFloat(asset.available);
+      const available = parseFloat(asset.available || 0) + parseFloat(asset.reserved || 0); // #71: total holdings
       if (available <= 0) continue;
 
       const symbol = `${asset.currency}-USD`;
@@ -7315,7 +7315,7 @@ async function checkPortfolio() {
         if (!currentPrice) continue;
 
         // Dust check — skip swing signals for positions < $1
-        const swingPositionValue = parseFloat(asset.available) * currentPrice;
+        const swingPositionValue = (parseFloat(asset.available || 0) + parseFloat(asset.reserved || 0)) * currentPrice; // #71
         if (swingPositionValue > 0 && swingPositionValue < 1.00) {
           console.log(`[dust] Skipping swing signal for ${symbol} — $${swingPositionValue.toFixed(4)} below $1`);
           continue;
@@ -7370,7 +7370,7 @@ async function checkPortfolio() {
 
         // Check we haven't sent this extreme alert recently (use basePrices as proxy)
         const coinBase = asset.currency;
-        const available = parseFloat(asset.available);
+        const available = parseFloat(asset.available || 0) + parseFloat(asset.reserved || 0); // #71: total holdings
         const entryPrice = entryPrices.get(symbol);
 
         // Swing: check one-alert + one-reminder logic (shared Maps with pump/drop alerts)
