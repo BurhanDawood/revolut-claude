@@ -6635,27 +6635,9 @@ async function checkPortfolio() {
                `USDT→${swapCoin} swap — internal rebalancing`, 'neutral', 'auto_internal']
             ).catch(() => {});
 
-          } else if (decrease > 100) {
-            // Unexplained large decrease (no matching USD or crypto increase) — ask for confirmation
-            console.warn(`[usdt] Large USDT decrease $${decrease.toFixed(2)} — requesting confirmation, not auto-logging`);
-            await sendTelegram(
-              `⚠️ Large USDT decrease detected: $${decrease.toFixed(2)}\n` +
-              `Was this a card payment?\n\n` +
-              `Reply '<b>confirm payment ${decrease.toFixed(2)}</b>' to log\n` +
-              `Or '<b>skip payment</b>' to ignore`
-            ).catch(() => {});
-            lastKnownUSDT = currentUSDT; // Update baseline so it doesn't re-fire
-            lastKnownUSD  = currentUSD;
-            await db.execute(
-              `INSERT INTO system_config (config_key, config_value) VALUES ('last_known_usdt', ?), ('last_known_usd', ?)
-               ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)`,
-              [currentUSDT.toString(), currentUSD.toString()]
-            ).catch(() => {});
-            return; // Wait for manual confirmation
-
           } else {
-            // Fix A+B (#82): never silently mutate invested capital.
-            // Fix B: if a crypto trade happened in last 10 min, this is trade-funding — not a payment
+            // Unexplained USDT decrease (no matching USD/crypto increase) — could be a card payment or trade-funding.
+            // Fix B (#82): if a crypto trade happened in last 10 min, this is trade-funding, not a payment.
             const [recentTrade] = await db.execute(
               `SELECT id FROM trading_journal
                WHERE action IN ('buy', 'add')
@@ -6673,7 +6655,8 @@ async function checkPortfolio() {
                  `USDT used for trade funding — no capital change (#82 fix B)`, 'neutral', 'auto_internal']
               ).catch(() => {});
             } else {
-              // Fix A: unexplained small decrease with no recent trade — ask for confirmation, never auto-deduct
+              // No offsetting increase, no recent trade = card payment. AUTO-LOG it (all amounts), decrement capital, notify.
+              // Reversible: Bryan taps 'skip payment X' to undo. Dupe-guard first to avoid double-logging on repeated detection.
               const [dupe] = await db.execute(
                 `SELECT id FROM trading_journal
                  WHERE symbol = 'USDT' AND action = 'payment'
@@ -6684,24 +6667,31 @@ async function checkPortfolio() {
               ).catch(() => [[]]);
 
               if (dupe.length > 0) {
-                console.log('[usdt] Duplicate payment check — skipping');
+                console.log('[usdt] Duplicate payment check — skipping auto-log');
               } else {
-                // Ask for confirmation — never auto-deduct capital (#82 fix A)
-                console.warn(`[usdt] Unexplained USDT decrease $${decrease.toFixed(2)} — requesting confirmation (no auto-deduct)`);
-                await sendTelegram(
-                  `⚠️ USDT decrease detected: $${decrease.toFixed(2)}\n` +
-                  `Was this a card payment?\n\n` +
-                  `Reply '<b>confirm payment ${decrease.toFixed(2)}</b>' to log\n` +
-                  `Or '<b>skip payment</b>' to ignore`
-                ).catch(() => {});
-                lastKnownUSDT = currentUSDT;
-                lastKnownUSD  = currentUSD;
+                console.log(`[usdt] Auto-logging card payment $${decrease.toFixed(2)} (no offsetting increase, no recent trade)`);
                 await db.execute(
-                  `INSERT INTO system_config (config_key, config_value) VALUES ('last_known_usdt', ?), ('last_known_usd', ?)
-                   ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)`,
-                  [currentUSDT.toString(), currentUSD.toString()]
+                  `INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+                  ['USDT', 'payment', 1.00, decrease, decrease,
+                   `Auto-logged card payment — $${decrease.toFixed(2)} USDT (no offsetting balance increase)`, 'neutral', 'revolut_card']
+                ).catch(() => {});
+                const prevCap = totalInvestedCapital;
+                const newCap  = totalInvestedCapital - decrease;
+                await updateInvestedCapital(newCap, `Card payment auto-logged: -$${decrease.toFixed(2)}`);
+                await sendTelegram(
+                  `💳 PAYMENT $${decrease.toFixed(2)} USDT\n` +
+                  `Capital: $${prevCap.toFixed(2)} → $${newCap.toFixed(2)}\n\n` +
+                  `Tap '<b>skip payment ${decrease.toFixed(2)}</b>' if not a payment.`
                 ).catch(() => {});
               }
+              lastKnownUSDT = currentUSDT;
+              lastKnownUSD  = currentUSD;
+              await db.execute(
+                `INSERT INTO system_config (config_key, config_value) VALUES ('last_known_usdt', ?), ('last_known_usd', ?)
+                 ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)`,
+                [currentUSDT.toString(), currentUSD.toString()]
+              ).catch(() => {});
             }
           }
         } else if (currentUSDT - lastKnownUSDT > 0.10) {
@@ -11236,8 +11226,38 @@ app.post('/telegram-webhook', async (req, res) => {
       return res.status(200).json({ ok: true });
     }
 
-    if (/^skip payment$/i.test(commandText)) {
-      await sendReply('✅ Payment detection cancelled — capital unchanged.');
+    // 'skip payment X' reverses an auto-logged payment (re-credits capital + deletes the row). 'skip payment' alone reverses the most recent.
+    const skipPaymentMatch = commandText.match(/^skip payment(?:\s+([\d.]+))?$/i);
+    if (skipPaymentMatch) {
+      const skipAmt = skipPaymentMatch[1] ? parseFloat(skipPaymentMatch[1]) : null;
+      let rows;
+      if (skipAmt !== null && !isNaN(skipAmt)) {
+        [rows] = await db.execute(
+          `SELECT id, quantity FROM trading_journal
+           WHERE symbol = 'USDT' AND action = 'payment' AND source = 'revolut_card'
+           AND ABS(quantity - ?) < 0.05
+           ORDER BY created_at DESC LIMIT 1`,
+          [skipAmt]
+        ).catch(() => [[]]);
+      } else {
+        [rows] = await db.execute(
+          `SELECT id, quantity FROM trading_journal
+           WHERE symbol = 'USDT' AND action = 'payment' AND source = 'revolut_card'
+           AND created_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)
+           ORDER BY created_at DESC LIMIT 1`
+        ).catch(() => [[]]);
+      }
+      if (rows && rows.length > 0) {
+        const row = rows[0];
+        const amt = parseFloat(row.quantity);
+        const prevCap = totalInvestedCapital;
+        const newCap  = totalInvestedCapital + amt;
+        await updateInvestedCapital(newCap, `Payment skipped/reversed: +$${amt.toFixed(2)}`);
+        await db.execute(`DELETE FROM trading_journal WHERE id = ?`, [row.id]).catch(() => {});
+        await sendReply(`✅ Payment $${amt.toFixed(2)} reversed.\nCapital: $${prevCap.toFixed(2)} → $${newCap.toFixed(2)}`);
+      } else {
+        await sendReply('⚠️ No matching payment found to skip.');
+      }
       return res.status(200).json({ ok: true });
     }
 
