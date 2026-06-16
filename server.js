@@ -6078,6 +6078,27 @@ async function autoExecuteSell(symbol, maxPct, analysis, confidence) {
     const reason = reasonMatch ? reasonMatch[1].trim() : 'Trailing stop triggered';
     await sendTelegram(formatAutoExecuteMessage(coinBase, 'sell', sellQty, currentPrice, valueUSD, reason, confidence));
     console.log(`[auto-exec] SELL ${sellQty.toFixed(4)} ${coinBase} @ $${currentPrice.toFixed(4)}`);
+
+    // #95 Stage 3: pump-armed sell → spawn ONE buyback rung (no deeper averaging-down).
+    // A buy only ever exists as the back-half of a completed sell. max_cascades:0 stops the rebuy from cascading deeper.
+    try {
+      const [parRows] = await db.execute('SELECT * FROM pump_armed_rules WHERE symbol = ? AND active = 1 LIMIT 1', [symbol]);
+      if (parRows.length) {
+        const syntheticRule = {
+          id: null,
+          symbol,
+          order_type: 'sell',
+          rule_type: 'sell_pump',
+          volume: sellQty,            // buy back the exact quantity just sold
+          volume_type: 'fixed',
+          exchange: 'revolut',
+          cascade_count: 0,
+          max_cascades: 0,            // single rebuy only — no deeper cascade buys
+        };
+        await cascadeRulesAfterTrade(syntheticRule, currentPrice);
+        console.log(`[auto-exec] Stage 3 single-rebuy cascade spawned for pump-armed ${coinBase} after sell`);
+      }
+    } catch (e) { console.error('[auto-exec] Stage 3 cascade error (non-fatal):', e.message); }
   } catch (e) {
     console.error('[auto-exec] sell error:', e.message);
     await sendTelegram(`❌ AUTO-EXEC FAILED — ${coinBase}\nError: ${e.message}\nManual review needed`);
@@ -6200,6 +6221,26 @@ async function autoExecuteKrakenSell(symbol, maxPct, analysis, confidence) {
     const reason = reasonMatch ? reasonMatch[1].trim() : 'Trailing stop triggered (Kraken)';
     await sendTelegram(formatAutoExecuteMessage(coinBase, 'sell', sellQty, currentPrice, valueUSD, reason, confidence));
     console.log(`[auto-exec] Kraken SELL ${sellQty.toFixed(4)} ${coinBase} @ $${currentPrice.toFixed(4)}`);
+
+    // #95 Stage 3: pump-armed Kraken sell → spawn ONE buyback rung (no deeper averaging-down). max_cascades:0.
+    try {
+      const [parRows] = await db.execute('SELECT * FROM pump_armed_rules WHERE symbol = ? AND active = 1 LIMIT 1', [symbol]);
+      if (parRows.length) {
+        const syntheticRule = {
+          id: null,
+          symbol,
+          order_type: 'sell',
+          rule_type: 'sell_pump',
+          volume: sellQty,
+          volume_type: 'fixed',
+          exchange: 'kraken',
+          cascade_count: 0,
+          max_cascades: 0,
+        };
+        await cascadeRulesAfterTrade(syntheticRule, currentPrice);
+        console.log(`[auto-exec] Stage 3 single-rebuy cascade spawned for pump-armed ${coinBase} after Kraken sell`);
+      }
+    } catch (e) { console.error('[auto-exec] Stage 3 Kraken cascade error (non-fatal):', e.message); }
   } catch (e) {
     console.error('[auto-exec] Kraken sell error:', e.message);
     await sendTelegram(`❌ AUTO-EXEC FAILED — Kraken ${coinBase}\nError: ${e.message}`);
