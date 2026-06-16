@@ -6038,6 +6038,25 @@ async function autoExecuteSell(symbol, maxPct, analysis, confidence) {
       return;
     }
 
+    // #95 Stage 2: HARD ENTRY-FLOOR GUARD — never auto-sell below a pump-armed rule's entry_floor.
+    // Governed by dev_decision #3 (never-sell-below-entry). Authoritative source = pump_armed_rules table.
+    try {
+      const [floorRows] = await db.execute('SELECT entry_floor FROM pump_armed_rules WHERE symbol = ? AND active = 1 LIMIT 1', [symbol]);
+      const entryFloor = floorRows.length && floorRows[0].entry_floor != null ? parseFloat(floorRows[0].entry_floor) : null;
+      if (entryFloor !== null && currentPrice <= entryFloor) {
+        await sendTelegram(
+          `🛑 <b>AUTO-SELL BLOCKED — ${coinBase}</b>\n` +
+          `Price ${fmtPriceShort(currentPrice)} is at/below entry floor ${fmtPriceShort(entryFloor)}.\n` +
+          `Never-sell-below-entry guard held. Position untouched — your call.`
+        ).catch(() => {});
+        console.log(`[auto-exec] FLOOR GUARD blocked ${coinBase} sell: price ${currentPrice} <= floor ${entryFloor}`);
+        return;
+      }
+    } catch (e) { console.error('[auto-exec] floor guard error (failing safe — blocking sell):', e.message); 
+      await sendTelegram(`🛑 AUTO-SELL BLOCKED — ${coinBase}: floor-guard check errored, failing safe (no sell). Manual review.`).catch(() => {});
+      return;
+    }
+
     await db.execute(
       `INSERT INTO trade_intentions (symbol, action, reasoning, emotion, expires_at) VALUES (?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL 1 HOUR))`,
       [symbol, 'sell', `AI auto-execution [${confidence}]: ${analysis.substring(0, 150)}`, 'confident']
@@ -6138,6 +6157,25 @@ async function autoExecuteKrakenSell(symbol, maxPct, analysis, confidence) {
     // Dust guard: skip if the sell is negligible
     if (sellQty <= 0 || !isFinite(sellQty) || valueUSD < 1) {
       await sendTelegram('⚠️ AUTO-EXEC skipped: ' + coinBase + ' Kraken position is dust (qty ' + currentQty + ', sell value $' + (valueUSD || 0).toFixed(4) + '). Nothing to sell.');
+      return;
+    }
+
+    // #95 Stage 2: HARD ENTRY-FLOOR GUARD (Kraken path) — never auto-sell below entry_floor.
+    // Governed by dev_decision #3 (never-sell-below-entry). Authoritative source = pump_armed_rules table.
+    try {
+      const [floorRows] = await db.execute('SELECT entry_floor FROM pump_armed_rules WHERE symbol = ? AND active = 1 LIMIT 1', [symbol]);
+      const entryFloor = floorRows.length && floorRows[0].entry_floor != null ? parseFloat(floorRows[0].entry_floor) : null;
+      if (entryFloor !== null && currentPrice <= entryFloor) {
+        await sendTelegram(
+          `🛑 <b>AUTO-SELL BLOCKED — ${coinBase} (Kraken)</b>\n` +
+          `Price ${fmtPriceShort(currentPrice)} is at/below entry floor ${fmtPriceShort(entryFloor)}.\n` +
+          `Never-sell-below-entry guard held. Position untouched — your call.`
+        ).catch(() => {});
+        console.log(`[auto-exec] FLOOR GUARD blocked Kraken ${coinBase} sell: price ${currentPrice} <= floor ${entryFloor}`);
+        return;
+      }
+    } catch (e) { console.error('[auto-exec] Kraken floor guard error (failing safe — blocking sell):', e.message);
+      await sendTelegram(`🛑 AUTO-SELL BLOCKED — Kraken ${coinBase}: floor-guard check errored, failing safe (no sell). Manual review.`).catch(() => {});
       return;
     }
 
