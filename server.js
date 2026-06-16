@@ -9672,6 +9672,111 @@ function createMcpServer() {
         "INSERT INTO system_config (config_key, config_value) VALUES ('pm_decisions_last_seen', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)",
         [new Date().toISOString()]
       ).catch(() => {});
+
+      // #105 PM Build 2: recommendation engine — held positions + research + principles
+      let pmRecommendations = [];
+      try {
+        // Pull held positions with entry price (non-dust, non-exited)
+        const [epRows] = await db.execute(
+          `SELECT ep.symbol, ep.entry_price, ep.available_qty, ep.gain_loss
+           FROM entry_prices ep
+           WHERE ep.available_qty > 0
+           ORDER BY ep.symbol ASC`
+        );
+        // Pull most-recent research per symbol
+        const [rhRows] = await db.execute(
+          `SELECT r1.symbol, r1.thesis_status, r1.drift_verdict, r1.live_price, r1.researched_at
+           FROM research_history r1
+           INNER JOIN (
+             SELECT symbol, MAX(researched_at) AS latest FROM research_history GROUP BY symbol
+           ) r2 ON r1.symbol = r2.symbol AND r1.researched_at = r2.latest`
+        );
+        const researchMap = {};
+        for (const r of rhRows) researchMap[r.symbol] = r;
+        // Pull win rates by category from trading_journal
+        const [catRows] = await db.execute(
+          `SELECT
+             CASE
+               WHEN symbol IN ('CC-USD','LINK-USD','XLM-USD','XRP-USD') THEN 'institutional'
+               WHEN symbol IN ('NEAR-USD','TON-USD','ALGO-USD','ADA-USD','JTO-USD') THEN 'layer1'
+               WHEN symbol IN ('ENA-USD','AERO-USD','HYPE-USD') THEN 'defi'
+               WHEN symbol IN ('GHIBLI-USD','BONK-USD','FLOKI-USD','MOG-USD') THEN 'meme'
+               ELSE 'other'
+             END AS category,
+             COUNT(*) AS total,
+             SUM(CASE WHEN outcome_pnl > 0 THEN 1 ELSE 0 END) AS wins
+           FROM trading_journal
+           WHERE outcome_pnl IS NOT NULL
+           GROUP BY category`
+        );
+        const winRateMap = {};
+        for (const c of catRows) {
+          winRateMap[c.category] = c.total > 0 ? Math.round((c.wins / c.total) * 100) : null;
+        }
+        // Load active pm_decisions principles
+        const principles = (pmDecRows || []).map(d => d.principle_tag).filter(Boolean);
+        // Build recommendations per position
+        for (const ep of epRows) {
+          const sym = ep.symbol.includes('-USD') ? ep.symbol : ep.symbol + '-USD';
+          const base = sym.replace('-USD', '');
+          const entry = parseFloat(ep.entry_price || 0);
+          const qty = parseFloat(ep.available_qty || 0);
+          const gainLoss = parseFloat(ep.gain_loss || 0);
+          if (!entry || qty < 0.0001) continue;
+          const research = researchMap[base] || null;
+          const recs = [];
+          // TRIM candidate: unrealized gain significant + research STRENGTHENING or INTACT
+          if (gainLoss > 15 && research && ['STRENGTHENING', 'INTACT'].includes((research.thesis_status || '').toUpperCase())) {
+            recs.push({
+              type: 'trim_candidate',
+              reason: `+${gainLoss.toFixed(1)}% unrealized gain, thesis ${research.thesis_status}. Per trim-into-strength principle: consider laddered limit sells into strength, retain 25% moon bag. Research: ${(research.drift_verdict || '').slice(0, 120)}`,
+              principle: 'trim-into-strength',
+              research_date: research.researched_at,
+            });
+          }
+          // HOLD confirmation: thesis STRENGTHENING but still below entry
+          if (gainLoss < 0 && research && (research.thesis_status || '').toUpperCase() === 'STRENGTHENING') {
+            recs.push({
+              type: 'hold_confirmation',
+              reason: `${gainLoss.toFixed(1)}% below entry but thesis STRENGTHENING — plan supports hold, not cut. Research: ${(research.drift_verdict || '').slice(0, 120)}`,
+              principle: 'thesis-driven-hold',
+              research_date: research.researched_at,
+            });
+          }
+          // WEAKENING flag: thesis weakening or broken → review
+          if (research && ['WEAKENING', 'BROKEN'].includes((research.thesis_status || '').toUpperCase())) {
+            recs.push({
+              type: 'thesis_risk',
+              reason: `Thesis ${research.thesis_status} as of ${research.researched_at ? new Date(research.researched_at).toISOString().slice(0,10) : 'unknown'}. Review exit plan. Research: ${(research.drift_verdict || '').slice(0, 120)}`,
+              principle: 'cut-weakening-thesis',
+              research_date: research.researched_at,
+            });
+          }
+          // ROTATION candidate: STRENGTHENING thesis on watchlist/small position
+          if (qty < 1 && research && (research.thesis_status || '').toUpperCase() === 'STRENGTHENING') {
+            recs.push({
+              type: 'rotation_candidate',
+              reason: `Dust/tiny position but thesis STRENGTHENING — potential rotation target if trim proceeds free capital. Research: ${(research.drift_verdict || '').slice(0, 120)}`,
+              principle: 'rotate-to-researched-dips',
+              research_date: research.researched_at,
+            });
+          }
+          if (recs.length > 0) {
+            pmRecommendations.push({ symbol: sym, unrealized_pct: gainLoss, entry_price: entry, recommendations: recs });
+          }
+        }
+        // Sort: thesis_risk first, then trim_candidate, then rotation, then hold_confirmation
+        const typeOrder = { thesis_risk: 0, trim_candidate: 1, rotation_candidate: 2, hold_confirmation: 3 };
+        pmRecommendations.sort((a, b) => {
+          const aMin = Math.min(...a.recommendations.map(r => typeOrder[r.type] ?? 9));
+          const bMin = Math.min(...b.recommendations.map(r => typeOrder[r.type] ?? 9));
+          return aMin - bMin;
+        });
+      } catch (e) {
+        console.error('[pm-recs] recommendation engine error:', e.message);
+        pmRecommendations = [];
+      }
+
       const [statsRows]      = await db.execute(
         `SELECT
            COUNT(*) AS total_completed,
@@ -9694,6 +9799,7 @@ function createMcpServer() {
         working_notes_unverified: sessionState,
         pmDecisions:       pmDecRows || [],
         pmDecisionsDigest: pmDecisionsSinceLastSession || [],
+        pmRecommendations: pmRecommendations,
       };
       console.log('[mcp] get_context called');
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
