@@ -734,6 +734,21 @@ await db.execute(`CREATE TABLE IF NOT EXISTS pm_decisions (
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 )`);
 
+await db.execute(`CREATE TABLE IF NOT EXISTS dev_decisions (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  decision TEXT NOT NULL,
+  reasoning TEXT,
+  principle_tag VARCHAR(80),
+  cross_thread TINYINT(1) NOT NULL DEFAULT 0,
+  alternatives_rejected TEXT,
+  related_dev_log VARCHAR(60),
+  status ENUM('active','superseded','revisited') NOT NULL DEFAULT 'active',
+  supersedes_id INT,
+  captured_by VARCHAR(50) NOT NULL DEFAULT 'manual',
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+)`).catch(e => console.error('[migration] dev_decisions:', e.message));
+
 await db.execute(`CREATE TABLE IF NOT EXISTS auto_trade_rules (
   id INT AUTO_INCREMENT PRIMARY KEY,
   symbol VARCHAR(50) NOT NULL,
@@ -8820,6 +8835,27 @@ function createMcpServer() {
             ...resolvedRows
           ];
         } catch (e) { result.dev_log = { error: e.message }; }
+
+        // #105 Dev-side: decision-memory layer + "since last session" digest (mirrors pm_decisions)
+        try {
+          const [devDecRows] = await db.execute(
+            "SELECT id, created_at, decision, reasoning, principle_tag, cross_thread, alternatives_rejected, related_dev_log, status, supersedes_id, captured_by FROM dev_decisions WHERE status IN ('active','revisited') ORDER BY created_at DESC LIMIT 25"
+          );
+          let devDecLastSeen = null;
+          try {
+            const [lsRows] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'dev_decisions_last_seen'");
+            if (lsRows.length) devDecLastSeen = lsRows[0].config_value;
+          } catch (e) { /* first run */ }
+          const devDecisionsSinceLastSession = devDecLastSeen
+            ? devDecRows.filter(r => new Date(r.created_at) > new Date(devDecLastSeen))
+            : devDecRows.filter(r => r.captured_by === 'auto');
+          await db.execute(
+            "INSERT INTO system_config (config_key, config_value) VALUES ('dev_decisions_last_seen', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)",
+            [new Date().toISOString()]
+          ).catch(() => {});
+          result.dev_decisions = devDecRows;
+          result.dev_decisions_digest = devDecisionsSinceLastSession;
+        } catch (e) { result.dev_decisions = { error: e.message }; }
       }
 
       // dev_bridge — explicitly excluded from fetchAll; must be requested by name
@@ -8976,7 +9012,7 @@ function createMcpServer() {
   server.tool('manage_trading',
     'Log journal entries, trade intentions, trader preferences, update invested capital, or configure USDT sweep',
     {
-      action:                 z.enum(['log_journal', 'log_intention', 'save_preference', 'update_capital', 'configure_sweep', 'configure_auto_execute', 'log_dev_issue', 'update_session_state', 'upsert_coin_strategy', 'export_dev_log', 'log_research', 'log_pm_decision']).describe('What trading action to perform'),
+      action:                 z.enum(['log_journal', 'log_intention', 'save_preference', 'update_capital', 'configure_sweep', 'configure_auto_execute', 'log_dev_issue', 'update_session_state', 'upsert_coin_strategy', 'export_dev_log', 'log_research', 'log_pm_decision', 'log_dev_decision']).describe('What trading action to perform'),
       symbol:                 z.string().optional().describe('Coin e.g. NEAR-USD or NEAR'),
       trade_action:           z.enum(['buy', 'sell', 'hold', 'add', 'reduce', 'payment', 'transfer']).optional().describe('Trade action for log_journal or log_intention'),
       price:                  z.number().optional().describe('Price for log_journal'),
@@ -9022,8 +9058,14 @@ function createMcpServer() {
       pm_conviction:        z.enum(['high','medium','low']).optional().describe('log_pm_decision: conviction level'),
       pm_captured_by:       z.string().optional().describe('log_pm_decision: who captured this — claude / manual'),
       pm_supersedes_id:     z.number().optional().describe('log_pm_decision: id of an older decision this replaces'),
+      dev_decision:         z.string().optional().describe('log_dev_decision: the design decision/call made'),
+      dev_principle_tag:    z.string().optional().describe('log_dev_decision: durable tag e.g. safety / phased-builds / never-sell-below-entry'),
+      dev_cross_thread:     z.boolean().optional().describe('log_dev_decision: true if this principle spans PM+Dev'),
+      dev_alternatives:     z.string().optional().describe('log_dev_decision: alternatives considered + rejected + why'),
+      dev_related_log:      z.string().optional().describe('log_dev_decision: dev_log ticket(s) it governs e.g. "#95,#45"'),
+      dev_supersedes_id:    z.number().optional().describe('log_dev_decision: id of an older decision this replaces'),
     },
-    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, max_buy_usd, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam, title, detail, category, status: devStatus, source: devSource, related_symbol: relSymbol, dev_log_id, active_workstream, progress, open_threads, next_action, recent_decision, recent_decisions, cs_status, cs_role, cs_theme, cs_strategy_md, pm_decision, pm_principle_tag, pm_conviction, pm_captured_by, pm_supersedes_id }) => {
+    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, max_buy_usd, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam, title, detail, category, status: devStatus, source: devSource, related_symbol: relSymbol, dev_log_id, active_workstream, progress, open_threads, next_action, recent_decision, recent_decisions, cs_status, cs_role, cs_theme, cs_strategy_md, pm_decision, pm_principle_tag, pm_conviction, pm_captured_by, pm_supersedes_id, dev_decision, dev_principle_tag, dev_cross_thread, dev_alternatives, dev_related_log, dev_supersedes_id }) => {
       // Make hodl_symbols accessible in configure_auto_execute via params object
       const params = { hodl_symbols: hodlSymbolsParam };
 
@@ -9261,6 +9303,17 @@ function createMcpServer() {
           await db.execute(`UPDATE pm_decisions SET status = 'superseded' WHERE id = ?`, [pm_supersedes_id]).catch(() => {});
         }
         return { content: [{ type: 'text', text: JSON.stringify({ ok: true, pm_decision_id: pmRes.insertId, captured_by: pm_captured_by || 'manual', supersedes: pm_supersedes_id || null }) }] };
+      } else if (action === 'log_dev_decision') {
+        if (!dev_decision) return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'dev_decision text is required' }) }] };
+        const [devDecRes] = await db.execute(
+          `INSERT INTO dev_decisions (decision, reasoning, principle_tag, cross_thread, alternatives_rejected, related_dev_log, status, supersedes_id, captured_by)
+           VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)`,
+          [dev_decision, reasoning || null, dev_principle_tag || null, dev_cross_thread ? 1 : 0, dev_alternatives || null, dev_related_log || null, dev_supersedes_id || null, pm_captured_by || 'manual']
+        );
+        if (dev_supersedes_id) {
+          await db.execute(`UPDATE dev_decisions SET status = 'superseded' WHERE id = ?`, [dev_supersedes_id]).catch(() => {});
+        }
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, dev_decision_id: devDecRes.insertId, cross_thread: dev_cross_thread ? 1 : 0, supersedes: dev_supersedes_id || null }) }] };
       } else if (action === 'log_research') {
         // #72 Build 2: store a chat-based research snapshot + return diff vs prior
         const rBase = (symbol || '').toUpperCase().replace('-USD', '');
