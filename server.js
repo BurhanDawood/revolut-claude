@@ -9113,9 +9113,11 @@ function createMcpServer() {
             ? anchor_price * (1 - threshold_pct / 100)
             : anchor_price * (1 + threshold_pct / 100);
           const impliedDirM = targetPrice >= anchor_price ? 'up' : 'down';
+          let dirCorrected = false;
           if (dir !== impliedDirM) {
             console.log(`[targets] ${sym} direction auto-corrected ${dir} -> ${impliedDirM} (target ${targetPrice} vs anchor ${anchor_price})`);
             dir = impliedDirM;
+            dirCorrected = true;
           }
           await db.execute(
             'INSERT INTO price_targets (symbol, anchor_price, threshold_pct, target_price, direction, note) VALUES (?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE anchor_price=VALUES(anchor_price), threshold_pct=VALUES(threshold_pct), target_price=VALUES(target_price), direction=VALUES(direction), note=VALUES(note), updated_at=CURRENT_TIMESTAMP',
@@ -9127,7 +9129,8 @@ function createMcpServer() {
         } else {
           r = await setFixedTarget(sym, threshold_pct, dir, description ?? null);
         }
-        result = { ok: true, action: 'set_target', symbol: sym, ...r, description: description ?? null, message: `Alert set — fires when ${sym} ${dir === 'down' ? 'drops to' : 'hits'} $${r.targetPrice?.toFixed(6)}` };
+        const dirWarning = dirCorrected ? ` ⚠️ Direction auto-corrected to ${dir} (your anchor $${anchor_price} implies ${dir})` : '';
+        result = { ok: true, action: 'set_target', symbol: sym, ...r, description: description ?? null, direction_corrected: dirCorrected || undefined, message: `Alert set — fires when ${sym} ${dir === 'down' ? 'drops to' : 'hits'} $${r.targetPrice?.toFixed(6)}${dirWarning}` };
 
       } else if (action === 'set_threshold') {
         const { oldThreshold, newThreshold } = await setThreshold(sym, threshold_pct / 100);
