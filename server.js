@@ -7195,7 +7195,7 @@ async function checkPortfolio() {
               `🔔 <b>REMINDER — ${coinBase} PUMP ALERT</b>\n\n` +
               `Still up ${pct}% in 24h.\n` +
               `This is the final reminder.\n\n` +
-              `1️⃣ Hold\n2️⃣ Sell advice\n3️⃣ Buy more\n4️⃣ Analyse\n5️⃣ Acknowledge — stop alerts`
+              `1️⃣ Hold\n2️⃣ Sell advice\n3️⃣ Buy more\n4️⃣ Analyse\n5️⃣ Acknowledge ⚠️ mutes coin 24h`
             );
             await db.execute(
               'INSERT INTO alert_reminders (symbol, alert_date, count) VALUES (?, CURDATE(), 1) ON DUPLICATE KEY UPDATE count = count + 1',
@@ -7213,7 +7213,7 @@ async function checkPortfolio() {
           [symbol]
         ).catch(() => {});
         let aiRec = alertRecommendations.get(symbol)?.rec || 'HOLD - Monitor the situation closely.';
-        const replyMenu = `\n\n1️⃣ Hold  2️⃣ Sell  3️⃣ Buy more  4️⃣ Analyse  5️⃣ Ignore\n💬 Reply number or '<b>${coinBase.toLowerCase()} 2</b>' to target this coin`;
+        const replyMenu = `\n\n1️⃣ Hold  2️⃣ Sell  3️⃣ Buy more  4️⃣ Analyse  5️⃣ Ignore ⚠️\n💬 Reply number or '<b>${coinBase.toLowerCase()} 2</b>' to target this coin`;
         let swingSignal;
         if (isDeepLoss) {
           // Pumping but still deeply underwater — don't celebrate, auto rules handle exit
@@ -7272,7 +7272,7 @@ async function checkPortfolio() {
               `🔔 <b>REMINDER — ${coinBase} DROP ALERT</b>\n\n` +
               `Still down ${pct}% in 24h.\n` +
               `This is the final reminder.\n\n` +
-              `1️⃣ Hold\n2️⃣ Buy more\n3️⃣ Sell advice\n4️⃣ Analyse\n5️⃣ Acknowledge — stop alerts`
+              `1️⃣ Hold\n2️⃣ Buy more\n3️⃣ Sell advice\n4️⃣ Analyse\n5️⃣ Acknowledge ⚠️ mutes coin 24h`
             );
             await db.execute(
               'INSERT INTO alert_reminders (symbol, alert_date, count) VALUES (?, CURDATE(), 1) ON DUPLICATE KEY UPDATE count = count + 1',
@@ -7290,7 +7290,7 @@ async function checkPortfolio() {
           [symbol]
         ).catch(() => {});
         let aiRec = alertRecommendations.get(symbol)?.rec || 'HOLD - Monitor the situation closely.';
-        const replyMenu = `\n\n1️⃣ Hold  2️⃣ Buy more  3️⃣ Sell  4️⃣ Analyse  5️⃣ Ignore\n💬 Reply number or '<b>${coinBase.toLowerCase()} 2</b>' to target this coin`;
+        const replyMenu = `\n\n1️⃣ Hold  2️⃣ Buy more  3️⃣ Sell  4️⃣ Analyse  5️⃣ Ignore ⚠️\n💬 Reply number or '<b>${coinBase.toLowerCase()} 2</b>' to target this coin`;
         let swingSignal;
         if (isDeepLoss) {
           // Deeply underwater — NEVER suggest buying
@@ -7441,7 +7441,7 @@ async function checkPortfolio() {
             `'analyse ${coinBase}' — get fresh analysis before deciding\n` +
             `'hold ${coinBase}' — log decision to hold through this level`;
         } else {
-          const replyMenu = `\n\n1️⃣ Sell  2️⃣ Hold  3️⃣ Analyse  4️⃣ Acknowledge\n💬 Reply number or '<b>${coinBase.toLowerCase()} 1</b>' to target this coin`;
+          const replyMenu = `\n\n1️⃣ Sell  2️⃣ Hold  3️⃣ Analyse  4️⃣ Acknowledge ⚠️ mutes coin 24h\n💬 Reply number or '<b>${coinBase.toLowerCase()} 1</b>' to target this coin`;
           const autoReady = await getAutomationReadiness(symbol, 'buy');
           const autoLine = autoReady ? `\n\n⚡ AUTO-READY: This setup has worked ${autoReady.winRate}% of the time (${autoReady.sampleSize} trades). Could be automated.` : '';
           alertMessage = `🎯 <b>${symbol} FIXED TARGET HIT!</b>\n\nAnchor: $${anchorStr} → Now $${priceStr} (+${changePct.toFixed(1)}%)${entryLine}${upDescLine}${upWickLine}\n\n⚡ RECOMMENDATION: ${aiRec}${replyMenu}${autoLine}`;
@@ -7514,7 +7514,7 @@ async function checkPortfolio() {
 
         const entryPrice = entryPrices.get(symbol) || target.entryPrice;
         const plPct = entryPrice ? ((currentPrice - entryPrice) / entryPrice * 100).toFixed(1) : null;
-        const replyMenu = `\n\n1️⃣ Buy more  2️⃣ Hold  3️⃣ Sell  4️⃣ Acknowledge\n💬 Reply number or '<b>${coinBase.toLowerCase()} 1</b>' to target this coin`;
+        const replyMenu = `\n\n1️⃣ Buy more  2️⃣ Hold  3️⃣ Sell  4️⃣ Acknowledge ⚠️ mutes coin 24h\n💬 Reply number or '<b>${coinBase.toLowerCase()} 1</b>' to target this coin`;
 
         let alertMessage;
         let noteData = null;
@@ -7727,7 +7727,7 @@ async function checkPortfolio() {
                 `🔔 <b>REMINDER — ${coinBase} SWING ${swDir} SIGNAL</b>\n\n` +
                 `Still ${swPct}% outside 7-day average.\n` +
                 `This is the final reminder.\n\n` +
-                `Reply 'acknowledge ${coinBase}' to stop alerts`
+                `Reply 'acknowledge ${coinBase}' to mute ⚠️ (24h)`
               );
             }
             continue; // already alerted this cycle — skip re-send
@@ -7904,7 +7904,7 @@ async function checkPortfolio() {
             `Baseline: ${fmtPriceShort(basePrices[symbol])} → Now ${fmtPriceShort(asset.price)} (+${pct}%)\n` +
             `You hold: ${asset.quantity.toFixed(4)} ${coinBase} on Kraken\n\n` +
             `⚡ RECOMMENDATION: ${aiRec}${krakenGate.text || ''}` + trailReminderKraken + `\n\n` +
-            `Reply 'acknowledge ${coinBase}' to stop alerts`
+            `Reply 'acknowledge ${coinBase}' to mute ⚠️ (24h)`
           );
         }
 
