@@ -9108,12 +9108,12 @@ function createMcpServer() {
       if (action === 'set_target') {
         let dir = direction || 'up';
         let r;
+        let dirCorrected = false;
         if (anchor_price) {
           const targetPrice = dir === 'down'
             ? anchor_price * (1 - threshold_pct / 100)
             : anchor_price * (1 + threshold_pct / 100);
           const impliedDirM = targetPrice >= anchor_price ? 'up' : 'down';
-          let dirCorrected = false;
           if (dir !== impliedDirM) {
             console.log(`[targets] ${sym} direction auto-corrected ${dir} -> ${impliedDirM} (target ${targetPrice} vs anchor ${anchor_price})`);
             dir = impliedDirM;
