@@ -780,6 +780,10 @@ await db.execute("UPDATE auto_trade_rules SET exchange = 'kraken' WHERE exchange
 await safeAddColumn('auto_trade_rules', 'cascade_count',   'INT DEFAULT 0');
 await safeAddColumn('auto_trade_rules', 'max_cascades',    'INT DEFAULT 3');
 await safeAddColumn('auto_trade_rules', 'cascade_parent_id', 'INT NULL');
+await safeAddColumn('pump_armed_rules', 'loop_enabled',      'TINYINT(1) NOT NULL DEFAULT 0');
+await safeAddColumn('pump_armed_rules', 'cycle_count',       'INT DEFAULT 0');
+await safeAddColumn('pump_armed_rules', 'max_cycles',        'INT DEFAULT 10');
+await safeAddColumn('pump_armed_rules', 'loop_realized_pnl', 'DECIMAL(20,8) DEFAULT 0');
 await safeAddColumn('auto_trade_rules', 'proceeds_reserved', 'DECIMAL(12,2) NULL');
 await safeAddColumn('trading_journal',  'source',          "VARCHAR(20) DEFAULT 'auto_detected'");
 await safeAddColumn('trading_journal',  'updated_at',      'TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP');
@@ -5411,6 +5415,96 @@ async function cascadeRulesAfterTrade(rule, executedPrice) {
   }
 }
 
+// #95 Rinse-Repeat: after a pump-loop rebuy fills, re-arm the pump rule for the next cycle.
+// Gated: only acts if loop_enabled=1 AND auto-exec master ON. 4 guards (loop flag, master, circuit-breaker, max-cycles cap).
+async function rearmPumpLoopAfterBuyback(rule, executedPrice) {
+  try {
+    // Only pump-loop rebuys: cascade-sourced buy rules
+    if (rule.order_type !== 'buy' || rule.source !== 'cascade') return;
+    const symbol = rule.symbol;
+    const coinBase = symbol.replace('-USD', '');
+
+    const [parRows] = await db.execute('SELECT * FROM pump_armed_rules WHERE symbol = ? AND active = 1 LIMIT 1', [symbol]);
+    if (!parRows.length) return;
+    const par = parRows[0];
+
+    // GUARD 1: loop must be explicitly enabled for this coin (default OFF = ships inert)
+    if (!par.loop_enabled || parseInt(par.loop_enabled) !== 1) {
+      console.log(`[rinse-repeat] ${coinBase} rebuy filled but loop_enabled=0 — single-cycle, not re-arming`);
+      return;
+    }
+
+    // GUARD 2: global auto-exec master must be ON
+    let masterOn = false;
+    try {
+      const [cfgRows] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'ai_auto_execute'");
+      if (cfgRows.length) masterOn = JSON.parse(cfgRows[0].config_value).enabled === true;
+    } catch (e) { masterOn = false; }
+    if (!masterOn) {
+      console.log(`[rinse-repeat] ${coinBase} loop_enabled but auto-exec master OFF — not re-arming`);
+      return;
+    }
+
+    // Cycle accounting: this rebuy closed one sell→rebuy round-trip.
+    const newCycleCount = parseInt(par.cycle_count || 0) + 1;
+    const maxCycles = parseInt(par.max_cycles || 10);
+    // Realized spread for this cycle: the ringfenced sell proceeds minus the rebuy cost.
+    const reserved = par_proceeds_for_symbol(rule);
+    const rebuyCost = executedPrice * parseFloat(rule.volume || 0);
+    const cycleSpread = (reserved != null ? reserved : rebuyCost) - rebuyCost;
+    const newPnl = parseFloat(par.loop_realized_pnl || 0) + cycleSpread;
+
+    await db.execute(
+      'UPDATE pump_armed_rules SET cycle_count = ?, loop_realized_pnl = ? WHERE symbol = ?',
+      [newCycleCount, newPnl, symbol]
+    );
+
+    // GUARD 3: circuit-breaker — loop net-negative → halt
+    if (newPnl < 0) {
+      await db.execute('UPDATE pump_armed_rules SET loop_enabled = 0 WHERE symbol = ?', [symbol]);
+      await sendTelegram(
+        `🛑 <b>LOOP HALTED (net-negative) — ${coinBase}</b>\n\n` +
+        `Cumulative loop P&L: $${newPnl.toFixed(2)} after ${newCycleCount} cycles.\n` +
+        `Rinse-repeat disabled for ${coinBase}. Review and re-enable manually if you want to continue.`
+      ).catch(() => {});
+      console.log(`[rinse-repeat] ${coinBase} HALTED — net-negative $${newPnl.toFixed(2)}`);
+      return;
+    }
+
+    // GUARD 4: max-cycles cap — pause and ask
+    if (newCycleCount >= maxCycles) {
+      await db.execute('UPDATE pump_armed_rules SET loop_enabled = 0 WHERE symbol = ?', [symbol]);
+      await sendTelegram(
+        `⏸️ <b>LOOP PAUSED (max cycles) — ${coinBase}</b>\n\n` +
+        `Completed ${newCycleCount}/${maxCycles} cycles. Loop P&L: $${newPnl.toFixed(2)}.\n` +
+        `Rinse-repeat paused for ${coinBase}. Re-enable to run another batch.`
+      ).catch(() => {});
+      console.log(`[rinse-repeat] ${coinBase} PAUSED at max cycles ${newCycleCount}/${maxCycles}`);
+      return;
+    }
+
+    // RE-ARM: reset to dormant-watching so checkPumpArm re-detects a fresh pump from the new lower entry
+    await db.execute(
+      'UPDATE pump_armed_rules SET armed = 0, baseline_price = NULL, baseline_at = NULL WHERE symbol = ?',
+      [symbol]
+    );
+    await sendTelegram(
+      `🔁 <b>LOOP RE-ARMED — ${coinBase}</b>\n\n` +
+      `Cycle ${newCycleCount}/${maxCycles} complete. Loop P&L: $${newPnl.toFixed(2)}.\n` +
+      `Watching for the next qualifying pump to repeat sell→rebuy.`
+    ).catch(() => {});
+    console.log(`[rinse-repeat] ${coinBase} RE-ARMED — cycle ${newCycleCount}/${maxCycles}, loop P&L $${newPnl.toFixed(2)}`);
+  } catch (e) {
+    console.error('[rinse-repeat] rearmPumpLoopAfterBuyback error (non-fatal):', e.message);
+  }
+}
+
+// Helper: pull the ringfenced proceeds_reserved off the firing rule (set when the buy_retrace was created)
+function par_proceeds_for_symbol(rule) {
+  const v = rule.proceeds_reserved;
+  return (v != null && !isNaN(parseFloat(v))) ? parseFloat(v) : null;
+}
+
 // Returns available USD/USDT cash on a given exchange
 async function getAvailableUSD(exchange) {
   try {
@@ -6517,6 +6611,9 @@ async function checkAutoTradeRules(priceMap) {
 
           // Cascade: generate next set of rules based on executed price
           await cascadeRulesAfterTrade(rule, currentPrice);
+
+          // #95 Rinse-Repeat: if this was a pump-loop rebuy, re-arm for the next cycle (gated, inert by default)
+          await rearmPumpLoopAfterBuyback(rule, currentPrice);
 
           // Real-time target cancellation: after a sell fires, wipe 'up' targets at or below executed price
           if (rule.order_type === 'sell') {
