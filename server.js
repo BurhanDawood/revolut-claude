@@ -8955,7 +8955,7 @@ function createMcpServer() {
       if (fetchAll || fetch.includes('alerts')) {
         result.alerts = {
           daily_thresholds:    Object.entries(customThresholds).map(([sym, thr]) => ({ symbol: sym, threshold_pct: (thr * 100).toFixed(1) })),
-          fixed_price_targets: [...priceTargets.entries()].map(([sym, t]) => ({ symbol: sym, direction: t.direction, anchor: t.anchorPrice, target: t.targetPrice, threshold_pct: t.thresholdPct })),
+          fixed_price_targets: [...priceTargets.entries()].flatMap(([sym, arr]) => (Array.isArray(arr) ? arr : [arr]).map(t => ({ symbol: sym, direction: t.direction, anchor: t.anchorPrice, target: t.targetPrice, threshold_pct: t.thresholdPct, description: t.note || null }))),
           trailing_stops:      [...trailingStops.entries()].map(([sym, ts]) => ({ symbol: sym, trail_pct: ts.trailPct, peak_price: ts.peakPrice, stop_price: ts.stopPrice, entry_price: ts.entryPrice })),
           active_pump_alerts:  [...alertState.active.keys()],
           active_drop_alerts:  [...activeDropAlerts.keys()],
