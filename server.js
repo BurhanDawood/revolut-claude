@@ -6173,6 +6173,22 @@ async function autoExecuteSell(symbol, maxPct, analysis, confidence) {
     await sendTelegram(formatAutoExecuteMessage(coinBase, 'sell', sellQty, currentPrice, valueUSD, reason, confidence));
     console.log(`[auto-exec] SELL ${sellQty.toFixed(4)} ${coinBase} @ $${currentPrice.toFixed(4)}`);
 
+    // #112 Fix 4: notify of any UP trim targets still live ABOVE the executed sell price (stale trim flag).
+    // Notify-only — never auto-deletes. PM sees the flag and decides whether to clear the rung.
+    try {
+      const remainingTargets = priceTargets.get(symbol) || [];
+      const staleUpTrims = (Array.isArray(remainingTargets) ? remainingTargets : [remainingTargets])
+        .filter(t => (t.direction || 'up') === 'up' && t.targetPrice > currentPrice);
+      if (staleUpTrims.length > 0) {
+        const staleLines = staleUpTrims.map(t => `  • ${fmtPriceShort(t.targetPrice)} UP${t.note ? ' — ' + String(t.note).slice(0, 60) : ''}`).join('\n');
+        await sendTelegram(
+          `⚠️ <b>Stale trim alert: ${coinBase}</b>\n` +
+          `Sold @ ${fmtPriceShort(currentPrice)} — ${staleUpTrims.length} UP target(s) still live above sell price:\n` +
+          staleLines + '\n\nReview: remove if no longer relevant.'
+        ).catch(() => {});
+      }
+    } catch (e) { console.error('[auto-exec] stale trim check error (non-fatal):', e.message); }
+
     // #95 Stage 3: pump-armed sell → spawn ONE buyback rung (no deeper averaging-down).
     // A buy only ever exists as the back-half of a completed sell. max_cascades:0 stops the rebuy from cascading deeper.
     try {
