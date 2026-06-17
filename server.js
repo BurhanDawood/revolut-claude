@@ -10805,11 +10805,9 @@ async function processAlertChoice(ctx, choice, sendReply) {
     return;
   }
   if (action === 'hold') {
-    await acknowledgeAlert(symbol);
     await sendReply(
       `✅ <b>HOLD — ${coinBase}</b>\n` +
-      `Acknowledged @ ${priceStr}\n` +
-      `Monitoring continues silently.`
+      `Noted @ ${priceStr} — still watching for next move.`
     );
     return;
   }
