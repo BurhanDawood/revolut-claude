@@ -8896,7 +8896,7 @@ function createMcpServer() {
           for (const r of epDetailRows) epDetail[r.symbol] = r;
           for (const asset of balances) {
             if (!asset.currency || SKIP_CURRENCIES.includes(asset.currency)) continue;
-            const qty = parseFloat(asset.available);
+            const qty = parseFloat(asset.available || 0) + parseFloat(asset.reserved || 0); // #71: total holdings
             if (qty <= 0) continue;
             const sym = `${asset.currency}-USD`;
             const price = priceMap[sym] || null;
