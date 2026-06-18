@@ -9265,6 +9265,7 @@ function createMcpServer() {
       const params = { hodl_symbols: hodlSymbolsParam };
 
       if (action === 'log_journal') {
+        if (!trade_action) return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'trade_action is required for log_journal (e.g. buy, sell, hold, add, reduce, payment, transfer)' }) }] };
         const sym      = symbol?.includes('-USD') ? symbol.toUpperCase() : `${symbol?.toUpperCase()}-USD`;
         const coinBase = sym.replace('-USD', '');
         const valueUsd = quantity && price ? quantity * price : null;
@@ -9281,7 +9282,7 @@ function createMcpServer() {
              AND created_at > DATE_SUB(NOW(), INTERVAL 6 HOUR)
              ORDER BY created_at DESC
              LIMIT 1`,
-            [coinBase, sym, trade_action,
+            [coinBase, sym, trade_action ?? null,
              quantity ?? null, quantity ?? null]
           );
           if (dupe.length > 0) existingId = dupe[0].id;
