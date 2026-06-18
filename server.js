@@ -6742,16 +6742,30 @@ async function checkPortfolio() {
     // Ensures alerts fire on genuine 24h moves, not week-old drift.
     const baseline24hMap = {};
     try {
+      // #91: true rolling 24h baseline — find the price_history row closest to exactly 24h ago per symbol.
+      // The prior query picked the MOST RECENT row (midnight snapshot), which absorbed any pump already
+      // in progress at midnight. This query targets the row nearest to NOW()-24h (±2h window) so a
+      // continuation pump that started before midnight is correctly measured over the full 24h.
       const [ph24Rows] = await db.execute(`
-        SELECT symbol, MAX(recorded_at) as ts, SUBSTRING_INDEX(GROUP_CONCAT(price ORDER BY recorded_at DESC), ',', 1) as price
-        FROM price_history
-        WHERE recorded_at >= DATE_SUB(NOW(), INTERVAL 28 HOUR)
-        GROUP BY symbol
+        SELECT p1.symbol, p1.price
+        FROM price_history p1
+        INNER JOIN (
+          SELECT symbol,
+                 MIN(ABS(TIMESTAMPDIFF(MINUTE, recorded_at, DATE_SUB(NOW(), INTERVAL 24 HOUR)))) AS min_diff
+          FROM price_history
+          WHERE recorded_at >= DATE_SUB(NOW(), INTERVAL 26 HOUR)
+            AND recorded_at <= DATE_SUB(NOW(), INTERVAL 22 HOUR)
+          GROUP BY symbol
+        ) p2
+          ON p1.symbol = p2.symbol
+         AND ABS(TIMESTAMPDIFF(MINUTE, p1.recorded_at, DATE_SUB(NOW(), INTERVAL 24 HOUR))) = p2.min_diff
+         AND p1.recorded_at >= DATE_SUB(NOW(), INTERVAL 26 HOUR)
+         AND p1.recorded_at <= DATE_SUB(NOW(), INTERVAL 22 HOUR)
       `);
       for (const r of ph24Rows) {
         if (r.price) baseline24hMap[r.symbol] = parseFloat(r.price);
       }
-      console.log(`[baseline24h] Loaded ${Object.keys(baseline24hMap).length} 24h prices from price_history`);
+      console.log(`[baseline24h] Loaded ${Object.keys(baseline24hMap).length} 24h prices from price_history (rolling 24h)`);
     } catch (e) {
       console.warn('[baseline24h] Failed to load 24h prices:', e.message);
     }
