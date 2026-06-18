@@ -2,7 +2,7 @@
 
 > **Purpose of this document.** This is the single durable reference for how the system is built, how data flows through it, what each subsystem does, and *why* the major design decisions were made. It exists because the build history was previously fragmented across 100+ dev_log tickets, git commits, Claude's cross-session memory, and conversation logs — making "how does X work / why is it this way" a reconstruction job. Maintain this file: when a major subsystem ships or a load-bearing decision changes, update the relevant section. The live ticket board remains the `dev_log` (see §7); this document is the map, not the changelog.
 >
-> **Owner:** Bryan. **Last updated:** 2026-06-17. (#95 pump-loop completed through Rinse-Repeat; #105 decision-memory layer; #107 payment auto-log; #71/#102 shipped.)
+> **Owner:** Bryan. **Last updated:** 2026-06-18. (#91 rolling 24h baseline; #71 holdings undercount fully resolved; #111/#112/#113 alert quality cluster; #114/#115/#116 Telegram/logging fixes.)
 
 ---
 
@@ -149,7 +149,11 @@ Reconstructed from git history and the dev_log. Not exhaustive — the `dev_log`
 - **#72 Build 1 + 2** — `researchAsset()` primitive + `research_asset` tool; then research persistence (`research_history`, snapshot+diff, `log_research`, `weeklyResearchSweep()`). *Deployed.*
 - **#78 / #79** — front-door `README.md`; `export_dev_log` action + dated CHANGELOG snapshots. *Shipped.*
 - **#82** — capital-mutation fix (USDT→USD conversions no longer corrupt invested capital). *Resolved.*
-- **#71** — portfolio holdings undercount (resting-limit coins). *Shipped 2026-06-16.*
+- **#71** — portfolio holdings undercount fully resolved (2026-06-18). Revolut X API returns `available` balance only; resting-limit coins were excluded. Fixed across 7 contexts (`available + reserved` = total holdings). CC gap +3,000 coins / +$467 portfolio value now correctly counted. *Resolved 2026-06-18.*
+- **#91** — rolling 24h baseline fix (2026-06-18). The midnight baseline snapshot absorbed pumps already in progress (NEAR +21.67% showed as -2% to system). INNER JOIN self-join now finds `price_history` row closest to exactly 24h ago (±2h window). Continuation pumps correctly measured. *Resolved 2026-06-18.*
+- **#111** — coin_strategy table ↔ preference bidirectional auto-sync (2026-06-18). Alert AI-analysis reads the `coin_strategy` TABLE; PM updates the `coin_strategy_XXX` PREFERENCE — two stores that silently drifted. Fix: `save_preference(coin_strategy_XXX)` now also upserts table `strategy_md`; `upsert_coin_strategy` mirrors back to preference. Closes the stale-plan-contradiction class. *Resolved 2026-06-18.*
+- **#112** — alert direction verification (2026-06-18). Ships A+B: `fixed_price_targets` now flatMaps per-rung detail (direction/anchor/target/description); `set_target` surfaces direction auto-correction warnings. Fix #4: stale trim Telegram flag after auto-sell. Fix #3 (dashboard ▲/▼) queued. *Partially resolved 2026-06-18.*
+- **#113/#114/#115/#116** — Telegram/alert quality cluster (2026-06-17–18). #113: Hold reply no longer calls `acknowledgeAlert`; ⚠️ warning labels on all mute-triggering menu options. #114: trailing stop alerts now show 4-option numbered menu (auto-ack removed). #115: `log_journal` guard — missing `trade_action` returns clear error instead of crashing. #116: stale reminder interval self-heal guard — removed rungs no longer fire zombie reminders. *All resolved.*
 - **#102** — nightly dated server.js snapshot to Drive (3rd backup layer). *Shipped 2026-06-16.*
 - **#107** — card-payment auto-log (USDT outflow → journal + capital decrement + reversible `skip payment`). *Shipped + proven live 2026-06-17.*
 - **#105** — decision-memory layer: PM Build 1 (`pm_decisions` + `log_pm_decision` + briefing digest), PM Build 2 (`pmRecommendations` engine), Dev-side (`dev_decisions` + `log_dev_decision`), cross-thread surfacing in both briefings. *Shipped 2026-06-16.*
@@ -167,7 +171,7 @@ The **`dev_log`** (queried via `get_trading_data include=['dev_log']`) is the li
 - **Tier 2 — core quality / intelligence layer:** #72 Researcher done (keystone) → #36 plan-aware alerts → #50 Build 2 ATR detector → #49 MSS tracker → #40 catalyst calendar. Umbrella framing in #68; sources #61 (YouTube), #69 (social). #90 weekly-sweep `extractDriftVerdict()` parser fix.
 - **Tier 2.5 — learning loop:** #48 outcome loop → #52 shadow tracker → #54 emotion×outcome → #51 checklist gate → #53 concentration dashboard.
 - **Auto-exec / pump-loop:** #95 built end-to-end (OFF). Follow-ups: an MCP setter for `loop_enabled`/`max_cycles` (currently SQL-only); exact loop P&L accounting vs the approximate proxy; #45 per-coin sell-floor generalisation; #24/#46/#33/#34 per-coin config, availability-gating, modes. Enabling remains a separate cold decision; single cycle never run live.
-- **Known bugs to watch:** #76 (macro alert not price-aware), #74 (context-blind ladder rec), #44 (multi-trade approval clobber), #75 (dashboard render verification), #88 (boot-cleanup deleting intentional auto_internal rows), #91 (daily-threshold continuation pump), #99 (fast-scan dynamic upgrade).
+- **Known bugs to watch:** #76 (macro alert not price-aware), #74 (context-blind ladder rec), #44 (multi-trade approval clobber), #75 (dashboard render verification), #99 (fast-scan dynamic upgrade). (#88, #91, #116 resolved 2026-06-18.)
 - **Cosmetic:** `project_description` config still says "11 tools" (real count 15); cron log line omits the server-backup entry.
 - **Documentation:** #73 (this file). The `dev_log` export to a dated CHANGELOG (#79) guards against detail-replacement on ticket updates.
 
