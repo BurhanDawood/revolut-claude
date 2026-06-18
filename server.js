@@ -10258,6 +10258,109 @@ function createMcpServer() {
     }
   );
 
+  server.tool('resolve_pending_trades',
+    'Batch-resolve auto-detected pending trades from the PM thread without Telegram. Pass an array of per-trade resolutions; each maps a symbol to a resolution type (rebalance/transfer/payment/reason/skip). Resolves all in one call against the live in-memory pending queue.',
+    {
+      resolutions: z.array(z.object({
+        symbol: z.string().describe('Coin e.g. AERO or AERO-USD'),
+        type: z.enum(['rebalance','transfer','payment','reason','skip']).describe('Resolution type'),
+        from_coin: z.string().optional().describe('For rebalance: the SOLD coin whose proceeds funded this buy'),
+        reasoning: z.string().optional().describe('For type=reason: freeform journal reasoning'),
+        emotion: z.enum(['confident','uncertain','fomo','fearful','neutral']).optional().describe('Optional emotion; defaults to neutral')
+      })).describe('Per-trade resolution array')
+    },
+    async ({ resolutions } = {}) => {
+      if (!Array.isArray(resolutions) || resolutions.length === 0) {
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'resolutions[] is required and must be non-empty' }) }] };
+      }
+      const results = [];
+      let capitalTouched = false;
+      const capitalBefore = totalInvestedCapital;
+      for (const r of resolutions) {
+        const rawSym = (r && r.symbol) ? String(r.symbol) : '';
+        const key = rawSym.includes('-USD') ? rawSym.toUpperCase() : `${rawSym.toUpperCase()}-USD`;
+        const coinBase = key.replace('-USD', '');
+        try {
+          const pending = pendingTradeContext.get(key);
+          if (!pending) { results.push({ symbol: coinBase, type: r && r.type, status: 'error', detail: `no pending trade for ${coinBase}` }); continue; }
+          const type = r.type;
+          if (!type) { results.push({ symbol: coinBase, status: 'error', detail: 'type is required' }); continue; }
+          clearTimeout(pending.timeoutHandle);
+          pendingTradeContext.delete(key);
+
+          if (type === 'rebalance') {
+            if (!r.from_coin) { results.push({ symbol: coinBase, type, status: 'error', detail: 'from_coin required for rebalance (rolled back: pending already cleared, journal left as auto-detected)' }); continue; }
+            const fromCoin = String(r.from_coin).replace('-USD','').toUpperCase();
+            const reasoning = `Rebalancing — bought ${coinBase} with proceeds from selling ${fromCoin}`;
+            await db.execute('UPDATE trading_journal SET reasoning = ?, emotion = ? WHERE id = ?', [reasoning, 'confident', pending.journalId]);
+            try {
+              const [fromRows] = await db.execute(
+                "SELECT id, price, value_usd, quantity FROM trading_journal WHERE symbol = ? AND action = 'sell' AND created_at > DATE_SUB(NOW(), INTERVAL 4 HOUR) ORDER BY created_at DESC LIMIT 1",
+                [`${fromCoin}-USD`]
+              );
+              if (fromRows.length > 0) {
+                const fr = fromRows[0];
+                await logRebalancePair({
+                  sellSymbol: fromCoin, sellJournalId: fr.id, sellPrice: parseFloat(fr.price),
+                  sellValueUsd: Math.abs(parseFloat(fr.value_usd || 0)), sellQty: parseFloat(fr.quantity || 0),
+                  buySymbol: coinBase, buyJournalId: pending.journalId, buyPrice: pending.price,
+                  buyValueUsd: pending.valueUsd, buyQty: pending.qty
+                }).catch(() => {});
+              }
+            } catch (e) { /* pairing is best-effort */ }
+            results.push({ symbol: coinBase, type, status: 'ok', detail: `rebalance from ${fromCoin}` });
+
+          } else if (type === 'transfer') {
+            await db.execute('UPDATE trading_journal SET action = ?, reasoning = ?, emotion = ? WHERE id = ?',
+              ['transfer', 'Internal transfer — capital rebalanced within portfolio, invested capital unchanged', 'neutral', pending.journalId]);
+            results.push({ symbol: coinBase, type, status: 'ok', detail: 'logged as transfer, capital unchanged' });
+
+          } else if (type === 'payment') {
+            await db.execute('UPDATE trading_journal SET action = ?, reasoning = ?, emotion = ?, notes = ? WHERE id = ?',
+              ['payment', 'Revolut payment made using this asset', 'neutral', 'excluded_from_stats', pending.journalId]);
+            try {
+              const [jRows] = await db.execute('SELECT value_usd FROM trading_journal WHERE id = ?', [pending.journalId]);
+              const payVal = jRows[0]?.value_usd ? Math.abs(parseFloat(jRows[0].value_usd)) : null;
+              if (payVal && payVal > 0) {
+                const prev = totalInvestedCapital;
+                const next = totalInvestedCapital - payVal;
+                await updateInvestedCapital(next, `Auto-deducted (batch): ${coinBase} payment -$${payVal.toFixed(2)}`);
+                capitalTouched = true;
+                results.push({ symbol: coinBase, type, status: 'ok', detail: `payment -$${payVal.toFixed(2)} | capital $${prev.toFixed(2)} -> $${next.toFixed(2)}` });
+              } else {
+                results.push({ symbol: coinBase, type, status: 'ok', detail: 'payment logged, no value_usd to deduct' });
+              }
+            } catch (e) {
+              results.push({ symbol: coinBase, type, status: 'error', detail: `payment logged but capital deduct failed: ${e.message} — update capital manually` });
+            }
+
+          } else if (type === 'reason') {
+            if (!r.reasoning) { results.push({ symbol: coinBase, type, status: 'error', detail: 'reasoning required for type=reason (pending already cleared, journal left as auto-detected)' }); continue; }
+            await db.execute('UPDATE trading_journal SET reasoning = ?, emotion = ? WHERE id = ?',
+              [r.reasoning, r.emotion || 'neutral', pending.journalId]);
+            results.push({ symbol: coinBase, type, status: 'ok', detail: `reason saved (emotion: ${r.emotion || 'neutral'})` });
+
+          } else if (type === 'skip') {
+            await db.execute("UPDATE trading_journal SET reasoning = ?, emotion = ? WHERE id = ? AND reasoning = ?",
+              ['no reason provided', 'neutral', pending.journalId, 'auto-detected']);
+            results.push({ symbol: coinBase, type, status: 'ok', detail: 'skipped — logged without details' });
+
+          } else {
+            results.push({ symbol: coinBase, type, status: 'error', detail: `unknown type ${type}` });
+          }
+        } catch (e) {
+          results.push({ symbol: coinBase, type: r && r.type, status: 'error', detail: e.message });
+        }
+      }
+      await updateLearningModel().catch(() => {});
+      const resolved = results.filter(x => x.status === 'ok').length;
+      const failed = results.filter(x => x.status === 'error').length;
+      const out = { ok: true, resolved, failed, results };
+      if (capitalTouched) { out.capital_before = capitalBefore; out.capital_after = totalInvestedCapital; }
+      return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] };
+    }
+  );
+
   return server;
 }
 
