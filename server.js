@@ -3230,7 +3230,7 @@ async function recordDailyPrices() {
     }
     for (const asset of balances) {
       if (!asset.currency || SKIP_CURRENCIES.includes(asset.currency)) continue;
-      const available = parseFloat(asset.available);
+      const available = parseFloat(asset.available || 0) + parseFloat(asset.reserved || 0); // #71: total holdings
       if (available <= 0) continue;
       const symbol = `${asset.currency}-USD`;
       const price = priceMap[symbol];
@@ -3281,7 +3281,7 @@ async function sendMorningBriefing() {
     let totalUSD = 0;
     for (const asset of balances) {
       if (!asset.currency || SKIP_CURRENCIES.includes(asset.currency)) continue;
-      const available = parseFloat(asset.available);
+      const available = parseFloat(asset.available || 0) + parseFloat(asset.reserved || 0); // #71: total holdings
       if (available <= 0) continue;
       const symbol = `${asset.currency}-USD`;
       const price = priceMap[symbol];
@@ -3816,7 +3816,7 @@ async function checkMacroNews() {
       }
       for (const asset of balances) {
         if (!asset.currency || SKIP_CURRENCIES.includes(asset.currency)) continue;
-        const available = parseFloat(asset.available);
+        const available = parseFloat(asset.available || 0) + parseFloat(asset.reserved || 0); // #71: total holdings
         if (available <= 0) continue;
         const symbol = `${asset.currency}-USD`;
         const price = priceMap[symbol];
@@ -5095,7 +5095,7 @@ async function buildPositions() {
 
   for (const asset of balances) {
     if (!asset.currency || SKIP_CURRENCIES.includes(asset.currency)) continue;
-    const available = parseFloat(asset.available);
+    const available = parseFloat(asset.available || 0) + parseFloat(asset.reserved || 0); // #71: total holdings
     if (available <= 0.0001) continue;
     const symbol = `${asset.currency}-USD`;
     const price = priceMap[symbol];
@@ -7045,7 +7045,7 @@ async function checkPortfolio() {
       const pending = [];
       for (const asset of balances) {
         if (!asset.currency || SKIP_CURRENCIES.includes(asset.currency)) continue;
-        const available = parseFloat(asset.available);
+        const available = parseFloat(asset.available || 0) + parseFloat(asset.reserved || 0); // #71: total holdings
         if (available <= 0) continue;
         const symbol = `${asset.currency}-USD`;
         const currentPrice = priceMap[symbol];
@@ -8182,7 +8182,7 @@ app.get('/api/balances', async (req, res) => {
     let totalUSD = 0;
     const result = [];
     for (const asset of balances) {
-      const available = parseFloat(asset.available);
+      const available = parseFloat(asset.available || 0) + parseFloat(asset.reserved || 0); // #71: total holdings
       if (!asset.currency || available <= 0) continue;
       const symbol = `${asset.currency}-USD`;
       const price = SKIP_CURRENCIES.includes(asset.currency) ? 1 : (priceMap[symbol] || null);
