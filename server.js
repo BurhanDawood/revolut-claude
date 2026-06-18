@@ -7463,6 +7463,14 @@ async function checkPortfolio() {
 
         targetReminderCount.set(symbol, 0); // reset counter when first alert fires
         activeFixedAlerts.set(symbol, setInterval(async () => {
+          // #116: self-heal — if the rung was removed (remove_target) the closure's `target` is stale; stop firing.
+          const stillExistsUp = (priceTargets.get(symbol) || []).some(t => Math.abs(t.targetPrice - target.targetPrice) < 1e-9);
+          if (!stillExistsUp) {
+            console.log('[alert] Fixed-target reminder self-cleared — rung no longer exists:', symbol, target.targetPrice);
+            clearInterval(activeFixedAlerts.get(symbol));
+            activeFixedAlerts.delete(symbol);
+            return;
+          }
           if (alertState.acknowledged.has(symbol)) {
             console.log('[alert] Fixed-target reminder skipped — recently acknowledged:', symbol);
             clearInterval(activeFixedAlerts.get(symbol));
@@ -7557,6 +7565,14 @@ async function checkPortfolio() {
 
         targetReminderCount.set(symbol, 0); // reset counter when first alert fires
         activeFixedAlerts.set(symbol, setInterval(async () => {
+          // #116: self-heal — if the rung was removed (remove_target) the closure's `target` is stale; stop firing.
+          const stillExistsDown = (priceTargets.get(symbol) || []).some(t => Math.abs(t.targetPrice - target.targetPrice) < 1e-9);
+          if (!stillExistsDown) {
+            console.log('[alert] Fixed-floor reminder self-cleared — rung no longer exists:', symbol, target.targetPrice);
+            clearInterval(activeFixedAlerts.get(symbol));
+            activeFixedAlerts.delete(symbol);
+            return;
+          }
           if (alertState.acknowledged.has(symbol)) {
             console.log('[alert] Fixed-floor reminder skipped — recently acknowledged:', symbol);
             clearInterval(activeFixedAlerts.get(symbol));
