@@ -10942,6 +10942,19 @@ async function processAlertChoice(ctx, choice, sendReply) {
 
   console.log(`[alert] choice ${num} → '${action} ${coinBase}' (alertType: ${alertType})`);
 
+  // #117: any numbered reply means Bryan has engaged — cancel the redundant reminder cycle for this alert
+  // instance (reminders only exist to prompt an UNanswered alert). This stops reminder spam after a Hold/Buy/
+  // Sell/Analyse reply WITHOUT muting the coin (acknowledge/ignore handle their own clearing + mute separately).
+  if (action !== 'acknowledge' && action !== 'ignore') {
+    if (activeFixedAlerts.has(symbol)) {
+      clearInterval(activeFixedAlerts.get(symbol));
+      activeFixedAlerts.delete(symbol);
+      console.log('[#117] Cancelled fixed-alert reminder cycle after reply:', symbol);
+    }
+    targetReminderCount.delete(symbol);
+    alertReminderSent.delete(symbol);
+  }
+
   // Fetch price once for use in confirmations below
   const currentPriceForConfirm = await getCurrentPrice(symbol).catch(() => null);
   const priceStr = currentPriceForConfirm ? formatPrice(currentPriceForConfirm) : 'unknown';
