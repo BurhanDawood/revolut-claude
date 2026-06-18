@@ -9333,6 +9333,18 @@ function createMcpServer() {
           'INSERT INTO trader_profile (preference_key, preference_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE preference_value = VALUES(preference_value), updated_at = CURRENT_TIMESTAMP',
           [key, value]
         );
+        // #111 auto-sync: if this is a coin_strategy_XXX preference, mirror it into the coin_strategy TABLE (strategy_md) so the alert AI-analysis (which reads the table) never goes stale. Only strategy_md is touched; status/role/theme set via upsert_coin_strategy are preserved.
+        try {
+          if (key && key.startsWith('coin_strategy_') && key !== 'coin_strategy_INDEX') {
+            const csSym = key.replace('coin_strategy_', '').toUpperCase();
+            await db.execute(
+              `INSERT INTO coin_strategy (symbol, strategy_md, updated_by)
+               VALUES (?, ?, 'pref_sync')
+               ON DUPLICATE KEY UPDATE strategy_md = VALUES(strategy_md), updated_by = 'pref_sync'`,
+              [csSym, value]
+            );
+          }
+        } catch (e) { console.error('[111-sync] save_preference -> coin_strategy table failed (non-fatal):', e.message); }
         return { content: [{ type: 'text', text: JSON.stringify({ ok: true, key, value }) }] };
 
       } else if (action === 'update_capital') {
@@ -9581,6 +9593,15 @@ function createMcpServer() {
              updated_by = 'claude_mcp'`,
           [csSym, cs_status ?? null, cs_role ?? null, cs_theme ?? null, cs_strategy_md ?? null]
         );
+        // #111 auto-sync: mirror strategy_md back into the coin_strategy_XXX preference so PM's preference reads + dashboard stay consistent with the table. Only writes the preference when strategy_md was provided.
+        try {
+          if (cs_strategy_md) {
+            await db.execute(
+              'INSERT INTO trader_profile (preference_key, preference_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE preference_value = VALUES(preference_value), updated_at = CURRENT_TIMESTAMP',
+              [`coin_strategy_${csSym}`, cs_strategy_md]
+            );
+          }
+        } catch (e) { console.error('[111-sync] upsert_coin_strategy -> preference failed (non-fatal):', e.message); }
         return { content: [{ type:'text', text: JSON.stringify({ ok:true, action:'upsert_coin_strategy', symbol: csSym }) }] };
       }
     }
