@@ -3939,6 +3939,14 @@ async function checkMacroNews() {
     const headlines = allTitles.slice(0, 35).join('\n');
     const totalValue = significantHoldings.reduce((s, h) => s + h.valueUSD, 0);
 
+    // #76: fetch live BTC price to pass to Claude so it can cross-check narratives against the tape
+    const liveBtcHolder = significantHoldings.find(h => h.coin === 'BTC');
+    let liveBtcPrice = liveBtcHolder?.price || null;
+    if (!liveBtcPrice) {
+      try { liveBtcPrice = await getCurrentPrice('BTC-USD').catch(() => null); } catch(e) { liveBtcPrice = null; }
+    }
+    const liveBtcStr = liveBtcPrice ? `LIVE BTC PRICE RIGHT NOW: $${liveBtcPrice.toFixed(0)} (use this to cross-check the narrative — if headlines claim BTC support at $X is crumbling but live price is well above $X, the narrative is stale/backwards)` : '';
+
     const claudeResponse = await anthropic.messages.create({
       model: 'claude-haiku-4-5-20251001',
       max_tokens: 600,
@@ -3970,6 +3978,10 @@ URGENCY LEVELS:
 
 Do NOT alert on: price predictions, technical analysis opinions, vague market sentiment.
 
+CRITICAL — PRICE AWARENESS: Before returning alert:true, cross-check any BTC level mentioned against the live price provided in the user message. If the narrative claims "BTC support at $X is crumbling" but the live price is more than $3,000 above $X, the narrative CONTRADICTS the tape — set alert:false and do not send it. Only alert when the described scenario is consistent with live price action.
+
+CRITICAL — TRADER PROFILE: Bryan runs NO leverage and uses NO stop-losses (trailing stops only to protect profits). Never include advice to "tighten stops on leveraged positions", "set stop-losses", or references to "liquidation risk" from leverage. This advice does not apply to his strategy and actively misleads him.
+
 Respond with JSON only — no extra text:
 {
   "alert": true,
@@ -3985,7 +3997,7 @@ or:
       }],
       messages: [{
         role: 'user',
-        content: `Holdings: ${holdingsList}${totalValue > 0 ? ` (total ~$${totalValue.toFixed(0)})` : ''}\nKeywords triggering this scan: ${foundKeywords.slice(0, 10).join(', ')}\n\nNews headlines to analyse:\n${headlines}`
+        content: `Holdings: ${holdingsList}${totalValue > 0 ? ` (total ~$${totalValue.toFixed(0)})` : ''}\nKeywords triggering this scan: ${foundKeywords.slice(0, 10).join(', ')}\n${liveBtcStr ? liveBtcStr + '\n' : ''}\nNews headlines to analyse:\n${headlines}`
       }]
     });
 
