@@ -6256,10 +6256,10 @@ async function handleTrailingStopAlert(symbol, currentPrice, ts, exchange = 'rev
     `\n🧠 Running AI analysis...`
   );
 
-  await sendTelegram(alertMsg);
+  const replyMenu = `\n\n1️⃣ Noted — keep watching\n2️⃣ Analyse — run 5-pillar check\n3️⃣ Remove trail — cancel trailing stop\n4️⃣ Acknowledge ⚠️ mutes coin 24h\n💬 Reply number or '<b>${coinBase.toLowerCase()} 2</b>' to target this coin`;
+  await sendTelegram(alertMsg + replyMenu);
   alertContextBySymbol.set(coinBase.toLowerCase(), { symbol, coinBase, alertType: 'trailing_stop', timestamp: Date.now() });
   lastAlertCoin = coinBase.toLowerCase();
-  await acknowledgeAlert(symbol);
   trailingStopAlerted.set(symbol, Date.now());
   console.log(`[trailing] Stop triggered for ${symbol} @ ${fmtPriceShort(currentPrice)} on ${exchange}`);
 
