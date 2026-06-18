@@ -6,3 +6,8 @@ _archive_bats/
 check_output.txt
 commit_log.txt
 followed
+# Local scratch / backups — never commit
+*.bak
+readback-*.txt
+.tmp.driveupload/
+html-ids.txt
