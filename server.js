@@ -2639,6 +2639,31 @@ async function updateTrailingStop(symbol, currentPrice) {
 
   // Check if stop triggered
   if (currentPrice <= ts.stopPrice && !alertState.acknowledged.has(symbol) && !ignoredCoins.has(symbol)) {
+    // #21: flat-position guard — never fire a trailing stop (and never spin up sell analysis / auto-exec)
+    // on a position that has already been fully exited. A stale stop tracking a zero-balance ghost is
+    // dangerous on auto-exec-eligible coins. On breach, verify a live non-dust balance exists; if flat,
+    // self-heal by clearing the stale stop and suppress the trigger. Kraken-only coins are skipped here
+    // (their balance lives on Kraken, guarded in the Kraken sell path's own dust check).
+    if (!KRAKEN_MONITORED_COINS.includes(symbol)) {
+      try {
+        const liveBals = await revolutRequest('GET', '/balances');
+        const cur = symbol.replace('-USD', '');
+        const a = (liveBals || []).find(b => b.currency === cur);
+        const heldQty = a ? (parseFloat(a.available || 0) + parseFloat(a.reserved || 0)) : 0; // #71 total holdings
+        const posValue = heldQty * currentPrice;
+        if (posValue < 1.00) {
+          console.log(`[#21] ${symbol} trailing stop breached but position is flat/dust ($${posValue.toFixed(4)}) — clearing stale stop, suppressing trigger`);
+          await removeTrailingStop(symbol);
+          return { triggered: false, ts, suppressed: 'flat_position' };
+        }
+      } catch (e) {
+        // If the balance check fails, fail SAFE for an auto-exec coin: do not auto-fire on uncertainty.
+        // For non-auto-exec coins a notify-only alert is harmless, but we cannot tell here, so suppress
+        // and log — a missed notify is recoverable; a phantom auto-sell is not.
+        console.warn(`[#21] ${symbol} balance check failed (${e.message}) — suppressing trailing trigger to fail safe`);
+        return { triggered: false, ts, suppressed: 'balance_check_error' };
+      }
+    }
     return { triggered: true, ts };
   }
   return { triggered: false, ts };
