@@ -801,6 +801,7 @@ await safeAddColumn('pump_armed_rules', 'loop_realized_pnl', 'DECIMAL(20,8) DEFA
 await safeAddColumn('auto_trade_rules', 'proceeds_reserved', 'DECIMAL(12,2) NULL');
 await safeAddColumn('trading_journal',  'source',          "VARCHAR(20) DEFAULT 'auto_detected'");
 await safeAddColumn('trading_journal',  'updated_at',      'TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP');
+await db.execute('CREATE TABLE IF NOT EXISTS archived_journal (id INT AUTO_INCREMENT PRIMARY KEY, original_id INT NOT NULL, row_json TEXT NOT NULL, linked_summary VARCHAR(255), archive_reason VARCHAR(255), archived_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)').catch(e => console.error('[migration] archived_journal:', e.message));
   await db.execute("ALTER TABLE research_history MODIFY COLUMN drift_verdict TEXT")
     .then(() => console.log('[migration] research_history.drift_verdict widened to TEXT'))
     .catch(e => console.error('[migration] research_history.drift_verdict:', e.message));
@@ -9371,7 +9372,7 @@ function createMcpServer() {
   server.tool('manage_trading',
     'Log journal entries, trade intentions, trader preferences, update invested capital, or configure USDT sweep',
     {
-      action:                 z.enum(['log_journal', 'log_intention', 'save_preference', 'update_capital', 'configure_sweep', 'configure_auto_execute', 'log_dev_issue', 'update_session_state', 'upsert_coin_strategy', 'export_dev_log', 'log_research', 'log_pm_decision', 'log_dev_decision']).describe('What trading action to perform'),
+      action:                 z.enum(['log_journal', 'log_intention', 'save_preference', 'update_capital', 'configure_sweep', 'configure_auto_execute', 'log_dev_issue', 'update_session_state', 'upsert_coin_strategy', 'export_dev_log', 'log_research', 'log_pm_decision', 'log_dev_decision', 'void_journal']).describe('What trading action to perform'),
       symbol:                 z.string().optional().describe('Coin e.g. NEAR-USD or NEAR'),
       trade_action:           z.enum(['buy', 'sell', 'hold', 'add', 'reduce', 'payment', 'transfer']).optional().describe('Trade action for log_journal or log_intention'),
       price:                  z.number().optional().describe('Price for log_journal'),
@@ -9423,8 +9424,9 @@ function createMcpServer() {
       dev_alternatives:     z.string().optional().describe('log_dev_decision: alternatives considered + rejected + why'),
       dev_related_log:      z.string().optional().describe('log_dev_decision: dev_log ticket(s) it governs e.g. "#95,#45"'),
       dev_supersedes_id:    z.number().optional().describe('log_dev_decision: id of an older decision this replaces'),
+      journal_id:           z.number().optional().describe('void_journal: trading_journal row id to archive + delete'),
     },
-    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, max_buy_usd, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam, title, detail, category, status: devStatus, source: devSource, related_symbol: relSymbol, dev_log_id, active_workstream, progress, open_threads, next_action, recent_decision, recent_decisions, cs_status, cs_role, cs_theme, cs_strategy_md, pm_decision, pm_principle_tag, pm_conviction, pm_captured_by, pm_supersedes_id, dev_decision, dev_principle_tag, dev_cross_thread, dev_alternatives, dev_related_log, dev_supersedes_id }) => {
+    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, max_buy_usd, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam, title, detail, category, status: devStatus, source: devSource, related_symbol: relSymbol, dev_log_id, active_workstream, progress, open_threads, next_action, recent_decision, recent_decisions, cs_status, cs_role, cs_theme, cs_strategy_md, pm_decision, pm_principle_tag, pm_conviction, pm_captured_by, pm_supersedes_id, dev_decision, dev_principle_tag, dev_cross_thread, dev_alternatives, dev_related_log, dev_supersedes_id, journal_id }) => {
       // Make hodl_symbols accessible in configure_auto_execute via params object
       const params = { hodl_symbols: hodlSymbolsParam };
 
@@ -9767,6 +9769,36 @@ function createMcpServer() {
           }
         } catch (e) { console.error('[111-sync] upsert_coin_strategy -> preference failed (non-fatal):', e.message); }
         return { content: [{ type:'text', text: JSON.stringify({ ok:true, action:'upsert_coin_strategy', symbol: csSym }) }] };
+      } else if (action === 'void_journal') {
+        // #25: archive + hard-delete an erroneous journal row by id. Cascade-deletes its coin_cash_flows
+        // (keeps the cash ledger consistent). Reports (does NOT delete) tax_lots / rebalance_log / trade_intentions links.
+        const vid = (typeof journal_id === 'number') ? journal_id : parseInt(journal_id, 10);
+        if (!vid || isNaN(vid)) return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'journal_id (number) required for void_journal' }) }] };
+        const [vrows] = await db.execute('SELECT * FROM trading_journal WHERE id = ?', [vid]);
+        if (!vrows || vrows.length === 0) return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'No trading_journal row with id ' + vid }) }] };
+        const vrow = vrows[0];
+        const [ccf] = await db.execute('SELECT COUNT(*) AS n FROM coin_cash_flows WHERE journal_id = ?', [vid]).catch(() => [[{ n: 0 }]]);
+        const [txl] = await db.execute('SELECT COUNT(*) AS n FROM tax_lots WHERE journal_id = ?', [vid]).catch(() => [[{ n: 0 }]]);
+        const [rbl] = await db.execute('SELECT COUNT(*) AS n FROM rebalance_log WHERE out_journal_id = ? OR in_journal_id = ?', [vid, vid]).catch(() => [[{ n: 0 }]]);
+        const [tin] = await db.execute('SELECT COUNT(*) AS n FROM trade_intentions WHERE matched_journal_id = ?', [vid]).catch(() => [[{ n: 0 }]]);
+        const ccfN = (ccf[0] && ccf[0].n) || 0, txlN = (txl[0] && txl[0].n) || 0, rblN = (rbl[0] && rbl[0].n) || 0, tinN = (tin[0] && tin[0].n) || 0;
+        const linkedSummary = 'coin_cash_flows:' + ccfN + '(cascaded) tax_lots:' + txlN + ' rebalance_log:' + rblN + ' trade_intentions:' + tinN;
+        await db.execute(
+          'INSERT INTO archived_journal (original_id, row_json, linked_summary, archive_reason) VALUES (?, ?, ?, ?)',
+          [vid, JSON.stringify(vrow), linkedSummary, (detail || 'void_journal (no reason given)').slice(0, 250)]
+        );
+        await db.execute('DELETE FROM coin_cash_flows WHERE journal_id = ?', [vid]);
+        await db.execute('DELETE FROM trading_journal WHERE id = ?', [vid]);
+        const vwarnings = [];
+        if (txlN > 0) vwarnings.push(txlN + ' tax_lots row(s) reference this journal_id - NOT deleted (tax-relevant; handle manually).');
+        if (rblN > 0) vwarnings.push(rblN + ' rebalance_log row(s) reference this journal_id - NOT deleted (pairing record left intact).');
+        if (tinN > 0) vwarnings.push(tinN + ' trade_intentions row(s) matched to this journal_id - NOT deleted (matched_journal_id now dangling).');
+        console.log('[void_journal] archived+deleted journal id ' + vid + ' (' + vrow.symbol + ' ' + vrow.action + ' qty ' + vrow.quantity + '); cascaded ' + ccfN + ' cash_flows; reason: ' + (detail || 'n/a'));
+        return { content: [{ type: 'text', text: JSON.stringify({
+          ok: true, action: 'void_journal', deleted_id: vid,
+          deleted_row: { symbol: vrow.symbol, action: vrow.action, price: vrow.price, quantity: vrow.quantity, value_usd: vrow.value_usd, source: vrow.source, created_at: vrow.created_at },
+          cascaded_coin_cash_flows: ccfN, archived: true, restorable_from: 'archived_journal.row_json', warnings: vwarnings
+        }) }] };
       }
     }
   );
