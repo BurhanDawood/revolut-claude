@@ -31,7 +31,7 @@ const BASE_URL = 'https://revx.revolut.com/api/1.0';
 const KRAKEN_API_URL = 'https://api.kraken.com';
 const TANGEM_XRP_ADDRESS = 'r4E3rtCa4FT4HxTQV2iw3yQHRTrAHMYS3v';
 const TANGEM_XRP_ENTRY   = 2.65; // average entry price for Tangem XRP position
-const XRPL_API = 'https://xrplcluster.com';
+const XRPL_API = 'https://s1.ripple.com:51234/'; // hash119: Ripple official public JSON-RPC node (replaced the community cluster alias that returned a non-JSON body)
 const CHECK_INTERVAL_MS = 5 * 60 * 1000;
 const CAPTURE_INTERVAL_MS = 2 * 60 * 1000;   // #50: intraday price capture cadence (decoupled from alert loop)
 const FAST_SCAN_INTERVAL_MS = 30 * 1000;      // #94: fast-cadence trailing-stop scan for volatile meme/lotto coins (30s)
@@ -1895,7 +1895,11 @@ async function getTangemXRPBalance() {
       signal: controller.signal
     });
     clearTimeout(timeout);
-    const data = await response.json();
+    // hash119: read text then parse so a non-JSON body (e.g. an error page) yields a legible message, not "Unexpected token"
+    const rawText = await response.text();
+    let data;
+    try { data = JSON.parse(rawText); }
+    catch (parseErr) { throw new Error('XRPL non-JSON response (HTTP ' + response.status + '): ' + rawText.slice(0, 80)); }
     if (data.result && data.result.account_data) {
       // XRP balance is in drops (1 XRP = 1,000,000 drops)
       const drops = parseInt(data.result.account_data.Balance);
