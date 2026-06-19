@@ -3175,20 +3175,23 @@ function extractThesisStatus(report) {
 
 function extractDriftVerdict(report) {
   if (!report) return 'unknown';
-  // Prefer explicit "PLAN-DRIFT VERDICT" heading; fall back to a line-anchored "VERDICT".
-  // Captures content inline OR on the following line(s); strips markdown/leading punctuation.
-  let m = report.match(/PLAN[-\s]?DRIFT\s+VERDICT\b\s*[:\-—–]?\s*([\s\S]{0,300})/i)
-       || report.match(/(?:^|\n)[^\n]*?\bVERDICT\b\s*[:\-—–]?\s*([\s\S]{0,300})/i);
-  if (!m) return 'unknown';
-  let v = m[1]
-    .replace(/^[\s>*#_:\-—–]+/, '')
-    .split(/\n\s*\n/)[0]
-    .replace(/\n+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-  if (!v) return 'unknown';
-  if (/\bplan intact\b/i.test(v)) return 'plan intact';
-  return v.slice(0, 120);
+  // The verdict is emitted as the report's canonical FIRST line ("PLAN-DRIFT VERDICT: ...") so it
+  // survives truncation and is unambiguous. Tolerate hy/en/em dashes; capture inline or next line(s).
+  let m = report.match(/PLAN[-\s—–]?DRIFT\s+VERDICT\b\s*[:\-—–]?\s*([\s\S]{0,300})/i);
+  if (m) {
+    let v = m[1]
+      .replace(/^[\s>*#_:\-—–]+/, '')
+      .split(/\n\s*\n/)[0]
+      .replace(/\n+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .replace(/[\s*_`>#\-—–]+$/, '')
+      .trim();
+    if (v) return /\bplan intact\b/i.test(v) ? 'plan intact' : v.slice(0, 160);
+  }
+  if (/\bplan intact\b/i.test(report)) return 'plan intact';
+  // No bare-"VERDICT" fallback: section 1's "Verdict: <thesis>" is the THESIS status (extractThesisStatus),
+  // not the plan-drift verdict - matching it produced wrong values (#90). Unknown is the honest result.
+  return 'unknown';
 }
 
 function buildResearchDiff(prev, curr) {
@@ -3230,7 +3233,7 @@ async function researchAsset(symbol, triggeredBy = 'manual') {
     : `No saved plan on record for ${base}.`;
   const priceBlock = livePrice !== null ? `LIVE PRICE (just fetched): $${livePrice}` : 'Live price unavailable.';
 
-  const prompt = `You are a crypto research analyst for Bryan, a disciplined swing trader in portfolio-recovery mode (no leverage, never sell below entry on anchors, ladder out on MSS, 25% moon bags). Research ${base} and evaluate reality AGAINST his saved plan below.\n\n${planBlock}\n\n${priceBlock}\n\nSearch the web for CURRENT information and produce a concise structured report:\n\n1) FUNDAMENTALS / THESIS — is the original thesis intact, strengthening, or broken?\n2) CATALYSTS — upcoming dated events (give DATE + expected impact + priced-in / sell-the-news risk). Flag any that already hit/missed/delayed.\n3) MATERIAL NEWS — only genuinely material items from the last ~2 weeks.\n4) PRICE vs THESIS — does current price action align with or diverge from the plan?\n5) PLAN-DRIFT VERDICT — has anything shifted enough to warrant a strategy adjustment? If yes, state the specific suggested adjustment (re-ladder / role change / cap change / exit-or-add thesis change). If no, say "plan intact".\n\nRULES: cite SOURCE + DATE for every factual claim. TAG any promotional/affiliate/leverage/influencer-pumped content and discount it. Reality-check every price/figure against the live price above — never relay a stale number as fact. You RECOMMEND only — never suggest auto-execution. Be concise; this is a notify/decision aid, not an essay.`;
+  const prompt = `You are a crypto research analyst for Bryan, a disciplined swing trader in portfolio-recovery mode (no leverage, never sell below entry on anchors, ladder out on MSS, 25% moon bags). Research ${base} and evaluate reality AGAINST his saved plan below.\n\n${planBlock}\n\n${priceBlock}\n\nSearch the web for CURRENT information and produce a concise structured report:\n\n1) FUNDAMENTALS / THESIS — is the original thesis intact, strengthening, or broken?\n2) CATALYSTS — upcoming dated events (give DATE + expected impact + priced-in / sell-the-news risk). Flag any that already hit/missed/delayed.\n3) MATERIAL NEWS — only genuinely material items from the last ~2 weeks.\n4) PRICE vs THESIS — does current price action align with or diverge from the plan?\n5) PLAN-DRIFT VERDICT — has anything shifted enough to warrant a strategy adjustment? If yes, state the specific suggested adjustment (re-ladder / role change / cap change / exit-or-add thesis change). If no, say "plan intact".\n\nRULES: cite SOURCE + DATE for every factual claim. TAG any promotional/affiliate/leverage/influencer-pumped content and discount it. Reality-check every price/figure against the live price above — never relay a stale number as fact. You RECOMMEND only — never suggest auto-execution.\n\nFORMAT REQUIREMENT (critical): the VERY FIRST line of your reply must be exactly, on its own line with NO preamble before it:\nPLAN-DRIFT VERDICT: <either \"plan intact\" or the single specific suggested adjustment, 25 words max>\nThen produce the full structured report (sections 1-5) below it; section 5 may elaborate on that verdict. Be concise; this is a notify/decision aid, not an essay.`;
 
   const response = await anthropic.messages.create({
     model: 'claude-sonnet-4-6',
