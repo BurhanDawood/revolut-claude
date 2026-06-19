@@ -2872,6 +2872,100 @@ async function recordRealisedPnl(journalId, symbolUsd, salePrice, saleQty) {
   }
 }
 
+// ── #8 Part B: per-asset lifetime ledger (read-only) ───────────────────
+// Cross-cycle realized (SUM realised_pnl_usd, all sources) + cash in/out + live
+// unrealized per held coin. Spans exited coins (realized persists). Journal rows
+// = fills. Excludes payment/transfer/hold + USDT/USD. All keys normalized to base.
+async function getLifetimeLedger() {
+  try {
+    const [jrows] = await db.execute(
+      "SELECT UPPER(REPLACE(symbol, '-USD', '')) AS base, " +
+      "SUM(CASE WHEN action IN ('buy','add') THEN value_usd ELSE 0 END) AS cash_in, " +
+      "SUM(CASE WHEN action IN ('sell','reduce') THEN value_usd ELSE 0 END) AS cash_out, " +
+      "SUM(CASE WHEN action = 'sell' THEN realised_pnl_usd ELSE 0 END) AS realized_pnl, " +
+      "SUM(CASE WHEN action = 'sell' AND realised_pnl_usd IS NULL THEN 1 ELSE 0 END) AS sells_missing_pnl, " +
+      "SUM(CASE WHEN action IN ('buy','add','sell','reduce') THEN 1 ELSE 0 END) AS trade_count " +
+      "FROM trading_journal " +
+      "WHERE action IN ('buy','add','sell','reduce') " +
+      "AND symbol NOT IN ('USDT','USD','USDT-USD','USD-USD') " +
+      "GROUP BY UPPER(REPLACE(symbol, '-USD', ''))"
+    );
+    const [openRows] = await db.execute(
+      "SELECT symbol, SUM(remaining_quantity) AS qty FROM position_tranches WHERE is_legacy = 0 GROUP BY symbol HAVING SUM(remaining_quantity) > 0"
+    );
+    const openMap = {};
+    for (const o of openRows) openMap[String(o.symbol).replace('-USD','').toUpperCase()] = parseFloat(o.qty || 0);
+    const [entryRows] = await db.execute('SELECT symbol, entry_price FROM entry_prices');
+    const entryMap = {};
+    for (const er of entryRows) entryMap[String(er.symbol).replace('-USD','').toUpperCase()] = parseFloat(er.entry_price || 0);
+    const [priceRows] = await db.execute(
+      "SELECT pi.symbol, pi.price FROM price_intraday pi INNER JOIN (SELECT symbol, MAX(recorded_at) AS latest FROM price_intraday GROUP BY symbol) m ON pi.symbol = m.symbol AND pi.recorded_at = m.latest"
+    );
+    const priceMap = {};
+    for (const pr of priceRows) priceMap[String(pr.symbol).replace('-USD','').toUpperCase()] = parseFloat(pr.price || 0);
+
+    const jmap = {};
+    const bases = new Set();
+    for (const j of jrows) { if (j.base) { jmap[j.base] = j; bases.add(j.base); } }
+    for (const b of Object.keys(openMap)) bases.add(b);
+
+    const assets = [];
+    let pRealized = 0, pUnrealized = 0;
+    for (const base of bases) {
+      const j = jmap[base] || {};
+      const cashIn = parseFloat(j.cash_in || 0);
+      const cashOut = parseFloat(j.cash_out || 0);
+      const realized = parseFloat(j.realized_pnl || 0);
+      const missing = parseInt(j.sells_missing_pnl || 0, 10);
+      const openQty = openMap[base] || 0;
+      const entry = entryMap[base] || 0;
+      const live = priceMap[base];
+      const held = openQty > 0.0001;
+      let unrealized = null, marketValue = null;
+      if (held && entry > 0 && live != null && live > 0) {
+        marketValue = openQty * live;
+        unrealized = (live - entry) * openQty;
+      }
+      const lifetimeTotal = realized + (unrealized || 0);
+      pRealized += realized;
+      pUnrealized += (unrealized || 0);
+      assets.push({
+        symbol: base,
+        held: held,
+        open_qty: held ? Number(openQty.toFixed(8)) : 0,
+        entry_price: entry || null,
+        live_price: (live != null ? live : null),
+        market_value_usd: marketValue != null ? Number(marketValue.toFixed(2)) : null,
+        total_cash_in_usd: Number(cashIn.toFixed(2)),
+        total_cash_out_usd: Number(cashOut.toFixed(2)),
+        realized_pnl_usd: Number(realized.toFixed(2)),
+        unrealized_pnl_usd: unrealized != null ? Number(unrealized.toFixed(2)) : null,
+        lifetime_total_usd: Number(lifetimeTotal.toFixed(2)),
+        trade_count: parseInt(j.trade_count || 0, 10),
+        sells_missing_realized: missing
+      });
+    }
+    assets.sort((a, b) => (Number(b.held) - Number(a.held)) || (b.lifetime_total_usd - a.lifetime_total_usd));
+    const totalMissing = assets.reduce((s, a) => s + a.sells_missing_realized, 0);
+    return {
+      generated_at: new Date().toISOString(),
+      price_source: 'price_intraday (<=2min stale)',
+      asset_count: assets.length,
+      portfolio_realized_pnl_usd: Number(pRealized.toFixed(2)),
+      portfolio_unrealized_pnl_usd: Number(pUnrealized.toFixed(2)),
+      portfolio_lifetime_total_usd: Number((pRealized + pUnrealized).toFixed(2)),
+      data_quality: {
+        sells_missing_realized_total: totalMissing,
+        note: totalMissing > 0 ? (totalMissing + ' historical sell(s) pre-date the #8 realised_pnl_usd fix; excluded from realized totals until backfilled via position_tranches (ties #3).') : 'all sells have realized P&L recorded.'
+      },
+      assets: assets
+    };
+  } catch (e) {
+    console.error('[ledger] getLifetimeLedger error:', e.message);
+    return { error: e.message, assets: [] };
+  }
+}
+
 async function runLimitFillPipeline(order, filledQty, avgPrice) {
   try {
     const symbol = order.symbol;
@@ -9221,7 +9315,7 @@ function createMcpServer() {
   server.tool('get_trading_data',
     'Get trading journal entries, active alerts, trader context/profile, rebalancing history, and dev_bridge messages',
     {
-      include: z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'dev_bridge', 'coin_strategy', 'reconciliation', 'all'])).optional()
+      include: z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'dev_bridge', 'coin_strategy', 'reconciliation', 'ledger', 'all'])).optional()
         .describe('What data to fetch — defaults to all. dev_bridge, coin_strategy and reconciliation are never included in all; request them explicitly'),
       symbol:           z.string().optional().describe('Filter journal by coin e.g. NEAR'),
       limit:            z.number().optional().describe('Max journal entries to return, default 10'),
@@ -9380,6 +9474,13 @@ function createMcpServer() {
           );
           result.reconciliation = recRows;
         } catch (e) { result.reconciliation = { error: e.message }; }
+      }
+
+      // ledger -- explicitly excluded from fetchAll; must be requested by name (#8 Part B)
+      if (fetch.includes('ledger')) {
+        try {
+          result.ledger = await getLifetimeLedger();
+        } catch (e) { result.ledger = { error: e.message }; }
       }
 
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
