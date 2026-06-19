@@ -35,6 +35,7 @@ const XRPL_API = 'https://xrplcluster.com';
 const CHECK_INTERVAL_MS = 5 * 60 * 1000;
 const CAPTURE_INTERVAL_MS = 2 * 60 * 1000;   // #50: intraday price capture cadence (decoupled from alert loop)
 const FAST_SCAN_INTERVAL_MS = 30 * 1000;      // #94: fast-cadence trailing-stop scan for volatile meme/lotto coins (30s)
+const ORDER_POLL_INTERVAL_MS = 60 * 1000;     // #47 Phase B1 (hash47b): poll resting pending_orders for fills (detection-only)
 const ALERT_INTERVAL_MS = 60 * 1000;
 const PUMP_THRESHOLD = 0.20;
 const SKIP_CURRENCIES = ['USD', 'USDT', 'USDC', 'EUR', 'GBP'];
@@ -2828,6 +2829,51 @@ async function runReconciliation() {
     console.log(`[reconciliation] Run complete: ${checked} checked, ${drifts.length} new drift(s)`);
   } catch (e) {
     console.error('[reconciliation] error:', e.message);
+  }
+}
+
+// #47 Phase B1 (hash47b): fill-detection poller - DETECTION ONLY, no side-effects.
+// Reads open pending_orders, calls GET /orders/{id}, updates status/filled_quantity/avg_fill_price + last_checked.
+// The post-trade pipeline relocation (reduceTranches / journal-enrich / entry-price / USDT sweep / confirmation)
+// is Phase B2 and is intentionally NOT wired here. This pass only OBSERVES fills.
+async function pollPendingOrders() {
+  try {
+    const [rows] = await db.execute(
+      "SELECT order_id, symbol, side, order_type, quantity, limit_price, status, filled_quantity FROM pending_orders WHERE status NOT IN ('filled','cancelled','rejected','expired') LIMIT 50"
+    );
+    if (!rows || rows.length === 0) return;
+    for (const o of rows) {
+      try {
+        const resp = await revolutRequest('GET', '/orders/' + o.order_id);
+        // First-fill visibility: log the full raw response so Phase B2 can pin exact field names.
+        console.log('[orders] poll ' + o.order_id + ' (' + o.symbol + ') raw: ' + JSON.stringify(resp));
+        if (!resp || resp.message || resp.error || resp.errors) {
+          await db.execute('UPDATE pending_orders SET last_checked = NOW() WHERE order_id = ?', [o.order_id]);
+          continue;
+        }
+        // Defensive field parsing - exact names confirmed on first live fill via the raw log above.
+        const newStatus = resp.state || resp.status || o.status;
+        const filledQty = (resp.filled_quantity != null ? resp.filled_quantity
+                          : (resp.filledQuantity != null ? resp.filledQuantity
+                          : (resp.filled_qty != null ? resp.filled_qty : null)));
+        const avgPrice = (resp.average_price != null ? resp.average_price
+                         : (resp.avg_price != null ? resp.avg_price
+                         : (resp.average_fill_price != null ? resp.average_fill_price : null)));
+        await db.execute(
+          'UPDATE pending_orders SET status = ?, filled_quantity = ?, avg_fill_price = ?, last_checked = NOW() WHERE order_id = ?',
+          [String(newStatus), (filledQty != null ? filledQty : 0), (avgPrice != null ? avgPrice : null), o.order_id]
+        );
+        const terminal = ['filled','cancelled','rejected','expired'];
+        if (terminal.indexOf(String(newStatus)) !== -1) {
+          console.log('[orders] order ' + o.order_id + ' ' + o.side + ' ' + o.symbol + ' -> ' + newStatus + ' (filled ' + (filledQty != null ? filledQty : '?') + ') [B1 detection-only; pipeline NOT run]');
+        }
+      } catch (inner) {
+        console.error('[orders] poll error for ' + o.order_id + ': ' + inner.message);
+        try { await db.execute('UPDATE pending_orders SET last_checked = NOW() WHERE order_id = ?', [o.order_id]); } catch (e2) {}
+      }
+    }
+  } catch (e) {
+    console.error('[orders] pollPendingOrders error: ' + e.message);
   }
 }
 
@@ -8043,6 +8089,8 @@ setTimeout(async () => {
   setInterval(captureIntradayPrices, CAPTURE_INTERVAL_MS);
   runFastScan();
   setInterval(runFastScan, FAST_SCAN_INTERVAL_MS);
+  pollPendingOrders();
+  setInterval(pollPendingOrders, ORDER_POLL_INTERVAL_MS);   // #47 Phase B1 (hash47b) fill-detection poller (detection-only)
 }, 5000);
 
 // Record prices at midnight every day (UK time)
