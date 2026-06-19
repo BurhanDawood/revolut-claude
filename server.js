@@ -1331,6 +1331,9 @@ try {
   `);
 } catch (e) { console.warn('[seed] XLM sold history seed:', e.message); }
 
+// #8 — one-time realised_pnl_usd backfill (guarded; runs once). After XLM seed so column + entry_prices exist.
+try { await backfillRealisedPnlOnce(db); } catch (e) { console.warn('[backfill] realised_pnl_usd seed:', e.message); }
+
 // Backfill coin_cash_flows from existing trading_journal (idempotent — ON DUPLICATE KEY ignores already-loaded rows)
 try {
   const [bfResult] = await db.execute(`
@@ -2876,6 +2879,41 @@ async function recordRealisedPnl(journalId, symbolUsd, salePrice, saleQty) {
 // Cross-cycle realized (SUM realised_pnl_usd, all sources) + cash in/out + live
 // unrealized per held coin. Spans exited coins (realized persists). Journal rows
 // = fills. Excludes payment/transfer/hold + USDT/USD. All keys normalized to base.
+// #8 — one-time backfill of realised_pnl_usd on historical sells. Copies the existing
+// outcome_pnl (already-correct historical dollars) where present; otherwise computes
+// (sale - current avg entry) * qty (avg-cost approximate, same method as /api/fix/sell-pnl).
+// Scoped to action='sell' (what the ledger sums). Guarded by a flag so it writes exactly once.
+async function backfillRealisedPnlOnce(db) {
+  const [bfFlag] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'realised_pnl_backfill_v1'");
+  if (bfFlag.length && bfFlag[0].config_value === 'done') return { skippedAlreadyDone: true };
+  const [bfSells] = await db.execute(
+    "SELECT id, symbol, price, quantity, outcome_pnl FROM trading_journal WHERE action = 'sell' AND realised_pnl_usd IS NULL AND price IS NOT NULL AND quantity IS NOT NULL"
+  );
+  let copied = 0, computed = 0, skipped = 0;
+  const byCoin = {};
+  for (const s of bfSells) {
+    const coinBase = String(s.symbol || '').replace('-USD', '').toUpperCase();
+    let realised = null, isCopy = false;
+    if (s.outcome_pnl != null) {
+      realised = parseFloat(s.outcome_pnl); isCopy = true;
+    } else {
+      const [er] = await db.execute('SELECT entry_price FROM entry_prices WHERE symbol = ?', [coinBase + '-USD']);
+      const entry = er.length ? parseFloat(er[0].entry_price) : null;
+      if (!(entry > 0)) { skipped++; continue; }
+      realised = (parseFloat(s.price) - entry) * parseFloat(s.quantity);
+    }
+    if (realised == null || !isFinite(realised)) { skipped++; continue; }
+    await db.execute('UPDATE trading_journal SET realised_pnl_usd = ? WHERE id = ?', [realised.toFixed(8), s.id]);
+    if (isCopy) copied++; else computed++;
+    byCoin[coinBase] = (byCoin[coinBase] || 0) + realised;
+  }
+  await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('realised_pnl_backfill_v1', 'done') ON DUPLICATE KEY UPDATE config_value = 'done'");
+  const total = Object.values(byCoin).reduce((a, b) => a + b, 0);
+  const top = Object.entries(byCoin).sort((a, b) => Math.abs(b[1]) - Math.abs(a[1])).slice(0, 10).map(([c, v]) => `${c} ${v >= 0 ? '+' : ''}$${v.toFixed(2)}`).join(', ');
+  console.log(`[backfill] realised_pnl_usd: ${copied} copied + ${computed} computed, ${skipped} skipped (no entry). Total $${total.toFixed(2)}. Top: ${top}`);
+  return { copied, computed, skipped, total, byCoin };
+}
+
 async function getLifetimeLedger() {
   try {
     const [jrows] = await db.execute(
