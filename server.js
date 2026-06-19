@@ -4343,7 +4343,9 @@ async function findMatchingIntention(symbol, action) {
        AND action IN (${placeholders})
        AND matched_at IS NULL
        AND expires_at > NOW()
-       AND stated_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)
+       -- hash41: removed redundant stated_at 24h cap; it overrode the intention own expires_at,
+       -- so a limit order filling more than 24h after the intention was stated could never match,
+       -- producing an unenriched auto_detected duplicate. expires_at is now the sole validity gate.
        ORDER BY stated_at DESC
        LIMIT 1`,
       [symbol, ...normalizedAction]
@@ -9381,7 +9383,7 @@ function createMcpServer() {
 
       } else if (action === 'log_intention') {
         const sym         = symbol?.includes('-USD') ? symbol.toUpperCase() : `${symbol?.toUpperCase()}-USD`;
-        const expiresHours = expires_hours || 24;
+        const expiresHours = expires_hours || 168; // hash41: 7d default was 24h - limit orders fill days after intention; expires_at is the sole match-validity gate
         await db.execute(
           'INSERT INTO trade_intentions (symbol, action, reasoning, emotion, expires_at) VALUES (?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL ? HOUR))',
           [sym, trade_action, reasoning, emotion || 'confident', expiresHours]
