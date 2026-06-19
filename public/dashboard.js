@@ -698,6 +698,40 @@ function loadTrailingStops() {
 
 // ── Full refresh ──────────────────────────────────────────────────
 
+function loadLedger() {
+  fetchData('/api/ledger').then(function(data) {
+    var sumEl = $('ledger-summary');
+    var el = $('ledger-list');
+    if (!el) return;
+    if (!data || data.error) { el.innerHTML = '<div class="empty-state">' + ((data && data.error) || 'Unavailable') + '</div>'; return; }
+    var assets = data.assets || [];
+    function money(v) { if (v == null) return '—'; var s = v < 0 ? '-' : (v > 0 ? '+' : ''); return s + '$' + Math.abs(v).toFixed(2); }
+    function col(v) { if (v == null) return '#888'; return v < 0 ? '#ff5555' : (v > 0 ? '#33cc66' : '#888'); }
+    if (sumEl) {
+      sumEl.innerHTML =
+        'Realized <b style="color:' + col(data.portfolio_realized_pnl_usd) + '">' + money(data.portfolio_realized_pnl_usd) + '</b> · '
+        + 'Unrealized <b style="color:' + col(data.portfolio_unrealized_pnl_usd) + '">' + money(data.portfolio_unrealized_pnl_usd) + '</b> · '
+        + 'Lifetime <b style="color:' + col(data.portfolio_lifetime_total_usd) + '">' + money(data.portfolio_lifetime_total_usd) + '</b>'
+        + ((data.data_quality && data.data_quality.sells_missing_realized_total) ? '<div style="color:#ff8800;margin-top:4px">⚠ ' + data.data_quality.sells_missing_realized_total + ' historical sells pre-date P&L tracking — realized is partial</div>' : '');
+    }
+    if (!assets.length) { el.innerHTML = '<div class="empty-state">None</div>'; return; }
+    var html = '';
+    assets.forEach(function(a) {
+      var mv = a.market_value_usd != null ? '$' + a.market_value_usd.toFixed(2) : '—';
+      var heldBadge = a.held ? '<span style="color:#33cc66">●</span> ' : '<span style="color:#555">○</span> ';
+      html += '<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 8px;background:rgba(255,255,255,0.03);border-radius:6px">'
+        + '<span style="font-weight:600">' + heldBadge + (a.symbol || '?') + '</span>'
+        + '<span style="font-size:0.76rem;color:#888;text-align:right">'
+        +   'val ' + mv
+        +   ' · u/r <span style="color:' + col(a.unrealized_pnl_usd) + '">' + money(a.unrealized_pnl_usd) + '</span>'
+        +   ' · real <span style="color:' + col(a.realized_pnl_usd) + '">' + money(a.realized_pnl_usd) + '</span>'
+        +   ' · life <b style="color:' + col(a.lifetime_total_usd) + '">' + money(a.lifetime_total_usd) + '</b>'
+        + '</span></div>';
+    });
+    el.innerHTML = html;
+  });
+}
+
 function refreshAll() {
   var spinner = $('spinner');
   if (spinner) spinner.classList.add('active');
@@ -705,6 +739,7 @@ function refreshAll() {
   try { loadSweep(); } catch(e){ console.error('loadSweep FAILED', e); }
   try { loadThresholds(); } catch(e){ console.error('loadThresholds FAILED', e); }
   try { loadAlerts(); } catch(e){ console.error('loadAlerts FAILED', e); }
+  try { loadLedger(); } catch(e){ console.error('loadLedger FAILED', e); }
   try { loadMonitorStatus(); } catch(e){ console.error('loadMonitorStatus FAILED', e); }
   try { loadTrailingStops(); } catch(e){ console.error('loadTrailingStops FAILED', e); }
   if (spinner) setTimeout(function() { spinner.classList.remove('active'); }, 3000);

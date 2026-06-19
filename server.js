@@ -8504,6 +8504,15 @@ app.get('/api/status', (req, res) => {
   });
 });
 
+// GET /api/ledger — per-asset lifetime ledger (#8 Part B)
+app.get('/api/ledger', async (req, res) => {
+  try {
+    res.json(await getLifetimeLedger());
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // GET /api/balances — balances with prices, overnight change, and total portfolio value
 app.get('/api/balances', async (req, res) => {
   try {
