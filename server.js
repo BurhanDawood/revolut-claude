@@ -10084,13 +10084,28 @@ function createMcpServer() {
       // #105 PM Build 2: recommendation engine — held positions + research + principles
       let pmRecommendations = [];
       try {
-        // Pull held positions with entry price (non-dust, non-exited)
+        // Pull held positions + qty from non-legacy tranches (reconciliation source of truth; symbol stored as base). pmrecs_dbderived
         const [epRows] = await db.execute(
-          `SELECT ep.symbol, ep.entry_price, ep.available_qty, ep.gain_loss
-           FROM entry_prices ep
-           WHERE ep.available_qty > 0
-           ORDER BY ep.symbol ASC`
+          `SELECT symbol, SUM(remaining_quantity) AS qty
+           FROM position_tranches
+           WHERE is_legacy = 0
+           GROUP BY symbol
+           HAVING SUM(remaining_quantity) > 0
+           ORDER BY symbol ASC`
         );
+        // Entry price per coin, keyed by base symbol
+        const [entryRows] = await db.execute('SELECT symbol, entry_price FROM entry_prices');
+        const entryMap = {};
+        for (const er of entryRows) entryMap[String(er.symbol).replace('-USD', '').toUpperCase()] = parseFloat(er.entry_price || 0);
+        // Latest intraday price per coin (#50 capture, <=2min stale), keyed by base symbol
+        const [priceRows] = await db.execute(
+          `SELECT pi.symbol, pi.price
+           FROM price_intraday pi
+           INNER JOIN (SELECT symbol, MAX(recorded_at) AS latest FROM price_intraday GROUP BY symbol) m
+             ON pi.symbol = m.symbol AND pi.recorded_at = m.latest`
+        );
+        const priceMap = {};
+        for (const pr of priceRows) priceMap[String(pr.symbol).replace('-USD', '').toUpperCase()] = parseFloat(pr.price || 0);
         // Pull most-recent research per symbol
         const [rhRows] = await db.execute(
           `SELECT r1.symbol, r1.thesis_status, r1.drift_verdict, r1.live_price, r1.researched_at
@@ -10125,11 +10140,12 @@ function createMcpServer() {
         const principles = (pmDecRows || []).map(d => d.principle_tag).filter(Boolean);
         // Build recommendations per position
         for (const ep of epRows) {
-          const sym = ep.symbol.includes('-USD') ? ep.symbol : ep.symbol + '-USD';
-          const base = sym.replace('-USD', '');
-          const entry = parseFloat(ep.entry_price || 0);
-          const qty = parseFloat(ep.available_qty || 0);
-          const gainLoss = parseFloat(ep.gain_loss || 0);
+          const base = String(ep.symbol).replace('-USD', '').toUpperCase();
+          const sym = base + '-USD';
+          const qty = parseFloat(ep.qty || 0);
+          const entry = entryMap[base] || 0;
+          const livePrice = priceMap[base];
+          const gainLoss = (entry > 0 && livePrice != null) ? ((livePrice - entry) / entry) * 100 : 0;
           if (!entry || qty < 0.0001) continue;
           const research = researchMap[base] || null;
           const recs = [];
