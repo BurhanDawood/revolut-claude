@@ -803,6 +803,7 @@ await safeAddColumn('pump_armed_rules', 'loop_realized_pnl', 'DECIMAL(20,8) DEFA
 await safeAddColumn('auto_trade_rules', 'proceeds_reserved', 'DECIMAL(12,2) NULL');
 await safeAddColumn('trading_journal',  'source',          "VARCHAR(20) DEFAULT 'auto_detected'");
 await safeAddColumn('trading_journal',  'updated_at',      'TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP');
+await safeAddColumn('trading_journal',  'realised_pnl_usd', 'DECIMAL(20,8) NULL');
 await db.execute('CREATE TABLE IF NOT EXISTS archived_journal (id INT AUTO_INCREMENT PRIMARY KEY, original_id INT NOT NULL, row_json TEXT NOT NULL, linked_summary VARCHAR(255), archive_reason VARCHAR(255), archived_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)').catch(e => console.error('[migration] archived_journal:', e.message));
   await db.execute("ALTER TABLE research_history MODIFY COLUMN drift_verdict TEXT")
     .then(() => console.log('[migration] research_history.drift_verdict widened to TEXT'))
@@ -2842,6 +2843,35 @@ async function runReconciliation() {
 // #47 Phase B1 (hash47b): fill-detection poller - DETECTION ONLY, no side-effects.
 // #47 B2a: run the post-trade pipeline ONCE on a confirmed full fill of a resting limit order, using the EXACT
 // filled_quantity + average_fill_price from the venue. Mirrors the manual-approval pipeline. Returns the journal id.
+// ── #8: unified realised-P&L (USD) writer — called from every sell path ──────
+// Writes trading_journal.realised_pnl_usd = (sale - avg entry) * qty in DOLLARS so
+// per-asset lifetime realised totals span ALL sell sources (not just auto_detected).
+// Cost basis = current avg entry (entry_prices), keyed by -USD symbol (base fallback).
+// Additive only: never alters execution or the existing outcome_pnl write.
+async function recordRealisedPnl(journalId, symbolUsd, salePrice, saleQty) {
+  try {
+    if (!journalId || !(parseFloat(salePrice) > 0) || !(parseFloat(saleQty) > 0)) return null;
+    const base = String(symbolUsd).replace('-USD', '');
+    let entry = entryPrices.get(symbolUsd);
+    if (entry == null) entry = entryPrices.get(base);
+    if (entry == null) {
+      const [er] = await db.execute('SELECT entry_price FROM entry_prices WHERE symbol = ? OR symbol = ? LIMIT 1', [symbolUsd, base]);
+      if (er && er.length) entry = parseFloat(er[0].entry_price);
+    }
+    if (entry == null || !(parseFloat(entry) > 0)) {
+      console.log('[pnl-usd] no cost basis for ' + symbolUsd + ' — realised_pnl_usd left NULL on journal ' + journalId);
+      return null;
+    }
+    const realised = (parseFloat(salePrice) - parseFloat(entry)) * parseFloat(saleQty);
+    await db.execute('UPDATE trading_journal SET realised_pnl_usd = ? WHERE id = ?', [realised.toFixed(8), journalId]);
+    console.log('[pnl-usd] ' + base + ' realised $' + realised.toFixed(2) + ' (entry $' + entry + ', sale $' + parseFloat(salePrice) + ', qty ' + parseFloat(saleQty) + ') -> journal ' + journalId);
+    return realised;
+  } catch (e) {
+    console.error('[pnl-usd] recordRealisedPnl error:', e.message);
+    return null;
+  }
+}
+
 async function runLimitFillPipeline(order, filledQty, avgPrice) {
   try {
     const symbol = order.symbol;
@@ -2879,6 +2909,7 @@ async function runLimitFillPipeline(order, filledQty, avgPrice) {
       ).catch(e => console.error('[tranches] B2a insert failed:', e.message));
     } else if (side === 'sell') {
       await reduceTranches(coinBase, 'revolut', qty).catch(e => console.error('[tranches] B2a reduce failed:', e.message));
+      if (journalId) await recordRealisedPnl(journalId, symbol, price, qty).catch(() => {});
     }
     await sendTelegram((side === 'sell' ? '✅' : '🟢') + ' LIMIT FILLED — ' + side.toUpperCase() + ' ' + formatTradeQty(qty) + ' ' + coinBase + ' @ ' + formatPrice(price) + ' = $' + valueUSD.toFixed(2) + ' 🔄').catch(() => {});
     if (side === 'sell') { await sweepToUSDT(valueUSD, symbol).catch(() => {}); }
@@ -4741,6 +4772,9 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
              journalId]
           );
 
+          // #8: also persist unambiguous USD realised P&L (shared-column source of truth)
+          await db.execute('UPDATE trading_journal SET realised_pnl_usd = ? WHERE id = ?', [realisedPnl.toFixed(8), journalId]).catch(() => {});
+
           // Running total realised P&L for this coin
           const [runningRows] = await db.execute(
             `SELECT SUM(outcome_pnl) as total_pnl, COUNT(*) as total_sells
@@ -6354,12 +6388,13 @@ async function autoExecuteSell(symbol, maxPct, analysis, confidence) {
 
     await placeRevolutOrder(symbol, 'sell', 'market', sellQty);
 
-    await db.execute(
+    const [aeRevIns] = await db.execute(
       `INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       [coinBase, 'sell', currentPrice, sellQty, valueUSD,
        `AI auto-executed [${confidence} confidence]: ${analysis.substring(0, 200)}`,
        'confident', 'ai_auto']
-    ).catch(e => console.error('[auto-exec] journal insert:', e.message));
+    ).catch(e => { console.error('[auto-exec] journal insert:', e.message); return [{}]; });
+    if (aeRevIns && aeRevIns.insertId) await recordRealisedPnl(aeRevIns.insertId, symbol, currentPrice, sellQty).catch(() => {});
 
     pendingUndo.set(symbol, { action: 'sell', qty: sellQty, price: currentPrice, timestamp: Date.now() });
     setTimeout(() => pendingUndo.delete(symbol), 2 * 60 * 1000);
@@ -6513,12 +6548,13 @@ async function autoExecuteKrakenSell(symbol, maxPct, analysis, confidence) {
 
     await executeKrakenTrade(symbol, 'sell', 'market', sellQty);
 
-    await db.execute(
+    const [aeKrkIns] = await db.execute(
       `INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       [coinBase, 'sell', currentPrice, sellQty, valueUSD,
        `AI auto-executed on Kraken [${confidence}]: ${analysis.substring(0, 200)}`,
        'confident', 'ai_auto']
-    ).catch(e => console.error('[auto-exec] Kraken journal insert:', e.message));
+    ).catch(e => { console.error('[auto-exec] Kraken journal insert:', e.message); return [{}]; });
+    if (aeKrkIns && aeKrkIns.insertId) await recordRealisedPnl(aeKrkIns.insertId, symbol, currentPrice, sellQty).catch(() => {});
 
     pendingUndo.set(symbol, { action: 'sell', qty: sellQty, price: currentPrice, exchange: 'kraken', timestamp: Date.now() });
     setTimeout(() => pendingUndo.delete(symbol), 2 * 60 * 1000);
@@ -6753,11 +6789,12 @@ async function checkAutoTradeRules(priceMap) {
 
           await db.execute('UPDATE auto_trade_rules SET last_triggered = NOW() WHERE id = ?', [rule.id]);
 
-          await db.execute(
+          const [autoRuleIns] = await db.execute(
             'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
             [coinBase, rule.order_type, currentPrice, resolvedVolume, currentPrice * resolvedVolume,
              `Auto-executed: ${rule.rule_type} rule triggered at $${currentPrice}${rule.volume_type === 'pct' ? ` (${rule.volume}% of position)` : ''} via ${exchange}`, 'neutral', 'auto_rule']
           );
+          if (rule.order_type === 'sell' && autoRuleIns && autoRuleIns.insertId) await recordRealisedPnl(autoRuleIns.insertId, rule.symbol, currentPrice, resolvedVolume).catch(() => {});
 
           // Fetch USDT sweep config for notification
           let sweepEnabled = false;
@@ -12174,10 +12211,11 @@ app.post('/telegram-webhook', async (req, res) => {
             const kQtyForJournal = parseFloat(t.volume) || (t.valueUSD && t.price ? t.valueUSD / t.price : 0);
             const kValueUSD = t.valueUSD ? parseFloat(t.valueUSD) : (t.price * kQtyForJournal);
             const kReasoning = 'Kraken trade approved via Telegram' + (t.qtyEstimated ? ' [qty estimated from value_usd]' : '');
-            await db.execute(
+            const [kJrnIns] = await db.execute(
               'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
               [coinBase, t.side, t.price, kQtyForJournal, kValueUSD, kReasoning, 'confident', krakenSource]
-            ).catch(e => console.error('[kraken] Journal insert failed:', e.message));
+            ).catch(e => { console.error('[kraken] Journal insert failed:', e.message); return [{}]; });
+            if (t.side === 'sell' && kJrnIns && kJrnIns.insertId) await recordRealisedPnl(kJrnIns.insertId, t.symbol, t.price, kQtyForJournal).catch(() => {});
 
             // Tranche tracking
             if (t.side.toLowerCase() === 'buy') {
@@ -12225,10 +12263,11 @@ app.post('/telegram-webhook', async (req, res) => {
             const reasoning = t.qtyEstimated ? baseReasoning + ' [qty estimated from value_usd]' : baseReasoning;
 
             const revolutSource = t.source === 'claude_mcp' ? 'claude_mcp' : 'manual';
-            await db.execute(
+            const [rJrnIns] = await db.execute(
               'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
               [coinBase, t.side, executedPrice, qtyForJournal, valueUSD, reasoning, 'confident', revolutSource]
-            ).catch(e => console.error('[revolut] Journal insert failed:', e.message));
+            ).catch(e => { console.error('[revolut] Journal insert failed:', e.message); return [{}]; });
+            if (t.side === 'sell' && rJrnIns && rJrnIns.insertId) await recordRealisedPnl(rJrnIns.insertId, t.symbol, executedPrice, qtyForJournal).catch(() => {});
 
             if (matchedIntention) {
               await db.execute('UPDATE trade_intentions SET matched_at = NOW() WHERE id = ?', [matchedIntention.id]).catch(() => {});
