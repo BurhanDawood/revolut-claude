@@ -2840,13 +2840,62 @@ async function runReconciliation() {
 }
 
 // #47 Phase B1 (hash47b): fill-detection poller - DETECTION ONLY, no side-effects.
+// #47 B2a: run the post-trade pipeline ONCE on a confirmed full fill of a resting limit order, using the EXACT
+// filled_quantity + average_fill_price from the venue. Mirrors the manual-approval pipeline. Returns the journal id.
+async function runLimitFillPipeline(order, filledQty, avgPrice) {
+  try {
+    const symbol = order.symbol;
+    const coinBase = symbol.replace('-USD', '');
+    const side = String(order.side).toLowerCase();
+    const qty = parseFloat(filledQty);
+    const price = (parseFloat(avgPrice) > 0) ? parseFloat(avgPrice) : parseFloat(order.limit_price);
+    if (!(qty > 0) || !(price > 0)) { console.error('[orders] B2a pipeline bad qty/price', order.order_id, qty, price); return null; }
+    const valueUSD = qty * price;
+    const matchedIntention = await findMatchingIntention(symbol, side).catch(() => null);
+    const reasoning = matchedIntention ? matchedIntention.reasoning : 'Revolut X limit order filled';
+    const [jr] = await db.execute(
+      'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      [coinBase, side, price, qty, valueUSD, reasoning, 'confident', 'limit_fill']
+    );
+    const journalId = (jr && jr.insertId) ? jr.insertId : null;
+    if (matchedIntention) {
+      await db.execute('UPDATE trade_intentions SET matched_at = NOW(), matched_journal_id = ? WHERE id = ?', [journalId, matchedIntention.id]).catch(() => {});
+    }
+    if (side === 'buy') {
+      const prevQty = previousBalances.get(symbol) || 0;
+      const existingEntry = entryPrices.get(symbol);
+      const isCycleBuyback = prevQty === 0 && existingEntry != null;
+      if (existingEntry && prevQty > 0) {
+        const newAvgEntry = ((prevQty * existingEntry) + (qty * price)) / (prevQty + qty);
+        await updateEntryPrice(symbol, newAvgEntry, false).catch(() => {});
+      } else if (isCycleBuyback) {
+        await updateEntryPrice(symbol, price, true).catch(() => {});
+      } else if (!existingEntry) {
+        await updateEntryPrice(symbol, price, false).catch(() => {});
+      }
+      await db.execute(
+        "INSERT INTO position_tranches (symbol, exchange, quantity, entry_price, entry_date, remaining_quantity, is_legacy, notes) VALUES (?, 'revolut', ?, ?, NOW(), ?, 0, ?)",
+        [coinBase, qty, price, qty, 'Limit fill - order ' + order.order_id]
+      ).catch(e => console.error('[tranches] B2a insert failed:', e.message));
+    } else if (side === 'sell') {
+      await reduceTranches(coinBase, 'revolut', qty).catch(e => console.error('[tranches] B2a reduce failed:', e.message));
+    }
+    await sendTelegram((side === 'sell' ? '✅' : '🟢') + ' LIMIT FILLED — ' + side.toUpperCase() + ' ' + formatTradeQty(qty) + ' ' + coinBase + ' @ ' + formatPrice(price) + ' = $' + valueUSD.toFixed(2) + ' 🔄').catch(() => {});
+    if (side === 'sell') { await sweepToUSDT(valueUSD, symbol).catch(() => {}); }
+    return journalId;
+  } catch (e) {
+    console.error('[orders] runLimitFillPipeline error for ' + order.order_id + ': ' + e.message);
+    return null;
+  }
+}
+
 // Reads open pending_orders, calls GET /orders/{id}, updates status/filled_quantity/avg_fill_price + last_checked.
 // The post-trade pipeline relocation (reduceTranches / journal-enrich / entry-price / USDT sweep / confirmation)
 // is Phase B2 and is intentionally NOT wired here. This pass only OBSERVES fills.
 async function pollPendingOrders() {
   try {
     const [rows] = await db.execute(
-      "SELECT order_id, symbol, side, order_type, quantity, limit_price, status, filled_quantity FROM pending_orders WHERE status NOT IN ('filled','cancelled','rejected','replaced') LIMIT 50"
+      "SELECT order_id, symbol, side, order_type, quantity, limit_price, status, filled_quantity, linked_journal_id FROM pending_orders WHERE status NOT IN ('filled','cancelled','rejected','replaced') LIMIT 50"
     );
     if (!rows || rows.length === 0) return;
     for (const o of rows) {
@@ -2873,7 +2922,17 @@ async function pollPendingOrders() {
         // Real Revolut X order states: pending_new | new | partially_filled | filled | cancelled | rejected | replaced.
         const terminal = ['filled','cancelled','rejected','replaced'];
         if (String(newStatus) === 'partially_filled' || terminal.indexOf(String(newStatus)) !== -1) {
-          console.log('[orders] order ' + o.order_id + ' ' + o.side + ' ' + o.symbol + ' -> ' + newStatus + ' (filled ' + (filledQty != null ? filledQty : '?') + '/' + o.quantity + ', leaves ' + (leavesQty != null ? leavesQty : '?') + ') [B1 detection-only; pipeline NOT run]');
+          console.log('[orders] order ' + o.order_id + ' ' + o.side + ' ' + o.symbol + ' -> ' + newStatus + ' (filled ' + (filledQty != null ? filledQty : '?') + '/' + o.quantity + ', leaves ' + (leavesQty != null ? leavesQty : '?') + ')');
+        }
+        // #47 B2a: on the first FULL fill of a resting LIMIT order, run the post-trade pipeline ONCE (idempotent via linked_journal_id).
+        if (String(newStatus) === 'filled' && String(o.order_type).toLowerCase() === 'limit' && o.linked_journal_id == null) {
+          const fq47 = (filledQty != null && parseFloat(filledQty) > 0) ? parseFloat(filledQty) : parseFloat(o.quantity);
+          const ap47 = (avgPrice != null && parseFloat(avgPrice) > 0) ? parseFloat(avgPrice) : parseFloat(o.limit_price);
+          const jid47 = await runLimitFillPipeline(o, fq47, ap47);
+          if (jid47 != null) {
+            await db.execute('UPDATE pending_orders SET linked_journal_id = ? WHERE order_id = ?', [jid47, o.order_id]);
+            console.log('[orders] B2a fill pipeline ran for ' + o.order_id + ' -> journal ' + jid47);
+          }
         }
       } catch (inner) {
         console.error('[orders] poll error for ' + o.order_id + ': ' + inner.message);
@@ -4462,6 +4521,18 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
       console.log(`Trade detection debounced for ${symbol} (within 10 min window)`);
       return;
     }
+
+    // ── #47 B2a: limit orders are poller-managed — suppress balance-detector noise (reservation on place, the fill, cancel-release) for any symbol with a resting or recently-polled limit order.
+    try {
+      const [po47] = await db.execute(
+        "SELECT order_id, status FROM pending_orders WHERE symbol IN (?, ?) AND order_type = 'limit' AND (status IN ('pending_new','new','partially_filled') OR last_checked > DATE_SUB(NOW(), INTERVAL 15 MINUTE)) ORDER BY created_at DESC LIMIT 1",
+        [symbol, coinBase]
+      );
+      if (po47.length > 0) {
+        console.log('[autoLog] ' + coinBase + ' — suppressed: limit order ' + po47[0].order_id + ' (status ' + po47[0].status + ') is poller-managed (#47 B2a)');
+        return;
+      }
+    } catch (e) { console.error('[autoLog] B2a pending_orders check error:', e.message); }
 
     // ── Deduplication: three-stage check before logging ──────────────────────
 
@@ -12137,6 +12208,11 @@ app.post('/telegram-webhook', async (req, res) => {
         (async () => {
           try {
             const result = await placeRevolutOrder(t.symbol, t.side, t.orderType, t.baseSize, t.price, t.valueUsd);
+            // #47 B2a: a LIMIT order rests — skip the placement pipeline; pollPendingOrders() runs journal/tranche/entry/sweep on the confirmed FILL.
+            if (String(t.orderType).toLowerCase() === 'limit') {
+              await sendTelegram('📌 LIMIT ' + t.side.toUpperCase() + ' ' + formatTradeQty(t.baseSize) + ' ' + t.symbol.replace('-USD','') + ' resting @ ' + formatPrice(t.price) + ' — will log on fill.').catch(() => {});
+              return;
+            }
             const coinBase = t.symbol.replace('-USD', '');
             const executedPrice = t.price || await getCurrentPrice(t.symbol).catch(() => 0) || 0;
             // Prefer explicit value_usd for value; derive quantity from it when baseSize was estimated
