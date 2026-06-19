@@ -2890,19 +2890,22 @@ async function getLifetimeLedger() {
       "AND symbol NOT IN ('USDT','USD','USDT-USD','USD-USD') " +
       "GROUP BY UPPER(REPLACE(symbol, '-USD', ''))"
     );
-    const [openRows] = await db.execute(
-      "SELECT symbol, SUM(remaining_quantity) AS qty FROM position_tranches WHERE is_legacy = 0 GROUP BY symbol HAVING SUM(remaining_quantity) > 0"
-    );
-    const openMap = {};
-    for (const o of openRows) openMap[String(o.symbol).replace('-USD','').toUpperCase()] = parseFloat(o.qty || 0);
+    // Entry prices for ALL coins (incl. exited) for display, keyed base
     const [entryRows] = await db.execute('SELECT symbol, entry_price FROM entry_prices');
     const entryMap = {};
     for (const er of entryRows) entryMap[String(er.symbol).replace('-USD','').toUpperCase()] = parseFloat(er.entry_price || 0);
-    const [priceRows] = await db.execute(
-      "SELECT pi.symbol, pi.price FROM price_intraday pi INNER JOIN (SELECT symbol, MAX(recorded_at) AS latest FROM price_intraday GROUP BY symbol) m ON pi.symbol = m.symbol AND pi.recorded_at = m.latest"
-    );
-    const priceMap = {};
-    for (const pr of priceRows) priceMap[String(pr.symbol).replace('-USD','').toUpperCase()] = parseFloat(pr.price || 0);
+    // Open positions + live price from LIVE balances (#71 available+reserved) + /tickers — authoritative
+    // held-set; covers legacy/untracked bags so CC (anchor) is no longer mis-read as exited. #8 B1.1
+    const openMap = {}, priceMap = {};
+    try {
+      const { positions } = await buildPositions();
+      for (const p of positions) {
+        const b = String(p.coin).toUpperCase();
+        openMap[b] = parseFloat(p.available || 0);
+        if (p.price != null) priceMap[b] = parseFloat(p.price);
+        if (p.entryPrice != null) entryMap[b] = parseFloat(p.entryPrice);
+      }
+    } catch (e) { console.error('[ledger] buildPositions failed, open side limited:', e.message); }
 
     const jmap = {};
     const bases = new Set();
@@ -2949,7 +2952,7 @@ async function getLifetimeLedger() {
     const totalMissing = assets.reduce((s, a) => s + a.sells_missing_realized, 0);
     return {
       generated_at: new Date().toISOString(),
-      price_source: 'price_intraday (<=2min stale)',
+      price_source: 'live Revolut /balances + /tickers (#71 available+reserved); Kraken/Tangem holdings not yet valued in unrealized',
       asset_count: assets.length,
       portfolio_realized_pnl_usd: Number(pRealized.toFixed(2)),
       portfolio_unrealized_pnl_usd: Number(pUnrealized.toFixed(2)),
