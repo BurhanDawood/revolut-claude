@@ -140,8 +140,10 @@ async function placeRevolutOrder(symbol, side, orderType, baseSize, price = null
   // Captures venue order id + initial status so the Phase B fill-confirmation loop can later
   // run side-effects on confirmed fill (via GET /orders/{id}, confirmed to exist) instead of at placement.
   try {
-    const oid = result && (result.id || result.order_id) ? (result.id || result.order_id) : clientOrderId;
-    const initStatus = (result && result.status) ? result.status : (orderType === 'limit' ? 'pending_new' : 'filled');
+    // #47 B1.5: place-order response is { data: { venue_order_id, client_order_id, state } } (docs-confirmed).
+    const od = (result && result.data) ? result.data : (result || {});
+    const oid = od.venue_order_id || od.id || od.order_id || clientOrderId;
+    const initStatus = od.state || od.status || (orderType === 'limit' ? 'pending_new' : 'filled');
     await db.execute(
       'INSERT INTO pending_orders (order_id, client_order_id, symbol, side, order_type, quantity, limit_price, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE status = VALUES(status)',
       [String(oid), clientOrderId, revolutSymbol, side.toUpperCase(), orderType, (baseSize != null ? baseSize : null), (price != null ? price : null), initStatus]
@@ -2844,33 +2846,34 @@ async function runReconciliation() {
 async function pollPendingOrders() {
   try {
     const [rows] = await db.execute(
-      "SELECT order_id, symbol, side, order_type, quantity, limit_price, status, filled_quantity FROM pending_orders WHERE status NOT IN ('filled','cancelled','rejected','expired') LIMIT 50"
+      "SELECT order_id, symbol, side, order_type, quantity, limit_price, status, filled_quantity FROM pending_orders WHERE status NOT IN ('filled','cancelled','rejected','replaced') LIMIT 50"
     );
     if (!rows || rows.length === 0) return;
     for (const o of rows) {
       try {
-        const resp = await revolutRequest('GET', '/orders/' + o.order_id);
-        // First-fill visibility: log the full raw response so Phase B2 can pin exact field names.
-        console.log('[orders] poll ' + o.order_id + ' (' + o.symbol + ') raw: ' + JSON.stringify(resp));
-        if (!resp || resp.message || resp.error || resp.errors) {
+        const respRaw = await revolutRequest('GET', '/orders/' + o.order_id);
+        // First-fill visibility: log the full raw response.
+        console.log('[orders] poll ' + o.order_id + ' (' + o.symbol + ') raw: ' + JSON.stringify(respRaw));
+        if (!respRaw || respRaw.message || respRaw.error || respRaw.errors) {
           await db.execute('UPDATE pending_orders SET last_checked = NOW() WHERE order_id = ?', [o.order_id]);
           continue;
         }
-        // Defensive field parsing - exact names confirmed on first live fill via the raw log above.
-        const newStatus = resp.state || resp.status || o.status;
+        // #47 B1.5: GET /orders/{id} returns { data: { id, status, filled_quantity, average_fill_price, leaves_quantity, ... } } (docs-confirmed).
+        const resp = (respRaw && respRaw.data) ? respRaw.data : respRaw;
+        const newStatus = resp.status || resp.state || o.status;
         const filledQty = (resp.filled_quantity != null ? resp.filled_quantity
-                          : (resp.filledQuantity != null ? resp.filledQuantity
-                          : (resp.filled_qty != null ? resp.filled_qty : null)));
-        const avgPrice = (resp.average_price != null ? resp.average_price
-                         : (resp.avg_price != null ? resp.avg_price
-                         : (resp.average_fill_price != null ? resp.average_fill_price : null)));
+                          : (resp.filledQuantity != null ? resp.filledQuantity : null));
+        const avgPrice = (resp.average_fill_price != null ? resp.average_fill_price
+                         : (resp.average_price != null ? resp.average_price : null));
+        const leavesQty = (resp.leaves_quantity != null ? resp.leaves_quantity : null);
         await db.execute(
           'UPDATE pending_orders SET status = ?, filled_quantity = ?, avg_fill_price = ?, last_checked = NOW() WHERE order_id = ?',
           [String(newStatus), (filledQty != null ? filledQty : 0), (avgPrice != null ? avgPrice : null), o.order_id]
         );
-        const terminal = ['filled','cancelled','rejected','expired'];
-        if (terminal.indexOf(String(newStatus)) !== -1) {
-          console.log('[orders] order ' + o.order_id + ' ' + o.side + ' ' + o.symbol + ' -> ' + newStatus + ' (filled ' + (filledQty != null ? filledQty : '?') + ') [B1 detection-only; pipeline NOT run]');
+        // Real Revolut X order states: pending_new | new | partially_filled | filled | cancelled | rejected | replaced.
+        const terminal = ['filled','cancelled','rejected','replaced'];
+        if (String(newStatus) === 'partially_filled' || terminal.indexOf(String(newStatus)) !== -1) {
+          console.log('[orders] order ' + o.order_id + ' ' + o.side + ' ' + o.symbol + ' -> ' + newStatus + ' (filled ' + (filledQty != null ? filledQty : '?') + '/' + o.quantity + ', leaves ' + (leavesQty != null ? leavesQty : '?') + ') [B1 detection-only; pipeline NOT run]');
         }
       } catch (inner) {
         console.error('[orders] poll error for ' + o.order_id + ': ' + inner.message);
