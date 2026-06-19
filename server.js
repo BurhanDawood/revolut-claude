@@ -135,6 +135,18 @@ async function placeRevolutOrder(symbol, side, orderType, baseSize, price = null
   if (result.message || result.error || result.errors) {
     throw new Error(result.message || JSON.stringify(result.error || result.errors));
   }
+  // hash47a Phase A - record every order placed (additive; no pipeline change).
+  // Captures venue order id + initial status so the Phase B fill-confirmation loop can later
+  // run side-effects on confirmed fill (via GET /orders/{id}, confirmed to exist) instead of at placement.
+  try {
+    const oid = result && (result.id || result.order_id) ? (result.id || result.order_id) : clientOrderId;
+    const initStatus = (result && result.status) ? result.status : (orderType === 'limit' ? 'pending_new' : 'filled');
+    await db.execute(
+      'INSERT INTO pending_orders (order_id, client_order_id, symbol, side, order_type, quantity, limit_price, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE status = VALUES(status)',
+      [String(oid), clientOrderId, revolutSymbol, side.toUpperCase(), orderType, (baseSize != null ? baseSize : null), (price != null ? price : null), initStatus]
+    );
+    if (orderType === 'limit') console.log('[orders] Recorded resting LIMIT order ' + oid + ' ' + side + ' ' + revolutSymbol + ' @ ' + price + ' (status ' + initStatus + ')');
+  } catch (e) { console.error('[orders] pending_orders capture failed:', e.message); }
   return { ...result, client_order_id: clientOrderId };
 }
 
@@ -902,6 +914,22 @@ await db.execute(`CREATE TABLE IF NOT EXISTS reconciliation_log (
   drift_type VARCHAR(40),
   acknowledged TINYINT(1) DEFAULT 0
 )`);
+
+    await db.execute(`CREATE TABLE IF NOT EXISTS pending_orders (
+      order_id VARCHAR(64) PRIMARY KEY,
+      client_order_id VARCHAR(64),
+      symbol VARCHAR(20) NOT NULL,
+      side VARCHAR(10) NOT NULL,
+      order_type VARCHAR(20),
+      quantity DECIMAL(24,10),
+      limit_price DECIMAL(24,10),
+      status VARCHAR(20) DEFAULT 'pending_new',
+      filled_quantity DECIMAL(24,10) DEFAULT 0,
+      avg_fill_price DECIMAL(24,10),
+      linked_journal_id INT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      last_checked TIMESTAMP NULL
+    )`);
 
 await db.execute(`CREATE TABLE IF NOT EXISTS tax_lots (
   id INT AUTO_INCREMENT PRIMARY KEY,
