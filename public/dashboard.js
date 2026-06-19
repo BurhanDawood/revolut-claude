@@ -443,9 +443,19 @@ function loadAlerts() {
     var alerts = (data && data.activeAlerts) || [];
     if (!alerts.length) { el.innerHTML = '<div class="empty-state">None</div>'; return; }
     var html = '';
+    function fp(v) { if (v == null) return ''; v = +v; return '$' + (v < 1 ? v.toFixed(6) : v.toFixed(4)); }
     alerts.forEach(function(a) {
-      html += '<div class="alert-row"><span class="alert-symbol">' + (a.symbol || '?') + '</span>'
-        + '<span style="color:#888;font-size:0.8rem">' + (a.type || '') + '</span></div>';
+      var sym = (a.symbol || '?').replace('-USD', '');
+      var isTrail = a.type === 'trailing';
+      var arrow = isTrail ? '\u25C6' : (a.direction === 'down' ? '\u25BC' : '\u25B2');
+      var color = isTrail ? '#ff8800' : (a.direction === 'down' ? '#ff5555' : '#33cc66');
+      var detail = isTrail
+        ? ('trail' + (a.trail_pct != null ? ' ' + a.trail_pct + '%' : '') + (a.stop != null ? ' \u2192 ' + fp(a.stop) : ''))
+        : fp(a.target);
+      if (a.firing) detail += ' \u26A1';
+      html += '<div class="alert-row"><span class="alert-symbol">'
+        + '<span style="color:' + color + '">' + arrow + '</span> ' + sym + '</span>'
+        + '<span style="color:#888;font-size:0.8rem">' + detail + '</span></div>';
     });
     el.innerHTML = html;
   });

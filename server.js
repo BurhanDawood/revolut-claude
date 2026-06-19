@@ -8274,9 +8274,17 @@ app.get('/api/health', (req, res) => {
 
 // GET /api/status — monitoring status, active alerts, baseline prices
 app.get('/api/status', (req, res) => {
-  const alerts = {};
-  for (const symbol of alertState.active.keys()) {
-    alerts[symbol] = { alerting: true };
+  // #112 Fix #3 / #75: emit a real ARRAY of configured alerts (with direction) so the dashboard can render up/down arrows.
+  const alerts = [];
+  for (const [sym, arr] of priceTargets.entries()) {
+    const rungs = Array.isArray(arr) ? arr : [arr];
+    for (const t of rungs) {
+      const dir = t.direction || ((t.targetPrice != null && t.anchorPrice != null && t.targetPrice < t.anchorPrice) ? 'down' : 'up');
+      alerts.push({ symbol: sym, type: 'target', direction: dir, target: (t.targetPrice != null ? t.targetPrice : null), anchor: (t.anchorPrice != null ? t.anchorPrice : null), firing: alertState.active.has(sym) });
+    }
+  }
+  for (const [sym, ts] of trailingStops.entries()) {
+    alerts.push({ symbol: sym, type: 'trailing', direction: 'down', trail_pct: (ts.trailPct != null ? ts.trailPct : null), stop: (ts.stopPrice != null ? ts.stopPrice : null), firing: alertState.active.has(sym) });
   }
   res.json({
     paused: monitoringPaused,
