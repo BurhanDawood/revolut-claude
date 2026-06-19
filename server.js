@@ -7541,9 +7541,13 @@ async function checkPortfolio() {
         const priceStr = formatPrice(currentPrice).replace('$', '');
         const anchorStr = formatPrice(target.anchorPrice).replace('$', '');
         const entryPrice = entryPrices.get(symbol) || target.entryPrice;
-        const entryLine = entryPrice && !isDustCoin
+        // #3: suppress stale Entry/P&L when position is exited (qty 0). available+reserved per #71;
+        // Kraken-monitored coins are not in Revolut balances, so do not infer exited for them.
+        const ftHeldQtyUp = assetBalance ? parseFloat(assetBalance.available || 0) + parseFloat(assetBalance.reserved || 0) : 0;
+        const ftExitedUp = ftHeldQtyUp <= 0 && !KRAKEN_MONITORED_COINS.includes(symbol);
+        const entryLine = (entryPrice && !isDustCoin && !ftExitedUp)
           ? `\nEntry: ${formatPrice(entryPrice)} | P&L: +${((currentPrice - entryPrice) / entryPrice * 100).toFixed(1)}%`
-          : '';
+          : (ftExitedUp ? `\n(No current position - watch alert)` : '');
 
         let alertMessage;
         // Check if this was auto-set from a Claude sell recommendation
@@ -7657,6 +7661,11 @@ async function checkPortfolio() {
 
         const entryPrice = entryPrices.get(symbol) || target.entryPrice;
         const plPct = entryPrice ? ((currentPrice - entryPrice) / entryPrice * 100).toFixed(1) : null;
+        // #3: detect exited position (qty 0) to suppress stale Entry/P&L. available+reserved per #71;
+        // Kraken-monitored coins are not in Revolut balances, so do not infer exited for them.
+        const dnHeldBal = balances.find(a => a.currency === coinBase);
+        const dnHeldQty = dnHeldBal ? parseFloat(dnHeldBal.available || 0) + parseFloat(dnHeldBal.reserved || 0) : 0;
+        const dnExited = dnHeldQty <= 0 && !KRAKEN_MONITORED_COINS.includes(symbol);
         const replyMenu = `\n\n1️⃣ Buy more  2️⃣ Hold  3️⃣ Sell  4️⃣ Acknowledge ⚠️ mutes coin 24h\n💬 Reply number or '<b>${coinBase.toLowerCase()} 1</b>' to target this coin`;
 
         let alertMessage;
@@ -7683,7 +7692,9 @@ async function checkPortfolio() {
         } else {
           // FIX 7: pass reason for cost logging
           const aiRec = await getQuickAiRecommendation(symbol, changePct, currentPrice, 'down', 'fixed floor hit');
-          const entryLine = plPct !== null ? `\nEntry: ${formatPrice(entryPrice)} | P&L: ${plPct}%` : '';
+          const entryLine = (plPct !== null && !dnExited)
+            ? `\nEntry: ${formatPrice(entryPrice)} | P&L: ${plPct}%`
+            : (dnExited ? `\n(No current position - watch alert)` : '');
           const autoReady = await getAutomationReadiness(symbol, 'sell');
           const autoLine = autoReady ? `\n\n⚡ AUTO-READY: This setup has worked ${autoReady.winRate}% of the time (${autoReady.sampleSize} trades). Could be automated.` : '';
           alertMessage = `📉 <b>${symbol} FIXED FLOOR HIT!</b>\n\nAnchor: ${formatPrice(target.anchorPrice)} → Now ${formatPrice(currentPrice)} (${changePct.toFixed(1)}%)${entryLine}${dnDescLine}${dnWickLine}\n\n⚡ RECOMMENDATION: ${aiRec}${replyMenu}${autoLine}`;
