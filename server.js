@@ -2906,6 +2906,33 @@ async function getLifetimeLedger() {
         if (p.entryPrice != null) entryMap[b] = parseFloat(p.entryPrice);
       }
     } catch (e) { console.error('[ledger] buildPositions failed, open side limited:', e.message); }
+    // Merge Kraken holdings (GHIBLI/ZK/XPL/TAO etc.) into the open side. #8 B1.2
+    try {
+      const kr = await getKrakenBalances();
+      for (const b of (kr.balances || [])) {
+        const base = String(b.standard || String(b.symbol || '').replace('-USD','')).toUpperCase();
+        const q = parseFloat(b.quantity || 0);
+        if (!base || !(q > 0)) continue;
+        const prevQ = openMap[base] || 0;
+        const kEntry = (b.entryPrice != null) ? parseFloat(b.entryPrice) : null;
+        if (prevQ > 0 && entryMap[base] > 0 && kEntry > 0) entryMap[base] = ((prevQ * entryMap[base]) + (q * kEntry)) / (prevQ + q);
+        else if (kEntry > 0 && !(entryMap[base] > 0)) entryMap[base] = kEntry;
+        openMap[base] = prevQ + q;
+        if (priceMap[base] == null && b.price != null) priceMap[base] = parseFloat(b.price);
+      }
+    } catch (e) { console.error('[ledger] kraken merge failed:', e.message); }
+    // Merge Tangem XRP cold storage (dual-held with Revolut XRP -> qty-weighted blended entry, #14). #8 B1.2
+    try {
+      const xrpQty = await getTangemXRPBalance();
+      if (xrpQty && xrpQty > 0) {
+        const base = 'XRP';
+        const prevQ = openMap[base] || 0;
+        if (prevQ > 0 && entryMap[base] > 0) entryMap[base] = ((prevQ * entryMap[base]) + (xrpQty * TANGEM_XRP_ENTRY)) / (prevQ + xrpQty);
+        else entryMap[base] = TANGEM_XRP_ENTRY;
+        openMap[base] = prevQ + xrpQty;
+        if (priceMap[base] == null) { const xp = await getCurrentPrice('XRP-USD').catch(() => null); if (xp) priceMap[base] = parseFloat(xp); }
+      }
+    } catch (e) { console.error('[ledger] tangem merge failed:', e.message); }
 
     const jmap = {};
     const bases = new Set();
@@ -2952,7 +2979,7 @@ async function getLifetimeLedger() {
     const totalMissing = assets.reduce((s, a) => s + a.sells_missing_realized, 0);
     return {
       generated_at: new Date().toISOString(),
-      price_source: 'live Revolut /balances + /tickers (#71 available+reserved); Kraken/Tangem holdings not yet valued in unrealized',
+      price_source: 'live Revolut /balances + /tickers + Kraken balances + Tangem XRP cold storage (#71 available+reserved, #14 blended entry)',
       asset_count: assets.length,
       portfolio_realized_pnl_usd: Number(pRealized.toFixed(2)),
       portfolio_unrealized_pnl_usd: Number(pUnrealized.toFixed(2)),
