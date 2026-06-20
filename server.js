@@ -6169,27 +6169,49 @@ async function analyseTrailingStopAlert(symbol, currentPrice, peakPrice, trailPc
 
     const prefsContext = traderPrefs.map(p => `${p.preference_key}: ${p.preference_value}`).join('\n');
 
-    const staticSystemPrompt =
+    // #87 — plan-aware: load coin's saved plan + role (mirrors A3 fixed-target path)
+    const { role: tsRole } = await getCoinContext(coinBase);
+    let tsPlanContext = 'No saved plan exists for this coin.';
+    let tsPlanRoleLine = '';
+    try {
+      const [tsCsRows] = await db.execute('SELECT status, role, theme, strategy_md FROM coin_strategy WHERE symbol = ? LIMIT 1', [coinBase]);
+      if (tsCsRows.length) {
+        const cs = tsCsRows[0];
+        const md = (cs.strategy_md || '').length > 1200 ? cs.strategy_md.slice(0, 1200) + '\u2026' : (cs.strategy_md || '');
+        tsPlanContext = `Status: ${cs.status || 'n/a'} | Role: ${cs.role || 'n/a'} | Theme: ${cs.theme || 'n/a'}\nStrategy notes:\n${md || 'none'}`;
+        tsPlanRoleLine = `${cs.role || ''}`.toLowerCase();
+      }
+    } catch (e) { console.error('[analysis] trailing-stop coin_strategy read failed:', e.message); }
+    // Role gate: hodl/anchor/increase coins — no SELL rec even on a trail breach (#87)
+    const tsNoSell = /increase|accumulat|hodl|anchor|dead|radar/.test(tsPlanRoleLine) || tsRole === 'hodl' || tsRole === 'manual_only';
+
+    const tsRecMenu = tsNoSell ? '[HOLD / RESET STOP]' : '[SELL 25% / HOLD / RESET STOP / BUY MORE / SELL ALL]';
+    const tsRoleGuardrail = tsNoSell
+      ? 'This coin is in a HODL/ANCHOR posture — NEVER recommend SELL or SELL ALL. Only valid options are HOLD (wait for recovery) or RESET STOP (if the dip looks like noise and the trend is intact).'
+      : 'Honour the saved plan: if the plan names a stop level or exit strategy, reference it. Default to HOLD if the drop looks like noise rather than a genuine MSS.';
+
+    const tsSystemPrompt =
 `You are a disciplined swing trader's AI assistant, analysing trailing stop alerts.
 
-## TRADING STRATEGY (STATIC)
+## DECISION RULES (in priority order)
+1. The SAVED PLAN for this coin (provided in the user message) is the PRIMARY authority.
+2. ${tsRoleGuardrail}
+3. Is this a genuine Market Structure Shift or normal consolidation/pullback?
+4. What does the drop size tell you — panic selling or healthy retracement?
+5. NEVER invent project fundamentals, catalysts, or price levels not in the saved plan or trade history.
+
+## TRADING STRATEGY (FALLBACK — only when no saved plan exists)
 Strategy: Extreme move swing trader — buys dips, sells pumps on macro moves
 Principles: Trend is friend, trailing stops protect gains, ladder out on MSS, never sell 100%
 MSS definition: Price breaks previous Higher Low after failing to make new Higher High
 Moon bag rule: Always keep 25% of position — never sell everything
 
-## YOUR ANALYSIS TASK
-1. Is this a genuine Market Structure Shift or normal consolidation/pullback?
-2. Does the trade history suggest this coin is in a profitable trend worth holding?
-3. What does the drop size tell you — panic selling or healthy retracement?
-4. Considering the active auto rules, what manual action if any is needed?
-
 Respond in exactly this format:
-RECOMMENDATION: [SELL 25% / HOLD / RESET STOP / BUY MORE / SELL ALL]
-REASON: [one clear sentence referencing the trade history]
+RECOMMENDATION: ${tsRecMenu}
+REASON: [one clear sentence referencing the saved plan or trade history]
 WATCH: [$price — what to monitor next]
 CONFIDENCE: [High/Medium/Low]
-CONTEXT: [one sentence on what the journal history tells you]`;
+CONTEXT: [one sentence on what the saved plan or journal history tells you]`;
 
     const dynamicUserMessage =
 `## TRADER PROFILE (from DB)
@@ -6209,7 +6231,10 @@ P&L from entry: ${plPct !== null ? (plPct > 0 ? '+' : '') + plPct.toFixed(1) + '
 ${journalContext}
 
 ## ACTIVE AUTO RULES FOR ${coinBase}
-${rulesContext}`;
+${rulesContext}
+
+## SAVED PLAN FOR ${coinBase}
+${tsPlanContext}`;
 
     console.log(`[analysis] Calling Claude API (30s timeout)...`);
 
@@ -6217,7 +6242,7 @@ ${rulesContext}`;
     const claudeCall = anthropic.messages.create({
       model: 'claude-sonnet-4-6',
       max_tokens: 400,
-      system: [{ type: 'text', text: staticSystemPrompt, cache_control: { type: 'ephemeral' } }],
+      system: [{ type: 'text', text: tsSystemPrompt, cache_control: { type: 'ephemeral' } }],
       messages: [{ role: 'user', content: dynamicUserMessage }]
     });
     const timeoutPromise = new Promise((_, reject) =>
