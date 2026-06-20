@@ -3235,7 +3235,14 @@ async function runFastScan() {
       fastScanLastPrice.set(symbol, price);
 
       console.log(`[fast-scan] ${symbol} @ ${fmtPriceShort(price)} — evaluating trailing stop`);
-      await updateTrailingStop(symbol, price);
+      const fsResult = await updateTrailingStop(symbol, price);
+      if (fsResult && fsResult.triggered) {
+        // #94: breach detected on fast scan — fire the same alert path as the 5-min loop.
+        // Exchange routing: KRAKEN_MONITORED_COINS (GHIBLI/ZK/XPL/TAO) → kraken, else revolut.
+        const fsExchange = KRAKEN_MONITORED_COINS.includes(symbol) ? 'kraken' : 'revolut';
+        console.log(`[fast-scan] ${symbol} BREACH — firing handleTrailingStopAlert (${fsExchange})`);
+        await handleTrailingStopAlert(symbol, price, fsResult.ts, fsExchange);
+      }
     }
   } catch (e) {
     console.error('[fast-scan] error:', e.message);
