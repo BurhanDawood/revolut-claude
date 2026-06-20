@@ -80,6 +80,13 @@ async function getCoinContext(coinBase) {
       else if ((ae.manual_only_symbols || []).includes(coinBase)) role = 'manual_only';
     }
   } catch (e) { /* ignore — default role 'normal' */ }
+  // #31 — also check coin_strategy.role for exit-only coins (dead_bag, legacy_exit)
+  if (role === 'normal') {
+    try {
+      const [csR] = await db.execute('SELECT role FROM coin_strategy WHERE symbol = ? LIMIT 1', [coinBase]);
+      if (csR.length && ['dead_bag', 'legacy_exit'].includes(csR[0].role)) role = 'exit';
+    } catch (e) { /* ignore */ }
+  }
   return { narrative, role };
 }
 
@@ -2222,6 +2229,10 @@ async function getQuickAiRecommendation(symbol, changePct, currentPrice, directi
     } else if (role === 'manual_only') {
       roleInstruction = 'This is a manual-decision anchor. DO NOT give a directive BUY or SELL — present it as HOLD/analysis for the user to decide.';
       startInstruction = 'Start with HOLD in bold.';
+    } else if (role === 'exit') {
+      // #31 — dead-bag / legacy-exit: hold for pump, exit on strength, never add on dips
+      roleInstruction = 'This is an EXIT/DEAD-BAG position. Bryan wants to hold for recovery pumps and exit on strength — NOT add on dips. DO NOT recommend buying or adding more.';
+      startInstruction = 'Start with HOLD in bold.';
     } else {
       roleInstruction = '';
       startInstruction = direction === 'down'
@@ -2265,7 +2276,7 @@ async function buildPlanAwareSwingSignal({ coinBase, direction, isDeepLoss, curr
     if (ctx.role === 'hodl') configHodl = true;
     else if (ctx.role === 'manual_only') configManual = true;
   } catch (e) { /* ignore */ }
-  const NO_TRIM_ROLES = ['hodl','anchor','dead_bag','lotto','radar','watch_entry'];
+  const NO_TRIM_ROLES = ['hodl','anchor','dead_bag','legacy_exit','lotto','radar','watch_entry']; // #31
   const md = strategyMd.toLowerCase();
   const planSaysNoTrim = /never sell below|no trim|do not round-trip|ignore daily pump|hold through pumps|never auto-sell|no upside rung/.test(md);
   const isStructuralNoTrim = NO_TRIM_ROLES.includes(role) || configHodl || configManual;
@@ -6183,7 +6194,7 @@ async function analyseTrailingStopAlert(symbol, currentPrice, peakPrice, trailPc
       }
     } catch (e) { console.error('[analysis] trailing-stop coin_strategy read failed:', e.message); }
     // Role gate: hodl/anchor/increase coins — no SELL rec even on a trail breach (#87)
-    const tsNoSell = /increase|accumulat|hodl|anchor|dead|radar/.test(tsPlanRoleLine) || tsRole === 'hodl' || tsRole === 'manual_only';
+    const tsNoSell = /increase|accumulat|hodl|anchor|dead|radar/.test(tsPlanRoleLine) || tsRole === 'hodl' || tsRole === 'manual_only' || tsRole === 'exit'; // #31
 
     const tsRecMenu = tsNoSell ? '[HOLD / RESET STOP]' : '[SELL 25% / HOLD / RESET STOP / BUY MORE / SELL ALL]';
     const tsRoleGuardrail = tsNoSell
@@ -6437,7 +6448,7 @@ async function analyseFixedTargetAlert(symbol, currentPrice, target) {
       }
     } catch (e) { console.error('[analysis] coin_strategy read failed:', e.message); }
     // Role gate: increase/accumulation/hodl/anchor/watch coins must NEVER get a SELL/LADDER rec
-    const noTrimRole = /increase|accumulat|hodl|anchor|watch|dead|radar/.test(planRoleLine) || csRole === 'hodl' || csRole === 'manual_only';
+    const noTrimRole = /increase|accumulat|hodl|anchor|watch|dead|radar/.test(planRoleLine) || csRole === 'hodl' || csRole === 'manual_only' || csRole === 'exit'; // #31
 
     // #36 A3 — the SAVED PLAN is the primary authority; generic swing heuristics are secondary and must never override it
     const recMenu = noTrimRole ? '[HOLD / ADD]' : '[SELL / HOLD / LADDER / ADD]';
@@ -8214,7 +8225,7 @@ async function checkPortfolio() {
           // A2 (dev_log #31): role-aware rec — hodl/manual_only coins are not dip-buy candidates
           const { narrative: dipNarrative, role: dipRole } = await getCoinContext(coinBase);
           let dipRecLine;
-          if (dipRole === 'hodl' || dipRole === 'manual_only') {
+          if (dipRole === 'hodl' || dipRole === 'manual_only' || dipRole === 'exit') { // #31
             dipRecLine =
               `⚡ This is a HOLD position (${dipNarrative || coinBase}). Per your strategy this is NOT a buy-the-dip candidate — it's a hold/exit bag. Watch for strength to trim into, not a dip to add. No action suggested.`;
           } else {
