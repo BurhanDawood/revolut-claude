@@ -12230,6 +12230,18 @@ app.post('/telegram-webhook', async (req, res) => {
           note = `Deposit +$${changeAmt}`;
         } else if (withdrawalMatch) {
           changeAmt = parseFloat(withdrawalMatch[1].replace(/,/g, ''));
+          const [wDupe] = await db.execute(
+            `SELECT id FROM trading_journal
+             WHERE source = 'fiat_withdrawal' AND action = 'payment'
+             AND ABS(quantity - ?) < 0.05
+             AND created_at > DATE_SUB(NOW(), INTERVAL 30 MINUTE)
+             LIMIT 1`,
+            [changeAmt]
+          ).catch(() => [[]]); 
+          if (wDupe.length > 0) {
+            await sendReply(`Already auto-logged $${changeAmt}. Use skip payment ${changeAmt} to reverse.`);
+            return res.status(200).json({ ok: true });
+          }
           newTotal = totalInvestedCapital - changeAmt;
           note = `Withdrawal -$${changeAmt}`;
         } else {
