@@ -12601,8 +12601,35 @@ app.post('/telegram-webhook', async (req, res) => {
         pendingRevolutTrade = null;
         if (pendingRevolutTradeReminder) { clearInterval(pendingRevolutTradeReminder); pendingRevolutTradeReminder = null; }
         await sendReply(`✅ Revolut X trade cancelled — ${t.side.toUpperCase()} ${formatTradeQty(t.baseSize)} ${t.symbol.replace('-USD','')} was not executed.`);
+      } else if (pendingMcpTradeQueue.length > 0) {
+        await sendReply(`ℹ️ No active trade to cancel, but ${pendingMcpTradeQueue.length} trade(s) queued. Reply 'cancel queue' to clear all, or 'approve trade' to process next.`);
       } else {
         await sendReply('ℹ️ No pending trade to cancel.');
+      }
+      return res.status(200).json({ ok: true });
+    }
+
+    // --- Command: cancel queue (clear all MCP-queued trades) ---  #44
+    if (/^cancel\s+queue$/i.test(commandText) || /^cancel\s+all\s+trades?$/i.test(commandText)) {
+      const n = pendingMcpTradeQueue.length;
+      pendingMcpTradeQueue = [];
+      if (n > 0) {
+        await sendReply(`✅ Cleared ${n} queued trade${n > 1 ? 's' : ''} — nothing will execute until new trades are submitted.`);
+      } else {
+        await sendReply('ℹ️ Trade queue is already empty.');
+      }
+      return res.status(200).json({ ok: true });
+    }
+
+    // --- Command: queue status ---  #44
+    if (/^queue\s+(status|count|show)$/i.test(commandText) || commandText === 'show queue') {
+      const n = pendingMcpTradeQueue.length;
+      if (n === 0) {
+        await sendReply('ℹ️ Trade queue is empty.');
+      } else {
+        const lines = pendingMcpTradeQueue.map((t, i) =>
+          `${i+1}. ${t.side.toUpperCase()} ${t.symbol.replace('-USD','')} on ${t._exchange} — $${(t.valueUSD||0).toFixed(2)}`);
+        await sendReply(`📋 ${n} trade${n > 1 ? 's' : ''} queued:\n${lines.join('\n')}\nReply 'approve trade' to process, 'cancel queue' to clear all.`);
       }
       return res.status(200).json({ ok: true });
     }
