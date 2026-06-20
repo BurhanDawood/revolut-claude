@@ -10042,8 +10042,19 @@ function createMcpServer() {
         } else if (awayAction === 'deactivate') {
           am.active = false; am.coins = [];
           reply = 'Away Mode OFF — all coins manual.';
+        } else if (awayAction === 'set_away_buy') {
+          // #125 2c-pre — per-coin away-buy USD size (INERT: no execution path reads this yet)
+          if (!am.away_buy_usd) am.away_buy_usd = {};
+          const buyCoin = awayCoinsIn[0];
+          if (!buyCoin || amount == null || amount <= 0) {
+            reply = `set_away_buy needs away_coins=[COIN] and amount>0. Current: ${Object.keys(am.away_buy_usd).length ? Object.entries(am.away_buy_usd).map(([k,v])=>k+' $'+v).join(', ') : '(none set)'}`;
+          } else {
+            am.away_buy_usd[buyCoin] = amount;
+            reply = `Away-buy size set: ${buyCoin} = $${amount}. (INERT — buys not wired until Phase 2c.) All: ${Object.entries(am.away_buy_usd).map(([k,v])=>k+' $'+v).join(', ')}`;
+          }
         } else {
-          reply = `Away Mode: ${am.active ? 'ACTIVE' : 'OFF'} | eligible: ${am.eligible.join(', ') || '(none)'} | live: ${am.coins.join(', ') || '(none)'} | session $${(am.session_sold_usd||0).toFixed(2)}/$${am.max_session_sell_usd}`;
+          const buyMap = am.away_buy_usd && Object.keys(am.away_buy_usd).length ? Object.entries(am.away_buy_usd).map(([k,v])=>k+' $'+v).join(', ') : '(none)';
+          reply = `Away Mode: ${am.active ? 'ACTIVE' : 'OFF'} | eligible: ${am.eligible.join(', ') || '(none)'} | live: ${am.coins.join(', ') || '(none)'} | session $${(am.session_sold_usd||0).toFixed(2)}/$${am.max_session_sell_usd} | away-buy sizes: ${buyMap}`;
         }
         await db.execute(
           "INSERT INTO system_config (config_key, config_value) VALUES ('away_mode', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)",
