@@ -7417,12 +7417,21 @@ async function checkPortfolio() {
             if (dupe86.length > 0) {
               console.log('[withdrawal] Duplicate/handled cash move — skipping flag');
             } else {
-              console.warn(`[withdrawal] Unexplained USD decrease $${usdDecrease.toFixed(2)} — possible crypto→personal withdrawal (notify-only, no auto-deduct)`);
+              // #63: auto-log fiat withdrawal + decrement capital (mirrors #107 card payment pattern)
+              console.log(`[withdrawal] USD -$${usdDecrease.toFixed(2)} — auto-logging as fiat withdrawal`);
+              await db.execute(
+                `INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+                ['USD', 'payment', 1.00, usdDecrease, usdDecrease,
+                 `Auto-logged fiat withdrawal — $${usdDecrease.toFixed(2)} USD left account`, 'neutral', 'fiat_withdrawal']
+              ).catch(() => {});
+              const prevCapW = totalInvestedCapital;
+              const newCapW  = totalInvestedCapital - usdDecrease;
+              await updateInvestedCapital(newCapW, `Fiat withdrawal auto-logged: -$${usdDecrease.toFixed(2)}`);
               await sendTelegram(
-                `⚠️ <b>USD left the account: $${usdDecrease.toFixed(2)}</b>\n` +
-                `No USDT conversion and no recent buy — looks like a withdrawal to a personal/external account.\n\n` +
-                `If you withdrew it, reply '<b>withdrew ${usdDecrease.toFixed(2)}</b>' to deduct it from invested capital.\n` +
-                `Or reply '<b>skip payment</b>' to dismiss (capital unchanged).`
+                `💸 WITHDRAWAL $${usdDecrease.toFixed(2)} USD\n` +
+                `Capital: $${prevCapW.toFixed(2)} → $${newCapW.toFixed(2)}\n\n` +
+                `Tap '<b>skip payment ${usdDecrease.toFixed(2)}</b>' if not a withdrawal.`
               ).catch(() => {});
             }
           }
@@ -12178,7 +12187,8 @@ app.post('/telegram-webhook', async (req, res) => {
       if (skipAmt !== null && !isNaN(skipAmt)) {
         [rows] = await db.execute(
           `SELECT id, quantity FROM trading_journal
-           WHERE symbol = 'USDT' AND action = 'payment' AND source = 'revolut_card'
+           WHERE symbol IN ('USDT','USD') AND action = 'payment'
+           AND source IN ('revolut_card','fiat_withdrawal')
            AND ABS(quantity - ?) < 0.05
            ORDER BY created_at DESC LIMIT 1`,
           [skipAmt]
@@ -12186,7 +12196,8 @@ app.post('/telegram-webhook', async (req, res) => {
       } else {
         [rows] = await db.execute(
           `SELECT id, quantity FROM trading_journal
-           WHERE symbol = 'USDT' AND action = 'payment' AND source = 'revolut_card'
+           WHERE symbol IN ('USDT','USD') AND action = 'payment'
+           AND source IN ('revolut_card','fiat_withdrawal')
            AND created_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)
            ORDER BY created_at DESC LIMIT 1`
         ).catch(() => [[]]);
