@@ -4761,7 +4761,7 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
         console.log('[autoLog] ' + coinBase + ' — suppressed: limit order ' + po47[0].order_id + ' (status ' + po47[0].status + ') is poller-managed (#47 B2a)');
         return;
       }
-    } catch (e) { console.error('[autoLog] B2a pending_orders check error:', e.message); }
+    } catch (e) { console.error('[autoLog] B2a pending_orders check error — skipping insert for safety:', e.message); return; } // #5 fail-safe
 
     // ── Deduplication: three-stage check before logging ──────────────────────
 
@@ -4814,7 +4814,7 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
         console.log(`[autoLog] ${coinBase} quantity-match duplicate (id=${anyLog[0].id}) — skipping`);
         return;
       }
-    } catch (e) { console.error('[autoLog] Quantity dedup check error:', e.message); }
+    } catch (e) { console.error('[autoLog] Quantity dedup check error — skipping insert for safety:', e.message); return; } // #5 fail-safe
     // ──────────────────────────────────────────────────────────────────────────
 
     // Look up most recent Claude recommendation for this coin
