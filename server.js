@@ -6639,11 +6639,15 @@ async function autoExecuteSell(symbol, maxPct, analysis, confidence) {
       return;
     }
 
-    // #95 Stage 2: HARD ENTRY-FLOOR GUARD — never auto-sell below a pump-armed rule's entry_floor.
-    // Governed by dev_decision #3 (never-sell-below-entry). Authoritative source = pump_armed_rules table.
+    // #95 Stage 2 + #125: HARD ENTRY-FLOOR GUARD — never auto-sell below entry.
+    // Governed by dev_decision #3 (never-sell-below-entry). Source priority: pump_armed_rules.entry_floor, else entry_prices.entry_price.
     try {
       const [floorRows] = await db.execute('SELECT entry_floor FROM pump_armed_rules WHERE symbol = ? AND active = 1 LIMIT 1', [symbol]);
-      const entryFloor = floorRows.length && floorRows[0].entry_floor != null ? parseFloat(floorRows[0].entry_floor) : null;
+      let entryFloor = floorRows.length && floorRows[0].entry_floor != null ? parseFloat(floorRows[0].entry_floor) : null;
+      if (entryFloor === null) {
+        const [epRow] = await db.execute('SELECT entry_price FROM entry_prices WHERE symbol = ? OR symbol = ? LIMIT 1', [symbol, coinBase + '-USD']);
+        if (epRow.length && epRow[0].entry_price != null && parseFloat(epRow[0].entry_price) > 0) entryFloor = parseFloat(epRow[0].entry_price);
+      }
       if (entryFloor !== null && currentPrice <= entryFloor) {
         await sendTelegram(
           `🛑 <b>AUTO-SELL BLOCKED — ${coinBase}</b>\n` +
@@ -6799,11 +6803,15 @@ async function autoExecuteKrakenSell(symbol, maxPct, analysis, confidence) {
       return;
     }
 
-    // #95 Stage 2: HARD ENTRY-FLOOR GUARD (Kraken path) — never auto-sell below entry_floor.
-    // Governed by dev_decision #3 (never-sell-below-entry). Authoritative source = pump_armed_rules table.
+    // #95 Stage 2 + #125: HARD ENTRY-FLOOR GUARD (Kraken path) — never auto-sell below entry.
+    // Governed by dev_decision #3 (never-sell-below-entry). Source priority: pump_armed_rules.entry_floor, else entry_prices.entry_price.
     try {
       const [floorRows] = await db.execute('SELECT entry_floor FROM pump_armed_rules WHERE symbol = ? AND active = 1 LIMIT 1', [symbol]);
-      const entryFloor = floorRows.length && floorRows[0].entry_floor != null ? parseFloat(floorRows[0].entry_floor) : null;
+      let entryFloor = floorRows.length && floorRows[0].entry_floor != null ? parseFloat(floorRows[0].entry_floor) : null;
+      if (entryFloor === null) {
+        const [epRow] = await db.execute('SELECT entry_price FROM entry_prices WHERE symbol = ? OR symbol = ? LIMIT 1', [symbol, coinBase + '-USD']);
+        if (epRow.length && epRow[0].entry_price != null && parseFloat(epRow[0].entry_price) > 0) entryFloor = parseFloat(epRow[0].entry_price);
+      }
       if (entryFloor !== null && currentPrice <= entryFloor) {
         await sendTelegram(
           `🛑 <b>AUTO-SELL BLOCKED — ${coinBase} (Kraken)</b>\n` +
