@@ -229,6 +229,41 @@ async function sendTelegram(message) {
 }
 
 // #125 Away Mode gate helper — fresh DB read (live-DB-is-truth + instant kill switch). Called by NOTHING in Phase 1 (inert).
+// #125 Phase 2b — Away Mode auto-sell on up-target. Double-gated: master enabled AND isAwayActionable. Returns true if handled (caller skips menu + returns).
+async function tryAwayAutoSellUpTarget(symbol, coinBase, currentPrice, changePct, target, assetQty, priceStr) {
+  try {
+    const [aeRows] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'ai_auto_execute'");
+    const ae = aeRows.length ? JSON.parse(aeRows[0].config_value) : {};
+    if (ae.enabled !== true) return false;
+    if (!(await isAwayActionable(coinBase))) return false;
+    const [amR] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'away_mode'");
+    const am = amR.length ? JSON.parse(amR[0].config_value) : {};
+    const cap = parseFloat(am.max_session_sell_usd ?? 500);
+    const sold = parseFloat(am.session_sold_usd ?? 0);
+    const estValue = (assetQty || 0) * 0.25 * currentPrice;
+    if (sold + estValue > cap) {
+      await sendTelegram(`AWAY CAP \u2014 ${coinBase}: up-target hit but session sell cap reached ($${sold.toFixed(2)}/$${cap.toFixed(2)}). Skipped \u2014 your call when back.`).catch(() => {});
+      console.log(`[away] session cap reached ${coinBase}: ${sold}+${estValue} > ${cap}`);
+      return true;
+    }
+    await sendTelegram(`\uD83E\uDD16 AWAY MODE \u2014 ${coinBase} up-target hit. Auto-selling 25% (floor-guarded) @ $${priceStr}.`).catch(() => {});
+    const awayAnalysis = `AWAY MODE auto-sell: ${coinBase} hit fixed up-target ${target.targetPrice} (now ${priceStr}, +${changePct.toFixed(1)}%). REASON: pre-set away strategy.`;
+    const conf = ae.require_confidence || 'High';
+    const pct = ae.max_sell_pct || 25;
+    if (KRAKEN_MONITORED_COINS.includes(symbol)) {
+      await autoExecuteKrakenSell(symbol, pct, awayAnalysis, conf);
+    } else {
+      await autoExecuteSell(symbol, pct, awayAnalysis, conf);
+    }
+    am.session_sold_usd = sold + estValue;
+    await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('away_mode', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)", [JSON.stringify(am)]).catch(() => {});
+    console.log(`[away] auto-sold ${pct}% ${coinBase} on up-target; session $${am.session_sold_usd.toFixed(2)}/$${cap}`);
+    return true;
+  } catch (e) {
+    console.error('[away] up-target auto-exec error (no sell):', e.message);
+    return false;
+  }
+}
 async function isAwayActionable(coinBase) {
   try {
     const [rows] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'away_mode'");
@@ -7989,6 +8024,11 @@ async function checkPortfolio() {
             `'hold ${coinBase}' — log decision to hold through this level`;
         } else {
           const replyMenu = `\n\n1️⃣ Sell  2️⃣ Hold  3️⃣ Analyse  4️⃣ Acknowledge ⚠️ mutes coin 24h\n💬 Reply number or '<b>${coinBase.toLowerCase()} 1</b>' to target this coin`;
+          // #125 Phase 2b — away-mode auto-sell before building the menu; skip menu if handled
+          if (await tryAwayAutoSellUpTarget(symbol, coinBase, currentPrice, changePct, target, assetQty, priceStr)) {
+            targetExtremes.delete(symbol);
+            return;
+          }
           const autoReady = await getAutomationReadiness(symbol, 'buy');
           const autoLine = autoReady ? `\n\n⚡ AUTO-READY: This setup has worked ${autoReady.winRate}% of the time (${autoReady.sampleSize} trades). Could be automated.` : '';
           alertMessage = `🎯 <b>${symbol} FIXED TARGET HIT!</b>\n\nAnchor: $${anchorStr} → Now $${priceStr} (+${changePct.toFixed(1)}%)${entryLine}${upDescLine}${upWickLine}\n\n⚡ RECOMMENDATION: ${aiRec}${replyMenu}${autoLine}`;
