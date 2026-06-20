@@ -10438,28 +10438,9 @@ function createMcpServer() {
       // #105 PM Build 2: recommendation engine — held positions + research + principles
       let pmRecommendations = [];
       try {
-        // Pull held positions + qty from non-legacy tranches (reconciliation source of truth; symbol stored as base). pmrecs_dbderived
-        const [epRows] = await db.execute(
-          `SELECT symbol, SUM(remaining_quantity) AS qty
-           FROM position_tranches
-           WHERE is_legacy = 0
-           GROUP BY symbol
-           HAVING SUM(remaining_quantity) > 0
-           ORDER BY symbol ASC`
-        );
-        // Entry price per coin, keyed by base symbol
-        const [entryRows] = await db.execute('SELECT symbol, entry_price FROM entry_prices');
-        const entryMap = {};
-        for (const er of entryRows) entryMap[String(er.symbol).replace('-USD', '').toUpperCase()] = parseFloat(er.entry_price || 0);
-        // Latest intraday price per coin (#50 capture, <=2min stale), keyed by base symbol
-        const [priceRows] = await db.execute(
-          `SELECT pi.symbol, pi.price
-           FROM price_intraday pi
-           INNER JOIN (SELECT symbol, MAX(recorded_at) AS latest FROM price_intraday GROUP BY symbol) m
-             ON pi.symbol = m.symbol AND pi.recorded_at = m.latest`
-        );
-        const priceMap = {};
-        for (const pr of priceRows) priceMap[String(pr.symbol).replace('-USD', '').toUpperCase()] = parseFloat(pr.price || 0);
+        // Re-source from live Revolut /balances + /tickers (same as ledger B1.1) so CC +
+        // all HODL bags are included (position_tranches is_legacy=0 missed these). pmrecs_live
+        const { positions: bpPositions } = await buildPositions();
         // Pull most-recent research per symbol
         const [rhRows] = await db.execute(
           `SELECT r1.symbol, r1.thesis_status, r1.drift_verdict, r1.live_price, r1.researched_at
@@ -10493,14 +10474,15 @@ function createMcpServer() {
         // Load active pm_decisions principles
         const principles = (pmDecRows || []).map(d => d.principle_tag).filter(Boolean);
         // Build recommendations per position
-        for (const ep of epRows) {
-          const base = String(ep.symbol).replace('-USD', '').toUpperCase();
+        for (const pos of bpPositions) {
+          const base = pos.coin.toUpperCase();
           const sym = base + '-USD';
-          const qty = parseFloat(ep.qty || 0);
-          const entry = entryMap[base] || 0;
-          const livePrice = priceMap[base];
-          const gainLoss = (entry > 0 && livePrice != null) ? ((livePrice - entry) / entry) * 100 : 0;
-          if (!entry || qty < 0.0001) continue;
+          const qty = pos.available;
+          const entry = pos.entryPrice || 0;
+          const livePrice = pos.price;
+          const gainLoss = pos.unrealisedPnlPct || 0;
+          // Value filter: skip no-entry or sub-$1 dust (same threshold as dust skip elsewhere)
+          if (!entry || pos.currentValue < 1.0) continue;
           const research = researchMap[base] || null;
           const recs = [];
           // TRIM candidate: unrealized gain significant + research STRENGTHENING or INTACT
