@@ -1392,17 +1392,20 @@ set_auto_trade_rule, get_auto_rules, manage_auto_rules,
 get_prices, get_tranches, research_asset,
 set_pump_armed_rule, resolve_pending_trades
 
-### ROADMAP
-1. Kraken monitoring and trade execution DONE
+### ROADMAP (updated 2026-06-20)
+1. Kraken + Revolut X monitoring and execution DONE
 2. Tangem XRP wallet integration DONE
-3. SOL fully automated trading DONE
-4. Trade intention system DONE
-5. MCP tools consolidated to 11 DONE
-6. Revolut X trade execution DONE
-7. Tax lot tracking US HIFO and UK S104 DONE
-8. Native mobile app PENDING
-9. Portfolio rebalancing automation PENDING
-10. Auto compound profits PENDING`]
+3. Trade intention system + outcome grader DONE
+4. Tax lot tracking US HIFO + UK S104 DONE
+5. 16 MCP tools + Telegram-gated approval flow DONE
+6. Research layer + weekly sweep + coin_strategy DONE
+7. Pump-loop #95 (all 4 stages, gated OFF by default) DONE
+8. Decision-memory layer (pm_decisions + dev_decisions) DONE
+9. Lifetime ledger (realized + unrealized, all accounts) DONE
+10. Auto-detection: card payments + fiat withdrawals DONE
+11. Dynamic fast-scan + plan-aware alerts DONE
+12. Native mobile app PENDING
+13. Auto compound profits PENDING`]
   );
   const MCP_TOOL_NAMES = [
     'get_portfolio_summary', 'get_portfolio_data', 'get_trading_data',
