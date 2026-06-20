@@ -228,6 +228,16 @@ async function sendTelegram(message) {
   console.log('Telegram sent:', message.substring(0, 50));
 }
 
+// #125 Away Mode gate helper — fresh DB read (live-DB-is-truth + instant kill switch). Called by NOTHING in Phase 1 (inert).
+async function isAwayActionable(coinBase) {
+  try {
+    const [rows] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'away_mode'");
+    if (!rows.length) return false;
+    const am = JSON.parse(rows[0].config_value);
+    return !!am.active && Array.isArray(am.coins) && am.coins.includes(String(coinBase).toUpperCase().replace('-USD',''));
+  } catch (e) { return false; }
+}
+
 async function sendTelegramMessage(chatId, text) {
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
   const res = await fetch(url, {
@@ -1512,6 +1522,25 @@ try {
   }
 } catch (e) {
   console.error('[config] Failed to seed ai_auto_execute:', e.message);
+}
+
+// #125 Away Mode config — Phase 1 foundation (ships INERT; no execution path reads it yet)
+try {
+  await db.execute(
+    'INSERT INTO system_config (config_key, config_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE config_key = config_key',
+    ['away_mode', JSON.stringify({
+      active: false,
+      eligible: [],
+      coins: [],
+      activated_at: null,
+      max_session_sell_usd: 500,
+      session_sold_usd: 0,
+      created_at: new Date().toISOString()
+    })]
+  );
+  console.log('[config] Away Mode config seeded (inactive, 0 eligible)');
+} catch (e) {
+  console.error('[config] Failed to seed away_mode:', e.message);
 }
 
 // Seed default USDT sweep config (ON CONFLICT DO NOTHING — preserves user settings)
@@ -9766,7 +9795,7 @@ function createMcpServer() {
   server.tool('manage_trading',
     'Log journal entries, trade intentions, trader preferences, update invested capital, or configure USDT sweep',
     {
-      action:                 z.enum(['log_journal', 'log_intention', 'save_preference', 'update_capital', 'configure_sweep', 'configure_auto_execute', 'log_dev_issue', 'update_session_state', 'upsert_coin_strategy', 'export_dev_log', 'log_research', 'log_pm_decision', 'log_dev_decision', 'void_journal']).describe('What trading action to perform'),
+      action:                 z.enum(['log_journal', 'log_intention', 'save_preference', 'update_capital', 'configure_sweep', 'configure_auto_execute', 'log_dev_issue', 'update_session_state', 'upsert_coin_strategy', 'export_dev_log', 'log_research', 'log_pm_decision', 'log_dev_decision', 'void_journal', 'configure_away_mode']).describe('What trading action to perform'),
       symbol:                 z.string().optional().describe('Coin e.g. NEAR-USD or NEAR'),
       trade_action:           z.enum(['buy', 'sell', 'hold', 'add', 'reduce', 'payment', 'transfer', 'pass']).optional().describe('Trade action for log_journal or log_intention — use pass to log a skipped trade for shadow grading at +7d/+30d'),
       price:                  z.number().optional().describe('Price for log_journal'),
@@ -9786,6 +9815,8 @@ function createMcpServer() {
       excluded_symbols:       z.array(z.string()).optional().describe('Symbols to exclude from sweep e.g. ["USDT-USD"] (configure_sweep)'),
       max_sell_pct:           z.number().optional().describe('Max % of position to sell per auto-exec trade (configure_auto_execute)'),
       max_buy_usd:            z.number().optional().describe('Max USD to spend per auto-exec buy (configure_auto_execute)'),
+      away_action:            z.enum(['set_eligible','activate','deactivate','status']).optional().describe('configure_away_mode: which away-mode operation'),
+      away_coins:             z.array(z.string()).optional().describe('configure_away_mode: coin list for set_eligible / activate'),
       allowed_triggers:       z.array(z.string()).optional().describe('Alert types that can trigger auto-exec: trailing_stop, fixed_target, pump_alert'),
       require_confidence:     z.enum(['High', 'Medium', 'Low']).optional().describe('Minimum Claude confidence level to auto-execute'),
       cooldown_minutes:       z.number().optional().describe('Minutes to wait between auto-executions for same coin'),
@@ -9942,6 +9973,36 @@ function createMcpServer() {
         );
         return { content: [{ type: 'text', text: JSON.stringify({ ok: true, config: sweepConfig }) }] };
 
+      } else if (action === 'configure_away_mode') {
+        // #125 Away Mode — PM control surface (Phase 1: INERT, no execution path reads this yet)
+        const awayAction = params?.away_action || 'status';
+        const awayCoinsIn = (params?.away_coins || []).map(c => String(c).toUpperCase().replace('-USD',''));
+        const [amRows] = await db.execute(
+          "SELECT config_value FROM system_config WHERE config_key = 'away_mode'"
+        ).catch(() => [[]]);
+        let am = amRows.length ? JSON.parse(amRows[0].config_value) : { active:false, eligible:[], coins:[], activated_at:null, max_session_sell_usd:500, session_sold_usd:0 };
+        let reply;
+        if (awayAction === 'set_eligible') {
+          am.eligible = awayCoinsIn;
+          reply = `Away-eligible coins set: ${am.eligible.length ? am.eligible.join(', ') : '(none)'}`;
+        } else if (awayAction === 'activate') {
+          const base = awayCoinsIn.length ? awayCoinsIn : am.eligible;
+          const live = base.filter(c => am.eligible.includes(c));
+          const rejected = base.filter(c => !am.eligible.includes(c));
+          am.active = true; am.coins = live; am.activated_at = new Date().toISOString(); am.session_sold_usd = 0;
+          reply = `Away Mode ACTIVE for: ${live.length ? live.join(', ') : '(none matched eligible)'}` + (rejected.length ? ` | ignored (not eligible): ${rejected.join(', ')}` : '') + ` | Phase 1 — nothing executes yet (foundation only).`;
+        } else if (awayAction === 'deactivate') {
+          am.active = false; am.coins = [];
+          reply = 'Away Mode OFF — all coins manual.';
+        } else {
+          reply = `Away Mode: ${am.active ? 'ACTIVE' : 'OFF'} | eligible: ${am.eligible.join(', ') || '(none)'} | live: ${am.coins.join(', ') || '(none)'} | session $${(am.session_sold_usd||0).toFixed(2)}/$${am.max_session_sell_usd}`;
+        }
+        await db.execute(
+          "INSERT INTO system_config (config_key, config_value) VALUES ('away_mode', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)",
+          [JSON.stringify(am)]
+        );
+        console.log('[away] configure_away_mode:', awayAction, '->', JSON.stringify(am));
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, away_mode: am, message: reply }) }] };
       } else if (action === 'configure_auto_execute') {
         // Preserve hodl_symbols from existing config if not provided in this call
         const [existingCfgRows] = await db.execute(
