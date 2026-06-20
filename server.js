@@ -3226,30 +3226,40 @@ async function checkPumpArm(symbol, currentPrice) {
 
 async function runFastScan() {
   try {
+    // Part A: pump-arm detector for explicit pump-loop targets (FAST_SCAN_SYMBOLS, #95 Stage 1)
     for (const symbol of FAST_SCAN_SYMBOLS) {
-      // #95 Stage 1: check pump-arm rules FIRST (these are dormant — no trailing stop yet)
-      {
-        const armPrice = await getCurrentPrice(symbol).catch(() => null);
-        if (armPrice) await checkPumpArm(symbol, armPrice);
+      const armPrice = await getCurrentPrice(symbol).catch(() => null);
+      if (armPrice) await checkPumpArm(symbol, armPrice);
+    }
+
+    // Part B: trailing-stop checks — dynamic over ALL armed stops (#99).
+    // Batch-fetches Revolut X prices once per cycle so N armed stops = 1 /tickers call
+    // (not N calls). Kraken-only coins get a per-coin getKrakenPriceForSymbol call.
+    if (trailingStops.size === 0) return;
+    const fsRevolutPrices = {};
+    try {
+      const fsTickers = await revolutRequest('GET', '/tickers');
+      const fsList = Array.isArray(fsTickers) ? fsTickers : (fsTickers.data || []);
+      for (const t of fsList) {
+        if (!t.symbol) continue;
+        const p = parseFloat(t.last_price || t.mid || t.ask || t.bid);
+        if (p) { fsRevolutPrices[t.symbol] = p; fsRevolutPrices[t.symbol.replace('/', '-')] = p; }
       }
-      // Only run trailing-stop logic if a trailing stop is armed — silent if not
-      if (!trailingStops.has(symbol)) continue;
-      // Skip if already acknowledged or ignored this cycle
+    } catch (e) { console.warn('[fast-scan] Revolut ticker fetch failed:', e.message); }
+
+    for (const symbol of trailingStops.keys()) {
       if (alertState.acknowledged.has(symbol) || ignoredCoins.has(symbol)) continue;
-
-      // Fetch current price (tries Revolut X first, falls back to Kraken)
-      const price = await getCurrentPrice(symbol).catch(() => null);
+      // Price: Kraken-only coins fetch individually; Revolut coins from the pre-fetched map
+      const price = KRAKEN_MONITORED_COINS.includes(symbol)
+        ? await getKrakenPriceForSymbol(symbol).catch(() => null)
+        : (fsRevolutPrices[symbol] || null);
       if (!price) continue;
-
-      // Dedup: skip if price hasn't changed since last fast-scan cycle
+      // Dedup: skip if price unchanged since last cycle
       if (fastScanLastPrice.get(symbol) === price) continue;
       fastScanLastPrice.set(symbol, price);
-
       console.log(`[fast-scan] ${symbol} @ ${fmtPriceShort(price)} — evaluating trailing stop`);
       const fsResult = await updateTrailingStop(symbol, price);
       if (fsResult && fsResult.triggered) {
-        // #94: breach detected on fast scan — fire the same alert path as the 5-min loop.
-        // Exchange routing: KRAKEN_MONITORED_COINS (GHIBLI/ZK/XPL/TAO) → kraken, else revolut.
         const fsExchange = KRAKEN_MONITORED_COINS.includes(symbol) ? 'kraken' : 'revolut';
         console.log(`[fast-scan] ${symbol} BREACH — firing handleTrailingStopAlert (${fsExchange})`);
         await handleTrailingStopAlert(symbol, price, fsResult.ts, fsExchange);
