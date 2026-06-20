@@ -246,8 +246,8 @@ async function tryAwayAutoSellUpTarget(symbol, coinBase, currentPrice, changePct
       console.log(`[away] session cap reached ${coinBase}: ${sold}+${estValue} > ${cap}`);
       return true;
     }
-    await sendTelegram(`\uD83E\uDD16 AWAY MODE \u2014 ${coinBase} up-target hit. Auto-selling 25% (floor-guarded) @ $${priceStr}.`).catch(() => {});
-    const awayAnalysis = `AWAY MODE auto-sell: ${coinBase} hit fixed up-target ${target.targetPrice} (now ${priceStr}, +${changePct.toFixed(1)}%). REASON: pre-set away strategy.`;
+    // #125 B: no pre-notice — autoExecuteSell sends the single 'AI EXECUTED' notice; REASON below surfaces the away context in it.
+    const awayAnalysis = `REASON: AWAY MODE auto-sell — ${coinBase} hit pre-set up-target ${target.targetPrice} (now ${priceStr}, +${changePct.toFixed(1)}%).`;
     const conf = ae.require_confidence || 'High';
     const pct = ae.max_sell_pct || 25;
     if (KRAKEN_MONITORED_COINS.includes(symbol)) {
