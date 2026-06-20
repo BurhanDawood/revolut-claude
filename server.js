@@ -7205,7 +7205,7 @@ async function checkPortfolio() {
     try {
       // #91: true rolling 24h baseline — find the price_history row closest to exactly 24h ago per symbol.
       // The prior query picked the MOST RECENT row (midnight snapshot), which absorbed any pump already
-      // in progress at midnight. This query targets the row nearest to NOW()-24h (±2h window) so a
+      // in progress at midnight. This query targets the row nearest to NOW()-24h (±12h window) so a
       // continuation pump that started before midnight is correctly measured over the full 24h.
       const [ph24Rows] = await db.execute(`
         SELECT p1.symbol, p1.price
@@ -7214,14 +7214,14 @@ async function checkPortfolio() {
           SELECT symbol,
                  MIN(ABS(TIMESTAMPDIFF(MINUTE, recorded_at, DATE_SUB(NOW(), INTERVAL 24 HOUR)))) AS min_diff
           FROM price_history
-          WHERE recorded_at >= DATE_SUB(NOW(), INTERVAL 26 HOUR)
-            AND recorded_at <= DATE_SUB(NOW(), INTERVAL 22 HOUR)
+          WHERE recorded_at >= DATE_SUB(NOW(), INTERVAL 36 HOUR)
+            AND recorded_at <= DATE_SUB(NOW(), INTERVAL 12 HOUR)
           GROUP BY symbol
         ) p2
           ON p1.symbol = p2.symbol
          AND ABS(TIMESTAMPDIFF(MINUTE, p1.recorded_at, DATE_SUB(NOW(), INTERVAL 24 HOUR))) = p2.min_diff
-         AND p1.recorded_at >= DATE_SUB(NOW(), INTERVAL 26 HOUR)
-         AND p1.recorded_at <= DATE_SUB(NOW(), INTERVAL 22 HOUR)
+         AND p1.recorded_at >= DATE_SUB(NOW(), INTERVAL 36 HOUR)
+         AND p1.recorded_at <= DATE_SUB(NOW(), INTERVAL 12 HOUR)
       `);
       for (const r of ph24Rows) {
         if (r.price) baseline24hMap[r.symbol] = parseFloat(r.price);
