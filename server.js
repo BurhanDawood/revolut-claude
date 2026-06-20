@@ -4601,12 +4601,12 @@ async function logRebalancePair({ sellSymbol, sellJournalId, sellPrice, sellValu
   // Update both journal entries as transfers
   await db.execute(
     'UPDATE trading_journal SET action = ?, reasoning = ?, emotion = ? WHERE id = ?',
-    ['transfer', `Rebalance exit — rotating into ${buySymbol || 'another position'}`, 'neutral', sellJournalId]
+    ['sell', `Rebalance exit — rotating into ${buySymbol || 'another position'}`, 'neutral', sellJournalId]   // #122
   );
   if (buyJournalId) {
     await db.execute(
       'UPDATE trading_journal SET action = ?, reasoning = ?, emotion = ? WHERE id = ?',
-      ['transfer', `Rebalance entry — rotated from ${sellSymbol}`, 'neutral', buyJournalId]
+      ['buy', `Rebalance entry — rotated from ${sellSymbol}`, 'neutral', buyJournalId]   // #122
     );
   }
   // Insert into rebalancing_tracker (primary) and rebalance_log (legacy)
