@@ -5497,9 +5497,9 @@ async function gradeTradeOutcomes() {
 
     const [d7] = await db.execute(
       `SELECT id, symbol, action, price FROM trading_journal
-       WHERE action IN ('buy','sell','add','reduce') AND price > 0 AND outcome_7d_pct IS NULL
+       WHERE action IN ('buy','sell','add','reduce','pass') AND price > 0 AND outcome_7d_pct IS NULL
          AND created_at <  DATE_SUB(NOW(), INTERVAL 7 DAY)
-         AND created_at >= DATE_SUB(NOW(), INTERVAL 9 DAY)`);
+         AND created_at >= DATE_SUB(NOW(), INTERVAL 9 DAY)   -- #52 pass = shadow trade`);
     let g7 = 0;
     for (const r of d7) {
       const now = await priceFor(r.symbol); const entry = parseFloat(r.price);
@@ -5511,9 +5511,9 @@ async function gradeTradeOutcomes() {
 
     const [d30] = await db.execute(
       `SELECT id, symbol, action, price FROM trading_journal
-       WHERE action IN ('buy','sell','add','reduce') AND price > 0 AND outcome_30d_pct IS NULL
+       WHERE action IN ('buy','sell','add','reduce','pass') AND price > 0 AND outcome_30d_pct IS NULL
          AND created_at <  DATE_SUB(NOW(), INTERVAL 30 DAY)
-         AND created_at >= DATE_SUB(NOW(), INTERVAL 32 DAY)`);
+         AND created_at >= DATE_SUB(NOW(), INTERVAL 32 DAY)  -- #52 pass = shadow trade`);
     let g30 = 0;
     for (const r of d30) {
       const now = await priceFor(r.symbol); const entry = parseFloat(r.price);
@@ -9768,7 +9768,7 @@ function createMcpServer() {
     {
       action:                 z.enum(['log_journal', 'log_intention', 'save_preference', 'update_capital', 'configure_sweep', 'configure_auto_execute', 'log_dev_issue', 'update_session_state', 'upsert_coin_strategy', 'export_dev_log', 'log_research', 'log_pm_decision', 'log_dev_decision', 'void_journal']).describe('What trading action to perform'),
       symbol:                 z.string().optional().describe('Coin e.g. NEAR-USD or NEAR'),
-      trade_action:           z.enum(['buy', 'sell', 'hold', 'add', 'reduce', 'payment', 'transfer']).optional().describe('Trade action for log_journal or log_intention'),
+      trade_action:           z.enum(['buy', 'sell', 'hold', 'add', 'reduce', 'payment', 'transfer', 'pass']).optional().describe('Trade action for log_journal or log_intention — use pass to log a skipped trade for shadow grading at +7d/+30d'),
       price:                  z.number().optional().describe('Price for log_journal'),
       quantity:               z.number().optional().describe('Quantity for log_journal'),
       reasoning:              z.string().optional().describe('Why the trade was or will be made'),
@@ -9825,7 +9825,7 @@ function createMcpServer() {
       const params = { hodl_symbols: hodlSymbolsParam };
 
       if (action === 'log_journal') {
-        if (!trade_action) return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'trade_action is required for log_journal (e.g. buy, sell, hold, add, reduce, payment, transfer)' }) }] };
+        if (!trade_action) return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'trade_action is required for log_journal (e.g. buy, sell, hold, add, reduce, payment, transfer, pass)' }) }] };
         const sym      = symbol?.includes('-USD') ? symbol.toUpperCase() : `${symbol?.toUpperCase()}-USD`;
         const coinBase = sym.replace('-USD', '');
         const valueUsd = quantity && price ? quantity * price : null;
