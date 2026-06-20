@@ -160,7 +160,7 @@ async function placeRevolutOrder(symbol, side, orderType, baseSize, price = null
   return { ...result, client_order_id: clientOrderId };
 }
 
-async function sweepToUSDT(proceedsUsd, sourceSymbol) {
+async function sweepToUSDT(proceedsUsd, sourceSymbol, realisedPnlUsd = null) {
   try {
     const [configRows] = await db.execute(
       "SELECT config_value FROM system_config WHERE config_key = 'usdt_sweep_config'"
@@ -169,7 +169,7 @@ async function sweepToUSDT(proceedsUsd, sourceSymbol) {
 
     const config = JSON.parse(configRows[0].config_value);
     if (!config.enabled) return;
-    if (proceedsUsd < config.min_trade_value_usd) return;
+    if (proceedsUsd < (config.min_trade_value_usd || 50)) return; // #26 Bug3
 
     // Check exclusions against both bare coin name (BONK) and full symbol (BONK-USD)
     if (config.excluded_symbols && config.excluded_symbols.length > 0) {
@@ -180,14 +180,18 @@ async function sweepToUSDT(proceedsUsd, sourceSymbol) {
       }
     }
 
-    const sweepAmountUsd = proceedsUsd * (config.sweep_pct / 100);
+    // #26 Bug1: use realised profit as base when available; fall back to proceeds
+    const basisLabel = (realisedPnlUsd !== null && realisedPnlUsd > 0) ? 'profit' : 'proceeds';
+    const sweepBase = basisLabel === 'profit' ? realisedPnlUsd : proceedsUsd;
+    const sweepAmountUsd = sweepBase * (config.sweep_pct / 100);
+    if (sweepAmountUsd <= 0) { console.log('[sweep] Zero/negative sweep amount — skipping'); return; }
 
     // Get current USDT balance for the confirmation message
     const balances = await revolutRequest('GET', '/balances');
     const usdtBalance = balances.find(b => b.currency === 'USDT');
     const currentUSDT = parseFloat(usdtBalance?.available || 0);
 
-    console.log(`[sweep] Sweeping $${sweepAmountUsd.toFixed(2)} to USDT after ${sourceSymbol} sell`);
+    console.log(`[sweep] Sweeping $${sweepAmountUsd.toFixed(2)} to USDT after ${sourceSymbol} sell (basis: ${basisLabel})`);
 
     await placeRevolutOrder('USDT-USD', 'buy', 'market', null, null, sweepAmountUsd);
 
@@ -197,7 +201,7 @@ async function sweepToUSDT(proceedsUsd, sourceSymbol) {
       `💰 <b>USDT SWEEP EXECUTED</b>\n\n` +
       `After selling ${sourceSymbol.replace('-USD', '')}\n` +
       `Swept: $${sweepAmountUsd.toFixed(2)} → USDT\n` +
-      `Config: ${config.sweep_pct}% of proceeds\n` +
+      `Config: ${config.sweep_pct}% of ${basisLabel}\n` +
       `USDT reserve: ~$${approxNewUSDT.toFixed(2)}\n\n` +
       `💡 Ready for next dip buy!`
     );
@@ -205,7 +209,7 @@ async function sweepToUSDT(proceedsUsd, sourceSymbol) {
     await db.execute(
       'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion) VALUES (?, ?, ?, ?, ?, ?, ?)',
       ['USDT', 'buy', 1, sweepAmountUsd, sweepAmountUsd,
-       `Auto-sweep: ${config.sweep_pct}% of ${sourceSymbol} sell proceeds`, 'neutral']
+       `Auto-sweep: ${config.sweep_pct}% of ${sourceSymbol} sell ${basisLabel}`, 'neutral']
     ).catch(() => {});
 
   } catch (e) {
@@ -3085,7 +3089,11 @@ async function runLimitFillPipeline(order, filledQty, avgPrice) {
       if (journalId) await recordRealisedPnl(journalId, symbol, price, qty).catch(() => {});
     }
     await sendTelegram((side === 'sell' ? '✅' : '🟢') + ' LIMIT FILLED — ' + side.toUpperCase() + ' ' + formatTradeQty(qty) + ' ' + coinBase + ' @ ' + formatPrice(price) + ' = $' + valueUSD.toFixed(2) + ' 🔄').catch(() => {});
-    if (side === 'sell') { await sweepToUSDT(valueUSD, symbol).catch(() => {}); }
+    if (side === 'sell') {
+      const _swEp = entryPrices.get(symbol) || 0;
+      const _swProfit = _swEp > 0 ? (price - _swEp) * qty : null; // #26 Bug1
+      await sweepToUSDT(valueUSD, symbol, _swProfit).catch(() => {});
+    }
     return journalId;
   } catch (e) {
     console.error('[orders] runLimitFillPipeline error for ' + order.order_id + ': ' + e.message);
@@ -7123,7 +7131,9 @@ async function checkAutoTradeRules(priceMap) {
           // USDT sweep after qualifying sells (Kraken only — Revolut handles its own treasury)
           if (rule.order_type === 'sell' && exchange === 'kraken') {
             const proceeds = currentPrice * resolvedVolume;
-            await sweepToUSDT(proceeds, rule.symbol).catch(() => {});
+            const _swEp7 = entryPrices.get(rule.symbol) || 0;
+            const _swProfit7 = _swEp7 > 0 ? (currentPrice - _swEp7) * resolvedVolume : null; // #26 Bug1
+            await sweepToUSDT(proceeds, rule.symbol, _swProfit7).catch(() => {});
           }
 
         } catch (e) {
@@ -12520,7 +12530,9 @@ app.post('/telegram-webhook', async (req, res) => {
             // USDT sweep — convert a % of sell proceeds to USDT for dry-powder reserves
             if (t.side.toLowerCase() === 'sell') {
               const proceeds = executedPrice * parseFloat(t.baseSize);
-              await sweepToUSDT(proceeds, t.symbol).catch(() => {});
+              const _swEp12 = entryPrices.get(t.symbol) || 0;
+              const _swProfit12 = _swEp12 > 0 ? (executedPrice - _swEp12) * parseFloat(t.baseSize) : null; // #26 Bug1
+              await sweepToUSDT(proceeds, t.symbol, _swProfit12).catch(() => {});
             }
           } catch (e) {
             console.error('[revolut] Trade execution failed:', e.message);
