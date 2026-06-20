@@ -1384,11 +1384,13 @@ try {
 - Revolut X API: REVOLUTX_API_KEY + REVOLUTX_PRIVATE_KEY in Railway env vars
 - Kraken API: KRAKEN_API_KEY + KRAKEN_PRIVATE_KEY in Railway env vars
 
-### MCP TOOLS (11 active)
+### MCP TOOLS (16 active)
 get_context, get_portfolio_summary, get_portfolio_data,
 get_trading_data, manage_alerts, manage_trading,
 set_entry_price, execute_kraken_trade,
-set_auto_trade_rule, get_auto_rules, get_prices
+set_auto_trade_rule, get_auto_rules, manage_auto_rules,
+get_prices, get_tranches, research_asset,
+set_pump_armed_rule, resolve_pending_trades
 
 ### ROADMAP
 1. Kraken monitoring and trade execution DONE
@@ -1407,8 +1409,9 @@ set_auto_trade_rule, get_auto_rules, get_prices
     'get_context', 'manage_alerts', 'manage_trading',
     'set_entry_price', 'execute_kraken_trade',
     'set_auto_trade_rule', 'get_auto_rules', 'get_prices',
-    'get_tranches', 'manage_auto_rules', 'research_asset'
-  ];
+    'get_tranches', 'manage_auto_rules', 'research_asset',
+    'set_pump_armed_rule', 'resolve_pending_trades'
+  ]; // #2 cosmetic
   await db.execute(
     'INSERT INTO system_config (config_key, config_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)',
     ['system_capabilities', JSON.stringify({
