@@ -347,6 +347,7 @@ const pendingUndo = new Map();               // symbol -> { action, qty, price, 
 let pendingKrakenTrade = null;               // { symbol, side, orderType, volume, price, valueUSD } — awaiting Telegram approval
 let pendingRevolutTrade = null;             // { symbol, side, orderType, baseSize, price, valueUSD } — awaiting Telegram approval
 let pendingKrakenTradeReminder = null;      // setInterval handle for Kraken approval reminders
+let pendingMcpTradeQueue = [];              // #44: FIFO queue for MCP-submitted trades
 let pendingRevolutTradeReminder = null;     // setInterval handle for Revolut X approval reminders
 let totalInvestedCapital = 20600; // loaded from DB on startup
 
@@ -10660,23 +10661,25 @@ function createMcpServer() {
 
       // When only value_usd is given, estimate token quantity for display/journal purposes
       const estBaseSize = volume || (value_usd && livePrice ? value_usd / livePrice : 0);
+      // #44: push to queue (not single-slot) to preserve laddered orders
       if (exchange === 'revolut') {
-        pendingRevolutTrade = { symbol: sym, side, orderType: order_type, baseSize: estBaseSize, valueUsd: value_usd || null, price: livePrice, valueUSD: tradeValueUSD, timestamp: Date.now(), source: 'claude_mcp', qtyEstimated: !volume && !!value_usd };
+        pendingMcpTradeQueue.push({ _exchange: 'revolut', symbol: sym, side, orderType: order_type, baseSize: estBaseSize, valueUsd: value_usd || null, price: livePrice, valueUSD: tradeValueUSD, timestamp: Date.now(), source: 'claude_mcp', qtyEstimated: !volume && !!value_usd });
       } else {
-        pendingKrakenTrade = { symbol: sym, side, orderType: order_type, volume: estBaseSize, price: livePrice, valueUSD: tradeValueUSD, timestamp: Date.now(), source: 'claude_mcp', qtyEstimated: !volume && !!value_usd };
+        pendingMcpTradeQueue.push({ _exchange: 'kraken', symbol: sym, side, orderType: order_type, volume: estBaseSize, price: livePrice, valueUSD: tradeValueUSD, timestamp: Date.now(), source: 'claude_mcp', qtyEstimated: !volume && !!value_usd });
       }
 
       await sendTelegram(formatApprovalRequest(coinBase, side, volume || null, livePrice, tradeValueUSD, exchange));
 
-      // Start reminder cycle — first reminder after 2.5 minutes
-      setTimeout(() => startTradeApprovalReminder(exchange), 2.5 * 60 * 1000);
+      const queueDepth = pendingMcpTradeQueue.length;
+      const queueNote  = queueDepth > 1 ? ` (${queueDepth} trades queued — reply 'approve trade' for each in order)` : '';
 
       return { content: [{ type: 'text', text: JSON.stringify({
         ok: true,
         status: 'pending_approval',
         exchange,
-        message: `Approval request sent to Telegram. Reply "approve trade" to execute ${side} ${displayQty}${value_usd ? ` of ${coinBase}` : ''} on ${exchangeLabel}.`,
+        message: `Approval request sent to Telegram.${queueNote} Reply "approve trade" to execute ${side} ${displayQty}${value_usd ? ` of ${coinBase}` : ''} on ${exchangeLabel}.`,
         symbol: sym, side, order_type, volume, value_usd, price: livePrice, valueUSD: tradeValueUSD,
+        queue_depth: queueDepth,
       }) }] };
     }
   );
@@ -12430,6 +12433,14 @@ app.post('/telegram-webhook', async (req, res) => {
         /^\u{1F44D}/u.test(rawText.trim())) {
       console.log('[approve] pendingKrakenTrade:', pendingKrakenTrade ? JSON.stringify(pendingKrakenTrade) : 'null');
       console.log('[approve] pendingRevolutTrade:', pendingRevolutTrade ? JSON.stringify(pendingRevolutTrade) : 'null');
+
+      // #44: if no auto-exec trade pending, pop oldest MCP-queued trade into single-slot
+      if (pendingMcpTradeQueue.length > 0 && !pendingKrakenTrade && !pendingRevolutTrade) {
+        const { _exchange, ...tradeData } = pendingMcpTradeQueue.shift();
+        if (_exchange === 'revolut') { pendingRevolutTrade = tradeData; }
+        else { pendingKrakenTrade = tradeData; }
+        if (pendingMcpTradeQueue.length > 0) console.log(`[approve] #44 queue: ${pendingMcpTradeQueue.length} more trade(s) remaining`);
+      }
 
       // Determine which pending trade to execute
       // If both are set, use the most recently created one (by timestamp)
