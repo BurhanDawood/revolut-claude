@@ -4429,6 +4429,24 @@ or:
 
     console.log('[macro] Alert decision:', parsed.alert, '| Urgency:', parsed.urgency || 'n/a', '| Coins:', (parsed.coins_affected || []).join(', '));
 
+    // #76 post-parse sanity check: if narrative uses bearish language about a BTC price
+    // that is >$3K BELOW the live price, the narrative is stale/backwards — suppress.
+    if (parsed.alert && liveBtcPrice) {
+      const narrativeText = (parsed.message || '') + ' ' + (parsed.headline || '');
+      const bearishPattern = /crumbl|break(?:ing|s)?\s+(?:below|through|support|down)|los(?:es?|ing)\s+(?:key\s+)?support|capitulat|plunge|crash(?:ed|ing)?|sell[- ]off/i;
+      if (bearishPattern.test(narrativeText)) {
+        const priceMatches = [...narrativeText.matchAll(/\$(\d[\d,]+)/g)];
+        for (const m of priceMatches) {
+          const mentioned = parseFloat(m[1].replace(/,/g, ''));
+          if (mentioned > 40000 && mentioned < 150000 && liveBtcPrice - mentioned > 3000) {
+            console.warn(`[macro] #76 sanity override: narrative says $${mentioned.toLocaleString()} (bearish) but live BTC $${liveBtcPrice.toFixed(0)} — suppressing stale alert`);
+            parsed.alert = false;
+            break;
+          }
+        }
+      }
+    }
+
     if (!parsed.alert) {
       console.log('[macro] No alert — Claude found nothing significant');
       return;
