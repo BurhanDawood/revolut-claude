@@ -10074,7 +10074,7 @@ function createMcpServer() {
       excluded_symbols:       z.array(z.string()).optional().describe('Symbols to exclude from sweep e.g. ["USDT-USD"] (configure_sweep)'),
       max_sell_pct:           z.number().optional().describe('Max % of position to sell per auto-exec trade (configure_auto_execute)'),
       max_buy_usd:            z.number().optional().describe('Max USD to spend per auto-exec buy (configure_auto_execute)'),
-      away_action:            z.enum(['set_eligible','activate','deactivate','status']).optional().describe('configure_away_mode: which away-mode operation'),
+      away_action:            z.enum(['set_eligible','activate','deactivate','status','set_away_buy']).optional().describe('configure_away_mode: which away-mode operation'),
       away_coins:             z.array(z.string()).optional().describe('configure_away_mode: coin list for set_eligible / activate'),
       allowed_triggers:       z.array(z.string()).optional().describe('Alert types that can trigger auto-exec: trailing_stop, fixed_target, pump_alert'),
       require_confidence:     z.enum(['High', 'Medium', 'Low']).optional().describe('Minimum Claude confidence level to auto-execute'),
