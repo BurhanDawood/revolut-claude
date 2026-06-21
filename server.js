@@ -9950,7 +9950,8 @@ function createMcpServer() {
         try {
           const tlParams = [];
           let tlQuery = 'SELECT id, symbol, exchange, quantity, cost_basis_usd, cost_per_unit, acquired_at, lot_status, journal_id, notes, created_at FROM tax_lots';
-          if (coinBase && coinBase !== 'UNKNOWN') { tlQuery += ' WHERE symbol = ?'; tlParams.push(coinBase); }
+          const tlSym = symbol ? symbol.replace('-USD','').toUpperCase() : null;
+          if (tlSym) { tlQuery += ' WHERE symbol = ?'; tlParams.push(tlSym); }
           tlQuery += ' ORDER BY acquired_at DESC LIMIT 50';
           const [tlRows] = await db.execute(tlQuery, tlParams);
           result.tax_lots = tlRows;
