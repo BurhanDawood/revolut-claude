@@ -7436,8 +7436,16 @@ async function checkPortfolio() {
                  `USDT used for trade funding — no capital change (#82 fix B)`, 'neutral', 'auto_internal']
               ).catch(() => {});
             } else {
-              // No offsetting increase, no recent trade = card payment. AUTO-LOG it (all amounts), decrement capital, notify.
-              // Reversible: Bryan taps 'skip payment X' to undo. Dupe-guard first to avoid double-logging on repeated detection.
+              // No offsetting increase, no recent trade = card payment.
+              // #127: skip if a resting limit order (<15min) explains the USDT drop.
+              const [limitRes107] = await db.execute(
+                'SELECT id FROM pending_orders WHERE status NOT IN (\'filled\',\'cancelled\',\'rejected\',\'replaced\') AND ABS(limit_price * quantity - ?) / ? < 0.10 AND created_at > DATE_SUB(NOW(), INTERVAL 15 MINUTE) LIMIT 1',
+                [decrease, decrease]
+              ).catch(() => [[]]);
+              if (limitRes107.length > 0) {
+                console.log('[usdt] #127 USDT drop $' + decrease.toFixed(2) + ' matches resting limit order -- skipping card-payment auto-log');
+              } else {
+              // AUTO-LOG it. Reversible: Bryan taps 'skip payment X' to undo. Dupe-guard first.
               const [dupe] = await db.execute(
                 `SELECT id FROM trading_journal
                  WHERE symbol = 'USDT' AND action = 'payment'
@@ -7465,6 +7473,7 @@ async function checkPortfolio() {
                   `Capital: $${prevCap.toFixed(2)} → $${newCap.toFixed(2)}\n\n` +
                   `Tap '<b>skip payment ${decrease.toFixed(2)}</b>' if not a payment.`
                 ).catch(() => {});
+              } // end limit-reserve guard (#127)
               }
               lastKnownUSDT = currentUSDT;
               lastKnownUSD  = currentUSD;
@@ -7509,6 +7518,14 @@ async function checkPortfolio() {
           if (recentBuy86.length > 0) {
             console.log(`[withdrawal] USD -$${usdDecrease.toFixed(2)} — recent buy detected, treating as trade-funding (no flag)`);
           } else {
+            // #127: skip if a resting limit order (<15min) explains the USD drop.
+            const [limitRes63] = await db.execute(
+              'SELECT id FROM pending_orders WHERE status NOT IN (\'filled\',\'cancelled\',\'rejected\',\'replaced\') AND ABS(limit_price * quantity - ?) / ? < 0.10 AND created_at > DATE_SUB(NOW(), INTERVAL 15 MINUTE) LIMIT 1',
+              [usdDecrease, usdDecrease]
+            ).catch(() => [[]]);
+            if (limitRes63.length > 0) {
+              console.log('[withdrawal] #127 USD drop $' + usdDecrease.toFixed(2) + ' matches resting limit order -- skipping fiat-withdrawal auto-log');
+            } else {
             const [dupe86] = await db.execute(
               `SELECT id FROM trading_journal
                WHERE action IN ('payment','transfer')
@@ -7536,6 +7553,7 @@ async function checkPortfolio() {
                 `Capital: $${prevCapW.toFixed(2)} → $${newCapW.toFixed(2)}\n\n` +
                 `Tap '<b>skip payment ${usdDecrease.toFixed(2)}</b>' if not a withdrawal.`
               ).catch(() => {});
+            } // end limit-reserve guard (#127)
             }
           }
         }
