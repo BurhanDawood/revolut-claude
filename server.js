@@ -3631,6 +3631,35 @@ async function runFastScan() {
         await handleTrailingStopAlert(symbol, price, fsResult.ts, fsExchange);
       }
     }
+    // Part C: trough tracker scan (#130) -- retrace-gate / bounce / floor-breach
+    if (troughTrackers.size > 0) {
+      for (const ttSymbol of troughTrackers.keys()) {
+        const ttPrice = KRAKEN_MONITORED_COINS.includes(ttSymbol)
+          ? await getKrakenPriceForSymbol(ttSymbol).catch(() => null)
+          : (fsRevolutPrices[ttSymbol] || null);
+        if (!ttPrice) continue;
+        const ttResult = await updateTroughTracker(ttSymbol, ttPrice);
+        if (!ttResult) continue;
+        const ttBase = ttSymbol.replace('-USD', '');
+        if (ttResult.action === 'buy') {
+          console.log('[trough] ' + ttBase + ' BUY SIGNAL: trough ' + ttResult.trough + ' bounced to ' + ttPrice);
+          await sendTelegram(
+            '<b>[#130 TROUGH BUY] ' + ttBase + '</b>\n\n' +
+            'Trough: $' + ttResult.trough.toFixed(8) + '\n' +
+            'Current: $' + ttPrice.toFixed(8) + '\n' +
+            'Bounce confirmed + above floor. Buy execution wiring in Phase C.'
+          ).catch(() => {});
+        } else if (ttResult.action === 'alert') {
+          console.log('[trough] ' + ttBase + ' FLOOR BREACH: trough ' + ttResult.trough + ' below rebuyFloor ' + ttResult.rebuyFloor);
+          await sendTelegram(
+            '<b>[#130 TROUGH FLOOR BREACH] ' + ttBase + '</b>\n\n' +
+            'Trough $' + ttResult.trough.toFixed(8) + ' below rebuy floor $' + ttResult.rebuyFloor.toFixed(8) + '.\n' +
+            'Auto-buy disabled. Manual decision needed.'
+          ).catch(() => {});
+          await clearTroughTracker(ttSymbol);
+        }
+      }
+    }
   } catch (e) {
     console.error('[fast-scan] error:', e.message);
   }
@@ -6173,13 +6202,34 @@ async function cascadeRulesAfterTrade(rule, executedPrice) {
             `Stop loss still protecting position.`
           ).catch(() => {});
         } else {
-          buyRules = await enforceMax(buyRules, MAX_BUY, 'buy');
-          await db.execute(
-            'INSERT INTO auto_trade_rules (symbol, rule_type, trigger_price, direction, order_type, volume, volume_type, source, exchange, cascade_count, max_cascades, cascade_parent_id, proceeds_reserved) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-            [symbol, 'buy_retrace', newBuyPrice, 'below', 'buy', cascadeVol, cascadeVolType, 'cascade', cascadeExchange, 0, maxCascades, rule.id, availableForBuyback]
-          );
-          console.log(`[cascade] Buy-back created @ $${newBuyPrice.toFixed(6)} with $${availableForBuyback.toFixed(2)} ringfenced from sell proceeds`);
-          created = true;
+          // #130: if pump_armed_rules row exists, arm trough tracker instead of fixed rung
+          let usedTroughTracker = false;
+          try {
+            const [pumpRows] = await db.execute('SELECT * FROM pump_armed_rules WHERE symbol = ? AND active = 1 LIMIT 1', [symbol]);
+            if (pumpRows.length) {
+              const pr = pumpRows[0];
+              const refBase = pr.entry_floor ? parseFloat(pr.entry_floor) : (entryPrices.get(symbol) || executedPrice);
+              await armReboundTracker(symbol, executedPrice, refBase, {
+                retrace_pct:       pr.retrace_pct       || 50,
+                bounce_pct:        pr.bounce_pct        || 8,
+                buyback_floor_pct: pr.buyback_floor_pct || 5,
+                entry_floor:       pr.entry_floor       || null
+              });
+              console.log('[trough] ' + coinBase + ' pump-loop sell: trough tracker armed (50%%-of-move gate)');
+              usedTroughTracker = true;
+              created = true;
+            }
+          } catch (e) { console.error('[trough] cascade armReboundTracker error:', e.message); }
+
+          if (!usedTroughTracker) {
+            buyRules = await enforceMax(buyRules, MAX_BUY, 'buy');
+            await db.execute(
+              'INSERT INTO auto_trade_rules (symbol, rule_type, trigger_price, direction, order_type, volume, volume_type, source, exchange, cascade_count, max_cascades, cascade_parent_id, proceeds_reserved) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+              [symbol, 'buy_retrace', newBuyPrice, 'below', 'buy', cascadeVol, cascadeVolType, 'cascade', cascadeExchange, 0, maxCascades, rule.id, availableForBuyback]
+            );
+            console.log('[cascade] Buy-back created @ $' + newBuyPrice.toFixed(6) + ' with $' + availableForBuyback.toFixed(2) + ' ringfenced');
+            created = true;
+          }
         }
       }
 
