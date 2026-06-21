@@ -9953,7 +9953,7 @@ function createMcpServer() {
   server.tool('manage_alerts',
     'Set or manage all alert types — fixed price targets, daily thresholds, trailing stops, acknowledge, ignore or unignore coins',
     {
-      action:        z.enum(['set_target', 'set_threshold', 'set_trailing', 'acknowledge', 'ignore', 'unignore', 'remove_trailing', 'remove_target', 'remove_threshold']).describe('What alert action to perform'),
+      action:        z.enum(['set_target', 'set_threshold', 'set_trailing', 'acknowledge', 'ignore', 'unignore', 'remove_trailing', 'remove_target', 'remove_threshold', 'clear_cooldown']).describe('What alert action to perform'),
       symbol:        z.string().describe('Trading pair e.g. NEAR-USD or NEAR'),
       direction:     z.enum(['up', 'down']).optional().describe('Alert direction for set_target'),
       threshold_pct: z.number().optional().describe('Percentage for set_target or set_threshold'),
@@ -10044,6 +10044,18 @@ function createMcpServer() {
         const hadThreshold = customThresholds[sym] !== undefined;
         await removeThreshold(sym);
         result = { ok: true, action: 'remove_threshold', symbol: sym, message: hadThreshold ? `Custom threshold removed for ${coinBase} — reverts to default` : `No custom threshold for ${coinBase} — any DB row cleared` };
+      } else if (action === 'clear_cooldown') {
+        // Clear the 24h alert cooldown for this coin so its targets can fire again immediately.
+        // Deletes recent macro_alerts_sent target rows + clears in-memory ack/reminder state.
+        const [delRes] = await db.execute(
+          "DELETE FROM macro_alerts_sent WHERE symbol = ? AND alert_type IN ('target','target_acknowledged') AND sent_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)",
+          [sym]
+        ).catch(() => [{ affectedRows: 0 }]);
+        alertState.acknowledged.delete(sym);
+        targetReminderCount.delete(sym);
+        if (activeFixedAlerts.has(sym)) { clearInterval(activeFixedAlerts.get(sym)); activeFixedAlerts.delete(sym); }
+        const cleared = (delRes && delRes.affectedRows != null) ? delRes.affectedRows : 0;
+        result = { ok: true, action: 'clear_cooldown', symbol: sym, rows_cleared: cleared, message: `Cooldown cleared for ${coinBase} (${cleared} alert row(s) removed) — targets can fire again on the next monitoring loop` };
       }
 
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
