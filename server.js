@@ -9099,8 +9099,8 @@ cron.schedule('30 3 * * *', backupDatabaseToDrive, { timezone: 'Europe/London' }
 //   }
 // }, { timezone: 'Europe/London' });
 
-// Check macro news every 5 minutes — free RSS + keyword scan; Claude called at most once per 2h
-cron.schedule('*/5 * * * *', checkMacroNews, { timezone: 'Europe/London' });
+// Check macro news every 5 minutes — TEMPORARILY DISABLED (repurpose later)
+// cron.schedule('*/5 * * * *', checkMacroNews, { timezone: 'Europe/London' });
 
 // Weekly rebalancing reminder — every Monday at 9:05 AM (after morning briefing)
 cron.schedule('5 9 * * 1', async () => {
