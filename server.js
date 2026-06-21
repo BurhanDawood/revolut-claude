@@ -7131,11 +7131,21 @@ async function autoExecuteSell(symbol, maxPct, analysis, confidence) {
       return;
     }
 
-    // #95 Stage 2 + #125: HARD ENTRY-FLOOR GUARD — never auto-sell below entry.
-    // Governed by dev_decision #3 (never-sell-below-entry). Source priority: pump_armed_rules.entry_floor, else entry_prices.entry_price.
+    // #95+#125+#45: HARD ENTRY-FLOOR GUARD — never auto-sell below entry or sell_floors config.
+    // Source priority: sell_floors config > pump_armed_rules.entry_floor > entry_prices.entry_price.
     try {
-      const [floorRows] = await db.execute('SELECT entry_floor FROM pump_armed_rules WHERE symbol = ? AND active = 1 LIMIT 1', [symbol]);
-      let entryFloor = floorRows.length && floorRows[0].entry_floor != null ? parseFloat(floorRows[0].entry_floor) : null;
+      // #45: sell_floors from ai_auto_execute config (highest priority)
+      let entryFloor = null;
+      try {
+        const [aeFloorRows] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'ai_auto_execute'");
+        const aeCfg = aeFloorRows.length ? JSON.parse(aeFloorRows[0].config_value) : {};
+        const cfgFloor = (aeCfg.sell_floors || {})[coinBase];
+        if (cfgFloor && parseFloat(cfgFloor) > 0) { entryFloor = parseFloat(cfgFloor); console.log('[auto-exec] #45 sell_floors floor ' + coinBase + ': $' + entryFloor); }
+      } catch (e) { /* ignore */ }
+      if (entryFloor === null) {
+        const [floorRows] = await db.execute('SELECT entry_floor FROM pump_armed_rules WHERE symbol = ? AND active = 1 LIMIT 1', [symbol]);
+        entryFloor = floorRows.length && floorRows[0].entry_floor != null ? parseFloat(floorRows[0].entry_floor) : null;
+      }
       if (entryFloor === null) {
         const [epRow] = await db.execute('SELECT entry_price FROM entry_prices WHERE symbol = ? OR symbol = ? LIMIT 1', [symbol, coinBase + '-USD']);
         if (epRow.length && epRow[0].entry_price != null && parseFloat(epRow[0].entry_price) > 0) entryFloor = parseFloat(epRow[0].entry_price);
@@ -7295,11 +7305,21 @@ async function autoExecuteKrakenSell(symbol, maxPct, analysis, confidence) {
       return;
     }
 
-    // #95 Stage 2 + #125: HARD ENTRY-FLOOR GUARD (Kraken path) — never auto-sell below entry.
-    // Governed by dev_decision #3 (never-sell-below-entry). Source priority: pump_armed_rules.entry_floor, else entry_prices.entry_price.
+    // #95+#125+#45: HARD ENTRY-FLOOR GUARD (Kraken path) — never auto-sell below entry or sell_floors config.
+    // Source priority: sell_floors config > pump_armed_rules.entry_floor > entry_prices.entry_price.
     try {
-      const [floorRows] = await db.execute('SELECT entry_floor FROM pump_armed_rules WHERE symbol = ? AND active = 1 LIMIT 1', [symbol]);
-      let entryFloor = floorRows.length && floorRows[0].entry_floor != null ? parseFloat(floorRows[0].entry_floor) : null;
+      // #45: sell_floors from ai_auto_execute config (highest priority)
+      let entryFloor = null;
+      try {
+        const [aeFloorRows] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'ai_auto_execute'");
+        const aeCfg = aeFloorRows.length ? JSON.parse(aeFloorRows[0].config_value) : {};
+        const cfgFloor = (aeCfg.sell_floors || {})[coinBase];
+        if (cfgFloor && parseFloat(cfgFloor) > 0) { entryFloor = parseFloat(cfgFloor); console.log('[auto-exec] #45 sell_floors floor ' + coinBase + ' (Kraken): $' + entryFloor); }
+      } catch (e) { /* ignore */ }
+      if (entryFloor === null) {
+        const [floorRows] = await db.execute('SELECT entry_floor FROM pump_armed_rules WHERE symbol = ? AND active = 1 LIMIT 1', [symbol]);
+        entryFloor = floorRows.length && floorRows[0].entry_floor != null ? parseFloat(floorRows[0].entry_floor) : null;
+      }
       if (entryFloor === null) {
         const [epRow] = await db.execute('SELECT entry_price FROM entry_prices WHERE symbol = ? OR symbol = ? LIMIT 1', [symbol, coinBase + '-USD']);
         if (epRow.length && epRow[0].entry_price != null && parseFloat(epRow[0].entry_price) > 0) entryFloor = parseFloat(epRow[0].entry_price);
@@ -10388,6 +10408,7 @@ function createMcpServer() {
       excluded_symbols:       z.array(z.string()).optional().describe('Symbols to exclude from sweep e.g. ["USDT-USD"] (configure_sweep)'),
       max_sell_pct:           z.number().optional().describe('Max % of position to sell per auto-exec trade (configure_auto_execute)'),
       max_buy_usd:            z.number().optional().describe('Max USD to spend per auto-exec buy (configure_auto_execute)'),
+      sell_floors:            z.record(z.number()).optional().describe('Per-coin min sell price map e.g. {"NEAR":1.87} -- auto-sell blocked if price <= floor (#45, configure_auto_execute)'),
       away_action:            z.enum(['set_eligible','activate','deactivate','status','set_away_buy']).optional().describe('configure_away_mode: which away-mode operation'),
       away_coins:             z.array(z.string()).optional().describe('configure_away_mode: coin list for set_eligible / activate'),
       allowed_triggers:       z.array(z.string()).optional().describe('Alert types that can trigger auto-exec: trailing_stop, fixed_target, pump_alert'),
@@ -10425,7 +10446,7 @@ function createMcpServer() {
       journal_id:           z.number().optional().describe('void_journal: trading_journal row id to archive + delete'),
       tax_lot_id:           z.coerce.number().optional().describe('delete_tax_lot: tax_lots.id row to read and hard-delete'),
     },
-    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, max_buy_usd, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam, title, detail, category, status: devStatus, source: devSource, related_symbol: relSymbol, dev_log_id, active_workstream, progress, open_threads, next_action, recent_decision, recent_decisions, cs_status, cs_role, cs_theme, cs_strategy_md, pm_decision, pm_principle_tag, pm_conviction, pm_captured_by, pm_supersedes_id, dev_decision, dev_principle_tag, dev_cross_thread, dev_alternatives, dev_related_log, dev_supersedes_id, journal_id, tax_lot_id, away_action, away_coins }) => {
+    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, max_buy_usd, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam, title, detail, category, status: devStatus, source: devSource, related_symbol: relSymbol, dev_log_id, active_workstream, progress, open_threads, next_action, recent_decision, recent_decisions, cs_status, cs_role, cs_theme, cs_strategy_md, pm_decision, pm_principle_tag, pm_conviction, pm_captured_by, pm_supersedes_id, dev_decision, dev_principle_tag, dev_cross_thread, dev_alternatives, dev_related_log, dev_supersedes_id, journal_id, tax_lot_id, away_action, away_coins, sell_floors }) => {
       // Make hodl_symbols accessible in configure_auto_execute via params object
       const params = { hodl_symbols: hodlSymbolsParam };
 
@@ -10604,6 +10625,7 @@ function createMcpServer() {
           require_confidence: require_confidence || existingCfg.require_confidence || 'High',
           cooldown_minutes: cooldown_minutes || existingCfg.cooldown_minutes || 60,
           hodl_symbols: params?.hodl_symbols ?? existingCfg.hodl_symbols ?? defaultHodl,
+          sell_floors: sell_floors ?? existingCfg.sell_floors ?? {}, // #45 preserved across updates
           updated_at: new Date().toISOString()
         };
         // Always saves to system_config — NOT trader_profile
