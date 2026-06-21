@@ -10054,8 +10054,11 @@ function createMcpServer() {
         alertState.acknowledged.delete(sym);
         targetReminderCount.delete(sym);
         if (activeFixedAlerts.has(sym)) { clearInterval(activeFixedAlerts.get(sym)); activeFixedAlerts.delete(sym); }
+        // Also clear the 1h away-buy analysis cooldown so an away-active coin can re-analyse immediately.
+        analysisRateLimit.delete('awaybuy_' + sym);
+        analysisRateLimit.delete(sym);
         const cleared = (delRes && delRes.affectedRows != null) ? delRes.affectedRows : 0;
-        result = { ok: true, action: 'clear_cooldown', symbol: sym, rows_cleared: cleared, message: `Cooldown cleared for ${coinBase} (${cleared} alert row(s) removed) — targets can fire again on the next monitoring loop` };
+        result = { ok: true, action: 'clear_cooldown', symbol: sym, rows_cleared: cleared, message: `Cooldown cleared for ${coinBase} (${cleared} alert row(s) removed; analysis cooldowns reset) — targets can fire again on the next monitoring loop` };
       }
 
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
