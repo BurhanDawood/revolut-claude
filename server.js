@@ -3654,12 +3654,110 @@ async function runFastScan() {
         if (!ttResult) continue;
         const ttBase = ttSymbol.replace('-USD', '');
         if (ttResult.action === 'buy') {
+          const t = troughTrackers.get(ttSymbol);
           console.log('[trough] ' + ttBase + ' BUY SIGNAL: trough ' + ttResult.trough + ' bounced to ' + ttPrice);
+
+          // Pre-flight: need saleProceedsUsd to size the rebuy
+          if (!t || !(t.saleProceedsUsd > 0)) {
+            console.error('[trough] ' + ttBase + ' BUY signal but no saleProceedsUsd in tracker -- cannot execute');
+            await sendTelegram(
+              '<b>[#130 TROUGH BUY signal] ' + ttBase + '</b>\n\n' +
+              'Bounce confirmed but no rebuy size stored (legacy tracker?). Manual rebuy needed.'
+            ).catch(() => {});
+            await clearTroughTracker(ttSymbol);
+            continue;
+          }
+          const buyUsd = t.saleProceedsUsd;
+
+          // GATE 1: master auto-exec ON
+          let masterOn = false;
+          try {
+            const [cfgR] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'ai_auto_execute'");
+            if (cfgR.length) masterOn = JSON.parse(cfgR[0].config_value).enabled === true;
+          } catch (e) { masterOn = false; }
+          if (!masterOn) {
+            await sendTelegram(
+              '<b>[#130 TROUGH BUY signal] ' + ttBase + '</b>\n\n' +
+              'Bounce confirmed @ $' + ttPrice + ' (trough $' + ttResult.trough.toFixed(8) + ', rebuy $' + buyUsd.toFixed(2) + ').\n' +
+              'Master auto-exec OFF -- not buying. Tracker cleared, manual rebuy if desired.'
+            ).catch(() => {});
+            console.log('[trough] ' + ttBase + ' GATE 1 fail: master auto-exec OFF');
+            await clearTroughTracker(ttSymbol);
+            continue;
+          }
+
+          // GATE 2: pump_armed_rules.loop_enabled = 1
+          let loopEnabled = false;
+          try {
+            const [lpR] = await db.execute('SELECT loop_enabled FROM pump_armed_rules WHERE symbol = ? AND active = 1 LIMIT 1', [ttSymbol]);
+            if (lpR.length) loopEnabled = parseInt(lpR[0].loop_enabled) === 1;
+          } catch (e) { loopEnabled = false; }
+          if (!loopEnabled) {
+            await sendTelegram(
+              '<b>[#130 TROUGH BUY signal] ' + ttBase + '</b>\n\n' +
+              'Bounce confirmed @ $' + ttPrice + ' but loop_enabled=0 -- not buying. Tracker cleared.'
+            ).catch(() => {});
+            console.log('[trough] ' + ttBase + ' GATE 2 fail: loop_enabled=0');
+            await clearTroughTracker(ttSymbol);
+            continue;
+          }
+
+          // GATE 3: sufficient USD on revolut
+          const availUsd = await getAvailableUSD('revolut');
+          if (availUsd < buyUsd) {
+            await sendTelegram(
+              '<b>[#130 TROUGH BUY signal] ' + ttBase + '</b>\n\n' +
+              'Bounce confirmed but insufficient USD: have $' + availUsd.toFixed(2) + ', need $' + buyUsd.toFixed(2) + '. Tracker cleared -- manual rebuy.'
+            ).catch(() => {});
+            console.log('[trough] ' + ttBase + ' GATE 3 fail: USD ' + availUsd + ' < ' + buyUsd);
+            await clearTroughTracker(ttSymbol);
+            continue;
+          }
+
+          // ALL GATES PASS -- clear tracker BEFORE placeRevolutOrder (Map.delete is sync; prevents double-fire on race/crash)
+          await clearTroughTracker(ttSymbol);
+
+          // Execute the buy
+          let buyQty = null;
+          try {
+            const orderResp = await placeRevolutOrder(ttSymbol, 'buy', 'market', null, null, buyUsd);
+            buyQty = buyUsd / ttPrice;
+            console.log('[trough] ' + ttBase + ' EXECUTED auto-buy $' + buyUsd.toFixed(2) + ' @ ~' + ttPrice + ' qty ~' + buyQty.toFixed(6) + ' (order ' + (orderResp && orderResp.id ? orderResp.id : 'n/a') + ')');
+          } catch (e) {
+            console.error('[trough] ' + ttBase + ' placeRevolutOrder failed: ' + e.message);
+            await sendTelegram(
+              '<b>[#130 TROUGH BUY FAILED] ' + ttBase + '</b>\n\n' +
+              'placeRevolutOrder error: ' + (e.message || '').substring(0,100) + '\nTracker already cleared. Manual rebuy if desired.'
+            ).catch(() => {});
+            continue;
+          }
+
+          // Journal the buy (best-effort -- not awaited on failure path)
+          try {
+            await db.execute(
+              'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+              [ttBase, 'buy', ttPrice, buyQty, buyUsd, '#130 trough auto-rebuy -- trough $' + ttResult.trough.toFixed(8) + ' bounced ' + t.bouncePct + '% to $' + ttPrice + ' (sell was $' + t.salePrice + ')', 'neutral', 'trough_auto']
+            );
+          } catch (e) { console.error('[trough] journal write failed:', e.message); }
+
+          // Re-arm pump loop for next cycle via synthetic rule (rearmPumpLoopAfterBuyback handles guards + circuit breaker)
+          try {
+            const synthRule = {
+              symbol: ttSymbol,
+              order_type: 'buy',
+              source: 'cascade',
+              volume: buyQty,
+              proceeds_reserved: buyUsd
+            };
+            await rearmPumpLoopAfterBuyback(synthRule, ttPrice);
+          } catch (e) { console.error('[trough] rearmPumpLoopAfterBuyback failed:', e.message); }
+
+          // Confirmation Telegram
           await sendTelegram(
-            '<b>[#130 TROUGH BUY] ' + ttBase + '</b>\n\n' +
-            'Trough: $' + ttResult.trough.toFixed(8) + '\n' +
-            'Current: $' + ttPrice.toFixed(8) + '\n' +
-            'Bounce confirmed + above floor. Buy execution wiring in Phase C.'
+            '<b>[#130 AUTO-BOUGHT] ' + ttBase + '</b>\n\n' +
+            '$' + buyUsd.toFixed(2) + ' @ ~$' + ttPrice + ' (~' + buyQty.toFixed(6) + ' ' + ttBase + ')\n' +
+            'Trough was $' + ttResult.trough.toFixed(8) + ', bounced +' + t.bouncePct + '%.\n' +
+            'Sell was $' + t.salePrice + '. Round-trip complete.'
           ).catch(() => {});
         } else if (ttResult.action === 'alert') {
           console.log('[trough] ' + ttBase + ' FLOOR BREACH: trough ' + ttResult.trough + ' below rebuyFloor ' + ttResult.rebuyFloor);
