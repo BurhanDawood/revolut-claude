@@ -10562,7 +10562,7 @@ function createMcpServer() {
   server.tool('manage_auto_rules',
     'Manage automatic trade rules — list, remove, disable or enable a rule by ID',
     {
-      action:  z.enum(['list', 'remove', 'disable', 'enable']).describe('Action to perform'),
+      action:  z.enum(['list', 'remove', 'disable', 'enable', 'pump_status']).describe('Action to perform'),
       rule_id: z.number().optional().describe('Rule ID to remove, disable or enable'),
     },
     async ({ action, rule_id }) => {
@@ -10570,6 +10570,10 @@ function createMcpServer() {
         if (action === 'list') {
           const [rules] = await db.execute('SELECT * FROM auto_trade_rules ORDER BY created_at DESC');
           return { content: [{ type: 'text', text: JSON.stringify({ rules, active: rules.filter(r => r.active) }, null, 2) }] };
+        }
+        if (action === 'pump_status') {
+          const [prules] = await db.execute('SELECT * FROM pump_armed_rules ORDER BY symbol');
+          return { content: [{ type: 'text', text: JSON.stringify({ pump_armed_rules: prules, count: prules.length }, null, 2) }] };
         }
         if (action === 'remove' && rule_id) {
           const [existing] = await db.execute('SELECT * FROM auto_trade_rules WHERE id = ?', [rule_id]);
