@@ -11003,8 +11003,25 @@ function createMcpServer() {
         const key = rawSym.includes('-USD') ? rawSym.toUpperCase() : `${rawSym.toUpperCase()}-USD`;
         const coinBase = key.replace('-USD', '');
         try {
-          const pending = pendingTradeContext.get(key);
-          if (!pending) { results.push({ symbol: coinBase, type: r && r.type, status: 'error', detail: `no pending trade for ${coinBase}` }); continue; }
+          let pending = pendingTradeContext.get(key);
+          if (!pending) {
+            // #124: no in-memory pending — check for a recent auto-logged journal row to patch instead
+            try {
+              const [recentRows] = await db.execute(
+                "SELECT id, price, quantity, value_usd FROM trading_journal WHERE symbol = ? AND action IN ('buy','sell','add','reduce') AND source IN ('auto_detected','limit_fill') AND created_at > DATE_SUB(NOW(), INTERVAL 60 MINUTE) ORDER BY created_at DESC LIMIT 1",
+                [key]
+              );
+              if (recentRows.length > 0) {
+                const rr = recentRows[0];
+                pending = { journalId: rr.id, price: parseFloat(rr.price), qty: parseFloat(rr.quantity || 0), valueUsd: Math.abs(parseFloat(rr.value_usd || 0)), fromFallback: true };
+                console.log('[resolve] #124 fallback: patching auto-logged journal row ' + rr.id + ' for ' + coinBase);
+              } else {
+                results.push({ symbol: coinBase, type: r && r.type, status: 'error', detail: 'no pending trade and no recent auto-logged row for ' + coinBase + ' (60min window)' }); continue;
+              }
+            } catch (e) {
+              results.push({ symbol: coinBase, type: r && r.type, status: 'error', detail: 'no pending trade for ' + coinBase + ' (fallback lookup failed: ' + e.message + ')' }); continue;
+            }
+          }
           const type = r.type;
           if (!type) { results.push({ symbol: coinBase, status: 'error', detail: 'type is required' }); continue; }
           clearTimeout(pending.timeoutHandle);
