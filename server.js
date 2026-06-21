@@ -556,6 +556,7 @@ const alertContextBySymbol = new Map();      // coinBase.toLowerCase() -> { symb
 let lastAlertCoin = null;                    // most recently fired alert coin (lowercase) — used for plain number replies
 let lastKnownUSDT  = null;                   // USDT at start of current cycle — set once on startup from live balance
 let lastKnownUSD   = null;                   // USD at start of current cycle — used to detect USDT→USD conversions
+let pendingFiatWithdrawal = null;             // #136: USD drop parked 1 cycle to detect USD→USDT timing gap (Revolut API eventual consistency)
 let previousBTCPrice = null;                 // BTC price from last checkPortfolio cycle — used for key-level crossing alerts
 const ruleApproachAlerted = new Map();       // ruleId -> timestamp — tracks 2% approach alerts so they don't spam
 let mostRecentSwingAlert = null;             // { symbol, coinBase, direction, price, timestamp } — for 👍 / natural language
@@ -7812,6 +7813,33 @@ async function checkPortfolio() {
         const decrease    = lastKnownUSDT - currentUSDT;
         const usdIncrease = currentUSD - (lastKnownUSD ?? currentUSD);
 
+        // #136: resolve any USD drop parked from the previous cycle
+        if (pendingFiatWithdrawal !== null) {
+          const earlyUsdtInc = currentUSDT - (lastKnownUSDT ?? currentUSDT);
+          if (earlyUsdtInc > 0 && Math.abs(pendingFiatWithdrawal - earlyUsdtInc) / pendingFiatWithdrawal < 0.10) {
+            // USDT offset arrived this cycle — it was a USD→USDT conversion all along
+            console.log('[withdrawal] #136 Parked $' + pendingFiatWithdrawal.toFixed(2) + ' USD drop offset by USDT +$' + earlyUsdtInc.toFixed(2) + ' — USD→USDT conversion confirmed, no withdrawal');
+            pendingFiatWithdrawal = null;
+          } else {
+            // No USDT offset after a full 5-min cycle — genuine fiat withdrawal
+            const w = pendingFiatWithdrawal;
+            pendingFiatWithdrawal = null;
+            console.log('[withdrawal] #136 Parked $' + w.toFixed(2) + ' confirmed as genuine withdrawal — auto-logging now');
+            await db.execute(
+              'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+              ['USD', 'payment', 1.00, w, w, 'Auto-logged fiat withdrawal — $' + w.toFixed(2) + ' USD left account (#136 1-cycle delay)', 'neutral', 'fiat_withdrawal']
+            ).catch(() => {});
+            const prevCapW2 = totalInvestedCapital;
+            const newCapW2  = totalInvestedCapital - w;
+            await updateInvestedCapital(newCapW2, 'Fiat withdrawal auto-logged: -$' + w.toFixed(2));
+            await sendTelegram(
+              '💸 WITHDRAWAL $' + w.toFixed(2) + ' USD\n' +
+              'Capital: $' + prevCapW2.toFixed(2) + ' → $' + newCapW2.toFixed(2) + '\n\n' +
+              "Tap '<b>skip payment " + w.toFixed(2) + "</b>' if not a withdrawal."
+            ).catch(() => {});
+          }
+        }
+
         if (decrease > 0.10) {
           console.log(`[usdt] USDT -$${decrease.toFixed(2)} | USD ${usdIncrease >= 0 ? '+' : ''}$${usdIncrease.toFixed(2)}`);
 
@@ -7984,22 +8012,12 @@ async function checkPortfolio() {
             if (dupe86.length > 0) {
               console.log('[withdrawal] Duplicate/handled cash move — skipping flag');
             } else {
-              // #63: auto-log fiat withdrawal + decrement capital (mirrors #107 card payment pattern)
-              console.log(`[withdrawal] USD -$${usdDecrease.toFixed(2)} — auto-logging as fiat withdrawal`);
-              await db.execute(
-                `INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-                ['USD', 'payment', 1.00, usdDecrease, usdDecrease,
-                 `Auto-logged fiat withdrawal — $${usdDecrease.toFixed(2)} USD left account`, 'neutral', 'fiat_withdrawal']
-              ).catch(() => {});
-              const prevCapW = totalInvestedCapital;
-              const newCapW  = totalInvestedCapital - usdDecrease;
-              await updateInvestedCapital(newCapW, `Fiat withdrawal auto-logged: -$${usdDecrease.toFixed(2)}`);
-              await sendTelegram(
-                `💸 WITHDRAWAL $${usdDecrease.toFixed(2)} USD\n` +
-                `Capital: $${prevCapW.toFixed(2)} → $${newCapW.toFixed(2)}\n\n` +
-                `Tap '<b>skip payment ${usdDecrease.toFixed(2)}</b>' if not a withdrawal.`
-              ).catch(() => {});
+              // #136: park for 1 cycle instead of firing immediately
+              // Revolut API can be eventually-consistent on USD→USDT conversions:
+              // USD debit shows in this poll; USDT credit may only appear next poll (5 min later).
+              // The pending check at cycle start (above) will fire or clear this next cycle.
+              console.log('[withdrawal] #136 USD -$' + usdDecrease.toFixed(2) + ' — parked 1 cycle to await USDT offset');
+              pendingFiatWithdrawal = usdDecrease;
             } // end limit-reserve guard (#127)
             }
           }
