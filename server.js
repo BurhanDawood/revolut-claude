@@ -264,6 +264,185 @@ async function tryAwayAutoSellUpTarget(symbol, coinBase, currentPrice, changePct
     return false;
   }
 }
+
+// #125 Phase 2c — Away Mode analyse-and-buy on down-target. Triple-gated: master enabled AND isAwayActionable AND LLM High-confidence BUY.
+// Below-entry buys ARE allowed (deliberate buybacks) — does NOT apply the cascade below-95%-entry guard. Returns true if handled (caller skips menu).
+async function tryAwayAnalyseBuyDownTarget(symbol, coinBase, currentPrice, changePct, target, entryPrice) {
+  try {
+    // GATE 1: master auto-exec enabled
+    const [aeRows] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'ai_auto_execute'");
+    const ae = aeRows.length ? JSON.parse(aeRows[0].config_value) : {};
+    if (ae.enabled !== true) return false;
+    // GATE 2: this coin is away-active
+    if (!(await isAwayActionable(coinBase))) return false;
+    // v1 scope: Revolut-only. Kraken away-buys deferred — notify and leave armed.
+    if (KRAKEN_MONITORED_COINS.includes(symbol)) {
+      await sendTelegram(`AWAY \u2014 ${coinBase} down-target hit but Kraken away-buys are not enabled yet. Left armed \u2014 your call when back.`).catch(() => {});
+      return true;
+    }
+    // Per-symbol analysis cooldown (1h) so we don't re-analyse every 5-min loop while the rung sits armed
+    const ONE_HOUR = 60 * 60 * 1000;
+    const lastA = analysisRateLimit.get('awaybuy_' + symbol);
+    if (lastA && Date.now() - lastA < ONE_HOUR) {
+      console.log('[away-buy] ' + coinBase + ' analysis cooldown active \u2014 leaving armed, no re-analyse');
+      return true;
+    }
+    analysisRateLimit.set('awaybuy_' + symbol, Date.now());
+
+    // Load away config + per-coin buy size
+    const [amR] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'away_mode'");
+    const am = amR.length ? JSON.parse(amR[0].config_value) : {};
+    const buyMap = am.away_buy_usd || {};
+    const buyUsd = parseFloat(buyMap[coinBase] ?? 0);
+    if (!(buyUsd > 0)) {
+      await sendTelegram(`AWAY \u2014 ${coinBase} hit buy level ${formatPrice(target.targetPrice)} but no away_buy_usd size is set for it. Left armed \u2014 set a size or buy manually.`).catch(() => {});
+      return true;
+    }
+    // Session buy cap
+    const buyCap = parseFloat(am.max_session_buy_usd ?? 200);
+    const bought = parseFloat(am.session_bought_usd ?? 0);
+    if (bought + buyUsd > buyCap) {
+      await sendTelegram(`AWAY CAP \u2014 ${coinBase}: buy level hit but session buy cap reached ($${bought.toFixed(2)}/$${buyCap.toFixed(2)}). Left armed \u2014 your call when back.`).catch(() => {});
+      console.log('[away-buy] session cap reached ' + coinBase + ': ' + bought + '+' + buyUsd + ' > ' + buyCap);
+      return true;
+    }
+
+    // Build BUY-oriented plan-aware analysis
+    const [recentTrades] = await db.execute(
+      "SELECT action, price, quantity, value_usd, reasoning, emotion, outcome_pnl, created_at FROM trading_journal WHERE symbol = ? AND action NOT IN ('payment','transfer') ORDER BY created_at DESC LIMIT 5",
+      [coinBase]
+    ).catch(() => [[]]);
+    const journalContext = recentTrades.length > 0
+      ? recentTrades.map(t => {
+          const date = new Date(t.created_at).toLocaleDateString('en-GB');
+          const pnl = t.outcome_pnl ? ' | P&L: ' + (parseFloat(t.outcome_pnl) > 0 ? '+' : '') + '$' + parseFloat(t.outcome_pnl).toFixed(2) : '';
+          return date + ': ' + t.action.toUpperCase() + ' @ $' + parseFloat(t.price).toFixed(6) + pnl + '\n  Reason: ' + (t.reasoning || 'none');
+        }).join('\n')
+      : 'No recent trades';
+
+    let planContext = 'No saved plan exists for this coin.';
+    try {
+      const [csRows] = await db.execute('SELECT status, role, theme, strategy_md FROM coin_strategy WHERE symbol = ? LIMIT 1', [coinBase]);
+      if (csRows.length) {
+        const cs = csRows[0];
+        const md = (cs.strategy_md || '').length > 1200 ? cs.strategy_md.slice(0, 1200) + '\u2026' : (cs.strategy_md || '');
+        planContext = 'Status: ' + (cs.status || 'n/a') + ' | Role: ' + (cs.role || 'n/a') + ' | Theme: ' + (cs.theme || 'n/a') + '\nStrategy notes:\n' + (md || 'none');
+      }
+    } catch (e) { /* plan load best-effort */ }
+
+    let liveBtc = null;
+    try { liveBtc = await getCurrentPrice('BTC-USD').catch(() => null); } catch (e) { liveBtc = null; }
+    const btcLine = liveBtc ? '$' + Math.round(liveBtc).toLocaleString() : 'unavailable';
+
+    const awayBuySystemPrompt =
+"You are a disciplined swing trader's AI assistant, deciding whether to AUTONOMOUSLY BUY a pre-set dip rung while the trader is AWAY and unreachable. This is real money with no human in the loop, so the bar to act is HIGH.\n\n" +
+"## DECISION RULES (in priority order)\n" +
+"1. DEFAULT TO HOLD. Only return BUY if the saved plan explicitly names THIS price as a planned buy/add level AND the conditions in the rung's note (if any) are satisfied.\n" +
+"2. BTC STRUCTURE IS DECISIVE. If BTC is breaking down, losing a major support, or in a risk-off cascade right now, return HOLD even at a named buy level \u2014 a falling knife is not a dip. Weight this heavily.\n" +
+"3. HONOUR THE RUNG NOTE conditions exactly. If a stated condition is not clearly met, return HOLD.\n" +
+"4. NEVER invent catalysts, partnerships, fundamentals, or price levels not present in the saved plan or trade history.\n" +
+"5. This is a BUY-only decision. Never recommend SELL. Valid outputs are BUY (act), HOLD (named level but conditions not met / wait), or WAIT (no clear named level).\n" +
+"6. Require genuine conviction for High confidence. If anything is ambiguous \u2014 unclear BTC tape, vague note, price not precisely at a named level \u2014 confidence is Medium or Low, which means NO buy fires.\n\n" +
+"Respond in exactly this format:\n" +
+"RECOMMENDATION: [BUY / HOLD / WAIT]\n" +
+"REASON: [one clear sentence grounded in the saved plan, rung note, and BTC structure]\n" +
+"CONFIDENCE: [High/Medium/Low]";
+
+    const awayBuyUserMsg =
+"## SAVED PLAN for " + coinBase + " (PRIMARY AUTHORITY)\n" + planContext + "\n\n" +
+"## BUY LEVEL HIT \u2014 " + coinBase + "\n" +
+"Target (buy) price: " + formatPrice(target.targetPrice) + "\n" +
+"Current price: " + formatPrice(currentPrice) + "\n" +
+"Entry price: " + (entryPrice ? formatPrice(entryPrice) : 'unknown') + "\n" +
+"Move from anchor: " + changePct.toFixed(1) + "%\n" +
+(target.note ? "Rung note: " + target.note + "\n" : "") +
+"\n## LIVE BTC PRICE\n" + btcLine + "\n\n" +
+"## LAST 5 TRADES FOR " + coinBase + "\n" + journalContext;
+
+    let analysis = null;
+    try {
+      const claudeCall = anthropic.messages.create({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 250,
+        system: [{ type: 'text', text: awayBuySystemPrompt, cache_control: { type: 'ephemeral' } }],
+        messages: [{ role: 'user', content: awayBuyUserMsg }]
+      });
+      const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('away-buy analysis timeout 30s')), 30000));
+      const msg = await Promise.race([claudeCall, timeoutPromise]);
+      await logClaudeCall('away-buy analysis (' + coinBase + ')', msg.model || 'claude-sonnet-4-6', msg.usage).catch(() => {});
+      analysis = msg.content?.[0]?.text || null;
+    } catch (e) {
+      console.error('[away-buy] analysis call failed for ' + coinBase + ': ' + e.message);
+      await sendTelegram(`AWAY \u2014 ${coinBase} buy level hit but analysis failed (${e.message.substring(0,80)}). Left armed \u2014 manual review.`).catch(() => {});
+      return true;
+    }
+    if (!analysis) {
+      await sendTelegram(`AWAY \u2014 ${coinBase} buy level hit but analysis returned empty. Left armed \u2014 manual review.`).catch(() => {});
+      return true;
+    }
+
+    // Parse recommendation + confidence (same regex family as the trailing-stop gate)
+    const recMatch = /RECOMMENDATION:\s*(.+)/i.exec(analysis);
+    const confMatch = /CONFIDENCE:\s*(High|Medium|Low)/i.exec(analysis);
+    const rec = recMatch ? recMatch[1].trim().toUpperCase() : '';
+    const conf = confMatch ? confMatch[1].trim() : '';
+    const requireConf = ae.require_confidence || 'High';
+
+    // GATE 3: High-confidence BUY only
+    const isBuy = /\bBUY\b/.test(rec) && !/DON'?T BUY|DO NOT BUY|NOT? BUY/.test(rec);
+    if (!(conf === requireConf && isBuy)) {
+      await sendTelegram(
+        `\ud83e\udde0 AWAY \u2014 ${coinBase} buy level ${formatPrice(target.targetPrice)} analysed, held off.\n\n` +
+        `${analysis}\n\n` +
+        `Left armed \u2014 will re-evaluate. Buy manually if you disagree.`
+      ).catch(() => {});
+      console.log('[away-buy] ' + coinBase + ' gate fail (conf=' + conf + ' rec=' + rec + ') \u2014 left armed');
+      return true;
+    }
+
+    // GATE PASS: check available USD then BUY
+    const availUsd = await getAvailableUSD('revolut');
+    if (availUsd < buyUsd) {
+      await sendTelegram(`AWAY \u2014 ${coinBase} High-confidence BUY but only $${availUsd.toFixed(2)} USD available (need $${buyUsd.toFixed(2)}). Left armed \u2014 your call when back.`).catch(() => {});
+      console.log('[away-buy] ' + coinBase + ' insufficient USD: ' + availUsd + ' < ' + buyUsd);
+      return true;
+    }
+
+    // Place the market buy (USD-sized). Below-entry allowed by design.
+    let buyQty = null;
+    try {
+      const orderResp = await placeRevolutOrder(symbol, 'buy', 'market', null, null, buyUsd);
+      buyQty = buyUsd / currentPrice; // approximate fill qty for the journal
+      console.log('[away-buy] EXECUTED ' + coinBase + ' buy $' + buyUsd.toFixed(2) + ' @ ~' + currentPrice + ' (order ' + (orderResp?.id || 'n/a') + ')');
+    } catch (e) {
+      console.error('[away-buy] placeRevolutOrder failed for ' + coinBase + ': ' + e.message);
+      await sendTelegram(`AWAY \u2014 ${coinBase} buy ORDER FAILED (${e.message.substring(0,80)}). Left armed \u2014 manual review.`).catch(() => {});
+      return true;
+    }
+
+    // Journal the buy (source away_auto) + update session counter
+    await db.execute(
+      'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      [coinBase, 'buy', currentPrice, buyQty, buyUsd, 'AWAY MODE auto-buy \u2014 ' + coinBase + ' hit pre-set buy level ' + formatPrice(target.targetPrice) + ' (High-confidence). ' + (analysis.split('\n')[0] || ''), 'neutral', 'away_auto']
+    ).catch(() => {});
+    am.session_bought_usd = bought + buyUsd;
+    await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('away_mode', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)", [JSON.stringify(am)]).catch(() => {});
+
+    await sendTelegram(
+      `\ud83e\udd16 AWAY MODE \u2014 AUTO-BOUGHT ${coinBase}\n\n` +
+      `$${buyUsd.toFixed(2)} @ ~${formatPrice(currentPrice)} (buy level ${formatPrice(target.targetPrice)})\n` +
+      `Session bought: $${am.session_bought_usd.toFixed(2)}/$${buyCap.toFixed(2)}\n\n` +
+      `${analysis.split('\n').slice(0,2).join('\n')}\n\n` +
+      `Reply 'skip payment ${buyUsd.toFixed(2)}' is NOT applicable \u2014 this was a buy. Adjust manually if needed.`
+    ).catch(() => {});
+    console.log('[away-buy] ' + coinBase + ' auto-bought $' + buyUsd.toFixed(2) + '; session $' + am.session_bought_usd.toFixed(2) + '/$' + buyCap);
+    return true;
+  } catch (e) {
+    console.error('[away-buy] error (no buy):', e.message);
+    return false;
+  }
+}
+
 async function isAwayActionable(coinBase) {
   try {
     const [rows] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'away_mode'");
@@ -8149,6 +8328,11 @@ async function checkPortfolio() {
         const dnDescLine = (target.note && !noteData) ? `\n📝 <i>${target.note}</i>` : '';
         const dnWickLine = (currentPrice > target.targetPrice) ? `\n⚡ Wick trigger: low ${formatPrice(effLow)} touched your floor between checks — price has bounced since` : '';
 
+        // #125 Phase 2c — away-mode analyse-and-buy before building the menu; skip menu if handled (leave armed on gate-fail)
+        if (await tryAwayAnalyseBuyDownTarget(symbol, coinBase, currentPrice, changePct, target, entryPrice)) {
+          targetExtremes.delete(symbol);
+          continue;
+        }
         if (noteData && noteData.source === 'claude_rec') {
           // Enhanced message: this was auto-set from Bryan's thumbs-up on a recommendation
           const assetBalance = balances.find(a => a.currency === coinBase);
