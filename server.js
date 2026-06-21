@@ -10862,12 +10862,12 @@ function createMcpServer() {
     'Set a pump-armed trailing stop rule (#95 Stage 1). Dormant until the coin pumps arm_pump_pct within arm_window_min, then arms a trailing stop. Stage 1 only arms + alerts — does NOT auto-sell.',
     {
       symbol:         z.string().describe('Trading pair e.g. GHIBLI-USD'),
-      arm_pump_pct:   z.number().describe('Pump %% that arms the trailing stop (e.g. 25 = +25%)'),
-      trail_pct:      z.number().describe('Trailing stop %% below peak once armed (e.g. 8)'),
-      sell_pct:       z.number().optional().describe('%% of position to sell when trail breaches (Stage 2 — stored now, default 50)'),
-      entry_floor:    z.number().optional().describe('Never sell below this price (the hard floor; Stage 2)'),
-      arm_window_min: z.number().optional().describe('Window in minutes for the pump to count (default 60)'),
-      rebuy_pct:      z.number().optional().describe('Retrace %% below sale price to place rebuy (default 8). e.g. 70 = buy back 70%% below the auto-sell price'),
+      arm_pump_pct:   z.coerce.number().describe('Pump %% that arms the trailing stop (e.g. 25 = +25%)'),
+      trail_pct:      z.coerce.number().describe('Trailing stop %% below peak once armed (e.g. 8)'),
+      sell_pct:       z.coerce.number().optional().describe('%% of position to sell when trail breaches (Stage 2 — stored now, default 50)'),
+      entry_floor:    z.coerce.number().optional().describe('Never sell below this price (the hard floor; Stage 2)'),
+      arm_window_min: z.coerce.number().optional().describe('Window in minutes for the pump to count (default 60)'),
+      rebuy_pct:      z.coerce.number().optional().describe('Retrace %% below sale price to place rebuy (default 8). e.g. 70 = buy back 70%% below the auto-sell price'),
     },
     async ({ symbol, arm_pump_pct, trail_pct, sell_pct, entry_floor, arm_window_min, rebuy_pct }) => {
       try {
