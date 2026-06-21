@@ -567,6 +567,7 @@ const trailingStopAlerted = new Map();       // symbol -> timestamp — tracks r
 const fastScanLastPrice  = new Map();         // #94: symbol -> last price seen by fast scan (dedup — skip if unchanged)
 const pendingAnalysis = new Map();           // symbol -> { type, recommendation, analysis, price, timestamp }
 const analysisRateLimit = new Map();         // symbol -> timestamp of last Claude analysis (rate-limit: 1/hr)
+const troughTrackers = new Map();            // #130: symbol -> trough tracker state
 const pendingUndo = new Map();               // symbol -> { action, qty, price, timestamp } — 2-min undo window after AI auto-exec
 let pendingKrakenTrade = null;               // { symbol, side, orderType, volume, price, valueUSD } — awaiting Telegram approval
 let pendingRevolutTrade = null;             // { symbol, side, orderType, baseSize, price, valueUSD } — awaiting Telegram approval
@@ -1037,6 +1038,11 @@ await safeAddColumn('pump_armed_rules', 'cycle_count',       'INT DEFAULT 0');
 await safeAddColumn('pump_armed_rules', 'max_cycles',        'INT DEFAULT 10');
 await safeAddColumn('pump_armed_rules', 'loop_realized_pnl', 'DECIMAL(20,8) DEFAULT 0');
 await safeAddColumn('pump_armed_rules', 'rebuy_pct',       'DECIMAL(10,4) DEFAULT 8.0'); // #131
+await safeAddColumn('pump_armed_rules', 'sale_price',      'DECIMAL(20,10) NULL'); // #130
+await safeAddColumn('pump_armed_rules', 'reference_base',  'DECIMAL(20,10) NULL'); // #130
+await safeAddColumn('pump_armed_rules', 'retrace_gate',    'DECIMAL(20,10) NULL'); // #130
+await safeAddColumn('pump_armed_rules', 'trough_low',      'DECIMAL(20,10) NULL'); // #130
+await safeAddColumn('pump_armed_rules', 'trough_armed',    'TINYINT(1) DEFAULT 0'); // #130
 await db.execute("UPDATE pump_armed_rules SET rebuy_pct = 20.0 WHERE symbol = 'BOBA-USD'"); // #131 BOBA default
 await safeAddColumn('auto_trade_rules', 'proceeds_reserved', 'DECIMAL(12,2) NULL');
 await safeAddColumn('trading_journal',  'source',          "VARCHAR(20) DEFAULT 'auto_detected'");
@@ -1490,6 +1496,24 @@ try {
 } catch (e) {
   console.error('Failed to load trailing stops:', e.message);
 }
+try {
+  const [ttRows] = await db.execute(
+    'SELECT symbol, sale_price, reference_base, retrace_gate, trough_low, trough_armed, retrace_pct, bounce_pct, buyback_floor_pct, entry_floor FROM pump_armed_rules WHERE active = 1 AND sale_price IS NOT NULL'
+  );
+  for (const row of ttRows) {
+    troughTrackers.set(row.symbol, {
+      salePrice:       parseFloat(row.sale_price),
+      referenceBase:   parseFloat(row.reference_base),
+      retraceGate:     parseFloat(row.retrace_gate),
+      troughLow:       row.trough_low ? parseFloat(row.trough_low) : null,
+      troughArmed:     row.trough_armed === 1,
+      bouncePct:       parseFloat(row.bounce_pct || 8),
+      buybackFloorPct: parseFloat(row.buyback_floor_pct || 5),
+      entryFloor:      row.entry_floor ? parseFloat(row.entry_floor) : null
+    });
+  }
+  if (ttRows.length) console.log('[trough] Loaded ' + ttRows.length + ' active trough tracker(s) from DB');
+} catch (e) { console.error('[trough] boot-load failed:', e.message); }
 
 // Load swing cooldowns from DB
 try {
@@ -2977,6 +3001,85 @@ async function updateTrailingStop(symbol, currentPrice) {
 }
 
 // Quick price formatter for alert messages
+// #130 Trough Tracker - Phase A (inert foundation, called by nothing yet)
+async function armReboundTracker(symbol, salePrice, referenceBase, params) {
+  params = params || {};
+  try {
+    const retracePct      = parseFloat(params.retrace_pct      || 50);
+    const bouncePct       = parseFloat(params.bounce_pct       || 8);
+    const buybackFloorPct = parseFloat(params.buyback_floor_pct || 5);
+    const entryFloor      = params.entry_floor ? parseFloat(params.entry_floor) : null;
+    const moveSize        = salePrice - referenceBase;
+    const retraceGate     = moveSize > 0
+      ? salePrice - (moveSize * retracePct / 100)
+      : salePrice * (1 - retracePct / 100);
+    troughTrackers.set(symbol, {
+      salePrice, referenceBase, retraceGate,
+      troughLow: null, troughArmed: false,
+      bouncePct, buybackFloorPct, entryFloor
+    });
+    await db.execute(
+      'UPDATE pump_armed_rules SET sale_price=?, reference_base=?, retrace_gate=?, trough_low=NULL, trough_armed=0 WHERE symbol=? AND active=1',
+      [salePrice, referenceBase, retraceGate, symbol]
+    );
+    console.log('[trough] ' + symbol + ' armed: sale=' + salePrice + ' base=' + referenceBase + ' gate=' + retraceGate.toFixed(8) + ' (' + retracePct + '% of move)');
+  } catch (e) { console.error('[trough] armReboundTracker error:', e.message); }
+}
+
+// updateTroughTracker: called from fast-scan Part C each 30s cycle (Phase B).
+// Returns { action: 'buy'|'alert'|'tracking'|'waiting' } or null.
+async function updateTroughTracker(symbol, currentPrice) {
+  try {
+    const t = troughTrackers.get(symbol);
+    if (!t) return null;
+    if (!t.troughArmed) {
+      if (currentPrice > t.retraceGate) return { action: 'waiting' };
+      t.troughArmed = true;
+      t.troughLow = currentPrice;
+      await db.execute('UPDATE pump_armed_rules SET trough_armed=1, trough_low=? WHERE symbol=? AND active=1', [currentPrice, symbol]);
+      console.log('[trough] ' + symbol + ' retrace gate met @ ' + currentPrice + ' - tracking trough');
+      return { action: 'tracking' };
+    }
+    if (currentPrice < t.troughLow) {
+      t.troughLow = currentPrice;
+      await db.execute('UPDATE pump_armed_rules SET trough_low=? WHERE symbol=? AND active=1', [currentPrice, symbol]);
+      if (t.entryFloor) {
+        const rebuyFloor = t.entryFloor * (1 - t.buybackFloorPct / 100);
+        if (currentPrice < rebuyFloor) {
+          console.log('[trough] ' + symbol + ' trough ' + currentPrice + ' below floor ' + rebuyFloor + ' - alert only');
+          return { action: 'alert', trough: currentPrice, rebuyFloor };
+        }
+      }
+      return { action: 'tracking' };
+    }
+    const bounceTarget = t.troughLow * (1 + t.bouncePct / 100);
+    if (currentPrice >= bounceTarget) {
+      if (t.entryFloor) {
+        const rebuyFloor = t.entryFloor * (1 - t.buybackFloorPct / 100);
+        if (t.troughLow < rebuyFloor) {
+          console.log('[trough] ' + symbol + ' bounce confirmed but trough ' + t.troughLow + ' below floor - alert only');
+          return { action: 'alert', trough: t.troughLow, rebuyFloor };
+        }
+      }
+      console.log('[trough] ' + symbol + ' BOUNCE CONFIRMED - trough ' + t.troughLow + ' buy @ ' + currentPrice);
+      return { action: 'buy', trough: t.troughLow, buyPrice: currentPrice };
+    }
+    return { action: 'tracking' };
+  } catch (e) { console.error('[trough] updateTroughTracker error:', e.message); return null; }
+}
+
+// clearTroughTracker: call after a buy fills or loop disabled.
+async function clearTroughTracker(symbol) {
+  troughTrackers.delete(symbol);
+  try {
+    await db.execute(
+      'UPDATE pump_armed_rules SET sale_price=NULL, reference_base=NULL, retrace_gate=NULL, trough_low=NULL, trough_armed=0 WHERE symbol=? AND active=1',
+      [symbol]
+    );
+    console.log('[trough] ' + symbol + ' tracker cleared');
+  } catch (e) { console.error('[trough] clearTroughTracker error:', e.message); }
+}
+
 function fmtPriceShort(n) {
   if (n === null || n === undefined) return '—';
   if (n >= 1000) return '$' + n.toLocaleString('en-US', { maximumFractionDigits: 2 });
