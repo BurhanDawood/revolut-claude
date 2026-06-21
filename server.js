@@ -10867,25 +10867,27 @@ function createMcpServer() {
       sell_pct:       z.number().optional().describe('%% of position to sell when trail breaches (Stage 2 — stored now, default 50)'),
       entry_floor:    z.number().optional().describe('Never sell below this price (the hard floor; Stage 2)'),
       arm_window_min: z.number().optional().describe('Window in minutes for the pump to count (default 60)'),
+      rebuy_pct:      z.number().optional().describe('Retrace %% below sale price to place rebuy (default 8). e.g. 70 = buy back 70%% below the auto-sell price'),
     },
-    async ({ symbol, arm_pump_pct, trail_pct, sell_pct, entry_floor, arm_window_min }) => {
+    async ({ symbol, arm_pump_pct, trail_pct, sell_pct, entry_floor, arm_window_min, rebuy_pct }) => {
       try {
         const sym = symbol.includes('-USD') ? symbol.toUpperCase() : `${symbol.toUpperCase()}-USD`;
         await db.execute(
-          `INSERT INTO pump_armed_rules (symbol, arm_pump_pct, arm_window_min, trail_pct, sell_pct, entry_floor, armed, baseline_price, baseline_at, active)
-           VALUES (?, ?, ?, ?, ?, ?, 0, NULL, NULL, 1)
-           ON DUPLICATE KEY UPDATE arm_pump_pct=VALUES(arm_pump_pct), arm_window_min=VALUES(arm_window_min), trail_pct=VALUES(trail_pct), sell_pct=VALUES(sell_pct), entry_floor=VALUES(entry_floor), armed=0, baseline_price=NULL, baseline_at=NULL, active=1, updated_at=CURRENT_TIMESTAMP`,
-          [sym, arm_pump_pct, arm_window_min || 60, trail_pct, sell_pct ?? 50, entry_floor ?? null]
+          `INSERT INTO pump_armed_rules (symbol, arm_pump_pct, arm_window_min, trail_pct, sell_pct, entry_floor, rebuy_pct, armed, baseline_price, baseline_at, active)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, 1)
+           ON DUPLICATE KEY UPDATE arm_pump_pct=VALUES(arm_pump_pct), arm_window_min=VALUES(arm_window_min), trail_pct=VALUES(trail_pct), sell_pct=VALUES(sell_pct), entry_floor=VALUES(entry_floor), rebuy_pct=VALUES(rebuy_pct), armed=0, baseline_price=NULL, baseline_at=NULL, active=1, updated_at=CURRENT_TIMESTAMP`,
+          [sym, arm_pump_pct, arm_window_min || 60, trail_pct, sell_pct ?? 50, entry_floor ?? null, rebuy_pct ?? 8]
         );
         await sendTelegram(
           `🎯 <b>PUMP-ARM RULE SET — ${sym.replace('-USD','')}</b>\n\n` +
           `Arms when +${arm_pump_pct}% within ${arm_window_min || 60}min\n` +
           `Then trails ${trail_pct}% below peak\n` +
           `${entry_floor ? `Floor: ${entry_floor}\n` : ''}` +
-          `Sell %% (Stage 2): ${sell_pct ?? 50}%\n\n` +
+          `Sell %% (Stage 2): ${sell_pct ?? 50}%\n` +
+          `Rebuy retrace: ${rebuy_pct ?? 8}%\n\n` +
           `⚠️ Stage 1 active — arms + alerts only, no auto-sell yet.`
         ).catch(() => {});
-        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, symbol: sym, arm_pump_pct, trail_pct, arm_window_min: arm_window_min || 60, sell_pct: sell_pct ?? 50, entry_floor: entry_floor ?? null, note: 'Stage 1 — arms trailing stop on pump, no auto-sell' }) }] };
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, symbol: sym, arm_pump_pct, trail_pct, arm_window_min: arm_window_min || 60, sell_pct: sell_pct ?? 50, entry_floor: entry_floor ?? null, rebuy_pct: rebuy_pct ?? 8, note: 'Stage 1 — arms trailing stop on pump, no auto-sell' }) }] };
       } catch (e) {
         return { content: [{ type: 'text', text: JSON.stringify({ error: e.message }) }] };
       }
