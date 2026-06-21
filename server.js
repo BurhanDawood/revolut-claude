@@ -6295,7 +6295,9 @@ async function cascadeRulesAfterTrade(rule, executedPrice) {
 
       const sellProceeds = executedPrice * parseFloat(cascadeVol);
       const sweepDeduction = sweepEnabled ? sellProceeds * (sweepPct / 100) : 0;
-      const availableForBuyback = sellProceeds - sweepDeduction;
+      // #130: leave $1 untouched for the Revolut X trading fee on the sell (fee is deducted from proceeds at the exchange)
+      const FEE_BUFFER_USD = 1.0;
+      const availableForBuyback = Math.max(0, sellProceeds - sweepDeduction - FEE_BUFFER_USD);
 
       if (nearExists(buyRules, newBuyPrice)) {
         console.log(`[cascade] Buy rule near $${newBuyPrice.toFixed(6)} already exists — skipped`);
