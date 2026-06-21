@@ -10137,7 +10137,7 @@ function createMcpServer() {
       dev_related_log:      z.string().optional().describe('log_dev_decision: dev_log ticket(s) it governs e.g. "#95,#45"'),
       dev_supersedes_id:    z.number().optional().describe('log_dev_decision: id of an older decision this replaces'),
       journal_id:           z.number().optional().describe('void_journal: trading_journal row id to archive + delete'),
-      tax_lot_id:           z.number().optional().describe('delete_tax_lot: tax_lots.id row to read and hard-delete'),
+      tax_lot_id:           z.coerce.number().optional().describe('delete_tax_lot: tax_lots.id row to read and hard-delete'),
     },
     async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, max_buy_usd, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam, title, detail, category, status: devStatus, source: devSource, related_symbol: relSymbol, dev_log_id, active_workstream, progress, open_threads, next_action, recent_decision, recent_decisions, cs_status, cs_role, cs_theme, cs_strategy_md, pm_decision, pm_principle_tag, pm_conviction, pm_captured_by, pm_supersedes_id, dev_decision, dev_principle_tag, dev_cross_thread, dev_alternatives, dev_related_log, dev_supersedes_id, journal_id, tax_lot_id, away_action, away_coins }) => {
       // Make hodl_symbols accessible in configure_auto_execute via params object
