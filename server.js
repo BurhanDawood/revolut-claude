@@ -1053,6 +1053,9 @@ await safeAddColumn('auto_trade_rules', 'proceeds_reserved', 'DECIMAL(12,2) NULL
 await safeAddColumn('trading_journal',  'source',          "VARCHAR(20) DEFAULT 'auto_detected'");
 await safeAddColumn('trading_journal',  'updated_at',      'TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP');
 await safeAddColumn('trading_journal',  'realised_pnl_usd', 'DECIMAL(20,8) NULL');
+await safeAddColumn('trailing_stops',   'auto_execute',    'TINYINT(1) NOT NULL DEFAULT 0'); // #93
+await safeAddColumn('trailing_stops',   'sell_pct',        'DECIMAL(10,4) DEFAULT 25.0');   // #93
+await safeAddColumn('trailing_stops',   'exchange',        "VARCHAR(20) DEFAULT 'revolut'"); // #93
 await db.execute('CREATE TABLE IF NOT EXISTS archived_journal (id INT AUTO_INCREMENT PRIMARY KEY, original_id INT NOT NULL, row_json TEXT NOT NULL, linked_summary VARCHAR(255), archive_reason VARCHAR(255), archived_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)').catch(e => console.error('[migration] archived_journal:', e.message));
   await db.execute("ALTER TABLE research_history MODIFY COLUMN drift_verdict TEXT")
     .then(() => console.log('[migration] research_history.drift_verdict widened to TEXT'))
@@ -1494,7 +1497,10 @@ try {
       trailPct:   parseFloat(row.trail_pct),
       peakPrice:  parseFloat(row.peak_price),
       stopPrice:  parseFloat(row.stop_price),
-      entryPrice: row.entry_price ? parseFloat(row.entry_price) : null
+      entryPrice: row.entry_price ? parseFloat(row.entry_price) : null,
+      autoExecute: row.auto_execute ? Boolean(parseInt(row.auto_execute)) : false, // #93
+      sellPct:     row.sell_pct != null ? parseFloat(row.sell_pct) : 25,            // #93
+      exchange:    row.exchange || 'revolut'                                         // #93
     });
   }
   console.log(`Loaded ${tsRows.length} trailing stops from database`);
@@ -2890,16 +2896,21 @@ async function resumeAlerts(symbol) {
 
 // ── Trailing Stop Functions ───────────────────────────────────────────────────
 
-async function setTrailingStop(symbol, trailPct, currentPrice, entryPrice = null) {
+async function setTrailingStop(symbol, trailPct, currentPrice, entryPrice = null, autoExecute = false, sellPct = null, exchange = null) {
   const stopPrice = currentPrice * (1 - trailPct / 100);
-  const ts = { trailPct, peakPrice: currentPrice, stopPrice, entryPrice };
+  // #93: preserve existing fields if not overridden
+  const existing = trailingStops.get(symbol) || {};
+  const finalAutoExecute = autoExecute || existing.autoExecute || false;
+  const finalSellPct     = sellPct != null ? sellPct : (existing.sellPct != null ? existing.sellPct : 25);
+  const finalExchange    = exchange || existing.exchange || 'revolut';
+  const ts = { trailPct, peakPrice: currentPrice, stopPrice, entryPrice, autoExecute: finalAutoExecute, sellPct: finalSellPct, exchange: finalExchange };
   trailingStops.set(symbol, ts);
   await db.execute(
-    'INSERT INTO trailing_stops (symbol, trail_pct, peak_price, stop_price, entry_price) VALUES (?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE trail_pct=VALUES(trail_pct), peak_price=VALUES(peak_price), stop_price=VALUES(stop_price), entry_price=VALUES(entry_price), updated_at=CURRENT_TIMESTAMP',
-    [symbol, trailPct, currentPrice, stopPrice, entryPrice]
+    'INSERT INTO trailing_stops (symbol, trail_pct, peak_price, stop_price, entry_price, auto_execute, sell_pct, exchange) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE trail_pct=VALUES(trail_pct), peak_price=VALUES(peak_price), stop_price=VALUES(stop_price), entry_price=VALUES(entry_price), auto_execute=VALUES(auto_execute), sell_pct=VALUES(sell_pct), exchange=VALUES(exchange), updated_at=CURRENT_TIMESTAMP',
+    [symbol, trailPct, currentPrice, stopPrice, entryPrice, finalAutoExecute ? 1 : 0, finalSellPct, finalExchange]
   );
   alertState.acknowledged.delete(symbol); // Setting new trail re-enables coin
-  return { trailPct, peakPrice: currentPrice, stopPrice };
+  return { trailPct, peakPrice: currentPrice, stopPrice, autoExecute: finalAutoExecute, sellPct: finalSellPct, exchange: finalExchange };
 }
 
 async function removeTrailingStop(symbol) {
@@ -10281,8 +10292,10 @@ function createMcpServer() {
       current_price: z.number().optional().describe('Manual price override for set_trailing — useful for Kraken-only coins if auto-fetch fails'),
       target_price:  z.number().optional().describe('For remove_target — remove only the rung at this exact target price; omit to remove ALL targets for the symbol'),
       description:   z.string().optional().describe('For set_target -- human note stored on the rung, surfaced when the alert fires'),
+      auto_execute:  z.coerce.boolean().optional().describe('#93 set_trailing: if true, on breach auto-sells sell_pct of position without Telegram approval'),
+      sell_pct:      z.coerce.number().optional().describe('#93 set_trailing: percent of position to sell on auto-exec breach (default 25)'),
     },
-    async ({ action, symbol, direction, threshold_pct, anchor_price, trail_pct, current_price, target_price, description }) => {
+    async ({ action, symbol, direction, threshold_pct, anchor_price, trail_pct, current_price, target_price, description, auto_execute, sell_pct }) => {
       const sym      = symbol.includes('-USD') ? symbol.toUpperCase() : `${symbol.toUpperCase()}-USD`;
       const coinBase = sym.replace('-USD', '');
       let result = {};
@@ -10329,8 +10342,11 @@ function createMcpServer() {
           }) }] };
         }
         const entryPrice = entryPrices.get(sym) || null;
-        const r = await setTrailingStop(sym, trail_pct, resolvedPrice, entryPrice);
-        result = { ok: true, action: 'set_trailing', symbol: sym, trail_pct, peak_price: r.peakPrice, stop_price: r.stopPrice, current_price: resolvedPrice, message: `Trailing stop set — alerts if ${sym} drops ${trail_pct}% from any peak` };
+        // #93: derive exchange (Kraken-monitored coin or default Revolut). Pass auto_execute + sell_pct (Zod-coerced).
+        const tsExchange = KRAKEN_MONITORED_COINS.includes(sym) ? 'kraken' : 'revolut';
+        const r = await setTrailingStop(sym, trail_pct, resolvedPrice, entryPrice, auto_execute === true, sell_pct != null ? sell_pct : null, tsExchange);
+        const msgSuffix = r.autoExecute ? ` — AUTO-EXEC ON: will sell ${r.sellPct}% on breach (${r.exchange})` : ` — notify-only`;
+        result = { ok: true, action: 'set_trailing', symbol: sym, trail_pct, peak_price: r.peakPrice, stop_price: r.stopPrice, current_price: resolvedPrice, auto_execute: r.autoExecute, sell_pct: r.sellPct, exchange: r.exchange, message: `Trailing stop set — alerts if ${sym} drops ${trail_pct}% from any peak` + msgSuffix };
 
       } else if (action === 'acknowledge') {
         await acknowledgeAlert(sym);
