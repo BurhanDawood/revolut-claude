@@ -1043,6 +1043,9 @@ await safeAddColumn('pump_armed_rules', 'reference_base',  'DECIMAL(20,10) NULL'
 await safeAddColumn('pump_armed_rules', 'retrace_gate',    'DECIMAL(20,10) NULL'); // #130
 await safeAddColumn('pump_armed_rules', 'trough_low',      'DECIMAL(20,10) NULL'); // #130
 await safeAddColumn('pump_armed_rules', 'trough_armed',    'TINYINT(1) DEFAULT 0'); // #130
+await safeAddColumn('pump_armed_rules', 'retrace_pct',     'DECIMAL(10,4) DEFAULT 50.0'); // #130 % of move required before trough arms
+await safeAddColumn('pump_armed_rules', 'bounce_pct',      'DECIMAL(10,4) DEFAULT 8.0'); // #130 % bounce off trough to trigger buy
+await safeAddColumn('pump_armed_rules', 'buyback_floor_pct','DECIMAL(10,4) DEFAULT 5.0'); // #130 % below entry_floor before alert-only
 await db.execute("UPDATE pump_armed_rules SET rebuy_pct = 20.0 WHERE symbol = 'BOBA-USD'"); // #131 BOBA default
 await safeAddColumn('auto_trade_rules', 'proceeds_reserved', 'DECIMAL(12,2) NULL');
 await safeAddColumn('trading_journal',  'source',          "VARCHAR(20) DEFAULT 'auto_detected'");
