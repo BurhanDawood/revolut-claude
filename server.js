@@ -9777,7 +9777,7 @@ function createMcpServer() {
   server.tool('get_trading_data',
     'Get trading journal entries, active alerts, trader context/profile, rebalancing history, and dev_bridge messages',
     {
-      include: z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'dev_bridge', 'coin_strategy', 'reconciliation', 'ledger', 'all'])).optional()
+      include: z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'dev_bridge', 'coin_strategy', 'reconciliation', 'ledger', 'tax_lots', 'all'])).optional()
         .describe('What data to fetch — defaults to all. dev_bridge, coin_strategy and reconciliation are never included in all; request them explicitly'),
       symbol:           z.string().optional().describe('Filter journal by coin e.g. NEAR'),
       limit:            z.number().optional().describe('Max journal entries to return, default 10'),
@@ -9945,6 +9945,18 @@ function createMcpServer() {
         } catch (e) { result.ledger = { error: e.message }; }
       }
 
+      if (fetch.includes('tax_lots')) {
+        // #134: read tax_lots rows. Filter by symbol if provided.
+        try {
+          const tlParams = [];
+          let tlQuery = 'SELECT id, symbol, exchange, quantity, cost_basis_usd, cost_per_unit, acquired_at, lot_status, journal_id, notes, created_at FROM tax_lots';
+          if (coinBase && coinBase !== 'UNKNOWN') { tlQuery += ' WHERE symbol = ?'; tlParams.push(coinBase); }
+          tlQuery += ' ORDER BY acquired_at DESC LIMIT 50';
+          const [tlRows] = await db.execute(tlQuery, tlParams);
+          result.tax_lots = tlRows;
+        } catch (e) { result.tax_lots = { error: e.message }; }
+      }
+
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
     }
   );
@@ -10069,7 +10081,7 @@ function createMcpServer() {
   server.tool('manage_trading',
     'Log journal entries, trade intentions, trader preferences, update invested capital, or configure USDT sweep',
     {
-      action:                 z.enum(['log_journal', 'log_intention', 'save_preference', 'update_capital', 'configure_sweep', 'configure_auto_execute', 'log_dev_issue', 'update_session_state', 'upsert_coin_strategy', 'export_dev_log', 'log_research', 'log_pm_decision', 'log_dev_decision', 'void_journal', 'configure_away_mode']).describe('What trading action to perform'),
+      action:                 z.enum(['log_journal', 'log_intention', 'save_preference', 'update_capital', 'configure_sweep', 'configure_auto_execute', 'log_dev_issue', 'update_session_state', 'upsert_coin_strategy', 'export_dev_log', 'log_research', 'log_pm_decision', 'log_dev_decision', 'void_journal', 'configure_away_mode', 'delete_tax_lot']).describe('What trading action to perform'),
       symbol:                 z.string().optional().describe('Coin e.g. NEAR-USD or NEAR'),
       trade_action:           z.enum(['buy', 'sell', 'hold', 'add', 'reduce', 'payment', 'transfer', 'pass']).optional().describe('Trade action for log_journal or log_intention — use pass to log a skipped trade for shadow grading at +7d/+30d'),
       price:                  z.number().optional().describe('Price for log_journal'),
@@ -10124,8 +10136,9 @@ function createMcpServer() {
       dev_related_log:      z.string().optional().describe('log_dev_decision: dev_log ticket(s) it governs e.g. "#95,#45"'),
       dev_supersedes_id:    z.number().optional().describe('log_dev_decision: id of an older decision this replaces'),
       journal_id:           z.number().optional().describe('void_journal: trading_journal row id to archive + delete'),
+      tax_lot_id:           z.number().optional().describe('delete_tax_lot: tax_lots.id row to read and hard-delete'),
     },
-    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, max_buy_usd, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam, title, detail, category, status: devStatus, source: devSource, related_symbol: relSymbol, dev_log_id, active_workstream, progress, open_threads, next_action, recent_decision, recent_decisions, cs_status, cs_role, cs_theme, cs_strategy_md, pm_decision, pm_principle_tag, pm_conviction, pm_captured_by, pm_supersedes_id, dev_decision, dev_principle_tag, dev_cross_thread, dev_alternatives, dev_related_log, dev_supersedes_id, journal_id, away_action, away_coins }) => {
+    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, max_buy_usd, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam, title, detail, category, status: devStatus, source: devSource, related_symbol: relSymbol, dev_log_id, active_workstream, progress, open_threads, next_action, recent_decision, recent_decisions, cs_status, cs_role, cs_theme, cs_strategy_md, pm_decision, pm_principle_tag, pm_conviction, pm_captured_by, pm_supersedes_id, dev_decision, dev_principle_tag, dev_cross_thread, dev_alternatives, dev_related_log, dev_supersedes_id, journal_id, tax_lot_id, away_action, away_coins }) => {
       // Make hodl_symbols accessible in configure_auto_execute via params object
       const params = { hodl_symbols: hodlSymbolsParam };
 
@@ -10538,6 +10551,23 @@ function createMcpServer() {
           ok: true, action: 'void_journal', deleted_id: vid,
           deleted_row: { symbol: vrow.symbol, action: vrow.action, price: vrow.price, quantity: vrow.quantity, value_usd: vrow.value_usd, source: vrow.source, created_at: vrow.created_at },
           cascaded_coin_cash_flows: ccfN, archived: true, restorable_from: 'archived_journal.row_json', warnings: vwarnings
+        }) }] };
+      } else if (action === 'delete_tax_lot') {
+        // #134: read-then-hard-delete a tax_lots row by its own id. Always reads before deleting.
+        const tlid = (typeof tax_lot_id === 'number') ? tax_lot_id : parseInt(tax_lot_id, 10);
+        if (!tlid || isNaN(tlid)) return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'tax_lot_id required -- use get_trading_data include=[tax_lots] to find the id first' }) }] };
+        const [tlrows] = await db.execute('SELECT * FROM tax_lots WHERE id = ?', [tlid]);
+        if (!tlrows || tlrows.length === 0) return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'No tax_lots row with id ' + tlid }) }] };
+        const tlrow = tlrows[0];
+        if (tlrow.lot_status !== 'open') {
+          return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'Refusing to delete a ' + tlrow.lot_status + ' tax lot -- only open lots can be deleted' }) }] };
+        }
+        await db.execute('DELETE FROM tax_lots WHERE id = ?', [tlid]);
+        console.log('[delete_tax_lot] #134 deleted open tax_lot id=' + tlid + ' symbol=' + tlrow.symbol + ' qty=' + tlrow.quantity + ' journal_id=' + tlrow.journal_id);
+        return { content: [{ type: 'text', text: JSON.stringify({
+          ok: true, action: 'delete_tax_lot', deleted_id: tlid,
+          deleted_row: { symbol: tlrow.symbol, exchange: tlrow.exchange, quantity: tlrow.quantity, cost_basis_usd: tlrow.cost_basis_usd, cost_per_unit: tlrow.cost_per_unit, acquired_at: tlrow.acquired_at, lot_status: tlrow.lot_status, journal_id: tlrow.journal_id },
+          note: 'Hard-deleted from tax_lots. Not restorable via archived_journal.'
         }) }] };
       }
     }
