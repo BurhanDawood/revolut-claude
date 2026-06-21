@@ -857,6 +857,8 @@ await safeAddColumn('pump_armed_rules', 'loop_enabled',      'TINYINT(1) NOT NUL
 await safeAddColumn('pump_armed_rules', 'cycle_count',       'INT DEFAULT 0');
 await safeAddColumn('pump_armed_rules', 'max_cycles',        'INT DEFAULT 10');
 await safeAddColumn('pump_armed_rules', 'loop_realized_pnl', 'DECIMAL(20,8) DEFAULT 0');
+await safeAddColumn('pump_armed_rules', 'rebuy_pct',       'DECIMAL(10,4) DEFAULT 8.0'); // #131
+await db.execute("UPDATE pump_armed_rules SET rebuy_pct = 20.0 WHERE symbol = 'BOBA-USD'"); // #131 BOBA default
 await safeAddColumn('auto_trade_rules', 'proceeds_reserved', 'DECIMAL(12,2) NULL');
 await safeAddColumn('trading_journal',  'source',          "VARCHAR(20) DEFAULT 'auto_detected'");
 await safeAddColumn('trading_journal',  'updated_at',      'TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP');
@@ -5786,9 +5788,16 @@ async function cascadeRulesAfterTrade(rule, executedPrice) {
 
     let newSellPrice, newBuyPrice, cascadeMsg;
 
+    // Read per-coin rebuy_pct from pump_armed_rules (default 8%) — #131
+    let rebuyPct = 8;
+    try {
+      const [rebuyRows] = await db.execute('SELECT rebuy_pct FROM pump_armed_rules WHERE symbol = ? AND active = 1 LIMIT 1', [symbol]);
+      if (rebuyRows.length && rebuyRows[0].rebuy_pct != null) rebuyPct = parseFloat(rebuyRows[0].rebuy_pct);
+    } catch (e) { /* default 8% on lookup error */ }
+
     if (isSell) {
       newSellPrice = executedPrice * 1.10; // 10% higher — ride the trend
-      newBuyPrice  = executedPrice * 0.92; // 8% retrace — buy back on dip
+      newBuyPrice  = executedPrice * (1 - rebuyPct / 100); // rebuyPct% retrace — configurable per coin #131
       cascadeMsg = `🔁 CASCADE — ${coinBase}\nNext sell: ${formatPrice(newSellPrice)} / Buy-back: ${formatPrice(newBuyPrice)}`;
     } else {
       newBuyPrice  = executedPrice * 0.95; // 5% deeper — add on continued dip
