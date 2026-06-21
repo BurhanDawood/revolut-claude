@@ -10566,7 +10566,7 @@ function createMcpServer() {
       rule_id: z.number().optional().describe('Rule ID to remove, disable or enable'),
       symbol: z.string().optional().describe('Symbol e.g. BOBA-USD for loop_enable/loop_disable'),
     },
-    async ({ action, rule_id }) => {
+    async ({ action, rule_id, symbol }) => {
       try {
         if (action === 'list') {
           const [rules] = await db.execute('SELECT * FROM auto_trade_rules ORDER BY created_at DESC');
