@@ -10579,7 +10579,7 @@ function createMcpServer() {
       for (const asset of balances) {
         if (!asset.currency || SKIP_CURRENCIES.includes(asset.currency)) continue;
         const symbol = `${asset.currency}-USD`;
-        const liveQty = parseFloat(asset.available);
+        const liveQty = parseFloat(asset.available || 0) + parseFloat(asset.reserved || 0); // #71: total holdings — must match the detection cache (available+reserved), else resting limit orders desync the cache and trigger phantom buy/sell detection
         const cachedQty = previousBalances.get(symbol);
         if (cachedQty !== undefined && liveQty > 0 && Math.abs(liveQty - cachedQty) / Math.max(cachedQty, 0.000001) > 0.05) {
           console.log(`[qty mismatch] ${symbol}: live=${liveQty} cached=${cachedQty} — updating cache`);
