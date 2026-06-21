@@ -10562,8 +10562,9 @@ function createMcpServer() {
   server.tool('manage_auto_rules',
     'Manage automatic trade rules — list, remove, disable or enable a rule by ID',
     {
-      action:  z.enum(['list', 'remove', 'disable', 'enable', 'pump_status']).describe('Action to perform'),
+      action:  z.enum(['list', 'remove', 'disable', 'enable', 'pump_status', 'loop_enable', 'loop_disable']).describe('Action to perform'),
       rule_id: z.number().optional().describe('Rule ID to remove, disable or enable'),
+      symbol: z.string().optional().describe('Symbol e.g. BOBA-USD for loop_enable/loop_disable'),
     },
     async ({ action, rule_id }) => {
       try {
@@ -10574,6 +10575,27 @@ function createMcpServer() {
         if (action === 'pump_status') {
           const [prules] = await db.execute('SELECT * FROM pump_armed_rules ORDER BY symbol');
           return { content: [{ type: 'text', text: JSON.stringify({ pump_armed_rules: prules, count: prules.length }, null, 2) }] };
+        }
+        if (action === 'loop_enable') {
+          if (!symbol) throw new Error('symbol required for loop_enable');
+          const sym = symbol.includes('-') ? symbol.toUpperCase() : symbol.toUpperCase()+'-USD';
+          const [pr] = await db.execute('SELECT * FROM pump_armed_rules WHERE symbol = ? LIMIT 1', [sym]);
+          if (!pr.length) throw new Error('No pump_armed_rules row for '+sym);
+          const r = pr[0];
+          if (r.active !== 1) throw new Error(sym+' rule is not active (active='+r.active+') — refusing to enable loop');
+          if (r.entry_floor == null || parseFloat(r.entry_floor) <= 0) throw new Error(sym+' has no entry_floor — refusing to enable loop (never-sell-below-entry guard)');
+          await db.execute('UPDATE pump_armed_rules SET loop_enabled = 1 WHERE symbol = ?', [sym]);
+          const [after] = await db.execute('SELECT * FROM pump_armed_rules WHERE symbol = ? LIMIT 1', [sym]);
+          await sendTelegram('LOOP ENABLED -- '+sym+' rinse-repeat ON. Floor $'+parseFloat(r.entry_floor).toFixed(6)+', sell '+r.sell_pct+'%, max '+r.max_cycles+' cycles. Master must also be ON to fire.').catch(()=>{});
+          return { content: [{ type: 'text', text: JSON.stringify({ ok: true, loop_enabled: 1, row: after[0] }, null, 2) }] };
+        }
+        if (action === 'loop_disable') {
+          if (!symbol) throw new Error('symbol required for loop_disable');
+          const sym = symbol.includes('-') ? symbol.toUpperCase() : symbol.toUpperCase()+'-USD';
+          await db.execute('UPDATE pump_armed_rules SET loop_enabled = 0 WHERE symbol = ?', [sym]);
+          const [after] = await db.execute('SELECT * FROM pump_armed_rules WHERE symbol = ? LIMIT 1', [sym]);
+          await sendTelegram('LOOP DISABLED -- '+sym+' rinse-repeat OFF.').catch(()=>{});
+          return { content: [{ type: 'text', text: JSON.stringify({ ok: true, loop_enabled: 0, row: after[0] || null }, null, 2) }] };
         }
         if (action === 'remove' && rule_id) {
           const [existing] = await db.execute('SELECT * FROM auto_trade_rules WHERE id = ?', [rule_id]);
