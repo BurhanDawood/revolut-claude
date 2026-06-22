@@ -6894,6 +6894,7 @@ ${tsPlanContext}`;
 
     const shouldAutoExecute =
       autoExec.enabled &&
+      (autoExec.per_coin_enabled || {})[coinBase] === true && // #24: explicit per-coin opt-in required
       autoExec.allowed_triggers?.includes('trailing_stop') &&
       confidence === autoExec.require_confidence &&
       (recommendation.includes('SELL') || recommendation.includes('HOLD'));
@@ -10476,6 +10477,7 @@ function createMcpServer() {
       max_sell_pct:           z.number().optional().describe('Max % of position to sell per auto-exec trade (configure_auto_execute)'),
       max_buy_usd:            z.number().optional().describe('Max USD to spend per auto-exec buy (configure_auto_execute)'),
       sell_floors:            z.preprocess(v => { if (typeof v === 'string') { try { return JSON.parse(v); } catch(e) { return v; } } return v; }, z.record(z.number())).optional().describe('Per-coin min sell price map e.g. {"NEAR":1.87} -- auto-sell blocked if price <= floor (#45, configure_auto_execute)'),
+      per_coin_enabled:       z.preprocess(v => { if (typeof v === 'string') { try { return JSON.parse(v); } catch(e) { return v; } } return v; }, z.record(z.boolean())).optional().describe('#24 explicit per-coin auto-exec opt-in map e.g. {"BOBA":true} -- only coins listed here can shouldAutoExecute'),
       away_action:            z.enum(['set_eligible','activate','deactivate','status','set_away_buy']).optional().describe('configure_away_mode: which away-mode operation'),
       away_coins:             z.array(z.string()).optional().describe('configure_away_mode: coin list for set_eligible / activate'),
       allowed_triggers:       z.array(z.string()).optional().describe('Alert types that can trigger auto-exec: trailing_stop, fixed_target, pump_alert'),
@@ -10513,7 +10515,7 @@ function createMcpServer() {
       journal_id:           z.number().optional().describe('void_journal: trading_journal row id to archive + delete'),
       tax_lot_id:           z.coerce.number().optional().describe('delete_tax_lot: tax_lots.id row to read and hard-delete'),
     },
-    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, max_buy_usd, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam, title, detail, category, status: devStatus, source: devSource, related_symbol: relSymbol, dev_log_id, active_workstream, progress, open_threads, next_action, recent_decision, recent_decisions, cs_status, cs_role, cs_theme, cs_strategy_md, pm_decision, pm_principle_tag, pm_conviction, pm_captured_by, pm_supersedes_id, dev_decision, dev_principle_tag, dev_cross_thread, dev_alternatives, dev_related_log, dev_supersedes_id, journal_id, tax_lot_id, away_action, away_coins, sell_floors }) => {
+    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, max_buy_usd, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam, title, detail, category, status: devStatus, source: devSource, related_symbol: relSymbol, dev_log_id, active_workstream, progress, open_threads, next_action, recent_decision, recent_decisions, cs_status, cs_role, cs_theme, cs_strategy_md, pm_decision, pm_principle_tag, pm_conviction, pm_captured_by, pm_supersedes_id, dev_decision, dev_principle_tag, dev_cross_thread, dev_alternatives, dev_related_log, dev_supersedes_id, journal_id, tax_lot_id, away_action, away_coins, sell_floors, per_coin_enabled }) => {
       // Make hodl_symbols accessible in configure_auto_execute via params object
       const params = { hodl_symbols: hodlSymbolsParam };
 
@@ -10693,6 +10695,7 @@ function createMcpServer() {
           cooldown_minutes: cooldown_minutes || existingCfg.cooldown_minutes || 60,
           hodl_symbols: params?.hodl_symbols ?? existingCfg.hodl_symbols ?? defaultHodl,
           sell_floors: sell_floors ?? existingCfg.sell_floors ?? {}, // #45 preserved across updates
+          per_coin_enabled: per_coin_enabled ?? existingCfg.per_coin_enabled ?? {}, // #24 explicit per-coin opt-in
           updated_at: new Date().toISOString()
         };
         // Always saves to system_config — NOT trader_profile
