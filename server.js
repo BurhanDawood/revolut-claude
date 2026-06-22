@@ -569,6 +569,7 @@ const fastScanLastPrice  = new Map();         // #94: symbol -> last price seen 
 const pendingAnalysis = new Map();           // symbol -> { type, recommendation, analysis, price, timestamp }
 const analysisRateLimit = new Map();         // symbol -> timestamp of last Claude analysis (rate-limit: 1/hr)
 const troughTrackers = new Map();            // #130: symbol -> trough tracker state
+const standaloneTroughTrackers = new Map(); // standalone inverse trough-buy
 const pendingUndo = new Map();               // symbol -> { action, qty, price, timestamp } — 2-min undo window after AI auto-exec
 let pendingKrakenTrade = null;               // { symbol, side, orderType, volume, price, valueUSD } — awaiting Telegram approval
 let pendingRevolutTrade = null;             // { symbol, side, orderType, baseSize, price, valueUSD } — awaiting Telegram approval
@@ -1056,6 +1057,16 @@ await safeAddColumn('trading_journal',  'realised_pnl_usd', 'DECIMAL(20,8) NULL'
 await safeAddColumn('trailing_stops',   'auto_execute',    'TINYINT(1) NOT NULL DEFAULT 0'); // #93
 await safeAddColumn('trailing_stops',   'sell_pct',        'DECIMAL(10,4) DEFAULT 25.0');   // #93
 await safeAddColumn('trailing_stops',   'exchange',        "VARCHAR(20) DEFAULT 'revolut'"); // #93
+await db.execute(`CREATE TABLE IF NOT EXISTS standalone_trough_trackers (
+  symbol VARCHAR(20) PRIMARY KEY,
+  buy_usd DECIMAL(20,8) NOT NULL,
+  bounce_pct DECIMAL(10,4) NOT NULL DEFAULT 8.0,
+  entry_floor DECIMAL(20,8) NULL,
+  exchange VARCHAR(20) NOT NULL DEFAULT 'revolut',
+  trough_price DECIMAL(20,8) NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+)`).catch(e => console.error('[migration] standalone_trough_trackers:', e.message));
 await db.execute('CREATE TABLE IF NOT EXISTS archived_journal (id INT AUTO_INCREMENT PRIMARY KEY, original_id INT NOT NULL, row_json TEXT NOT NULL, linked_summary VARCHAR(255), archive_reason VARCHAR(255), archived_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)').catch(e => console.error('[migration] archived_journal:', e.message));
   await db.execute("ALTER TABLE research_history MODIFY COLUMN drift_verdict TEXT")
     .then(() => console.log('[migration] research_history.drift_verdict widened to TEXT'))
@@ -1526,6 +1537,18 @@ try {
   }
   if (ttRows.length) console.log('[trough] Loaded ' + ttRows.length + ' active trough tracker(s) from DB');
 } catch (e) { console.error('[trough] boot-load failed:', e.message); }
+try {
+  const [stRows] = await db.execute('SELECT symbol, buy_usd, bounce_pct, entry_floor, exchange, trough_price FROM standalone_trough_trackers');
+  for (const r of stRows) {
+    standaloneTroughTrackers.set(r.symbol, {
+      buyUsd: parseFloat(r.buy_usd), bouncePct: parseFloat(r.bounce_pct || 8),
+      entryFloor: r.entry_floor ? parseFloat(r.entry_floor) : null,
+      exchange: r.exchange || 'revolut',
+      troughPrice: r.trough_price ? parseFloat(r.trough_price) : null
+    });
+  }
+  if (stRows.length) console.log('[trough-st] Loaded ' + stRows.length + ' tracker(s)');
+} catch (e) { console.error('[trough-st] boot-load failed:', e.message); }
 
 // Load swing cooldowns from DB
 try {
@@ -3107,6 +3130,33 @@ async function clearTroughTracker(symbol) {
   } catch (e) { console.error('[trough] clearTroughTracker error:', e.message); }
 }
 
+async function armStandaloneTrough(symbol, buyUsd, bouncePct, entryFloor, exchange) {
+  standaloneTroughTrackers.set(symbol, {
+    buyUsd: parseFloat(buyUsd), bouncePct: parseFloat(bouncePct || 8),
+    entryFloor: entryFloor ? parseFloat(entryFloor) : null,
+    exchange: exchange || 'revolut', troughPrice: null, createdAt: Date.now()
+  });
+  try {
+    await db.execute(
+      'INSERT INTO standalone_trough_trackers (symbol,buy_usd,bounce_pct,entry_floor,exchange) VALUES (?,?,?,?,?) ON DUPLICATE KEY UPDATE buy_usd=VALUES(buy_usd),bounce_pct=VALUES(bounce_pct),entry_floor=VALUES(entry_floor),exchange=VALUES(exchange),trough_price=NULL,updated_at=NOW()',
+      [symbol, buyUsd, bouncePct||8, entryFloor||null, exchange||'revolut']
+    );
+    const b = symbol.replace('-USD','');
+    console.log('[trough-st] armed: ' + symbol + ' buy $' + buyUsd + ' bounce ' + (bouncePct||8) + '%%');
+    await sendTelegram('<b>[TROUGH ARMED]</b> ' + b +
+      '\nBuy $' + buyUsd + ' on ' + (bouncePct||8) + '%% bounce off trough' +
+      (entryFloor ? '\nFloor: $' + entryFloor : '') +
+      '\nExchange: ' + (exchange||'revolut')).catch(() => {});
+  } catch (e) { console.error('[trough-st] arm error:', e.message); }
+}
+async function clearStandaloneTrough(symbol) {
+  standaloneTroughTrackers.delete(symbol);
+  try {
+    await db.execute('DELETE FROM standalone_trough_trackers WHERE symbol=?',[symbol]);
+    console.log('[trough-st] cleared: ' + symbol);
+  } catch (e) { console.error('[trough-st] clear error:', e.message); }
+}
+
 function fmtPriceShort(n) {
   if (n === null || n === undefined) return '—';
   if (n >= 1000) return '$' + n.toLocaleString('en-US', { maximumFractionDigits: 2 });
@@ -3780,6 +3830,34 @@ async function runFastScan() {
           ).catch(() => {});
           await clearTroughTracker(ttSymbol);
         }
+      }
+    }
+    // Part D: standalone inverse trough-buy (no prior sell needed)
+    if (standaloneTroughTrackers.size > 0) {
+      for (const stSym of [...standaloneTroughTrackers.keys()]) {
+        try {
+          const st = standaloneTroughTrackers.get(stSym);
+          if (!st) continue;
+          const stB = stSym.replace('-USD','');
+          const stEx = st.exchange || 'revolut';
+          let stP = stEx === 'kraken'
+            ? await getKrakenPriceForSymbol(stSym).catch(() => null)
+            : (fsRevolutPrices[stSym] || null);
+          if (!stP) continue;
+          if (st.troughPrice === null || stP < st.troughPrice) {
+            standaloneTroughTrackers.set(stSym, { ...st, troughPrice: stP });
+            await db.execute('UPDATE standalone_trough_trackers SET trough_price=?,updated_at=NOW() WHERE symbol=?',[stP,stSym]).catch(()=>{});
+            console.log('[trough-st] ' + stB + ' new low: ' + fmtPriceShort(stP));
+            continue;
+          }
+          if (st.troughPrice !== null) {
+            const stBT = st.troughPrice * (1 + (st.bouncePct || 8) / 100);
+            if (stP >= stBT) {
+              // Phase B: buy execution here
+              console.log('[trough-st] BOUNCE ' + stB + ' ' + fmtPriceShort(st.troughPrice) + '->' + fmtPriceShort(stP));
+            }
+          }
+        } catch (e) { console.error('[trough-st] ' + stSym + ':', e.message); }
       }
     }
   } catch (e) {
@@ -10335,7 +10413,7 @@ function createMcpServer() {
   server.tool('manage_alerts',
     'Set or manage all alert types — fixed price targets, daily thresholds, trailing stops, acknowledge, ignore or unignore coins',
     {
-      action:        z.enum(['set_target', 'set_threshold', 'set_trailing', 'acknowledge', 'ignore', 'unignore', 'remove_trailing', 'remove_target', 'remove_threshold', 'clear_cooldown']).describe('What alert action to perform'),
+      action:        z.enum(['set_target','set_threshold','set_trailing','acknowledge','ignore','unignore','remove_trailing','remove_target','remove_threshold','clear_cooldown','set_trough','remove_trough']).describe('What alert action to perform'),
       symbol:        z.string().describe('Trading pair e.g. NEAR-USD or NEAR'),
       direction:     z.enum(['up', 'down']).optional().describe('Alert direction for set_target'),
       threshold_pct: z.number().optional().describe('Percentage for set_target or set_threshold'),
@@ -10346,8 +10424,11 @@ function createMcpServer() {
       description:   z.string().optional().describe('For set_target -- human note stored on the rung, surfaced when the alert fires'),
       auto_execute:  z.coerce.boolean().optional().describe('#93 set_trailing: if true, on breach auto-sells sell_pct of position without Telegram approval'),
       sell_pct:      z.coerce.number().optional().describe('#93 set_trailing: percent of position to sell on auto-exec breach (default 25)'),
+      buy_usd:       z.coerce.number().optional().describe('set_trough: USD to auto-buy on bounce'),
+      bounce_pct:    z.coerce.number().optional().describe('set_trough: %% bounce off trough (default 8)'),
+      entry_floor:   z.coerce.number().optional().describe('set_trough: never buy below this price'),
     },
-    async ({ action, symbol, direction, threshold_pct, anchor_price, trail_pct, current_price, target_price, description, auto_execute, sell_pct }) => {
+    async ({ action, symbol, direction, threshold_pct, anchor_price, trail_pct, current_price, target_price, description, auto_execute, sell_pct, buy_usd, bounce_pct, entry_floor }) => {
       const sym      = symbol.includes('-USD') ? symbol.toUpperCase() : `${symbol.toUpperCase()}-USD`;
       const coinBase = sym.replace('-USD', '');
       let result = {};
@@ -10431,6 +10512,16 @@ function createMcpServer() {
         const hadThreshold = customThresholds[sym] !== undefined;
         await removeThreshold(sym);
         result = { ok: true, action: 'remove_threshold', symbol: sym, message: hadThreshold ? `Custom threshold removed for ${coinBase} — reverts to default` : `No custom threshold for ${coinBase} — any DB row cleared` };
+      } else if (action === 'set_trough') {
+        if (!buy_usd || buy_usd <= 0) throw new Error('set_trough requires buy_usd > 0');
+        const stExch = KRAKEN_MONITORED_COINS.includes(coinBase) ? 'kraken' : 'revolut';
+        await armStandaloneTrough(sym, buy_usd, bounce_pct||8, entry_floor||null, stExch);
+        result = { ok: true, action: 'set_trough', symbol: sym, buy_usd, bounce_pct: bounce_pct||8,
+          entry_floor: entry_floor||null, exchange: stExch,
+          message: 'Trough tracker armed -- buys $' + buy_usd + ' on ' + (bounce_pct||8) + '%% bounce' };
+      } else if (action === 'remove_trough') {
+        await clearStandaloneTrough(sym);
+        result = { ok: true, action: 'remove_trough', symbol: sym, message: 'Tracker cleared for ' + sym };
       } else if (action === 'clear_cooldown') {
         // Clear the 24h alert cooldown for this coin so its targets can fire again immediately.
         // Deletes recent macro_alerts_sent target rows + clears in-memory ack/reminder state.
