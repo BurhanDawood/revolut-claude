@@ -564,6 +564,7 @@ const alertRecommendations = new Map();      // symbol -> { rec, timestamp } —
 const responseCache = new Map();             // 'type:symbol' -> { response, timestamp } — 30-min cache for sell/buy advice
 const trailingStops = new Map();             // symbol -> { trailPct, peakPrice, stopPrice, entryPrice }
 const mssAlertState = new Map();             // #49B symbol|tf -> { status, lastFiredStatus, lastFiredAt } -- MSS alert flip-detection
+const abnAlertState = new Map();             // #50B symbol -> lastFiredAt (ms) -- abnormal-move alert cooldown
 const targetExtremes = new Map();            // symbol -> { high, low } — high-water/low-water per target across polls (resets on fire/ack/remove)
 const trailingStopAlerted = new Map();       // symbol -> timestamp — tracks recently-triggered trailing stops for hold reply
 const fastScanLastPrice  = new Map();         // #94: symbol -> last price seen by fast scan (dedup — skip if unchanged)
@@ -3657,6 +3658,7 @@ async function captureIntradayPrices() {
       const placeholders = Array(rows).fill('(?, ?)').join(', ');
       await db.execute(`INSERT INTO price_intraday (symbol, price) VALUES ${placeholders}`, values);
       console.log(`[intraday] Captured ${rows} prices`);
+      evaluateAbnormalAlerts().catch(e => console.error('[abn] eval', e.message)); // #50B fire abnormal-move alerts on fresh data
     } else {
       console.log('[intraday] Captured 0 prices (no ticker matches)');
     }
@@ -3668,7 +3670,7 @@ async function captureIntradayPrices() {
 // === #50 Build 2 abnormal-move detector (Phase A: compute + expose, NO alerts) ===
 const ABN_LOOKBACK_DAYS = 14;
 const ABN_K = 3;            // move must be >= K x baseline
-const ABN_FLOOR_PCT = 1.0;  // absolute floor: ignore moves under this even if high multiple
+const ABN_FLOOR_PCT = 0.4;  // #50B adaptive floor: max(0.4%, baseline*k) reduces to flat 0.4% noise floor
 const ABN_MAX_GAP_MS = 10 * 60 * 1000; // skip consecutive pairs spanning a capture gap (server down)
 
 function abnComputeBaseline(rows) {
@@ -3741,6 +3743,37 @@ async function computeAbnormalMoves() {
     }
   } catch (e) { console.error('[abn] computeAbnormalMoves error:', e.message); }
   return out;
+}
+
+// #50B abnormal-move alert layer (alert-only, never an execution path)
+const ABN_ALERT_COOLDOWN_MS = 30 * 60 * 1000; // 30min per-coin cooldown
+
+function abnFmtP(p) {
+  if (p == null || isNaN(p)) return '?';
+  const n = Number(p);
+  if (n >= 1) return n.toFixed(4);
+  if (n >= 0.01) return n.toFixed(5);
+  return n.toPrecision(4);
+}
+
+async function evaluateAbnormalAlerts() {
+  try {
+    const states = await computeAbnormalMoves();
+    const now = Date.now();
+    for (const symbol of Object.keys(states)) {
+      const s = states[symbol];
+      if (!s || s.status !== 'ABNORMAL') continue;
+      const last = abnAlertState.get(symbol) || 0;
+      if (now - last < ABN_ALERT_COOLDOWN_MS) continue; // still cooling down
+      const base = symbol.replace('-USD', '');
+      const arrow = s.direction === 'PUMP' ? '+' : '';
+      const msg = 'ABNORMAL MOVE - ' + base + ' ' + s.direction + '\n' +
+        arrow + s.move + '% in ' + s.interval_min + 'min | ' + s.multiple + 'x normal range\n' +
+        abnFmtP(s.prev_price) + ' -> ' + abnFmtP(s.last_price) + ' | baseline ' + s.baseline + '%/2min';
+      try { await sendTelegram(msg); abnAlertState.set(symbol, now); }
+      catch (err) { console.error('[abn] send', symbol, err.message); }
+    }
+  } catch (e) { console.error('[abn] evaluateAbnormalAlerts error:', e.message); }
 }
 
 // === #49 MSS structure tracker (Phase A: compute + expose, NO alerts) ===
