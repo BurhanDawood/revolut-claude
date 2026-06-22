@@ -3665,6 +3665,84 @@ async function captureIntradayPrices() {
   }
 }
 
+// === #50 Build 2 abnormal-move detector (Phase A: compute + expose, NO alerts) ===
+const ABN_LOOKBACK_DAYS = 14;
+const ABN_K = 3;            // move must be >= K x baseline
+const ABN_FLOOR_PCT = 1.0;  // absolute floor: ignore moves under this even if high multiple
+const ABN_MAX_GAP_MS = 10 * 60 * 1000; // skip consecutive pairs spanning a capture gap (server down)
+
+function abnComputeBaseline(rows) {
+  if (!rows || rows.length < 10) return null;
+  const moves = [];
+  for (let i = 1; i < rows.length; i++) {
+    const prev = parseFloat(rows[i-1].price), cur = parseFloat(rows[i].price);
+    if (!(prev > 0) || !(cur > 0)) continue;
+    const dt = new Date(rows[i].recorded_at).getTime() - new Date(rows[i-1].recorded_at).getTime();
+    if (!(dt > 0) || dt > ABN_MAX_GAP_MS) continue;
+    moves.push(Math.abs((cur - prev) / prev) * 100);
+  }
+  if (moves.length < 10) return null;
+  const mean = moves.reduce((a, b) => a + b, 0) / moves.length;
+  const variance = moves.reduce((a, b) => a + (b - mean) * (b - mean), 0) / moves.length;
+  const std = Math.sqrt(variance);
+  const sorted = moves.slice().sort((a, b) => a - b);
+  const p95 = sorted[Math.floor(sorted.length * 0.95)];
+  return { baseline: mean, std, p95, sample: moves.length };
+}
+
+// Analyse the latest move for one symbol's chronological rows. Returns a result object or null.
+function abnAnalyze(rows) {
+  if (!rows || rows.length < 12) return { status: 'insufficient_data', sample: rows ? rows.length : 0 };
+  const stats = abnComputeBaseline(rows.slice(0, -1)); // baseline from history EXCLUDING the latest move
+  if (!stats) return { status: 'insufficient_data', sample: rows.length };
+  const last = rows[rows.length - 1], prev = rows[rows.length - 2];
+  const pPrev = parseFloat(prev.price), pLast = parseFloat(last.price);
+  if (!(pPrev > 0) || !(pLast > 0)) return { status: 'no_prev' };
+  const dt = new Date(last.recorded_at).getTime() - new Date(prev.recorded_at).getTime();
+  const move = (pLast - pPrev) / pPrev * 100;
+  const absMove = Math.abs(move);
+  const threshold = ABN_K * stats.baseline;
+  const multiple = stats.baseline > 0 ? absMove / stats.baseline : 0;
+  const abnormal = absMove >= threshold && absMove >= ABN_FLOOR_PCT && (dt > 0 && dt <= ABN_MAX_GAP_MS);
+  return {
+    status: abnormal ? 'ABNORMAL' : 'normal',
+    direction: move > 0 ? 'PUMP' : 'DUMP',
+    move: Number(move.toFixed(3)),
+    abs_move: Number(absMove.toFixed(3)),
+    baseline: Number(stats.baseline.toFixed(4)),
+    threshold: Number(threshold.toFixed(3)),
+    multiple: Number(multiple.toFixed(1)),
+    p95: Number(stats.p95.toFixed(3)),
+    last_price: pLast,
+    prev_price: pPrev,
+    interval_min: Number((dt / 60000).toFixed(1)),
+    sample: stats.sample
+  };
+}
+
+// Compute abnormal-move state for all captured coins (held + watch, minus DEAD_BAGS/EXITED meta rows).
+// Phase A: returns the map; fires NOTHING.
+async function computeAbnormalMoves() {
+  const out = {};
+  try {
+    const [csRows] = await db.execute("SELECT symbol FROM coin_strategy WHERE symbol NOT IN ('DEAD_BAGS','EXITED','INDEX')");
+    for (const r of csRows) {
+      const symbol = r.symbol + '-USD';
+      let rows;
+      try {
+        [rows] = await db.execute(
+          'SELECT price, recorded_at FROM price_intraday WHERE symbol = ? AND recorded_at > DATE_SUB(NOW(), INTERVAL ? DAY) ORDER BY recorded_at ASC',
+          [symbol, ABN_LOOKBACK_DAYS]
+        );
+      } catch (e) { continue; }
+      if (!rows || rows.length < 12) continue;
+      const res = abnAnalyze(rows);
+      if (res && res.status !== 'insufficient_data' && res.status !== 'no_prev') out[symbol] = res;
+    }
+  } catch (e) { console.error('[abn] computeAbnormalMoves error:', e.message); }
+  return out;
+}
+
 // === #49 MSS structure tracker (Phase A: compute + expose, NO alerts) ===
 const MSS_TRACKED = ['CC', 'NEAR', 'TON'];
 const MSS_TIMEFRAMES = [1, 4];
@@ -9729,6 +9807,17 @@ app.get('/api/xrp-locations', async (req, res) => {
       tangem:   { qty: tanQty,   entry: tanEntry,     badge: 'Tangem',    ...calcPnl(tanQty,   tanEntry,     xrpPrice) },
       combined: { qty: totalQty, entry: blendedEntry,                     ...calcPnl(totalQty, blendedEntry, xrpPrice) }
     });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/abnormal - #50 Build 2 abnormal-move read (Phase A, always live-computes).
+app.get('/api/abnormal', async (req, res) => {
+  try {
+    const states = await computeAbnormalMoves();
+    const arr = Object.keys(states).map(sym => Object.assign({ symbol: sym }, states[sym]));
+    arr.sort((a, b) => (b.multiple || 0) - (a.multiple || 0));
+    const abnormal = arr.filter(s => s.status === 'ABNORMAL');
+    res.json({ k: ABN_K, floor_pct: ABN_FLOOR_PCT, lookback_days: ABN_LOOKBACK_DAYS, abnormal_count: abnormal.length, states: arr });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
