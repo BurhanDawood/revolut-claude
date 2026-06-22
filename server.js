@@ -563,6 +563,7 @@ let mostRecentSwingAlert = null;             // { symbol, coinBase, direction, p
 const alertRecommendations = new Map();      // symbol -> { rec, timestamp } — reused in reminders, no repeat API calls
 const responseCache = new Map();             // 'type:symbol' -> { response, timestamp } — 30-min cache for sell/buy advice
 const trailingStops = new Map();             // symbol -> { trailPct, peakPrice, stopPrice, entryPrice }
+const mssAlertState = new Map();             // #49B symbol|tf -> { status, lastFiredStatus, lastFiredAt } -- MSS alert flip-detection
 const targetExtremes = new Map();            // symbol -> { high, low } — high-water/low-water per target across polls (resets on fire/ack/remove)
 const trailingStopAlerted = new Map();       // symbol -> timestamp — tracks recently-triggered trailing stops for hold reply
 const fastScanLastPrice  = new Map();         // #94: symbol -> last price seen by fast scan (dedup — skip if unchanged)
@@ -1553,6 +1554,16 @@ try {
   console.log(`Loaded ${tsRows.length} trailing stops from database`);
 } catch (e) {
   console.error('Failed to load trailing stops:', e.message);
+}
+// #49B Load MSS alert state from DB so a redeploy does not re-fire existing structure
+try {
+  const [msRows] = await db.execute('SELECT symbol, timeframe, mss_status FROM mss_state');
+  for (const row of msRows) {
+    mssAlertState.set(row.symbol + '|' + row.timeframe, { status: row.mss_status, lastFiredStatus: null, lastFiredAt: 0 });
+  }
+  console.log(`Loaded ${msRows.length} MSS states from database`);
+} catch (e) {
+  console.error('Failed to load MSS states:', e.message);
 }
 try {
   const [ttRows] = await db.execute(
@@ -3775,19 +3786,94 @@ async function computeMssStructure() {
         );
       } catch (e) { console.error('[mss] query', symbol, e.message); continue; }
       if (!rows || !rows.length) continue;
+      const results = {};
       for (const tf of MSS_TIMEFRAMES) {
         const bars = mssResampleBars(rows, tf);
         const r = mssAnalyzeStructure(bars, MSS_ATR_K);
-        try {
-          await db.execute(
+        results[tf] = r;
+        try {          await db.execute(
             'INSERT INTO mss_state (symbol, timeframe, trend, mss_status, pivots_json, last_hh, last_hl, last_high, last_low, last_close, atr, threshold, bar_count) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE trend=VALUES(trend), mss_status=VALUES(mss_status), pivots_json=VALUES(pivots_json), last_hh=VALUES(last_hh), last_hl=VALUES(last_hl), last_high=VALUES(last_high), last_low=VALUES(last_low), last_close=VALUES(last_close), atr=VALUES(atr), threshold=VALUES(threshold), bar_count=VALUES(bar_count)',
             [symbol, tf + 'h', r.trend || null, r.mss_status || null, JSON.stringify(r.pivots || []), r.last_hh, r.last_hl, r.last_high, r.last_low, r.last_close, r.atr, r.threshold, r.bar_count]
           );
         } catch (e) { console.error('[mss] upsert', symbol, tf, e.message); }
       }
+      try { await evaluateMssAlerts(base, symbol, results); } catch (e) { console.error('[mss] alert', base, e.message); }
     }
     console.log('[mss] structure computed for ' + MSS_TRACKED.length + ' coins');
   } catch (e) { console.error('[mss] computeMssStructure error:', e.message); }
+}
+
+// #49B MSS alert layer (alert-only, NEVER an execution path)
+const MSS_ALERT_COOLDOWN_MS = 3 * 60 * 60 * 1000; // 3h anti-flap per symbol/timeframe/status
+
+function mssFmtP(p) {
+  if (p == null || isNaN(p)) return '?';
+  const n = Number(p);
+  if (n >= 1) return n.toFixed(4);
+  if (n >= 0.01) return n.toFixed(5);
+  return n.toPrecision(4);
+}
+
+function mssSwingMap(r) {
+  const ps = (r.pivots || []).filter(p => !p.prov).slice(-4);
+  if (!ps.length) return '(structure pending)';
+  return ps.map(p => p.label + ' ' + mssFmtP(p.price)).join(' -> ');
+}
+
+function mssBuildMsg(kind, base, tf, r) {
+  const hl = mssFmtP(r.last_hl);
+  const close = mssFmtP(r.last_close);
+  const hh = mssFmtP(r.last_hh);
+  const map = mssSwingMap(r);
+  if (kind === 'confirmed') {
+    return 'MSS CONFIRMED -- ' + base + ' (' + tf + ')\n' +
+      'Uptrend structure broken: closed ' + close + ' below higher-low ' + hl + '.\n' +
+      'Swing map: ' + map + '\n' +
+      'This is your ladder-out signal per plan -- reassess if it looks like a shakeout.';
+  } else if (kind === 'forming') {
+    return 'MSS FORMING -- ' + base + ' (' + tf + ')\n' +
+      'Failed to make a new high (lower-high vs prior ' + hh + '). Watching higher-low ' + hl + '.\n' +
+      'Swing map: ' + map + '\n' +
+      'Structure weakening, not broken yet -- a close below ' + hl + ' confirms the shift.';
+  } else {
+    return 'MSS EARLY WARNING -- ' + base + ' (' + tf + ')\n' +
+      '1h structure broke (closed ' + close + ' below 1h higher-low ' + hl + '). 4h still intact.\n' +
+      'Heads-up only -- watch for 4h confirmation before acting.';
+  }
+}
+
+async function evaluateMssAlerts(base, symbol, results) {
+  const now = Date.now();
+  const r4 = results[4];
+  const r1 = results[1];
+  // --- 4h PRIMARY (forming + confirmed) ---
+  if (r4 && r4.mss_status) {
+    const key4 = symbol + '|4h';
+    const e = mssAlertState.get(key4) || { status: null, lastFiredStatus: null, lastFiredAt: 0 };
+    const transitioned = e.status !== r4.mss_status;
+    const isAlertStatus = (r4.mss_status === 'confirmed' || r4.mss_status === 'forming');
+    const flapSuppressed = (r4.mss_status === e.lastFiredStatus) && (now - e.lastFiredAt < MSS_ALERT_COOLDOWN_MS);
+    let fired = false;
+    if (transitioned && isAlertStatus && !flapSuppressed) {
+      try { await sendTelegram(mssBuildMsg(r4.mss_status, base, '4h', r4)); fired = true; }
+      catch (err) { console.error('[mss] 4h send', base, err.message); }
+    }
+    mssAlertState.set(key4, { status: r4.mss_status, lastFiredStatus: fired ? r4.mss_status : e.lastFiredStatus, lastFiredAt: fired ? now : e.lastFiredAt });
+  }
+  // --- 1h EARLY WARNING (confirmed only, and only while 4h not yet confirmed) ---
+  if (r1 && r1.mss_status) {
+    const key1 = symbol + '|1h';
+    const e = mssAlertState.get(key1) || { status: null, lastFiredStatus: null, lastFiredAt: 0 };
+    const transitioned = e.status !== r1.mss_status;
+    const fourConfirmed = r4 && r4.mss_status === 'confirmed';
+    const flapSuppressed = (r1.mss_status === e.lastFiredStatus) && (now - e.lastFiredAt < MSS_ALERT_COOLDOWN_MS);
+    let fired = false;
+    if (transitioned && r1.mss_status === 'confirmed' && !fourConfirmed && !flapSuppressed) {
+      try { await sendTelegram(mssBuildMsg('early', base, '1h', r1)); fired = true; }
+      catch (err) { console.error('[mss] 1h send', base, err.message); }
+    }
+    mssAlertState.set(key1, { status: r1.mss_status, lastFiredStatus: fired ? 'confirmed' : e.lastFiredStatus, lastFiredAt: fired ? now : e.lastFiredAt });
+  }
 }
 // ── #94: fast-cadence trailing-stop scan for volatile meme/lotto coins ────────
 // Runs every 30s (decoupled from the 5-min alert loop). Only evaluates coins in
