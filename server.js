@@ -889,6 +889,24 @@ await db.execute(`CREATE TABLE IF NOT EXISTS dev_log (
     INDEX idx_research_symbol_time (symbol, researched_at)
   )`).catch(e => console.error('[migration] research_history:', e.message));
 
+  await db.execute(`CREATE TABLE IF NOT EXISTS catalyst_calendar (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    symbol VARCHAR(20) NOT NULL,
+    catalyst TEXT NOT NULL,
+    catalyst_date DATE,
+    catalyst_type VARCHAR(40),
+    expected_impact VARCHAR(20),
+    priced_in_risk TEXT,
+    confidence VARCHAR(20),
+    source TEXT,
+    source_date DATE,
+    status VARCHAR(20) NOT NULL DEFAULT 'upcoming',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_catalyst_symbol (symbol),
+    INDEX idx_catalyst_date (catalyst_date)
+  )`).catch(e => console.error('[migration] catalyst_calendar:', e.message));
+
 await db.execute(`CREATE TABLE IF NOT EXISTS coin_strategy (
   symbol VARCHAR(20) PRIMARY KEY,
   status VARCHAR(20),
@@ -4202,41 +4220,6 @@ async function researchAsset(symbol, triggeredBy = 'manual') {
   };
 }
 
-// ── #72 Build 2: weekly automated research sweep ──────────────────────────
-async function weeklyResearchSweep() {
-  const WEEKLY_COINS = ['CC', 'ENA', 'NEAR', 'JTO', 'TON', 'AERO', 'LINK', 'XLM', 'XRP', 'HYPE', 'RSC'];
-  console.log(`[research-sweep] Starting weekly sweep for ${WEEKLY_COINS.length} coins...`);
-  const results = [];
-  for (const sym of WEEKLY_COINS) {
-    try {
-      console.log(`[research-sweep] Researching ${sym}...`);
-      const r = await researchAsset(sym, 'weekly_sweep');
-      results.push({ symbol: sym, thesisStatus: r.thesisStatus, driftVerdict: r.driftVerdict, diff: r.diff });
-    } catch (e) {
-      console.error(`[research-sweep] ${sym} failed:`, e.message);
-      results.push({ symbol: sym, error: e.message });
-    }
-    // 30s spacing between calls — rate-limit friendly + spreads cost
-    await new Promise(res => setTimeout(res, 30000));
-  }
-  const drifted = results.filter(r => !r.error && r.driftVerdict && r.driftVerdict !== 'plan intact');
-  const changed = results.filter(r => !r.error && r.diff);
-  const errors  = results.filter(r => r.error);
-  let msg = `📊 <b>Weekly research sweep complete</b>\n${WEEKLY_COINS.length} coins checked`;
-  if (drifted.length) {
-    msg += `\n\n⚠️ <b>Plan drift detected (${drifted.length}):</b>`;
-    for (const r of drifted) msg += `\n• <b>${r.symbol}</b> [${r.thesisStatus}] — ${String(r.driftVerdict).slice(0, 80)}`;
-  }
-  if (changed.length) {
-    msg += `\n\n🔄 <b>Changes vs last research (${changed.length}):</b>`;
-    for (const r of changed) msg += `\n• <b>${r.symbol}</b>: ${String(r.diff).slice(0, 80)}`;
-  }
-  if (!drifted.length && !changed.length) msg += `\n\n✅ All plans intact — no material changes vs last research.`;
-  if (errors.length) msg += `\n\n❌ Failed: ${errors.map(r => r.symbol).join(', ')}`;
-  msg += `\n\nReview flagged coins in the PM thread.`;
-  try { await sendTelegram(msg); } catch (e) { console.error('[research-sweep] telegram failed:', e.message); }
-  console.log(`[research-sweep] Done. Drifted: ${drifted.length}, changed: ${changed.length}, errors: ${errors.length}`);
-}
 
 async function recordDailyPrices() {
   try {
@@ -9389,7 +9372,6 @@ cron.schedule('10 9 * * 1', async () => {
   }
 }, { timezone: 'Europe/London' });
 
-cron.schedule('15 9 * * 1', weeklyResearchSweep, { timezone: 'Europe/London' }); // #72 Build 2: weekly research sweep, Mondays 9:15 AM
 
 console.log('Cron jobs scheduled: midnight price recording + 9 AM morning briefing + every-2h macro news + Monday 9:05 rebalancing check + 9:15 AM research sweep + 10 AM intention outcomes + 10:02 AM rebalance checks (Europe/London)');
 
@@ -10357,7 +10339,7 @@ function createMcpServer() {
   server.tool('get_trading_data',
     'Get trading journal entries, active alerts, trader context/profile, rebalancing history, and dev_bridge messages',
     {
-      include: z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'dev_bridge', 'coin_strategy', 'reconciliation', 'ledger', 'tax_lots', 'all'])).optional()
+      include: z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'dev_bridge', 'coin_strategy', 'reconciliation', 'ledger', 'tax_lots', 'catalysts', 'all'])).optional()
         .describe('What data to fetch — defaults to all. dev_bridge, coin_strategy and reconciliation are never included in all; request them explicitly'),
       symbol:           z.string().optional().describe('Filter journal by coin e.g. NEAR'),
       limit:            z.number().optional().describe('Max journal entries to return, default 10'),
@@ -10505,6 +10487,17 @@ function createMcpServer() {
           const [csRows] = await db.execute(csQ[0], csQ[1]);
           result.coin_strategy = csRows;
         } catch (e) { result.coin_strategy = { error: e.message }; }
+      }
+
+      // catalysts -- explicitly excluded from fetchAll; must be requested by name
+      if (fetch.includes('catalysts')) {
+        try {
+          const catQ = symbol
+            ? ['SELECT * FROM catalyst_calendar WHERE symbol = ? AND status = \'upcoming\' ORDER BY (catalyst_date IS NULL), catalyst_date ASC', [symbol.toUpperCase().replace('-USD','')]]
+            : ['SELECT * FROM catalyst_calendar WHERE status = \'upcoming\' ORDER BY (catalyst_date IS NULL), catalyst_date ASC', []];
+          const [catRows] = await db.execute(catQ[0], catQ[1]);
+          result.catalysts = catRows;
+        } catch (e) { result.catalysts = { error: e.message }; }
       }
 
       // reconciliation -- explicitly excluded from fetchAll; must be requested by name
@@ -10680,7 +10673,7 @@ function createMcpServer() {
   server.tool('manage_trading',
     'Log journal entries, trade intentions, trader preferences, update invested capital, or configure USDT sweep',
     {
-      action:                 z.enum(['log_journal', 'log_intention', 'save_preference', 'update_capital', 'configure_sweep', 'configure_auto_execute', 'log_dev_issue', 'update_session_state', 'upsert_coin_strategy', 'export_dev_log', 'log_research', 'log_pm_decision', 'log_dev_decision', 'void_journal', 'configure_away_mode', 'delete_tax_lot']).describe('What trading action to perform'),
+      action:                 z.enum(['log_journal', 'log_intention', 'save_preference', 'update_capital', 'configure_sweep', 'configure_auto_execute', 'log_dev_issue', 'update_session_state', 'upsert_coin_strategy', 'export_dev_log', 'log_research', 'log_pm_decision', 'log_dev_decision', 'void_journal', 'configure_away_mode', 'delete_tax_lot', 'log_catalyst']).describe('What trading action to perform'),
       symbol:                 z.string().optional().describe('Coin e.g. NEAR-USD or NEAR'),
       trade_action:           z.enum(['buy', 'sell', 'hold', 'add', 'reduce', 'payment', 'transfer', 'pass']).optional().describe('Trade action for log_journal or log_intention — use pass to log a skipped trade for shadow grading at +7d/+30d'),
       price:                  z.number().optional().describe('Price for log_journal'),
@@ -10738,8 +10731,17 @@ function createMcpServer() {
       dev_supersedes_id:    z.number().optional().describe('log_dev_decision: id of an older decision this replaces'),
       journal_id:           z.number().optional().describe('void_journal: trading_journal row id to archive + delete'),
       tax_lot_id:           z.coerce.number().optional().describe('delete_tax_lot: tax_lots.id row to read and hard-delete'),
+      catalyst_id:          z.coerce.number().optional().describe('log_catalyst: existing catalyst_calendar id to update (omit to insert new)'),
+      catalyst:             z.string().optional().describe('log_catalyst: the catalyst description'),
+      catalyst_date:        z.string().optional().describe('log_catalyst: date YYYY-MM-DD (or null if undated)'),
+      catalyst_type:        z.string().optional().describe('log_catalyst: unlock|listing|upgrade|ETF|macro|earnings|other'),
+      expected_impact:      z.string().optional().describe('log_catalyst: bullish|bearish|neutral'),
+      priced_in_risk:       z.string().optional().describe('log_catalyst: sell-the-news / priced-in notes'),
+      catalyst_confidence:  z.string().optional().describe('log_catalyst: high|medium|low / rumoured|confirmed'),
+      catalyst_source:      z.string().optional().describe('log_catalyst: source + URL'),
+      catalyst_status:      z.string().optional().describe('log_catalyst: upcoming|passed|cancelled (default upcoming)'),
     },
-    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, max_buy_usd, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam, title, detail, category, status: devStatus, source: devSource, related_symbol: relSymbol, dev_log_id, active_workstream, progress, open_threads, next_action, recent_decision, recent_decisions, cs_status, cs_role, cs_theme, cs_strategy_md, pm_decision, pm_principle_tag, pm_conviction, pm_captured_by, pm_supersedes_id, dev_decision, dev_principle_tag, dev_cross_thread, dev_alternatives, dev_related_log, dev_supersedes_id, journal_id, tax_lot_id, away_action, away_coins, sell_floors, per_coin_enabled }) => {
+    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, max_buy_usd, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam, title, detail, category, status: devStatus, source: devSource, related_symbol: relSymbol, dev_log_id, active_workstream, progress, open_threads, next_action, recent_decision, recent_decisions, cs_status, cs_role, cs_theme, cs_strategy_md, pm_decision, pm_principle_tag, pm_conviction, pm_captured_by, pm_supersedes_id, dev_decision, dev_principle_tag, dev_cross_thread, dev_alternatives, dev_related_log, dev_supersedes_id, journal_id, tax_lot_id, away_action, away_coins, sell_floors, per_coin_enabled, catalyst_id, catalyst, catalyst_date, catalyst_type, expected_impact, priced_in_risk, catalyst_confidence, catalyst_source, catalyst_status }) => {
       // Make hodl_symbols accessible in configure_auto_execute via params object
       const params = { hodl_symbols: hodlSymbolsParam };
 
@@ -11155,6 +11157,35 @@ function createMcpServer() {
           deleted_row: { symbol: vrow.symbol, action: vrow.action, price: vrow.price, quantity: vrow.quantity, value_usd: vrow.value_usd, source: vrow.source, created_at: vrow.created_at },
           cascaded_coin_cash_flows: ccfN, archived: true, restorable_from: 'archived_journal.row_json', warnings: vwarnings
         }) }] };
+      } else if (action === 'log_catalyst') {
+        const cBase = (symbol || '').toUpperCase().replace('-USD', '');
+        if (!cBase) return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'symbol required' }) }] };
+        if (!catalyst && !catalyst_id) return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'catalyst text required for new entry' }) }] };
+        const cDate   = catalyst_date || null;
+        const cType   = catalyst_type || null;
+        const cImpact = expected_impact || null;
+        const cRisk   = priced_in_risk || null;
+        const cConf   = catalyst_confidence || null;
+        const cSrc    = catalyst_source || null;
+        const cStatus = catalyst_status || 'upcoming';
+        const cSrcDate = new Date().toISOString().slice(0, 10);
+        try {
+          if (catalyst_id) {
+            const cid = (typeof catalyst_id === 'number') ? catalyst_id : parseInt(catalyst_id, 10);
+            await db.execute(
+              `UPDATE catalyst_calendar SET symbol=?, catalyst=COALESCE(?, catalyst), catalyst_date=?, catalyst_type=?, expected_impact=?, priced_in_risk=?, confidence=?, source=?, status=? WHERE id=?`,
+              [cBase, catalyst || null, cDate, cType, cImpact, cRisk, cConf, cSrc, cStatus, cid]
+            );
+            return { content: [{ type: 'text', text: JSON.stringify({ ok: true, action: 'log_catalyst', updated_id: cid, symbol: cBase }) }] };
+          } else {
+            const [ins] = await db.execute(
+              `INSERT INTO catalyst_calendar (symbol, catalyst, catalyst_date, catalyst_type, expected_impact, priced_in_risk, confidence, source, source_date, status)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              [cBase, catalyst, cDate, cType, cImpact, cRisk, cConf, cSrc, cSrcDate, cStatus]
+            );
+            return { content: [{ type: 'text', text: JSON.stringify({ ok: true, action: 'log_catalyst', inserted_id: ins.insertId, symbol: cBase, catalyst_date: cDate }) }] };
+          }
+        } catch (e) { return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: e.message }) }] }; }
       } else if (action === 'delete_tax_lot') {
         // #134: read-then-hard-delete a tax_lots row by its own id. Always reads before deleting.
         const tlid = (typeof tax_lot_id === 'number') ? tax_lot_id : parseInt(tax_lot_id, 10);
