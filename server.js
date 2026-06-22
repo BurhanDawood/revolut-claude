@@ -7262,6 +7262,57 @@ async function autoResetTrailingStop(symbol) {
 // Reusable trailing stop alert handler — works for both Revolut X and Kraken coins
 async function handleTrailingStopAlert(symbol, currentPrice, ts, exchange = 'revolut') {
   const coinBase = symbol.replace('-USD', '');
+
+  // #93 Phase B: auto-exec trailing stop -- bypass Claude analysis entirely.
+  // Fires when ts.autoExecute=true (set via manage_alerts set_trailing auto_execute:true).
+  // All safety rails applied by autoExecuteSell/Kraken: sell_floors, entry_floor, dust, flat-pos guard.
+  if (ts.autoExecute) {
+    let hodlBlocked = false;
+    try {
+      const [ae93Rows] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'ai_auto_execute'");
+      const ae93Cfg = ae93Rows.length ? JSON.parse(ae93Rows[0].config_value) : {};
+      const hodl93 = ae93Cfg.hodl_symbols || [];
+      if (hodl93.includes(coinBase) || hodl93.includes(symbol)) {
+        // Hodl coin: respect the list even with auto_execute=true -- fall through to normal analysis
+        console.log('[trailing] #93 ' + coinBase + ' auto_execute=true but hodl -- falling through to analysis');
+        hodlBlocked = true;
+      }
+      if (!hodlBlocked) {
+        // Cooldown check (reuses symbol+'_executed' key, same as shouldAutoExecute)
+        const lastExec93 = analysisRateLimit.get(symbol + '_executed');
+        const cooldown93Ms = ((ae93Cfg.cooldown_minutes || 60)) * 60 * 1000;
+        if (lastExec93 && Date.now() - lastExec93 < cooldown93Ms) {
+          console.log('[trailing] #93 ' + coinBase + ' auto-exec cooldown active -- skipping');
+          await sendTelegram('<b>[#93 AUTO-TRAIL]</b> ' + coinBase + ' cooldown active (' + Math.round((Date.now()-lastExec93)/60000) + 'min). Trail cleared.').catch(() => {});
+          await removeTrailingStop(symbol).catch(() => {});
+          return;
+        }
+        // Arm cooldown and execute directly
+        analysisRateLimit.set(symbol + '_executed', Date.now());
+        const ae93Exchange = ts.exchange || exchange;
+        const ae93SellPct = ts.sellPct || 25;
+        console.log('[trailing] #93 ' + coinBase + ' auto_execute=true -- bypassing analysis (exchange: ' + ae93Exchange + ', sell_pct: ' + ae93SellPct + ')');
+        try {
+          const ae93Analysis = '#93 auto-trail breach at $' + fmtPriceShort(currentPrice) + ', trail ' + ts.trailPct + '% from peak $' + fmtPriceShort(ts.peakPrice);
+          if (ae93Exchange === 'kraken') {
+            await autoExecuteKrakenSell(symbol, ae93SellPct, ae93Analysis, 'High');
+          } else {
+            await autoExecuteSell(symbol, ae93SellPct, ae93Analysis, 'High');
+          }
+        } catch (ae93Err) {
+          console.error('[trailing] #93 auto-exec error:', ae93Err.message);
+          await sendTelegram('<b>[#93 AUTO-TRAIL FAILED]</b> ' + coinBase + ' -- ' + (ae93Err.message || '').substring(0, 100) + '. Manual action needed. Trail cleared.').catch(() => {});
+        }
+        // Single-use: remove trailing stop after execution (or failure)
+        await removeTrailingStop(symbol).catch(() => {});
+        return;
+      }
+    } catch (ae93ConfigErr) {
+      console.error('[trailing] #93 config read error -- falling through to analysis:', ae93ConfigErr.message);
+    }
+    // hodlBlocked or config error: fall through to normal analyseTrailingStopAlert below
+  }
+
   const dropFromPeak = ((ts.peakPrice - currentPrice) / ts.peakPrice * 100).toFixed(1);
   const entryPrice = ts.entryPrice || entryPrices.get(symbol) || null;
   const plPct = entryPrice ? ((currentPrice - entryPrice) / entryPrice * 100).toFixed(1) : null;
