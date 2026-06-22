@@ -3853,8 +3853,52 @@ async function runFastScan() {
           if (st.troughPrice !== null) {
             const stBT = st.troughPrice * (1 + (st.bouncePct || 8) / 100);
             if (stP >= stBT) {
-              // Phase B: buy execution here
-              console.log('[trough-st] BOUNCE ' + stB + ' ' + fmtPriceShort(st.troughPrice) + '->' + fmtPriceShort(stP));
+              let stMasterOn = false;
+              try {
+                const [stCfgR] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'ai_auto_execute'");
+                if (stCfgR.length) stMasterOn = JSON.parse(stCfgR[0].config_value).enabled === true;
+              } catch (e) { stMasterOn = false; }
+              if (!stMasterOn) {
+                console.log('[trough-st] bounce ' + stB + ' master OFF');
+                await sendTelegram('<b>[TROUGH BOUNCE] ' + stB + '</b>\nBounce ' + fmtPriceShort(st.troughPrice) + '->' + fmtPriceShort(stP) + ' but master auto-exec OFF. Manual buy?').catch(()=>{});
+                await clearStandaloneTrough(stSym); continue;
+              }
+              if (st.entryFloor && st.troughPrice < st.entryFloor) {
+                await sendTelegram('<b>[TROUGH FLOOR BREACH] ' + stB + '</b>\nTrough ' + fmtPriceShort(st.troughPrice) + ' below floor ' + fmtPriceShort(st.entryFloor) + '. No auto-buy.').catch(()=>{});
+                await clearStandaloneTrough(stSym); continue;
+              }
+              if (stEx === 'kraken') {
+                await sendTelegram('<b>[TROUGH BOUNCE] ' + stB + '</b>\nBounce confirmed but Kraken auto-buy not yet supported. Manual buy.').catch(()=>{});
+                await clearStandaloneTrough(stSym); continue;
+              }
+              const stAvailUsd = await getAvailableUSD('revolut').catch(() => 0);
+              if (stAvailUsd < st.buyUsd) {
+                await sendTelegram('<b>[TROUGH BLOCKED] ' + stB + '</b>\n$' + stAvailUsd.toFixed(2) + ' available, need $' + st.buyUsd + '. Cleared.').catch(()=>{});
+                await clearStandaloneTrough(stSym); continue;
+              }
+              await clearStandaloneTrough(stSym);
+              let stBuyQty = null;
+              try {
+                await placeRevolutOrder(stSym, 'buy', 'market', null, null, st.buyUsd);
+                stBuyQty = st.buyUsd / stP;
+                console.log('[trough-st] ' + stB + ' BOUGHT $' + st.buyUsd + ' at ' + fmtPriceShort(stP));
+              } catch (stBuyErr) {
+                console.error('[trough-st] buy failed:', stBuyErr.message);
+                await sendTelegram('<b>[TROUGH BUY FAILED] ' + stB + '</b>\n' + (stBuyErr.message||'').substring(0,100) + '. Cleared.').catch(()=>{});
+                continue;
+              }
+              try {
+                const stR = 'trough-st: trough ' + fmtPriceShort(st.troughPrice) + ' bounced ' + (st.bouncePct||8) + '%%' + ' to ' + fmtPriceShort(stP);
+                await db.execute(
+                  'INSERT INTO trading_journal (symbol,action,price,quantity,value_usd,reasoning,emotion,source) VALUES (?,?,?,?,?,?,?,?)',
+                  [stB,'buy',stP,stBuyQty,st.buyUsd,stR,'neutral','trough_auto']
+                );
+              } catch (e) { console.error('[trough-st] journal failed:', e.message); }
+              await sendTelegram(
+                '<b>[TROUGH AUTO-BOUGHT] ' + stB + '</b>\n' +
+                '$' + st.buyUsd + ' at ' + fmtPriceShort(stP) + '\n' +
+                'Trough ' + fmtPriceShort(st.troughPrice) + ' bounced ' + (st.bouncePct||8) + '%%'
+              ).catch(()=>{});
             }
           }
         } catch (e) { console.error('[trough-st] ' + stSym + ':', e.message); }
