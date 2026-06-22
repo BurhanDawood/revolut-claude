@@ -9304,6 +9304,7 @@ cron.schedule('5 9 * * 1', async () => {
 }, { timezone: 'Europe/London' });
 
 // Daily intention outcome checks — 10 AM, checks for 7-day and 30-day pending follow-ups
+cron.schedule('15 9 * * *', async () => { await sendTelegram('\ud83d\udccb Morning brief time. Open Claude PM and say "morning brief" - your positions need a daily eye.'); }, { timezone: 'Europe/London' }); // daily brief reminder
 cron.schedule('0 10 * * *', checkIntentionOutcomes, { timezone: 'Europe/London' });
 
 // #50: prune intraday prices older than 30 days
