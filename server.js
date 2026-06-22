@@ -9469,6 +9469,44 @@ app.get('/api/ledger', async (req, res) => {
   }
 });
 
+// GET /api/xrp-locations -- per-exchange XRP split view (#14)
+app.get('/api/xrp-locations', async (req, res) => {
+  try {
+    const tickerResponse = await revolutRequest('GET', '/tickers');
+    const tickerList = Array.isArray(tickerResponse) ? tickerResponse : (tickerResponse.data || []);
+    let xrpPrice = null;
+    for (const t of tickerList) {
+      const sym = (t.symbol || '').replace('/', '-');
+      if (sym === 'XRP-USD') { xrpPrice = parseFloat(t.last_price || t.mid || t.ask || t.bid) || null; break; }
+    }
+    const balances = await revolutRequest('GET', '/balances');
+    const xrpAsset = balances.find(b => b.currency === 'XRP');
+    const revQty = xrpAsset ? parseFloat(xrpAsset.available || 0) + parseFloat(xrpAsset.reserved || 0) : 0;
+    const revEntry = entryPrices.get('XRP-USD') || null;
+    let tanQty = 0;
+    try { tanQty = (await getTangemXRPBalance()) || 0; } catch (e) { tanQty = 0; }
+    const tanEntry = TANGEM_XRP_ENTRY;
+    const totalQty = revQty + tanQty;
+    let blendedEntry = null;
+    if (totalQty > 0) {
+      const rPart = (revQty > 0 && revEntry) ? revQty * revEntry : 0;
+      const tPart = tanQty > 0 ? tanQty * tanEntry : 0;
+      const denom = (revQty > 0 && revEntry ? revQty : 0) + (tanQty > 0 ? tanQty : 0);
+      if (denom > 0) blendedEntry = (rPart + tPart) / denom;
+    }
+    function calcPnl(qty, entry, price) {
+      if (!qty || !entry || !price) return { plPct: null, plUsd: null, valueUsd: null };
+      return { plPct: (price - entry) / entry * 100, plUsd: (price - entry) * qty, valueUsd: price * qty };
+    }
+    res.json({
+      price: xrpPrice,
+      revolut:  { qty: revQty,   entry: revEntry,     badge: 'Revolut X', ...calcPnl(revQty,   revEntry,     xrpPrice) },
+      tangem:   { qty: tanQty,   entry: tanEntry,     badge: 'Tangem',    ...calcPnl(tanQty,   tanEntry,     xrpPrice) },
+      combined: { qty: totalQty, entry: blendedEntry,                     ...calcPnl(totalQty, blendedEntry, xrpPrice) }
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // GET /api/balances — balances with prices, overnight change, and total portfolio value
 app.get('/api/balances', async (req, res) => {
   try {

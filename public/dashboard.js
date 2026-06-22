@@ -327,6 +327,7 @@ function loadCardDetail(sym, el) {
   if (cs && cs.strategy_md) {
     h += '<div style="white-space:pre-wrap;font-size:11px;color:#bbb;line-height:1.45;background:#141414;padding:8px;border-radius:4px;margin-bottom:8px">' + esc(cs.strategy_md) + '</div>';
   }
+  if (sym === 'XRP') { h += '<div id="cd-xrp-loc-XRP" style="font-size:11px;color:#888;margin-bottom:8px">Loading XRP locations...</div>'; }
   h += '<div id="cd-tranches-' + sym + '" style="font-size:11px;color:#888;margin-bottom:8px">Loading lots\u2026</div>';
   h += '<div id="cd-journal-' + sym + '" style="font-size:11px;color:#888">Loading journal\u2026</div>';
   el.innerHTML = h;
@@ -351,6 +352,35 @@ function loadCardDetail(sym, el) {
     if (ledgerCache) { renderLifetimePnl(ledgerCache); }
     else { fetchData('/api/ledger').then(function(d) { ledgerCache = d; renderLifetimePnl(d); }); }
   })(sym);
+
+  if (sym === 'XRP') {
+    fetchData('/api/xrp-locations').then(function(d) {
+      var c = $('cd-xrp-loc-XRP');
+      if (!c) return;
+      if (!d || d.error) { c.innerHTML = '<span style="color:#666">Location data unavailable</span>'; return; }
+      function fmtP(v) { return (v == null) ? '\u2014' : (v >= 0 ? '+' : '') + v.toFixed(2) + '%'; }
+      function money(v) { return (v == null) ? '\u2014' : (v >= 0 ? '+' : '-') + '$' + Math.abs(v).toFixed(2); }
+      function col(v) { return (!v && v !== 0) ? '#888' : v < 0 ? '#ff5555' : v > 0 ? '#33cc66' : '#888'; }
+      var rv = d.revolut || {}, tg = d.tangem || {}, cm = d.combined || {};
+      var html = '<div style="color:#666;font-weight:bold;margin-bottom:4px">XRP LOCATIONS</div>';
+      if (rv.qty >= 0.01) {
+        html += '<div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid #222">'
+          + '<span>\uD83D\uDD04 Revolut X ' + fmtQty(rv.qty, 2) + ' @ ' + (rv.entry ? fmtPrice(rv.entry) : '\u2014') + '</span>'
+          + '<span style="color:' + col(rv.plUsd) + '">' + money(rv.plUsd) + ' (' + fmtP(rv.plPct) + ')</span></div>';
+      }
+      if (tg.qty >= 0.01) {
+        html += '<div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid #222">'
+          + '<span>\uD83D\uDD12 Tangem ' + fmtQty(tg.qty, 2) + ' @ ' + (tg.entry ? fmtPrice(tg.entry) : '\u2014') + '</span>'
+          + '<span style="color:' + col(tg.plUsd) + '">' + money(tg.plUsd) + ' (' + fmtP(tg.plPct) + ')</span></div>';
+      }
+      if (cm.qty >= 0.01) {
+        html += '<div style="display:flex;justify-content:space-between;padding:3px 0;margin-top:2px">'
+          + '<b>Combined ' + fmtQty(cm.qty, 2) + ' @ ' + (cm.entry ? fmtPrice(cm.entry) : '\u2014') + '</b>'
+          + '<b style="color:' + col(cm.plUsd) + '">' + money(cm.plUsd) + ' (' + fmtP(cm.plPct) + ')</b></div>';
+      }
+      c.innerHTML = html;
+    });
+  }
 
   fetchData('/api/tranches/' + encodeURIComponent(sym)).then(function(t) {
     var c = $('cd-tranches-' + sym);
