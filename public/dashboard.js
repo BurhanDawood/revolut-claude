@@ -2,6 +2,7 @@
 
 var DASHBOARD_VERSION = '3.1.0';
 var csMap = {};
+var ledgerCache = null;
 console.log('Dashboard v' + DASHBOARD_VERSION);
 
 window.onerror = function(msg, src, line) {
@@ -322,13 +323,34 @@ function loadCardDetail(sym, el) {
   } else {
     h += '<div style="font-size:10px;color:#888;margin:8px 0 6px">No saved plan \u2014 dead-bag / untracked holding</div>';
   }
-  h += '<div style="font-size:10px;color:#ffaa00;margin-bottom:6px">Cycle P&amp;L \u2014 pending #8</div>';
+  h += '<div id="cd-lifetime-' + sym + '" style="font-size:10px;color:#888;margin-bottom:6px">Loading P&L...</div>';
   if (cs && cs.strategy_md) {
     h += '<div style="white-space:pre-wrap;font-size:11px;color:#bbb;line-height:1.45;background:#141414;padding:8px;border-radius:4px;margin-bottom:8px">' + esc(cs.strategy_md) + '</div>';
   }
   h += '<div id="cd-tranches-' + sym + '" style="font-size:11px;color:#888;margin-bottom:8px">Loading lots\u2026</div>';
   h += '<div id="cd-journal-' + sym + '" style="font-size:11px;color:#888">Loading journal\u2026</div>';
   el.innerHTML = h;
+
+  (function(s) {
+    function renderLifetimePnl(ld) {
+      var c = $('cd-lifetime-' + s);
+      if (!c) return;
+      var assets = (ld && ld.assets) || [];
+      var a = null;
+      for (var i = 0; i < assets.length; i++) { if ((assets[i].symbol || '').toUpperCase() === s) { a = assets[i]; break; } }
+      if (!a) { c.innerHTML = '<span style="color:#666">No P&L history yet</span>'; return; }
+      function money(v) { if (v == null) return '\u2014'; return (v >= 0 ? '+' : '-') + '$' + Math.abs(v).toFixed(2); }
+      function col(v) { if (v == null) return '#888'; return v < 0 ? '#ff5555' : (v > 0 ? '#33cc66' : '#888'); }
+      var warn = a.sells_missing_realized ? ' <span style="color:#ff8800">\u26a0 ' + a.sells_missing_realized + ' sells pre-#8</span>' : '';
+      c.innerHTML = '<div style="display:flex;gap:10px;flex-wrap:wrap">'
+        + '<span>Lifetime <b style="color:' + col(a.lifetime_total_usd) + '">' + money(a.lifetime_total_usd) + '</b></span>'
+        + '<span style="color:#777">Real <span style="color:' + col(a.realized_pnl_usd) + '">' + money(a.realized_pnl_usd) + '</span></span>'
+        + '<span style="color:#777">Unreal <span style="color:' + col(a.unrealized_pnl_usd) + '">' + money(a.unrealized_pnl_usd) + '</span></span>'
+        + warn + '</div>';
+    }
+    if (ledgerCache) { renderLifetimePnl(ledgerCache); }
+    else { fetchData('/api/ledger').then(function(d) { ledgerCache = d; renderLifetimePnl(d); }); }
+  })(sym);
 
   fetchData('/api/tranches/' + encodeURIComponent(sym)).then(function(t) {
     var c = $('cd-tranches-' + sym);
@@ -704,6 +726,7 @@ function loadLedger() {
     var el = $('ledger-list');
     if (!el) return;
     if (!data || data.error) { el.innerHTML = '<div class="empty-state">' + ((data && data.error) || 'Unavailable') + '</div>'; return; }
+    ledgerCache = data;
     var assets = data.assets || [];
     function money(v) { if (v == null) return '—'; var s = v < 0 ? '-' : (v > 0 ? '+' : ''); return s + '$' + Math.abs(v).toFixed(2); }
     function col(v) { if (v == null) return '#888'; return v < 0 ? '#ff5555' : (v > 0 ? '#33cc66' : '#888'); }
