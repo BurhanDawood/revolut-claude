@@ -907,6 +907,24 @@ await db.execute(`CREATE TABLE IF NOT EXISTS dev_log (
     INDEX idx_catalyst_date (catalyst_date)
   )`).catch(e => console.error('[migration] catalyst_calendar:', e.message));
 
+  await db.execute(`CREATE TABLE IF NOT EXISTS mss_state (
+    symbol VARCHAR(20) NOT NULL,
+    timeframe VARCHAR(10) NOT NULL,
+    trend VARCHAR(20),
+    mss_status VARCHAR(20),
+    pivots_json TEXT,
+    last_hh DECIMAL(20,10),
+    last_hl DECIMAL(20,10),
+    last_high DECIMAL(20,10),
+    last_low DECIMAL(20,10),
+    last_close DECIMAL(20,10),
+    atr DECIMAL(20,10),
+    threshold DECIMAL(20,10),
+    bar_count INT,
+    computed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (symbol, timeframe)
+  )`).catch(e => console.error('[migration] mss_state:', e.message));
+
 await db.execute(`CREATE TABLE IF NOT EXISTS coin_strategy (
   symbol VARCHAR(20) PRIMARY KEY,
   status VARCHAR(20),
@@ -3634,6 +3652,142 @@ async function captureIntradayPrices() {
   } catch (e) {
     console.error('[intraday] capture error:', e.message);
   }
+}
+
+// === #49 MSS structure tracker (Phase A: compute + expose, NO alerts) ===
+const MSS_TRACKED = ['CC', 'NEAR', 'TON'];
+const MSS_TIMEFRAMES = [1, 4];
+const MSS_LOOKBACK_DAYS = 14;
+const MSS_ATR_K = 1.5;
+
+function mssResampleBars(rows, hours) {
+  if (!rows.length) return [];
+  const binMs = hours * 3600 * 1000;
+  const bars = [];
+  let cur = null;
+  for (const r of rows) {
+    const tms = new Date(r.recorded_at).getTime();
+    const price = parseFloat(r.price);
+    if (!price || isNaN(tms)) continue;
+    const bucket = Math.floor(tms / binMs);
+    if (!cur || cur.bucket !== bucket) {
+      if (cur) bars.push(cur);
+      cur = { bucket, t: bucket * binMs, o: price, h: price, l: price, c: price };
+    } else {
+      if (price > cur.h) cur.h = price;
+      if (price < cur.l) cur.l = price;
+      cur.c = price;
+    }
+  }
+  if (cur) bars.push(cur);
+  return bars;
+}
+
+function mssComputeATR(bars) {
+  if (!bars.length) return 0;
+  let s = 0;
+  for (const b of bars) s += (b.h - b.l);
+  return s / bars.length;
+}
+
+function mssDetectPivots(bars, threshold) {
+  const n = bars.length;
+  if (n < 3 || threshold <= 0) return [];
+  const ref = bars[0].c;
+  let trend = 0, startIdx = 1;
+  for (let i = 1; i < n; i++) {
+    if (bars[i].h - ref >= threshold) { trend = 1; startIdx = i; break; }
+    if (ref - bars[i].l >= threshold) { trend = -1; startIdx = i; break; }
+  }
+  if (trend === 0) return [];
+  const pivots = [{ type: trend === 1 ? 'low' : 'high', price: ref, idx: 0 }];
+  let ext = ref, extIdx = 0;
+  for (let i = startIdx; i < n; i++) {
+    const h = bars[i].h, l = bars[i].l;
+    if (trend === 1) {
+      if (h > ext) { ext = h; extIdx = i; }
+      else if (ext - l >= threshold) {
+        pivots.push({ type: 'high', price: ext, idx: extIdx });
+        trend = -1; ext = l; extIdx = i;
+      }
+    } else {
+      if (l < ext) { ext = l; extIdx = i; }
+      else if (h - ext >= threshold) {
+        pivots.push({ type: 'low', price: ext, idx: extIdx });
+        trend = 1; ext = h; extIdx = i;
+      }
+    }
+  }
+  pivots.push({ type: trend === 1 ? 'high' : 'low', price: ext, idx: extIdx, provisional: true });
+  return pivots;
+}
+
+function mssAnalyzeStructure(bars, k) {
+  if (bars.length < 4) return { mss_status: 'insufficient_data', bar_count: bars.length, atr: null, threshold: null, pivots: [] };
+  const atr = mssComputeATR(bars);
+  const threshold = k * atr;
+  const pivots = mssDetectPivots(bars, threshold);
+  if (pivots.length < 3) return { mss_status: 'insufficient_data', bar_count: bars.length, atr, threshold, pivots: [] };
+  const labeled = [];
+  let prevHigh = null, prevLow = null;
+  for (const p of pivots) {
+    let label = p.type;
+    if (p.type === 'high') { label = (prevHigh !== null && p.price > prevHigh) ? 'HH' : (prevHigh !== null ? 'LH' : 'H'); prevHigh = p.price; }
+    else { label = (prevLow !== null && p.price > prevLow) ? 'HL' : (prevLow !== null ? 'LL' : 'L'); prevLow = p.price; }
+    labeled.push(Object.assign({}, p, { label }));
+  }
+  const confirmed = labeled.filter(p => !p.provisional);
+  const lastHigh = [].concat(confirmed).reverse().find(p => p.type === 'high');
+  const lastLow = [].concat(confirmed).reverse().find(p => p.type === 'low');
+  const lastClose = bars[bars.length - 1].c;
+  const recent = confirmed.slice(-4).map(p => p.label);
+  const ups = recent.filter(l => l === 'HH' || l === 'HL').length;
+  const downs = recent.filter(l => l === 'LH' || l === 'LL').length;
+  let trend = 'ranging';
+  if (ups >= 3) trend = 'uptrend';
+  else if (downs >= 3) trend = 'downtrend';
+  let mss_status = 'intact';
+  const lastConfirmed = confirmed[confirmed.length - 1];
+  if (trend === 'uptrend' || ups >= 2) {
+    if (lastConfirmed && lastConfirmed.type === 'high' && lastConfirmed.label === 'LH') mss_status = 'forming';
+    if (lastLow && lastLow.label === 'HL' && lastClose < lastLow.price) mss_status = 'confirmed';
+  }
+  return {
+    mss_status, trend, bar_count: bars.length, atr, threshold,
+    last_hh: lastHigh ? lastHigh.price : null,
+    last_hl: (lastLow && (lastLow.label === 'HL' || lastLow.label === 'L')) ? lastLow.price : null,
+    last_high: lastHigh ? lastHigh.price : null,
+    last_low: lastLow ? lastLow.price : null,
+    last_close: lastClose,
+    pivots: labeled.slice(-6).map(p => ({ type: p.type, label: p.label, price: Number(p.price.toFixed(8)), prov: !!p.provisional }))
+  };
+}
+
+async function computeMssStructure() {
+  try {
+    for (const base of MSS_TRACKED) {
+      const symbol = base + '-USD';
+      let rows;
+      try {
+        [rows] = await db.execute(
+          'SELECT price, recorded_at FROM price_intraday WHERE symbol = ? AND recorded_at > DATE_SUB(NOW(), INTERVAL ? DAY) ORDER BY recorded_at ASC',
+          [symbol, MSS_LOOKBACK_DAYS]
+        );
+      } catch (e) { console.error('[mss] query', symbol, e.message); continue; }
+      if (!rows || !rows.length) continue;
+      for (const tf of MSS_TIMEFRAMES) {
+        const bars = mssResampleBars(rows, tf);
+        const r = mssAnalyzeStructure(bars, MSS_ATR_K);
+        try {
+          await db.execute(
+            'INSERT INTO mss_state (symbol, timeframe, trend, mss_status, pivots_json, last_hh, last_hl, last_high, last_low, last_close, atr, threshold, bar_count) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE trend=VALUES(trend), mss_status=VALUES(mss_status), pivots_json=VALUES(pivots_json), last_hh=VALUES(last_hh), last_hl=VALUES(last_hl), last_high=VALUES(last_high), last_low=VALUES(last_low), last_close=VALUES(last_close), atr=VALUES(atr), threshold=VALUES(threshold), bar_count=VALUES(bar_count)',
+            [symbol, tf + 'h', r.trend || null, r.mss_status || null, JSON.stringify(r.pivots || []), r.last_hh, r.last_hl, r.last_high, r.last_low, r.last_close, r.atr, r.threshold, r.bar_count]
+          );
+        } catch (e) { console.error('[mss] upsert', symbol, tf, e.message); }
+      }
+    }
+    console.log('[mss] structure computed for ' + MSS_TRACKED.length + ' coins');
+  } catch (e) { console.error('[mss] computeMssStructure error:', e.message); }
 }
 // ── #94: fast-cadence trailing-stop scan for volatile meme/lotto coins ────────
 // Runs every 30s (decoupled from the 5-min alert loop). Only evaluates coins in
@@ -9253,6 +9407,8 @@ setTimeout(async () => {
   monitoringInterval = setInterval(checkPortfolio, CHECK_INTERVAL_MS);
   captureIntradayPrices();
   setInterval(captureIntradayPrices, CAPTURE_INTERVAL_MS);
+  setTimeout(computeMssStructure, 120000); // #49 initial MSS compute ~2min after boot
+  setInterval(computeMssStructure, 15 * 60 * 1000); // #49 recompute every 15min
   runFastScan();
   setInterval(runFastScan, FAST_SCAN_INTERVAL_MS);
   pollPendingOrders();
@@ -9487,6 +9643,28 @@ app.get('/api/xrp-locations', async (req, res) => {
       tangem:   { qty: tanQty,   entry: tanEntry,     badge: 'Tangem',    ...calcPnl(tanQty,   tanEntry,     xrpPrice) },
       combined: { qty: totalQty, entry: blendedEntry,                     ...calcPnl(totalQty, blendedEntry, xrpPrice) }
     });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/mss - #49 MSS structure read (Phase A). ?compute=1 recomputes first.
+app.get('/api/mss', async (req, res) => {
+  try {
+    if (req.query.compute === '1') { await computeMssStructure(); }
+    const [rows] = await db.execute('SELECT * FROM mss_state ORDER BY symbol, timeframe');
+    const out = rows.map(r => ({
+      symbol: r.symbol, timeframe: r.timeframe, trend: r.trend, mss_status: r.mss_status,
+      last_hh: r.last_hh != null ? Number(r.last_hh) : null,
+      last_hl: r.last_hl != null ? Number(r.last_hl) : null,
+      last_high: r.last_high != null ? Number(r.last_high) : null,
+      last_low: r.last_low != null ? Number(r.last_low) : null,
+      last_close: r.last_close != null ? Number(r.last_close) : null,
+      atr: r.atr != null ? Number(r.atr) : null,
+      threshold: r.threshold != null ? Number(r.threshold) : null,
+      bar_count: r.bar_count,
+      pivots: (() => { try { return JSON.parse(r.pivots_json || '[]'); } catch (e) { return []; } })(),
+      computed_at: r.computed_at
+    }));
+    res.json({ tracked: MSS_TRACKED, timeframes: MSS_TIMEFRAMES, atr_k: MSS_ATR_K, lookback_days: MSS_LOOKBACK_DAYS, states: out });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
