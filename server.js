@@ -5431,20 +5431,30 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
       }
     } catch (e) { console.error('[autoLog] Intention dedup check error:', e.message); }
 
-    // CHECK 2: Already logged by Claude MCP / auto rule?
+    // CHECK 2: Already logged by Claude MCP / auto rule? (#20: price-deviated fill)
+    let staleClaudeMcpRowId = null;
     try {
       const [recentSourced] = await db.execute(
-        `SELECT id, source FROM trading_journal
+        `SELECT id, source, price, value_usd FROM trading_journal
          WHERE symbol IN (?, ?)
          AND action = ?
          AND source IN ('claude_mcp', 'auto_rule', 'ai_auto')
-         AND created_at > DATE_SUB(NOW(), INTERVAL 10 MINUTE)
+         AND created_at > DATE_SUB(NOW(), INTERVAL 60 MINUTE)
+         AND ABS(value_usd - ?) < (? * 0.20 + 0.01)
          LIMIT 1`,
-        [coinBase, symbol, action]
+        [coinBase, symbol, action, valueUsd, valueUsd]
       );
       if (recentSourced.length > 0) {
-        console.log(`[autoLog] Suppressing — trade already logged (source=${recentSourced[0].source}, id=${recentSourced[0].id}). No Telegram sent — balance change may be a limit-order reservation, not a fill (#47).`);
-        return;
+        const ex = recentSourced[0];
+        const priceDiff = Math.abs(parseFloat(ex.price) - price) / Math.max(price, 0.000001);
+        if (priceDiff < 0.005) {
+          // Same price - exact duplicate (e.g. limit reservation), suppress
+          console.log('[autoLog] Suppressing - already logged (source=' + ex.source + ', id=' + ex.id + '). May be limit reservation (#47).');
+          return;
+        }
+        // Price deviated - actual fill at different price (#20): flag stale row for cleanup
+        staleClaudeMcpRowId = ex.id;
+        console.log('[autoLog] #20 price-deviated fill: will supersede stale row ' + ex.id + ' (logged $' + parseFloat(ex.price).toFixed(6) + ', actual $' + price.toFixed(6) + ')');
       }
     } catch (e) { console.error('[autoLog] Source suppression check error:', e.message); }
 
@@ -5499,6 +5509,11 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
       [coinBase, action, price, absQty, valueUsd, reasoning, 'pending', claudeRec]
     );
     const journalId = result.insertId;
+    // #20: remove stale claude_mcp row superseded by actual fill at different price
+    if (staleClaudeMcpRowId) {
+      await db.execute('DELETE FROM trading_journal WHERE id = ?', [staleClaudeMcpRowId]).catch(() => {});
+      console.log('[autoLog] #20 removed stale row ' + staleClaudeMcpRowId + ' (superseded by fill row ' + journalId + ')');
+    }
 
     // Regenerate learning model every 10th journal entry
     try {
