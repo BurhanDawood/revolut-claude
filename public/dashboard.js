@@ -94,6 +94,7 @@ function switchTab(name) {
   if (name === 'kraken') loadKraken();
   if (name === 'rebalancing') loadRebalancing();
   if (name === 'journal') { loadJournalEntries(); loadJournalStats(); }
+  if (name === 'scorecards') loadScorecards();
 }
 
 // ── Portfolio ─────────────────────────────────────────────────────
@@ -785,6 +786,60 @@ function loadLedger() {
   });
 }
 
+function toggleScorecard(idx) {
+  var el = $('sc-detail-' + idx);
+  if (el) el.style.display = (el.style.display === 'none' || !el.style.display) ? 'block' : 'none';
+}
+
+function loadScorecards() {
+  var el = $('scorecards-list');
+  if (!el) return;
+  fetchData('/api/scorecards').then(function(data) {
+    if (!data || data.error) { el.innerHTML = '<div class="empty-state">' + ((data && data.error) || 'Unavailable') + '</div>'; return; }
+    var scs = data.scorecards || [];
+    if (!scs.length) { el.innerHTML = '<div class="empty-state">No scorecards saved. Ask PM to save scorecard_data preference.</div>'; return; }
+    function money(v) { if (v == null) return '\u2014'; return (v >= 0 ? '+' : '-') + '$' + Math.abs(v).toFixed(2); }
+    function col(v) { return (!v && v !== 0) ? '#888' : v < 0 ? '#ff5555' : v > 0 ? '#33cc66' : '#888'; }
+    function fmtPt(v) { return (v == null) ? '\u2014' : (v >= 0 ? '+' : '') + v.toFixed(2) + '%'; }
+    var html = '';
+    scs.forEach(function(sc, idx) {
+      var lv = sc.live || {};
+      var delta = lv.delta_vs_baseline_usd;
+      var dStr = delta != null ? ' <span style="color:' + col(delta) + ';font-size:0.75rem">(' + money(delta) + ' vs baseline)</span>' : '';
+      var exits = lv.exits || sc.exits || [];
+      var exitRows = '';
+      exits.forEach(function(e) {
+        exitRows += '<div style="display:flex;justify-content:space-between;padding:2px 0;border-bottom:1px solid #222">'
+          + '<span style="color:#bbb">' + esc(e.coin) + ' ' + fmtQty(e.qty, 2) + ' @ ' + fmtPrice(e.sale_price) + '</span>'
+          + '<span style="color:' + col(e.loss_saved_usd) + '">' + money(e.loss_saved_usd) + '</span></div>';
+      });
+      var detail = '<div style="font-size:0.79rem;color:#666;font-weight:700;margin-bottom:4px">EXITS (vs holding today)</div>'
+        + exitRows
+        + '<div style="display:flex;justify-content:space-between;padding:3px 0;margin-top:3px">'
+        + '<span style="color:#888">Detour losses (realized)</span>'
+        + '<span style="color:' + col(sc.detour_losses_usd) + '">' + money(sc.detour_losses_usd) + '</span></div>';
+      if (sc.baseline) {
+        detail += '<div style="margin-top:8px;font-size:0.75rem;color:#666;font-weight:700">BASELINE (' + esc(sc.baseline_date || '') + ')</div>'
+          + '<div style="font-size:0.75rem;color:#888">Loss saved ' + money(sc.baseline.loss_saved_usd)
+          + ' | Net ' + money(sc.baseline.net_usd)
+          + (sc.anchor ? ' | ' + esc(sc.anchor.coin) + ' ' + money(sc.baseline.anchor_unrealized_usd) + ' (+' + sc.baseline.anchor_unrealized_pct.toFixed(2) + '%)' : '') + '</div>';
+      }
+      if (sc.caveats) { detail += '<div style="margin-top:6px;font-size:0.73rem;color:#555;font-style:italic">' + esc(sc.caveats) + '</div>'; }
+      html += '<div style="background:rgba(255,255,255,0.04);border-radius:8px;padding:12px">'
+        + '<div onclick="toggleScorecard(' + idx + ')" style="cursor:pointer">'
+        + '<div style="font-weight:700;font-size:0.95rem;margin-bottom:3px">' + esc(sc.name || sc.key) + ' <span style="color:#555;font-size:0.75rem">' + esc(sc.baseline_date || '') + '</span></div>'
+        + '<div style="display:flex;gap:14px;flex-wrap:wrap;font-size:0.82rem">'
+        + '<span>Loss saved <b style="color:' + col(lv.loss_saved_usd) + '">' + money(lv.loss_saved_usd) + '</b>' + dStr + '</span>'
+        + '<span>Net <b style="color:' + col(lv.net_usd) + '">' + money(lv.net_usd) + '</b></span>'
+        + (sc.anchor ? '<span>' + esc(sc.anchor.coin) + ' anchor <b style="color:' + col(lv.anchor_unrealized_usd) + '">' + money(lv.anchor_unrealized_usd) + '</b> (' + fmtPt(lv.anchor_unrealized_pct) + ')</span>' : '')
+        + '</div></div>'
+        + '<div id="sc-detail-' + idx + '" style="display:none;margin-top:10px;border-top:1px solid #2a2a2a;padding-top:10px;font-size:0.8rem">' + detail + '</div>'
+        + '</div>';
+    });
+    el.innerHTML = html;
+  });
+}
+
 function refreshAll() {
   var spinner = $('spinner');
   if (spinner) spinner.classList.add('active');
@@ -795,6 +850,7 @@ function refreshAll() {
   try { loadLedger(); } catch(e){ console.error('loadLedger FAILED', e); }
   try { loadMonitorStatus(); } catch(e){ console.error('loadMonitorStatus FAILED', e); }
   try { loadTrailingStops(); } catch(e){ console.error('loadTrailingStops FAILED', e); }
+  try { loadScorecards(); } catch(e){ console.error('loadScorecards FAILED', e); }
   if (spinner) setTimeout(function() { spinner.classList.remove('active'); }, 3000);
 }
 

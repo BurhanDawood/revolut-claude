@@ -669,6 +669,7 @@
   <button class="tab-btn" onclick="switchTab('journal')">📓 Journal</button>
   <button class="tab-btn" onclick="switchTab('rebalancing')">📊 Rebalancing</button>
   <button class="tab-btn" onclick="switchTab('kraken')">🦑 Kraken</button>
+  <button class="tab-btn" onclick="switchTab('scorecards')">📊 Scorecards</button>
 </nav>
 
 <div class="error-banner" id="error-banner"></div>
@@ -1166,6 +1167,13 @@
   </div>
 
 </div><!-- /tab-activity -->
+
+<div id="tab-scorecards" class="tab-content">
+  <div class="card">
+    <div class="card-title">📊 Strategy Scorecards</div>
+    <div id="scorecards-list" style="display:flex;flex-direction:column;gap:6px"><div class="empty-state">Loading...</div></div>
+  </div>
+</div><!-- /tab-scorecards -->
 
 <div class="toast" id="toast"></div>
   </div>

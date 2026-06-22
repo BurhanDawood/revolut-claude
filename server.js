@@ -9507,6 +9507,42 @@ app.get('/api/xrp-locations', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// GET /api/scorecards - strategy scorecard live recompute (#23)
+app.get('/api/scorecards', async (req, res) => {
+  try {
+    const [prefRows] = await db.execute(
+      "SELECT preference_value FROM trader_profile WHERE preference_key = 'scorecard_data' LIMIT 1"
+    );
+    if (!prefRows.length) return res.json({ scorecards: [] });
+    const scorecards = JSON.parse(prefRows[0].preference_value);
+    const tickerResponse = await revolutRequest('GET', '/tickers');
+    const tickerList = Array.isArray(tickerResponse) ? tickerResponse : (tickerResponse.data || []);
+    const priceMap = {};
+    for (const t of tickerList) {
+      if (t.symbol) { const sym = t.symbol.replace('/', '-'); const p = parseFloat(t.last_price || t.mid || t.ask || t.bid); if (p) priceMap[sym] = p; }
+    }
+    const enriched = scorecards.map(sc => {
+      const exits = (sc.exits || []).map(e => {
+        const lp = priceMap[e.coin + '-USD'] || null;
+        const holdingVal = lp ? e.qty * lp : null;
+        const lossSaved = holdingVal != null ? e.proceeds - holdingVal : null;
+        return { ...e, live_price: lp, current_holding_value: holdingVal != null ? Number(holdingVal.toFixed(2)) : null, loss_saved_usd: lossSaved != null ? Number(lossSaved.toFixed(2)) : null };
+      });
+      const hasAll = exits.every(e => e.loss_saved_usd != null);
+      const totalLossSaved = hasAll ? Number(exits.reduce((s, e) => s + e.loss_saved_usd, 0).toFixed(2)) : null;
+      const netCurrent = totalLossSaved != null ? Number((totalLossSaved + (sc.detour_losses_usd || 0)).toFixed(2)) : null;
+      const delta = totalLossSaved != null && sc.baseline ? Number((totalLossSaved - sc.baseline.loss_saved_usd).toFixed(2)) : null;
+      let anchorUsd = null, anchorPct = null;
+      if (sc.anchor) {
+        const ap = priceMap[sc.anchor.coin + '-USD'] || null;
+        if (ap) { anchorUsd = Number(((ap - sc.anchor.entry_price) * sc.anchor.qty).toFixed(2)); anchorPct = Number(((ap - sc.anchor.entry_price) / sc.anchor.entry_price * 100).toFixed(2)); }
+      }
+      return { ...sc, live: { exits, loss_saved_usd: totalLossSaved, net_usd: netCurrent, delta_vs_baseline_usd: delta, anchor_unrealized_usd: anchorUsd, anchor_unrealized_pct: anchorPct } };
+    });
+    res.json({ scorecards: enriched });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // GET /api/balances — balances with prices, overnight change, and total portfolio value
 app.get('/api/balances', async (req, res) => {
   try {
