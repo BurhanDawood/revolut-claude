@@ -1566,6 +1566,11 @@ try {
 } catch (e) {
   console.error('Failed to load MSS states:', e.message);
 }
+// #50C boot-load abnormal-move tunable config from system_config
+try {
+  const [abnCfgRows] = await db.execute("SELECT value FROM system_config WHERE `key`='abn_config'");
+  if (abnCfgRows.length) { Object.assign(abnConfig, JSON.parse(abnCfgRows[0].value)); console.log('[abn] config loaded:', JSON.stringify(abnConfig)); }
+} catch (e) { console.error('[abn] config boot-load error:', e.message); }
 try {
   const [ttRows] = await db.execute(
     'SELECT symbol, sale_price, reference_base, retrace_gate, trough_low, trough_armed, retrace_pct, bounce_pct, buyback_floor_pct, entry_floor, sale_proceeds_usd FROM pump_armed_rules WHERE active = 1 AND sale_price IS NOT NULL'
@@ -3670,7 +3675,9 @@ async function captureIntradayPrices() {
 // === #50 Build 2 abnormal-move detector (Phase A: compute + expose, NO alerts) ===
 const ABN_LOOKBACK_DAYS = 14;
 const ABN_K = 3;            // move must be >= K x baseline
-const ABN_FLOOR_PCT = 0.4;  // #50B adaptive floor: max(0.4%, baseline*k) reduces to flat 0.4% noise floor
+const ABN_FLOOR_PCT = 0.4;  // detection floor (fixed; k*baseline is the main gate)
+// #50C tunable alert config -- adjust live from PM via manage_trading configure_abnormal
+let abnConfig = { alert_floor_pct: 5.0, broad_threshold: 5, broad_floor_pct: 3.0, cooldown_min: 30 };
 const ABN_MAX_GAP_MS = 10 * 60 * 1000; // skip consecutive pairs spanning a capture gap (server down)
 
 function abnComputeBaseline(rows) {
@@ -3746,8 +3753,6 @@ async function computeAbnormalMoves() {
 }
 
 // #50B abnormal-move alert layer (alert-only, never an execution path)
-const ABN_ALERT_COOLDOWN_MS = 30 * 60 * 1000; // 30min per-coin cooldown
-
 function abnFmtP(p) {
   if (p == null || isNaN(p)) return '?';
   const n = Number(p);
@@ -3756,15 +3761,33 @@ function abnFmtP(p) {
   return n.toPrecision(4);
 }
 
+// #50C evaluateAbnormalAlerts: correlation guard + per-coin floors (tunable via abnConfig)
 async function evaluateAbnormalAlerts() {
   try {
     const states = await computeAbnormalMoves();
     const now = Date.now();
-    for (const symbol of Object.keys(states)) {
+    const cooldownMs = (abnConfig.cooldown_min || 30) * 60 * 1000;
+    // Collect all abnormal coins this cycle (detection threshold: k*baseline, floor 0.4%)
+    const abnCoins = Object.keys(states).filter(sym => states[sym] && states[sym].status === 'ABNORMAL');
+    // CORRELATION GUARD: if >=broad_threshold coins abnormal AND each >= broad_floor_pct -> one summary
+    const broadCoins = abnCoins.filter(sym => states[sym].abs_move >= (abnConfig.broad_floor_pct || 3.0));
+    if (broadCoins.length >= (abnConfig.broad_threshold || 5)) {
+      const pumps = broadCoins.filter(sym => states[sym].direction === 'PUMP').length;
+      const dumps = broadCoins.filter(sym => states[sym].direction === 'DUMP').length;
+      const msg = 'BROAD MARKET MOVE: ' + broadCoins.length + ' coins >='
+        + (abnConfig.broad_floor_pct || 3) + '% abnormal (' + pumps + ' PUMP / ' + dumps + ' DUMP)';
+      try {
+        await sendTelegram(msg);
+        for (const sym of abnCoins) abnAlertState.set(sym, now);
+      } catch (err) { console.error('[abn] broad send', err.message); }
+      return;
+    }
+    // INDIVIDUAL ALERTS: only for moves >= alert_floor_pct (default 5%) and past cooldown
+    for (const symbol of abnCoins) {
       const s = states[symbol];
-      if (!s || s.status !== 'ABNORMAL') continue;
+      if (s.abs_move < (abnConfig.alert_floor_pct || 5.0)) continue;
       const last = abnAlertState.get(symbol) || 0;
-      if (now - last < ABN_ALERT_COOLDOWN_MS) continue; // still cooling down
+      if (now - last < cooldownMs) continue;
       const base = symbol.replace('-USD', '');
       const arrow = s.direction === 'PUMP' ? '+' : '';
       const msg = 'ABNORMAL MOVE - ' + base + ' ' + s.direction + '\n' +
@@ -11060,7 +11083,7 @@ function createMcpServer() {
   server.tool('manage_trading',
     'Log journal entries, trade intentions, trader preferences, update invested capital, or configure USDT sweep',
     {
-      action:                 z.enum(['log_journal', 'log_intention', 'save_preference', 'update_capital', 'configure_sweep', 'configure_auto_execute', 'log_dev_issue', 'update_session_state', 'upsert_coin_strategy', 'export_dev_log', 'log_research', 'log_pm_decision', 'log_dev_decision', 'void_journal', 'configure_away_mode', 'delete_tax_lot', 'log_catalyst']).describe('What trading action to perform'),
+      action:                 z.enum(['log_journal', 'log_intention', 'save_preference', 'update_capital', 'configure_sweep', 'configure_auto_execute', 'log_dev_issue', 'update_session_state', 'upsert_coin_strategy', 'export_dev_log', 'log_research', 'log_pm_decision', 'log_dev_decision', 'void_journal', 'configure_away_mode', 'delete_tax_lot', 'log_catalyst', 'configure_abnormal']).describe('What trading action to perform'),
       symbol:                 z.string().optional().describe('Coin e.g. NEAR-USD or NEAR'),
       trade_action:           z.enum(['buy', 'sell', 'hold', 'add', 'reduce', 'payment', 'transfer', 'pass']).optional().describe('Trade action for log_journal or log_intention — use pass to log a skipped trade for shadow grading at +7d/+30d'),
       price:                  z.number().optional().describe('Price for log_journal'),
@@ -11127,8 +11150,12 @@ function createMcpServer() {
       catalyst_confidence:  z.string().optional().describe('log_catalyst: high|medium|low / rumoured|confirmed'),
       catalyst_source:      z.string().optional().describe('log_catalyst: source + URL'),
       catalyst_status:      z.string().optional().describe('log_catalyst: upcoming|passed|cancelled (default upcoming)'),
+      abn_alert_floor_pct:  z.number().optional().describe('configure_abnormal: individual coin alert minimum % (default 5.0)'),
+      abn_broad_floor_pct:  z.number().optional().describe('configure_abnormal: per-coin minimum % to count toward broad market total (default 3.0)'),
+      abn_broad_threshold:  z.number().optional().describe('configure_abnormal: how many coins trigger broad market summary (default 5)'),
+      abn_cooldown_min:     z.number().optional().describe('configure_abnormal: per-coin alert cooldown in minutes (default 30)'),
     },
-    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, max_buy_usd, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam, title, detail, category, status: devStatus, source: devSource, related_symbol: relSymbol, dev_log_id, active_workstream, progress, open_threads, next_action, recent_decision, recent_decisions, cs_status, cs_role, cs_theme, cs_strategy_md, pm_decision, pm_principle_tag, pm_conviction, pm_captured_by, pm_supersedes_id, dev_decision, dev_principle_tag, dev_cross_thread, dev_alternatives, dev_related_log, dev_supersedes_id, journal_id, tax_lot_id, away_action, away_coins, sell_floors, per_coin_enabled, catalyst_id, catalyst, catalyst_date, catalyst_type, expected_impact, priced_in_risk, catalyst_confidence, catalyst_source, catalyst_status }) => {
+    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, max_buy_usd, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam, title, detail, category, status: devStatus, source: devSource, related_symbol: relSymbol, dev_log_id, active_workstream, progress, open_threads, next_action, recent_decision, recent_decisions, cs_status, cs_role, cs_theme, cs_strategy_md, pm_decision, pm_principle_tag, pm_conviction, pm_captured_by, pm_supersedes_id, dev_decision, dev_principle_tag, dev_cross_thread, dev_alternatives, dev_related_log, dev_supersedes_id, journal_id, tax_lot_id, away_action, away_coins, sell_floors, per_coin_enabled, catalyst_id, catalyst, catalyst_date, catalyst_type, expected_impact, priced_in_risk, catalyst_confidence, catalyst_source, catalyst_status, abn_alert_floor_pct, abn_broad_floor_pct, abn_broad_threshold, abn_cooldown_min }) => {
       // Make hodl_symbols accessible in configure_auto_execute via params object
       const params = { hodl_symbols: hodlSymbolsParam };
 
@@ -11544,6 +11571,16 @@ function createMcpServer() {
           deleted_row: { symbol: vrow.symbol, action: vrow.action, price: vrow.price, quantity: vrow.quantity, value_usd: vrow.value_usd, source: vrow.source, created_at: vrow.created_at },
           cascaded_coin_cash_flows: ccfN, archived: true, restorable_from: 'archived_journal.row_json', warnings: vwarnings
         }) }] };
+      } else if (action === 'configure_abnormal') {
+        const updates = {};
+        if (abn_alert_floor_pct != null) updates.alert_floor_pct = Number(abn_alert_floor_pct);
+        if (abn_broad_floor_pct  != null) updates.broad_floor_pct  = Number(abn_broad_floor_pct);
+        if (abn_broad_threshold  != null) updates.broad_threshold  = Number(abn_broad_threshold);
+        if (abn_cooldown_min     != null) updates.cooldown_min     = Number(abn_cooldown_min);
+        if (!Object.keys(updates).length) return { content: [{ type: 'text', text: JSON.stringify({ error: 'No parameters provided', current: abnConfig }) }] };
+        Object.assign(abnConfig, updates);
+        await db.execute("INSERT INTO system_config (`key`,value) VALUES ('abn_config',?) ON DUPLICATE KEY UPDATE value=?", [JSON.stringify(abnConfig), JSON.stringify(abnConfig)]);
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, action: 'configure_abnormal', abn_config: abnConfig }) }] };
       } else if (action === 'log_catalyst') {
         const cBase = (symbol || '').toUpperCase().replace('-USD', '');
         if (!cBase) return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'symbol required' }) }] };
