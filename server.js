@@ -8426,6 +8426,9 @@ async function checkPortfolio() {
           // so large conversions are never mis-flagged as suspected card payments
           const isUSDConversion = usdIncrease > 0 &&
             Math.abs(usdIncrease - decrease) / decrease < 0.02;
+          // #146: partial USD offset fix -- subtract USDT->USD conversion leg before logging card payment
+          const partialUSDOffset = (!isUSDConversion && usdIncrease > 0.50) ? usdIncrease : 0;
+          const netPaymentAmt = parseFloat((decrease - partialUSDOffset).toFixed(2));
 
           // Guard 2: USDT→crypto swap — also checked before the cap
           let isCryptoPurchase = false;
@@ -8512,20 +8515,21 @@ async function checkPortfolio() {
               if (dupe.length > 0) {
                 console.log('[usdt] Duplicate payment check — skipping auto-log');
               } else {
-                console.log(`[usdt] Auto-logging card payment $${decrease.toFixed(2)} (no offsetting increase, no recent trade)`);
+                if (partialUSDOffset > 0) console.log(`[usdt] #146 Partial USD offset $${partialUSDOffset.toFixed(2)} (USDT->USD conversion leg) -- net card payment: $${netPaymentAmt.toFixed(2)}`);
+                else console.log(`[usdt] Auto-logging card payment $${netPaymentAmt.toFixed(2)} (no offsetting increase, no recent trade)`);
                 await db.execute(
                   `INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-                  ['USDT', 'payment', 1.00, decrease, decrease,
-                   `Auto-logged card payment — $${decrease.toFixed(2)} USDT (no offsetting balance increase)`, 'neutral', 'revolut_card']
+                  ['USDT', 'payment', 1.00, netPaymentAmt, netPaymentAmt,
+                   `Auto-logged card payment -- $${netPaymentAmt.toFixed(2)} USDT${partialUSDOffset > 0 ? ' (#146: $' + partialUSDOffset.toFixed(2) + ' USDT->USD conversion excluded)' : ' (no offsetting balance increase)'}`, 'neutral', 'revolut_card']
                 ).catch(() => {});
                 const prevCap = totalInvestedCapital;
-                const newCap  = totalInvestedCapital - decrease;
-                await updateInvestedCapital(newCap, `Card payment auto-logged: -$${decrease.toFixed(2)}`);
+                const newCap  = totalInvestedCapital - netPaymentAmt;
+                await updateInvestedCapital(newCap, `Card payment auto-logged: -$${netPaymentAmt.toFixed(2)}`);
                 await sendTelegram(
-                  `💳 PAYMENT $${decrease.toFixed(2)} USDT\n` +
+                  `💳 PAYMENT $${netPaymentAmt.toFixed(2)} USDT\n` +
                   `Capital: $${prevCap.toFixed(2)} → $${newCap.toFixed(2)}\n\n` +
-                  `Tap '<b>skip payment ${decrease.toFixed(2)}</b>' if not a payment.`
+                  `Tap '<b>skip payment ${netPaymentAmt.toFixed(2)}</b>' if not a payment.`
                 ).catch(() => {});
               } // end limit-reserve guard (#127)
               }
