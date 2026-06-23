@@ -2,7 +2,7 @@
 
 > **Purpose of this document.** This is the single durable reference for how the system is built, how data flows through it, what each subsystem does, and *why* the major design decisions were made. It exists because the build history was previously fragmented across 100+ dev_log tickets, git commits, Claude's cross-session memory, and conversation logs — making "how does X work / why is it this way" a reconstruction job. Maintain this file: when a major subsystem ships or a load-bearing decision changes, update the relevant section. The live ticket board remains the `dev_log` (see §7); this document is the map, not the changelog.
 >
-> **Owner:** Bryan. **Last updated:** 2026-06-23. (#50C correlation guard + configure_abnormal; #144 per-rung sell_pct; #145 away_buy_usd + set_away_sell; #146 payment detector partial-offset fix; earlier 2026-06-22: #49 MSS A+B; #50B2 A+B; #40 catalyst; #14/#19/#20/#23 dashboard cluster; #93 trailing stop; #24 per-coin opt-in; #125 Away Mode 2c; #130 trough-rebuy; #143 standalone trough-buy.)
+> **Owner:** Bryan. **Last updated:** 2026-06-23. (#50C correlation guard + configure_abnormal; #144 per-rung sell_pct; #145 away_buy_usd + set_away_sell; #146 payment detector partial-offset fix; earlier 2026-06-22: #49 MSS A+B; #50B2 A+B; #40 catalyst; #14/#19/#20/#23 dashboard cluster; #93 trailing stop; #24 per-coin opt-in; #125 Away Mode 2c; #130 trough-rebuy; #143 standalone trough-buy; #53 concentration dashboard; #54 emotion x outcome forward grading; #51 pre-trade checklist gate.)
 
 ---
 
@@ -203,6 +203,9 @@ Reconstructed from git history and the dev_log. Not exhaustive — the `dev_log`
 - **#144** (2026-06-23): `sell_pct NULL` column on `price_targets`; `set_target sell_pct:100` stores per-rung override; `tryAwayAutoSellUpTarget` reads rung->per-coin->global->25% priority. *Resolved 2026-06-23.*
 - **#145** (2026-06-23): dedicated `away_buy_usd` param; `set_away_sell` action + `away_sell_pct` for symmetric Away Mode buy+sell config. Connector refresh required. *Resolved 2026-06-23.*
 - **#146** (2026-06-23): payment detector partial-offset fix -- concurrent USDT->USD conversion + GBP payment in same 5-min window no longer fires inflated combined amount. *Resolved 2026-06-23.*
+- **#53** (2026-06-23): Concentration dashboard -- GET /api/concentration groups live Revolut positions by coin_strategy theme + role; dashboard 'Conc %' tab with colour-coded bar chart (green <25%, amber 25-40%, red >=40%). Feeds #51 concentration check. *Resolved 2026-06-23.*
+- **#54** (2026-06-23): Emotion x outcome forward grading -- forwardSection in updateLearningModel() using outcome_7d_pct (#48 grader); emotion x action win-rate + avg forward move; followed_recommendation accuracy; surfaces in get_context learningModel when >=5 rows graded. *Resolved 2026-06-23.*
+- **#51** (2026-06-23): Pre-trade checklist gate -- checkPreTrade() prepended to every execute_kraken_trade Telegram approval; 5 data-driven checks: entry/chase (>8%), churn (48h sell), catalyst (14d), concentration (#53 theme ceiling 40%), capital. Advisory only, try/catch wrapped, never blocks execution. *Resolved 2026-06-23.*
 
 ---
 
@@ -213,7 +216,7 @@ The **`dev_log`** (queried via `get_trading_data include=['dev_log']`) is the li
 - **Tier 1 — resilience/safety:** #43 done, #12 done, #55 done, #71 done, #102 done.
 - **Tier 1.5 — data cleanup:** #47 Part 2 B2a shipped 2026-06-19 (limit-order fill pipeline) — awaiting live-fill confirmation; #3 Part B AVAX tax-lot reconstruction still open. #8 lifetime ledger resolved 2026-06-20.
 - **Tier 2 — core quality / intelligence layer:** #72 done; #36 plan-aware alerts done (A1/A2/A3 + #87 trailing-stop path, 2026-06-20); #90 parser done 2026-06-19; **#49 MSS tracker done 2026-06-22; #50 Build 2 abnormal-move detector done 2026-06-22; #40 catalyst calendar done 2026-06-22** (intelligence layer now substantially complete). Remaining sources: #61 YouTube, #69 X/social (both validation-first, deferred); umbrella framing #68/#39.
-- **Tier 2.5 — learning loop:** #48 outcome loop (Opus, own session); #122 rebalance journal fix ensures rotation legs are graded when #48 ships. → #52 shadow tracker → #54 emotion×outcome → #51 checklist gate → #53 concentration dashboard.
+- **Tier 2.5 — learning loop:** #48 gradeTradeOutcomes done. #52 shadow tracker done. #54 emotion×outcome forward grading done. #51 pre-trade checklist gate done. #53 concentration dashboard done. **Learning loop cluster fully shipped 2026-06-23.**
 - **Auto-exec / pump-loop:** #95 built, BOBA live cycles running. #93 auto-exec trailing stop done. #24 per-coin opt-in done. #45 per-coin sell-floor done. #125 Away Mode done (Phase 2c proven live). #144/#145 per-rung sell_pct + away_buy_usd + set_away_sell done. #130 trough-rebuy done. #143 standalone trough-buy done. Remaining: upgrade #130 rebuy to trailing trough tracker (needs PC/Cowork, spec in `rebound_tracker_spec` pref); #46 availability-gated; #33 emergency liquidation; #34 pump-capture mode.
 - **Known bugs to watch:** #76 (macro alert guardrails partial — Haiku can still produce stale narratives), #74 (context-blind ladder rec), #44 (multi-trade approval clobber — Opus, own session). #75 dashboard alerts resolved 2026-06-19. #99 dynamic fast-scan resolved 2026-06-20.
 - **Cosmetic:** cron log line omits server-backup entry. project_description roadmap and tool count updated 2026-06-20 (#2).
