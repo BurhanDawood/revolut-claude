@@ -240,16 +240,16 @@ async function tryAwayAutoSellUpTarget(symbol, coinBase, currentPrice, changePct
     const am = amR.length ? JSON.parse(amR[0].config_value) : {};
     const cap = parseFloat(am.max_session_sell_usd ?? 500);
     const sold = parseFloat(am.session_sold_usd ?? 0);
-    const estValue = (assetQty || 0) * 0.25 * currentPrice;
+    const pct = target.sellPct ?? ae.max_sell_pct ?? 25; // #144 per-rung override; falls back to global cap
+    const estValue = (assetQty || 0) * (pct / 100) * currentPrice;
     if (sold + estValue > cap) {
       await sendTelegram(`AWAY CAP \u2014 ${coinBase}: up-target hit but session sell cap reached ($${sold.toFixed(2)}/$${cap.toFixed(2)}). Skipped \u2014 your call when back.`).catch(() => {});
       console.log(`[away] session cap reached ${coinBase}: ${sold}+${estValue} > ${cap}`);
       return true;
     }
-    // #125 B: no pre-notice — autoExecuteSell sends the single 'AI EXECUTED' notice; REASON below surfaces the away context in it.
-    const awayAnalysis = `REASON: AWAY MODE auto-sell — ${coinBase} hit pre-set up-target ${target.targetPrice} (now ${priceStr}, +${changePct.toFixed(1)}%).`;
+    // #125 B / #144: no pre-notice — autoExecuteSell sends the single 'AI EXECUTED' notice.
+    const awayAnalysis = `REASON: AWAY MODE auto-sell — ${coinBase} hit pre-set up-target ${target.targetPrice} (${pct}% of position, now ${priceStr}, +${changePct.toFixed(1)}%).`;
     const conf = ae.require_confidence || 'High';
-    const pct = ae.max_sell_pct || 25;
     if (KRAKEN_MONITORED_COINS.includes(symbol)) {
       await autoExecuteKrakenSell(symbol, pct, awayAnalysis, conf);
     } else {
@@ -1093,6 +1093,7 @@ await safeAddColumn('trading_journal',  'source',          "VARCHAR(20) DEFAULT 
 await safeAddColumn('trading_journal',  'updated_at',      'TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP');
 await safeAddColumn('trading_journal',  'realised_pnl_usd', 'DECIMAL(20,8) NULL');
 await safeAddColumn('trailing_stops',   'auto_execute',    'TINYINT(1) NOT NULL DEFAULT 0'); // #93
+await safeAddColumn('price_targets',    'sell_pct',        'DECIMAL(5,2) NULL'); // #144 per-rung sell %% override for Away Mode up-targets
 await safeAddColumn('trailing_stops',   'sell_pct',        'DECIMAL(10,4) DEFAULT 25.0');   // #93
 await safeAddColumn('trailing_stops',   'exchange',        "VARCHAR(20) DEFAULT 'revolut'"); // #93
 await db.execute(`CREATE TABLE IF NOT EXISTS standalone_trough_trackers (
@@ -1435,7 +1436,7 @@ for (const row of thresholdRows) {
 }
 console.log(`Loaded ${thresholdRows.length} custom thresholds from database`);
 
-const [ptRows] = await db.execute('SELECT id, symbol, anchor_price, threshold_pct, target_price, entry_price, direction, note FROM price_targets');
+const [ptRows] = await db.execute('SELECT id, symbol, anchor_price, threshold_pct, target_price, entry_price, direction, note, sell_pct FROM price_targets');
 for (const row of ptRows) {
   const t = {
     id: row.id,
@@ -1444,7 +1445,8 @@ for (const row of ptRows) {
     targetPrice: parseFloat(row.target_price),
     entryPrice: row.entry_price ? parseFloat(row.entry_price) : null,
     direction: row.direction || 'up',
-    note: row.note || null
+    note: row.note || null,
+    sellPct: row.sell_pct ? parseFloat(row.sell_pct) : null // #144
   };
   const arr = priceTargets.get(row.symbol) || [];
   arr.push(t);
@@ -10959,7 +10961,7 @@ function createMcpServer() {
       target_price:  z.number().optional().describe('For remove_target — remove only the rung at this exact target price; omit to remove ALL targets for the symbol'),
       description:   z.string().optional().describe('For set_target -- human note stored on the rung, surfaced when the alert fires'),
       auto_execute:  z.coerce.boolean().optional().describe('#93 set_trailing: if true, on breach auto-sells sell_pct of position without Telegram approval'),
-      sell_pct:      z.coerce.number().optional().describe('#93 set_trailing: percent of position to sell on auto-exec breach (default 25)'),
+      sell_pct:      z.coerce.number().optional().describe('#93/#144 set_trailing/set_target: %% of position to sell; 100=full exit. Away Mode uses per-rung value if set, else global max_sell_pct (default 25)'),
       buy_usd:       z.coerce.number().optional().describe('set_trough: USD to auto-buy on bounce'),
       bounce_pct:    z.coerce.number().optional().describe('set_trough: %% bounce off trough (default 8)'),
       entry_floor:   z.coerce.number().optional().describe('set_trough: never buy below this price'),
@@ -10984,10 +10986,10 @@ function createMcpServer() {
             dirCorrected = true;
           }
           await db.execute(
-            'INSERT INTO price_targets (symbol, anchor_price, threshold_pct, target_price, direction, note) VALUES (?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE anchor_price=VALUES(anchor_price), threshold_pct=VALUES(threshold_pct), target_price=VALUES(target_price), direction=VALUES(direction), note=VALUES(note), updated_at=CURRENT_TIMESTAMP',
-            [sym, anchor_price, threshold_pct, targetPrice, dir, description ?? null]
+            'INSERT INTO price_targets (symbol, anchor_price, threshold_pct, target_price, direction, note, sell_pct) VALUES (?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE anchor_price=VALUES(anchor_price), threshold_pct=VALUES(threshold_pct), target_price=VALUES(target_price), direction=VALUES(direction), note=VALUES(note), sell_pct=VALUES(sell_pct), updated_at=CURRENT_TIMESTAMP',
+            [sym, anchor_price, threshold_pct, targetPrice, dir, description ?? null, sell_pct ?? null]
           );
-          upsertPriceTarget(sym, { anchorPrice: anchor_price, thresholdPct: threshold_pct, targetPrice, direction: dir, note: description ?? null }); // #38 B2
+          upsertPriceTarget(sym, { anchorPrice: anchor_price, thresholdPct: threshold_pct, targetPrice, direction: dir, note: description ?? null, sellPct: sell_pct ?? null }); // #38 B2 #144
           alertState.acknowledged.delete(sym);
           r = { anchorPrice: anchor_price, targetPrice, direction: dir };
         } else {
