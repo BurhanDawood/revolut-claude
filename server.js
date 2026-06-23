@@ -2550,6 +2550,88 @@ function formatSystemAlert(alertType, coinBase, details) {
   return `⚠️ <b>${alertType} — ${coinBase}</b>\n\n${details}`;
 }
 
+// #51 pre-trade checklist gate
+async function checkPreTrade(coinBase, side, valueUsd, livePrice) {
+  try {
+    const lines = [];
+    let pass = 0, warn = 0;
+
+    // 1. Entry check (chase / floor)
+    const ep = entryPrices.get(`${coinBase}-USD`);
+    if (ep && livePrice) {
+      const diff = (livePrice - ep) / ep * 100;
+      if (side === 'buy') {
+        if (diff > 8) { lines.push(`\u26a0\ufe0f Chasing \u2014 buying ${diff.toFixed(0)}% above entry ($${ep.toFixed(4)})`); warn++; }
+        else { lines.push(`\u2705 Entry \u2014 ${diff >= 0 ? '+' : ''}${diff.toFixed(0)}% vs entry ($${ep.toFixed(4)})`); pass++; }
+      } else {
+        if (diff < -10) { lines.push(`\u26a0\ufe0f Floor \u2014 selling ${Math.abs(diff).toFixed(0)}% below entry ($${ep.toFixed(4)})`); warn++; }
+        else { lines.push(`\u2705 Floor OK \u2014 ${diff >= 0 ? '+' : ''}${diff.toFixed(0)}% vs entry`); pass++; }
+      }
+    }
+
+    // 2. Churn check (buy only - sold same coin in last 48h)
+    if (side === 'buy') {
+      const [ch] = await db.execute(
+        `SELECT created_at, price FROM trading_journal WHERE symbol = ? AND action IN ('sell','reduce')
+         AND created_at >= DATE_SUB(NOW(), INTERVAL 48 HOUR) ORDER BY created_at DESC LIMIT 1`,
+        [`${coinBase}-USD`]
+      ).catch(() => [[]]);
+      if (ch.length) {
+        const h = Math.round((Date.now() - new Date(ch[0].created_at)) / 3.6e6);
+        const sp = parseFloat(ch[0].price);
+        const rp = livePrice ? ((livePrice - sp) / sp * 100) : null;
+        lines.push(`\u26a0\ufe0f Churn \u2014 sold ${coinBase} ${h}h ago @ $${sp.toFixed(4)}${rp != null ? ` (rebuy ${rp >= 0 ? '+' : ''}${rp.toFixed(1)}%)` : ''}`);
+        warn++;
+      } else { lines.push(`\u2705 No churn \u2014 no recent sell`); pass++; }
+    }
+
+    // 3. Catalyst within 14 days
+    const [cats] = await db.execute(
+      `SELECT catalyst, DATEDIFF(catalyst_date, CURDATE()) AS d FROM catalyst_calendar
+       WHERE symbol = ? AND status = 'upcoming' AND catalyst_date IS NOT NULL
+       AND catalyst_date BETWEEN CURDATE() AND DATE_ADD(CURDATE(), INTERVAL 14 DAY)
+       ORDER BY catalyst_date LIMIT 1`,
+      [coinBase]
+    ).catch(() => [[]]);
+    if (cats.length) { lines.push(`\u26a1 Catalyst \u2014 ${cats[0].catalyst} in ${cats[0].d}d`); pass++; }
+
+    // 4. Concentration check (buy only)
+    if (side === 'buy' && valueUsd) {
+      try {
+        const [csR] = await db.execute('SELECT theme FROM coin_strategy WHERE symbol = ?', [coinBase]);
+        if (csR.length && csR[0].theme) {
+          const themes = csR[0].theme.split(',').map(t => t.trim()).filter(Boolean).slice(0, 2);
+          const { positions, totalValue } = await buildPositions();
+          const [csAll] = await db.execute('SELECT symbol, theme FROM coin_strategy WHERE theme IS NOT NULL');
+          const csMap = new Map(csAll.map(r => [r.symbol, r.theme]));
+          for (const theme of themes) {
+            let tv = 0;
+            for (const p of positions) { if ((csMap.get(p.coin) || '').includes(theme)) tv += p.currentValue; }
+            const cur = totalValue > 0 ? (tv / totalValue * 100) : 0;
+            const aft = (totalValue + valueUsd) > 0 ? ((tv + valueUsd) / (totalValue + valueUsd) * 100) : 0;
+            if (aft >= 40) { lines.push(`\u26a0\ufe0f Conc \u2014 ${theme}: ${cur.toFixed(0)}%\u2192${aft.toFixed(0)}% (ceiling 40%)`); warn++; }
+            else { lines.push(`\u2705 Conc \u2014 ${theme}: ${cur.toFixed(0)}%\u2192${aft.toFixed(0)}%`); pass++; }
+          }
+        }
+      } catch (e) { /* concentration check failed silently */ }
+    }
+
+    // 5. Capital check (buy only)
+    if (side === 'buy' && valueUsd) {
+      const avail = await getAvailableUSD('revolut').catch(() => null);
+      if (avail !== null) {
+        if (avail < valueUsd) { lines.push(`\u26a0\ufe0f Capital \u2014 $${avail.toFixed(0)} available (need $${valueUsd.toFixed(0)})`); warn++; }
+        else { lines.push(`\u2705 Capital \u2014 $${avail.toFixed(0)} available`); pass++; }
+      }
+    }
+
+    if (!lines.length) return '';
+    const total = pass + warn;
+    const score = warn > 0 ? `${pass}/${total} \u2014 ${warn} caution${warn > 1 ? 's' : ''}` : `${pass}/${total} \u2705`;
+    return `\ud83d\udccb <b>PRE-TRADE CHECK</b> \u2014 ${score}\n` + lines.join('\n') + '\n\n';
+  } catch (e) { console.warn('[#51] checkPreTrade:', e.message); return ''; }
+}
+
 function formatApprovalRequest(coinBase, side, qty, price, valueUsd, exchange) {
   const exchangeLabel = exchange === 'revolut' ? 'Revolut X' : 'Kraken';
   const qtyStr = qty ? `${formatTradeQty(qty)} ${coinBase}` : coinBase;
@@ -12243,7 +12325,8 @@ function createMcpServer() {
         pendingMcpTradeQueue.push({ _exchange: 'kraken', symbol: sym, side, orderType: order_type, volume: estBaseSize, price: livePrice, valueUSD: tradeValueUSD, timestamp: Date.now(), source: 'claude_mcp', qtyEstimated: !volume && !!value_usd });
       }
 
-      await sendTelegram(formatApprovalRequest(coinBase, side, volume || null, livePrice, tradeValueUSD, exchange));
+      const checklistMsg = await checkPreTrade(coinBase, side, tradeValueUSD, livePrice).catch(() => '');
+      await sendTelegram(checklistMsg + formatApprovalRequest(coinBase, side, volume || null, livePrice, tradeValueUSD, exchange));
 
       const queueDepth = pendingMcpTradeQueue.length;
       const queueNote  = queueDepth > 1 ? ` (${queueDepth} trades queued — reply 'approve trade' for each in order)` : '';
