@@ -5070,6 +5070,53 @@ async function updateLearningModel() {
       }
     } catch (e) { /* ignore */ }
 
+    // -- #54 Forward-graded emotion x outcome (outcome_7d_pct from #48 grader)
+    let forwardSection = '';
+    try {
+      const [fwdRows] = await db.execute(
+        `SELECT emotion, action,
+           COUNT(*) AS n,
+           SUM(CASE WHEN outcome_7d_pct > 0 THEN 1 ELSE 0 END) AS wins,
+           ROUND(AVG(outcome_7d_pct),2) AS avg_pct
+         FROM trading_journal
+         WHERE outcome_7d_pct IS NOT NULL
+           AND action IN ('buy','sell','add','reduce','pass')
+           AND emotion IS NOT NULL AND emotion NOT IN ('pending','neutral')
+         GROUP BY emotion, action HAVING n >= 3 ORDER BY emotion, action`
+      );
+      const [recRows] = await db.execute(
+        `SELECT followed_recommendation,
+           COUNT(*) AS n,
+           SUM(CASE WHEN outcome_7d_pct > 0 THEN 1 ELSE 0 END) AS wins,
+           ROUND(AVG(outcome_7d_pct),2) AS avg_pct
+         FROM trading_journal
+         WHERE outcome_7d_pct IS NOT NULL
+           AND action IN ('buy','sell','add','reduce')
+           AND followed_recommendation IS NOT NULL
+         GROUP BY followed_recommendation`
+      );
+      const [gradedCount] = await db.execute(
+        `SELECT COUNT(*) AS n FROM trading_journal WHERE outcome_7d_pct IS NOT NULL AND action IN ('buy','sell','add','reduce','pass')`
+      );
+      const total7d = gradedCount[0].n;
+      if (total7d >= 5) {
+        const emoLines = fwdRows.map(r => {
+          const wr = Math.round(r.wins / r.n * 100);
+          const dir = parseFloat(r.avg_pct) >= 0 ? '+' : '';
+          return `- ${r.emotion} ${r.action.toUpperCase()}: ${wr}% right (${r.wins}/${r.n}) avg ${dir}${r.avg_pct}%`;
+        });
+        const recLines = recRows.map(r => {
+          const label = r.followed_recommendation === 1 ? 'Followed advice' : 'Ignored advice';
+          const wr = Math.round(r.wins / r.n * 100);
+          return `- ${label}: ${wr}% right (${r.wins}/${r.n}) avg ${r.avg_pct >= 0 ? '+' : ''}${r.avg_pct}%`;
+        });
+        forwardSection =
+          `FORWARD GRADING (#48 +7d, ${total7d} graded -- positive = correct direction):\n` +
+          (emoLines.length ? 'Emotion x action:\n' + emoLines.join('\n') + '\n' : '') +
+          (recLines.length ? 'Advice accuracy (7d forward):\n' + recLines.join('\n') : '');
+      }
+    } catch (e) { console.warn('[learning] #54 forward stats failed:', e.message); }
+
     // ── Assemble final summary ────────────────────────────────────────────────
     const summary = [
       winRateSection,
@@ -5079,6 +5126,7 @@ async function updateLearningModel() {
       intentionsSection,
       intentionAccSection,
       rebalanceSection,
+      forwardSection,
     ].filter(Boolean).join('\n').trim();
 
     learningModelCache = summary;
