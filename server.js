@@ -1568,7 +1568,7 @@ try {
 }
 // #50C boot-load abnormal-move tunable config from system_config
 try {
-  const [abnCfgRows] = await db.execute("SELECT value FROM system_config WHERE `key`='abn_config'");
+  const [abnCfgRows] = await db.execute("SELECT config_value FROM system_config WHERE config_key='abn_config'");
   if (abnCfgRows.length) { Object.assign(abnConfig, JSON.parse(abnCfgRows[0].value)); console.log('[abn] config loaded:', JSON.stringify(abnConfig)); }
 } catch (e) { console.error('[abn] config boot-load error:', e.message); }
 try {
@@ -11579,7 +11579,7 @@ function createMcpServer() {
         if (abn_cooldown_min     != null) updates.cooldown_min     = Number(abn_cooldown_min);
         if (!Object.keys(updates).length) return { content: [{ type: 'text', text: JSON.stringify({ error: 'No parameters provided', current: abnConfig }) }] };
         Object.assign(abnConfig, updates);
-        await db.execute("INSERT INTO system_config (`key`,value) VALUES ('abn_config',?) ON DUPLICATE KEY UPDATE value=?", [JSON.stringify(abnConfig), JSON.stringify(abnConfig)]);
+        await db.execute("INSERT INTO system_config (config_key,config_value) VALUES ('abn_config',?) ON DUPLICATE KEY UPDATE config_value=?", [JSON.stringify(abnConfig), JSON.stringify(abnConfig)]);
         return { content: [{ type: 'text', text: JSON.stringify({ ok: true, action: 'configure_abnormal', abn_config: abnConfig }) }] };
       } else if (action === 'log_catalyst') {
         const cBase = (symbol || '').toUpperCase().replace('-USD', '');
