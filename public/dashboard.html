@@ -671,6 +671,7 @@
   <button class="tab-btn" onclick="switchTab('kraken')">🦑 Kraken</button>
   <button class="tab-btn" onclick="switchTab('scorecards')">📊 Scorecards</button>
   <button class="tab-btn" onclick="switchTab('concentration')">Conc %</button>
+  <button class="tab-btn" onclick="switchTab('rotations')">Rotations</button>
 </nav>
 
 <div class="error-banner" id="error-banner"></div>
@@ -1176,6 +1177,12 @@
   </div>
 </div><!-- /tab-scorecards -->
 
+<div id="tab-rotations" class="tab-content">
+  <div class="card">
+    <div class="card-title">Rotation Tracker (#15)</div>
+    <div id="rotations-content"><div class="empty-state">Loading...</div></div>
+  </div>
+</div>
 <div id="tab-concentration" class="tab-content">
   <div class="card">
     <div class="card-title">Portfolio Concentration (#53)</div>

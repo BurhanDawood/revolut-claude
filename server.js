@@ -10035,6 +10035,35 @@ app.get('/api/mss', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// GET /api/rotations - #15 rotation tracker with live counterfactuals
+app.get('/api/rotations', async (req, res) => {
+  try {
+    const [rows] = await db.execute('SELECT * FROM rebalancing_tracker ORDER BY rebalance_date DESC LIMIT 30');
+    if (!rows.length) return res.json({ rotations: [], count: 0 });
+    const tl = await revolutRequest('GET', '/tickers').catch(() => []);
+    const pm = {};
+    for (const t of (Array.isArray(tl) ? tl : tl.data || [])) {
+      const p = parseFloat(t.last_price || t.mid || t.ask || t.bid);
+      if (t.symbol && p) { pm[t.symbol] = p; pm[t.symbol.replace('/', '-')] = p; }
+    }
+    const rotations = rows.map(r => {
+      const lA = pm[`${r.out_symbol}-USD`] || null, lB = pm[`${r.in_symbol}-USD`] || null;
+      const qIn = parseFloat(r.in_quantity || 0), qOut = parseFloat(r.out_quantity || 0);
+      const proc = parseFloat(r.out_value_usd || 0);
+      const actual = lB && qIn > 0 ? lB * qIn : null;
+      const vsA    = lA && qOut > 0 ? lA * qOut : null;
+      const dA = actual != null && vsA  != null ? parseFloat((actual - vsA).toFixed(2))   : null;
+      const dU = actual != null && proc > 0      ? parseFloat((actual - proc).toFixed(2))  : null;
+      const days = Math.round((Date.now() - new Date(r.rebalance_date)) / 86400000);
+      return { id: r.id, out_symbol: r.out_symbol, in_symbol: r.in_symbol,
+        proceeds_usd: proc, days_since: days, live_a: lA, live_b: lB,
+        actual_usd: actual ? parseFloat(actual.toFixed(2)) : null,
+        delta_vs_a: dA, delta_vs_usdt: dU, outcome: r.outcome };
+    });
+    res.json({ rotations, count: rotations.length });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // GET /api/concentration - live theme/role concentration (#53)
 app.get('/api/concentration', async (req, res) => {
   try {

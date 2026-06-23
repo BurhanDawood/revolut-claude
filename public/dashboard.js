@@ -96,6 +96,7 @@ function switchTab(name) {
   if (name === 'journal') { loadJournalEntries(); loadJournalStats(); }
   if (name === 'scorecards') loadScorecards();
   if (name === 'concentration') loadConcentration();
+  if (name === 'rotations') loadRotations();
 }
 
 // ── Portfolio ─────────────────────────────────────────────────────
@@ -871,6 +872,30 @@ function loadConcentration() {
   });
 }
 
+function loadRotations() {
+  var el = $('rotations-content'); if (!el) return;
+  fetchData('/api/rotations').then(function(data) {
+    if (!data || data.error) { el.innerHTML = '<div class="empty-state">' + ((data && data.error) || 'Unavailable') + '</div>'; return; }
+    var rots = data.rotations || [];
+    if (!rots.length) { el.innerHTML = '<div class="empty-state">No rotations yet. Use resolve_pending_trades type:rebalance.</div>'; return; }
+    function money(v) { return v == null ? '\u2014' : (v >= 0 ? '+' : '') + '$' + Math.abs(v).toFixed(0); }
+    function col(v) { return v > 0 ? '#33cc66' : '#ff5555'; }
+    el.innerHTML = rots.map(function(r) {
+      var dA = r.delta_vs_a, dU = r.delta_vs_usdt;
+      var bdr = dA > 0 && dU > 0 ? '#33cc66' : dA != null && (dA > 0 || dU > 0) ? '#ffaa00' : '#ff5555';
+      return '<div style="border-left:3px solid '+bdr+';padding:8px 10px;margin-bottom:6px;background:rgba(255,255,255,0.03);border-radius:0 6px 6px 0">'
+        +'<div style="font-size:0.88rem;font-weight:700;margin-bottom:3px">'+esc(r.out_symbol)+' \u2192 '+esc(r.in_symbol)
+        +' <span style="color:#555;font-weight:400;font-size:0.78rem">$'+(r.proceeds_usd||0).toFixed(0)+' | '+(r.days_since||0)+'d ago</span></div>'
+        +'<div style="display:flex;gap:12px;font-size:0.8rem;flex-wrap:wrap">'
+        +(r.actual_usd!=null?'<span>Now <b>$'+r.actual_usd.toFixed(0)+'</b></span>':'')
+        +(dA!=null?'<span style="color:'+col(dA)+'">'+money(dA)+' vs holding</span>':'')
+        +(dU!=null?'<span style="color:'+col(dU)+'">'+money(dU)+' vs USDT</span>':'')
+        +(r.outcome?'<span style="color:#555;font-size:0.75rem">'+esc(r.outcome)+'</span>':'')
+        +'</div></div>';
+    }).join('');
+  });
+}
+
 function refreshAll() {
   var spinner = $('spinner');
   if (spinner) spinner.classList.add('active');
@@ -883,6 +908,7 @@ function refreshAll() {
   try { loadTrailingStops(); } catch(e){ console.error('loadTrailingStops FAILED', e); }
   try { loadScorecards(); } catch(e){ console.error('loadScorecards FAILED', e); }
   try { loadConcentration(); } catch(e){ console.error('loadConcentration FAILED', e); }
+  try { loadRotations(); } catch(e){ console.error('loadRotations FAILED', e); }
   if (spinner) setTimeout(function() { spinner.classList.remove('active'); }, 3000);
 }
 
