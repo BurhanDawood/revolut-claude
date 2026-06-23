@@ -670,6 +670,7 @@
   <button class="tab-btn" onclick="switchTab('rebalancing')">📊 Rebalancing</button>
   <button class="tab-btn" onclick="switchTab('kraken')">🦑 Kraken</button>
   <button class="tab-btn" onclick="switchTab('scorecards')">📊 Scorecards</button>
+  <button class="tab-btn" onclick="switchTab('concentration')">Conc %</button>
 </nav>
 
 <div class="error-banner" id="error-banner"></div>
@@ -1174,6 +1175,13 @@
     <div id="scorecards-list" style="display:flex;flex-direction:column;gap:6px"><div class="empty-state">Loading...</div></div>
   </div>
 </div><!-- /tab-scorecards -->
+
+<div id="tab-concentration" class="tab-content">
+  <div class="card">
+    <div class="card-title">Portfolio Concentration (#53)</div>
+    <div id="concentration-content"><div class="empty-state">Loading...</div></div>
+  </div>
+</div><!-- /tab-concentration -->
 
 <div class="toast" id="toast"></div>
   </div>

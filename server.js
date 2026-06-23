@@ -9756,7 +9756,7 @@ cron.schedule('10 9 * * 1', async () => {
 }, { timezone: 'Europe/London' });
 
 
-console.log('Cron jobs scheduled: midnight price recording + 9 AM morning briefing + every-2h macro news + Monday 9:05 rebalancing check + 9:15 AM research sweep + 10 AM intention outcomes + 10:02 AM rebalance checks (Europe/London)');
+console.log('Cron jobs scheduled: midnight price recording + 9 AM morning briefing + every-2h macro news + Monday 9:05 rebalancing check + 9:15 AM research sweep + 10 AM intention outcomes + 10:05 AM rebalance checks + 10:10 AM trade outcome grading (#48) (Europe/London)');
 
 const app = express();
 app.use(cors());
@@ -9902,6 +9902,36 @@ app.get('/api/mss', async (req, res) => {
       computed_at: r.computed_at
     }));
     res.json({ tracked: MSS_TRACKED, timeframes: MSS_TIMEFRAMES, atr_k: MSS_ATR_K, lookback_days: MSS_LOOKBACK_DAYS, states: out });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/concentration - live theme/role concentration (#53)
+app.get('/api/concentration', apiTokenMiddleware, async (req, res) => {
+  try {
+    const [csRows] = await db.execute('SELECT symbol, role, theme FROM coin_strategy WHERE symbol IS NOT NULL');
+    const csMap = new Map(csRows.map(r => [r.symbol, { role: r.role || 'untagged', theme: r.theme || '' }]));
+    const { positions, totalValue } = await buildPositions();
+    const byTheme = {}, byRole = {};
+    const coins = [];
+    for (const pos of positions) {
+      if (!pos.currentValue || pos.currentValue < 1) continue;
+      const cs = csMap.get(pos.coin) || {};
+      const themes = cs.theme ? cs.theme.split(',').map(t => t.trim()).filter(Boolean) : ['Untagged'];
+      const role = cs.role || 'untagged';
+      for (const theme of themes) { byTheme[theme] = (byTheme[theme] || 0) + pos.currentValue; }
+      byRole[role] = (byRole[role] || 0) + pos.currentValue;
+      coins.push({ symbol: pos.coin, value: parseFloat(pos.currentValue.toFixed(2)), themes, role });
+    }
+    const fmtPct = v => parseFloat((v / totalValue * 100).toFixed(1));
+    const fmt    = v => parseFloat(v.toFixed(2));
+    const by_theme = Object.entries(byTheme)
+      .map(([theme, v]) => ({ theme, value: fmt(v), pct: fmtPct(v) }))
+      .sort((a, b) => b.value - a.value);
+    const by_role = Object.entries(byRole)
+      .map(([role, v]) => ({ role, value: fmt(v), pct: fmtPct(v) }))
+      .sort((a, b) => b.value - a.value);
+    res.json({ total: fmt(totalValue), by_theme, by_role,
+      coins: coins.sort((a, b) => b.value - a.value) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 

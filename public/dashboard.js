@@ -95,6 +95,7 @@ function switchTab(name) {
   if (name === 'rebalancing') loadRebalancing();
   if (name === 'journal') { loadJournalEntries(); loadJournalStats(); }
   if (name === 'scorecards') loadScorecards();
+  if (name === 'concentration') loadConcentration();
 }
 
 // ── Portfolio ─────────────────────────────────────────────────────
@@ -840,6 +841,36 @@ function loadScorecards() {
   });
 }
 
+function loadConcentration() {
+  var el = $('concentration-content');
+  if (!el) return;
+  fetchData('/api/concentration').then(function(data) {
+    if (!data || data.error) { el.innerHTML = '<div class="empty-state">' + ((data && data.error) || 'Unavailable') + '</div>'; return; }
+    function col(pct) { return pct >= 40 ? '#ff5555' : pct >= 25 ? '#ffaa00' : '#33cc66'; }
+    function money(v) { return '$' + (v || 0).toFixed(0); }
+    var html = '<div style="margin-bottom:12px">';
+    html += '<div style="font-size:0.75rem;color:#666;font-weight:700;margin-bottom:6px">BY THEME</div>';
+    (data.by_theme || []).forEach(function(t) {
+      var c = col(t.pct);
+      html += '<div style="margin-bottom:8px">'
+        + '<div style="display:flex;justify-content:space-between;font-size:0.82rem;margin-bottom:2px">'
+        + '<span style="color:#ccc">' + esc(t.theme) + '</span>'
+        + '<span style="color:' + c + ';font-weight:700">' + t.pct + '% ' + money(t.value) + '</span></div>'
+        + '<div style="background:#1a1a1a;border-radius:4px;height:5px">'
+        + '<div style="background:' + c + ';width:' + Math.min(t.pct,100) + '%;height:5px;border-radius:4px"></div></div></div>';
+    });
+    html += '</div><div><div style="font-size:0.75rem;color:#666;font-weight:700;margin-bottom:6px">BY ROLE</div>';
+    (data.by_role || []).forEach(function(r) {
+      var c = col(r.pct);
+      html += '<div style="display:flex;justify-content:space-between;font-size:0.82rem;padding:3px 0;border-bottom:1px solid #1a1a1a">'
+        + '<span style="color:#bbb">' + esc(r.role) + '</span>'
+        + '<span style="color:' + c + ';font-weight:700">' + r.pct + '% ' + money(r.value) + '</span></div>';
+    });
+    html += '</div><div style="margin-top:10px;font-size:0.75rem;color:#555">Revolut total: ' + money(data.total) + '</div>';
+    el.innerHTML = html;
+  });
+}
+
 function refreshAll() {
   var spinner = $('spinner');
   if (spinner) spinner.classList.add('active');
@@ -851,6 +882,7 @@ function refreshAll() {
   try { loadMonitorStatus(); } catch(e){ console.error('loadMonitorStatus FAILED', e); }
   try { loadTrailingStops(); } catch(e){ console.error('loadTrailingStops FAILED', e); }
   try { loadScorecards(); } catch(e){ console.error('loadScorecards FAILED', e); }
+  try { loadConcentration(); } catch(e){ console.error('loadConcentration FAILED', e); }
   if (spinner) setTimeout(function() { spinner.classList.remove('active'); }, 3000);
 }
 
