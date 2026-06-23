@@ -11096,7 +11096,8 @@ function createMcpServer() {
       expires_hours:          z.number().optional().describe('Hours until intention expires, default 24'),
       key:                    z.string().optional().describe('Preference key for save_preference'),
       value:                  z.string().optional().describe('Preference value for save_preference'),
-      amount:                 z.number().optional().describe('Amount in USD for update_capital'),
+      amount:                 z.number().optional().describe('Amount in USD for update_capital or set_away_buy (fallback)'),
+      away_buy_usd:           z.number().optional().describe('#145 configure_away_mode set_away_buy: dedicated USD amount to auto-buy per down-target trigger'),
       capital_type:           z.enum(['deposit', 'withdrawal', 'set']).optional().describe('Capital update type'),
       note:                   z.string().optional().describe('Optional note for update_capital'),
       enabled:                z.boolean().optional().describe('Enable or disable USDT sweep (configure_sweep)'),
@@ -11157,7 +11158,7 @@ function createMcpServer() {
       abn_broad_threshold:  z.number().optional().describe('configure_abnormal: how many coins trigger broad market summary (default 5)'),
       abn_cooldown_min:     z.number().optional().describe('configure_abnormal: per-coin alert cooldown in minutes (default 30)'),
     },
-    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, max_buy_usd, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam, title, detail, category, status: devStatus, source: devSource, related_symbol: relSymbol, dev_log_id, active_workstream, progress, open_threads, next_action, recent_decision, recent_decisions, cs_status, cs_role, cs_theme, cs_strategy_md, pm_decision, pm_principle_tag, pm_conviction, pm_captured_by, pm_supersedes_id, dev_decision, dev_principle_tag, dev_cross_thread, dev_alternatives, dev_related_log, dev_supersedes_id, journal_id, tax_lot_id, away_action, away_coins, sell_floors, per_coin_enabled, catalyst_id, catalyst, catalyst_date, catalyst_type, expected_impact, priced_in_risk, catalyst_confidence, catalyst_source, catalyst_status, abn_alert_floor_pct, abn_broad_floor_pct, abn_broad_threshold, abn_cooldown_min }) => {
+    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, away_buy_usd, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, max_buy_usd, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam, title, detail, category, status: devStatus, source: devSource, related_symbol: relSymbol, dev_log_id, active_workstream, progress, open_threads, next_action, recent_decision, recent_decisions, cs_status, cs_role, cs_theme, cs_strategy_md, pm_decision, pm_principle_tag, pm_conviction, pm_captured_by, pm_supersedes_id, dev_decision, dev_principle_tag, dev_cross_thread, dev_alternatives, dev_related_log, dev_supersedes_id, journal_id, tax_lot_id, away_action, away_coins, sell_floors, per_coin_enabled, catalyst_id, catalyst, catalyst_date, catalyst_type, expected_impact, priced_in_risk, catalyst_confidence, catalyst_source, catalyst_status, abn_alert_floor_pct, abn_broad_floor_pct, abn_broad_threshold, abn_cooldown_min }) => {
       // Make hodl_symbols accessible in configure_auto_execute via params object
       const params = { hodl_symbols: hodlSymbolsParam };
 
@@ -11304,11 +11305,12 @@ function createMcpServer() {
           // #125 2c-pre — per-coin away-buy USD size (INERT: no execution path reads this yet)
           if (!am.away_buy_usd) am.away_buy_usd = {};
           const buyCoin = awayCoinsIn[0];
-          if (!buyCoin || amount == null || amount <= 0) {
-            reply = `set_away_buy needs away_coins=[COIN] and amount>0. Current: ${Object.keys(am.away_buy_usd).length ? Object.entries(am.away_buy_usd).map(([k,v])=>k+' $'+v).join(', ') : '(none set)'}`;
+          const buyAmt = away_buy_usd ?? amount; // #145 dedicated param preferred, falls back to amount
+          if (!buyCoin || buyAmt == null || buyAmt <= 0) {
+            reply = `set_away_buy needs away_coins=[COIN] and away_buy_usd>0. Current: ${Object.keys(am.away_buy_usd).length ? Object.entries(am.away_buy_usd).map(([k,v])=>k+' $'+v).join(', ') : '(none set)'}`;
           } else {
-            am.away_buy_usd[buyCoin] = amount;
-            reply = `Away-buy size set: ${buyCoin} = $${amount}. (INERT — buys not wired until Phase 2c.) All: ${Object.entries(am.away_buy_usd).map(([k,v])=>k+' $'+v).join(', ')}`;
+            am.away_buy_usd[buyCoin] = buyAmt;
+            reply = `Away-buy size set: ${buyCoin} = $${buyAmt}. All: ${Object.entries(am.away_buy_usd).map(([k,v])=>k+' $'+v).join(', ')}`;
           }
         } else {
           const buyMap = am.away_buy_usd && Object.keys(am.away_buy_usd).length ? Object.entries(am.away_buy_usd).map(([k,v])=>k+' $'+v).join(', ') : '(none)';
