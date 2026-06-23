@@ -9906,7 +9906,7 @@ app.get('/api/mss', async (req, res) => {
 });
 
 // GET /api/concentration - live theme/role concentration (#53)
-app.get('/api/concentration', apiTokenMiddleware, async (req, res) => {
+app.get('/api/concentration', async (req, res) => {
   try {
     const [csRows] = await db.execute('SELECT symbol, role, theme FROM coin_strategy WHERE symbol IS NOT NULL');
     const csMap = new Map(csRows.map(r => [r.symbol, { role: r.role || 'untagged', theme: r.theme || '' }]));
