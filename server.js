@@ -240,7 +240,7 @@ async function tryAwayAutoSellUpTarget(symbol, coinBase, currentPrice, changePct
     const am = amR.length ? JSON.parse(amR[0].config_value) : {};
     const cap = parseFloat(am.max_session_sell_usd ?? 500);
     const sold = parseFloat(am.session_sold_usd ?? 0);
-    const pct = target.sellPct ?? ae.max_sell_pct ?? 25; // #144 per-rung override; falls back to global cap
+    const pct = target.sellPct ?? am.away_sell_pct?.[coinBase] ?? ae.max_sell_pct ?? 25; // #144/#145 rung > per-coin away config > global cap
     const estValue = (assetQty || 0) * (pct / 100) * currentPrice;
     if (sold + estValue > cap) {
       await sendTelegram(`AWAY CAP \u2014 ${coinBase}: up-target hit but session sell cap reached ($${sold.toFixed(2)}/$${cap.toFixed(2)}). Skipped \u2014 your call when back.`).catch(() => {});
@@ -11098,6 +11098,7 @@ function createMcpServer() {
       value:                  z.string().optional().describe('Preference value for save_preference'),
       amount:                 z.number().optional().describe('Amount in USD for update_capital or set_away_buy (fallback)'),
       away_buy_usd:           z.number().optional().describe('#145 configure_away_mode set_away_buy: dedicated USD amount to auto-buy per down-target trigger'),
+      away_sell_pct:          z.number().optional().describe('#145 configure_away_mode set_away_sell: per-coin sell %% override for Away Mode up-targets; 100=full exit'),
       capital_type:           z.enum(['deposit', 'withdrawal', 'set']).optional().describe('Capital update type'),
       note:                   z.string().optional().describe('Optional note for update_capital'),
       enabled:                z.boolean().optional().describe('Enable or disable USDT sweep (configure_sweep)'),
@@ -11108,7 +11109,7 @@ function createMcpServer() {
       max_buy_usd:            z.number().optional().describe('Max USD to spend per auto-exec buy (configure_auto_execute)'),
       sell_floors:            z.preprocess(v => { if (typeof v === 'string') { try { return JSON.parse(v); } catch(e) { return v; } } return v; }, z.record(z.number())).optional().describe('Per-coin min sell price map e.g. {"NEAR":1.87} -- auto-sell blocked if price <= floor (#45, configure_auto_execute)'),
       per_coin_enabled:       z.preprocess(v => { if (typeof v === 'string') { try { return JSON.parse(v); } catch(e) { return v; } } return v; }, z.record(z.boolean())).optional().describe('#24 explicit per-coin auto-exec opt-in map e.g. {"BOBA":true} -- only coins listed here can shouldAutoExecute'),
-      away_action:            z.enum(['set_eligible','activate','deactivate','status','set_away_buy']).optional().describe('configure_away_mode: which away-mode operation'),
+      away_action:            z.enum(['set_eligible','activate','deactivate','status','set_away_buy','set_away_sell']).optional().describe('configure_away_mode: which away-mode operation'),
       away_coins:             z.array(z.string()).optional().describe('configure_away_mode: coin list for set_eligible / activate'),
       allowed_triggers:       z.array(z.string()).optional().describe('Alert types that can trigger auto-exec: trailing_stop, fixed_target, pump_alert'),
       require_confidence:     z.enum(['High', 'Medium', 'Low']).optional().describe('Minimum Claude confidence level to auto-execute'),
@@ -11158,7 +11159,7 @@ function createMcpServer() {
       abn_broad_threshold:  z.number().optional().describe('configure_abnormal: how many coins trigger broad market summary (default 5)'),
       abn_cooldown_min:     z.number().optional().describe('configure_abnormal: per-coin alert cooldown in minutes (default 30)'),
     },
-    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, away_buy_usd, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, max_buy_usd, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam, title, detail, category, status: devStatus, source: devSource, related_symbol: relSymbol, dev_log_id, active_workstream, progress, open_threads, next_action, recent_decision, recent_decisions, cs_status, cs_role, cs_theme, cs_strategy_md, pm_decision, pm_principle_tag, pm_conviction, pm_captured_by, pm_supersedes_id, dev_decision, dev_principle_tag, dev_cross_thread, dev_alternatives, dev_related_log, dev_supersedes_id, journal_id, tax_lot_id, away_action, away_coins, sell_floors, per_coin_enabled, catalyst_id, catalyst, catalyst_date, catalyst_type, expected_impact, priced_in_risk, catalyst_confidence, catalyst_source, catalyst_status, abn_alert_floor_pct, abn_broad_floor_pct, abn_broad_threshold, abn_cooldown_min }) => {
+    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, away_buy_usd, away_sell_pct, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, max_buy_usd, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam, title, detail, category, status: devStatus, source: devSource, related_symbol: relSymbol, dev_log_id, active_workstream, progress, open_threads, next_action, recent_decision, recent_decisions, cs_status, cs_role, cs_theme, cs_strategy_md, pm_decision, pm_principle_tag, pm_conviction, pm_captured_by, pm_supersedes_id, dev_decision, dev_principle_tag, dev_cross_thread, dev_alternatives, dev_related_log, dev_supersedes_id, journal_id, tax_lot_id, away_action, away_coins, sell_floors, per_coin_enabled, catalyst_id, catalyst, catalyst_date, catalyst_type, expected_impact, priced_in_risk, catalyst_confidence, catalyst_source, catalyst_status, abn_alert_floor_pct, abn_broad_floor_pct, abn_broad_threshold, abn_cooldown_min }) => {
       // Make hodl_symbols accessible in configure_auto_execute via params object
       const params = { hodl_symbols: hodlSymbolsParam };
 
@@ -11311,6 +11312,16 @@ function createMcpServer() {
           } else {
             am.away_buy_usd[buyCoin] = buyAmt;
             reply = `Away-buy size set: ${buyCoin} = $${buyAmt}. All: ${Object.entries(am.away_buy_usd).map(([k,v])=>k+' $'+v).join(', ')}`;
+          }
+        } else if (awayAction === 'set_away_sell') {
+          // #145 per-coin away-sell pct (stored in away_mode config; used by tryAwayAutoSellUpTarget)
+          if (!am.away_sell_pct) am.away_sell_pct = {};
+          const sellCoin = awayCoinsIn[0];
+          if (!sellCoin || away_sell_pct == null || away_sell_pct <= 0 || away_sell_pct > 100) {
+            reply = `set_away_sell needs away_coins=[COIN] and away_sell_pct 1-100. Current: ${Object.keys(am.away_sell_pct).length ? Object.entries(am.away_sell_pct).map(([k,v])=>k+' '+v+'%').join(', ') : '(none set, using global max_sell_pct)'}`;
+          } else {
+            am.away_sell_pct[sellCoin] = away_sell_pct;
+            reply = `Away-sell pct set: ${sellCoin} = ${away_sell_pct}%. All: ${Object.entries(am.away_sell_pct).map(([k,v])=>k+' '+v+'%').join(', ')}`;
           }
         } else {
           const buyMap = am.away_buy_usd && Object.keys(am.away_buy_usd).length ? Object.entries(am.away_buy_usd).map(([k,v])=>k+' $'+v).join(', ') : '(none)';
