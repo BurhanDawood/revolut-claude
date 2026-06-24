@@ -267,6 +267,21 @@ async function tryAwayAutoSellUpTarget(symbol, coinBase, currentPrice, changePct
 
 // #125 Phase 2c — Away Mode analyse-and-buy on down-target. Triple-gated: master enabled AND isAwayActionable AND LLM High-confidence BUY.
 // Below-entry buys ARE allowed (deliberate buybacks) — does NOT apply the cascade below-95%-entry guard. Returns true if handled (caller skips menu).
+// DND mode helpers (#32)
+async function getDndMode() {
+  try {
+    const [r] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'dnd_mode'");
+    return r.length ? JSON.parse(r[0].config_value) : { enabled: false, coins: [] };
+  } catch (e) { return { enabled: false, coins: [] }; }
+}
+async function setDndMode(obj) {
+  await db.execute("INSERT INTO system_config (config_key,config_value) VALUES ('dnd_mode',?) ON DUPLICATE KEY UPDATE config_value=VALUES(config_value)", [JSON.stringify(obj)]);
+}
+async function isDndCoin(coinBase) {
+  const d = await getDndMode();
+  return d.enabled && Array.isArray(d.coins) && d.coins.includes(coinBase.toUpperCase());
+}
+
 async function tryAwayAnalyseBuyDownTarget(symbol, coinBase, currentPrice, changePct, target, entryPrice) {
   try {
     // GATE 1: master auto-exec enabled
@@ -4129,9 +4144,11 @@ async function checkPumpArm(symbol, currentPrice) {
     if (pumpPct >= parseFloat(rule.arm_pump_pct)) {
       // ARM — set a trailing stop, mark armed. NO SELL (Stage 1).
       const entryFloor = rule.entry_floor != null ? parseFloat(rule.entry_floor) : null;
-      await setTrailingStop(symbol, parseFloat(rule.trail_pct), currentPrice, entryFloor);
+      const isDnd = await isDndCoin(symbol.replace('-USD',''));
+      await setTrailingStop(symbol, parseFloat(rule.trail_pct), currentPrice, entryFloor, isDnd, isDnd ? (rule.sell_pct || 100) : null);
       await db.execute('UPDATE pump_armed_rules SET armed = 1 WHERE symbol = ?', [symbol]);
-      console.log(`[pump-arm] ${symbol} ARMED — pumped +${pumpPct.toFixed(1)}% to ${fmtPriceShort(currentPrice)}, trailing stop set ${rule.trail_pct}%`);
+      console.log(`[pump-arm] ${symbol} ARMED${isDnd?' (DND)':''} — pumped +${pumpPct.toFixed(1)}% to ${fmtPriceShort(currentPrice)}, trail ${rule.trail_pct}%`);
+      if (isDnd) return; // DND: silent arm, confirmation sent only on trade execution
       await sendTelegram(
         `🎯 <b>PUMP-ARMED — ${symbol.replace('-USD','')}</b>\n\n` +
         `Pumped +${pumpPct.toFixed(1)}% to ${fmtPriceShort(currentPrice)}\n` +
@@ -14477,6 +14494,35 @@ app.post('/telegram-webhook', async (req, res) => {
     }
 
     // --- Command: status ---
+    // Command: dnd COIN1 COIN2 (#32)
+    const dndMatch = commandText.match(/^dnd(?:\s+(.+))?$/i);
+    if (dndMatch && commandText !== 'dnd off') {
+      const coins = dndMatch[1] ? dndMatch[1].trim().split(/\s+/).map(c => c.toUpperCase()) : [];
+      if (!coins.length) { await sendReply('Usage: dnd COIN1 COIN2 (or: dnd off)'); return res.status(200).json({ ok: true }); }
+      const DND = { arm_pump_pct: 30, trail_pct: 8, rebuy_pct: 8, sell_pct: 100 };
+      for (const coin of coins) {
+        const sym = `${coin}-USD`;
+        const [ex] = await db.execute('SELECT id FROM pump_armed_rules WHERE symbol = ? AND active = 1', [sym]);
+        if (!ex.length) {
+          await db.execute(
+            'INSERT INTO pump_armed_rules (symbol,arm_pump_pct,arm_window_min,trail_pct,rebuy_pct,sell_pct,loop_enabled,active) VALUES (?,?,60,?,?,?,1,1)',
+            [sym, DND.arm_pump_pct, DND.trail_pct, DND.rebuy_pct, DND.sell_pct]
+          );
+        } else {
+          await db.execute('UPDATE pump_armed_rules SET loop_enabled=1 WHERE symbol=? AND active=1', [sym]);
+        }
+      }
+      await setDndMode({ enabled: true, activated_at: new Date().toISOString(), coins });
+      await sendReply(`\ud83c\udf19 DND ON for ${coins.join(', ')}. Pump loop auto-executes silently (30% arm, 8% trail, loop). Say <b>dnd off</b> to cancel.`);
+      return res.status(200).json({ ok: true });
+    }
+    // Command: dnd off (#32)
+    if (commandText === 'dnd off') {
+      const d = await getDndMode();
+      await setDndMode({ enabled: false, coins: d.coins || [] });
+      await sendReply('\u2600\ufe0f DND OFF. Pump loop returns to standard behaviour.');
+      return res.status(200).json({ ok: true });
+    }
     if (commandText === 'status') {
       const alertedSymbols = [...alertState.active.keys()];
       const dropSymbols    = [...activeDropAlerts.keys()];
@@ -14495,7 +14541,9 @@ app.post('/telegram-webhook', async (req, res) => {
         (trailLines.length ? `🎯 Trailing stops (${trailLines.length}):\n${trailLines.join('\n')}\n` : '') +
         (ackedSymbols.length ? `🔕 Acknowledged (silent until restart): ${ackedSymbols.join(', ')}\n` : '') +
         (ignoredList.length ? `🚫 Permanently ignored: ${ignoredList.join(', ')}` : '');
-      await sendReply(statusMsg);
+      const dnd32 = await getDndMode().catch(() => ({ enabled: false, coins: [] }));
+      const dndLine = dnd32.enabled ? `\ud83c\udf19 DND: ON (${(dnd32.coins||[]).join(', ')})\n` : '';
+      await sendReply(dndLine + statusMsg);
       return res.status(200).json({ ok: true });
     }
 
