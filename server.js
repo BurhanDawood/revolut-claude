@@ -11387,11 +11387,11 @@ function createMcpServer() {
       abn_broad_threshold:  z.number().optional().describe('configure_abnormal: how many coins trigger broad market summary (default 5)'),
       abn_cooldown_min:     z.number().optional().describe('configure_abnormal: per-coin alert cooldown in minutes (default 30)'),
       dnd_action:       z.enum(['activate','deactivate','set_eligible','set_params','status']).optional().describe('configure_dnd sub-action'),
-      dnd_coins:        z.array(z.string()).optional().describe('configure_dnd: coin list e.g. ["BOBA","ENA"]'),
-      dnd_arm_pct:      z.number().optional().describe('configure_dnd: pump %% to arm trail (default 30)'),
-      dnd_trail_pct:    z.number().optional().describe('configure_dnd: trailing stop %% (default 8)'),
-      dnd_sell_pct:     z.number().optional().describe('configure_dnd: sell %% on trail breach (default 100)'),
-      dnd_rebuy_pct:    z.number().optional().describe('configure_dnd: retrace %% for rebuy (default 8)'),
+      dnd_coins:        z.preprocess(v => { if (typeof v === 'string') { try { return JSON.parse(v); } catch(e) { return v; } } return v; }, z.array(z.string())).optional().describe('configure_dnd: coin list e.g. ["BOBA","ENA"]'),
+      dnd_arm_pct:      z.coerce.number().optional().describe('configure_dnd: pump %% to arm trail (default 30)'),
+      dnd_trail_pct:    z.coerce.number().optional().describe('configure_dnd: trailing stop %% (default 8)'),
+      dnd_sell_pct:     z.coerce.number().optional().describe('configure_dnd: sell %% on trail breach (default 100)'),
+      dnd_rebuy_pct:    z.coerce.number().optional().describe('configure_dnd: retrace %% for rebuy (default 8)'),
     },
     async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, away_buy_usd, away_sell_pct, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, max_buy_usd, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam, title, detail, category, status: devStatus, source: devSource, related_symbol: relSymbol, dev_log_id, active_workstream, progress, open_threads, next_action, recent_decision, recent_decisions, cs_status, cs_role, cs_theme, cs_strategy_md, pm_decision, pm_principle_tag, pm_conviction, pm_captured_by, pm_supersedes_id, dev_decision, dev_principle_tag, dev_cross_thread, dev_alternatives, dev_related_log, dev_supersedes_id, journal_id, tax_lot_id, away_action, away_coins, sell_floors, per_coin_enabled, catalyst_id, catalyst, catalyst_date, catalyst_type, expected_impact, priced_in_risk, catalyst_confidence, catalyst_source, catalyst_status, abn_alert_floor_pct, abn_broad_floor_pct, abn_broad_threshold, abn_cooldown_min, dnd_action, dnd_coins, dnd_arm_pct, dnd_trail_pct, dnd_sell_pct, dnd_rebuy_pct }) => {
       // Make hodl_symbols accessible in configure_auto_execute via params object
