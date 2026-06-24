@@ -11861,7 +11861,7 @@ function createMcpServer() {
           const D = { arm: dnd_arm_pct ?? dp.arm_pump_pct ?? 30, trail: dnd_trail_pct ?? dp.trail_pct ?? 8, sell: dnd_sell_pct ?? dp.sell_pct ?? 100, rebuy: dnd_rebuy_pct ?? dp.rebuy_pct ?? 8 };
           for (const coin of coins) {
             const sym = `${coin}-USD`;
-            const [ex] = await db.execute('SELECT id FROM pump_armed_rules WHERE symbol=? AND active=1', [sym]);
+            const [ex] = await db.execute('SELECT symbol FROM pump_armed_rules WHERE symbol=? AND active=1', [sym]);
             if (!ex.length) {
               await db.execute('INSERT INTO pump_armed_rules (symbol,arm_pump_pct,arm_window_min,trail_pct,rebuy_pct,sell_pct,loop_enabled,active) VALUES (?,?,60,?,?,?,1,1)', [sym,D.arm,D.trail,D.rebuy,D.sell]);
             } else {
@@ -14587,7 +14587,7 @@ app.post('/telegram-webhook', async (req, res) => {
       const DND = { arm_pump_pct: 30, trail_pct: 8, rebuy_pct: 8, sell_pct: 100 };
       for (const coin of coins) {
         const sym = `${coin}-USD`;
-        const [ex] = await db.execute('SELECT id FROM pump_armed_rules WHERE symbol = ? AND active = 1', [sym]);
+        const [ex] = await db.execute('SELECT symbol FROM pump_armed_rules WHERE symbol = ? AND active = 1', [sym]);
         if (!ex.length) {
           await db.execute(
             'INSERT INTO pump_armed_rules (symbol,arm_pump_pct,arm_window_min,trail_pct,rebuy_pct,sell_pct,loop_enabled,active) VALUES (?,?,60,?,?,?,1,1)',
