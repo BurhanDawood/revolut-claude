@@ -284,6 +284,13 @@ async function tryAwayAnalyseBuyDownTarget(symbol, coinBase, currentPrice, chang
     const ONE_HOUR = 60 * 60 * 1000;
     const lastA = analysisRateLimit.get('awaybuy_' + symbol);
     if (lastA && Date.now() - lastA < ONE_HOUR) {
+      const lastNotif = analysisRateLimit.get('awaybuy_notif_' + symbol);
+      const NOTIF_GAP = 15 * 60 * 1000;
+      if (!lastNotif || Date.now() - lastNotif > NOTIF_GAP) {
+        const remainMin = Math.ceil((ONE_HOUR - (Date.now() - lastA)) / 60000);
+        await sendTelegram(`\ud83e\udd16 AWAY \u2014 ${coinBase} hit buy level ${formatPrice(target.targetPrice)}. Analysis on cooldown (re-eval in ${remainMin}min). Manually buy if wanted.`).catch(() => {});
+        analysisRateLimit.set('awaybuy_notif_' + symbol, Date.now());
+      }
       console.log('[away-buy] ' + coinBase + ' analysis cooldown active \u2014 leaving armed, no re-analyse');
       return true;
     }
