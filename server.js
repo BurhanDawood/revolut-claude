@@ -258,6 +258,9 @@ async function tryAwayAutoSellUpTarget(symbol, coinBase, currentPrice, changePct
     am.session_sold_usd = sold + estValue;
     await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('away_mode', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)", [JSON.stringify(am)]).catch(() => {});
     console.log(`[away] auto-sold ${pct}% ${coinBase} on up-target; session $${am.session_sold_usd.toFixed(2)}/$${cap}`);
+    await db.execute('DELETE FROM price_targets WHERE symbol = ? AND target_price = ?', [symbol, target.targetPrice]).catch(() => {});
+    if (priceTargets.has(symbol)) priceTargets.set(symbol, (priceTargets.get(symbol)||[]).filter(t => t.targetPrice !== target.targetPrice));
+    console.log(`[away] rung ${target.targetPrice} removed for ${coinBase} (executed)`);
     return true;
   } catch (e) {
     console.error('[away] up-target auto-exec error (no sell):', e.message);
@@ -458,6 +461,9 @@ async function tryAwayAnalyseBuyDownTarget(symbol, coinBase, currentPrice, chang
       `Reply 'skip payment ${buyUsd.toFixed(2)}' is NOT applicable \u2014 this was a buy. Adjust manually if needed.`
     ).catch(() => {});
     console.log('[away-buy] ' + coinBase + ' auto-bought $' + buyUsd.toFixed(2) + '; session $' + am.session_bought_usd.toFixed(2) + '/$' + buyCap);
+    await db.execute('DELETE FROM price_targets WHERE symbol = ? AND target_price = ?', [symbol, target.targetPrice]).catch(() => {});
+    if (priceTargets.has(symbol)) priceTargets.set(symbol, (priceTargets.get(symbol)||[]).filter(t => t.targetPrice !== target.targetPrice));
+    console.log('[away-buy] rung ' + target.targetPrice + ' removed for ' + coinBase + ' (executed)');
     return true;
   } catch (e) {
     console.error('[away-buy] error (no buy):', e.message);
