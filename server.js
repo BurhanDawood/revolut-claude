@@ -261,6 +261,16 @@ async function tryAwayAutoSellUpTarget(symbol, coinBase, currentPrice, changePct
     await db.execute('DELETE FROM price_targets WHERE symbol = ? AND target_price = ?', [symbol, target.targetPrice]).catch(() => {});
     if (priceTargets.has(symbol)) priceTargets.set(symbol, (priceTargets.get(symbol)||[]).filter(t => t.targetPrice !== target.targetPrice));
     console.log(`[away] rung ${target.targetPrice} removed for ${coinBase} (executed)`);
+    try {
+      const today = new Date().toISOString().split('T')[0];
+      const [csR] = await db.execute('SELECT strategy_md FROM coin_strategy WHERE symbol = ?', [coinBase]);
+      if (csR.length && csR[0].strategy_md) {
+        const newMd = csR[0].strategy_md + `\n[Away auto-sold ${pct}% @ $${formatPrice(currentPrice)} on ${today} \u2014 up-target rung ${target.targetPrice} executed and removed.]`;
+        await db.execute('UPDATE coin_strategy SET strategy_md = ?, updated_by = ? WHERE symbol = ?', [newMd, 'away_auto', coinBase]);
+        await db.execute('INSERT INTO trader_profile (preference_key, preference_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE preference_value = VALUES(preference_value)', [`coin_strategy_${coinBase}`, newMd]);
+        console.log(`[away] #156 strategy annotated for ${coinBase}`);
+      }
+    } catch (e) { console.error('[away] #156 strategy annotation failed:', e.message); }
     return true;
   } catch (e) {
     console.error('[away] up-target auto-exec error (no sell):', e.message);
@@ -464,6 +474,16 @@ async function tryAwayAnalyseBuyDownTarget(symbol, coinBase, currentPrice, chang
     await db.execute('DELETE FROM price_targets WHERE symbol = ? AND target_price = ?', [symbol, target.targetPrice]).catch(() => {});
     if (priceTargets.has(symbol)) priceTargets.set(symbol, (priceTargets.get(symbol)||[]).filter(t => t.targetPrice !== target.targetPrice));
     console.log('[away-buy] rung ' + target.targetPrice + ' removed for ' + coinBase + ' (executed)');
+    try {
+      const today = new Date().toISOString().split('T')[0];
+      const [csR] = await db.execute('SELECT strategy_md FROM coin_strategy WHERE symbol = ?', [coinBase]);
+      if (csR.length && csR[0].strategy_md) {
+        const newMd = csR[0].strategy_md + '\n[Away auto-bought $' + buyUsd.toFixed(0) + ' @ $' + formatPrice(currentPrice) + ' on ' + today + ' \u2014 buy rung ' + target.targetPrice + ' executed and removed.]';
+        await db.execute('UPDATE coin_strategy SET strategy_md = ?, updated_by = ? WHERE symbol = ?', [newMd, 'away_auto', coinBase]);
+        await db.execute('INSERT INTO trader_profile (preference_key, preference_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE preference_value = VALUES(preference_value)', ['coin_strategy_' + coinBase, newMd]);
+        console.log('[away-buy] #156 strategy annotated for ' + coinBase);
+      }
+    } catch (e) { console.error('[away-buy] #156 strategy annotation failed:', e.message); }
     return true;
   } catch (e) {
     console.error('[away-buy] error (no buy):', e.message);
