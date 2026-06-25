@@ -13451,6 +13451,39 @@ app.post('/telegram-webhook', async (req, res) => {
     // --- Alert reply shortcuts: coin-prefixed ('xlm 1') or plain number ('1') ---
     const chatIdStr = chatId.toString();
 
+    // #149 Multi-line batch reply: 'cc 2\\ninj 1\\nxrp 2' resolves several alerts at once.
+    // Process valid lines, report which failed. Passes real sendReply so any trade-approval prompt still shows.
+    if (commandText.includes('\\n') && /\n\s*[a-z]+\s+[1-5]\s*(\n|$)/i.test('\n' + commandText)) {
+      const lines = commandText.split('\n').map(l => l.trim()).filter(Boolean);
+      const batchOk = [];
+      const batchFail = [];
+      for (const line of lines) {
+        const m = line.match(/^([a-z]+)\s+([1-5])$/i);
+        if (!m) { batchFail.push(`${line} (bad format)`); continue; }
+        const bc = m[1].toLowerCase();
+        const ch = parseInt(m[2]);
+        const bctx = alertContextBySymbol.get(bc);
+        if (!bctx) { batchFail.push(`${bc.toUpperCase()} (no active alert)`); continue; }
+        alertContextBySymbol.delete(bc);
+        if (lastAlertCoin === bc) lastAlertCoin = null;
+        try {
+          await processAlertChoice(bctx, ch, sendReply);
+          batchOk.push(`${bc.toUpperCase()} ${ch}`);
+        } catch (e) {
+          batchFail.push(`${bc.toUpperCase()} (error: ${e.message})`);
+        }
+      }
+      if (batchOk.length || batchFail.length) {
+        let summary = `\ud83d\udce6 <b>Batch resolved</b>`;
+        if (batchOk.length) summary += `\n\u2705 Done: ${batchOk.join(', ')}`;
+        if (batchFail.length) summary += `\n\u26a0\ufe0f Failed: ${batchFail.join(', ')}`;
+        const stillActive = [...alertContextBySymbol.keys()].map(c => c.toUpperCase());
+        if (stillActive.length) summary += `\n\ud83d\udd14 Still pending: ${stillActive.join(', ')}`;
+        await sendReply(summary);
+        return res.status(200).json({ ok: true });
+      }
+    }
+
     // Coin-prefixed reply: 'xlm 1', 'near 2', 'hft 5' etc.
     const coinPrefixMatch = commandText.match(/^([a-z]+)\s+([1-5])$/);
     if (coinPrefixMatch) {
