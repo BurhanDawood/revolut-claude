@@ -9224,18 +9224,10 @@ async function checkPortfolio() {
           continue;
         }
 
-        // Max-2-reminders: if already sent 2+ reminders, auto-acknowledge and delete target
+        // #150: after 3 reminders go QUIET only -- never delete the target, never 24h-mute. Rung stays live.
         const remindersSent = targetReminderCount.get(symbol) || 0;
-        if (remindersSent >= 2) {
-          console.log(`[targets] Auto-acknowledging ${symbol} id=${target.id} — ${remindersSent} reminders already sent`);
-          const arr38up = priceTargets.get(symbol) || [];
-          const filtered38up = arr38up.filter(t => t.id !== target.id);
-          if (filtered38up.length) priceTargets.set(symbol, filtered38up);
-          else priceTargets.delete(symbol);
-          targetReminderCount.delete(symbol);
-          targetExtremes.delete(symbol); // reset accumulator — target gone
-          await db.execute('DELETE FROM price_targets WHERE id = ?', [target.id]).catch(() => {});
-          await sendTelegram(`🔕 <b>Target auto-dismissed: ${coinBase}</b>\nNo response after 2 reminders — target removed. Set a new one when ready.`).catch(() => {});
+        if (remindersSent >= 3) {
+          console.log(`[targets] ${symbol} id=${target.id} -- ${remindersSent} reminders sent, going quiet (rung stays live, not muted)`);
           continue;
         }
 
@@ -9332,14 +9324,14 @@ async function checkPortfolio() {
           }
           const count = (targetReminderCount.get(symbol) || 0) + 1;
           targetReminderCount.set(symbol, count);
-          const reminderSuffix = ` (Reminder ${count}/2)`;
-          console.log('[alert] Sending fixed-target reminder for:', symbol, `(${count}/2)`);
-          if (count >= 2) {
-            // Final reminder — next cycle will auto-dismiss
+          const reminderSuffix = ` (Reminder ${count}/3)`;
+          console.log('[alert] Sending fixed-target reminder for:', symbol, `(${count}/3)`);
+          if (count >= 3) {
+            // #150: 3rd and final reminder -- stop timer, go quiet. Rung stays live (not deleted/muted).
             clearInterval(activeFixedAlerts.get(symbol));
             activeFixedAlerts.delete(symbol);
           }
-          await sendTelegram(`⚠️ <b>REMINDER: ${symbol} FIXED TARGET STILL ACTIVE!</b>${reminderSuffix}\n\nTarget: ${formatPrice(target.targetPrice)} | Now: ${formatPrice(currentPrice)}\nReply 'acknowledge ${coinBase}' to stop`);
+          await sendTelegram(`⚠️ <b>REMINDER: ${symbol} FIXED TARGET STILL ACTIVE!</b>${reminderSuffix}\n\nTarget: ${formatPrice(target.targetPrice)} | Now: ${formatPrice(currentPrice)}\nReply a number or 'acknowledge ${coinBase}'`);
         }, ALERT_INTERVAL_MS));
       }
 
@@ -9358,18 +9350,10 @@ async function checkPortfolio() {
           continue;
         }
 
-        // Max-2-reminders: if already sent 2+ reminders, auto-acknowledge and delete target
+        // #150: after 3 reminders go QUIET only -- never delete the target, never 24h-mute. Rung stays live.
         const remindersSentDown = targetReminderCount.get(symbol) || 0;
-        if (remindersSentDown >= 2) {
-          console.log(`[targets] Auto-acknowledging ${symbol} (down) id=${target.id} — ${remindersSentDown} reminders already sent`);
-          const arr38dn = priceTargets.get(symbol) || [];
-          const filtered38dn = arr38dn.filter(t => t.id !== target.id);
-          if (filtered38dn.length) priceTargets.set(symbol, filtered38dn);
-          else priceTargets.delete(symbol);
-          targetReminderCount.delete(symbol);
-          targetExtremes.delete(symbol); // reset accumulator — target gone
-          await db.execute('DELETE FROM price_targets WHERE id = ?', [target.id]).catch(() => {});
-          await sendTelegram(`🔕 <b>Target auto-dismissed: ${coinBase}</b>\nNo response after 2 reminders — target removed. Set a new one when ready.`).catch(() => {});
+        if (remindersSentDown >= 3) {
+          console.log(`[targets] ${symbol} (down) id=${target.id} -- ${remindersSentDown} reminders sent, going quiet (rung stays live, not muted)`);
           continue;
         }
 
@@ -9446,14 +9430,14 @@ async function checkPortfolio() {
           }
           const count = (targetReminderCount.get(symbol) || 0) + 1;
           targetReminderCount.set(symbol, count);
-          const reminderSuffix = ` (Reminder ${count}/2)`;
-          console.log('[alert] Sending fixed-floor reminder for:', symbol, `(${count}/2)`);
-          if (count >= 2) {
-            // Final reminder — next cycle will auto-dismiss
+          const reminderSuffix = ` (Reminder ${count}/3)`;
+          console.log('[alert] Sending fixed-floor reminder for:', symbol, `(${count}/3)`);
+          if (count >= 3) {
+            // #150: 3rd and final reminder -- stop timer, go quiet. Rung stays live (not deleted/muted).
             clearInterval(activeFixedAlerts.get(symbol));
             activeFixedAlerts.delete(symbol);
           }
-          await sendTelegram(`⚠️ <b>REMINDER: ${symbol} FIXED FLOOR STILL ACTIVE!</b>${reminderSuffix}\n\nFloor: ${formatPrice(target.targetPrice)} | Now: ${formatPrice(currentPrice)}\nReply 'acknowledge ${coinBase}' to stop`);
+          await sendTelegram(`⚠️ <b>REMINDER: ${symbol} FIXED FLOOR STILL ACTIVE!</b>${reminderSuffix}\n\nFloor: ${formatPrice(target.targetPrice)} | Now: ${formatPrice(currentPrice)}\nReply a number or 'acknowledge ${coinBase}'`);
         }, ALERT_INTERVAL_MS));
       }
       } // end inner target loop — #38 B1
