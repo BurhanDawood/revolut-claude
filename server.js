@@ -9253,8 +9253,12 @@ async function checkPortfolio() {
         const coinBase_ = symbol.replace('-USD', '');
         const assetB = balances.find(a => a.currency === coinBase_);
         const ftPositionValue = assetB ? parseFloat(assetB.available) * currentPrice : 0;
-        if (ftPositionValue > 0 && ftPositionValue < 1.00) {
-          console.log(`[dust] Skipping fixed target for ${symbol} — $${ftPositionValue.toFixed(4)} below $1`);
+        // #161: down-direction targets are buy-entry paths (Away Mode, dip alerts).
+        // Dust-filtering them silences Away Mode buys on dust/new positions (root cause: NEAR).
+        // Only UP targets (sell / profit alerts) are dust-filtered.
+        const preDir161 = target.direction || 'up';
+        if (ftPositionValue > 0 && ftPositionValue < 1.00 && preDir161 !== 'down') {
+          console.log(`[dust] Skipping fixed target for ${symbol} — $${ftPositionValue.toFixed(4)} below $1 (#161 down targets exempt)`);
           continue;
         }
       }
