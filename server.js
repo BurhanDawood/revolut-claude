@@ -11446,9 +11446,10 @@ function createMcpServer() {
       dnd_arm_pct:      z.coerce.number().optional().describe('configure_dnd: pump %% to arm trail (default 30)'),
       dnd_trail_pct:    z.coerce.number().optional().describe('configure_dnd: trailing stop %% (default 8)'),
       dnd_sell_pct:     z.coerce.number().optional().describe('configure_dnd: sell %% on trail breach (default 100)'),
-      dnd_rebuy_pct:    z.coerce.number().optional().describe('configure_dnd: retrace %% for rebuy (default 8)'),
+      dnd_retrace_pct:  z.coerce.number().optional().describe('configure_dnd: #160 %% of move price must retrace before trough arms (default 50)'),
+      dnd_bounce_pct:   z.coerce.number().optional().describe('configure_dnd: #160 %% bounce off trough to trigger rebuy (default 8)'),
     },
-    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, away_buy_usd, away_sell_pct, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, max_buy_usd, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam, title, detail, category, status: devStatus, source: devSource, related_symbol: relSymbol, dev_log_id, active_workstream, progress, open_threads, next_action, recent_decision, recent_decisions, cs_status, cs_role, cs_theme, cs_strategy_md, pm_decision, pm_principle_tag, pm_conviction, pm_captured_by, pm_supersedes_id, dev_decision, dev_principle_tag, dev_cross_thread, dev_alternatives, dev_related_log, dev_supersedes_id, journal_id, tax_lot_id, away_action, away_coins, sell_floors, per_coin_enabled, catalyst_id, catalyst, catalyst_date, catalyst_type, expected_impact, priced_in_risk, catalyst_confidence, catalyst_source, catalyst_status, abn_alert_floor_pct, abn_broad_floor_pct, abn_broad_threshold, abn_cooldown_min, dnd_action, dnd_coins, dnd_arm_pct, dnd_trail_pct, dnd_sell_pct, dnd_rebuy_pct }) => {
+    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, away_buy_usd, away_sell_pct, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, max_buy_usd, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam, title, detail, category, status: devStatus, source: devSource, related_symbol: relSymbol, dev_log_id, active_workstream, progress, open_threads, next_action, recent_decision, recent_decisions, cs_status, cs_role, cs_theme, cs_strategy_md, pm_decision, pm_principle_tag, pm_conviction, pm_captured_by, pm_supersedes_id, dev_decision, dev_principle_tag, dev_cross_thread, dev_alternatives, dev_related_log, dev_supersedes_id, journal_id, tax_lot_id, away_action, away_coins, sell_floors, per_coin_enabled, catalyst_id, catalyst, catalyst_date, catalyst_type, expected_impact, priced_in_risk, catalyst_confidence, catalyst_source, catalyst_status, abn_alert_floor_pct, abn_broad_floor_pct, abn_broad_threshold, abn_cooldown_min, dnd_action, dnd_coins, dnd_arm_pct, dnd_trail_pct, dnd_sell_pct, dnd_retrace_pct, dnd_bounce_pct }) => {
       // Make hodl_symbols accessible in configure_auto_execute via params object
       const params = { hodl_symbols: hodlSymbolsParam };
 
@@ -11904,7 +11905,8 @@ function createMcpServer() {
           if (dnd_arm_pct   != null) p.arm_pump_pct = Number(dnd_arm_pct);
           if (dnd_trail_pct != null) p.trail_pct    = Number(dnd_trail_pct);
           if (dnd_sell_pct  != null) p.sell_pct     = Number(dnd_sell_pct);
-          if (dnd_rebuy_pct != null) p.rebuy_pct    = Number(dnd_rebuy_pct);
+          if (dnd_retrace_pct != null) p.retrace_pct = Number(dnd_retrace_pct);
+          if (dnd_bounce_pct  != null) p.bounce_pct  = Number(dnd_bounce_pct);
           dndSt.default_params = p;
           await saveDnd();
           return { content: [{ type: 'text', text: JSON.stringify({ ok: true, default_params: p }) }] };
@@ -11913,14 +11915,14 @@ function createMcpServer() {
           const coins = (dnd_coins && dnd_coins.length) ? dnd_coins.map(c => c.toUpperCase().replace('-USD','')) : (dndSt.eligible_coins || []);
           if (!coins.length) return { content: [{ type: 'text', text: JSON.stringify({ error: 'No coins: use set_eligible first or pass dnd_coins' }) }] };
           const dp = dndSt.default_params || {};
-          const D = { arm: dnd_arm_pct ?? dp.arm_pump_pct ?? 30, trail: dnd_trail_pct ?? dp.trail_pct ?? 8, sell: dnd_sell_pct ?? dp.sell_pct ?? 100, rebuy: dnd_rebuy_pct ?? dp.rebuy_pct ?? 8 };
+          const D = { arm: dnd_arm_pct ?? dp.arm_pump_pct ?? 30, trail: dnd_trail_pct ?? dp.trail_pct ?? 8, sell: dnd_sell_pct ?? dp.sell_pct ?? 100, retrace: dnd_retrace_pct ?? dp.retrace_pct ?? 50, bounce: dnd_bounce_pct ?? dp.bounce_pct ?? 8 };
           for (const coin of coins) {
             const sym = `${coin}-USD`;
             const [ex] = await db.execute('SELECT symbol FROM pump_armed_rules WHERE symbol=? AND active=1', [sym]);
             if (!ex.length) {
-              await db.execute('INSERT INTO pump_armed_rules (symbol,arm_pump_pct,arm_window_min,trail_pct,rebuy_pct,sell_pct,loop_enabled,active) VALUES (?,?,60,?,?,?,1,1)', [sym,D.arm,D.trail,D.rebuy,D.sell]);
+              await db.execute('INSERT INTO pump_armed_rules (symbol,arm_pump_pct,arm_window_min,trail_pct,retrace_pct,bounce_pct,sell_pct,loop_enabled,active) VALUES (?,?,60,?,?,?,?,1,1)', [sym,D.arm,D.trail,D.retrace,D.bounce,D.sell]);
             } else {
-              await db.execute('UPDATE pump_armed_rules SET loop_enabled=1,arm_pump_pct=?,trail_pct=?,sell_pct=?,rebuy_pct=? WHERE symbol=? AND active=1', [D.arm,D.trail,D.sell,D.rebuy,sym]);
+              await db.execute('UPDATE pump_armed_rules SET loop_enabled=1,arm_pump_pct=?,trail_pct=?,sell_pct=?,retrace_pct=?,bounce_pct=? WHERE symbol=? AND active=1', [D.arm,D.trail,D.sell,D.retrace,D.bounce,sym]);
             }
           }
           dndSt.enabled = true; dndSt.activated_at = new Date().toISOString(); dndSt.coins = coins;
@@ -14672,14 +14674,14 @@ app.post('/telegram-webhook', async (req, res) => {
         coins = pool;
       }
       if (!coins.length) { await sendReply('Usage: dnd COIN1 COIN2 | dnd all | dnd eligible COIN1 COIN2'); return res.status(200).json({ ok: true }); }
-      const DND = { arm_pump_pct: 30, trail_pct: 8, rebuy_pct: 8, sell_pct: 100 };
+      const DND = { arm_pump_pct: 30, trail_pct: 8, retrace_pct: 50, bounce_pct: 8, sell_pct: 100 };
       for (const coin of coins) {
         const sym = `${coin}-USD`;
         const [ex] = await db.execute('SELECT symbol FROM pump_armed_rules WHERE symbol = ? AND active = 1', [sym]);
         if (!ex.length) {
           await db.execute(
-            'INSERT INTO pump_armed_rules (symbol,arm_pump_pct,arm_window_min,trail_pct,rebuy_pct,sell_pct,loop_enabled,active) VALUES (?,?,60,?,?,?,1,1)',
-            [sym, DND.arm_pump_pct, DND.trail_pct, DND.rebuy_pct, DND.sell_pct]
+            'INSERT INTO pump_armed_rules (symbol,arm_pump_pct,arm_window_min,trail_pct,retrace_pct,bounce_pct,sell_pct,loop_enabled,active) VALUES (?,?,60,?,?,?,?,1,1)',
+            [sym, DND.arm_pump_pct, DND.trail_pct, DND.retrace_pct, DND.bounce_pct, DND.sell_pct]
           );
         } else {
           await db.execute('UPDATE pump_armed_rules SET loop_enabled=1 WHERE symbol=? AND active=1', [sym]);
