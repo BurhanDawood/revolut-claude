@@ -36,7 +36,7 @@ const CHECK_INTERVAL_MS = 5 * 60 * 1000;
 const CAPTURE_INTERVAL_MS = 2 * 60 * 1000;   // #50: intraday price capture cadence (decoupled from alert loop)
 const FAST_SCAN_INTERVAL_MS = 30 * 1000;      // #94: fast-cadence trailing-stop scan for volatile meme/lotto coins (30s)
 const ORDER_POLL_INTERVAL_MS = 60 * 1000;     // #47 Phase B1 (hash47b): poll resting pending_orders for fills (detection-only)
-const ALERT_INTERVAL_MS = 60 * 1000;
+const ALERT_INTERVAL_MS = 3 * 60 * 1000; // 3 min between reminders (#150)
 const PUMP_THRESHOLD = 0.20;
 const SKIP_CURRENCIES = ['USD', 'USDT', 'USDC', 'EUR', 'GBP'];
 
