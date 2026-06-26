@@ -6401,7 +6401,8 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
 
     const reentryLine = reentryNote || '';
     const msg =
-      `📝 <b>TRADE DETECTED — ${symbol}</b>\n` +
+      `💰 <b>TRADE DETECTED — ${symbol}</b>\n` +
+      `<b>⏰ REPLY NOW — auto-logs in 30 min</b>\n\n` +
       `Action: ${actionLabel} ~${formatTradeQty(absQty)} tokens at ${formatPrice(price)} ($${valueUsd.toFixed(2)})${pnlLine}${avgEntryLine}${recLine}${reentryLine}\n\n` +
       `Just reply:\n` +
       `'<b>taking profits, confident</b>' — reason + emotion, done\n` +
@@ -6409,7 +6410,7 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
       `'<b>payment</b>' — Revolut payment (excluded from stats)\n` +
       `'<b>transfer</b>' — internal transfer (excluded from stats)\n` +
       `'<b>skip</b>' — log without details\n\n` +
-      `⏰ Will auto-log in 30 minutes if no reply.`;
+      `Reply before the timer fires or trade logs without context.`;
     await sendTelegram(msg);
 
     // Set 30-minute timeout to auto-complete
