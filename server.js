@@ -11235,7 +11235,7 @@ function createMcpServer() {
   server.tool('manage_alerts',
     'Set or manage all alert types — fixed price targets, daily thresholds, trailing stops, acknowledge, ignore or unignore coins',
     {
-      action:        z.enum(['set_target','set_threshold','set_trailing','acknowledge','ignore','unignore','remove_trailing','remove_target','remove_threshold','clear_cooldown','set_trough','remove_trough']).describe('What alert action to perform'),
+      action:        z.enum(['set_target','set_threshold','set_trailing','acknowledge','ignore','unignore','remove_trailing','remove_target','remove_threshold','clear_cooldown','set_trough','remove_trough','list_pending','batch_resolve']).describe('What alert action to perform'),
       symbol:        z.string().describe('Trading pair e.g. NEAR-USD or NEAR'),
       direction:     z.enum(['up', 'down']).optional().describe('Alert direction for set_target'),
       threshold_pct: z.number().optional().describe('Percentage for set_target or set_threshold'),
@@ -11249,8 +11249,9 @@ function createMcpServer() {
       buy_usd:       z.coerce.number().optional().describe('set_trough: USD to auto-buy on bounce'),
       bounce_pct:    z.coerce.number().optional().describe('set_trough: %% bounce off trough (default 8)'),
       entry_floor:   z.coerce.number().optional().describe('set_trough: never buy below this price'),
+      resolutions:   z.preprocess(v => { if (typeof v === 'string') { try { return JSON.parse(v); } catch(e) { return v; } } return v; }, z.array(z.object({ symbol: z.string(), choice: z.coerce.number() }))).optional().describe('#148 batch_resolve: [{symbol,choice}] to resolve pending alerts from PM thread'),
     },
-    async ({ action, symbol, direction, threshold_pct, anchor_price, trail_pct, current_price, target_price, description, auto_execute, sell_pct, buy_usd, bounce_pct, entry_floor }) => {
+    async ({ action, symbol, direction, threshold_pct, anchor_price, trail_pct, current_price, target_price, description, auto_execute, sell_pct, buy_usd, bounce_pct, entry_floor, resolutions }) => {
       const sym      = symbol.includes('-USD') ? symbol.toUpperCase() : `${symbol.toUpperCase()}-USD`;
       const coinBase = sym.replace('-USD', '');
       let result = {};
@@ -11359,6 +11360,43 @@ function createMcpServer() {
         analysisRateLimit.delete(sym);
         const cleared = (delRes && delRes.affectedRows != null) ? delRes.affectedRows : 0;
         result = { ok: true, action: 'clear_cooldown', symbol: sym, rows_cleared: cleared, message: `Cooldown cleared for ${coinBase} (${cleared} alert row(s) removed; analysis cooldowns reset) — targets can fire again on the next monitoring loop` };
+      } else if (action === 'list_pending') {
+        // #148: list all currently pending alerts (alertContextBySymbol map) for PM thread
+        const p148 = [...alertContextBySymbol.entries()].map(([k, v]) => ({
+          symbol: v.symbol, coinBase: v.coinBase, alertType: v.alertType,
+          pending_since_s: Math.round((Date.now() - v.timestamp) / 1000)
+        }));
+        result = { ok: true, count: p148.length, pending: p148,
+          note: p148.length ? 'Call batch_resolve with [{symbol,choice}] to resolve.' : 'No active pending alerts.' };
+
+      } else if (action === 'batch_resolve') {
+        // #148: resolve multiple pending alerts from PM thread without touching Telegram.
+        // processAlertChoice fires Telegram messages (analysis, approval prompts) exactly as if Bryan replied directly.
+        const rList = Array.isArray(resolutions) ? resolutions : [];
+        if (!rList.length) {
+          result = { ok: false, error: 'No resolutions provided. Pass resolutions:[{symbol,choice}]' };
+        } else {
+          const r148ok = [], r148fail = [];
+          for (const r of rList) {
+            const bc = (r.symbol || '').toLowerCase().replace('-usd', '');
+            const ch = parseInt(r.choice);
+            const ctx148 = alertContextBySymbol.get(bc);
+            if (!ctx148) {
+              const avail = [...alertContextBySymbol.keys()].map(c => c.toUpperCase()).join(', ') || 'none';
+              r148fail.push({ symbol: bc.toUpperCase(), reason: 'no active alert', available: avail }); continue;
+            }
+            alertContextBySymbol.delete(bc);
+            if (lastAlertCoin === bc) lastAlertCoin = null;
+            try {
+              await processAlertChoice(ctx148, ch, sendTelegram);
+              r148ok.push({ symbol: bc.toUpperCase(), choice: ch });
+            } catch(e148) {
+              r148fail.push({ symbol: bc.toUpperCase(), reason: 'error: ' + e148.message });
+            }
+          }
+          const stillP = [...alertContextBySymbol.keys()].map(c => c.toUpperCase());
+          result = { ok: true, resolved: r148ok, failed: r148fail, still_pending: stillP };
+        }
       }
 
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
