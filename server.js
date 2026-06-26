@@ -11236,7 +11236,7 @@ function createMcpServer() {
     'Set or manage all alert types — fixed price targets, daily thresholds, trailing stops, acknowledge, ignore or unignore coins',
     {
       action:        z.enum(['set_target','set_threshold','set_trailing','acknowledge','ignore','unignore','remove_trailing','remove_target','remove_threshold','clear_cooldown','set_trough','remove_trough','list_pending','batch_resolve']).describe('What alert action to perform'),
-      symbol:        z.string().describe('Trading pair e.g. NEAR-USD or NEAR'),
+      symbol:        z.string().optional().describe('Trading pair e.g. NEAR-USD or NEAR (omit for list_pending and batch_resolve)'),
       direction:     z.enum(['up', 'down']).optional().describe('Alert direction for set_target'),
       threshold_pct: z.number().optional().describe('Percentage for set_target or set_threshold'),
       anchor_price:  z.number().optional().describe('Anchor price for set_target'),
@@ -11252,7 +11252,7 @@ function createMcpServer() {
       resolutions:   z.preprocess(v => { if (typeof v === 'string') { try { return JSON.parse(v); } catch(e) { return v; } } return v; }, z.array(z.object({ symbol: z.string(), choice: z.coerce.number() }))).optional().describe('#148 batch_resolve: [{symbol,choice}] to resolve pending alerts from PM thread'),
     },
     async ({ action, symbol, direction, threshold_pct, anchor_price, trail_pct, current_price, target_price, description, auto_execute, sell_pct, buy_usd, bounce_pct, entry_floor, resolutions }) => {
-      const sym      = symbol.includes('-USD') ? symbol.toUpperCase() : `${symbol.toUpperCase()}-USD`;
+      const sym      = symbol ? (symbol.includes('-USD') ? symbol.toUpperCase() : `${symbol.toUpperCase()}-USD`) : 'UNKNOWN-USD';
       const coinBase = sym.replace('-USD', '');
       let result = {};
 
