@@ -8733,6 +8733,51 @@ async function checkPortfolio() {
               ).catch(() => {});
             }
           }
+        } else if (usdIncrease < -1) {
+          // #159: USD decreased while USDT net did NOT decrease.
+          // A USD->USDT conversion + a simultaneous USDT payment in the same 5-min window.
+          // The conversion swamped the payment so net USDT appears positive, hiding the payment.
+          // hiddenPayment = |USD out| - USDT net in. Both legs are ~1:1 with USD.
+          const usdOut159  = Math.abs(usdIncrease);
+          const usdtIn159  = Math.max(0, currentUSDT - lastKnownUSDT);
+          const hidden159  = parseFloat((usdOut159 - usdtIn159).toFixed(2));
+          console.log(`[usdt] #159: USD -$${usdOut159.toFixed(2)} | USDT +$${usdtIn159.toFixed(2)} | gap=$${hidden159.toFixed(2)}`);
+          if (hidden159 > 1) {
+            const [recentTrade159] = await db.execute(
+              `SELECT id FROM trading_journal WHERE action IN ('buy','add') AND source IN ('claude_mcp','auto_detected','manual') AND created_at > DATE_SUB(NOW(), INTERVAL 10 MINUTE) LIMIT 1`
+            ).catch(() => [[]]);
+            if (recentTrade159.length === 0) {
+              const [dupe159] = await db.execute(
+                `SELECT id FROM trading_journal WHERE symbol='USDT' AND action='payment' AND ABS(quantity - ?) < 0.05 AND created_at > DATE_SUB(NOW(), INTERVAL 15 MINUTE) LIMIT 1`,
+                [hidden159]
+              ).catch(() => [[]]);
+              if (dupe159.length === 0) {
+                console.log(`[usdt] #159 Auto-logging hidden payment $${hidden159.toFixed(2)} (USD->USDT conversion masked it)`);
+                await db.execute(
+                  `INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+                  ['USDT', 'payment', 1.00, hidden159, hidden159,
+                   `#159 Auto-logged card payment $${hidden159.toFixed(2)} USDT — masked by simultaneous USD\u2192USDT conversion ($${usdOut159.toFixed(2)} USD out, $${usdtIn159.toFixed(2)} USDT in)`,
+                   'neutral', 'revolut_card']
+                ).catch(() => {});
+                const prevCap159 = totalInvestedCapital;
+                const newCap159  = totalInvestedCapital - hidden159;
+                await updateInvestedCapital(newCap159, `#159 Hidden card payment auto-logged: -$${hidden159.toFixed(2)}`);
+                await sendTelegram(
+                  `\ud83d\udcb3 PAYMENT $${hidden159.toFixed(2)} USDT\n` +
+                  `(#159: masked by USD\u2192USDT conversion in same window)\n` +
+                  `Capital: $${prevCap159.toFixed(2)} \u2192 $${newCap159.toFixed(2)}\n\n` +
+                  `Tap '<b>skip payment ${hidden159.toFixed(2)}</b>' if not a payment.`
+                ).catch(() => {});
+              }
+            }
+          }
+          lastKnownUSDT = currentUSDT;
+          lastKnownUSD  = currentUSD;
+          await db.execute(
+            `INSERT INTO system_config (config_key, config_value) VALUES ('last_known_usdt', ?), ('last_known_usd', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)`,
+            [currentUSDT.toString(), currentUSD.toString()]
+          ).catch(() => {});
+
         } else if (currentUSDT - lastKnownUSDT > 0.10) {
           console.log(`[usdt] USDT +$${(currentUSDT - lastKnownUSDT).toFixed(2)} — sweep or deposit`);
         }
