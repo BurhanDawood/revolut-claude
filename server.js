@@ -1270,6 +1270,7 @@ await db.execute(`CREATE TABLE IF NOT EXISTS reconciliation_log (
   acknowledged TINYINT(1) DEFAULT 0
 )`);
 
+    await db.execute('ALTER TABLE pending_orders ADD COLUMN IF NOT EXISTS last_pipeline_qty DECIMAL(24,10) DEFAULT 0').catch(() => {});
     await db.execute(`CREATE TABLE IF NOT EXISTS pending_orders (
       order_id VARCHAR(64) PRIMARY KEY,
       client_order_id VARCHAR(64),
@@ -3724,7 +3725,7 @@ async function runLimitFillPipeline(order, filledQty, avgPrice) {
 async function pollPendingOrders() {
   try {
     const [rows] = await db.execute(
-      "SELECT order_id, symbol, side, order_type, quantity, limit_price, status, filled_quantity, linked_journal_id FROM pending_orders WHERE status NOT IN ('filled','cancelled','rejected','replaced') LIMIT 50"
+      "SELECT order_id, symbol, side, order_type, quantity, limit_price, status, filled_quantity, avg_fill_price, linked_journal_id, last_pipeline_qty FROM pending_orders WHERE status NOT IN ('filled','cancelled','rejected','replaced') LIMIT 50"
     );
     if (!rows || rows.length === 0) return;
     for (const o of rows) {
@@ -3753,14 +3754,24 @@ async function pollPendingOrders() {
         if (String(newStatus) === 'partially_filled' || terminal.indexOf(String(newStatus)) !== -1) {
           console.log('[orders] order ' + o.order_id + ' ' + o.side + ' ' + o.symbol + ' -> ' + newStatus + ' (filled ' + (filledQty != null ? filledQty : '?') + '/' + o.quantity + ', leaves ' + (leavesQty != null ? leavesQty : '?') + ')');
         }
-        // #47 B2a: on the first FULL fill of a resting LIMIT order, run the post-trade pipeline ONCE (idempotent via linked_journal_id).
-        if (String(newStatus) === 'filled' && String(o.order_type).toLowerCase() === 'limit' && o.linked_journal_id == null) {
-          const fq47 = (filledQty != null && parseFloat(filledQty) > 0) ? parseFloat(filledQty) : parseFloat(o.quantity);
-          const ap47 = (avgPrice != null && parseFloat(avgPrice) > 0) ? parseFloat(avgPrice) : parseFloat(o.limit_price);
-          const jid47 = await runLimitFillPipeline(o, fq47, ap47);
-          if (jid47 != null) {
-            await db.execute('UPDATE pending_orders SET linked_journal_id = ? WHERE order_id = ?', [jid47, o.order_id]);
-            console.log('[orders] B2a fill pipeline ran for ' + o.order_id + ' -> journal ' + jid47);
+        // #47 B2b: incremental partial-fill pipeline. Fires on partially_filled, filled, OR
+        // cancelled/rejected/replaced with partial fill (previously orphaned). Uses last_pipeline_qty
+        // to track how much has already been journaled so we only run the pipeline for the delta.
+        const b2bIsLimit = String(o.order_type).toLowerCase() === 'limit';
+        const b2bFilled = (filledQty != null && parseFloat(filledQty) > 0) ? parseFloat(filledQty) : 0;
+        const b2bLastQty = parseFloat(o.last_pipeline_qty || 0);
+        const b2bDelta = parseFloat((b2bFilled - b2bLastQty).toFixed(10));
+        const b2bIsPartial = String(newStatus) === 'partially_filled';
+        const b2bIsFilled = String(newStatus) === 'filled';
+        const b2bIsOrphaned = ['cancelled','rejected','replaced'].indexOf(String(newStatus)) !== -1 && b2bFilled > 0;
+        if (b2bIsLimit && b2bDelta > 0.0001 && (b2bIsPartial || b2bIsFilled || b2bIsOrphaned)) {
+          const b2bPrice = (avgPrice != null && parseFloat(avgPrice) > 0) ? parseFloat(avgPrice) : parseFloat(o.limit_price);
+          const b2bTag = b2bIsOrphaned ? '(orphaned partial)' : b2bIsPartial ? '(partial)' : '(final)';
+          console.log('[orders] B2b ' + b2bTag + ' ' + o.order_id + ' delta=' + b2bDelta + ' @ $' + b2bPrice + ' total=' + b2bFilled + '/' + o.quantity);
+          const jid47b = await runLimitFillPipeline(o, b2bDelta, b2bPrice);
+          if (jid47b != null) {
+            await db.execute('UPDATE pending_orders SET linked_journal_id = ?, last_pipeline_qty = ? WHERE order_id = ?', [jid47b, b2bFilled, o.order_id]);
+            console.log('[orders] B2b pipeline ran ' + b2bTag + ' ' + o.order_id + ' -> journal ' + jid47b + ' (pipelined ' + b2bFilled + '/' + o.quantity + ')');
           }
         }
       } catch (inner) {
