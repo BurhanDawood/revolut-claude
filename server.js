@@ -11928,6 +11928,14 @@ function createMcpServer() {
           }
           dndSt.enabled = true; dndSt.activated_at = new Date().toISOString(); dndSt.coins = coins;
           await saveDnd();
+          // #153: warn if ai_auto_execute master is OFF (ae93 path doesn't need it, but good to know)
+          try {
+            const [mRows] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'ai_auto_execute'");
+            const mCfg = mRows.length ? JSON.parse(mRows[0].config_value) : {};
+            if (!mCfg.enabled) {
+              await sendTelegram('\u26a0\ufe0f DND activated from PM but <b>ai_auto_execute master is OFF</b>. The ae93 trailing-stop path executes regardless, but other auto-exec paths (pump-loop, Away Mode) will not fire. Enable master if needed.').catch(() => {});
+            }
+          } catch (e) { console.error('[dnd] #153 master check error:', e.message); }
           await sendTelegram(`\ud83c\udf19 DND activated from PM: ${coins.join(', ')} (${D.arm}% arm, ${D.trail}% trail, loop on).`).catch(() => {});
           return { content: [{ type: 'text', text: JSON.stringify({ ok: true, activated: coins, params: D }) }] };
         }
