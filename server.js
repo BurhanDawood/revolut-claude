@@ -12967,11 +12967,12 @@ function createMcpServer() {
         result = { ok: true, action: 'fetch_now', ...fr };
       } else if (action === 'get_items') {
         const days = since_days || 7; const lim = limit || 10;
-        let q = 'SELECT fi.id, sf.name source_name, fi.title, fi.published_at, fi.url, fi.thesis_status, fi.analysis, fi.coin_tags FROM feed_items fi JOIN source_feeds sf ON fi.source_id=sf.id WHERE fi.published_at > DATE_SUB(NOW(), INTERVAL ? DAY)';
-        const p = [days];
+        const daysInt = Math.max(1, parseInt(days) || 7);
+        const limInt = Math.max(1, parseInt(lim) || 10);
+        let q = `SELECT fi.id, sf.name source_name, fi.title, fi.published_at, fi.url, fi.thesis_status, fi.analysis, fi.coin_tags FROM feed_items fi JOIN source_feeds sf ON fi.source_id=sf.id WHERE fi.published_at > DATE_SUB(NOW(), INTERVAL ${daysInt} DAY)`;
+        const p = [];
         if (coin_filter) { q += ' AND JSON_CONTAINS(fi.coin_tags, JSON_QUOTE(?))'; p.push(coin_filter.toUpperCase()); }
-        q += ' ORDER BY fi.published_at DESC LIMIT ?';
-        p.push(lim);
+        q += ` ORDER BY fi.published_at DESC LIMIT ${limInt}`;
         const [items] = await db.execute(q, p);
         result = { ok: true, count: items.length, items };
       }
