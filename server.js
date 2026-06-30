@@ -1270,7 +1270,7 @@ await db.execute(`CREATE TABLE IF NOT EXISTS reconciliation_log (
   acknowledged TINYINT(1) DEFAULT 0
 )`);
 
-    await db.execute('ALTER TABLE pending_orders ADD COLUMN IF NOT EXISTS last_pipeline_qty DECIMAL(24,10) DEFAULT 0').catch(() => {});
+    await safeAddColumn('pending_orders', 'last_pipeline_qty', 'DECIMAL(24,10) DEFAULT 0');
     await db.execute(`CREATE TABLE IF NOT EXISTS pending_orders (
       order_id VARCHAR(64) PRIMARY KEY,
       client_order_id VARCHAR(64),
