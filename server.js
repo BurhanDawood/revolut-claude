@@ -9989,7 +9989,7 @@ function parseRssXml(xml) {
 }
 async function analyseSourceFeedItem(item, source) {
   if (!item.transcript || item.transcript.length < 100) return null;
-  const coinTags = JSON.parse(source.coin_tags||'[]');
+  let coinTags = []; try { const ct = JSON.parse(source.coin_tags||'[]'); coinTags = Array.isArray(ct) ? ct : (ct ? ct.toString().split(',').map(s=>s.trim()).filter(Boolean) : []); } catch(e) { coinTags = (source.coin_tags||'').split(',').map(s=>s.trim()).filter(Boolean); }
   const plans = [];
   for (const coin of coinTags) {
     const [[row]] = await db.execute('SELECT strategy_md FROM coin_strategy WHERE symbol=?',[coin]).catch(()=>[[]]);
@@ -12953,7 +12953,7 @@ function createMcpServer() {
       if (action === 'add') {
         let channelId = null;
         if (type === 'youtube') { channelId = await resolveYoutubeChannelId(url); }
-        const tags = JSON.stringify(coin_tags || []);
+        let tagsArr = []; if (Array.isArray(coin_tags)) { tagsArr = coin_tags; } else if (typeof coin_tags === 'string' && coin_tags) { try { const p = JSON.parse(coin_tags); tagsArr = Array.isArray(p) ? p : coin_tags.split(',').map(s=>s.trim()).filter(Boolean); } catch(e) { tagsArr = coin_tags.split(',').map(s=>s.trim()).filter(Boolean); } } const tags = JSON.stringify(tagsArr);
         await db.execute('INSERT INTO source_feeds (name, type, url, channel_id, coin_tags, active) VALUES (?,?,?,?,?,1)', [name, type, url, channelId, tags]);
         result = { ok: true, action: 'add', name, type, channel_id: channelId, coin_tags: coin_tags || [] };
       } else if (action === 'list') {
