@@ -1395,6 +1395,32 @@ await safeAddColumn('entry_prices', 'last_sold_at',        'TIMESTAMP NULL');
 await safeAddColumn('entry_prices', 'original_entry_date',  'TIMESTAMP NULL');
 await safeAddColumn('entry_prices', 'cycle_count',          'INT DEFAULT 0');
 await safeAddColumn('entry_prices', 'created_at',           'TIMESTAMP DEFAULT CURRENT_TIMESTAMP');
+  await db.execute(`CREATE TABLE IF NOT EXISTS source_feeds (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    type ENUM('youtube','rss') NOT NULL,
+    url VARCHAR(500) NOT NULL,
+    channel_id VARCHAR(60),
+    coin_tags JSON,
+    last_fetched TIMESTAMP NULL,
+    active TINYINT DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  )`).catch(()=>{});
+  await db.execute(`CREATE TABLE IF NOT EXISTS feed_items (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    source_id INT NOT NULL,
+    item_id VARCHAR(200) NOT NULL,
+    title VARCHAR(500),
+    published_at TIMESTAMP NULL,
+    url VARCHAR(500),
+    transcript MEDIUMTEXT,
+    analysis TEXT,
+    coin_tags JSON,
+    thesis_status ENUM('intact','drifting','broken','neutral','pending') DEFAULT 'pending',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_item (source_id, item_id),
+    INDEX idx_pub (published_at)
+  )`).catch(()=>{});
 
 // Backfill: preserve current entry prices as original for all existing positions
 await db.execute(`
@@ -9922,6 +9948,107 @@ cron.schedule('5 9 * * 1', async () => {
 }, { timezone: 'Europe/London' });
 
 // Daily intention outcome checks — 10 AM, checks for 7-day and 30-day pending follow-ups
+// Source feed helpers (#62/#68) 
+async function resolveYoutubeChannelId(url) {
+  const apiKey = process.env.YOUTUBE_API_KEY;
+  if (!apiKey) throw new Error('YOUTUBE_API_KEY env var not set');
+  if (/^UC[\w-]{22}$/.test(url)) return url;
+  const chanM = url.match(/youtube\.com\/channel\/(UC[\w-]{22})/);
+  if (chanM) return chanM[1];
+  const handleM = url.match(/youtube\.com\/@([\w.-]+)/);
+  if (handleM) {
+    const r = await fetch(`https://www.googleapis.com/youtube/v3/channels?part=id&forHandle=@${handleM[1]}&key=${apiKey}`).then(x=>x.json());
+    if (r.items?.[0]?.id) return r.items[0].id;
+  }
+  const userM = url.match(/youtube\.com\/user\/([\w.-]+)/);
+  if (userM) {
+    const r = await fetch(`https://www.googleapis.com/youtube/v3/channels?part=id&forUsername=${userM[1]}&key=${apiKey}`).then(x=>x.json());
+    if (r.items?.[0]?.id) return r.items[0].id;
+  }
+  throw new Error('Could not resolve YouTube channel ID from: ' + url);
+}
+async function fetchYoutubeTranscript(videoId) {
+  try {
+    const html = await fetch(`https://www.youtube.com/watch?v=${videoId}`, { headers: { 'User-Agent': 'Mozilla/5.0' } }).then(r=>r.text());
+    const m = html.match(/ytInitialPlayerResponse\s*=\s*(\{.+?\});/);
+    if (!m) return null;
+    const tracks = JSON.parse(m[1])?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+    if (!tracks?.length) return null;
+    const track = tracks.find(t=>t.languageCode==='en') || tracks[0];
+    const capData = await fetch(track.baseUrl + '&fmt=json3').then(r=>r.json());
+    return (capData.events||[]).filter(e=>e.segs).map(e=>e.segs.map(s=>s.utf8||'').join('')).join(' ').replace(/\s+/g,' ').trim() || null;
+  } catch(e) { console.error('[feeds] transcript err '+videoId+':',e.message); return null; }
+}
+function parseRssXml(xml) {
+  const items = [];
+  for (const item of (xml.match(/<item>([\s\S]*?)<\/item>/g)||[])) {
+    const get = tag => { const m = item.match(new RegExp('<'+tag+'[^>]*><!\\[CDATA\\[([\\s\\S]*?)\\]\\]></'+tag+'>|<'+tag+'[^>]*>([^<]*)</'+tag+'>')); return m?(m[1]||m[2]||'').trim():''; };
+    items.push({ title:get('title'), link:get('link'), description:get('description')||get('content:encoded'), pubDate:get('pubDate'), guid:get('guid')||get('link') });
+  }
+  return items;
+}
+async function analyseSourceFeedItem(item, source) {
+  if (!item.transcript || item.transcript.length < 100) return null;
+  const coinTags = JSON.parse(source.coin_tags||'[]');
+  const plans = [];
+  for (const coin of coinTags) {
+    const [[row]] = await db.execute('SELECT strategy_md FROM coin_strategy WHERE symbol=?',[coin]).catch(()=>[[]]);
+    if (row?.strategy_md) plans.push('=== '+coin+' PLAN ===\n'+row.strategy_md);
+  }
+  const prompt = `Analyse this content from "${source.name}" against the trader's saved coin plans.\n\nCOIN PLANS:\n${plans.join('\n\n')||'No saved plans.'}\n\nCONTENT:\nTitle: ${item.title}\n\n${item.transcript.slice(0,6000)}\n\nRespond JSON only (no markdown): {"thesis_status":"intact|drifting|broken|neutral","takeaways":["bullet1","bullet2","bullet3"],"implication":"one sentence"}`;
+  try {
+    const resp = await anthropic.messages.create({ model:'claude-haiku-4-5-20251001', max_tokens:400, messages:[{role:'user',content:prompt}] });
+    const text = resp.content?.[0]?.text||'';
+    return JSON.parse(text.replace(/```json|```/g,'').trim());
+  } catch(e) { console.error('[feeds] analysis err:',e.message); return null; }
+}
+async function fetchYoutubeUploads(source) {
+  const apiKey = process.env.YOUTUBE_API_KEY;
+  const chan = await fetch(`https://www.googleapis.com/youtube/v3/channels?part=contentDetails&id=${source.channel_id}&key=${apiKey}`).then(r=>r.json());
+  const playlist = chan.items?.[0]?.contentDetails?.relatedPlaylists?.uploads;
+  if (!playlist) throw new Error('No uploads playlist for '+source.channel_id);
+  const list = await fetch(`https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&playlistId=${playlist}&maxResults=10&key=${apiKey}`).then(r=>r.json());
+  const since = source.last_fetched ? new Date(source.last_fetched) : new Date(0);
+  return (list.items||[]).filter(i=>new Date(i.snippet.publishedAt)>since).map(i=>({
+    item_id: i.snippet.resourceId.videoId, title: i.snippet.title,
+    published_at: i.snippet.publishedAt, url: 'https://www.youtube.com/watch?v='+i.snippet.resourceId.videoId
+  }));
+}
+async function fetchRssItems(source) {
+  const xml = await fetch(source.url).then(r=>r.text());
+  const since = source.last_fetched ? new Date(source.last_fetched) : new Date(0);
+  return parseRssXml(xml).filter(i=>!i.pubDate||new Date(i.pubDate)>since).map(i=>({
+    item_id: i.guid||i.link, title: i.title, published_at: i.pubDate?new Date(i.pubDate).toISOString():null,
+    url: i.link, transcript: i.description
+  }));
+}
+async function fetchAllSources(sourceId) {
+  const [sources] = await db.execute(sourceId?'SELECT * FROM source_feeds WHERE active=1 AND id=?':'SELECT * FROM source_feeds WHERE active=1', sourceId?[sourceId]:[]);
+  let totalFetched=0, totalAnalysed=0, errors_=[];
+  for (const source of sources) {
+    try {
+      let newItems=[];
+      if (source.type==='youtube' && process.env.YOUTUBE_API_KEY) {
+        const uploads = await fetchYoutubeUploads(source);
+        for (const u of uploads) { const transcript = await fetchYoutubeTranscript(u.item_id); newItems.push({...u,transcript}); }
+      } else if (source.type==='rss') {
+        newItems = await fetchRssItems(source);
+      }
+      for (const item of newItems) {
+        const [ins] = await db.execute('INSERT IGNORE INTO feed_items (source_id,item_id,title,published_at,url,transcript,coin_tags,thesis_status) VALUES (?,?,?,?,?,?,?,?)',[source.id,item.item_id,item.title,item.published_at,item.url,item.transcript,source.coin_tags,'pending']);
+        if (ins.affectedRows>0) {
+          totalFetched++;
+          const analysis = await analyseSourceFeedItem(item, source);
+          if (analysis) { await db.execute('UPDATE feed_items SET analysis=?,thesis_status=? WHERE source_id=? AND item_id=?',[JSON.stringify(analysis),analysis.thesis_status,source.id,item.item_id]); totalAnalysed++; }
+        }
+      }
+      await db.execute('UPDATE source_feeds SET last_fetched=NOW() WHERE id=?',[source.id]);
+      console.log('[feeds] '+source.name+': '+newItems.length+' new, '+totalAnalysed+' analysed');
+    } catch(e) { console.error('[feeds] error '+source.name+':',e.message); errors_.push({source:source.name,error:e.message}); }
+  }
+  return { totalFetched, totalAnalysed, errors: errors_ };
+}
+
 cron.schedule('15 9 * * *', async () => { await sendTelegram('\ud83d\udccb Morning brief time. Open Claude PM and say "morning brief" - your positions need a daily eye.'); }, { timezone: 'Europe/London' }); // daily brief reminder
 cron.schedule('0 10 * * *', checkIntentionOutcomes, { timezone: 'Europe/London' });
 
@@ -12803,6 +12930,52 @@ function createMcpServer() {
       const out = { ok: true, resolved, failed, results };
       if (capitalTouched) { out.capital_before = capitalBefore; out.capital_after = totalInvestedCapital; }
       return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] };
+    }
+  );
+
+
+  // Tool: manage_sources
+  server.tool('manage_sources',
+    'Manage YouTube/RSS source feeds and retrieve analysed items for morning brief and in-chat research',
+    {
+      action:      z.enum(['add','list','remove','fetch_now','get_items']).describe('add: add source; list: list all; remove: deactivate; fetch_now: fetch new items now; get_items: retrieve analysed items'),
+      source_id:   z.coerce.number().optional().describe('source id for remove/fetch_now/get_items'),
+      name:        z.string().optional().describe('add: display name e.g. CoinBureau'),
+      type:        z.enum(['youtube','rss']).optional().describe('add: source type'),
+      url:         z.string().optional().describe('add: YouTube channel URL, handle, channel ID (UC...), or RSS URL'),
+      coin_tags:   z.preprocess(v => { if (typeof v === 'string') { try { return JSON.parse(v); } catch(e) { return v; } } return v; }, z.array(z.string())).optional().describe('add: coins this source covers e.g. ["NEAR","HYPE"]'),
+      coin_filter: z.string().optional().describe('get_items: filter by coin tag e.g. NEAR'),
+      limit:       z.coerce.number().optional().describe('get_items: max items (default 10)'),
+      since_days:  z.coerce.number().optional().describe('get_items: only items from last N days (default 7)'),
+    },
+    async ({ action, source_id, name, type, url, coin_tags, coin_filter, limit, since_days }) => {
+      let result = {};
+      if (action === 'add') {
+        let channelId = null;
+        if (type === 'youtube') { channelId = await resolveYoutubeChannelId(url); }
+        const tags = JSON.stringify(coin_tags || []);
+        await db.execute('INSERT INTO source_feeds (name, type, url, channel_id, coin_tags, active) VALUES (?,?,?,?,?,1)', [name, type, url, channelId, tags]);
+        result = { ok: true, action: 'add', name, type, channel_id: channelId, coin_tags: coin_tags || [] };
+      } else if (action === 'list') {
+        const [rows] = await db.execute('SELECT id, name, type, url, channel_id, coin_tags, last_fetched, active FROM source_feeds ORDER BY id');
+        result = { ok: true, sources: rows };
+      } else if (action === 'remove') {
+        await db.execute('UPDATE source_feeds SET active=0 WHERE id=?', [source_id]);
+        result = { ok: true, action: 'remove', source_id };
+      } else if (action === 'fetch_now') {
+        const fr = await fetchAllSources(source_id || null);
+        result = { ok: true, action: 'fetch_now', ...fr };
+      } else if (action === 'get_items') {
+        const days = since_days || 7; const lim = limit || 10;
+        let q = 'SELECT fi.id, sf.name source_name, fi.title, fi.published_at, fi.url, fi.thesis_status, fi.analysis, fi.coin_tags FROM feed_items fi JOIN source_feeds sf ON fi.source_id=sf.id WHERE fi.published_at > DATE_SUB(NOW(), INTERVAL ? DAY)';
+        const p = [days];
+        if (coin_filter) { q += ' AND JSON_CONTAINS(fi.coin_tags, JSON_QUOTE(?))'; p.push(coin_filter.toUpperCase()); }
+        q += ' ORDER BY fi.published_at DESC LIMIT ?';
+        p.push(lim);
+        const [items] = await db.execute(q, p);
+        result = { ok: true, count: items.length, items };
+      }
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
     }
   );
 
