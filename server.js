@@ -9989,7 +9989,7 @@ function parseRssXml(xml) {
 }
 async function analyseSourceFeedItem(item, source) {
   if (!item.transcript || item.transcript.length < 100) return null;
-  let coinTags = []; try { const ct = JSON.parse(source.coin_tags||'[]'); coinTags = Array.isArray(ct) ? ct : (ct ? ct.toString().split(',').map(s=>s.trim()).filter(Boolean) : []); } catch(e) { coinTags = (source.coin_tags||'').split(',').map(s=>s.trim()).filter(Boolean); }
+  let coinTags = []; if (Array.isArray(source.coin_tags)) { coinTags = source.coin_tags; } else if (typeof source.coin_tags === 'string' && source.coin_tags) { try { const ct = JSON.parse(source.coin_tags); coinTags = Array.isArray(ct) ? ct : String(ct).split(',').map(s=>s.trim()).filter(Boolean); } catch(e) { coinTags = source.coin_tags.split(',').map(s=>s.trim()).filter(Boolean); } }
   const plans = [];
   for (const coin of coinTags) {
     const [[row]] = await db.execute('SELECT strategy_md FROM coin_strategy WHERE symbol=?',[coin]).catch(()=>[[]]);
