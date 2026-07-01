@@ -10068,6 +10068,7 @@ async function fetchAllSources(sourceId) {
           totalFetched++;
           const analysis = await analyseSourceFeedItem(item, source);
           if (analysis) { await db.execute('UPDATE feed_items SET analysis=?,thesis_status=? WHERE source_id=? AND item_id=?',[JSON.stringify(analysis),analysis.thesis_status,source.id,item.item_id]); totalAnalysed++; }
+          else { const reason = (!item.transcript || item.transcript.length < 100) ? 'content too short to analyse (headline/snippet only)' : 'analysis unavailable'; await db.execute('UPDATE feed_items SET analysis=?,thesis_status=? WHERE source_id=? AND item_id=?',[JSON.stringify({skipped:reason}),'neutral',source.id,item.item_id]); }
         }
       }
       await db.execute('UPDATE source_feeds SET last_fetched=NOW() WHERE id=?',[source.id]);
