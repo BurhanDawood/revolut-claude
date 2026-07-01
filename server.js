@@ -9967,16 +9967,36 @@ async function resolveYoutubeChannelId(url) {
   }
   throw new Error('Could not resolve YouTube channel ID from: ' + url);
 }
+function extractBalancedJson(html, anchor) {
+  const a = html.indexOf(anchor);
+  if (a < 0) return null;
+  let i = html.indexOf('{', a);
+  if (i < 0) return null;
+  const begin = i; let depth = 0, inStr = false, esc = false;
+  for (; i < html.length; i++) {
+    const c = html[i];
+    if (esc) { esc = false; continue; }
+    if (c === '\\') { esc = true; continue; }
+    if (c === '"') { inStr = !inStr; continue; }
+    if (inStr) continue;
+    if (c === '{') depth++;
+    else if (c === '}') { depth--; if (depth === 0) return html.substring(begin, i + 1); }
+  }
+  return null;
+}
 async function fetchYoutubeTranscript(videoId) {
   try {
     const html = await fetch(`https://www.youtube.com/watch?v=${videoId}`, { headers: { 'User-Agent': 'Mozilla/5.0' } }).then(r=>r.text());
-    const m = html.match(/ytInitialPlayerResponse\s*=\s*(\{.+?\});/);
-    if (!m) return null;
-    const tracks = JSON.parse(m[1])?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
-    if (!tracks?.length) return null;
+    const jsonStr = extractBalancedJson(html, 'ytInitialPlayerResponse');
+    if (!jsonStr) { console.error('[feeds] transcript '+videoId+': no ytInitialPlayerResponse'); return null; }
+    let player; try { player = JSON.parse(jsonStr); } catch(e) { console.error('[feeds] transcript '+videoId+': player JSON parse failed'); return null; }
+    const tracks = player?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+    if (!tracks?.length) { console.error('[feeds] transcript '+videoId+': no caption tracks (captions unavailable)'); return null; }
     const track = tracks.find(t=>t.languageCode==='en') || tracks[0];
     const capData = await fetch(track.baseUrl + '&fmt=json3').then(r=>r.json());
-    return (capData.events||[]).filter(e=>e.segs).map(e=>e.segs.map(s=>s.utf8||'').join('')).join(' ').replace(/\s+/g,' ').trim() || null;
+    const text = (capData.events||[]).filter(e=>e.segs).map(e=>e.segs.map(s=>s.utf8||'').join('')).join(' ').replace(/\s+/g,' ').trim();
+    if (!text) { console.error('[feeds] transcript '+videoId+': caption fetch empty'); return null; }
+    return text;
   } catch(e) { console.error('[feeds] transcript err '+videoId+':',e.message); return null; }
 }
 function parseRssXml(xml) {
@@ -10030,7 +10050,15 @@ async function fetchAllSources(sourceId) {
       let newItems=[];
       if (source.type==='youtube' && process.env.YOUTUBE_API_KEY) {
         const uploads = await fetchYoutubeUploads(source);
-        for (const u of uploads) { const transcript = await fetchYoutubeTranscript(u.item_id); newItems.push({...u,transcript}); }
+        for (const u of uploads) {
+          let transcript = await fetchYoutubeTranscript(u.item_id);
+          if (!transcript || transcript.length < 100) {
+            const fallback = ('Video title: ' + (u.title||'') + '. (Full transcript unavailable for this upload; analyse the title as an analyst signal about the tagged coins.)');
+            console.log('[feeds] '+source.name+' '+u.item_id+': no transcript, using title fallback');
+            transcript = fallback;
+          }
+          newItems.push({...u, transcript});
+        }
       } else if (source.type==='rss') {
         newItems = await fetchRssItems(source);
       }
