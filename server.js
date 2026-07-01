@@ -12965,7 +12965,7 @@ function createMcpServer() {
 
   // Tool: manage_sources
   server.tool('manage_sources',
-    'Manage YouTube/RSS source feeds and retrieve analysed items for morning brief and in-chat research',
+    'Content intelligence feed: manage YouTube channels and RSS news sources and fetch and read their analysed items. Monitors crypto analyst videos and news articles, pulls transcripts, and analyses each against saved coin strategies for thesis impact. Actions: add (add a YouTube or RSS source with coin tags), list (list all sources), remove (deactivate a source), fetch_now (fetch and analyse latest videos/articles now), get_items (read analysed content items, filter by coin). Use for morning brief content review, checking what analysts and news say about held coins, source feed management, and in-chat research.',
     {
       action:      z.enum(['add','list','remove','fetch_now','get_items']).describe('add: add source; list: list all; remove: deactivate; fetch_now: fetch new items now; get_items: retrieve analysed items'),
       source_id:   z.coerce.number().optional().describe('source id for remove/fetch_now/get_items'),
