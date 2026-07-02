@@ -13012,13 +13012,22 @@ function createMcpServer() {
   return server;
 }
 
-app.post('/mcp', async (req, res) => {
+// #186 -- MCP endpoint auth via path secret. Route registers ONLY if MCP_PATH_SECRET is set (fail closed).
+const MCP_PATH_SECRET = process.env.MCP_PATH_SECRET;
+const mcpHandler = async (req, res) => {
   const server = createMcpServer();
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
   await server.connect(transport);
   await transport.handleRequest(req, res, req.body);
   await server.close();
-});
+};
+if (MCP_PATH_SECRET) {
+  app.post('/mcp-' + MCP_PATH_SECRET, mcpHandler);
+  app.post('/mcp', mcpHandler); // legacy path -- removed in Push 2 after connector URL swap
+  console.log('[mcp] endpoint registered (secret path active, len=' + MCP_PATH_SECRET.length + '; legacy /mcp on for migration)');
+} else {
+  console.log('[mcp] MCP_PATH_SECRET unset -- /mcp endpoint DISABLED (fail closed)');
+}
 
 
 app.get('/', (req, res) => {
