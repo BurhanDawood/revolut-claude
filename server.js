@@ -1,4 +1,4 @@
-﻿import express from 'express';
+import express from 'express';
 // chromebook browser-tab workflow verified 2026-06-18
 import cors from 'cors';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -9996,9 +9996,16 @@ function extractBalancedJson(html, anchor) {
 }
 async function fetchYoutubeTranscript(videoId) {
   try {
-    const html = await fetch(`https://www.youtube.com/watch?v=${videoId}`, { headers: { 'User-Agent': 'Mozilla/5.0' } }).then(r=>r.text());
+    const resp = await fetch(`https://www.youtube.com/watch?v=${videoId}`, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+    const html = await resp.text();
     const jsonStr = extractBalancedJson(html, 'ytInitialPlayerResponse');
-    if (!jsonStr) { console.error('[feeds] transcript '+videoId+': no ytInitialPlayerResponse'); return null; }
+    if (!jsonStr) {
+      // #201 diagnostics: capture what YouTube actually served (status, final URL, size, marker flags, head)
+      const lowerHtml = html.toLowerCase();
+      const markers = ['ytInitialData','Sign in to confirm','consent','captcha','enable javascript','unusual traffic'].filter(m => lowerHtml.includes(m.toLowerCase())).join(',') || 'none';
+      console.error('[feeds] transcript '+videoId+': no ytInitialPlayerResponse | status='+resp.status+' | finalUrl='+resp.url+' | len='+html.length+' | markers=['+markers+'] | head='+JSON.stringify(html.slice(0,300)));
+      return null;
+    }
     let player; try { player = JSON.parse(jsonStr); } catch(e) { console.error('[feeds] transcript '+videoId+': player JSON parse failed'); return null; }
     const tracks = player?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
     if (!tracks?.length) { console.error('[feeds] transcript '+videoId+': no caption tracks (captions unavailable)'); return null; }
