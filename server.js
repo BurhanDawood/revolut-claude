@@ -13674,6 +13674,12 @@ async function processAlertChoice(ctx, choice, sendReply) {
 // POST /telegram-webhook — handle incoming Telegram messages
 app.post('/telegram-webhook', async (req, res) => {
   try {
+    // hash189 SECURITY: verify Telegram secret token; fail-closed if unset or mismatched
+    const expectedWebhookSecret = process.env.TELEGRAM_WEBHOOK_SECRET;
+    if (!expectedWebhookSecret || req.headers['x-telegram-bot-api-secret-token'] !== expectedWebhookSecret) {
+      console.warn('[security] /telegram-webhook rejected: secret token missing or mismatch');
+      return res.status(403).json({ ok: false });
+    }
     const message = req.body.message;
     if (!message || !message.text) {
       return res.status(200).json({ ok: true });
@@ -13697,6 +13703,13 @@ app.post('/telegram-webhook', async (req, res) => {
     // ── Admin journal delete — two-step guarded command ───────────────────────
     // Authorized chat only: TELEGRAM_CHAT_ID (same constant the bot always uses)
     const isAuthorizedAdmin = chatId.toString() === TELEGRAM_CHAT_ID.toString();
+    // hash189 defense-in-depth: secret_token proves the request came from Telegram, not WHICH user.
+    // Telegram forwards messages from any user who DMs the bot (all carry the valid secret header),
+    // so hard-gate ALL routing to the authorized chat. Fail-closed: unknown chat gets a silent 200.
+    if (!isAuthorizedAdmin) {
+      console.warn('[security] /telegram-webhook ignoring message from unauthorized chat ' + chatId);
+      return res.status(200).json({ ok: true });
+    }
 
     // Step 4: implicit cancel — if a delete is armed and this message is NOT the
     // confirmation, cancel it BEFORE normal routing so other commands still work.
@@ -16193,8 +16206,12 @@ Active alerts (coins currently above threshold): ${[...alertState.active.keys()]
 // GET /telegram-setup — register the webhook URL with Telegram
 app.get('/telegram-setup', async (req, res) => {
   const token = process.env.TELEGRAM_BOT_TOKEN;
+  const webhookSecret = process.env.TELEGRAM_WEBHOOK_SECRET;
+  if (!webhookSecret) {
+    return res.status(500).json({ error: 'TELEGRAM_WEBHOOK_SECRET not set (hash189): refusing to register webhook without a secret token' });
+  }
   const webhookUrl = 'https://revolut-claude-production.up.railway.app/telegram-webhook';
-  const response = await fetch(`https://api.telegram.org/bot${token}/setWebhook?url=${webhookUrl}`);
+  const response = await fetch(`https://api.telegram.org/bot${token}/setWebhook?url=${webhookUrl}&secret_token=${encodeURIComponent(webhookSecret)}`);
   const data = await response.json();
   res.json(data);
 });
