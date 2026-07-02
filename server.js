@@ -7885,6 +7885,11 @@ async function autoExecuteSell(symbol, maxPct, analysis, confidence) {
         const [epRow] = await db.execute('SELECT entry_price FROM entry_prices WHERE symbol = ? OR symbol = ? LIMIT 1', [symbol, coinBase + '-USD']);
         if (epRow.length && epRow[0].entry_price != null && parseFloat(epRow[0].entry_price) > 0) entryFloor = parseFloat(epRow[0].entry_price);
       }
+      if (entryFloor === null) {
+        await sendTelegram('AUTO-SELL BLOCKED - ' + coinBase + ': no entry floor established (no sell_floors, no pump entry_floor, no entry_price). Never-sell-below-entry cannot be verified - failing safe, position untouched.').catch(() => {});
+        console.log('[auto-exec] FLOOR GUARD blocked ' + coinBase + ' sell: entryFloor null - fail-safe hash187');
+        return;
+      }
       if (entryFloor !== null && currentPrice <= entryFloor) {
         await sendTelegram(
           `🛑 <b>AUTO-SELL BLOCKED — ${coinBase}</b>\n` +
@@ -8111,6 +8116,11 @@ async function autoExecuteKrakenSell(symbol, maxPct, analysis, confidence) {
       if (entryFloor === null) {
         const [epRow] = await db.execute('SELECT entry_price FROM entry_prices WHERE symbol = ? OR symbol = ? LIMIT 1', [symbol, coinBase + '-USD']);
         if (epRow.length && epRow[0].entry_price != null && parseFloat(epRow[0].entry_price) > 0) entryFloor = parseFloat(epRow[0].entry_price);
+      }
+      if (entryFloor === null) {
+        await sendTelegram('AUTO-SELL BLOCKED - ' + coinBase + ' (Kraken): no entry floor established (no sell_floors, no pump entry_floor, no entry_price). Never-sell-below-entry cannot be verified - failing safe, position untouched.').catch(() => {});
+        console.log('[auto-exec] FLOOR GUARD blocked Kraken ' + coinBase + ' sell: entryFloor null - fail-safe hash187');
+        return;
       }
       if (entryFloor !== null && currentPrice <= entryFloor) {
         await sendTelegram(
