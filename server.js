@@ -10535,7 +10535,7 @@ app.post('/api/targets/:symbol', async (req, res) => {
 // POST /api/bridge — dev_bridge ingestion (Claude→Railway). Token-protected.
 app.post('/api/bridge', async (req, res) => {
   // AUTH — required, unlike the other open routes
-  if (req.headers['x-bridge-token'] !== process.env.BRIDGE_TOKEN) {
+  if (!process.env.BRIDGE_TOKEN || req.headers['x-bridge-token'] !== process.env.BRIDGE_TOKEN) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
   const { type, payload, ref_devlog_id } = req.body;
