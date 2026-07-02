@@ -1,4 +1,4 @@
-import express from 'express';
+﻿import express from 'express';
 // chromebook browser-tab workflow verified 2026-06-18
 import cors from 'cors';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -13,7 +13,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import cron from 'node-cron';
 import { gzipSync } from 'zlib';
 
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY, defaultHeaders: { 'Accept-Encoding': 'identity' } });
 
 // FIX 3: Verify API key present at startup
 if (!process.env.ANTHROPIC_API_KEY) {
