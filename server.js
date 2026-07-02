@@ -13023,8 +13023,7 @@ const mcpHandler = async (req, res) => {
 };
 if (MCP_PATH_SECRET) {
   app.post('/mcp-' + MCP_PATH_SECRET, mcpHandler);
-  app.post('/mcp', mcpHandler); // legacy path -- removed in Push 2 after connector URL swap
-  console.log('[mcp] endpoint registered (secret path active, len=' + MCP_PATH_SECRET.length + '; legacy /mcp on for migration)');
+  console.log('[mcp] endpoint registered (secret path only, len=' + MCP_PATH_SECRET.length + '; legacy /mcp removed -- #186 sealed)');
 } else {
   console.log('[mcp] MCP_PATH_SECRET unset -- /mcp endpoint DISABLED (fail closed)');
 }
