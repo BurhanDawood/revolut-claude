@@ -13,6 +13,10 @@ import Anthropic from '@anthropic-ai/sdk';
 import cron from 'node-cron';
 import { gzipSync } from 'zlib';
 
+// #209: transport-tolerant schema wrapper -- MCP client may serialize arrays/booleans/objects as JSON strings.
+// Mirrors the inline JSON.parse preprocess pattern already used on dnd_coins/coin_tags/sell_floors/per_coin_enabled/resolutions (#152).
+const zLoose = (schema) => z.preprocess((v) => { if (typeof v === 'string') { try { return JSON.parse(v); } catch (e) { return v; } } return v; }, schema);
+
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY, defaultHeaders: { 'Accept-Encoding': 'identity' } });
 
 // FIX 3: Verify API key present at startup
@@ -11074,7 +11078,7 @@ function createMcpServer() {
   server.tool('get_prices', 'Get current crypto price(s). Pass symbol for one, or symbols[] for many in a single call.',
     {
       symbol:  z.string().optional().describe('Single trading pair e.g. BTC-USD'),
-      symbols: z.array(z.string()).optional().describe('Multiple trading pairs e.g. ["BTC-USD","ENA-USD"] — batched in one call'),
+      symbols: zLoose(z.array(z.string())).optional().describe('Multiple trading pairs e.g. ["BTC-USD","ENA-USD"] — batched in one call'),
     },
     async ({ symbol, symbols } = {}) => {
       const raw = (symbols && symbols.length) ? symbols : (symbol ? [symbol] : []);
@@ -11123,7 +11127,7 @@ function createMcpServer() {
   server.tool('get_portfolio_data',
     'Get complete portfolio data across all accounts — Revolut X balances and P&L, Kraken balances, and Tangem XRP wallet',
     {
-      accounts: z.array(z.enum(['revolut', 'kraken', 'tangem', 'all'])).optional()
+      accounts: zLoose(z.array(z.enum(['revolut', 'kraken', 'tangem', 'all']))).optional()
         .describe('Which accounts to fetch — defaults to all'),
     },
     async ({ accounts } = {}) => {
@@ -11223,14 +11227,14 @@ function createMcpServer() {
   server.tool('get_trading_data',
     'Get trading journal entries, active alerts, trader context/profile, rebalancing history, and dev_bridge messages',
     {
-      include: z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'dev_bridge', 'coin_strategy', 'reconciliation', 'ledger', 'tax_lots', 'catalysts', 'all'])).optional()
+      include: zLoose(z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'dev_bridge', 'coin_strategy', 'reconciliation', 'ledger', 'tax_lots', 'catalysts', 'all']))).optional()
         .describe('What data to fetch — defaults to all. dev_bridge, coin_strategy and reconciliation are never included in all; request them explicitly'),
       symbol:           z.string().optional().describe('Filter journal by coin e.g. NEAR'),
-      limit:            z.number().optional().describe('Max journal entries to return, default 10'),
-      bridge_id:        z.number().optional().describe('Fetch a specific dev_bridge row by id'),
-      ref_devlog_id:    z.number().optional().describe('Filter dev_bridge by referenced dev_log id'),
-      include_consumed: z.boolean().optional().describe('Include consumed dev_bridge rows (default false)'),
-      mark_consumed:    z.boolean().optional().describe('Mark returned dev_bridge rows consumed (default false)'),
+      limit:            z.coerce.number().optional().describe('Max journal entries to return, default 10'),
+      bridge_id:        z.coerce.number().optional().describe('Fetch a specific dev_bridge row by id'),
+      ref_devlog_id:    z.coerce.number().optional().describe('Filter dev_bridge by referenced dev_log id'),
+      include_consumed: zLoose(z.boolean()).optional().describe('Include consumed dev_bridge rows (default false)'),
+      mark_consumed:    zLoose(z.boolean()).optional().describe('Mark returned dev_bridge rows consumed (default false)'),
     },
     async ({ include, symbol, limit, bridge_id, ref_devlog_id, include_consumed, mark_consumed } = {}) => {
       const fetch = include || ['all'];
@@ -11426,13 +11430,13 @@ function createMcpServer() {
       action:        z.enum(['set_target','set_threshold','set_trailing','acknowledge','ignore','unignore','remove_trailing','remove_target','remove_threshold','clear_cooldown','set_trough','remove_trough','list_pending','batch_resolve']).describe('What alert action to perform'),
       symbol:        z.string().optional().describe('Trading pair e.g. NEAR-USD or NEAR (omit for list_pending and batch_resolve)'),
       direction:     z.enum(['up', 'down']).optional().describe('Alert direction for set_target'),
-      threshold_pct: z.number().optional().describe('Percentage for set_target or set_threshold'),
-      anchor_price:  z.number().optional().describe('Anchor price for set_target'),
-      trail_pct:     z.number().optional().describe('Trailing percentage e.g. 10 for 10%'),
-      current_price: z.number().optional().describe('Manual price override for set_trailing — useful for Kraken-only coins if auto-fetch fails'),
-      target_price:  z.number().optional().describe('For remove_target — remove only the rung at this exact target price; omit to remove ALL targets for the symbol'),
+      threshold_pct: z.coerce.number().optional().describe('Percentage for set_target or set_threshold'),
+      anchor_price:  z.coerce.number().optional().describe('Anchor price for set_target'),
+      trail_pct:     z.coerce.number().optional().describe('Trailing percentage e.g. 10 for 10%'),
+      current_price: z.coerce.number().optional().describe('Manual price override for set_trailing — useful for Kraken-only coins if auto-fetch fails'),
+      target_price:  z.coerce.number().optional().describe('For remove_target — remove only the rung at this exact target price; omit to remove ALL targets for the symbol'),
       description:   z.string().optional().describe('For set_target -- human note stored on the rung, surfaced when the alert fires'),
-      auto_execute:  z.coerce.boolean().optional().describe('#93 set_trailing: if true, on breach auto-sells sell_pct of position without Telegram approval'),
+      auto_execute:  zLoose(z.boolean()).optional().describe('#93 set_trailing: if true, on breach auto-sells sell_pct of position without Telegram approval'),
       sell_pct:      z.coerce.number().optional().describe('#93/#144 set_trailing/set_target: %% of position to sell; 100=full exit. Away Mode uses per-rung value if set, else global max_sell_pct (default 25)'),
       buy_usd:       z.coerce.number().optional().describe('set_trough: USD to auto-buy on bounce'),
       bounce_pct:    z.coerce.number().optional().describe('set_trough: %% bounce off trough (default 8)'),
@@ -11598,46 +11602,46 @@ function createMcpServer() {
       action:                 z.enum(['log_journal', 'log_intention', 'save_preference', 'update_capital', 'configure_sweep', 'configure_auto_execute', 'log_dev_issue', 'update_session_state', 'upsert_coin_strategy', 'export_dev_log', 'log_research', 'log_pm_decision', 'log_dev_decision', 'void_journal', 'configure_away_mode', 'delete_tax_lot', 'log_catalyst', 'configure_abnormal', 'configure_dnd']).describe('What trading action to perform'),
       symbol:                 z.string().optional().describe('Coin e.g. NEAR-USD or NEAR'),
       trade_action:           z.enum(['buy', 'sell', 'hold', 'add', 'reduce', 'payment', 'transfer', 'pass']).optional().describe('Trade action for log_journal or log_intention — use pass to log a skipped trade for shadow grading at +7d/+30d'),
-      price:                  z.number().optional().describe('Price for log_journal'),
-      quantity:               z.number().optional().describe('Quantity for log_journal'),
+      price:                  z.coerce.number().optional().describe('Price for log_journal'),
+      quantity:               z.coerce.number().optional().describe('Quantity for log_journal'),
       reasoning:              z.string().optional().describe('Why the trade was or will be made'),
       emotion:                z.enum(['confident', 'uncertain', 'fomo', 'fearful', 'neutral']).optional().describe('Emotional state'),
-      followed_recommendation: z.boolean().optional().describe('Whether Claude recommendation was followed'),
-      expires_hours:          z.number().optional().describe('Hours until intention expires, default 24'),
+      followed_recommendation: zLoose(z.boolean()).optional().describe('Whether Claude recommendation was followed'),
+      expires_hours:          z.coerce.number().optional().describe('Hours until intention expires, default 24'),
       key:                    z.string().optional().describe('Preference key for save_preference'),
       value:                  z.string().optional().describe('Preference value for save_preference'),
-      amount:                 z.number().optional().describe('Amount in USD for update_capital or set_away_buy (fallback)'),
-      away_buy_usd:           z.number().optional().describe('#145 configure_away_mode set_away_buy: dedicated USD amount to auto-buy per down-target trigger'),
-      away_sell_pct:          z.number().optional().describe('#145 configure_away_mode set_away_sell: per-coin sell %% override for Away Mode up-targets; 100=full exit'),
+      amount:                 z.coerce.number().optional().describe('Amount in USD for update_capital or set_away_buy (fallback)'),
+      away_buy_usd:           z.coerce.number().optional().describe('#145 configure_away_mode set_away_buy: dedicated USD amount to auto-buy per down-target trigger'),
+      away_sell_pct:          z.coerce.number().optional().describe('#145 configure_away_mode set_away_sell: per-coin sell %% override for Away Mode up-targets; 100=full exit'),
       capital_type:           z.enum(['deposit', 'withdrawal', 'set']).optional().describe('Capital update type'),
       note:                   z.string().optional().describe('Optional note for update_capital'),
-      enabled:                z.boolean().optional().describe('Enable or disable USDT sweep (configure_sweep)'),
-      sweep_pct:              z.number().optional().describe('Percentage of sell proceeds to sweep to USDT (configure_sweep)'),
-      min_trade_value_usd:    z.number().optional().describe('Minimum sell value in USD to trigger sweep (configure_sweep)'),
-      excluded_symbols:       z.array(z.string()).optional().describe('Symbols to exclude from sweep e.g. ["USDT-USD"] (configure_sweep)'),
-      max_sell_pct:           z.number().optional().describe('Max % of position to sell per auto-exec trade (configure_auto_execute)'),
-      max_buy_usd:            z.number().optional().describe('Max USD to spend per auto-exec buy (configure_auto_execute)'),
-      sell_floors:            z.preprocess(v => { if (typeof v === 'string') { try { return JSON.parse(v); } catch(e) { return v; } } return v; }, z.record(z.number())).optional().describe('Per-coin min sell price map e.g. {"NEAR":1.87} -- auto-sell blocked if price <= floor (#45, configure_auto_execute)'),
+      enabled:                zLoose(z.boolean()).optional().describe('Enable or disable USDT sweep (configure_sweep)'),
+      sweep_pct:              z.coerce.number().optional().describe('Percentage of sell proceeds to sweep to USDT (configure_sweep)'),
+      min_trade_value_usd:    z.coerce.number().optional().describe('Minimum sell value in USD to trigger sweep (configure_sweep)'),
+      excluded_symbols:       zLoose(z.array(z.string())).optional().describe('Symbols to exclude from sweep e.g. ["USDT-USD"] (configure_sweep)'),
+      max_sell_pct:           z.coerce.number().optional().describe('Max % of position to sell per auto-exec trade (configure_auto_execute)'),
+      max_buy_usd:            z.coerce.number().optional().describe('Max USD to spend per auto-exec buy (configure_auto_execute)'),
+      sell_floors:            z.preprocess(v => { if (typeof v === 'string') { try { return JSON.parse(v); } catch(e) { return v; } } return v; }, z.record(z.coerce.number())).optional().describe('Per-coin min sell price map e.g. {"NEAR":1.87} -- auto-sell blocked if price <= floor (#45, configure_auto_execute)'),
       per_coin_enabled:       z.preprocess(v => { if (typeof v === 'string') { try { return JSON.parse(v); } catch(e) { return v; } } return v; }, z.record(z.boolean())).optional().describe('#24 explicit per-coin auto-exec opt-in map e.g. {"BOBA":true} -- only coins listed here can shouldAutoExecute'),
       away_action:            z.enum(['set_eligible','activate','deactivate','status','set_away_buy','set_away_sell']).optional().describe('configure_away_mode: which away-mode operation'),
-      away_coins:             z.array(z.string()).optional().describe('configure_away_mode: coin list for set_eligible / activate'),
-      allowed_triggers:       z.array(z.string()).optional().describe('Alert types that can trigger auto-exec: trailing_stop, fixed_target, pump_alert'),
+      away_coins:             zLoose(z.array(z.string())).optional().describe('configure_away_mode: coin list for set_eligible / activate'),
+      allowed_triggers:       zLoose(z.array(z.string())).optional().describe('Alert types that can trigger auto-exec: trailing_stop, fixed_target, pump_alert'),
       require_confidence:     z.enum(['High', 'Medium', 'Low']).optional().describe('Minimum Claude confidence level to auto-execute'),
-      cooldown_minutes:       z.number().optional().describe('Minutes to wait between auto-executions for same coin'),
-      hodl_symbols:           z.array(z.string()).optional().describe('Coins where AI analyses only and never auto-executes — Bryan decides. e.g. ["ENA","INJ","ALGO"]'),
+      cooldown_minutes:       z.coerce.number().optional().describe('Minutes to wait between auto-executions for same coin'),
+      hodl_symbols:           zLoose(z.array(z.string())).optional().describe('Coins where AI analyses only and never auto-executes — Bryan decides. e.g. ["ENA","INJ","ALGO"]'),
       title:                  z.string().optional().describe('Title for log_dev_issue (required when creating)'),
       detail:                 z.string().optional().describe('Detail/description for log_dev_issue'),
       category:               z.string().optional().describe('Category for log_dev_issue e.g. bug, feature, note'),
       status:                 z.string().optional().describe('Status for log_dev_issue: open, in_progress, resolved'),
       source:                 z.string().optional().describe('Source author for log_dev_issue, defaults to developer'),
       related_symbol:         z.string().optional().describe('Related coin symbol for log_dev_issue e.g. NEAR'),
-      dev_log_id:             z.number().optional().describe('Dev log row id to update (omit to create new)'),
+      dev_log_id:             z.coerce.number().optional().describe('Dev log row id to update (omit to create new)'),
       active_workstream:      z.string().optional().describe('Current active workstream for update_session_state'),
       progress:               z.any().optional().describe('Progress object for update_session_state'),
       open_threads:           z.any().optional().describe('Open threads array for update_session_state'),
       next_action:            z.string().optional().describe('Next recommended action for update_session_state'),
       recent_decision:        z.string().optional().describe('Single new decision to prepend to recent_decisions list (update_session_state)'),
-      recent_decisions:       z.array(z.string()).optional().describe('Full recent_decisions array replacement, capped at 5 (update_session_state)'),
+      recent_decisions:       zLoose(z.array(z.string())).optional().describe('Full recent_decisions array replacement, capped at 5 (update_session_state)'),
       cs_status:            z.string().optional().describe('upsert_coin_strategy: active_holding|dust|watchlist|exited|radar'),
       cs_role:              z.string().optional().describe('upsert_coin_strategy: anchor|swing|hodl|lotto|watch_entry|radar|dead_bag'),
       cs_theme:             z.string().optional().describe('upsert_coin_strategy: theme tags e.g. DTCC,L1,DeFi'),
@@ -11646,14 +11650,14 @@ function createMcpServer() {
       pm_principle_tag:     z.string().optional().describe('log_pm_decision: short tag e.g. position-sizing / risk-management'),
       pm_conviction:        z.enum(['high','medium','low']).optional().describe('log_pm_decision: conviction level'),
       pm_captured_by:       z.string().optional().describe('log_pm_decision: who captured this — claude / manual'),
-      pm_supersedes_id:     z.number().optional().describe('log_pm_decision: id of an older decision this replaces'),
+      pm_supersedes_id:     z.coerce.number().optional().describe('log_pm_decision: id of an older decision this replaces'),
       dev_decision:         z.string().optional().describe('log_dev_decision: the design decision/call made'),
       dev_principle_tag:    z.string().optional().describe('log_dev_decision: durable tag e.g. safety / phased-builds / never-sell-below-entry'),
-      dev_cross_thread:     z.boolean().optional().describe('log_dev_decision: true if this principle spans PM+Dev'),
+      dev_cross_thread:     zLoose(z.boolean()).optional().describe('log_dev_decision: true if this principle spans PM+Dev'),
       dev_alternatives:     z.string().optional().describe('log_dev_decision: alternatives considered + rejected + why'),
       dev_related_log:      z.string().optional().describe('log_dev_decision: dev_log ticket(s) it governs e.g. "#95,#45"'),
-      dev_supersedes_id:    z.number().optional().describe('log_dev_decision: id of an older decision this replaces'),
-      journal_id:           z.number().optional().describe('void_journal: trading_journal row id to archive + delete'),
+      dev_supersedes_id:    z.coerce.number().optional().describe('log_dev_decision: id of an older decision this replaces'),
+      journal_id:           z.coerce.number().optional().describe('void_journal: trading_journal row id to archive + delete'),
       tax_lot_id:           z.coerce.number().optional().describe('delete_tax_lot: tax_lots.id row to read and hard-delete'),
       catalyst_id:          z.coerce.number().optional().describe('log_catalyst: existing catalyst_calendar id to update (omit to insert new)'),
       catalyst:             z.string().optional().describe('log_catalyst: the catalyst description'),
@@ -11664,10 +11668,10 @@ function createMcpServer() {
       catalyst_confidence:  z.string().optional().describe('log_catalyst: high|medium|low / rumoured|confirmed'),
       catalyst_source:      z.string().optional().describe('log_catalyst: source + URL'),
       catalyst_status:      z.string().optional().describe('log_catalyst: upcoming|passed|cancelled (default upcoming)'),
-      abn_alert_floor_pct:  z.number().optional().describe('configure_abnormal: individual coin alert minimum % (default 5.0)'),
-      abn_broad_floor_pct:  z.number().optional().describe('configure_abnormal: per-coin minimum % to count toward broad market total (default 3.0)'),
-      abn_broad_threshold:  z.number().optional().describe('configure_abnormal: how many coins trigger broad market summary (default 5)'),
-      abn_cooldown_min:     z.number().optional().describe('configure_abnormal: per-coin alert cooldown in minutes (default 30)'),
+      abn_alert_floor_pct:  z.coerce.number().optional().describe('configure_abnormal: individual coin alert minimum % (default 5.0)'),
+      abn_broad_floor_pct:  z.coerce.number().optional().describe('configure_abnormal: per-coin minimum % to count toward broad market total (default 3.0)'),
+      abn_broad_threshold:  z.coerce.number().optional().describe('configure_abnormal: how many coins trigger broad market summary (default 5)'),
+      abn_cooldown_min:     z.coerce.number().optional().describe('configure_abnormal: per-coin alert cooldown in minutes (default 30)'),
       dnd_action:       z.enum(['activate','deactivate','set_eligible','set_params','status']).optional().describe('configure_dnd sub-action'),
       dnd_coins:        z.preprocess(v => { if (typeof v === 'string') { try { return JSON.parse(v); } catch(e) { return v; } } return v; }, z.array(z.string())).optional().describe('configure_dnd: coin list e.g. ["BOBA","ENA"]'),
       dnd_arm_pct:      z.coerce.number().optional().describe('configure_dnd: pump %% to arm trail (default 30)'),
@@ -12227,7 +12231,7 @@ function createMcpServer() {
     'Set average entry price for a coin',
     {
       symbol:      z.string().describe('Trading pair e.g. LINK-USD'),
-      entry_price: z.number().describe('Average entry price in USD'),
+      entry_price: z.coerce.number().describe('Average entry price in USD'),
     },
     async ({ symbol, entry_price }) => {
       const sym = symbol.includes('-USD') ? symbol : `${symbol}-USD`;
@@ -12412,14 +12416,14 @@ function createMcpServer() {
     {
       symbol:           z.string().describe('Trading pair e.g. SOL-USD'),
       rule_type:        z.string().describe('Label: buy_dip, sell_pump, stop_loss, buy_retrace, moon_bag'),
-      trigger_price:    z.number().describe('Price that triggers the trade (use 0 for moon_bag markers)'),
+      trigger_price:    z.coerce.number().describe('Price that triggers the trade (use 0 for moon_bag markers)'),
       direction:        z.enum(['above', 'below']).describe('Trigger when price goes above or below trigger_price'),
       order_type:       z.enum(['buy', 'sell']).describe('Buy or sell when triggered'),
-      volume:           z.number().describe('Token amount (fixed) or percentage (pct) of position to trade'),
+      volume:           z.coerce.number().describe('Token amount (fixed) or percentage (pct) of position to trade'),
       volume_type:      z.enum(['fixed', 'pct']).optional().describe('fixed = token count, pct = % of current position (default: fixed)'),
-      max_position_usd: z.number().optional().describe('Max position size in USD — skips buy if already holding this much'),
+      max_position_usd: z.coerce.number().optional().describe('Max position size in USD — skips buy if already holding this much'),
       exchange:         z.enum(['kraken', 'revolut']).optional().describe('Exchange to execute on: kraken (default) or revolut'),
-      max_cascades:     z.number().optional().describe('Max cascade buy-backs before stopping runaway downside buying — default 3'),
+      max_cascades:     z.coerce.number().optional().describe('Max cascade buy-backs before stopping runaway downside buying — default 3'),
     },
     async ({ symbol, rule_type, trigger_price, direction, order_type, volume, volume_type, max_position_usd, exchange, max_cascades }) => {
       try {
@@ -12468,7 +12472,7 @@ function createMcpServer() {
     'Manage automatic trade rules — list, remove, disable or enable a rule by ID',
     {
       action:  z.enum(['list', 'remove', 'disable', 'enable', 'pump_status', 'loop_enable', 'loop_disable']).describe('Action to perform'),
-      rule_id: z.number().optional().describe('Rule ID to remove, disable or enable'),
+      rule_id: z.coerce.number().optional().describe('Rule ID to remove, disable or enable'),
       symbol: z.string().optional().describe('Symbol e.g. BOBA-USD for loop_enable/loop_disable'),
     },
     async ({ action, rule_id, symbol }) => {
@@ -12716,9 +12720,9 @@ function createMcpServer() {
       symbol:     z.string().describe('Trading pair e.g. SOL-USD or LINK-USD'),
       side:       z.enum(['buy', 'sell']).describe('Buy or sell'),
       order_type: z.enum(['market', 'limit']).describe('Market or limit order'),
-      volume:     z.number().optional().describe('Amount of base currency to trade e.g. 1.3 for 1.3 NEAR — use value_usd instead for Revolut market orders'),
-      value_usd:  z.number().optional().describe('USD value to trade — Revolut calculates tokens automatically. Use instead of volume for cleaner execution e.g. 3 for $3 of NEAR'),
-      price:      z.number().optional().describe('Limit price — required for limit orders'),
+      volume:     z.coerce.number().optional().describe('Amount of base currency to trade e.g. 1.3 for 1.3 NEAR — use value_usd instead for Revolut market orders'),
+      value_usd:  z.coerce.number().optional().describe('USD value to trade — Revolut calculates tokens automatically. Use instead of volume for cleaner execution e.g. 3 for $3 of NEAR'),
+      price:      z.coerce.number().optional().describe('Limit price — required for limit orders'),
     },
     async ({ exchange, symbol, side, order_type, volume, value_usd, price }) => {
       const sym           = symbol.includes('-USD') ? symbol.toUpperCase() : `${symbol.toUpperCase()}-USD`;
@@ -12862,13 +12866,13 @@ function createMcpServer() {
   server.tool('resolve_pending_trades',
     'Batch-resolve auto-detected pending trades from the PM thread without Telegram. Pass an array of per-trade resolutions; each maps a symbol to a resolution type (rebalance/transfer/payment/reason/skip). Resolves all in one call against the live in-memory pending queue.',
     {
-      resolutions: z.array(z.object({
+      resolutions: zLoose(z.array(z.object({
         symbol: z.string().describe('Coin e.g. AERO or AERO-USD'),
         type: z.enum(['rebalance','transfer','payment','reason','skip']).describe('Resolution type'),
         from_coin: z.string().optional().describe('For rebalance: the SOLD coin whose proceeds funded this buy'),
         reasoning: z.string().optional().describe('For type=reason: freeform journal reasoning'),
         emotion: z.enum(['confident','uncertain','fomo','fearful','neutral']).optional().describe('Optional emotion; defaults to neutral')
-      })).describe('Per-trade resolution array')
+      }))).describe('Per-trade resolution array')
     },
     async ({ resolutions } = {}) => {
       if (!Array.isArray(resolutions) || resolutions.length === 0) {
