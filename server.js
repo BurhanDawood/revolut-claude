@@ -4251,10 +4251,33 @@ async function checkPumpArm(symbol, currentPrice) {
 
 async function runFastScan() {
   try {
-    // Part A: pump-arm detector for explicit pump-loop targets (FAST_SCAN_SYMBOLS, #95 Stage 1)
-    for (const symbol of FAST_SCAN_SYMBOLS) {
-      const armPrice = await getCurrentPrice(symbol).catch(() => null);
-      if (armPrice) await checkPumpArm(symbol, armPrice);
+    // Part A: pump-arm detector -- dynamic over ALL active, unarmed pump_armed_rules (#215 fix;
+    // was hardcoded FAST_SCAN_SYMBOLS, same bug class as #94/#99 -- 20 of 23 rules were never scanned).
+    // Single batched /tickers call covers Revolut-side symbols; Kraken-only symbols fetched individually.
+    let paSymbols = [];
+    try {
+      const [paRows] = await db.execute('SELECT symbol FROM pump_armed_rules WHERE active = 1 AND armed = 0');
+      paSymbols = paRows.map(r => r.symbol);
+    } catch (e) { console.error('[fast-scan] Part A symbol query failed:', e.message); }
+
+    if (paSymbols.length > 0) {
+      const paRevolutPrices = {};
+      try {
+        const paTickers = await revolutRequest('GET', '/tickers');
+        const paList = Array.isArray(paTickers) ? paTickers : (paTickers.data || []);
+        for (const t of paList) {
+          if (!t.symbol) continue;
+          const p = parseFloat(t.last_price || t.mid || t.ask || t.bid);
+          if (p) { paRevolutPrices[t.symbol] = p; paRevolutPrices[t.symbol.replace('/', '-')] = p; }
+        }
+      } catch (e) { console.warn('[fast-scan] Part A ticker fetch failed:', e.message); }
+
+      for (const paSymbol of paSymbols) {
+        const armPrice = KRAKEN_MONITORED_COINS.includes(paSymbol)
+          ? await getKrakenPriceForSymbol(paSymbol).catch(() => null)
+          : (paRevolutPrices[paSymbol] || null);
+        if (armPrice) await checkPumpArm(paSymbol, armPrice);
+      }
     }
 
     // Part B: trailing-stop checks — dynamic over ALL armed stops (#99).

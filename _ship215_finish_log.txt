@@ -1,0 +1,96 @@
+﻿**********************
+Windows PowerShell transcript start
+Start time: 20260704173044
+Username: DESKTOP-JNNOGJJ\owner
+RunAs User: DESKTOP-JNNOGJJ\owner
+Configuration Name: 
+Machine: DESKTOP-JNNOGJJ (Microsoft Windows NT 10.0.22000.0)
+Host Application: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+Process ID: 172100
+PSVersion: 5.1.22000.2538
+PSEdition: Desktop
+PSCompatibleVersions: 1.0, 2.0, 3.0, 4.0, 5.0, 5.1.22000.2538
+BuildVersion: 10.0.22000.2538
+CLRVersion: 4.0.30319.42000
+WSManStackVersion: 3.0
+PSRemotingProtocolVersion: 2.3
+SerializationVersion: 1.1.0.1
+**********************
+PS C:\Windows\system32> & {
+    $ErrorActionPreference = "Stop"
+    $repoPath = "C:\Users\owner\revolut-claude\server.js"
+
+    try {
+        $content = [System.IO.File]::ReadAllText($repoPath)
+
+        # STEP 1: fix the cosmetic em-dash-stripped-by-console-paste line (ASCII-safe this time)
+        $oldDash = "// Part A: pump-arm detector  dynamic over ALL active, unarmed pump_armed_rules (#215 fix;"
+        $newDash = "// Part A: pump-arm detector -- dynamic over ALL active, unarmed pump_armed_rules (#215 fix;"
+
+        $dashOccurrences = ([regex]::Matches($content, [regex]::Escape($oldDash))).Count
+        if ($dashOccurrences -ne 1) {
+            Write-Host "ABORT: cosmetic-fix anchor found $dashOccurrences times (expected 1). File may differ from what we think -- stopping." -ForegroundColor Red
+            return
+        }
+        $content = $content.Replace($oldDash, $newDash)
+        [System.IO.File]::WriteAllText($repoPath, $content)
+        Write-Host "Cosmetic dash fix applied." -ForegroundColor Green
+
+        # STEP 2: verify the function block byte-for-byte against expected
+        $content = [System.IO.File]::ReadAllText($repoPath)
+        $startMarker = "async function runFastScan() {"
+        $endMarker = "// Part B: trailing-stop checks"
+        $startIdx = $content.IndexOf($startMarker)
+        $endIdx = $content.IndexOf($endMarker)
+        if ($startIdx -lt 0 -or $endIdx -lt 0) {
+            Write-Host "ABORT: could not locate function markers." -ForegroundColor Red
+            return
+        }
+        $block = $content.Substring($startIdx, $endIdx - $startIdx)
+        $blockBytes = [System.Text.Encoding]::UTF8.GetBytes($block)
+        $blockHash = [System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash($blockBytes)).Replace("-","").ToLower()
+
+        $expectedBlockHash = "66d07328d852c49fe36865f81a1fb14908af41e7bbcbc4001eb1fc7723011fef"
+        Write-Host "Function-block hash: $blockHash"
+        if ($blockHash -ne $expectedBlockHash) {
+            Write-Host "BLOCK HASH MISMATCH! Expected: $expectedBlockHash" -ForegroundColor Red
+            Write-Host "File differs from the verified patch beyond the dash fix -- STOP, do not push. Report back to Claude." -ForegroundColor Red
+            return
+        }
+        Write-Host "Function-block verified byte-for-byte OK." -ForegroundColor Green
+
+        # STEP 3: full-file hash gate
+        $expectedFullHash = "7E5C90F6057538AAC620B5EA1C8C73F79A8D48077BAF8535DF77EFE977D042D5"
+        $actualFullHash = (Get-FileHash -Path $repoPath -Algorithm SHA256).Hash
+        if ($actualFullHash -ne $expectedFullHash) {
+            Write-Host "FULL FILE HASH MISMATCH! Expected: $expectedFullHash" -ForegroundColor Red
+            Write-Host "Got:                          $actualFullHash" -ForegroundColor Red
+            Write-Host "The function block matched but something ELSE in the file differs. STOP -- do not push." -ForegroundColor Red
+            return
+        }
+        Write-Host "Full-file hash verified OK: $actualFullHash" -ForegroundColor Green
+
+        # STEP 4: node --check
+        Push-Location "C:\Users\owner\revolut-claude"
+        node --check server.js
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "node --check FAILED -- do not push." -ForegroundColor Red
+            Pop-Location
+            return
+        }
+        Write-Host "node --check passed" -ForegroundColor Green
+
+        # STEP 5: stage only this file, push
+        git add server.js
+        git status
+        .\PUSH_NOW.bat
+        Pop-Location
+    }
+    catch {
+        Write-Host "SCRIPT ERROR: $($_.Exception.Message)" -ForegroundColor Red
+    }
+}
+Cosmetic dash fix applied.
+Function-block hash: 66d07328d852c49fe36865f81a1fb14908af41e7bbcbc4001eb1fc7723011fef
+Function-block verified byte-for-byte OK.
+Full-file hash verified OK: 7E5C90F6057538AAC620B5EA1C8C73F79A8D48077BAF8535DF77EFE977D042D5

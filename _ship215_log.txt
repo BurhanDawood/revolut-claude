@@ -1,0 +1,112 @@
+﻿**********************
+Windows PowerShell transcript start
+Start time: 20260704172649
+Username: DESKTOP-JNNOGJJ\owner
+RunAs User: DESKTOP-JNNOGJJ\owner
+Configuration Name: 
+Machine: DESKTOP-JNNOGJJ (Microsoft Windows NT 10.0.22000.0)
+Host Application: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+Process ID: 172100
+PSVersion: 5.1.22000.2538
+PSEdition: Desktop
+PSCompatibleVersions: 1.0, 2.0, 3.0, 4.0, 5.0, 5.1.22000.2538
+BuildVersion: 10.0.22000.2538
+CLRVersion: 4.0.30319.42000
+WSManStackVersion: 3.0
+PSRemotingProtocolVersion: 2.3
+SerializationVersion: 1.1.0.1
+**********************
+PS C:\Windows\system32> & {
+    $ErrorActionPreference = "Stop"
+    $repoPath = "C:\Users\owner\revolut-claude\server.js"
+
+    try {
+        $content = [System.IO.File]::ReadAllText($repoPath)
+
+        $old = @'
+    // Part A: pump-arm detector for explicit pump-loop targets (FAST_SCAN_SYMBOLS, #95 Stage 1)
+    for (const symbol of FAST_SCAN_SYMBOLS) {
+      const armPrice = await getCurrentPrice(symbol).catch(() => null);
+      if (armPrice) await checkPumpArm(symbol, armPrice);
+    }
+'@
+
+        $new = @'
+    // Part A: pump-arm detector  dynamic over ALL active, unarmed pump_armed_rules (#215 fix;
+    // was hardcoded FAST_SCAN_SYMBOLS, same bug class as #94/#99 -- 20 of 23 rules were never scanned).
+    // Single batched /tickers call covers Revolut-side symbols; Kraken-only symbols fetched individually.
+    let paSymbols = [];
+    try {
+      const [paRows] = await db.execute('SELECT symbol FROM pump_armed_rules WHERE active = 1 AND armed = 0');
+      paSymbols = paRows.map(r => r.symbol);
+    } catch (e) { console.error('[fast-scan] Part A symbol query failed:', e.message); }
+
+    if (paSymbols.length > 0) {
+      const paRevolutPrices = {};
+      try {
+        const paTickers = await revolutRequest('GET', '/tickers');
+        const paList = Array.isArray(paTickers) ? paTickers : (paTickers.data || []);
+        for (const t of paList) {
+          if (!t.symbol) continue;
+          const p = parseFloat(t.last_price || t.mid || t.ask || t.bid);
+          if (p) { paRevolutPrices[t.symbol] = p; paRevolutPrices[t.symbol.replace('/', '-')] = p; }
+        }
+      } catch (e) { console.warn('[fast-scan] Part A ticker fetch failed:', e.message); }
+
+      for (const paSymbol of paSymbols) {
+        const armPrice = KRAKEN_MONITORED_COINS.includes(paSymbol)
+          ? await getKrakenPriceForSymbol(paSymbol).catch(() => null)
+          : (paRevolutPrices[paSymbol] || null);
+        if (armPrice) await checkPumpArm(paSymbol, armPrice);
+      }
+    }
+'@
+
+        $old = $old.TrimEnd("`r","`n")
+        $new = $new.TrimEnd("`r","`n")
+
+        $occurrences = ([regex]::Matches($content, [regex]::Escape($old))).Count
+        if ($occurrences -ne 1) {
+            Write-Host "ABORT: anchor found $occurrences times (expected 1). No changes made." -ForegroundColor Red
+            return
+        }
+
+        $newContent = $content.Replace($old, $new)
+        if (-not $newContent.EndsWith("`n")) { $newContent = $newContent + "`n" }
+
+        [System.IO.File]::WriteAllText($repoPath, $newContent)
+
+        $expectedHash = "D6928AA1921F6F8CE9205E3EE091712722F53DE90E66B72438A69CE6F40C5E7A"
+        $actualHash = (Get-FileHash -Path $repoPath -Algorithm SHA256).Hash
+        if ($actualHash -ne $expectedHash) {
+            Write-Host "HASH MISMATCH! Expected: $expectedHash" -ForegroundColor Red
+            Write-Host "Got:                     $actualHash" -ForegroundColor Red
+            Write-Host "ABORTING  file left in unverified state. Do NOT push." -ForegroundColor Red
+            return
+        }
+        Write-Host "Hash verified OK: $actualHash" -ForegroundColor Green
+
+        Push-Location "C:\Users\owner\revolut-claude"
+        node --check server.js
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "node --check FAILED  do not push. File on disk is patched but broken." -ForegroundColor Red
+            Pop-Location
+            return
+        }
+        Write-Host "node --check passed" -ForegroundColor Green
+
+        git add server.js
+        git status
+        .\PUSH_NOW.bat
+        Pop-Location
+    }
+    catch {
+        Write-Host "SCRIPT ERROR: $($_.Exception.Message)" -ForegroundColor Red
+    }
+}
+ABORT: anchor found 0 times (expected 1). No changes made.
+PS C:\Windows\system32> Stop-Transcript | Out-Null
+**********************
+Windows PowerShell transcript end
+End time: 20260704172650
+**********************
