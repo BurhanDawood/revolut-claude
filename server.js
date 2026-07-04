@@ -3464,34 +3464,43 @@ async function runReconciliation() {
 
     for (const c of checks) {
       checked++;
-      const trancheSum = trMap.get(`${c.sym}::${c.exchange}`) ?? null;
-      // system "position" reference = tranche sum when present, else exchange qty
-      const systemQty = trancheSum;
-      if (systemQty === null) continue; // no tranche record to compare -- skip (dust/untracked)
-      const base = c.exchangeQty || 0.00000001;
-      const driftPct = ((systemQty - c.exchangeQty) / base) * 100;
-      if (Math.abs(driftPct) <= TOL) continue;
+      try {
+        const trancheSum = trMap.get(`${c.sym}::${c.exchange}`) ?? null;
+        // system "position" reference = tranche sum when present, else exchange qty
+        const systemQty = trancheSum;
+        if (systemQty === null) continue; // no tranche record to compare -- skip (dust/untracked)
+        const base = c.exchangeQty || 0.00000001;
+        const driftPct = ((systemQty - c.exchangeQty) / base) * 100;
+        if (Math.abs(driftPct) <= TOL) continue;
 
-      // tag possible open-order reservation (Revolut available reads low when reserved)
-      const driftType = (c.exchange === 'revolut' && systemQty > c.exchangeQty)
-        ? 'system_high_maybe_open_order'
-        : (systemQty > c.exchangeQty ? 'system_high' : 'exchange_high');
+        // tag possible open-order reservation (Revolut available reads low when reserved)
+        const driftType = (c.exchange === 'revolut' && systemQty > c.exchangeQty)
+          ? 'system_high_maybe_open_order'
+          : (systemQty > c.exchangeQty ? 'system_high' : 'exchange_high');
 
-      // suppress repeats: skip if an unacknowledged row for this sym+exchange already exists from a prior run
-      const [[prior]] = await db.execute(
-        `SELECT COUNT(*) AS n FROM reconciliation_log
-         WHERE symbol = ? AND exchange = ? AND acknowledged = 0
-         AND run_date > DATE_SUB(NOW(), INTERVAL 7 DAY)`,
-        [c.sym, c.exchange]
-      );
-      await db.execute(
-        `INSERT INTO reconciliation_log (symbol, exchange, exchange_qty, system_qty, tranche_sum, drift_pct, drift_type)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [c.sym, c.exchange, c.exchangeQty, systemQty, trancheSum, driftPct.toFixed(4), driftType]
-      );
-      if (prior.n === 0) {
-        const tag = driftType === 'system_high_maybe_open_order' ? ' (may be open order)' : '';
-        drifts.push(`${c.sym} ${c.exchange}: sys ${systemQty.toFixed(4)} vs exch ${c.exchangeQty.toFixed(4)} (${driftPct > 0 ? '+' : ''}${driftPct.toFixed(1)}%)${tag}`);
+        // suppress repeats: skip if an unacknowledged row for this sym+exchange already exists from a prior run
+        const [[prior]] = await db.execute(
+          `SELECT COUNT(*) AS n FROM reconciliation_log
+           WHERE symbol = ? AND exchange = ? AND acknowledged = 0
+           AND run_date > DATE_SUB(NOW(), INTERVAL 7 DAY)`,
+          [c.sym, c.exchange]
+        );
+        // #211: clamp the stored value to fit drift_pct DECIMAL(10,4) (max +/-999999.9999).
+        // Near-zero exchangeQty vs a real tranche_sum can otherwise blow driftPct into the
+        // millions of percent and abort this INSERT -- true magnitude still goes to Telegram below.
+        const driftPctStored = Math.max(-999999.9, Math.min(999999.9, driftPct));
+        await db.execute(
+          `INSERT INTO reconciliation_log (symbol, exchange, exchange_qty, system_qty, tranche_sum, drift_pct, drift_type)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [c.sym, c.exchange, c.exchangeQty, systemQty, trancheSum, driftPctStored.toFixed(4), driftType]
+        );
+        if (prior.n === 0) {
+          const tag = driftType === 'system_high_maybe_open_order' ? ' (may be open order)' : '';
+          drifts.push(`${c.sym} ${c.exchange}: sys ${systemQty.toFixed(4)} vs exch ${c.exchangeQty.toFixed(4)} (${driftPct > 0 ? '+' : ''}${driftPct.toFixed(1)}%)${tag}`);
+        }
+      } catch (e) {
+        // #211: a safety NET must fail-open per-row, not fail-closed whole-run (mirrors #5 lesson, inverted)
+        console.error(`[reconciliation] row error (${c.sym} ${c.exchange}):`, e.message);
       }
     }
 
@@ -6523,9 +6532,10 @@ async function checkRebalancingOutcomes() {
       try {
         const outSym = `${row.out_symbol}-USD`;
         const inSym  = `${row.in_symbol}-USD`;
-        const [outData, inData] = await Promise.all([fetchPrices([outSym]), fetchPrices([inSym])]);
-        const outNow = outData?.[outSym]?.price;
-        const inNow  = inData?.[inSym]?.price;
+        // #212: fetchPrices() doesn't exist in this file -- was silently erroring every call,
+        // grading zero rows daily. Use the existing getCurrentPrice() helper instead.
+        const outNow = await getCurrentPrice(outSym);
+        const inNow  = await getCurrentPrice(inSym);
         if (!outNow || !inNow) continue;
         const outPct = ((outNow - parseFloat(row.out_price)) / parseFloat(row.out_price)) * 100;
         const inPct  = ((inNow  - parseFloat(row.in_price))  / parseFloat(row.in_price))  * 100;
@@ -6571,9 +6581,10 @@ async function checkRebalancingOutcomes() {
       try {
         const outSym = `${row.out_symbol}-USD`;
         const inSym  = `${row.in_symbol}-USD`;
-        const [outData, inData] = await Promise.all([fetchPrices([outSym]), fetchPrices([inSym])]);
-        const outNow = outData?.[outSym]?.price;
-        const inNow  = inData?.[inSym]?.price;
+        // #212: fetchPrices() doesn't exist in this file -- was silently erroring every call,
+        // grading zero rows daily. Use the existing getCurrentPrice() helper instead.
+        const outNow = await getCurrentPrice(outSym);
+        const inNow  = await getCurrentPrice(inSym);
         if (!outNow || !inNow) continue;
         const outPct = ((outNow - parseFloat(row.out_price)) / parseFloat(row.out_price)) * 100;
         const inPct  = ((inNow  - parseFloat(row.in_price))  / parseFloat(row.in_price))  * 100;
