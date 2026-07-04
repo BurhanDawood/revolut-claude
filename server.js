@@ -11727,7 +11727,7 @@ function createMcpServer() {
 
         const [result] = await db.execute(
           'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, followed_recommendation) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-          [coinBase, trade_action, price, quantity ?? null, valueUsd, reasoning, emotion, followed_recommendation ?? null]
+          [coinBase, trade_action, price ?? null, quantity ?? null, valueUsd, reasoning ?? null, emotion ?? null, followed_recommendation ?? null]
         );
         return { content: [{ type: 'text', text: JSON.stringify({ ok: true, journal_id: result.insertId, symbol: coinBase, action: trade_action, price }) }] };
 
