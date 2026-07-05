@@ -11,6 +11,7 @@ followed
 readback-*.txt
 .tmp.driveupload/
 html-ids.txt
+_ship*_log.txt
 
 claude-desktop-debian/
 package-lock.json
