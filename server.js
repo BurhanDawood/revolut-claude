@@ -7039,6 +7039,47 @@ async function cascadeRulesAfterTrade(rule, executedPrice) {
       ).catch(() => {});
     }
 
+    // #223/#195/#220: pump-loop coins exit via trailing-stop + trough-rebuy ONLY, not the static cascade ladder.
+    // If an active pump_armed_rules row exists, arm the trough tracker directly and skip BOTH:
+    //   (a) the +10% sell_pump rung -- it pre-empts the trailing stop (cf #195 TON rule 207), and
+    //   (b) the fixed rebuy_pct rung -- whose price the nearExists/entry-floor guards below would
+    //       otherwise use to silently block trough arming (#223). Arming here cannot be gated out.
+    if (isSell) {
+      let pumpLoopRow = null;
+      try {
+        const [plRows] = await db.execute('SELECT * FROM pump_armed_rules WHERE symbol = ? AND active = 1 LIMIT 1', [symbol]);
+        if (plRows.length) pumpLoopRow = plRows[0];
+      } catch (e) { console.error('[cascade] #223 pump-loop lookup error:', e.message); }
+
+      if (pumpLoopRow) {
+        // Ringfence proceeds (mirror the sweep-aware calc used in the fixed-rung path below).
+        let plSweepEnabled = false, plSweepPct = 0;
+        try {
+          const [plSweepRows] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'usdt_sweep_config'");
+          if (plSweepRows.length) { const cfg = JSON.parse(plSweepRows[0].config_value); plSweepEnabled = cfg.enabled === true; plSweepPct = cfg.sweep_pct || 0; }
+        } catch (e) { /* default off */ }
+        const plSellProceeds   = executedPrice * parseFloat(rule.volume || 0);
+        const plSweepDeduction = plSweepEnabled ? plSellProceeds * (plSweepPct / 100) : 0;
+        const PL_FEE_BUFFER_USD = 1.0;
+        const plAvailableForBuyback = Math.max(0, plSellProceeds - plSweepDeduction - PL_FEE_BUFFER_USD);
+
+        const plRefBase = pumpLoopRow.entry_floor ? parseFloat(pumpLoopRow.entry_floor) : (entryPrices.get(symbol) || executedPrice);
+        try {
+          await armReboundTracker(symbol, executedPrice, plRefBase, {
+            retrace_pct:       pumpLoopRow.retrace_pct       || 50,
+            bounce_pct:        pumpLoopRow.bounce_pct        || 8,
+            buyback_floor_pct: pumpLoopRow.buyback_floor_pct || 5,
+            entry_floor:       pumpLoopRow.entry_floor       || null
+          }, plAvailableForBuyback);
+          console.log('[trough] ' + coinBase + ' pump-loop sell: trough tracker armed directly, static cascade rungs skipped (#223), proceeds $' + plAvailableForBuyback.toFixed(2));
+        } catch (e) {
+          console.error('[trough] #223 direct armReboundTracker error:', e.message);
+          await sendTelegram('<b>[TROUGH ARM FAILED] ' + coinBase + '</b> -- pump-loop sell executed but trough-rebuy tracker did NOT arm. No rebuy pending; manual action needed.').catch(() => {});
+        }
+        return; // #223: pump-loop exit fully handled -- no static sell/buy rungs
+      }
+    }
+
     // Create cascaded sell rule
     if (!nearExists(sellRules, newSellPrice)) {
       sellRules = await enforceMax(sellRules, MAX_SELL, 'sell');
