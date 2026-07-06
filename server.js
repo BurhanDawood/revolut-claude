@@ -11807,11 +11807,15 @@ function createMcpServer() {
         return { content: [{ type: 'text', text: JSON.stringify({ ok: true, journal_id: result.insertId, symbol: coinBase, action: trade_action, price }) }] };
 
       } else if (action === 'log_intention') {
+        // #228: mirror log_journal #115 guard + #213 null-coalesce. trade_action was bound raw, so an
+        // omitted action (e.g. caller passed direction= instead of trade_action=) threw
+        // "Bind parameters must not contain undefined". Guard it, and coalesce reasoning to null.
+        if (!trade_action) return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'trade_action is required for log_intention (e.g. buy, sell, hold, add, reduce, pass). Use trade_action, not direction.' }) }] };
         const sym         = symbol?.includes('-USD') ? symbol.toUpperCase() : `${symbol?.toUpperCase()}-USD`;
         const expiresHours = expires_hours || 168; // hash41: 7d default was 24h - limit orders fill days after intention; expires_at is the sole match-validity gate
         await db.execute(
           'INSERT INTO trade_intentions (symbol, action, reasoning, emotion, expires_at) VALUES (?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL ? HOUR))',
-          [sym, trade_action, reasoning, emotion || 'confident', expiresHours]
+          [sym, trade_action, reasoning ?? null, emotion || 'confident', expiresHours]
         );
         await sendTelegram(
           `🎯 <b>TRADE INTENTION LOGGED — ${sym.replace('-USD', '')}</b>\n\n` +
