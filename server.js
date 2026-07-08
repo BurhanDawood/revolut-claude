@@ -14045,7 +14045,10 @@ app.post('/telegram-webhook', async (req, res) => {
         } else {
           // For everything else, only intercept if it isn't a recognised system command
           const isKnownCommand = /^(pause|resume|status|acknowledge|ack|ignore|watch|sell|buy|entry|daily|target|journal|my stats|learning|holding|bought|sold|i prefer|trail|trailing|approve|cancel)/i.test(commandText);
-          if (!isKnownCommand) {
+          // #224/#227: capital commands must NEVER be swallowed as trade-context reasoning while a trade
+          // is pending enrichment. Mirror the dedicated handlers' own regexes so they fall through to them.
+          const isCapitalCommand = /^skip payment(?:\s+[\d.]+)?$|^(?:i )?(?:deposited?|withdrew?)\s+\$?[\d,]|^(?:total invested|invested capital)\b/i.test(commandText);
+          if (!isKnownCommand && !isCapitalCommand) {
             matchedPending.push({ symbol, pending, skip: false });
           }
         }
