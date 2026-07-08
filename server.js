@@ -14526,6 +14526,14 @@ app.post('/telegram-webhook', async (req, res) => {
           }
           newTotal = totalInvestedCapital - changeAmt;
           note = `Withdrawal -$${changeAmt}`;
+          // #227 ask-2: write the fiat_withdrawal audit row BEFORE decrementing capital
+          // (never mutate invested capital without an audit row - #82). Row shape mirrors
+          // the auto-detector (~L8727) so `skip payment ${changeAmt}` can reverse it. No
+          // .catch here: if the row cannot be written, throw and abort so capital is untouched.
+          await db.execute(
+            'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            ['USD', 'payment', 1.00, changeAmt, changeAmt, 'Manual withdrawal logged via withdrew command - $' + changeAmt.toFixed(2) + ' USD left account', 'neutral', 'fiat_withdrawal']
+          );
         } else {
           newTotal = parseFloat(setCapitalMatch[1].replace(/,/g, ''));
           note = `Manual set to $${newTotal}`;
