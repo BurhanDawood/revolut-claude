@@ -13127,6 +13127,17 @@ function createMcpServer() {
 // #186 -- MCP endpoint auth via path secret. Route registers ONLY if MCP_PATH_SECRET is set (fail closed).
 const MCP_PATH_SECRET = process.env.MCP_PATH_SECRET;
 const mcpHandler = async (req, res) => {
+  // #236: instrument every inbound MCP request so a connector-drop can be
+  // localized. The tool-list bind lives client-side (stateless transport,
+  // no session), so when tools go "not found" we need to know whether the
+  // client ever re-sent tools/list on reconnect. Logs JSON-RPC method +
+  // id + whether a body parsed. Best-effort, never throws, no PII.
+  try {
+    const b = req.body;
+    const rpcMethod = (b && typeof b === 'object' && !Array.isArray(b)) ? b.method : (Array.isArray(b) ? 'batch[' + b.length + ']' : undefined);
+    const rpcId = (b && typeof b === 'object' && !Array.isArray(b)) ? b.id : undefined;
+    console.log('[mcp-req] ' + new Date().toISOString() + ' method=' + (rpcMethod || 'unknown') + ' id=' + (rpcId === undefined ? '-' : rpcId) + ' hasBody=' + (b ? 'y' : 'n'));
+  } catch (e) { /* logging must never break the request */ }
   const server = createMcpServer();
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
   await server.connect(transport);
