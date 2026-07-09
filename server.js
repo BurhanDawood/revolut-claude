@@ -6447,6 +6447,21 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
       } catch (e) {
         console.warn('[entry-sync] Sync failed, keeping internal estimate:', e.message);
       }
+
+      // #221 Build 1: write a real position_tranches row for this auto-detected buy.
+      // Previously autoLogTrade updated entry_prices (the running average) but never
+      // created a tranche, so a later sell reduced against a stale legacy tranche and
+      // reported wildly wrong realized P&L (HBAR: -$309 vs -$17 real). The other three
+      // buy paths (runLimitFillPipeline + the two MCP paths) already do this; this
+      // closes the gap for the balance-detector path. Records the ACTUAL fill qty/price
+      // as its own lot (correct for moving-average cost: the average is derived by
+      // summing lots, not stored per-row). Non-fatal on error, mirrors the other paths.
+      if (price > 0 && absQty > 0) {
+        await db.execute(
+          "INSERT INTO position_tranches (symbol, exchange, quantity, entry_price, entry_date, remaining_quantity, is_legacy, notes) VALUES (?, ?, ?, ?, NOW(), ?, 0, ?)",
+          [coinBase, (KRAKEN_MONITORED_COINS.includes(symbol) ? 'kraken' : 'revolut'), absQty, price, absQty, 'Auto-detected buy (#221) - journal ' + journalId]
+        ).catch(e => console.error('[tranches] #221 autoLogTrade insert failed:', e.message));
+      }
     }
 
     // Update balance snapshot immediately so position quantities stay accurate
