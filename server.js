@@ -11850,7 +11850,19 @@ function createMcpServer() {
         const previous = totalInvestedCapital;
         let newTotal;
         if (capital_type === 'deposit')        newTotal = previous + amount;
-        else if (capital_type === 'withdrawal') newTotal = previous - amount;
+        else if (capital_type === 'withdrawal') {
+          newTotal = previous - amount;
+          // #234: write the fiat_withdrawal audit row BEFORE decrementing capital
+          // (never mutate invested capital without an audit row - #82). Mirrors
+          // the #227 / POST-/api/capital fix so `skip payment X` can reverse it
+          // and the auto-detector dupe guard (~L8950) recognises it and skips.
+          // No .catch here: if the row cannot be written, throw and abort so
+          // capital is untouched.
+          await db.execute(
+            'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            ['USD', 'payment', 1.00, amount, amount, `Manual withdrawal logged via update_capital MCP action - $${Number(amount).toFixed(2)} USD`, 'neutral', 'fiat_withdrawal']
+          );
+        }
         else                                    newTotal = amount;
         await updateInvestedCapital(newTotal, note || `${capital_type}: $${amount}`);
         const portfolioValue = await getCurrentPortfolioValue();
@@ -13323,7 +13335,19 @@ app.post('/api/capital', async (req, res) => {
     if (!amount || !type) return res.status(400).json({ error: 'amount and type required' });
     let newTotal;
     if (type === 'deposit') newTotal = totalInvestedCapital + parseFloat(amount);
-    else if (type === 'withdrawal') newTotal = totalInvestedCapital - parseFloat(amount);
+    else if (type === 'withdrawal') {
+      newTotal = totalInvestedCapital - parseFloat(amount);
+      // #234: write the fiat_withdrawal audit row BEFORE decrementing capital
+      // (never mutate invested capital without an audit row - #82). Row shape
+      // mirrors the #227 fix (~L14536) so `skip payment X` can reverse it, and
+      // so the auto-detector dupe guard (~L8950) recognises it and skips.
+      // No .catch here: if the row cannot be written, throw and abort so
+      // capital is untouched.
+      await db.execute(
+        'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        ['USD', 'payment', 1.00, parseFloat(amount), parseFloat(amount), `Manual withdrawal logged via POST /api/capital - $${parseFloat(amount).toFixed(2)} USD`, 'neutral', 'fiat_withdrawal']
+      );
+    }
     else if (type === 'set') newTotal = parseFloat(amount);
     else return res.status(400).json({ error: 'type must be deposit, withdrawal, or set' });
     await updateInvestedCapital(newTotal, note || `${type} $${amount}`);
