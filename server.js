@@ -2070,7 +2070,7 @@ async function reduceTranches(symbol, exchange, qtySold) {
     const [tranches] = await db.execute(
       `SELECT id, remaining_quantity, entry_price FROM position_tranches
        WHERE symbol = ? AND exchange = ? AND remaining_quantity > 0
-       ORDER BY entry_price DESC`,
+       ORDER BY entry_date ASC, id ASC`,
       [coinBase, exchange]
     );
     let remaining = parseFloat(qtySold);
@@ -6337,7 +6337,7 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
             [realisedPnl,
              `Realised ${isGain ? 'gain' : 'loss'}: ${isGain ? '+' : ''}$${realisedPnl.toFixed(2)} ` +
              `(${realisedPnlPct.toFixed(1)}%) | ` +
-             `Entry: ${formatPrice(sellEntryPrice)} | Sale: ${formatPrice(salePrice)} | Method: US HIFO`,
+             `Entry: ${formatPrice(sellEntryPrice)} | Sale: ${formatPrice(salePrice)} | Method: avg-cost`,
              journalId]
           );
 
@@ -16606,7 +16606,7 @@ app.post('/api/fix/sell-pnl', async (req, res) => {
         `UPDATE trading_journal SET outcome_pnl = ?, outcome_notes = ? WHERE id = ?`,
         [realisedPnl,
          `Realised ${isGain ? 'gain' : 'loss'}: ${isGain ? '+' : ''}$${realisedPnl.toFixed(2)} ` +
-         `(${realisedPnlPct.toFixed(1)}%) | Entry: $${entryPrice} | Sale: $${salePrice} | Method: US HIFO`,
+         `(${realisedPnlPct.toFixed(1)}%) | Entry: $${entryPrice} | Sale: $${salePrice} | Method: avg-cost`,
          sell.id]
       );
 
