@@ -1041,6 +1041,19 @@ await db.execute(`CREATE TABLE IF NOT EXISTS invested_capital (
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )`);
 
+// #233: capital-integrity reconciliation backstop. General, entry-point-agnostic
+// catch for any invested_capital decrement with no matching trading_journal
+// audit row (the #227/#234-class gap) -- alert-only, mirrors the #55
+// reconciliation_log dedup pattern (acknowledged flag, alert only on new flags).
+await db.execute(`CREATE TABLE IF NOT EXISTS capital_integrity_log (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  invested_capital_id INT NOT NULL,
+  drop_amount DECIMAL(20,4),
+  note VARCHAR(200),
+  flagged_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  acknowledged TINYINT(1) DEFAULT 0
+)`);
+
 await db.execute(`CREATE TABLE IF NOT EXISTS trailing_stops (
   symbol VARCHAR(50) PRIMARY KEY,
   trail_pct DECIMAL(10,4) NOT NULL,
@@ -3512,6 +3525,79 @@ async function runReconciliation() {
     console.log(`[reconciliation] Run complete: ${checked} checked, ${drifts.length} new drift(s)`);
   } catch (e) {
     console.error('[reconciliation] error:', e.message);
+  }
+}
+
+// #233: capital-integrity reconciliation backstop. Diffs invested_capital
+// history (last 26h) against trading_journal for a matching audit row within
+// a 30-min window and +/-$0.02 tolerance. Flags (Telegram + capital_integrity_log)
+// any decrement with no match -- general, entry-point-agnostic; alert-only,
+// never blocks or mutates capital. Dedup mirrors #55: alert only on rows with
+// no prior unacknowledged flag for the same invested_capital_id.
+async function runCapitalIntegrityCheck() {
+  try {
+    const TOL_USD = 0.02;
+    const WINDOW_MIN = 30;
+    const flags = [];
+    let checked = 0;
+
+    const [rows] = await db.execute(
+      `SELECT id, total_invested, note, updated_at FROM invested_capital
+       WHERE updated_at > DATE_SUB(NOW(), INTERVAL 26 HOUR)
+       ORDER BY id ASC`
+    );
+    if (!rows.length) {
+      console.log('[capital-integrity] No invested_capital changes in the last 26h -- nothing to check');
+      return;
+    }
+
+    const [[prevRow]] = await db.execute(
+      `SELECT total_invested FROM invested_capital WHERE id < ? ORDER BY id DESC LIMIT 1`,
+      [rows[0].id]
+    );
+    let prevTotal = prevRow ? parseFloat(prevRow.total_invested) : parseFloat(rows[0].total_invested);
+
+    for (const row of rows) {
+      checked++;
+      const total = parseFloat(row.total_invested);
+      const delta = total - prevTotal;
+      prevTotal = total;
+      if (delta >= -0.01) continue; // not a decrement (or negligible)
+
+      const dropAmt = Math.abs(delta);
+
+      const [[match]] = await db.execute(
+        `SELECT id FROM trading_journal
+         WHERE symbol = 'USD' AND action IN ('payment','sell')
+         AND ABS(value_usd - ?) <= ?
+         AND ABS(TIMESTAMPDIFF(MINUTE, created_at, ?)) <= ?
+         LIMIT 1`,
+        [dropAmt, TOL_USD, row.updated_at, WINDOW_MIN]
+      );
+      if (match) continue; // audited, fine
+
+      const [[prior]] = await db.execute(
+        `SELECT COUNT(*) AS n FROM capital_integrity_log WHERE invested_capital_id = ? AND acknowledged = 0`,
+        [row.id]
+      );
+      await db.execute(
+        `INSERT INTO capital_integrity_log (invested_capital_id, drop_amount, note) VALUES (?, ?, ?)`,
+        [row.id, dropAmt.toFixed(4), row.note || null]
+      );
+      if (prior.n === 0) {
+        const ts = row.updated_at instanceof Date ? row.updated_at.toISOString() : row.updated_at;
+        flags.push(`-$${dropAmt.toFixed(2)} (invested_capital #${row.id}, ${ts}) note: "${row.note || 'none'}" -- no matching trading_journal row within ${WINDOW_MIN}min`);
+      }
+    }
+
+    if (flags.length) {
+      await sendTelegram(`\u26a0\ufe0f <b>CAPITAL INTEGRITY -- ${flags.length} unaudited decrement(s)</b>\n\n${flags.join('\n')}\n\n<i>Checked ${checked} capital changes (last 26h). #233.</i>`).catch(() => {});
+    } else {
+      console.log(`[capital-integrity] Clean -- ${checked} capital changes checked, no unaudited decrements`);
+    }
+    console.log(`[capital-integrity] Run complete: ${checked} checked, ${flags.length} new flag(s)`);
+  } catch (e) {
+    console.error('[capital-integrity] error:', e.message);
   }
 }
 
@@ -9995,6 +10081,7 @@ setTimeout(async () => {
 // Record prices at midnight every day (UK time)
 cron.schedule('0 0 * * *', recordDailyPrices, { timezone: 'Europe/London' });
 cron.schedule('0 3 * * *', runReconciliation, { timezone: 'Europe/London' });
+cron.schedule('45 3 * * *', runCapitalIntegrityCheck, { timezone: 'Europe/London' }); // #233 capital-integrity backstop
 cron.schedule('55 2 * * *', backupServerJsToDrive, { timezone: 'Europe/London' }); // nightly server.js snapshot → revolut-claude-backups
 cron.schedule('30 3 * * *', backupDatabaseToDrive, { timezone: 'Europe/London' }); // #12 nightly DB backup
 
