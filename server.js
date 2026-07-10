@@ -1145,6 +1145,13 @@ await safeAddColumn('auto_trade_rules', 'cascade_count',   'INT DEFAULT 0');
 await safeAddColumn('auto_trade_rules', 'max_cascades',    'INT DEFAULT 3');
 await safeAddColumn('auto_trade_rules', 'cascade_parent_id', 'INT NULL');
 await safeAddColumn('pump_armed_rules', 'loop_enabled',      'TINYINT(1) NOT NULL DEFAULT 0');
+// #222: dedicated arm-transition timestamp. pump_armed_rules.updated_at has
+// ON UPDATE CURRENT_TIMESTAMP, so it bumps on ANY row change (trough tracking,
+// cycle_count, loop_enabled toggles, etc.) and can't answer "how long has this
+// been stuck armed" -- a genuinely stuck coin's updated_at keeps refreshing from
+// unrelated activity. armed_since is set ONLY on the real 0->1 arm transition and
+// cleared on de-arm, so a staleness check against it is reliable.
+await safeAddColumn('pump_armed_rules', 'armed_since',      'TIMESTAMP NULL');
 await safeAddColumn('pump_armed_rules', 'cycle_count',       'INT DEFAULT 0');
 await safeAddColumn('pump_armed_rules', 'max_cycles',        'INT DEFAULT 10');
 await safeAddColumn('pump_armed_rules', 'loop_realized_pnl', 'DECIMAL(20,8) DEFAULT 0');
@@ -3615,6 +3622,50 @@ async function runCapitalIntegrityCheck() {
   }
 }
 
+// #222: pump-loop stuck-armed staleness alert. A coin can sit pump_armed_rules.armed=1
+// indefinitely with no way to self-clear and no prompt for Bryan/PM to notice --
+// this is exactly what happened with GHIBLI (armed since 2026-07-02, discovered only
+// by manually cross-checking pump_status against portfolio data). Alert-only, never
+// blocks or clears anything; re-alerts daily while still stuck (unlike #55/#233's
+// alert-once-per-new-drift pattern) since the whole point here is persistent
+// visibility until Bryan actually acts, not a one-time notice of a new issue.
+async function runPumpArmStalenessCheck() {
+  try {
+    const STALE_HOURS = 48;
+    const [rows] = await db.execute(
+      `SELECT symbol, entry_floor, loop_enabled, armed_since FROM pump_armed_rules
+       WHERE armed = 1 AND active = 1 AND armed_since IS NOT NULL
+       AND armed_since < DATE_SUB(NOW(), INTERVAL ? HOUR)`,
+      [STALE_HOURS]
+    );
+    if (!rows.length) {
+      console.log('[pump-arm-staleness] Clean -- no coin stuck armed past ' + STALE_HOURS + 'h');
+      return;
+    }
+
+    const lines = [];
+    for (const row of rows) {
+      const coinBase = row.symbol.replace('-USD', '');
+      const hoursStuck = Math.floor((Date.now() - new Date(row.armed_since).getTime()) / (60 * 60 * 1000));
+      let priceLine = '';
+      try {
+        const isKraken = KRAKEN_MONITORED_COINS.includes(row.symbol);
+        const price = isKraken ? await getKrakenPriceForSymbol(row.symbol).catch(() => null) : await getCurrentPrice(row.symbol).catch(() => null);
+        if (price && row.entry_floor) {
+          const belowFloor = price <= parseFloat(row.entry_floor);
+          priceLine = ` | price ${fmtPriceShort(price)} vs floor ${fmtPriceShort(parseFloat(row.entry_floor))}${belowFloor ? ' (BELOW -- floor guard likely blocking)' : ''}`;
+        }
+      } catch (e) { /* price fetch best-effort only */ }
+      lines.push(`${coinBase} -- armed ${hoursStuck}h, loop_enabled=${row.loop_enabled}${priceLine}`);
+    }
+
+    await sendTelegram(`\u26a0\ufe0f <b>PUMP-ARM STUCK (${rows.length} coin(s) past ${STALE_HOURS}h)</b>\n\n${lines.join('\n')}\n\n<i>No auto-clear. Check pump_status / manage_alerts to resolve. #222.</i>`).catch(() => {});
+    console.log(`[pump-arm-staleness] ${rows.length} coin(s) flagged: ${lines.join(' | ')}`);
+  } catch (e) {
+    console.error('[pump-arm-staleness] error:', e.message);
+  }
+}
+
 // #47 Phase B1 (hash47b): fill-detection poller - DETECTION ONLY, no side-effects.
 // #47 B2a: run the post-trade pipeline ONCE on a confirmed full fill of a resting limit order, using the EXACT
 // filled_quantity + average_fill_price from the venue. Mirrors the manual-approval pipeline. Returns the journal id.
@@ -4327,7 +4378,7 @@ async function checkPumpArm(symbol, currentPrice) {
         const floor24 = lowRow.length && lowRow[0].lo != null ? parseFloat(lowRow[0].lo) : null;
         if (floor24) await db.execute('UPDATE pump_armed_rules SET entry_floor = ? WHERE symbol = ? AND active = 1', [floor24, symbol]);
         await setTrailingStop(symbol, parseFloat(rule.trail_pct), currentPrice, floor24, true, rule.sell_pct || 100);
-        await db.execute('UPDATE pump_armed_rules SET armed = 1 WHERE symbol = ?', [symbol]);
+        await db.execute('UPDATE pump_armed_rules SET armed = 1, armed_since = NOW() WHERE symbol = ?', [symbol]);
         console.log(`[pump-arm] ${symbol} ARMED (DND) — 24h floor=$${floor24 ? floor24.toFixed(4) : 'none'}, trail ${rule.trail_pct}%`);
         return;
       }
@@ -4341,7 +4392,7 @@ async function checkPumpArm(symbol, currentPrice) {
       // IDEX overnight non-execution). The DND branch above already passed true.
       const loopEnabledArm = parseInt(rule.loop_enabled) === 1;
       await setTrailingStop(symbol, parseFloat(rule.trail_pct), currentPrice, entryFloor, loopEnabledArm, loopEnabledArm ? (rule.sell_pct || 50) : null);
-      await db.execute('UPDATE pump_armed_rules SET armed = 1 WHERE symbol = ?', [symbol]);
+      await db.execute('UPDATE pump_armed_rules SET armed = 1, armed_since = NOW() WHERE symbol = ?', [symbol]);
       console.log(`[pump-arm] ${symbol} ARMED — pumped +${pumpPct.toFixed(1)}% to ${fmtPriceShort(currentPrice)}, trailing stop set ${rule.trail_pct}%`);
       await sendTelegram(
         `🎯 <b>PUMP-ARMED — ${symbol.replace('-USD','')}</b>\n\n` +
@@ -7398,7 +7449,7 @@ async function rearmPumpLoopAfterBuyback(rule, executedPrice) {
 
     // RE-ARM: reset to dormant-watching so checkPumpArm re-detects a fresh pump from the new lower entry
     await db.execute(
-      'UPDATE pump_armed_rules SET armed = 0, baseline_price = NULL, baseline_at = NULL WHERE symbol = ?',
+      'UPDATE pump_armed_rules SET armed = 0, armed_since = NULL, baseline_price = NULL, baseline_at = NULL WHERE symbol = ?',
       [symbol]
     );
     await sendTelegram(
@@ -10142,6 +10193,7 @@ setTimeout(async () => {
 cron.schedule('0 0 * * *', recordDailyPrices, { timezone: 'Europe/London' });
 cron.schedule('0 3 * * *', runReconciliation, { timezone: 'Europe/London' });
 cron.schedule('45 3 * * *', runCapitalIntegrityCheck, { timezone: 'Europe/London' }); // #233 capital-integrity backstop
+cron.schedule('50 3 * * *', runPumpArmStalenessCheck, { timezone: 'Europe/London' }); // #222 stuck-armed staleness alert
 cron.schedule('55 2 * * *', backupServerJsToDrive, { timezone: 'Europe/London' }); // nightly server.js snapshot → revolut-claude-backups
 cron.schedule('30 3 * * *', backupDatabaseToDrive, { timezone: 'Europe/London' }); // #12 nightly DB backup
 
