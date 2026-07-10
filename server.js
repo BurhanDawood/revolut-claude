@@ -12697,10 +12697,23 @@ function createMcpServer() {
           const r = pr[0];
           if (r.active !== 1) throw new Error(sym+' rule is not active (active='+r.active+') — refusing to enable loop');
           if (r.entry_floor == null || parseFloat(r.entry_floor) <= 0) throw new Error(sym+' has no entry_floor — refusing to enable loop (never-sell-below-entry guard)');
+
+          // #237/#238 ask-3: warn if a trailing stop already exists for this symbol
+          // that isn't from the pump-loop's own last arm cycle (armed=1 on this same
+          // row) -- likely a leftover manual trailing stop (manage_alerts set_trailing).
+          // setTrailingStop MERGES with any existing entry rather than replacing it, so
+          // a stale manual auto_execute setting can silently persist into the loop's
+          // arm. Same conflict class that caused the IDEX and GHIBLI incidents.
+          const existingTs = trailingStops.get(sym);
+          let conflictWarning = '';
+          if (existingTs && r.armed !== 1) {
+            conflictWarning = ' WARNING: an existing trailing stop was found for this symbol that is not from the pump-loop\'s own arm cycle (peak '+existingTs.peakPrice+', auto_execute='+existingTs.autoExecute+') -- likely a leftover manual set_trailing. Recommend remove_trailing before relying on this loop.';
+          }
+
           await db.execute('UPDATE pump_armed_rules SET loop_enabled = 1 WHERE symbol = ?', [sym]);
           const [after] = await db.execute('SELECT * FROM pump_armed_rules WHERE symbol = ? LIMIT 1', [sym]);
-          await sendTelegram('LOOP ENABLED -- '+sym+' rinse-repeat ON. Floor $'+parseFloat(r.entry_floor).toFixed(6)+', sell '+r.sell_pct+'%, max '+r.max_cycles+' cycles. Master must also be ON to fire.').catch(()=>{});
-          return { content: [{ type: 'text', text: JSON.stringify({ ok: true, loop_enabled: 1, row: after[0] }, null, 2) }] };
+          await sendTelegram('LOOP ENABLED -- '+sym+' rinse-repeat ON. Floor $'+parseFloat(r.entry_floor).toFixed(6)+', sell '+r.sell_pct+'%, max '+r.max_cycles+' cycles. Master must also be ON to fire.'+conflictWarning).catch(()=>{});
+          return { content: [{ type: 'text', text: JSON.stringify({ ok: true, loop_enabled: 1, row: after[0], conflict_warning: conflictWarning || null }, null, 2) }] };
         }
         if (action === 'loop_disable') {
           if (!symbol) throw new Error('symbol required for loop_disable');
@@ -12977,6 +12990,22 @@ function createMcpServer() {
     async ({ symbol, arm_pump_pct, trail_pct, sell_pct, entry_floor, arm_window_min, rebuy_pct }) => {
       try {
         const sym = symbol.includes('-USD') ? symbol.toUpperCase() : `${symbol.toUpperCase()}-USD`;
+
+        // #237/#238 ask-3: detect a pre-existing trailing stop for this symbol that
+        // is NOT from the pump-loop's own last arm cycle (i.e. pump_armed_rules.armed
+        // was not already 1) before this call. setTrailingStop MERGES with any
+        // existing entry rather than replacing it, so a stale manual trailing stop
+        // (e.g. from manage_alerts set_trailing, possibly with auto_execute left on)
+        // can silently persist into the pump-loop's arm -- the exact dual-mechanism
+        // conflict that caused the IDEX and GHIBLI incidents. Warn loudly rather than
+        // auto-clear: a silent delete could remove a monitor Bryan still wants.
+        const [priorRows] = await db.execute('SELECT armed FROM pump_armed_rules WHERE symbol = ?', [sym]);
+        const existingTs = trailingStops.get(sym);
+        let conflictWarning = '';
+        if (existingTs && (!priorRows.length || priorRows[0].armed !== 1)) {
+          conflictWarning = `\n\n⚠️ CONFLICT: an existing trailing stop for ${sym.replace('-USD','')} was found (peak ${existingTs.peakPrice}, stop ${existingTs.stopPrice}, auto_execute=${existingTs.autoExecute}) that is NOT from the pump-loop's own last arm cycle -- likely a leftover manual trailing stop (manage_alerts set_trailing). Recommend remove_trailing before relying on this arm, or the two mechanisms may conflict exactly as happened with IDEX/GHIBLI.`;
+        }
+
         await db.execute(
           `INSERT INTO pump_armed_rules (symbol, arm_pump_pct, arm_window_min, trail_pct, sell_pct, entry_floor, rebuy_pct, armed, baseline_price, baseline_at, active)
            VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, 1)
@@ -12990,9 +13019,9 @@ function createMcpServer() {
           `${entry_floor ? `Floor: ${entry_floor}\n` : ''}` +
           `Sell %% (Stage 2): ${sell_pct ?? 50}%\n` +
           `Rebuy retrace: ${rebuy_pct ?? 8}%\n\n` +
-          `⚠️ Stage 1 active — arms + alerts only, no auto-sell yet.`
+          `⚠️ Stage 1 active — arms + alerts only, no auto-sell yet.` + conflictWarning
         ).catch(() => {});
-        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, symbol: sym, arm_pump_pct, trail_pct, arm_window_min: arm_window_min || 60, sell_pct: sell_pct ?? 50, entry_floor: entry_floor ?? null, rebuy_pct: rebuy_pct ?? 8, note: 'Stage 1 — arms trailing stop on pump, no auto-sell' }) }] };
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, symbol: sym, arm_pump_pct, trail_pct, arm_window_min: arm_window_min || 60, sell_pct: sell_pct ?? 50, entry_floor: entry_floor ?? null, rebuy_pct: rebuy_pct ?? 8, conflict_warning: conflictWarning || null, note: 'Stage 1 — arms trailing stop on pump, no auto-sell' }) }] };
       } catch (e) {
         return { content: [{ type: 'text', text: JSON.stringify({ error: e.message }) }] };
       }
