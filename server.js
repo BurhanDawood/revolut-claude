@@ -4317,7 +4317,16 @@ async function checkPumpArm(symbol, currentPrice) {
         console.log(`[pump-arm] ${symbol} ARMED (DND) — 24h floor=$${floor24 ? floor24.toFixed(4) : 'none'}, trail ${rule.trail_pct}%`);
         return;
       }
-      await setTrailingStop(symbol, parseFloat(rule.trail_pct), currentPrice, entryFloor);
+      // #237 ask-1: gate autonomous Stage-2 auto-sell on the per-coin loop_enabled
+      // flag (double-gate: global ai_auto_execute master + this per-coin switch, per
+      // the double-gated-autonomy design principle). loop_enabled=1 -> arm an
+      // auto-executing trailing stop (breach sells without a Telegram reply, floor
+      // guards in autoExecuteSell still apply); loop_enabled=0 -> notify-only, exactly
+      // as before. Previously this non-DND path never passed autoExecute, so EVERY
+      // non-DND pump-armed coin was silently notify-only and never auto-sold (the
+      // IDEX overnight non-execution). The DND branch above already passed true.
+      const loopEnabledArm = parseInt(rule.loop_enabled) === 1;
+      await setTrailingStop(symbol, parseFloat(rule.trail_pct), currentPrice, entryFloor, loopEnabledArm, loopEnabledArm ? (rule.sell_pct || 50) : null);
       await db.execute('UPDATE pump_armed_rules SET armed = 1 WHERE symbol = ?', [symbol]);
       console.log(`[pump-arm] ${symbol} ARMED — pumped +${pumpPct.toFixed(1)}% to ${fmtPriceShort(currentPrice)}, trailing stop set ${rule.trail_pct}%`);
       await sendTelegram(
@@ -4325,7 +4334,9 @@ async function checkPumpArm(symbol, currentPrice) {
         `Pumped +${pumpPct.toFixed(1)}% to ${fmtPriceShort(currentPrice)}\n` +
         `Trailing stop now ACTIVE at ${rule.trail_pct}% below peak\n` +
         `${entryFloor ? `Floor: never sell below ${fmtPriceShort(entryFloor)}\n` : ''}` +
-        `\n⚠️ Stage 1 — monitoring only, no auto-sell yet. You'll be alerted if the trail breaches.`
+        (loopEnabledArm
+          ? `\n✅ Stage 2 ACTIVE — will AUTO-SELL ${rule.sell_pct || 50}% on trail breach (no reply needed). Floor guard still applies.`
+          : `\n⚠️ Stage 1 — monitoring only, no auto-sell yet. You'll be alerted if the trail breaches.`)
       ).catch(() => {});
     } else {
       console.log(`[pump-arm] ${symbol} watching — +${pumpPct.toFixed(1)}% of ${rule.arm_pump_pct}% needed`);
