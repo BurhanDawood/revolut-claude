@@ -580,6 +580,12 @@ const ignoredCoins = new Set(); // permanently ignored coins — survives restar
 const activeFixedAlerts = new Map(); // symbol -> intervalId for fixed price target alerts (up)
 const activeDropAlerts  = new Map(); // symbol -> intervalId for fixed floor/drop alerts (down)
 const targetReminderCount = new Map(); // symbol -> number of reminders sent (resets on acknowledge)
+// #237/#238 ask-2: trailing-stop breach notifications had NO reminder cap at all --
+// fast-scan re-evaluates every ~30-60s, so an overnight breach re-sent the FULL
+// "TRAILING STOP TRIGGERED" alert (and re-ran AI analysis) every single cycle. This
+// produced the IDEX 153-alert flood. Caps at 3 notifications total then goes quiet,
+// mirroring the #150 philosophy exactly (never delete the trail, never auto-mute).
+const trailingStopReminderCount = new Map(); // symbol -> number of notifications sent (resets on acknowledge/remove/new-set)
 const alertFirstSent = new Map();    // symbol -> timestamp when first pump/drop/swing alert was sent
 const alertReminderSent = new Map(); // symbol -> timestamp when single follow-up reminder was sent
 const activeSecondaryAlerts = {}; // `${symbol}:${price}` -> true — fired secondary rec-based alerts
@@ -3095,6 +3101,13 @@ async function acknowledgeAlert(symbol) {
     console.log('[ack] Reset reminder count for:', symbol);
   }
 
+  // #237/#238 ask-2: reset the trailing-stop reminder cap too, so a re-armed trail
+  // gets a fresh 3 notifications rather than inheriting a stale count.
+  if (trailingStopReminderCount.has(symbol)) {
+    trailingStopReminderCount.delete(symbol);
+    console.log('[ack] Reset trailing-stop reminder count for:', symbol);
+  }
+
   // Clear pump/drop/swing alert timing so they can fire fresh if the move recurs
   alertFirstSent.delete(symbol);
   alertReminderSent.delete(symbol);
@@ -3168,6 +3181,7 @@ async function setTrailingStop(symbol, trailPct, currentPrice, entryPrice = null
 async function removeTrailingStop(symbol) {
   trailingStops.delete(symbol);
   trailingStopAlerted.delete(symbol);
+  trailingStopReminderCount.delete(symbol); // #237/#238 ask-2
   await db.execute('DELETE FROM trailing_stops WHERE symbol = ?', [symbol]);
 }
 
@@ -8244,25 +8258,45 @@ async function handleTrailingStopAlert(symbol, currentPrice, ts, exchange = 'rev
     : '';
   const exchLabel = exchange === 'kraken' ? '🦑 Kraken' : '🔄 Revolut X';
 
-  const alertMsg = formatSystemAlert(
-    'TRAILING STOP TRIGGERED', coinBase,
-    `Exchange: ${exchLabel}\n` +
-    `📉 Drop: ${dropFromPeak}% from peak\n` +
-    `Peak: ${fmtPriceShort(ts.peakPrice)} → Current: ${fmtPriceShort(currentPrice)}\n` +
-    `Trail: ${ts.trailPct}% | Stop: ${fmtPriceShort(ts.stopPrice)}\n` +
-    (entryLine ? entryLine + '\n' : '') +
-    `\n🧠 Running AI analysis...`
-  );
+  // #237/#238 ask-2: cap total notifications at 3 then go quiet -- never delete the
+  // trail, never auto-mute. This is the exact gap that let IDEX flood 153 alerts:
+  // this path previously had no cap and fast-scan calls it every ~30-60s while breached.
+  const trailRemindersSent = trailingStopReminderCount.get(symbol) || 0;
+  if (trailRemindersSent >= 3) {
+    console.log(`[trailing] ${symbol} -- ${trailRemindersSent} notifications already sent, going quiet (trail stays live, not muted)`);
+    return;
+  }
+
+  const alertMsg = trailRemindersSent === 0
+    ? formatSystemAlert(
+        'TRAILING STOP TRIGGERED', coinBase,
+        `Exchange: ${exchLabel}\n` +
+        `📉 Drop: ${dropFromPeak}% from peak\n` +
+        `Peak: ${fmtPriceShort(ts.peakPrice)} → Current: ${fmtPriceShort(currentPrice)}\n` +
+        `Trail: ${ts.trailPct}% | Stop: ${fmtPriceShort(ts.stopPrice)}\n` +
+        (entryLine ? entryLine + '\n' : '') +
+        `\n🧠 Running AI analysis...`
+      )
+    : formatSystemAlert(
+        `TRAILING STOP STILL BREACHED (reminder ${trailRemindersSent + 1}/3)`, coinBase,
+        `Exchange: ${exchLabel}\n` +
+        `📉 Drop: ${dropFromPeak}% from peak\n` +
+        `Current: ${fmtPriceShort(currentPrice)} | Stop: ${fmtPriceShort(ts.stopPrice)}\n` +
+        (entryLine ? entryLine + '\n' : '')
+      );
 
   const replyMenu = `\n\n1️⃣ Noted — keep watching\n2️⃣ Analyse — run 5-pillar check\n3️⃣ Remove trail — cancel trailing stop\n4️⃣ Acknowledge ⚠️ mutes coin 24h\n💬 Reply number or '<b>${coinBase.toLowerCase()} 2</b>' to target this coin`;
   await sendTelegram(alertMsg + replyMenu);
   alertContextBySymbol.set(coinBase.toLowerCase(), { symbol, coinBase, alertType: 'trailing_stop', timestamp: Date.now() });
   lastAlertCoin = coinBase.toLowerCase();
   trailingStopAlerted.set(symbol, Date.now());
-  console.log(`[trailing] Stop triggered for ${symbol} @ ${fmtPriceShort(currentPrice)} on ${exchange}`);
+  trailingStopReminderCount.set(symbol, trailRemindersSent + 1);
+  console.log(`[trailing] Stop triggered for ${symbol} @ ${fmtPriceShort(currentPrice)} on ${exchange} (notification ${trailRemindersSent + 1}/3)`);
 
-  analyseTrailingStopAlert(symbol, currentPrice, ts.peakPrice, ts.trailPct, ts.stopPrice, exchange)
-    .catch(e => console.error('[analysis] trailing stop:', e.message));
+  if (trailRemindersSent === 0) {
+    analyseTrailingStopAlert(symbol, currentPrice, ts.peakPrice, ts.trailPct, ts.stopPrice, exchange)
+      .catch(e => console.error('[analysis] trailing stop:', e.message));
+  }
 }
 
 async function autoExecuteKrakenSell(symbol, maxPct, analysis, confidence) {
