@@ -16,3 +16,7 @@ _ship*_log.txt
 claude-desktop-debian/
 package-lock.json
 node_modules/
+
+e237*.b64
+edit_*.py
+*.b64
