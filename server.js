@@ -9537,7 +9537,7 @@ async function checkPortfolio() {
     if (portfolioCheckCount > 1) {
       const currentSymbols = new Set(
         balances
-          .filter(a => a.currency && !SKIP_CURRENCIES.includes(a.currency) && parseFloat(a.available) > 0)
+          .filter(a => a.currency && !SKIP_CURRENCIES.includes(a.currency) && (parseFloat(a.available || 0) + parseFloat(a.reserved || 0)) > 0) // #253: total holdings (available + reserved), not available-only; a card-auth or resting-limit reserve on a whole position otherwise fakes a full exit
           .map(a => `${a.currency}-USD`)
       );
       for (const [sym, prevQty] of previousBalances) {
