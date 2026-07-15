@@ -1946,7 +1946,7 @@ try {
     await db.execute(
       'INSERT INTO system_config (config_key, config_value) VALUES (?, ?)',
       ['ai_auto_execute', JSON.stringify({
-        enabled: false, max_sell_pct: 25, max_buy_usd: 100,
+        enabled: false, max_sell_pct: 25,
         allowed_triggers: ['trailing_stop', 'fixed_target', 'pump_alert'],
         require_confidence: 'High', cooldown_minutes: 60,
         hodl_symbols: defaultHodl,
@@ -11894,7 +11894,6 @@ function createMcpServer() {
       min_trade_value_usd:    z.coerce.number().optional().describe('Minimum sell value in USD to trigger sweep (configure_sweep)'),
       excluded_symbols:       zLoose(z.array(z.string())).optional().describe('Symbols to exclude from sweep e.g. ["USDT-USD"] (configure_sweep)'),
       max_sell_pct:           z.coerce.number().optional().describe('Max % of position to sell per auto-exec trade (configure_auto_execute)'),
-      max_buy_usd:            z.coerce.number().optional().describe('Max USD to spend per auto-exec buy (configure_auto_execute)'),
       sell_floors:            z.preprocess(v => { if (typeof v === 'string') { try { return JSON.parse(v); } catch(e) { return v; } } return v; }, z.record(z.coerce.number())).optional().describe('Per-coin min sell price map e.g. {"NEAR":1.87} -- auto-sell blocked if price <= floor (#45, configure_auto_execute)'),
       per_coin_enabled:       z.preprocess(v => { if (typeof v === 'string') { try { return JSON.parse(v); } catch(e) { return v; } } return v; }, z.record(z.boolean())).optional().describe('#24 explicit per-coin auto-exec opt-in map e.g. {"BOBA":true} -- only coins listed here can shouldAutoExecute'),
       away_action:            z.enum(['set_eligible','activate','deactivate','status','set_away_buy','set_away_sell']).optional().describe('configure_away_mode: which away-mode operation'),
@@ -11954,7 +11953,7 @@ function createMcpServer() {
       dnd_retrace_pct:  z.coerce.number().optional().describe('configure_dnd: #160 %% of move price must retrace before trough arms (default 50)'),
       dnd_bounce_pct:   z.coerce.number().optional().describe('configure_dnd: #160 %% bounce off trough to trigger rebuy (default 8)'),
     },
-    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, away_buy_usd, away_sell_pct, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, max_buy_usd, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam, title, detail, category, status: devStatus, source: devSource, related_symbol: relSymbol, dev_log_id, active_workstream, progress, open_threads, next_action, recent_decision, recent_decisions, cs_status, cs_role, cs_theme, cs_strategy_md, pm_decision, pm_principle_tag, pm_conviction, pm_captured_by, pm_supersedes_id, dev_decision, dev_principle_tag, dev_cross_thread, dev_alternatives, dev_related_log, dev_supersedes_id, journal_id, tax_lot_id, away_action, away_coins, sell_floors, per_coin_enabled, catalyst_id, catalyst, catalyst_date, catalyst_type, expected_impact, priced_in_risk, catalyst_confidence, catalyst_source, catalyst_status, abn_alert_floor_pct, abn_broad_floor_pct, abn_broad_threshold, abn_cooldown_min, dnd_action, dnd_coins, dnd_arm_pct, dnd_trail_pct, dnd_sell_pct, dnd_retrace_pct, dnd_bounce_pct }) => {
+    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, away_buy_usd, away_sell_pct, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam, title, detail, category, status: devStatus, source: devSource, related_symbol: relSymbol, dev_log_id, active_workstream, progress, open_threads, next_action, recent_decision, recent_decisions, cs_status, cs_role, cs_theme, cs_strategy_md, pm_decision, pm_principle_tag, pm_conviction, pm_captured_by, pm_supersedes_id, dev_decision, dev_principle_tag, dev_cross_thread, dev_alternatives, dev_related_log, dev_supersedes_id, journal_id, tax_lot_id, away_action, away_coins, sell_floors, per_coin_enabled, catalyst_id, catalyst, catalyst_date, catalyst_type, expected_impact, priced_in_risk, catalyst_confidence, catalyst_source, catalyst_status, abn_alert_floor_pct, abn_broad_floor_pct, abn_broad_threshold, abn_cooldown_min, dnd_action, dnd_coins, dnd_arm_pct, dnd_trail_pct, dnd_sell_pct, dnd_retrace_pct, dnd_bounce_pct }) => {
       // Make hodl_symbols accessible in configure_auto_execute via params object
       const params = { hodl_symbols: hodlSymbolsParam };
 
@@ -12155,7 +12154,6 @@ function createMcpServer() {
         const config = {
           enabled: enabled ?? existingCfg.enabled ?? false,
           max_sell_pct: max_sell_pct || existingCfg.max_sell_pct || 25,
-          max_buy_usd: max_buy_usd || existingCfg.max_buy_usd || 100,
           allowed_triggers: allowed_triggers || existingCfg.allowed_triggers || ['trailing_stop', 'fixed_target', 'pump_alert'],
           require_confidence: require_confidence || existingCfg.require_confidence || 'High',
           cooldown_minutes: cooldown_minutes || existingCfg.cooldown_minutes || 60,
@@ -12173,7 +12171,6 @@ function createMcpServer() {
         await sendTelegram(
           `🤖 <b>AI AUTO-EXECUTE ${config.enabled ? 'ENABLED ✅' : 'DISABLED ❌'}</b>\n\n` +
           `Max sell: ${config.max_sell_pct}% per trade\n` +
-          `Max buy: $${config.max_buy_usd}\n` +
           `Confidence required: ${config.require_confidence}\n` +
           `Cooldown: ${config.cooldown_minutes} min\n` +
           `Triggers: ${config.allowed_triggers.join(', ')}\n` +
