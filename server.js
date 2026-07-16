@@ -13495,7 +13495,7 @@ app.get('/portfolio/summary', async (req, res) => {
     const positions = [];
     for (const asset of balancesRaw) {
       if (!asset.currency || SKIP_CURRENCIES.includes(asset.currency)) continue;
-      const qty = parseFloat(asset.available);
+      const qty = parseFloat(asset.available || 0) + parseFloat(asset.reserved || 0); // #260/L13498: total holdings — was available-only, undercounting reserved coin in the REST portfolio summary
       if (qty <= 0) continue;
       const sym = `${asset.currency}-USD`;
       const price = priceMap[sym] || null;
@@ -16178,7 +16178,7 @@ app.post('/telegram-webhook', async (req, res) => {
         let totalPnlUsd = 0;
         for (const asset of balances) {
           if (!asset.currency || SKIP_CURRENCIES.includes(asset.currency)) continue;
-          const qty = parseFloat(asset.available);
+          const qty = parseFloat(asset.available || 0) + parseFloat(asset.reserved || 0); // #260/L16181: total holdings — was available-only, undercounting/omitting reserved coin from the my-pnl summary
           if (qty <= 0) continue;
           const sym = `${asset.currency}-USD`;
           const price = priceMap[sym];
@@ -16271,7 +16271,7 @@ app.post('/telegram-webhook', async (req, res) => {
         // Compute holdings with USD values
         const holdings = [];
         for (const asset of balances) {
-          const available = parseFloat(asset.available);
+          const available = parseFloat(asset.available || 0) + parseFloat(asset.reserved || 0); // #260/L16274: total holdings — a fully-reserved coin previously vanished entirely from what Claude sees (available<=0 skip below)
           if (!asset.currency || available <= 0) continue;
           const symbol = `${asset.currency}-USD`;
           const isStable = SKIP_CURRENCIES.includes(asset.currency);
