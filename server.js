@@ -7601,7 +7601,7 @@ async function syncEntryPriceFromRevolutX(symbol) {
     }
 
     // Fallback: derive from total_cost / quantity if available
-    const qty       = parseFloat(asset.available || 0);
+    const qty       = parseFloat(asset.available || 0) + parseFloat(asset.reserved || 0); // #260/L7604: total holdings as denominator — total_cost/book_cost reflects the whole position, available-only inflated the calculated avg entry when reserved>0
     const totalCost = parseFloat(asset.total_cost || asset.book_cost || 0);
     if (qty > 0 && totalCost > 0) {
       const calculatedAvg = totalCost / qty;
@@ -10427,7 +10427,7 @@ cron.schedule('10 9 * * 1', async () => {
       let syncCount = 0;
       for (const asset of rvBals) {
         if (!asset.currency || SKIP_CURRENCIES.includes(asset.currency)) continue;
-        const qty = parseFloat(asset.available || 0);
+        const qty = parseFloat(asset.available || 0) + parseFloat(asset.reserved || 0); // #260/L10430: total holdings — was available-only, silently skipping a fully-reserved coin from the weekly entry-price sync
         if (qty < 0.001) continue;
         const sym = `${asset.currency}-USD`;
         const synced = await syncEntryPriceFromRevolutX(sym).catch(() => null);
@@ -12185,7 +12185,7 @@ function createMcpServer() {
         const rvBalances = await revolutRequest('GET', '/balances');
         for (const asset of rvBalances) {
           if (!asset.currency || SKIP_CURRENCIES.includes(asset.currency)) continue;
-          const qty = parseFloat(asset.available || 0);
+          const qty = parseFloat(asset.available || 0) + parseFloat(asset.reserved || 0); // #260/L12188: total holdings — was available-only, silently skipping a fully-reserved coin from a Bryan-invoked full entry-price sync
           if (qty < 0.001) continue;
           const sym = `${asset.currency}-USD`;
           const synced = await syncEntryPriceFromRevolutX(sym);
