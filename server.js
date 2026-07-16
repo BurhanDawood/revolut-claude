@@ -4445,7 +4445,7 @@ async function runFastScan() {
     // Part B: trailing-stop checks — dynamic over ALL armed stops (#99).
     // Batch-fetches Revolut X prices once per cycle so N armed stops = 1 /tickers call
     // (not N calls). Kraken-only coins get a per-coin getKrakenPriceForSymbol call.
-    if (trailingStops.size === 0) return;
+    if (trailingStops.size === 0 && troughTrackers.size === 0 && standaloneTroughTrackers.size === 0) return; // #264: was `trailingStops.size===0` only, which returned BEFORE Part C(#130 trough)/Part D(#143 standalone) and the shared price map — starving both trough subsystems whenever no trailing stop was armed (IDEX rebuy stalled 5h). Bail only when ALL THREE are empty; Parts C/D keep their own size guards.
     const fsRevolutPrices = {};
     try {
       const fsTickers = await revolutRequest('GET', '/tickers');
