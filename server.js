@@ -8952,7 +8952,7 @@ async function checkPortfolio() {
             for (const asset of balances) {
               if (SKIP_CURRENCIES.includes(asset.currency)) continue;
               const sym      = `${asset.currency}-USD`;
-              const currQty  = parseFloat(asset.available || 0);
+              const currQty  = parseFloat(asset.available || 0) + parseFloat(asset.reserved || 0); // #260/L8955: compare against total holdings — prevQty from previousBalances is total (available+reserved); using available-only here falsely suppresses the USDT→crypto swap guard and can misclassify a real crypto buy as a card payment
               const prevQty  = previousBalances.get(sym) || 0;
               const increase = currQty - prevQty;
               if (increase <= 0) continue;
