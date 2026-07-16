@@ -12570,7 +12570,7 @@ function createMcpServer() {
       for (const r of epSummaryRows) epSummary[r.symbol] = r;
       for (const asset of balances) {
         if (!asset.currency || SKIP_CURRENCIES.includes(asset.currency)) continue;
-        const qty = parseFloat(asset.available);
+        const qty = parseFloat(asset.available || 0) + parseFloat(asset.reserved || 0); // #260/L12573: total holdings for display — was available-only, undercounting reserved coin in get_portfolio_summary (value, P&L, and the qty<=0 skip that hid fully-reserved positions)
         if (qty <= 0) continue;
         const sym = `${asset.currency}-USD`;
         const price = priceMap[sym] || priceMap[`${asset.currency}/USD`] || null;
