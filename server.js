@@ -13179,6 +13179,194 @@ function createMcpServer() {
     }
   );
 
+  server.tool('get_asset_synthesis',
+    'Cross-asset grounded synthesis signal board (#262 Part A). For each asset it aggregates live holding + P&L (GROUND TRUTH from live balances), MSS market structure, the latest research thesis, upcoming/past catalysts, and the saved coin_strategy plan — then flags where those signals AGREE / CONFLICT / are STALE, plus data-hygiene contradictions. Forms NO opinions and recommends NO trades: it only surfaces where existing signals align, conflict, or are out of date. Omit symbol for the full held+watchlist board; pass a symbol (e.g. NEAR) for a single-asset deep-dive.',
+    {
+      symbol: z.string().optional().describe('Coin symbol e.g. NEAR or NEAR-USD — omit for the full held+watchlist board'),
+    },
+    async ({ symbol } = {}) => {
+      try {
+        const STALE_DAYS = 14;
+        const now = Date.now();
+        const ageDays = (ts) => {
+          if (!ts) return null;
+          const t = new Date(ts).getTime();
+          if (isNaN(t)) return null;
+          return Math.floor((now - t) / 86400000);
+        };
+        const staleLabel = (ts) => {
+          const a = ageDays(ts);
+          if (a === null) return 'MISSING';
+          return a > STALE_DAYS ? ('STALE(' + a + 'd)') : (a + 'd');
+        };
+
+        // GROUND TRUTH: live holdings via buildPositions (#71 total-holdings = available + reserved).
+        // coin_strategy.status is NEVER trusted for held/not-held (it contradicts live, e.g. MORPHO).
+        const { positions } = await buildPositions();
+        const heldMap = {};
+        for (const p of positions) heldMap[String(p.coin).toUpperCase()] = p;
+
+        // Saved plans — coin_strategy.symbol is stored BASE (CC, NEAR).
+        const [csRows] = await db.execute(
+          'SELECT symbol, status, role, theme, strategy_md, updated_at FROM coin_strategy'
+        );
+        const csMap = {};
+        for (const r of csRows) csMap[String(r.symbol).toUpperCase()] = r;
+
+        // Latest research per symbol — research_history.symbol is BASE. Self-join = most recent per symbol.
+        const [rhRows] = await db.execute(
+          'SELECT r1.symbol, r1.thesis_status, r1.drift_verdict, r1.researched_at ' +
+          'FROM research_history r1 ' +
+          'INNER JOIN (SELECT symbol, MAX(researched_at) AS latest FROM research_history GROUP BY symbol) r2 ' +
+          'ON r1.symbol = r2.symbol AND r1.researched_at = r2.latest'
+        );
+        const rhMap = {};
+        for (const r of rhRows) rhMap[String(r.symbol).toUpperCase()] = r;
+
+        // MSS structure — mss_state.symbol is stored PAIR (CC-USD); timeframe is '1h'/'4h'. Key by BASE.
+        const [mssRows] = await db.execute(
+          'SELECT symbol, timeframe, trend, mss_status, computed_at FROM mss_state'
+        );
+        const mssMap = {};
+        for (const r of mssRows) {
+          const b = String(r.symbol).replace('-USD', '').toUpperCase();
+          (mssMap[b] = mssMap[b] || []).push(r);
+        }
+
+        // Catalysts — catalyst_calendar.symbol is BASE.
+        const [catRows] = await db.execute(
+          'SELECT symbol, catalyst, catalyst_date, expected_impact, status FROM catalyst_calendar'
+        );
+        const catMap = {};
+        for (const r of catRows) {
+          const b = String(r.symbol).toUpperCase();
+          (catMap[b] = catMap[b] || []).push(r);
+        }
+
+        // Symbol universe.
+        let symbols;
+        if (symbol) {
+          symbols = [String(symbol).replace('-USD', '').toUpperCase()];
+        } else {
+          const set = new Set(Object.keys(heldMap));
+          const liveStatuses = ['watchlist', 'radar', 'rebuilding', 'active_holding'];
+          const liveRoles = ['watch_entry', 'swing', 'anchor', 'lotto', 'hodl'];
+          for (const r of csRows) {
+            const b = String(r.symbol).toUpperCase();
+            if (b === 'DEAD_BAGS' || b === 'EXITED' || b === 'INDEX') continue;
+            const st = String(r.status || '').toLowerCase();
+            const ro = String(r.role || '').toLowerCase();
+            if (liveStatuses.includes(st) || liveRoles.includes(ro)) set.add(b);
+          }
+          symbols = [...set].sort();
+        }
+
+        const assets = [];
+        for (const base of symbols) {
+          const held = heldMap[base] || null;
+          const cs = csMap[base] || null;
+          const rh = rhMap[base] || null;
+          const mss = (mssMap[base] || []).slice().sort((a, b) => (a.timeframe > b.timeframe ? 1 : -1));
+          const cats = catMap[base] || [];
+
+          const holding = held
+            ? {
+                held: true,
+                qty: held.available,
+                value_usd: held.currentValue != null ? Math.round(held.currentValue * 100) / 100 : null,
+                pnl_pct: held.unrealisedPnlPct != null ? Math.round(held.unrealisedPnlPct * 10) / 10 : null,
+              }
+            : { held: false };
+
+          const structure = mss.length
+            ? mss.map((m) => ({ tf: m.timeframe, trend: m.trend, mss: m.mss_status, age: staleLabel(m.computed_at) }))
+            : 'MISSING';
+
+          const thesis = rh
+            ? {
+                status: rh.thesis_status || 'unknown',
+                as_of: staleLabel(rh.researched_at),
+                verdict: rh.drift_verdict ? String(rh.drift_verdict).slice(0, 140) : null,
+              }
+            : 'MISSING';
+
+          const catalysts = cats.length
+            ? cats.map((c) => {
+                const d = c.catalyst_date ? new Date(c.catalyst_date) : null;
+                const isPast = d && !isNaN(d.getTime()) && d.getTime() < now;
+                return {
+                  when: (d && !isNaN(d.getTime())) ? d.toISOString().slice(0, 10) : 'undated',
+                  state: isPast ? 'PAST' : 'upcoming',
+                  impact: c.expected_impact || null,
+                  what: c.catalyst ? String(c.catalyst).slice(0, 90) : null,
+                };
+              })
+            : 'none';
+
+          const plan = cs
+            ? { status: cs.status || null, role: cs.role || null, theme: cs.theme || null, updated: staleLabel(cs.updated_at) }
+            : 'MISSING';
+
+          // Data-hygiene: grounded contradictions between the plan and live truth.
+          const data_hygiene = [];
+          if (cs) {
+            const st = String(cs.status || '').toLowerCase();
+            if (st === 'active_holding' && !held) {
+              data_hygiene.push('coin_strategy.status=active_holding but NOT held live — stale/contradictory plan');
+            }
+            if (held && (st === 'closed' || st === 'exited')) {
+              data_hygiene.push('held live but coin_strategy.status=' + st + ' — plan says gone but position exists');
+            }
+            const csAge = ageDays(cs.updated_at);
+            if (csAge != null && csAge > 30) {
+              data_hygiene.push('coin_strategy plan not updated in ' + csAge + 'd');
+            }
+          }
+
+          // Conflicts: grounded observations across signals — NOT opinions, NOT recommendations.
+          const conflicts = [];
+          const tstat = rh && rh.thesis_status ? String(rh.thesis_status).toUpperCase() : '';
+          const fourH = mss.find((m) => m.timeframe === '4h');
+          const fourTrend = fourH ? String(fourH.trend || '').toLowerCase() : '';
+          if (['STRENGTHENING', 'INTACT'].includes(tstat) && /down|bear/.test(fourTrend)) {
+            conflicts.push('thesis is ' + tstat + ' but 4h structure trend is ' + fourH.trend + ' — CONFLICT');
+          }
+          if (['WEAKENING', 'BROKEN', 'DRIFTING'].includes(tstat) && /up|bull/.test(fourTrend)) {
+            conflicts.push('thesis is ' + tstat + ' but 4h structure trend is ' + fourH.trend + ' — CONFLICT');
+          }
+          const upcomingBear = cats.find((c) => {
+            const d = c.catalyst_date ? new Date(c.catalyst_date) : null;
+            const upcoming = d && !isNaN(d.getTime()) && d.getTime() >= now;
+            return upcoming && /bear/i.test(String(c.expected_impact || ''));
+          });
+          if (['STRENGTHENING', 'INTACT'].includes(tstat) && upcomingBear) {
+            conflicts.push('thesis is ' + tstat + ' but an upcoming bearish catalyst is on the calendar — tension');
+          }
+          if (rh) {
+            const ra = ageDays(rh.researched_at);
+            if (ra != null && ra > STALE_DAYS) {
+              conflicts.push('latest research is ' + ra + 'd old (> ' + STALE_DAYS + 'd) — treat thesis as low-confidence');
+            }
+          }
+          if (!conflicts.length) conflicts.push('no signal conflicts detected');
+
+          assets.push({ symbol: base, holding, structure, thesis, catalysts, plan, data_hygiene, conflicts });
+        }
+
+        const result = {
+          generated_at: new Date().toISOString(),
+          mode: symbol ? 'single-asset' : 'full-board',
+          note: 'PART A: grounded aggregation only — no opinions, no recommendations, no execution path. Ground truth = live balances (available+reserved). Structure/thesis/catalysts/plan are surfaced with staleness + contradiction flags; they are NOT independently verified beyond recency.',
+          asset_count: assets.length,
+          assets,
+        };
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      } catch (e) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: e.message }) }] };
+      }
+    }
+  );
+
   server.tool('resolve_pending_trades',
     'Batch-resolve auto-detected pending trades from the PM thread without Telegram. Pass an array of per-trade resolutions; each maps a symbol to a resolution type (rebalance/transfer/payment/reason/skip). Resolves all in one call against the live in-memory pending queue.',
     {
