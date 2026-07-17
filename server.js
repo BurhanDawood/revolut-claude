@@ -995,6 +995,20 @@ await db.execute(`CREATE TABLE IF NOT EXISTS coin_strategy (
   updated_by VARCHAR(40)
 )`).catch(e => console.error('[migration] coin_strategy:', e.message));
 
+await db.execute(`CREATE TABLE IF NOT EXISTS asset_thesis (
+  id INT PRIMARY KEY AUTO_INCREMENT,
+  symbol VARCHAR(20) NOT NULL,
+  conviction VARCHAR(10) NOT NULL,
+  bull_case TEXT NOT NULL,
+  bear_case TEXT NOT NULL,
+  invalidation_triggers TEXT NOT NULL,
+  supporting_refs TEXT NOT NULL,
+  thesis_status VARCHAR(20),
+  source VARCHAR(30) DEFAULT 'in_chat',
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_asset_thesis_symbol (symbol, created_at)
+)`).catch(e => console.error('[migration] asset_thesis:', e.message));
+
 await db.execute(`CREATE TABLE IF NOT EXISTS session_state (
   id INT PRIMARY KEY AUTO_INCREMENT,
   active_workstream TEXT,
@@ -11501,7 +11515,7 @@ function createMcpServer() {
   server.tool('get_trading_data',
     'Get trading journal entries, active alerts, trader context/profile, rebalancing history, and dev_bridge messages',
     {
-      include: zLoose(z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'dev_bridge', 'coin_strategy', 'reconciliation', 'ledger', 'tax_lots', 'catalysts', 'all']))).optional()
+      include: zLoose(z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'dev_bridge', 'coin_strategy', 'reconciliation', 'ledger', 'tax_lots', 'catalysts', 'thesis', 'all']))).optional()
         .describe('What data to fetch — defaults to all. dev_bridge, coin_strategy and reconciliation are never included in all; request them explicitly'),
       symbol:           z.string().optional().describe('Filter journal by coin e.g. NEAR'),
       limit:            z.coerce.number().optional().describe('Max journal entries to return, default 10'),
@@ -11660,6 +11674,17 @@ function createMcpServer() {
           const [catRows] = await db.execute(catQ[0], catQ[1]);
           result.catalysts = catRows;
         } catch (e) { result.catalysts = { error: e.message }; }
+      }
+
+      // thesis -- explicitly excluded from fetchAll; must be requested by name (#262 Part B)
+      if (fetch.includes('thesis')) {
+        try {
+          const thQ = symbol
+            ? ['SELECT t1.* FROM asset_thesis t1 INNER JOIN (SELECT symbol, MAX(created_at) AS latest FROM asset_thesis WHERE symbol = ? GROUP BY symbol) t2 ON t1.symbol = t2.symbol AND t1.created_at = t2.latest', [symbol.toUpperCase().replace('-USD','')]]
+            : ['SELECT t1.* FROM asset_thesis t1 INNER JOIN (SELECT symbol, MAX(created_at) AS latest FROM asset_thesis GROUP BY symbol) t2 ON t1.symbol = t2.symbol AND t1.created_at = t2.latest ORDER BY t1.symbol ASC', []];
+          const [thRows] = await db.execute(thQ[0], thQ[1]);
+          result.thesis = thRows;
+        } catch (e) { result.thesis = { error: e.message }; }
       }
 
       // reconciliation -- explicitly excluded from fetchAll; must be requested by name
@@ -11922,6 +11947,11 @@ function createMcpServer() {
       pm_decision:          z.string().optional().describe('log_pm_decision: the decision text to record'),
       pm_principle_tag:     z.string().optional().describe('log_pm_decision: short tag e.g. position-sizing / risk-management'),
       pm_conviction:        z.enum(['high','medium','low']).optional().describe('log_pm_decision: conviction level'),
+      conviction:           z.enum(['high','medium','low']).optional().describe('log_thesis: conviction level (high|medium|low)'),
+      bull_case:            z.string().optional().describe('log_thesis: the bull case / why this could work'),
+      bear_case:            z.string().optional().describe('log_thesis: MANDATORY bear case / what would break the thesis (#262 safety primitive)'),
+      invalidation_triggers: z.string().optional().describe('log_thesis: MANDATORY concrete conditions that would invalidate the thesis'),
+      supporting_refs:      z.string().optional().describe('log_thesis: MANDATORY grounding — which MSS/research/abnormal/source-feed/plan rows back this'),
       pm_captured_by:       z.string().optional().describe('log_pm_decision: who captured this — claude / manual'),
       pm_supersedes_id:     z.coerce.number().optional().describe('log_pm_decision: id of an older decision this replaces'),
       dev_decision:         z.string().optional().describe('log_dev_decision: the design decision/call made'),
@@ -11953,7 +11983,7 @@ function createMcpServer() {
       dnd_retrace_pct:  z.coerce.number().optional().describe('configure_dnd: #160 %% of move price must retrace before trough arms (default 50)'),
       dnd_bounce_pct:   z.coerce.number().optional().describe('configure_dnd: #160 %% bounce off trough to trigger rebuy (default 8)'),
     },
-    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, away_buy_usd, away_sell_pct, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam, title, detail, category, status: devStatus, source: devSource, related_symbol: relSymbol, dev_log_id, active_workstream, progress, open_threads, next_action, recent_decision, recent_decisions, cs_status, cs_role, cs_theme, cs_strategy_md, pm_decision, pm_principle_tag, pm_conviction, pm_captured_by, pm_supersedes_id, dev_decision, dev_principle_tag, dev_cross_thread, dev_alternatives, dev_related_log, dev_supersedes_id, journal_id, tax_lot_id, away_action, away_coins, sell_floors, per_coin_enabled, catalyst_id, catalyst, catalyst_date, catalyst_type, expected_impact, priced_in_risk, catalyst_confidence, catalyst_source, catalyst_status, abn_alert_floor_pct, abn_broad_floor_pct, abn_broad_threshold, abn_cooldown_min, dnd_action, dnd_coins, dnd_arm_pct, dnd_trail_pct, dnd_sell_pct, dnd_retrace_pct, dnd_bounce_pct }) => {
+    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, away_buy_usd, away_sell_pct, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam, title, detail, category, status: devStatus, source: devSource, related_symbol: relSymbol, dev_log_id, active_workstream, progress, open_threads, next_action, recent_decision, recent_decisions, cs_status, cs_role, cs_theme, cs_strategy_md, pm_decision, pm_principle_tag, pm_conviction, pm_captured_by, pm_supersedes_id, dev_decision, dev_principle_tag, dev_cross_thread, dev_alternatives, dev_related_log, dev_supersedes_id, journal_id, tax_lot_id, away_action, away_coins, sell_floors, per_coin_enabled, catalyst_id, catalyst, catalyst_date, catalyst_type, expected_impact, priced_in_risk, catalyst_confidence, catalyst_source, catalyst_status, abn_alert_floor_pct, abn_broad_floor_pct, abn_broad_threshold, abn_cooldown_min, dnd_action, dnd_coins, dnd_arm_pct, dnd_trail_pct, dnd_sell_pct, dnd_retrace_pct, dnd_bounce_pct, conviction, bull_case, bear_case, invalidation_triggers, supporting_refs }) => {
       // Make hodl_symbols accessible in configure_auto_execute via params object
       const params = { hodl_symbols: hodlSymbolsParam };
 
@@ -12492,6 +12522,71 @@ function createMcpServer() {
             return { content: [{ type: 'text', text: JSON.stringify({ ok: true, action: 'log_catalyst', inserted_id: ins.insertId, symbol: cBase, catalyst_date: cDate }) }] };
           }
         } catch (e) { return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: e.message }) }] }; }
+      } else if (action === 'log_thesis') {
+        // #262 Part B — opinionated conviction/thesis WITH mandatory bear-case pairing.
+        // Recommend-only research-analyst note; NEVER an execution path (inherits #68 + auto-exec-off).
+        // FULL-RIGOUR SAFETY GATE: a thesis cannot persist unless it argues against itself
+        // (bear_case + invalidation_triggers) AND points at the live data grounding it (supporting_refs).
+        // MIN_LEN is the single tunable knob — lower it if the friction proves too high.
+        const MIN_LEN = 20;
+        const sub = (v) => typeof v === 'string' && v.trim().length >= MIN_LEN;
+        const thBase = (symbol || '').toUpperCase().replace('-USD', '');
+        if (!thBase) {
+          return { content: [{ type: 'text', text: JSON.stringify({ error: 'log_thesis: symbol is required' }) }] };
+        }
+        if (!['high','medium','low'].includes(conviction || '')) {
+          return { content: [{ type: 'text', text: JSON.stringify({ error: 'log_thesis: conviction must be high|medium|low' }) }] };
+        }
+        const thMissing = [];
+        if (!sub(bull_case)) thMissing.push('bull_case');
+        if (!sub(bear_case)) thMissing.push('bear_case');
+        if (!sub(invalidation_triggers)) thMissing.push('invalidation_triggers');
+        if (!sub(supporting_refs)) thMissing.push('supporting_refs');
+        if (thMissing.length) {
+          return { content: [{ type: 'text', text: JSON.stringify({
+            error: 'log_thesis REJECTED — #262 safety primitive: every thesis must pair a substantive bull case, bear case, invalidation triggers, and data grounding. Missing or too short (min ' + MIN_LEN + ' chars): ' + thMissing.join(', ') + '. Nothing stored.',
+          }) }] };
+        }
+        let thesisStatus = 'new';
+        let thPriorNote = null;
+        try {
+          const [thPrev] = await db.execute(
+            'SELECT conviction, created_at FROM asset_thesis WHERE symbol = ? ORDER BY created_at DESC LIMIT 1', [thBase]
+          );
+          if (thPrev.length) {
+            const thRank = { low: 1, medium: 2, high: 3 };
+            const oldR = thRank[thPrev[0].conviction] || 0;
+            const newR = thRank[conviction] || 0;
+            thesisStatus = newR > oldR ? 'strengthened' : (newR < oldR ? 'weakened' : 'reaffirmed');
+            thPriorNote = 'prior conviction ' + thPrev[0].conviction + ' -> ' + conviction;
+          }
+        } catch (e) { /* first-run / table race: default to 'new' */ }
+        // Soft plan-contradiction warning (plan outranks transient synthesis — mirror Away Mode). Flags, never blocks.
+        const thWarnings = [];
+        try {
+          const [thCs] = await db.execute('SELECT status, role FROM coin_strategy WHERE symbol = ? LIMIT 1', [thBase]);
+          if (thCs.length) {
+            const cst = (thCs[0].status || '').toLowerCase();
+            const cro = (thCs[0].role || '').toLowerCase();
+            if (conviction === 'high' && (cst === 'exited' || cst === 'closed' || cro === 'dead_bag' || cro === 'legacy_exit' || cro === 'exited')) {
+              thWarnings.push('conviction=high contradicts saved coin_strategy (status=' + cst + ', role=' + cro + '). Plan outranks transient synthesis — reconcile in PM before acting.');
+            }
+          }
+        } catch (e) { /* non-fatal */ }
+        await db.execute(
+          'INSERT INTO asset_thesis (symbol, conviction, bull_case, bear_case, invalidation_triggers, supporting_refs, thesis_status, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+          [thBase, conviction, bull_case, bear_case, invalidation_triggers, supporting_refs, thesisStatus, 'in_chat']
+        );
+        return { content: [{ type: 'text', text: JSON.stringify({
+          ok: true,
+          logged: 'asset_thesis',
+          symbol: thBase,
+          conviction,
+          thesis_status: thesisStatus,
+          prior: thPriorNote,
+          warnings: thWarnings,
+          note: 'Stored as a research-analyst note (#262 Part B). Recommend-only, not an execution trigger. Bear case + invalidation + grounding all verified present.',
+        }, null, 2) }] };
       } else if (action === 'delete_tax_lot') {
         // #134: read-then-hard-delete a tax_lots row by its own id. Always reads before deleting.
         const tlid = (typeof tax_lot_id === 'number') ? tax_lot_id : parseInt(tax_lot_id, 10);
