@@ -11515,7 +11515,7 @@ function createMcpServer() {
   server.tool('get_trading_data',
     'Get trading journal entries, active alerts, trader context/profile, rebalancing history, and dev_bridge messages',
     {
-      include: zLoose(z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'dev_bridge', 'coin_strategy', 'reconciliation', 'ledger', 'tax_lots', 'catalysts', 'thesis', 'all']))).optional()
+      include: zLoose(z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'dev_bridge', 'coin_strategy', 'reconciliation', 'ledger', 'tax_lots', 'catalysts', 'thesis', 'nudges', 'all']))).optional()
         .describe('What data to fetch — defaults to all. dev_bridge, coin_strategy and reconciliation are never included in all; request them explicitly'),
       symbol:           z.string().optional().describe('Filter journal by coin e.g. NEAR'),
       limit:            z.coerce.number().optional().describe('Max journal entries to return, default 10'),
@@ -11685,6 +11685,51 @@ function createMcpServer() {
           const [thRows] = await db.execute(thQ[0], thQ[1]);
           result.thesis = thRows;
         } catch (e) { result.thesis = { error: e.message }; }
+      }
+
+      // nudges -- explicitly excluded from fetchAll; on-demand attention list (#262 Part C Build 1). Recommend-only, NO push.
+      if (fetch.includes('nudges')) {
+        try {
+          const [ntTh] = await db.execute(
+            'SELECT t1.symbol, t1.conviction, t1.thesis_status, t1.bear_case, t1.invalidation_triggers, t1.created_at ' +
+            'FROM asset_thesis t1 INNER JOIN (SELECT symbol, MAX(created_at) AS latest FROM asset_thesis GROUP BY symbol) t2 ' +
+            'ON t1.symbol = t2.symbol AND t1.created_at = t2.latest'
+          );
+          const [ntMss] = await db.execute("SELECT symbol, trend, mss_status FROM mss_state WHERE timeframe = '4h'");
+          const mss4 = {};
+          for (const m of ntMss) mss4[String(m.symbol).replace('-USD', '').toUpperCase()] = m;
+          const nudges = [];
+          for (const t of ntTh) {
+            const sym = String(t.symbol).toUpperCase();
+            const conv = String(t.conviction || '').toLowerCase();
+            const status = String(t.thesis_status || '').toLowerCase();
+            // Triggers 1+2: thesis invalidated / weakened (grounded in Part B diff).
+            if (status === 'invalidated') {
+              nudges.push({ symbol: sym, type: 'thesis_invalidated', severity: 4, conviction: conv,
+                detail: 'Latest thesis marked INVALIDATED. Triggers: ' + String(t.invalidation_triggers || '').slice(0, 120), as_of: t.created_at });
+            } else if (status === 'weakened') {
+              nudges.push({ symbol: sym, type: 'thesis_weakened', severity: (conv === 'low' ? 4 : 3), conviction: conv,
+                detail: 'Conviction weakened to ' + conv + '. Bear case: ' + String(t.bear_case || '').slice(0, 120), as_of: t.created_at });
+            }
+            // Trigger 3: thesis-vs-structure divergence (buy-leaning conviction vs a CONFIRMED adverse 4h structure).
+            const m = mss4[sym];
+            if (m && (conv === 'high' || conv === 'medium')) {
+              const tr = String(m.trend || '').toLowerCase();
+              const st = String(m.mss_status || '').toLowerCase();
+              if (/down|bear/.test(tr) && st === 'confirmed') {
+                nudges.push({ symbol: sym, type: 'thesis_structure_divergence', severity: (conv === 'high' ? 3 : 2), conviction: conv,
+                  detail: conv + '-conviction thesis but 4h structure is a CONFIRMED ' + m.trend + ' -- market moving against the thesis.', as_of: t.created_at });
+              }
+            }
+          }
+          nudges.sort((a, b) => (b.severity - a.severity) || (new Date(b.as_of) - new Date(a.as_of)));
+          result.nudges = {
+            generated_at: new Date().toISOString(),
+            bar: 'HIGH -- thesis invalidation/weakening + confirmed thesis-vs-4h-structure divergence. Recommend-only, NO Telegram push (Part C Build 1). Regime-shift trigger + passive push deferred to Build 2.',
+            count: nudges.length,
+            nudges,
+          };
+        } catch (e) { result.nudges = { error: e.message }; }
       }
 
       // reconciliation -- explicitly excluded from fetchAll; must be requested by name
