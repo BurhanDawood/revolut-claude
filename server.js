@@ -11722,10 +11722,24 @@ function createMcpServer() {
               }
             }
           }
+          // Trigger 4: regime shift -- reuse the #50 broad-market guard (>= broad_threshold coins >= broad_floor_pct abnormal).
+          try {
+            const abnStates = await computeAbnormalMoves();
+            const abnSyms = Object.keys(abnStates).filter(s => abnStates[s] && abnStates[s].status === 'ABNORMAL');
+            const bFloor = (abnConfig && abnConfig.broad_floor_pct) ? abnConfig.broad_floor_pct : 3.0;
+            const bThresh = (abnConfig && abnConfig.broad_threshold) ? abnConfig.broad_threshold : 5;
+            const broad = abnSyms.filter(s => abnStates[s].abs_move >= bFloor);
+            if (broad.length >= bThresh) {
+              const pumps = broad.filter(s => abnStates[s].direction === 'PUMP').length;
+              const dumps = broad.filter(s => abnStates[s].direction === 'DUMP').length;
+              nudges.push({ symbol: 'MARKET', type: 'regime_shift', severity: 3, conviction: null,
+                detail: 'BROAD MARKET MOVE: ' + broad.length + ' coins >=' + bFloor + '% abnormal (' + pumps + ' PUMP / ' + dumps + ' DUMP). Re-check theses against a moving tape.', as_of: new Date().toISOString() });
+            }
+          } catch (e) { /* abnormal data unavailable -- skip regime trigger */ }
           nudges.sort((a, b) => (b.severity - a.severity) || (new Date(b.as_of) - new Date(a.as_of)));
           result.nudges = {
             generated_at: new Date().toISOString(),
-            bar: 'HIGH -- thesis invalidation/weakening + confirmed thesis-vs-4h-structure divergence. Recommend-only, NO Telegram push (Part C Build 1). Regime-shift trigger + passive push deferred to Build 2.',
+            bar: 'HIGH -- thesis invalidation/weakening, confirmed thesis-vs-4h-structure divergence, and #50 broad-market regime shift. Recommend-only, NO Telegram push. Passive push deferred to Build 2b.',
             count: nudges.length,
             nudges,
           };
