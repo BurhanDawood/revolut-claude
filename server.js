@@ -10204,6 +10204,84 @@ setTimeout(async () => {
 }, 5000);
 
 // Record prices at midnight every day (UK time)
+// #262 Part C Build 2b -- shared thesis-nudge detector + passive push (push GATED OFF by default via system_config thesis_nudge.enabled).
+async function computeThesisNudges() {
+  const nudges = [];
+  const [ntTh] = await db.execute(
+    'SELECT t1.symbol, t1.conviction, t1.thesis_status, t1.bear_case, t1.invalidation_triggers, t1.created_at ' +
+    'FROM asset_thesis t1 INNER JOIN (SELECT symbol, MAX(created_at) AS latest FROM asset_thesis GROUP BY symbol) t2 ' +
+    'ON t1.symbol = t2.symbol AND t1.created_at = t2.latest'
+  );
+  const [ntMss] = await db.execute("SELECT symbol, trend, mss_status FROM mss_state WHERE timeframe = '4h'");
+  const mss4 = {};
+  for (const m of ntMss) mss4[String(m.symbol).replace('-USD', '').toUpperCase()] = m;
+  for (const t of ntTh) {
+    const sym = String(t.symbol).toUpperCase();
+    const conv = String(t.conviction || '').toLowerCase();
+    const status = String(t.thesis_status || '').toLowerCase();
+    if (status === 'invalidated') {
+      nudges.push({ symbol: sym, type: 'thesis_invalidated', severity: 4, conviction: conv,
+        detail: 'Latest thesis marked INVALIDATED. Triggers: ' + String(t.invalidation_triggers || '').slice(0, 120), as_of: t.created_at });
+    } else if (status === 'weakened') {
+      nudges.push({ symbol: sym, type: 'thesis_weakened', severity: (conv === 'low' ? 4 : 3), conviction: conv,
+        detail: 'Conviction weakened to ' + conv + '. Bear case: ' + String(t.bear_case || '').slice(0, 120), as_of: t.created_at });
+    }
+    const m = mss4[sym];
+    if (m && (conv === 'high' || conv === 'medium')) {
+      const tr = String(m.trend || '').toLowerCase();
+      const st = String(m.mss_status || '').toLowerCase();
+      if (/down|bear/.test(tr) && st === 'confirmed') {
+        nudges.push({ symbol: sym, type: 'thesis_structure_divergence', severity: (conv === 'high' ? 3 : 2), conviction: conv,
+          detail: conv + '-conviction thesis but 4h structure is a CONFIRMED ' + m.trend + ' -- market moving against the thesis.', as_of: t.created_at });
+      }
+    }
+  }
+  try {
+    const abnStates = await computeAbnormalMoves();
+    const abnSyms = Object.keys(abnStates).filter(s => abnStates[s] && abnStates[s].status === 'ABNORMAL');
+    const bFloor = (abnConfig && abnConfig.broad_floor_pct) ? abnConfig.broad_floor_pct : 3.0;
+    const bThresh = (abnConfig && abnConfig.broad_threshold) ? abnConfig.broad_threshold : 5;
+    const broad = abnSyms.filter(s => abnStates[s].abs_move >= bFloor);
+    if (broad.length >= bThresh) {
+      const pumps = broad.filter(s => abnStates[s].direction === 'PUMP').length;
+      const dumps = broad.filter(s => abnStates[s].direction === 'DUMP').length;
+      nudges.push({ symbol: 'MARKET', type: 'regime_shift', severity: 3, conviction: null,
+        detail: 'BROAD MARKET MOVE: ' + broad.length + ' coins >=' + bFloor + '% abnormal (' + pumps + ' PUMP / ' + dumps + ' DUMP). Re-check theses against a moving tape.', as_of: new Date().toISOString() });
+    }
+  } catch (e) { /* abnormal data unavailable -- skip regime trigger */ }
+  nudges.sort((a, b) => (b.severity - a.severity) || (new Date(b.as_of) - new Date(a.as_of)));
+  return nudges;
+}
+const thesisNudgeState = new Map(); // key symbol:type -> lastFiredAt ms (dedupe + cooldown)
+async function evaluateThesisNudges() {
+  try {
+    let cfg = { enabled: false, min_severity: 3, cooldown_min: 240 };
+    try {
+      const [cr] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'thesis_nudge'");
+      if (cr.length) cfg = Object.assign(cfg, JSON.parse(cr[0].config_value));
+    } catch (e) { /* use default cfg */ }
+    const eligible = (await computeThesisNudges()).filter(n => n.severity >= (cfg.min_severity || 3));
+    if (!cfg.enabled) {
+      console.log('[thesis_nudge] gate OFF -- computed ' + eligible.length + ' eligible nudge(s), NOT sending (#262 Build 2b)');
+      return;
+    }
+    const now = Date.now();
+    const cooldownMs = (cfg.cooldown_min || 240) * 60000;
+    const fresh = eligible.filter(n => {
+      const k = n.symbol + ':' + n.type;
+      if (now - (thesisNudgeState.get(k) || 0) < cooldownMs) return false;
+      thesisNudgeState.set(k, now);
+      return true;
+    });
+    if (!fresh.length) return;
+    const lines = fresh.slice(0, 6).map(n => '- [' + n.severity + '] ' + n.symbol + ' ' + n.type + ': ' + n.detail);
+    const msg = 'Thesis watch (' + fresh.length + '):\n' + lines.join('\n') + "\n\nReply 'give me suggestions' in the PM thread for the full grounded picture. (Recommend-only, no trade taken.)";
+    await sendTelegram(msg);
+    console.log('[thesis_nudge] sent digest of ' + fresh.length + ' nudge(s)');
+  } catch (e) { console.error('[thesis_nudge] evaluate error:', e.message); }
+}
+// Cadence: every 2h, 08:00-22:00 London. GATED OFF by default -- enabling is a separate deliberate flip (#262 Build 2c).
+cron.schedule('0 8,10,12,14,16,18,20,22 * * *', evaluateThesisNudges, { timezone: 'Europe/London' });
 cron.schedule('0 0 * * *', recordDailyPrices, { timezone: 'Europe/London' });
 cron.schedule('0 3 * * *', runReconciliation, { timezone: 'Europe/London' });
 cron.schedule('45 3 * * *', runCapitalIntegrityCheck, { timezone: 'Europe/London' }); // #233 capital-integrity backstop
@@ -11687,59 +11765,13 @@ function createMcpServer() {
         } catch (e) { result.thesis = { error: e.message }; }
       }
 
-      // nudges -- explicitly excluded from fetchAll; on-demand attention list (#262 Part C Build 1). Recommend-only, NO push.
+      // nudges -- on-demand attention list (#262 Part C). Shared detector computeThesisNudges(); passive push gated OFF (thesis_nudge.enabled).
       if (fetch.includes('nudges')) {
         try {
-          const [ntTh] = await db.execute(
-            'SELECT t1.symbol, t1.conviction, t1.thesis_status, t1.bear_case, t1.invalidation_triggers, t1.created_at ' +
-            'FROM asset_thesis t1 INNER JOIN (SELECT symbol, MAX(created_at) AS latest FROM asset_thesis GROUP BY symbol) t2 ' +
-            'ON t1.symbol = t2.symbol AND t1.created_at = t2.latest'
-          );
-          const [ntMss] = await db.execute("SELECT symbol, trend, mss_status FROM mss_state WHERE timeframe = '4h'");
-          const mss4 = {};
-          for (const m of ntMss) mss4[String(m.symbol).replace('-USD', '').toUpperCase()] = m;
-          const nudges = [];
-          for (const t of ntTh) {
-            const sym = String(t.symbol).toUpperCase();
-            const conv = String(t.conviction || '').toLowerCase();
-            const status = String(t.thesis_status || '').toLowerCase();
-            // Triggers 1+2: thesis invalidated / weakened (grounded in Part B diff).
-            if (status === 'invalidated') {
-              nudges.push({ symbol: sym, type: 'thesis_invalidated', severity: 4, conviction: conv,
-                detail: 'Latest thesis marked INVALIDATED. Triggers: ' + String(t.invalidation_triggers || '').slice(0, 120), as_of: t.created_at });
-            } else if (status === 'weakened') {
-              nudges.push({ symbol: sym, type: 'thesis_weakened', severity: (conv === 'low' ? 4 : 3), conviction: conv,
-                detail: 'Conviction weakened to ' + conv + '. Bear case: ' + String(t.bear_case || '').slice(0, 120), as_of: t.created_at });
-            }
-            // Trigger 3: thesis-vs-structure divergence (buy-leaning conviction vs a CONFIRMED adverse 4h structure).
-            const m = mss4[sym];
-            if (m && (conv === 'high' || conv === 'medium')) {
-              const tr = String(m.trend || '').toLowerCase();
-              const st = String(m.mss_status || '').toLowerCase();
-              if (/down|bear/.test(tr) && st === 'confirmed') {
-                nudges.push({ symbol: sym, type: 'thesis_structure_divergence', severity: (conv === 'high' ? 3 : 2), conviction: conv,
-                  detail: conv + '-conviction thesis but 4h structure is a CONFIRMED ' + m.trend + ' -- market moving against the thesis.', as_of: t.created_at });
-              }
-            }
-          }
-          // Trigger 4: regime shift -- reuse the #50 broad-market guard (>= broad_threshold coins >= broad_floor_pct abnormal).
-          try {
-            const abnStates = await computeAbnormalMoves();
-            const abnSyms = Object.keys(abnStates).filter(s => abnStates[s] && abnStates[s].status === 'ABNORMAL');
-            const bFloor = (abnConfig && abnConfig.broad_floor_pct) ? abnConfig.broad_floor_pct : 3.0;
-            const bThresh = (abnConfig && abnConfig.broad_threshold) ? abnConfig.broad_threshold : 5;
-            const broad = abnSyms.filter(s => abnStates[s].abs_move >= bFloor);
-            if (broad.length >= bThresh) {
-              const pumps = broad.filter(s => abnStates[s].direction === 'PUMP').length;
-              const dumps = broad.filter(s => abnStates[s].direction === 'DUMP').length;
-              nudges.push({ symbol: 'MARKET', type: 'regime_shift', severity: 3, conviction: null,
-                detail: 'BROAD MARKET MOVE: ' + broad.length + ' coins >=' + bFloor + '% abnormal (' + pumps + ' PUMP / ' + dumps + ' DUMP). Re-check theses against a moving tape.', as_of: new Date().toISOString() });
-            }
-          } catch (e) { /* abnormal data unavailable -- skip regime trigger */ }
-          nudges.sort((a, b) => (b.severity - a.severity) || (new Date(b.as_of) - new Date(a.as_of)));
+          const nudges = await computeThesisNudges();
           result.nudges = {
             generated_at: new Date().toISOString(),
-            bar: 'HIGH -- thesis invalidation/weakening, confirmed thesis-vs-4h-structure divergence, and #50 broad-market regime shift. Recommend-only, NO Telegram push. Passive push deferred to Build 2b.',
+            bar: 'HIGH -- thesis invalidation/weakening, confirmed thesis-vs-4h-structure divergence, and #50 broad-market regime shift. Recommend-only; passive Telegram push GATED OFF (thesis_nudge.enabled, #262 Build 2b).',
             count: nudges.length,
             nudges,
           };
