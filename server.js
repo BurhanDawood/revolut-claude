@@ -11989,7 +11989,7 @@ function createMcpServer() {
   server.tool('manage_trading',
     'Log journal entries, trade intentions, trader preferences, update invested capital, or configure USDT sweep',
     {
-      action:                 z.enum(['log_journal', 'log_intention', 'save_preference', 'update_capital', 'configure_sweep', 'configure_auto_execute', 'log_dev_issue', 'update_session_state', 'upsert_coin_strategy', 'export_dev_log', 'log_research', 'log_pm_decision', 'log_dev_decision', 'void_journal', 'configure_away_mode', 'delete_tax_lot', 'log_catalyst', 'log_thesis', 'configure_abnormal', 'configure_dnd']).describe('What trading action to perform'),
+      action:                 z.enum(['log_journal', 'log_intention', 'save_preference', 'update_capital', 'configure_sweep', 'configure_auto_execute', 'log_dev_issue', 'update_session_state', 'upsert_coin_strategy', 'export_dev_log', 'log_research', 'log_pm_decision', 'log_dev_decision', 'void_journal', 'configure_away_mode', 'delete_tax_lot', 'log_catalyst', 'log_thesis', 'configure_abnormal', 'configure_dnd', 'configure_thesis_nudge']).describe('What trading action to perform'),
       symbol:                 z.string().optional().describe('Coin e.g. NEAR-USD or NEAR'),
       trade_action:           z.enum(['buy', 'sell', 'hold', 'add', 'reduce', 'payment', 'transfer', 'pass']).optional().describe('Trade action for log_journal or log_intention — use pass to log a skipped trade for shadow grading at +7d/+30d'),
       price:                  z.coerce.number().optional().describe('Price for log_journal'),
@@ -12066,6 +12066,9 @@ function createMcpServer() {
       abn_broad_floor_pct:  z.coerce.number().optional().describe('configure_abnormal: per-coin minimum % to count toward broad market total (default 3.0)'),
       abn_broad_threshold:  z.coerce.number().optional().describe('configure_abnormal: how many coins trigger broad market summary (default 5)'),
       abn_cooldown_min:     z.coerce.number().optional().describe('configure_abnormal: per-coin alert cooldown in minutes (default 30)'),
+      tn_enabled:           z.coerce.boolean().optional().describe('configure_thesis_nudge: turn the passive Telegram push on/off (#262 Build 2c)'),
+      tn_min_severity:      z.coerce.number().optional().describe('configure_thesis_nudge: minimum nudge severity to push (default 3)'),
+      tn_cooldown_min:      z.coerce.number().optional().describe('configure_thesis_nudge: per symbol+type re-push cooldown in minutes (default 240)'),
       dnd_action:       z.enum(['activate','deactivate','set_eligible','set_params','status']).optional().describe('configure_dnd sub-action'),
       dnd_coins:        z.preprocess(v => { if (typeof v === 'string') { try { return JSON.parse(v); } catch(e) { return v; } } return v; }, z.array(z.string())).optional().describe('configure_dnd: coin list e.g. ["BOBA","ENA"]'),
       dnd_arm_pct:      z.coerce.number().optional().describe('configure_dnd: pump %% to arm trail (default 30)'),
@@ -12074,7 +12077,7 @@ function createMcpServer() {
       dnd_retrace_pct:  z.coerce.number().optional().describe('configure_dnd: #160 %% of move price must retrace before trough arms (default 50)'),
       dnd_bounce_pct:   z.coerce.number().optional().describe('configure_dnd: #160 %% bounce off trough to trigger rebuy (default 8)'),
     },
-    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, away_buy_usd, away_sell_pct, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam, title, detail, category, status: devStatus, source: devSource, related_symbol: relSymbol, dev_log_id, active_workstream, progress, open_threads, next_action, recent_decision, recent_decisions, cs_status, cs_role, cs_theme, cs_strategy_md, pm_decision, pm_principle_tag, pm_conviction, pm_captured_by, pm_supersedes_id, dev_decision, dev_principle_tag, dev_cross_thread, dev_alternatives, dev_related_log, dev_supersedes_id, journal_id, tax_lot_id, away_action, away_coins, sell_floors, per_coin_enabled, catalyst_id, catalyst, catalyst_date, catalyst_type, expected_impact, priced_in_risk, catalyst_confidence, catalyst_source, catalyst_status, abn_alert_floor_pct, abn_broad_floor_pct, abn_broad_threshold, abn_cooldown_min, dnd_action, dnd_coins, dnd_arm_pct, dnd_trail_pct, dnd_sell_pct, dnd_retrace_pct, dnd_bounce_pct, conviction, bull_case, bear_case, invalidation_triggers, supporting_refs }) => {
+    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, away_buy_usd, away_sell_pct, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam, title, detail, category, status: devStatus, source: devSource, related_symbol: relSymbol, dev_log_id, active_workstream, progress, open_threads, next_action, recent_decision, recent_decisions, cs_status, cs_role, cs_theme, cs_strategy_md, pm_decision, pm_principle_tag, pm_conviction, pm_captured_by, pm_supersedes_id, dev_decision, dev_principle_tag, dev_cross_thread, dev_alternatives, dev_related_log, dev_supersedes_id, journal_id, tax_lot_id, away_action, away_coins, sell_floors, per_coin_enabled, catalyst_id, catalyst, catalyst_date, catalyst_type, expected_impact, priced_in_risk, catalyst_confidence, catalyst_source, catalyst_status, abn_alert_floor_pct, abn_broad_floor_pct, abn_broad_threshold, abn_cooldown_min, dnd_action, dnd_coins, dnd_arm_pct, dnd_trail_pct, dnd_sell_pct, dnd_retrace_pct, dnd_bounce_pct, conviction, bull_case, bear_case, invalidation_triggers, supporting_refs, tn_enabled, tn_min_severity, tn_cooldown_min }) => {
       // Make hodl_symbols accessible in configure_auto_execute via params object
       const params = { hodl_symbols: hodlSymbolsParam };
 
@@ -12525,6 +12528,23 @@ function createMcpServer() {
         Object.assign(abnConfig, updates);
         await db.execute("INSERT INTO system_config (config_key,config_value) VALUES ('abn_config',?) ON DUPLICATE KEY UPDATE config_value=?", [JSON.stringify(abnConfig), JSON.stringify(abnConfig)]);
         return { content: [{ type: 'text', text: JSON.stringify({ ok: true, action: 'configure_abnormal', abn_config: abnConfig }) }] };
+      } else if (action === 'configure_thesis_nudge') {
+        // #262 Build 2c -- the deliberate flip. Mirrors configure_abnormal's pattern. Read-merge-write; no-params call is a status read.
+        const [tnR] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'thesis_nudge'");
+        const tnCfg = tnR.length ? JSON.parse(tnR[0].config_value) : { enabled: false, min_severity: 3, cooldown_min: 240 };
+        const tnUpdates = {};
+        if (tn_enabled != null) tnUpdates.enabled = !!tn_enabled;
+        if (tn_min_severity != null) tnUpdates.min_severity = Number(tn_min_severity);
+        if (tn_cooldown_min != null) tnUpdates.cooldown_min = Number(tn_cooldown_min);
+        if (!Object.keys(tnUpdates).length) {
+          return { content: [{ type: 'text', text: JSON.stringify({ ok: true, thesis_nudge: tnCfg }) }] };
+        }
+        Object.assign(tnCfg, tnUpdates);
+        await db.execute("INSERT INTO system_config (config_key,config_value) VALUES ('thesis_nudge',?) ON DUPLICATE KEY UPDATE config_value=VALUES(config_value)", [JSON.stringify(tnCfg)]);
+        return { content: [{ type: 'text', text: JSON.stringify({
+          ok: true, action: 'configure_thesis_nudge', thesis_nudge: tnCfg,
+          note: tnCfg.enabled ? 'PUSH IS NOW LIVE -- #262 Build 2c flip complete. Next cron fire (every 2h, 08:00-22:00 London) will push if any nudge >= min_severity.' : 'Push remains OFF.',
+        }, null, 2) }] };
       } else if (action === 'configure_dnd') {
         const [dndR] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'dnd_mode'");
         const dndSt = dndR.length ? JSON.parse(dndR[0].config_value) : { enabled: false, coins: [], eligible_coins: [], default_params: {} };
