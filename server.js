@@ -11785,7 +11785,7 @@ function createMcpServer() {
           const deployed = process.env.RAILWAY_GIT_COMMIT_SHA || null;
           let head = null;
           try {
-            const r = await fetch('https://github.com/BurhanDawood/revolut-claude/commits/main.atom');
+            const r = await globalThis.fetch('https://github.com/BurhanDawood/revolut-claude/commits/main.atom');
             const xml = await r.text();
             const mm = xml.match(/Commit\/([0-9a-f]{7,40})/);
             head = mm ? mm[1] : null;
