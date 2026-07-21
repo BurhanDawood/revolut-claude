@@ -11593,7 +11593,7 @@ function createMcpServer() {
   server.tool('get_trading_data',
     'Get trading journal entries, active alerts, trader context/profile, rebalancing history, and dev_bridge messages',
     {
-      include: zLoose(z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'dev_bridge', 'coin_strategy', 'reconciliation', 'ledger', 'tax_lots', 'catalysts', 'thesis', 'nudges', 'all']))).optional()
+      include: zLoose(z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'dev_bridge', 'coin_strategy', 'reconciliation', 'ledger', 'tax_lots', 'catalysts', 'thesis', 'nudges', 'dev_health', 'all']))).optional()
         .describe('What data to fetch — defaults to all. dev_bridge, coin_strategy and reconciliation are never included in all; request them explicitly'),
       symbol:           z.string().optional().describe('Filter journal by coin e.g. NEAR'),
       limit:            z.coerce.number().optional().describe('Max journal entries to return, default 10'),
@@ -11776,6 +11776,59 @@ function createMcpServer() {
             nudges,
           };
         } catch (e) { result.nudges = { error: e.message }; }
+      }
+
+      // dev_health -- Dev-side health snapshot (#261 Part A). Read-only, opt-in (not in fetchAll).
+      if (fetch.includes('dev_health')) {
+        const dh = { generated_at: new Date().toISOString(), notes: [] };
+        try {
+          const deployed = process.env.RAILWAY_GIT_COMMIT_SHA || null;
+          let head = null;
+          try {
+            const r = await fetch('https://github.com/BurhanDawood/revolut-claude/commits/main.atom');
+            const xml = await r.text();
+            const mm = xml.match(/Commit\/([0-9a-f]{7,40})/);
+            head = mm ? mm[1] : null;
+          } catch (e) { dh.notes.push('github HEAD fetch failed: ' + e.message); }
+          dh.commit_sync = {
+            deployed: deployed || 'unknown (RAILWAY_GIT_COMMIT_SHA not set)',
+            github_head: head || 'fetch failed',
+            in_sync: (deployed && head) ? (deployed.slice(0, 7) === head.slice(0, 7)) : 'unknown',
+          };
+          if (!deployed) dh.notes.push('deployed commit unknown -- set RAILWAY_GIT_COMMIT_SHA to enable shipped-vs-deployed check');
+        } catch (e) { dh.commit_sync = { error: e.message }; }
+        try {
+          const up = process.uptime();
+          dh.runtime = { booted_at: new Date(Date.now() - up * 1000).toISOString(), uptime_min: Math.round(up / 60) };
+        } catch (e) { dh.runtime = { error: e.message }; }
+        dh.notes.push('live deploy status: use Railway MCP (not visible server-side)');
+        try {
+          const [aeR] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'ai_auto_execute'");
+          const ae = aeR.length ? JSON.parse(aeR[0].config_value) : {};
+          dh.sensitive_config = {
+            auto_exec_enabled: ae.enabled === true,
+            max_sell_pct: ae.max_sell_pct != null ? ae.max_sell_pct : null,
+            allowed_triggers: ae.allowed_triggers || [],
+            per_coin_enabled: Object.keys(ae.per_coin_enabled || {}).filter(k => (ae.per_coin_enabled || {})[k]),
+            hodl_symbols: ae.hodl_symbols || [],
+          };
+        } catch (e) { dh.sensitive_config = { error: e.message }; }
+        try {
+          let markerDate = null;
+          try {
+            const md = readFileSync('ARCHITECTURE.md', 'utf8');
+            const dm = md.match(/last-updated:\s*(\d{4}-\d{2}-\d{2})/i);
+            markerDate = dm ? dm[1] : null;
+          } catch (e) { dh.notes.push('ARCHITECTURE.md not readable: ' + e.message); }
+          const [rt] = await db.execute("SELECT MAX(resolved_at) AS latest FROM dev_log WHERE status = 'resolved'");
+          const latest = (rt.length && rt[0].latest) ? new Date(rt[0].latest).toISOString().slice(0, 10) : null;
+          dh.doc_staleness = {
+            architecture_marker_date: markerDate || 'no marker (add last-updated: YYYY-MM-DD to ARCHITECTURE.md)',
+            latest_resolved_ticket: latest || 'none',
+            stale: (markerDate && latest) ? (markerDate < latest) : 'unknown',
+          };
+        } catch (e) { dh.doc_staleness = { error: e.message }; }
+        result.dev_health = dh;
       }
 
       // reconciliation -- explicitly excluded from fetchAll; must be requested by name
