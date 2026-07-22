@@ -11593,7 +11593,7 @@ function createMcpServer() {
   server.tool('get_trading_data',
     'Get trading journal entries, active alerts, trader context/profile, rebalancing history, and dev_bridge messages',
     {
-      include: zLoose(z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'dev_bridge', 'coin_strategy', 'reconciliation', 'ledger', 'tax_lots', 'catalysts', 'thesis', 'nudges', 'dev_health', 'all']))).optional()
+      include: zLoose(z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'dev_bridge', 'coin_strategy', 'reconciliation', 'ledger', 'tax_lots', 'catalysts', 'thesis', 'nudges', 'dev_health', 'dev_recommendations', 'all']))).optional()
         .describe('What data to fetch — defaults to all. dev_bridge, coin_strategy and reconciliation are never included in all; request them explicitly'),
       symbol:           z.string().optional().describe('Filter journal by coin e.g. NEAR'),
       limit:            z.coerce.number().optional().describe('Max journal entries to return, default 10'),
@@ -11829,6 +11829,95 @@ function createMcpServer() {
           };
         } catch (e) { dh.doc_staleness = { error: e.message }; }
         result.dev_health = dh;
+      }
+
+      // dev_recommendations -- ranked Dev observations (#261 Part B) + friction patterns (Part C). Read-only, opt-in.
+      if (fetch.includes('dev_recommendations')) {
+        const dr = { generated_at: new Date().toISOString(), recommendations: [], friction_patterns: [], notes: [] };
+        const DRDAY = 86400000;
+        const drNow = Date.now();
+        const drAge = r => Math.floor((drNow - new Date(r.updated_at || r.created_at).getTime()) / DRDAY);
+        try {
+          const [drOpen] = await db.execute("SELECT id, status, category, title, created_at, updated_at FROM dev_log WHERE status <> 'resolved'");
+          dr.open_total = drOpen.length;
+          for (const r of drOpen.filter(x => String(x.status) === 'in_progress' && drAge(x) > 21).sort((a, b) => drAge(b) - drAge(a))) {
+            dr.recommendations.push({ type: 'stale_in_progress', severity: 4, ticket: r.id, age_days: drAge(r),
+              detail: '#' + r.id + ' (' + String(r.title || '').slice(0, 70) + ') is in_progress but untouched ' + drAge(r) + 'd.',
+              action: 'Resume it, or move it back to open / resolve it.' });
+          }
+          const drAging = drOpen.filter(x => String(x.status) === 'open' && drAge(x) > 30).sort((a, b) => drAge(b) - drAge(a));
+          if (drAging.length) {
+            dr.recommendations.push({ type: 'aging_backlog', severity: 2, count: drAging.length,
+              detail: drAging.length + ' open tickets idle >30d. Oldest: ' + drAging.slice(0, 3).map(r => '#' + r.id + ' (' + drAge(r) + 'd)').join(', ') + '.',
+              action: 'Re-rank the queue, schedule, or close as wont-fix.' });
+          }
+        } catch (e) { dr.notes.push('dev_log scan failed: ' + e.message); }
+        try {
+          const [pqR] = await db.execute("SELECT preference_value, updated_at FROM trader_profile WHERE preference_key = 'dev_priority_queue'");
+          if (!pqR.length) {
+            dr.recommendations.push({ type: 'priority_queue_missing', severity: 3,
+              detail: 'No dev_priority_queue preference found -- ranking has no maintained source of truth.',
+              action: 'Create one via manage_trading save_preference.' });
+          } else {
+            const pqAge = Math.floor((drNow - new Date(pqR[0].updated_at).getTime()) / DRDAY);
+            const ids = [];
+            const rx = /#(\d+)/g;
+            let mm;
+            while ((mm = rx.exec(String(pqR[0].preference_value))) !== null) {
+              const n = Number(mm[1]);
+              if (n > 0 && ids.indexOf(n) === -1 && ids.length < 200) ids.push(n);
+            }
+            let done = 0;
+            if (ids.length) {
+              const [st] = await db.execute('SELECT id, status FROM dev_log WHERE id IN (' + ids.join(',') + ')');
+              done = st.filter(x => String(x.status) === 'resolved').length;
+            }
+            const pct = ids.length ? Math.round((done / ids.length) * 100) : 0;
+            dr.priority_queue = { age_days: pqAge, referenced: ids.length, resolved: done, resolved_pct: pct };
+            if (pqAge > 30 || pct >= 70) {
+              dr.recommendations.push({ type: 'priority_queue_stale', severity: 3, age_days: pqAge,
+                detail: 'dev_priority_queue last updated ' + pqAge + 'd ago; ' + done + '/' + ids.length + ' (' + pct + '%) of its referenced tickets are already resolved.',
+                action: 'Re-rank the queue against the current open backlog.' });
+            }
+          }
+        } catch (e) { dr.notes.push('priority queue check failed: ' + e.message); }
+        try {
+          const [drAe] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'ai_auto_execute'");
+          const ae2 = drAe.length ? JSON.parse(drAe[0].config_value) : {};
+          if (ae2.enabled === true) {
+            const coins = Object.keys(ae2.per_coin_enabled || {}).filter(k => (ae2.per_coin_enabled || {})[k]);
+            dr.recommendations.push({ type: 'config_risk', severity: 3,
+              detail: 'ai_auto_execute is ENABLED. Per-coin armed: ' + (coins.length ? coins.join(', ') : 'none') + '. max_sell_pct ' + (ae2.max_sell_pct != null ? ae2.max_sell_pct : 'n/a') + '. Triggers: ' + JSON.stringify(ae2.allowed_triggers || []) + '.',
+              action: 'Confirm still intended; disarm coins no longer in an active loop.' });
+          }
+        } catch (e) { dr.notes.push('config check failed: ' + e.message); }
+        try {
+          const [frR] = await db.execute("SELECT id, title, created_at FROM dev_log WHERE category = 'friction' ORDER BY created_at DESC LIMIT 60");
+          dr.friction_total = frR.length;
+          if (!frR.length) {
+            dr.notes.push('no friction entries yet -- log via manage_trading log_dev_issue with category friction');
+          } else {
+            const stop = ' the and for with from that this when into not but was are has had get set use via out all any its one two new old off top ';
+            const tok = {};
+            for (const f of frR) {
+              const seen = {};
+              for (const w of String(f.title || '').toLowerCase().split(/[^a-z0-9]+/)) {
+                if (w.length < 4 || stop.indexOf(' ' + w + ' ') !== -1 || seen[w]) continue;
+                seen[w] = 1;
+                if (!tok[w]) tok[w] = [];
+                tok[w].push(f.id);
+              }
+            }
+            for (const w of Object.keys(tok)) {
+              if (tok[w].length >= 2) dr.friction_patterns.push({ keyword: w, occurrences: tok[w].length, tickets: tok[w] });
+            }
+            dr.friction_patterns.sort((a, b) => b.occurrences - a.occurrences);
+            dr.friction_patterns = dr.friction_patterns.slice(0, 10);
+          }
+        } catch (e) { dr.notes.push('friction scan failed: ' + e.message); }
+        dr.recommendations.sort((a, b) => b.severity - a.severity);
+        dr.count = dr.recommendations.length;
+        result.dev_recommendations = dr;
       }
 
       // reconciliation -- explicitly excluded from fetchAll; must be requested by name
