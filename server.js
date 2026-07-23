@@ -11892,27 +11892,48 @@ function createMcpServer() {
           }
         } catch (e) { dr.notes.push('config check failed: ' + e.message); }
         try {
-          const [frR] = await db.execute("SELECT id, title, created_at FROM dev_log WHERE category = 'friction' ORDER BY created_at DESC LIMIT 60");
+          const [frR] = await db.execute("SELECT id, title, detail, created_at FROM dev_log WHERE category = 'friction' ORDER BY created_at DESC LIMIT 60");
           dr.friction_total = frR.length;
           if (!frR.length) {
-            dr.notes.push('no friction entries yet -- log via manage_trading log_dev_issue with category friction');
+            dr.notes.push('no friction entries yet -- log via manage_trading log_dev_issue with category friction; add a "tags: a, b, c" line in detail for best pattern detection');
           } else {
-            const stop = ' the and for with from that this when into not but was are has had get set use via out all any its one two new old off top ';
+            const stop = ' the and for with from that this when into not but was are has had get set use via out all any its one two new old off top friction rule rules file files line lines text case step steps time work item items list name names runs used using note notes fixed fixes bugs issue issues error errors fail fails failed apply block blocks because before after while would should could there their been being have having does than then they them what where which will very just also like even still more most some such only same need needs made make makes must each other ';
+            const srank = s => (s === 'tagged' ? 0 : (s === 'mixed' ? 1 : 2));
             const tok = {};
+            const tsrc = {};
+            let tagged = 0;
             for (const f of frR) {
+              const dtl = String(f.detail || '');
+              const tm = dtl.match(/(?:^|\n)\s*tags:\s*([^\n]+)/i);
+              let words = [];
+              let mode = 'inferred';
+              if (tm) {
+                mode = 'tagged';
+                tagged++;
+                words = tm[1].split(',').map(s => s.trim().toLowerCase()).filter(s => s.length >= 3 && s.length <= 30);
+              } else {
+                const ttl = String(f.title || '').replace(/^\s*friction\s*:\s*/i, '');
+                words = (ttl + ' ' + dtl).toLowerCase().split(/[^a-z0-9-]+/).filter(w => w.length >= 4 && /[a-z]/.test(w) && stop.indexOf(' ' + w + ' ') === -1);
+              }
               const seen = {};
-              for (const w of String(f.title || '').toLowerCase().split(/[^a-z0-9]+/)) {
-                if (w.length < 4 || stop.indexOf(' ' + w + ' ') !== -1 || seen[w]) continue;
+              for (const w of words) {
+                if (!w || seen[w]) continue;
                 seen[w] = 1;
-                if (!tok[w]) tok[w] = [];
+                if (!tok[w]) { tok[w] = []; tsrc[w] = {}; }
                 tok[w].push(f.id);
+                tsrc[w][mode] = 1;
               }
             }
+            dr.friction_tagged = tagged;
+            dr.friction_untagged = frR.length - tagged;
             for (const w of Object.keys(tok)) {
-              if (tok[w].length >= 2) dr.friction_patterns.push({ keyword: w, occurrences: tok[w].length, tickets: tok[w] });
+              if (tok[w].length < 2) continue;
+              const s = (tsrc[w].tagged && tsrc[w].inferred) ? 'mixed' : (tsrc[w].tagged ? 'tagged' : 'inferred');
+              dr.friction_patterns.push({ pattern: w, occurrences: tok[w].length, tickets: tok[w], source: s });
             }
-            dr.friction_patterns.sort((a, b) => b.occurrences - a.occurrences);
+            dr.friction_patterns.sort((a, b) => (b.occurrences - a.occurrences) || (srank(a.source) - srank(b.source)));
             dr.friction_patterns = dr.friction_patterns.slice(0, 10);
+            if (dr.friction_untagged) dr.notes.push(dr.friction_untagged + ' friction entr(ies) have no "tags:" line -- those patterns are free-text inferred and noisier');
           }
         } catch (e) { dr.notes.push('friction scan failed: ' + e.message); }
         dr.recommendations.sort((a, b) => b.severity - a.severity);
