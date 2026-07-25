@@ -11489,6 +11489,81 @@ function createMcpServer() {
     }
   );
 
+  // ── Tool: get_price_series (#259 Phase 1 — read-only historical price series for backtesting) ──
+  server.tool('get_price_series',
+    'Read-only historical price series for one symbol from stored captures, for analysis/backtesting. source=intraday reads 2-min price_intraday (last ~30d; pruned nightly), source=daily reads price_history daily closes. Optionally resample to OHLC bars (5m/1h/4h/1d) to keep payloads small; resample=raw returns raw points (capped). All timestamps UTC. Read-only: fires no alerts, mutates no state.',
+    {
+      symbol:   z.string().describe('Coin symbol e.g. CC or CC-USD'),
+      source:   z.enum(['intraday', 'daily']).optional().describe('intraday = 2-min captures (default); daily = daily closes'),
+      start:    z.string().optional().describe('ISO date/datetime inclusive (UTC), e.g. 2026-07-01 or 2026-07-01T00:00:00Z'),
+      end:      z.string().optional().describe('ISO date/datetime inclusive (UTC); defaults to now'),
+      resample: z.enum(['5m', '1h', '4h', '1d', 'raw']).optional().describe('OHLC bar size; defaults 1h for intraday, raw for daily'),
+      limit:    z.coerce.number().optional().describe('Max rows/bars returned (default 3000, hard cap 6000)'),
+    },
+    async ({ symbol, source, start, end, resample, limit } = {}) => {
+      try {
+        if (!symbol) return { content: [{ type: 'text', text: JSON.stringify({ error: 'symbol required' }) }] };
+        const sym = symbol.toUpperCase().includes('-USD') ? symbol.toUpperCase() : symbol.toUpperCase() + '-USD';
+        const src = source === 'daily' ? 'daily' : 'intraday';
+        const table = src === 'daily' ? 'price_history' : 'price_intraday';
+        const rs = resample || (src === 'daily' ? 'raw' : '1h');
+        const HARD = 6000;
+        let cap = parseInt(limit) || 3000;
+        if (cap > HARD) cap = HARD;
+        if (cap < 1) cap = 1;
+        const endMs = end ? Date.parse(end) : Date.now();
+        if (isNaN(endMs)) return { content: [{ type: 'text', text: JSON.stringify({ error: 'bad end date' }) }] };
+        const defBackDays = src === 'daily' ? 400 : 30;
+        const startMs = start ? Date.parse(start) : (endMs - defBackDays * 86400000);
+        if (isNaN(startMs)) return { content: [{ type: 'text', text: JSON.stringify({ error: 'bad start date' }) }] };
+        if (startMs >= endMs) return { content: [{ type: 'text', text: JSON.stringify({ error: 'start must be before end' }) }] };
+        const startIso = new Date(startMs).toISOString().slice(0, 19).replace('T', ' ');
+        const endIso = new Date(endMs).toISOString().slice(0, 19).replace('T', ' ');
+        let rows;
+        try {
+          [rows] = await db.execute(
+            'SELECT price, recorded_at FROM ' + table + ' WHERE symbol = ? AND recorded_at BETWEEN ? AND ? ORDER BY recorded_at ASC',
+            [sym, startIso, endIso]
+          );
+        } catch (e) {
+          return { content: [{ type: 'text', text: JSON.stringify({ error: 'query failed: ' + e.message }) }] };
+        }
+        const out = { symbol: sym, source: src, resample: rs, start_utc: startIso, end_utc: endIso, points_in_window: rows.length };
+        if (!rows.length) { out.note = 'no captures in window (intraday is pruned at 30d)'; out.series = []; return { content: [{ type: 'text', text: JSON.stringify(out) }] }; }
+        let mn = Infinity, mx = -Infinity;
+        const firstP = parseFloat(rows[0].price), lastP = parseFloat(rows[rows.length - 1].price);
+        for (const r of rows) { const p = parseFloat(r.price); if (p < mn) mn = p; if (p > mx) mx = p; }
+        out.summary = { first: firstP, last: lastP, min: mn, max: mx, change_pct: firstP > 0 ? Number(((lastP - firstP) / firstP * 100).toFixed(2)) : null };
+        if (rs === 'raw') {
+          let pts = rows.map(r => ({ t: new Date(r.recorded_at).toISOString(), p: parseFloat(r.price) }));
+          if (pts.length > cap) { out.truncated = { of: pts.length, returned: cap, note: 'most recent ' + cap + ' points; use resample for the full window' }; pts = pts.slice(-cap); }
+          out.series = pts;
+        } else {
+          const binMs = { '5m': 300000, '1h': 3600000, '4h': 14400000, '1d': 86400000 }[rs];
+          const bins = new Map();
+          for (const r of rows) {
+            const ts = new Date(r.recorded_at).getTime();
+            const p = parseFloat(r.price);
+            if (!(p > 0)) continue;
+            const k = Math.floor(ts / binMs) * binMs;
+            let b = bins.get(k);
+            if (!b) { b = { t: new Date(k).toISOString(), o: p, h: p, l: p, c: p, n: 0 }; bins.set(k, b); }
+            if (p > b.h) b.h = p;
+            if (p < b.l) b.l = p;
+            b.c = p; b.n++;
+          }
+          let bars = Array.from(bins.values());
+          out.bars_total = bars.length;
+          if (bars.length > cap) { out.truncated = { of: bars.length, returned: cap, note: 'most recent ' + cap + ' bars' }; bars = bars.slice(-cap); }
+          out.series = bars;
+        }
+        return { content: [{ type: 'text', text: JSON.stringify(out) }] };
+      } catch (e) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: e.message }) }] };
+      }
+    }
+  );
+
   // ── Tool: get_portfolio_data ──────────────────────────────────────────────
   server.tool('get_portfolio_data',
     'Get complete portfolio data across all accounts — Revolut X balances and P&L, Kraken balances, and Tangem XRP wallet',
@@ -11593,7 +11668,7 @@ function createMcpServer() {
   server.tool('get_trading_data',
     'Get trading journal entries, active alerts, trader context/profile, rebalancing history, and dev_bridge messages',
     {
-      include: zLoose(z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'dev_bridge', 'coin_strategy', 'reconciliation', 'ledger', 'tax_lots', 'catalysts', 'thesis', 'nudges', 'dev_health', 'dev_recommendations', 'all']))).optional()
+      include: zLoose(z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'dev_bridge', 'coin_strategy', 'reconciliation', 'ledger', 'tax_lots', 'catalysts', 'thesis', 'nudges', 'dev_health', 'dev_recommendations', 'volatility_baseline', 'all']))).optional()
         .describe('What data to fetch — defaults to all. dev_bridge, coin_strategy and reconciliation are never included in all; request them explicitly'),
       symbol:           z.string().optional().describe('Filter journal by coin e.g. NEAR'),
       limit:            z.coerce.number().optional().describe('Max journal entries to return, default 10'),
@@ -11939,6 +12014,35 @@ function createMcpServer() {
         dr.recommendations.sort((a, b) => b.severity - a.severity);
         dr.count = dr.recommendations.length;
         result.dev_recommendations = dr;
+      }
+
+      // volatility_baseline (#259 Phase 1) -- per-symbol 14-day abnormal-move baseline + live detector config. Read-only, opt-in.
+      if (fetch.includes('volatility_baseline')) {
+        const vb = { generated_at: new Date().toISOString(),
+          config: { k: ABN_K, floor_pct: ABN_FLOOR_PCT, lookback_days: ABN_LOOKBACK_DAYS, max_gap_min: ABN_MAX_GAP_MS / 60000,
+            alert_floor_pct: abnConfig.alert_floor_pct, broad_threshold: abnConfig.broad_threshold, broad_floor_pct: abnConfig.broad_floor_pct, cooldown_min: abnConfig.cooldown_min },
+          symbols: [] };
+        try {
+          const [vcs] = await db.execute("SELECT symbol FROM coin_strategy WHERE symbol NOT IN ('DEAD_BAGS','EXITED','INDEX')");
+          for (const vr of vcs) {
+            const psym = vr.symbol + '-USD';
+            let vrows;
+            try {
+              [vrows] = await db.execute(
+                'SELECT price, recorded_at FROM price_intraday WHERE symbol = ? AND recorded_at > DATE_SUB(NOW(), INTERVAL ? DAY) ORDER BY recorded_at ASC',
+                [psym, ABN_LOOKBACK_DAYS]
+              );
+            } catch (e) { continue; }
+            if (!vrows || vrows.length < 12) { vb.symbols.push({ symbol: psym, sample: vrows ? vrows.length : 0, status: 'insufficient_data' }); continue; }
+            const vstats = abnComputeBaseline(vrows);
+            if (!vstats) { vb.symbols.push({ symbol: psym, sample: vrows.length, status: 'insufficient_data' }); continue; }
+            vb.symbols.push({ symbol: psym,
+              baseline_pct: Number(vstats.baseline.toFixed(4)), std_pct: Number(vstats.std.toFixed(4)), p95_pct: Number(vstats.p95.toFixed(3)),
+              threshold_pct: Number((ABN_K * vstats.baseline).toFixed(3)), sample: vstats.sample,
+              last_price: parseFloat(vrows[vrows.length - 1].price), last_at: new Date(vrows[vrows.length - 1].recorded_at).toISOString() });
+          }
+        } catch (e) { vb.error = e.message; }
+        result.volatility_baseline = vb;
       }
 
       // reconciliation -- explicitly excluded from fetchAll; must be requested by name
