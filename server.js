@@ -11564,6 +11564,110 @@ function createMcpServer() {
     }
   );
 
+  // ── Tool: get_abnormal_events (#259 Phase 2 — read-only replay of the #50 detector over a window) ──
+  server.tool('get_abnormal_events',
+    'Read-only REPLAY of the #50 abnormal-move detector over stored price_intraday for backtesting. Walks the 2-min series and flags every move where abs(move%) >= k*baseline AND >= abs_floor, using the SAME trailing-14d mean-abs-move baseline as the live detector (computed via an O(n) sliding window, exact). Returns timestamped PUMP/DUMP events. k and abs_floor overridable to sweep thresholds; cooldown_min (default 0 = raw) collapses same-direction bursts within N minutes to the strongest. Intraday only. Fires no alerts, mutates no state. NOTE: intraday is pruned at 30d while the baseline needs 14d lead-in, so only the most recent ~16d are full-fidelity; each event carries baseline_sample and the response marks high_fidelity_from.',
+    {
+      symbol:       z.string().describe('Coin symbol e.g. CC or CC-USD'),
+      start:        z.string().optional().describe('ISO date/datetime inclusive (UTC); default end-30d'),
+      end:          z.string().optional().describe('ISO date/datetime inclusive (UTC); default now'),
+      k:            z.coerce.number().optional().describe('baseline multiple for the threshold (default 3 = live ABN_K)'),
+      abs_floor:    z.coerce.number().optional().describe('minimum abs move %% to count (default 0.4 = live ABN_FLOOR_PCT)'),
+      cooldown_min: z.coerce.number().optional().describe('collapse same-direction events within N min to the strongest (default 0 = all raw events)'),
+    },
+    async ({ symbol, start, end, k, abs_floor, cooldown_min } = {}) => {
+      try {
+        if (!symbol) return { content: [{ type: 'text', text: JSON.stringify({ error: 'symbol required' }) }] };
+        const sym = symbol.toUpperCase().includes('-USD') ? symbol.toUpperCase() : symbol.toUpperCase() + '-USD';
+        const kk = (k != null && k > 0) ? Number(k) : ABN_K;
+        const floor = (abs_floor != null && abs_floor >= 0) ? Number(abs_floor) : ABN_FLOOR_PCT;
+        const cd = (cooldown_min != null && cooldown_min > 0) ? Number(cooldown_min) * 60000 : 0;
+        const endMs = end ? Date.parse(end) : Date.now();
+        if (isNaN(endMs)) return { content: [{ type: 'text', text: JSON.stringify({ error: 'bad end date' }) }] };
+        const startMs = start ? Date.parse(start) : (endMs - 30 * 86400000);
+        if (isNaN(startMs)) return { content: [{ type: 'text', text: JSON.stringify({ error: 'bad start date' }) }] };
+        if (startMs >= endMs) return { content: [{ type: 'text', text: JSON.stringify({ error: 'start must be before end' }) }] };
+        const lookbackMs = ABN_LOOKBACK_DAYS * 86400000;
+        const readFromIso = new Date(startMs - lookbackMs).toISOString().slice(0, 19).replace('T', ' ');
+        const readToIso = new Date(endMs).toISOString().slice(0, 19).replace('T', ' ');
+        let rows;
+        try {
+          [rows] = await db.execute(
+            'SELECT price, recorded_at FROM price_intraday WHERE symbol = ? AND recorded_at BETWEEN ? AND ? ORDER BY recorded_at ASC',
+            [sym, readFromIso, readToIso]
+          );
+        } catch (e) { return { content: [{ type: 'text', text: JSON.stringify({ error: 'query failed: ' + e.message }) }] }; }
+        const params = { k: kk, abs_floor: floor, cooldown_min: cd / 60000, lookback_days: ABN_LOOKBACK_DAYS };
+        if (!rows || rows.length < 12) return { content: [{ type: 'text', text: JSON.stringify({ symbol: sym, params, scanned_points: rows ? rows.length : 0, note: 'insufficient captures in window (intraday pruned at 30d)', events: [] }) }] };
+        const earliestMs = new Date(rows[0].recorded_at).getTime();
+        const win = [];
+        let sum = 0, qualifying = 0;
+        const raw = [];
+        for (let i = 1; i < rows.length; i++) {
+          const pPrev = parseFloat(rows[i - 1].price), pCur = parseFloat(rows[i].price);
+          if (!(pPrev > 0) || !(pCur > 0)) continue;
+          const tCur = new Date(rows[i].recorded_at).getTime();
+          const dt = tCur - new Date(rows[i - 1].recorded_at).getTime();
+          const gapOk = dt > 0 && dt <= ABN_MAX_GAP_MS;
+          while (win.length && win[0].t <= tCur - lookbackMs) { sum -= win[0].m; win.shift(); }
+          if (gapOk) {
+            const move = (pCur - pPrev) / pPrev * 100;
+            const absMove = Math.abs(move);
+            const baseline = win.length >= 10 ? sum / win.length : null;
+            if (baseline !== null && baseline > 0) {
+              const threshold = kk * baseline;
+              if (absMove >= threshold && absMove >= floor && tCur >= startMs && tCur <= endMs) {
+                raw.push({ t: new Date(tCur).toISOString(), direction: move > 0 ? 'PUMP' : 'DUMP',
+                  price: pCur, prev_price: pPrev, move_pct: Number(move.toFixed(3)),
+                  baseline_pct: Number(baseline.toFixed(4)), threshold_pct: Number(threshold.toFixed(3)),
+                  multiple: Number((absMove / baseline).toFixed(1)), interval_min: Number((dt / 60000).toFixed(1)),
+                  baseline_sample: win.length });
+              }
+            }
+            win.push({ t: tCur, m: absMove }); sum += absMove; qualifying++;
+          }
+        }
+        // optional cooldown collapse (per direction, keep strongest within window)
+        let events = raw;
+        if (cd > 0 && raw.length) {
+          const out = [];
+          const cur = { PUMP: null, DUMP: null };
+          for (const e of raw) {
+            const d = e.direction, c = cur[d];
+            const et = Date.parse(e.t);
+            if (c && et - c.lastT <= cd) { c.lastT = et; if (e.multiple > c.best.multiple) c.best = e; }
+            else { if (c) out.push(c.best); cur[d] = { lastT: et, best: e }; }
+          }
+          if (cur.PUMP) out.push(cur.PUMP.best);
+          if (cur.DUMP) out.push(cur.DUMP.best);
+          out.sort((a, b) => Date.parse(a.t) - Date.parse(b.t));
+          events = out;
+        }
+        const CAP = 8000;
+        const truncated = events.length > CAP;
+        if (truncated) events = events.slice(0, CAP);
+        const pumps = events.filter(e => e.direction === 'PUMP');
+        const dumps = events.filter(e => e.direction === 'DUMP');
+        const strongest = arr => arr.reduce((m, e) => (!m || e.multiple > m.multiple) ? e : m, null);
+        const out = {
+          symbol: sym, source: 'intraday',
+          window: { start_utc: new Date(startMs).toISOString(), end_utc: new Date(endMs).toISOString() },
+          params,
+          high_fidelity_from: new Date(earliestMs + lookbackMs).toISOString(),
+          fidelity_note: 'events before high_fidelity_from use a baseline computed from < ' + ABN_LOOKBACK_DAYS + 'd of retained data (earlier history pruned); treat them as lower-fidelity',
+          scanned_points: rows.length, qualifying_moves: qualifying,
+          event_count: events.length, pumps: pumps.length, dumps: dumps.length,
+          largest_pump: strongest(pumps), largest_dump: strongest(dumps),
+          events
+        };
+        if (truncated) out.truncated = { note: 'capped at ' + CAP + ' events; narrow the window or raise abs_floor/k' };
+        return { content: [{ type: 'text', text: JSON.stringify(out) }] };
+      } catch (e) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: e.message }) }] };
+      }
+    }
+  );
+
   // ── Tool: get_portfolio_data ──────────────────────────────────────────────
   server.tool('get_portfolio_data',
     'Get complete portfolio data across all accounts — Revolut X balances and P&L, Kraken balances, and Tangem XRP wallet',
