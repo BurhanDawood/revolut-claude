@@ -761,6 +761,21 @@ await db.execute(`CREATE TABLE IF NOT EXISTS price_intraday (
   recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   INDEX idx_intraday_symbol_time (symbol, recorded_at)
 )`);
+await db.execute(`CREATE TABLE IF NOT EXISTS price_intraday_hourly (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  symbol VARCHAR(50) NOT NULL,
+  hour_bucket DATETIME NOT NULL,
+  open_px DECIMAL(20,10) NOT NULL,
+  high_px DECIMAL(20,10) NOT NULL,
+  low_px DECIMAL(20,10) NOT NULL,
+  close_px DECIMAL(20,10) NOT NULL,
+  sample_count INT NOT NULL,
+  UNIQUE KEY uq_hourly_symbol_hour (symbol, hour_bucket),
+  INDEX idx_hourly_symbol_time (symbol, hour_bucket)
+)`);
+// #259 Phase 3: seed/catch-up the hourly rollup in the background (never blocks boot)
+initHourlyRollup().catch(err => console.error('[hourly-rollup] init call error:', err.message));
+
 
 await db.execute(`CREATE TABLE IF NOT EXISTS balance_snapshots (
   symbol VARCHAR(50) PRIMARY KEY,
@@ -4986,6 +5001,66 @@ async function researchAsset(symbol, triggeredBy = 'manual') {
   };
 }
 
+
+// #259 Phase 3 — hourly rollup of price_intraday into long-retained price_intraday_hourly (read-only-safe: writes ONLY to the rollup table).
+async function rollupIntradayHourlyRange(startMs, endMs) {
+  try {
+    const s = new Date(startMs).toISOString().slice(0, 19).replace('T', ' ');
+    const e = new Date(endMs).toISOString().slice(0, 19).replace('T', ' ');
+    const [rows] = await db.execute(
+      'SELECT symbol, price, recorded_at FROM price_intraday WHERE recorded_at >= ? AND recorded_at < ? ORDER BY symbol ASC, recorded_at ASC',
+      [s, e]
+    );
+    if (!rows.length) return { buckets: 0, written: 0 };
+    const map = new Map();
+    for (const r of rows) {
+      const p = parseFloat(r.price);
+      if (!(p > 0)) continue;
+      const hb = Math.floor(new Date(r.recorded_at).getTime() / 3600000) * 3600000;
+      const key = r.symbol + '|' + hb;
+      let b = map.get(key);
+      if (!b) { b = { sym: r.symbol, hb, o: p, h: p, l: p, c: p, n: 0 }; map.set(key, b); }
+      if (p > b.h) b.h = p;
+      if (p < b.l) b.l = p;
+      b.c = p; b.n++;
+    }
+    const buckets = Array.from(map.values());
+    const CHUNK = 200;
+    let written = 0;
+    for (let i = 0; i < buckets.length; i += CHUNK) {
+      const slice = buckets.slice(i, i + CHUNK);
+      const ph = slice.map(() => '(?, ?, ?, ?, ?, ?, ?)').join(', ');
+      const vals = [];
+      for (const b of slice) vals.push(b.sym, new Date(b.hb).toISOString().slice(0, 19).replace('T', ' '), b.o, b.h, b.l, b.c, b.n);
+      await db.execute(
+        'INSERT INTO price_intraday_hourly (symbol, hour_bucket, open_px, high_px, low_px, close_px, sample_count) VALUES ' + ph +
+        ' ON DUPLICATE KEY UPDATE open_px=VALUES(open_px), high_px=VALUES(high_px), low_px=VALUES(low_px), close_px=VALUES(close_px), sample_count=VALUES(sample_count)',
+        vals
+      );
+      written += slice.length;
+    }
+    return { buckets: buckets.length, written };
+  } catch (err) { console.error('[hourly-rollup] range error:', err.message); return { error: err.message }; }
+}
+
+async function initHourlyRollup() {
+  try {
+    const [c] = await db.execute('SELECT COUNT(*) AS n FROM price_intraday_hourly');
+    if (Number(c[0].n) === 0) {
+      const todayStart = Math.floor(Date.now() / 86400000) * 86400000;
+      let total = 0;
+      for (let d = 31; d >= 0; d--) {
+        const dayStart = todayStart - d * 86400000;
+        const res = await rollupIntradayHourlyRange(dayStart, dayStart + 86400000);
+        total += (res.written || 0);
+      }
+      console.log('[hourly-rollup] backfill complete, buckets written:', total);
+    } else {
+      const res = await rollupIntradayHourlyRange(Date.now() - 72 * 3600000, Date.now());
+      console.log('[hourly-rollup] boot catch-up:', JSON.stringify(res));
+    }
+  } catch (err) { console.error('[hourly-rollup] init error:', err.message); }
+}
 
 async function recordDailyPrices() {
   try {
@@ -10283,6 +10358,7 @@ async function evaluateThesisNudges() {
 // Cadence: every 2h, 08:00-22:00 London. GATED OFF by default -- enabling is a separate deliberate flip (#262 Build 2c).
 cron.schedule('0 8,10,12,14,16,18,20,22 * * *', evaluateThesisNudges, { timezone: 'Europe/London' });
 cron.schedule('0 0 * * *', recordDailyPrices, { timezone: 'Europe/London' });
+cron.schedule('5 2 * * *', async () => { await rollupIntradayHourlyRange(Date.now() - 72 * 3600000, Date.now()); }, { timezone: 'Europe/London' }); // #259 Phase 3 hourly rollup (runs before the 2:15 intraday prune)
 cron.schedule('0 3 * * *', runReconciliation, { timezone: 'Europe/London' });
 cron.schedule('45 3 * * *', runCapitalIntegrityCheck, { timezone: 'Europe/London' }); // #233 capital-integrity backstop
 cron.schedule('50 3 * * *', runPumpArmStalenessCheck, { timezone: 'Europe/London' }); // #222 stuck-armed staleness alert
