@@ -11567,10 +11567,10 @@ function createMcpServer() {
 
   // ── Tool: get_price_series (#259 Phase 1 — read-only historical price series for backtesting) ──
   server.tool('get_price_series',
-    'Read-only historical price series for one symbol from stored captures, for analysis/backtesting. source=intraday reads 2-min price_intraday (last ~30d; pruned nightly), source=daily reads price_history daily closes. Optionally resample to OHLC bars (5m/1h/4h/1d) to keep payloads small; resample=raw returns raw points (capped). All timestamps UTC. Read-only: fires no alerts, mutates no state.',
+    'Read-only historical price series for one symbol from stored captures, for analysis/backtesting. source=intraday reads 2-min price_intraday (last ~30d; pruned nightly), source=hourly reads the long-retained price_intraday_hourly rollup (OHLC, survives the 30d prune), source=daily reads price_history daily closes. Optionally resample to OHLC bars (5m/1h/4h/1d) to keep payloads small; resample=raw returns raw points (capped). All timestamps UTC. Read-only: fires no alerts, mutates no state.',
     {
       symbol:   z.string().describe('Coin symbol e.g. CC or CC-USD'),
-      source:   z.enum(['intraday', 'daily']).optional().describe('intraday = 2-min captures (default); daily = daily closes'),
+      source:   z.enum(['intraday', 'daily', 'hourly']).optional().describe('intraday = 2-min captures (default, ~30d); hourly = long-retained OHLC rollup; daily = daily closes'),
       start:    z.string().optional().describe('ISO date/datetime inclusive (UTC), e.g. 2026-07-01 or 2026-07-01T00:00:00Z'),
       end:      z.string().optional().describe('ISO date/datetime inclusive (UTC); defaults to now'),
       resample: z.enum(['5m', '1h', '4h', '1d', 'raw']).optional().describe('OHLC bar size; defaults 1h for intraday, raw for daily'),
@@ -11580,7 +11580,7 @@ function createMcpServer() {
       try {
         if (!symbol) return { content: [{ type: 'text', text: JSON.stringify({ error: 'symbol required' }) }] };
         const sym = symbol.toUpperCase().includes('-USD') ? symbol.toUpperCase() : symbol.toUpperCase() + '-USD';
-        const src = source === 'daily' ? 'daily' : 'intraday';
+        const src = source === 'daily' ? 'daily' : (source === 'hourly' ? 'hourly' : 'intraday');
         const table = src === 'daily' ? 'price_history' : 'price_intraday';
         const rs = resample || (src === 'daily' ? 'raw' : '1h');
         const HARD = 6000;
@@ -11589,13 +11589,41 @@ function createMcpServer() {
         if (cap < 1) cap = 1;
         const endMs = end ? Date.parse(end) : Date.now();
         if (isNaN(endMs)) return { content: [{ type: 'text', text: JSON.stringify({ error: 'bad end date' }) }] };
-        const defBackDays = src === 'daily' ? 400 : 30;
+        const defBackDays = src === 'daily' ? 400 : (src === 'hourly' ? 180 : 30);
         const startMs = start ? Date.parse(start) : (endMs - defBackDays * 86400000);
         if (isNaN(startMs)) return { content: [{ type: 'text', text: JSON.stringify({ error: 'bad start date' }) }] };
         if (startMs >= endMs) return { content: [{ type: 'text', text: JSON.stringify({ error: 'start must be before end' }) }] };
         const startIso = new Date(startMs).toISOString().slice(0, 19).replace('T', ' ');
         const endIso = new Date(endMs).toISOString().slice(0, 19).replace('T', ' ');
-        let rows;
+        if (src === 'hourly') {
+          let hrows;
+          try {
+            [hrows] = await db.execute('SELECT hour_bucket, open_px, high_px, low_px, close_px, sample_count FROM price_intraday_hourly WHERE symbol = ? AND hour_bucket BETWEEN ? AND ? ORDER BY hour_bucket ASC', [sym, startIso, endIso]);
+          } catch (e) { return { content: [{ type: 'text', text: JSON.stringify({ error: 'query failed: ' + e.message }) }] }; }
+          const out = { symbol: sym, source: 'hourly', resample: rs, start_utc: startIso, end_utc: endIso, bars_in_window: hrows.length };
+          if (!hrows.length) { out.note = 'no hourly rollup in window (rollup seeds from ~30d intraday and grows forward)'; out.series = []; return { content: [{ type: 'text', text: JSON.stringify(out) }] }; }
+          let bars = hrows.map(r => ({ t: new Date(r.hour_bucket).toISOString(), o: parseFloat(r.open_px), h: parseFloat(r.high_px), l: parseFloat(r.low_px), c: parseFloat(r.close_px), n: r.sample_count }));
+          const firstP = bars[0].o, lastP = bars[bars.length - 1].c;
+          let mn = Infinity, mx = -Infinity;
+          for (const b of bars) { if (b.l < mn) mn = b.l; if (b.h > mx) mx = b.h; }
+          out.summary = { first: firstP, last: lastP, min: mn, max: mx, change_pct: firstP > 0 ? Number(((lastP - firstP) / firstP * 100).toFixed(2)) : null };
+          if (rs === '4h' || rs === '1d') {
+            const binMs = rs === '4h' ? 14400000 : 86400000;
+            const m = new Map();
+            for (const b of bars) {
+              const k = Math.floor(Date.parse(b.t) / binMs) * binMs;
+              let x = m.get(k);
+              if (!x) { x = { t: new Date(k).toISOString(), o: b.o, h: b.h, l: b.l, c: b.c, n: b.n }; m.set(k, x); }
+              else { if (b.h > x.h) x.h = b.h; if (b.l < x.l) x.l = b.l; x.c = b.c; x.n += b.n; }
+            }
+            bars = Array.from(m.values());
+          }
+          out.bars_total = bars.length;
+          if (bars.length > cap) { out.truncated = { of: bars.length, returned: cap, note: 'most recent ' + cap + ' bars' }; bars = bars.slice(-cap); }
+          out.series = bars;
+          return { content: [{ type: 'text', text: JSON.stringify(out) }] };
+        }
+let rows;
         try {
           [rows] = await db.execute(
             'SELECT price, recorded_at FROM ' + table + ' WHERE symbol = ? AND recorded_at BETWEEN ? AND ? ORDER BY recorded_at ASC',
