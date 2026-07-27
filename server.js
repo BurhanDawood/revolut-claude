@@ -13741,7 +13741,8 @@ let rows;
 
   // ── Tool: get_tranches ────────────────────────────────────────────────────
   server.tool('set_pump_armed_rule',
-    'Set a pump-armed trailing stop rule (#95 Stage 1). Dormant until the coin pumps arm_pump_pct within arm_window_min, then arms a trailing stop. Stage 1 only arms + alerts — does NOT auto-sell.',
+    'Set a pump-armed trailing stop rule (#95 Stage 1). Dormant until the coin pumps arm_pump_pct within arm_window_min, then arms a trailing stop. Stage 1 only arms + alerts — does NOT auto-sell.'
+    + ' #130 retrace_pct/bounce_pct govern the trough-rebuy trigger (retrace_pct = %% giveback of the pump that arms trough-detect; bounce_pct = %% bounce off the tracked trough low that fires the rebuy).',
     {
       symbol:         z.string().describe('Trading pair e.g. GHIBLI-USD'),
       arm_pump_pct:   z.coerce.number().describe('Pump %% that arms the trailing stop (e.g. 25 = +25%)'),
@@ -13750,8 +13751,10 @@ let rows;
       entry_floor:    z.coerce.number().optional().describe('Never sell below this price (the hard floor; Stage 2)'),
       arm_window_min: z.coerce.number().optional().describe('Window in minutes for the pump to count (default 60)'),
       rebuy_pct:      z.coerce.number().optional().describe('Retrace %% below sale price to place rebuy (default 8). e.g. 70 = buy back 70%% below the auto-sell price'),
+      retrace_pct:    z.coerce.number().optional().describe('#130 %% giveback of the pump that ARMS trough-detect (default 50)'),
+      bounce_pct:     z.coerce.number().optional().describe('#130 %% bounce off the tracked trough LOW that FIRES the rebuy (default 8)'),
     },
-    async ({ symbol, arm_pump_pct, trail_pct, sell_pct, entry_floor, arm_window_min, rebuy_pct }) => {
+    async ({ symbol, arm_pump_pct, trail_pct, sell_pct, entry_floor, arm_window_min, rebuy_pct, retrace_pct, bounce_pct }) => {
       try {
         const sym = symbol.includes('-USD') ? symbol.toUpperCase() : `${symbol.toUpperCase()}-USD`;
 
@@ -13771,10 +13774,10 @@ let rows;
         }
 
         await db.execute(
-          `INSERT INTO pump_armed_rules (symbol, arm_pump_pct, arm_window_min, trail_pct, sell_pct, entry_floor, rebuy_pct, armed, baseline_price, baseline_at, active)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, 1)
-           ON DUPLICATE KEY UPDATE arm_pump_pct=VALUES(arm_pump_pct), arm_window_min=VALUES(arm_window_min), trail_pct=VALUES(trail_pct), sell_pct=VALUES(sell_pct), entry_floor=VALUES(entry_floor), rebuy_pct=VALUES(rebuy_pct), armed=0, baseline_price=NULL, baseline_at=NULL, active=1, updated_at=CURRENT_TIMESTAMP`,
-          [sym, arm_pump_pct, arm_window_min || 60, trail_pct, sell_pct ?? 50, entry_floor ?? null, rebuy_pct ?? 8]
+          `INSERT INTO pump_armed_rules (symbol, arm_pump_pct, arm_window_min, trail_pct, sell_pct, entry_floor, rebuy_pct, retrace_pct, bounce_pct, armed, baseline_price, baseline_at, active)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, 1)
+           ON DUPLICATE KEY UPDATE arm_pump_pct=VALUES(arm_pump_pct), arm_window_min=VALUES(arm_window_min), trail_pct=VALUES(trail_pct), sell_pct=VALUES(sell_pct), entry_floor=VALUES(entry_floor), rebuy_pct=VALUES(rebuy_pct), retrace_pct=VALUES(retrace_pct), bounce_pct=VALUES(bounce_pct), armed=0, baseline_price=NULL, baseline_at=NULL, active=1, updated_at=CURRENT_TIMESTAMP`,
+          [sym, arm_pump_pct, arm_window_min || 60, trail_pct, sell_pct ?? 50, entry_floor ?? null, rebuy_pct ?? 8, retrace_pct ?? 50, bounce_pct ?? 8]
         );
         await sendTelegram(
           `🎯 <b>PUMP-ARM RULE SET — ${sym.replace('-USD','')}</b>\n\n` +
@@ -13782,10 +13785,11 @@ let rows;
           `Then trails ${trail_pct}% below peak\n` +
           `${entry_floor ? `Floor: ${entry_floor}\n` : ''}` +
           `Sell %% (Stage 2): ${sell_pct ?? 50}%\n` +
-          `Rebuy retrace: ${rebuy_pct ?? 8}%\n\n` +
+          `Rebuy retrace: ${rebuy_pct ?? 8}%\n` +
+          `Trough-arm retrace: ${retrace_pct ?? 50}%, bounce: ${bounce_pct ?? 8}%\n\n` +
           `⚠️ Stage 1 active — arms + alerts only, no auto-sell yet.` + conflictWarning
         ).catch(() => {});
-        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, symbol: sym, arm_pump_pct, trail_pct, arm_window_min: arm_window_min || 60, sell_pct: sell_pct ?? 50, entry_floor: entry_floor ?? null, rebuy_pct: rebuy_pct ?? 8, conflict_warning: conflictWarning || null, note: 'Stage 1 — arms trailing stop on pump, no auto-sell' }) }] };
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, symbol: sym, arm_pump_pct, trail_pct, arm_window_min: arm_window_min || 60, sell_pct: sell_pct ?? 50, entry_floor: entry_floor ?? null, rebuy_pct: rebuy_pct ?? 8, retrace_pct: retrace_pct ?? 50, bounce_pct: bounce_pct ?? 8, conflict_warning: conflictWarning || null, note: 'Stage 1 — arms trailing stop on pump, no auto-sell' }) }] };
       } catch (e) {
         return { content: [{ type: 'text', text: JSON.stringify({ error: e.message }) }] };
       }
