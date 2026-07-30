@@ -12751,6 +12751,7 @@ let rows;
 
         const defaultHodl = ['ENA','JTO','RENDER','INJ','FET','ALGO','AVAX','ADA','HBAR','ILV','PYTH','SUPER','SEI','MOG','HFT','CRO','FLR','POL','XLM','BONK'];
         const config = {
+          ...existingCfg, // #281 merge-not-replace: preserve every key this handler does not explicitly manage (e.g. manual_only_symbols) — explicit fields below still override
           enabled: enabled ?? existingCfg.enabled ?? false,
           max_sell_pct: max_sell_pct || existingCfg.max_sell_pct || 25,
           allowed_triggers: allowed_triggers || existingCfg.allowed_triggers || ['trailing_stop', 'fixed_target', 'pump_alert'],
