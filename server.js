@@ -13796,7 +13796,8 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
 
   server.tool('set_pump_armed_rule',
     'Set a pump-armed trailing stop rule (#95 Stage 1). Dormant until the coin pumps arm_pump_pct within arm_window_min, then arms a trailing stop. Stage 1 only arms + alerts — does NOT auto-sell.'
-    + ' #130 retrace_pct/bounce_pct govern the trough-rebuy trigger (retrace_pct = %% giveback of the pump that arms trough-detect; bounce_pct = %% bounce off the tracked trough low that fires the rebuy).',
+    + ' #130 retrace_pct/bounce_pct govern the trough-rebuy trigger (retrace_pct = %% giveback of the pump that arms trough-detect; bounce_pct = %% bounce off the tracked trough low that fires the rebuy).'
+    + ' #282 rule_mode=tiered stores laddered sell_tiers/buy_tiers (CONFIG ONLY — no execution path reads them yet). Tier sets whose CUMULATIVE sell exceeds the global max_sell_pct cap are REJECTED, never truncated. Omitted tier params are preserved, not reset.',
     {
       symbol:         z.string().describe('Trading pair e.g. GHIBLI-USD'),
       arm_pump_pct:   z.coerce.number().describe('Pump %% that arms the trailing stop (e.g. 25 = +25%)'),
@@ -13807,8 +13808,13 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
       rebuy_pct:      z.coerce.number().optional().describe('Retrace %% below sale price to place rebuy (default 8). e.g. 70 = buy back 70%% below the auto-sell price'),
       retrace_pct:    z.coerce.number().optional().describe('#130 %% giveback of the pump that ARMS trough-detect (default 50)'),
       bounce_pct:     z.coerce.number().optional().describe('#130 %% bounce off the tracked trough LOW that FIRES the rebuy (default 8)'),
+      rule_mode:        z.enum(['single','tiered']).optional().describe("#282 'single' (default, today's behaviour) or 'tiered' (laddered scale-out/scale-in; config only for now)"),
+      sell_tiers:       z.array(z.array(z.coerce.number())).optional().describe('#282 [[retrace_pct, sell_pct], ...] ascending by retrace_pct; sell_pct is %% of the CURRENT position. Cumulative must be <= max_sell_pct'),
+      buy_tiers:        z.array(z.array(z.coerce.number())).optional().describe('#282 [[drop_pct, buy_pct], ...] ascending by drop_pct; buy_pct is %% of REMAINING reserved cash'),
+      tier_cooldown_min: z.coerce.number().optional().describe('#282 minutes between intra-cycle tier fills (default 15). Global cooldown_minutes still governs re-arming'),
+      min_tier_usd:     z.coerce.number().optional().describe('#282 dust guard — skip and mark-filled any tier below this USD notional (default 2.0)'),
     },
-    async ({ symbol, arm_pump_pct, trail_pct, sell_pct, entry_floor, arm_window_min, rebuy_pct, retrace_pct, bounce_pct }) => {
+    async ({ symbol, arm_pump_pct, trail_pct, sell_pct, entry_floor, arm_window_min, rebuy_pct, retrace_pct, bounce_pct, rule_mode, sell_tiers, buy_tiers, tier_cooldown_min, min_tier_usd }) => {
       try {
         const sym = symbol.includes('-USD') ? symbol.toUpperCase() : `${symbol.toUpperCase()}-USD`;
 
