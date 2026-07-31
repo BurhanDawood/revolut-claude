@@ -1194,6 +1194,14 @@ await safeAddColumn('pump_armed_rules', 'retrace_pct',     'DECIMAL(10,4) DEFAUL
 await safeAddColumn('pump_armed_rules', 'bounce_pct',      'DECIMAL(10,4) DEFAULT 8.0'); // #130 % bounce off trough to trigger buy
 await safeAddColumn('pump_armed_rules', 'buyback_floor_pct','DECIMAL(10,4) DEFAULT 5.0'); // #130 % below entry_floor before alert-only
 await safeAddColumn('pump_armed_rules', 'sale_proceeds_usd','DECIMAL(20,10) NULL'); // #130 Phase C ringfenced USD from the sell, used for trough rebuy
+// #282 Phase 2 — tiered pump loop CONFIG ONLY (schema + validation). No execution path reads these yet;
+// rule_mode defaults to 'single' so every existing rule behaves byte-identically to today.
+await safeAddColumn('pump_armed_rules', 'rule_mode',         "VARCHAR(10) NOT NULL DEFAULT 'single'"); // 'single' | 'tiered'
+await safeAddColumn('pump_armed_rules', 'sell_tiers',        'JSON NULL'); // [[retrace_pct, sell_pct], ...] sell_pct = % of CURRENT position
+await safeAddColumn('pump_armed_rules', 'buy_tiers',         'JSON NULL'); // [[drop_pct, buy_pct], ...] buy_pct = % of REMAINING reserved cash
+await safeAddColumn('pump_armed_rules', 'tier_state',        'JSON NULL'); // engine-owned runtime state; never written by config
+await safeAddColumn('pump_armed_rules', 'tier_cooldown_min', 'INT DEFAULT 15'); // intra-cycle tier fills; global cooldown_minutes still governs re-arming
+await safeAddColumn('pump_armed_rules', 'min_tier_usd',      'DECIMAL(10,2) DEFAULT 2.0'); // dust guard
 await db.execute("UPDATE pump_armed_rules SET rebuy_pct = 20.0 WHERE symbol = 'BOBA-USD'"); // #131 BOBA default
 await safeAddColumn('auto_trade_rules', 'proceeds_reserved', 'DECIMAL(12,2) NULL');
 await safeAddColumn('trading_journal',  'source',          "VARCHAR(20) DEFAULT 'auto_detected'");
@@ -13741,6 +13749,51 @@ let rows;
   );
 
   // ── Tool: get_tranches ────────────────────────────────────────────────────
+// #282 Phase 2 — tier config validation. Pure functions, no side effects, no execution path.
+// A sell tier sells sell_pct of the CURRENT position, so cumulative % of the ORIGINAL position
+// is 1 - product(1 - p/100). Two 50/50 tiers = 50% + 50% of remainder = exactly 75%.
+function tierCumulativePct(tiers) {
+  let remaining = 1;
+  for (const t of tiers) remaining *= (1 - Number(t[1]) / 100);
+  return (1 - remaining) * 100;
+}
+
+function validateTierShape(tiers, label) {
+  const errs = [];
+  if (!Array.isArray(tiers)) { errs.push(`${label} must be an array of [trigger_pct, size_pct] pairs`); return errs; }
+  if (!tiers.length) { errs.push(`${label} must contain at least one tier`); return errs; }
+  if (tiers.length > 6) errs.push(`${label} has ${tiers.length} tiers; maximum is 6`);
+  let prevTrigger = -Infinity;
+  tiers.forEach((t, i) => {
+    if (!Array.isArray(t) || t.length !== 2) { errs.push(`${label}[${i}] must be a [trigger_pct, size_pct] pair`); return; }
+    const trig = Number(t[0]), size = Number(t[1]);
+    if (!isFinite(trig) || trig < 0) errs.push(`${label}[${i}] trigger_pct must be a number >= 0 (got ${t[0]})`);
+    if (!isFinite(size) || size <= 0 || size > 100) errs.push(`${label}[${i}] size_pct must be in (0, 100] (got ${t[1]})`);
+    if (isFinite(trig) && trig <= prevTrigger) errs.push(`${label}[${i}] trigger_pct ${trig} must be strictly greater than the previous tier's ${prevTrigger} — tiers must ascend`);
+    if (isFinite(trig)) prevTrigger = trig;
+  });
+  return errs;
+}
+
+// Returns { ok, errors[], cumulative_sell_pct, cumulative_buy_pct }.
+// REJECTS over-cap tier sets outright — never silently truncates (#282 safety requirement).
+function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
+  const errors = [];
+  errors.push(...validateTierShape(sellTiers, 'sell_tiers'));
+  errors.push(...validateTierShape(buyTiers, 'buy_tiers'));
+  let cumSell = null, cumBuy = null;
+  if (Array.isArray(sellTiers) && sellTiers.length && !validateTierShape(sellTiers, 'x').length) {
+    cumSell = tierCumulativePct(sellTiers);
+    if (cumSell > Number(maxSellPct) + 1e-9) {
+      errors.push(`sell_tiers cumulative ${cumSell.toFixed(2)}% of the original position exceeds the global max_sell_pct cap of ${maxSellPct}%. Reduce a tier size or lower the tier count — the cap is cumulative per armed cycle, not per tier.`);
+    }
+  }
+  if (Array.isArray(buyTiers) && buyTiers.length && !validateTierShape(buyTiers, 'x').length) {
+    cumBuy = tierCumulativePct(buyTiers);
+  }
+  return { ok: errors.length === 0, errors, cumulative_sell_pct: cumSell === null ? null : Number(cumSell.toFixed(4)), cumulative_buy_pct: cumBuy === null ? null : Number(cumBuy.toFixed(4)) };
+}
+
   server.tool('set_pump_armed_rule',
     'Set a pump-armed trailing stop rule (#95 Stage 1). Dormant until the coin pumps arm_pump_pct within arm_window_min, then arms a trailing stop. Stage 1 only arms + alerts — does NOT auto-sell.'
     + ' #130 retrace_pct/bounce_pct govern the trough-rebuy trigger (retrace_pct = %% giveback of the pump that arms trough-detect; bounce_pct = %% bounce off the tracked trough low that fires the rebuy).',
