@@ -13818,6 +13818,32 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
       try {
         const sym = symbol.includes('-USD') ? symbol.toUpperCase() : `${symbol.toUpperCase()}-USD`;
 
+        // #282 Phase 2 — validate tier config BEFORE any write. An invalid or over-cap set is
+        // REJECTED outright (nothing is written), never silently truncated.
+        let stJson = null, btJson = null, tierInfo = null;
+        const wantsTiers = rule_mode === 'tiered' || sell_tiers !== undefined || buy_tiers !== undefined;
+        if (wantsTiers) {
+          let st = sell_tiers, bt = buy_tiers;
+          try {
+            if (typeof st === 'string') st = JSON.parse(st);
+            if (typeof bt === 'string') bt = JSON.parse(bt);
+          } catch (pe) {
+            return { content: [{ type: 'text', text: JSON.stringify({ error: 'sell_tiers/buy_tiers must be valid JSON: ' + pe.message }) }] };
+          }
+          let maxSell = 25;
+          try {
+            const [aeR] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'ai_auto_execute'");
+            if (aeR.length) maxSell = JSON.parse(aeR[0].config_value).max_sell_pct ?? 25;
+          } catch (ce) { /* fall back to the conservative 25 default */ }
+          const v = validateTierConfig(st, bt, maxSell);
+          if (!v.ok) {
+            return { content: [{ type: 'text', text: JSON.stringify({ error: 'tier config REJECTED — nothing was written', errors: v.errors, max_sell_pct: maxSell, cumulative_sell_pct: v.cumulative_sell_pct }) }] };
+          }
+          stJson = JSON.stringify(st);
+          btJson = JSON.stringify(bt);
+          tierInfo = { cumulative_sell_pct: v.cumulative_sell_pct, cumulative_buy_pct: v.cumulative_buy_pct, max_sell_pct: maxSell };
+        }
+
         // #237/#238 ask-3: detect a pre-existing trailing stop for this symbol that
         // is NOT from the pump-loop's own last arm cycle (i.e. pump_armed_rules.armed
         // was not already 1) before this call. setTrailingStop MERGES with any
@@ -13834,10 +13860,12 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
         }
 
         await db.execute(
-          `INSERT INTO pump_armed_rules (symbol, arm_pump_pct, arm_window_min, trail_pct, sell_pct, entry_floor, rebuy_pct, retrace_pct, bounce_pct, armed, baseline_price, baseline_at, active)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, 1)
-           ON DUPLICATE KEY UPDATE arm_pump_pct=VALUES(arm_pump_pct), arm_window_min=VALUES(arm_window_min), trail_pct=VALUES(trail_pct), sell_pct=VALUES(sell_pct), entry_floor=VALUES(entry_floor), rebuy_pct=VALUES(rebuy_pct), retrace_pct=VALUES(retrace_pct), bounce_pct=VALUES(bounce_pct), armed=0, baseline_price=NULL, baseline_at=NULL, active=1, updated_at=CURRENT_TIMESTAMP`,
-          [sym, arm_pump_pct, arm_window_min || 60, trail_pct, sell_pct ?? 50, entry_floor ?? null, rebuy_pct ?? 8, retrace_pct ?? 50, bounce_pct ?? 8]
+          `INSERT INTO pump_armed_rules (symbol, arm_pump_pct, arm_window_min, trail_pct, sell_pct, entry_floor, rebuy_pct, retrace_pct, bounce_pct, rule_mode, sell_tiers, buy_tiers, tier_cooldown_min, min_tier_usd, armed, baseline_price, baseline_at, active)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, 'single'), ?, ?, COALESCE(?, 15), COALESCE(?, 2.0), 0, NULL, NULL, 1)
+           ON DUPLICATE KEY UPDATE arm_pump_pct=VALUES(arm_pump_pct), arm_window_min=VALUES(arm_window_min), trail_pct=VALUES(trail_pct), sell_pct=VALUES(sell_pct), entry_floor=VALUES(entry_floor), rebuy_pct=VALUES(rebuy_pct), retrace_pct=VALUES(retrace_pct), bounce_pct=VALUES(bounce_pct), rule_mode=COALESCE(?, rule_mode), sell_tiers=COALESCE(?, sell_tiers), buy_tiers=COALESCE(?, buy_tiers), tier_cooldown_min=COALESCE(?, tier_cooldown_min), min_tier_usd=COALESCE(?, min_tier_usd), armed=0, baseline_price=NULL, baseline_at=NULL, active=1, updated_at=CURRENT_TIMESTAMP`,
+          [sym, arm_pump_pct, arm_window_min || 60, trail_pct, sell_pct ?? 50, entry_floor ?? null, rebuy_pct ?? 8, retrace_pct ?? 50, bounce_pct ?? 8,
+           rule_mode ?? null, stJson, btJson, tier_cooldown_min ?? null, min_tier_usd ?? null,
+           rule_mode ?? null, stJson, btJson, tier_cooldown_min ?? null, min_tier_usd ?? null]
         );
         await sendTelegram(
           `🎯 <b>PUMP-ARM RULE SET — ${sym.replace('-USD','')}</b>\n\n` +
@@ -13846,10 +13874,12 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
           `${entry_floor ? `Floor: ${entry_floor}\n` : ''}` +
           `Sell %% (Stage 2): ${sell_pct ?? 50}%\n` +
           `Rebuy retrace: ${rebuy_pct ?? 8}%\n` +
-          `Trough-arm retrace: ${retrace_pct ?? 50}%, bounce: ${bounce_pct ?? 8}%\n\n` +
+          `Trough-arm retrace: ${retrace_pct ?? 50}%, bounce: ${bounce_pct ?? 8}%\n` +
+          `${tierInfo ? `Mode: TIERED — sell ${stJson}, buy ${btJson}\nCumulative sell ${tierInfo.cumulative_sell_pct}% (cap ${tierInfo.max_sell_pct}%)\n` : ''}` +
+          `\n` +
           `⚠️ Stage 1 active — arms + alerts only, no auto-sell yet.` + conflictWarning
         ).catch(() => {});
-        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, symbol: sym, arm_pump_pct, trail_pct, arm_window_min: arm_window_min || 60, sell_pct: sell_pct ?? 50, entry_floor: entry_floor ?? null, rebuy_pct: rebuy_pct ?? 8, retrace_pct: retrace_pct ?? 50, bounce_pct: bounce_pct ?? 8, conflict_warning: conflictWarning || null, note: 'Stage 1 — arms trailing stop on pump, no auto-sell' }) }] };
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, symbol: sym, arm_pump_pct, trail_pct, arm_window_min: arm_window_min || 60, sell_pct: sell_pct ?? 50, entry_floor: entry_floor ?? null, rebuy_pct: rebuy_pct ?? 8, retrace_pct: retrace_pct ?? 50, bounce_pct: bounce_pct ?? 8, rule_mode: rule_mode ?? null, sell_tiers: stJson ? JSON.parse(stJson) : null, buy_tiers: btJson ? JSON.parse(btJson) : null, tier_cooldown_min: tier_cooldown_min ?? null, min_tier_usd: min_tier_usd ?? null, tier_validation: tierInfo, conflict_warning: conflictWarning || null, note: 'Stage 1 — arms trailing stop on pump, no auto-sell. #282 tier config is stored but NOT executed yet.' }) }] };
       } catch (e) {
         return { content: [{ type: 'text', text: JSON.stringify({ error: e.message }) }] };
       }
