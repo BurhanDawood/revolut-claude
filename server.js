@@ -13446,13 +13446,14 @@ let rows;
 
   // ── Tool: manage_auto_rules ───────────────────────────────────────────────
   server.tool('manage_auto_rules',
-    'Manage automatic trade rules — list, remove, disable or enable a rule by ID',
+    'Manage automatic trade rules — list, remove, disable or enable a rule by ID. reset_cycle (#278) clears STALE pump-loop runtime state for a symbol (armed, armed_since, ringfenced sale_proceeds_usd, trough fields, baseline, tier_state) while PRESERVING all config; it refuses on a live cycle (sale_price set) unless force=true.',
     {
-      action:  z.enum(['list', 'remove', 'disable', 'enable', 'pump_status', 'loop_enable', 'loop_disable']).describe('Action to perform'),
+      action:  z.enum(['list', 'remove', 'disable', 'enable', 'pump_status', 'loop_enable', 'loop_disable', 'reset_cycle']).describe('Action to perform'),
       rule_id: z.coerce.number().optional().describe('Rule ID to remove, disable or enable'),
-      symbol: z.string().optional().describe('Symbol e.g. BOBA-USD for loop_enable/loop_disable'),
+      symbol: z.string().optional().describe('Symbol e.g. BOBA-USD for loop_enable/loop_disable/reset_cycle'),
+      force:  z.boolean().optional().describe('#278 reset_cycle only — override the live-cycle guard (sale_price set). Default false.'),
     },
-    async ({ action, rule_id, symbol }) => {
+    async ({ action, rule_id, symbol, force }) => {
       try {
         if (action === 'list') {
           const [rules] = await db.execute('SELECT * FROM auto_trade_rules ORDER BY created_at DESC');
@@ -13487,6 +13488,39 @@ let rows;
           const [after] = await db.execute('SELECT * FROM pump_armed_rules WHERE symbol = ? LIMIT 1', [sym]);
           await sendTelegram('LOOP ENABLED -- '+sym+' rinse-repeat ON. Floor $'+parseFloat(r.entry_floor).toFixed(6)+', sell '+r.sell_pct+'%, max '+r.max_cycles+' cycles. Master must also be ON to fire.'+conflictWarning).catch(()=>{});
           return { content: [{ type: 'text', text: JSON.stringify({ ok: true, loop_enabled: 1, row: after[0], conflict_warning: conflictWarning || null }, null, 2) }] };
+        }
+        if (action === 'reset_cycle') {
+          // #278 — clear stale pump-loop RUNTIME state while preserving all config.
+          // Fossils accumulate when a cycle dies part-way (e.g. the #130 rebuy fails GATE 3
+          // because the ringfenced USD was spent): armed/armed_since/sale_proceeds_usd linger.
+          if (!symbol) throw new Error('symbol required for reset_cycle');
+          const sym = symbol.includes('-') ? symbol.toUpperCase() : symbol.toUpperCase()+'-USD';
+          const [pr] = await db.execute('SELECT * FROM pump_armed_rules WHERE symbol = ? LIMIT 1', [sym]);
+          if (!pr.length) throw new Error('No pump_armed_rules row for '+sym);
+          const b = pr[0];
+          // SAFETY RAIL: a non-null sale_price means a LIVE trough tracker / pending rebuy.
+          // Resetting would silently abandon it, so require an explicit force.
+          if (b.sale_price != null && force !== true) {
+            return { content: [{ type: 'text', text: JSON.stringify({
+              error: 'REFUSED — '+sym+' has a LIVE cycle (sale_price is set), so a pending rebuy may still be tracked. Resetting would abandon it. Pass force=true to override.',
+              symbol: sym, sale_price: b.sale_price, sale_proceeds_usd: b.sale_proceeds_usd, trough_armed: b.trough_armed, armed: b.armed
+            }, null, 2) }] };
+          }
+          const clearedFrom = {
+            armed: b.armed, armed_since: b.armed_since, sale_price: b.sale_price,
+            sale_proceeds_usd: b.sale_proceeds_usd, reference_base: b.reference_base,
+            retrace_gate: b.retrace_gate, trough_low: b.trough_low, trough_armed: b.trough_armed,
+            baseline_price: b.baseline_price, baseline_at: b.baseline_at, tier_state: b.tier_state
+          };
+          troughTrackers.delete(sym); // drop any in-memory tracker too
+          await db.execute(
+            'UPDATE pump_armed_rules SET armed=0, armed_since=NULL, sale_price=NULL, sale_proceeds_usd=NULL, reference_base=NULL, retrace_gate=NULL, trough_low=NULL, trough_armed=0, baseline_price=NULL, baseline_at=NULL, tier_state=NULL WHERE symbol = ?',
+            [sym]
+          );
+          const [after] = await db.execute('SELECT * FROM pump_armed_rules WHERE symbol = ? LIMIT 1', [sym]);
+          console.log('[reset_cycle] '+sym+' runtime state cleared (config preserved)');
+          await sendTelegram('CYCLE RESET -- '+sym+' runtime state cleared (armed, ringfenced USD, trough, baseline). All config preserved.').catch(()=>{});
+          return { content: [{ type: 'text', text: JSON.stringify({ ok: true, symbol: sym, cleared_from: clearedFrom, row: after[0] }, null, 2) }] };
         }
         if (action === 'loop_disable') {
           if (!symbol) throw new Error('symbol required for loop_disable');
