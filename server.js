@@ -4468,6 +4468,93 @@ async function checkPumpArm(symbol, currentPrice) {
   }
 }
 
+// ── #282 step 3: PURE tier evaluator ─────────────────────────────────────────
+// No I/O, no DB, no orders. (state, bar, cfg, ctx) -> { state, fills[] }.
+// Kept pure deliberately so it can be unit-tested and replayed against history
+// rather than only observed by waiting for live cycles.
+function shadowNewState(qty) {
+  return { phase:'idle', baseline:null, baseline_at:null, peak:null, qty, qty0:qty, reserved:0, reserved_left:0,
+    sell_done:[], buy_done:[], sells_filled:0, buys_filled:0, gross_sold:0, sale_price:null, trough:null,
+    last_fill_at:null, cycle_id:null };
+}
+
+function shadowEvalTier(state, bar, cfg, ctx) {
+  const fills = [];
+  const t = bar.t, hi = bar.h, lo = bar.l, px = bar.c;
+  const cdMs = (cfg.tier_cooldown_min != null ? cfg.tier_cooldown_min : 15) * 60000;
+  const coolOk = () => !state.last_fill_at || (t - state.last_fill_at) >= cdMs;
+  const minUsd = cfg.min_tier_usd != null ? cfg.min_tier_usd : 2;
+  const rec = (leg, i, trig, obs, price, qty, usd, ok, reason) => {
+    fills.push({ t, leg, tier: i, trigger_pct: trig, observed_pct: Number(obs.toFixed(3)), price,
+      intended_qty: qty, intended_usd: usd == null ? null : Number(usd.toFixed(4)),
+      would_have_filled: ok, block_reason: ok ? null : reason,
+      available_usd: ctx.availableUsd, position_qty: Number(state.qty.toFixed(6)), cycle_id: state.cycle_id });
+  };
+
+  if (state.phase === 'idle') {
+    if (state.baseline == null) { state.baseline = px; state.baseline_at = t; }
+    if (t - state.baseline_at > (cfg.arm_window_min != null ? cfg.arm_window_min : 60) * 60000) { state.baseline = px; state.baseline_at = t; }
+    if ((hi - state.baseline) / state.baseline * 100 >= cfg.arm_pump_pct) {
+      state.phase = 'armed'; state.cycle_id = 'c' + (++ctx.cycleSeq);
+      state.armed_at = t; state.peak = hi; state.sell_done = [];
+      state.qty0 = state.qty; state.sells_filled = 0; state.buys_filled = 0; state.gross_sold = 0;
+    }
+    return { state, fills };
+  }
+
+  if (state.phase === 'armed') {
+    if (hi > state.peak) state.peak = hi;
+    for (let i = 0; i < cfg.sell_tiers.length; i++) {
+      if (state.sell_done.indexOf(i) !== -1) continue;
+      const retr = Number(cfg.sell_tiers[i][0]), pct = Number(cfg.sell_tiers[i][1]);
+      const trigPx = state.peak * (1 - retr / 100);
+      if (lo > trigPx) continue;
+      const obs = (trigPx - state.peak) / state.peak * 100;
+      if (!coolOk()) { rec('sell', i, retr, obs, trigPx, null, null, false, 'tier_cooldown'); break; }
+      const qty = state.qty * (pct / 100), usd = qty * trigPx;
+      if (cfg.entry_floor && trigPx <= cfg.entry_floor) { rec('sell', i, retr, obs, trigPx, qty, usd, false, 'below_entry_floor'); state.sell_done.push(i); continue; }
+      if (usd < minUsd) { rec('sell', i, retr, obs, trigPx, qty, usd, false, 'below_min_tier_usd'); state.sell_done.push(i); continue; }
+      rec('sell', i, retr, obs, trigPx, qty, usd, true, null);
+      state.qty -= qty; state.reserved += usd; state.sell_done.push(i);
+      state.last_fill_at = t; state.sale_price = trigPx; state.sells_filled++; state.gross_sold += qty;
+    }
+    if (state.sell_done.length === cfg.sell_tiers.length) {
+      state.phase = 'sold'; state.buy_done = []; state.reserved_left = state.reserved; state.trough = lo;
+    }
+    return { state, fills };
+  }
+
+  if (state.phase === 'sold') {
+    if (lo < state.trough) state.trough = lo;
+    const base = state.sale_price != null ? state.sale_price : px;
+    for (let j = 0; j < cfg.buy_tiers.length; j++) {
+      if (state.buy_done.indexOf(j) !== -1) continue;
+      const drop = Number(cfg.buy_tiers[j][0]), pct = Number(cfg.buy_tiers[j][1]);
+      const trigPx = base * (1 - drop / 100);
+      if (lo > trigPx) continue;
+      const obs = (trigPx - base) / base * 100;
+      if (!coolOk()) { rec('buy', j, drop, obs, trigPx, null, null, false, 'tier_cooldown'); break; }
+      const usd = state.reserved_left * (pct / 100);
+      if (usd < minUsd) { rec('buy', j, drop, obs, trigPx, null, usd, false, 'below_min_tier_usd'); state.buy_done.push(j); continue; }
+      if (ctx.availableUsd < usd) { rec('buy', j, drop, obs, trigPx, usd / trigPx, usd, false, 'insufficient_usd'); state.buy_done.push(j); continue; }
+      rec('buy', j, drop, obs, trigPx, usd / trigPx, usd, true, null);
+      state.qty += usd / trigPx; state.reserved_left -= usd; ctx.availableUsd -= usd;
+      state.buy_done.push(j); state.last_fill_at = t; state.buys_filled++;
+    }
+    if (state.buy_done.length === cfg.buy_tiers.length) {
+      // HONEST ACCOUNTING: a cycle only COMPLETES if at least one buy leg actually filled.
+      // Blocked tiers are marked done, so treating "all visited" as complete would report
+      // success for cycles where the buy leg never worked — corrupting the go/no-go metric.
+      if (state.buys_filled > 0) ctx.cyclesCompleted++; else ctx.cyclesAbandoned++;
+      ctx.lastOutcome = { cycle: state.cycle_id, sells_filled: state.sells_filled,
+        buys_filled: state.buys_filled, outcome: state.buys_filled > 0 ? 'completed' : 'abandoned_no_buy' };
+      state.phase = 'idle'; state.baseline = px; state.baseline_at = t; state.reserved = 0;
+    }
+    return { state, fills };
+  }
+  return { state, fills };
+}
+
 async function runFastScan() {
   try {
     // Part A: pump-arm detector -- dynamic over ALL active, unarmed pump_armed_rules (#215 fix;
