@@ -773,6 +773,26 @@ await db.execute(`CREATE TABLE IF NOT EXISTS price_intraday_hourly (
   UNIQUE KEY uq_hourly_symbol_hour (symbol, hour_bucket),
   INDEX idx_hourly_symbol_time (symbol, hour_bucket)
 )`);
+await db.execute(`CREATE TABLE IF NOT EXISTS shadow_tier_fills (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  symbol VARCHAR(50) NOT NULL,
+  cycle_id VARCHAR(64) NOT NULL,
+  leg VARCHAR(8) NOT NULL,
+  tier_index INT NOT NULL,
+  trigger_pct DECIMAL(10,4) NULL,
+  observed_pct DECIMAL(10,4) NULL,
+  price DECIMAL(20,10) NOT NULL,
+  intended_qty DECIMAL(20,10) NULL,
+  intended_usd DECIMAL(20,10) NULL,
+  would_have_filled TINYINT(1) NOT NULL,
+  block_reason VARCHAR(40) NULL,
+  available_usd DECIMAL(20,10) NULL,
+  position_qty DECIMAL(20,10) NULL,
+  notes TEXT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_shadow_symbol_time (symbol, created_at),
+  INDEX idx_shadow_cycle (cycle_id)
+)`);
 // #259 Phase 3: seed/catch-up the hourly rollup in the background (never blocks boot)
 initHourlyRollup().catch(err => console.error('[hourly-rollup] init call error:', err.message));
 
@@ -11884,7 +11904,7 @@ let rows;
   server.tool('get_trading_data',
     'Get trading journal entries, active alerts, trader context/profile, rebalancing history, and dev_bridge messages',
     {
-      include: zLoose(z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'dev_bridge', 'coin_strategy', 'reconciliation', 'ledger', 'tax_lots', 'catalysts', 'thesis', 'nudges', 'dev_health', 'dev_recommendations', 'volatility_baseline', 'all']))).optional()
+      include: zLoose(z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'dev_bridge', 'coin_strategy', 'reconciliation', 'ledger', 'tax_lots', 'catalysts', 'thesis', 'nudges', 'dev_health', 'dev_recommendations', 'volatility_baseline', 'shadow_fills', 'all']))).optional()
         .describe('What data to fetch — defaults to all. dev_bridge, coin_strategy and reconciliation are never included in all; request them explicitly'),
       symbol:           z.string().optional().describe('Filter journal by coin e.g. NEAR'),
       limit:            z.coerce.number().optional().describe('Max journal entries to return, default 10'),
@@ -12259,6 +12279,51 @@ let rows;
           }
         } catch (e) { vb.error = e.message; }
         result.volatility_baseline = vb;
+      }
+
+      // shadow_fills (#282 step 3) -- append-only simulated tier fills. Read-only, opt-in.
+      // available_usd is the KEY column: it records the ACTUAL balance at the moment a buy tier
+      // would have fired, which is what answers the #282 "is the buy leg blocked by cash, not by
+      // trigger tightness?" question directly rather than by inference.
+      if (fetch.includes('shadow_fills')) {
+        const sfOut = { generated_at: new Date().toISOString() };
+        try {
+          const sfLim = Math.min(parseInt(limit) || 100, 500);
+          let sfSql = 'SELECT * FROM shadow_tier_fills';
+          const sfP = [];
+          if (symbol) { sfSql += ' WHERE symbol = ?'; sfP.push(symbol.toUpperCase().includes('-USD') ? symbol.toUpperCase() : symbol.toUpperCase() + '-USD'); }
+          sfSql += ' ORDER BY created_at DESC LIMIT ' + sfLim;
+          const [sfRows] = await db.execute(sfSql, sfP);
+          sfOut.count = sfRows.length;
+          if (!sfRows.length) {
+            sfOut.note = 'no shadow fills recorded yet (shadow mode writes only for rules with rule_mode=tiered)';
+            sfOut.fills = [];
+          } else {
+            const byReason = {}, byLeg = {};
+            let filled = 0, blocked = 0;
+            const cycles = {};
+            for (const r of sfRows) {
+              const lg = String(r.leg);
+              byLeg[lg] = (byLeg[lg] || 0) + 1;
+              if (r.would_have_filled) filled++; else { blocked++; const br = r.block_reason || 'unknown'; byReason[br] = (byReason[br] || 0) + 1; }
+              cycles[r.cycle_id] = (cycles[r.cycle_id] || 0) + 1;
+            }
+            sfOut.summary = { would_have_filled: filled, blocked, by_leg: byLeg, blocked_by_reason: byReason, distinct_cycles: Object.keys(cycles).length };
+            sfOut.fills = sfRows.map(r => ({
+              t: new Date(r.created_at).toISOString(), symbol: r.symbol, cycle: r.cycle_id, leg: r.leg, tier: r.tier_index,
+              trigger_pct: r.trigger_pct != null ? parseFloat(r.trigger_pct) : null,
+              observed_pct: r.observed_pct != null ? parseFloat(r.observed_pct) : null,
+              price: parseFloat(r.price),
+              intended_qty: r.intended_qty != null ? parseFloat(r.intended_qty) : null,
+              intended_usd: r.intended_usd != null ? parseFloat(r.intended_usd) : null,
+              would_have_filled: !!r.would_have_filled, block_reason: r.block_reason,
+              available_usd: r.available_usd != null ? parseFloat(r.available_usd) : null,
+              position_qty: r.position_qty != null ? parseFloat(r.position_qty) : null,
+              notes: r.notes
+            }));
+          }
+        } catch (e) { sfOut.error = e.message; }
+        result.shadow_fills = sfOut;
       }
 
       // reconciliation -- explicitly excluded from fetchAll; must be requested by name
