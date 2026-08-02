@@ -4411,7 +4411,7 @@ async function checkPumpArm(symbol, currentPrice) {
       const isDnd = await isDndCoin(symbol.replace('-USD',''));
       if (isDnd) {
         // DND: compute 24h low as entry_floor (overrides entry_prices fallback in autoExecuteSell + trough rebuy floor)
-        const [lowRow] = await db.execute('SELECT MIN(price) as lo FROM price_intraday WHERE symbol = ? AND captured_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)', [symbol]);
+        const [lowRow] = await db.execute('SELECT MIN(price) as lo FROM price_intraday WHERE symbol = ? AND recorded_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)', [symbol]); // #286 was captured_at — a column that does not exist; the throw aborted checkPumpArm before setTrailingStop, so DND coins could never arm
         const floor24 = lowRow.length && lowRow[0].lo != null ? parseFloat(lowRow[0].lo) : null;
         if (floor24) await db.execute('UPDATE pump_armed_rules SET entry_floor = ? WHERE symbol = ? AND active = 1', [floor24, symbol]);
         await setTrailingStop(symbol, parseFloat(rule.trail_pct), currentPrice, floor24, true, rule.sell_pct || 100);
