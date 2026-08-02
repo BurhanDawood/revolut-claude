@@ -4589,6 +4589,77 @@ async function runFastScan() {
     // Part B: trailing-stop checks — dynamic over ALL armed stops (#99).
     // Batch-fetches Revolut X prices once per cycle so N armed stops = 1 /tickers call
     // (not N calls). Kraken-only coins get a per-coin getKrakenPriceForSymbol call.
+    // ── #282 step 3: SHADOW tier evaluation ──────────────────────────────────
+    // DELIBERATELY PLACED BEFORE the early return below. Shadow spans the whole
+    // cycle (idle -> armed -> sold), so gating it behind that return would starve
+    // it whenever nothing is armed — which is most of the time. That is the #264
+    // bug class (see the comment on the return line itself) and would produce a
+    // shadow log that looks reassuringly EMPTY while actually being BLIND.
+    // SIMULATION ONLY: writes to shadow_tier_fills + tier_state. Never trades.
+    // Fetches its own /tickers rather than reusing Part A's map, so that Part A
+    // (a live path) is not modified for the benefit of a shadow feature.
+    try {
+      const [shRules] = await db.execute("SELECT * FROM pump_armed_rules WHERE active = 1 AND rule_mode = 'tiered'");
+      if (shRules.length) {
+        const shPrices = {};
+        try {
+          const shT = await revolutRequest('GET', '/tickers');
+          const shL = Array.isArray(shT) ? shT : (shT.data || []);
+          for (const tk of shL) {
+            if (!tk.symbol) continue;
+            const p = parseFloat(tk.last_price || tk.mid || tk.ask || tk.bid);
+            if (p) { shPrices[tk.symbol] = p; shPrices[tk.symbol.replace('/', '-')] = p; }
+          }
+        } catch (e) { console.warn('[shadow] ticker fetch failed:', e.message); }
+        let shBal = [];
+        try { shBal = await revolutRequest('GET', '/balances'); } catch (e) { shBal = []; }
+        const shUsd = await getAvailableUSD('revolut').catch(() => 0);
+        for (const r of shRules) {
+          const shPx = KRAKEN_MONITORED_COINS.includes(r.symbol)
+            ? await getKrakenPriceForSymbol(r.symbol).catch(() => null)
+            : (shPrices[r.symbol] || null);
+          if (!shPx) continue;
+          let sTiers = null, bTiers = null;
+          try {
+            sTiers = typeof r.sell_tiers === 'string' ? JSON.parse(r.sell_tiers) : r.sell_tiers;
+            bTiers = typeof r.buy_tiers === 'string' ? JSON.parse(r.buy_tiers) : r.buy_tiers;
+          } catch (e) { continue; }
+          if (!Array.isArray(sTiers) || !Array.isArray(bTiers) || !sTiers.length || !bTiers.length) continue;
+          let st = null;
+          try { st = r.tier_state ? (typeof r.tier_state === 'string' ? JSON.parse(r.tier_state) : r.tier_state) : null; } catch (e) { st = null; }
+          const shBase = r.symbol.replace('-USD', '');
+          const shHold = parseFloat((shBal.find(b => b.currency === shBase) || {}).available || 0);
+          if (!st || !st.phase) st = shadowNewState(shHold);
+          if (st.phase === 'idle') st.qty = shHold; // refresh while idle; frozen mid-cycle
+          const before = JSON.stringify(st);
+          const shCfg = { arm_pump_pct: parseFloat(r.arm_pump_pct), arm_window_min: parseInt(r.arm_window_min) || 60,
+            sell_tiers: sTiers, buy_tiers: bTiers,
+            tier_cooldown_min: r.tier_cooldown_min != null ? Number(r.tier_cooldown_min) : 15,
+            min_tier_usd: r.min_tier_usd != null ? parseFloat(r.min_tier_usd) : 2,
+            entry_floor: r.entry_floor != null ? parseFloat(r.entry_floor) : null };
+          const shCtx = { availableUsd: shUsd, cycleSeq: st.cycle_seq || 0, cyclesCompleted: 0, cyclesAbandoned: 0 };
+          const shOut = shadowEvalTier(st, { t: Date.now(), h: shPx, l: shPx, c: shPx }, shCfg, shCtx);
+          st.cycle_seq = shCtx.cycleSeq;
+          for (const f of shOut.fills) {
+            try {
+              await db.execute(
+                'INSERT INTO shadow_tier_fills (symbol, cycle_id, leg, tier_index, trigger_pct, observed_pct, price, intended_qty, intended_usd, would_have_filled, block_reason, available_usd, position_qty, notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                [r.symbol, f.cycle_id || 'c0', f.leg, f.tier, f.trigger_pct, f.observed_pct, f.price,
+                 f.intended_qty, f.intended_usd, f.would_have_filled ? 1 : 0, f.block_reason,
+                 f.available_usd, f.position_qty, shCtx.lastOutcome ? JSON.stringify(shCtx.lastOutcome) : null]
+              );
+            } catch (e) { console.error('[shadow] insert failed:', e.message); }
+          }
+          if (shOut.fills.length) console.log('[shadow] ' + r.symbol + ' ' + shOut.fills.length + ' simulated fill(s), phase=' + st.phase);
+          const after = JSON.stringify(st);
+          if (after !== before) {
+            try { await db.execute('UPDATE pump_armed_rules SET tier_state = ? WHERE symbol = ?', [after, r.symbol]); }
+            catch (e) { console.error('[shadow] state persist failed:', e.message); }
+          }
+        }
+      }
+    } catch (e) { console.error('[shadow] evaluation error:', e.message); }
+
     if (trailingStops.size === 0 && troughTrackers.size === 0 && standaloneTroughTrackers.size === 0) return; // #264: was `trailingStops.size===0` only, which returned BEFORE Part C(#130 trough)/Part D(#143 standalone) and the shared price map — starving both trough subsystems whenever no trailing stop was armed (IDEX rebuy stalled 5h). Bail only when ALL THREE are empty; Parts C/D keep their own size guards.
     const fsRevolutPrices = {};
     try {
