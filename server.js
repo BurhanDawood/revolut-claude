@@ -12724,6 +12724,7 @@ let rows;
       require_confidence:     z.enum(['High', 'Medium', 'Low']).optional().describe('Minimum Claude confidence level to auto-execute'),
       cooldown_minutes:       z.coerce.number().optional().describe('Minutes to wait between auto-executions for same coin'),
       hodl_symbols:           zLoose(z.array(z.string())).optional().describe('Coins where AI analyses only and never auto-executes — Bryan decides. e.g. ["ENA","INJ","ALGO"]'),
+      manual_only_symbols:    zLoose(z.array(z.string())).optional().describe('#304 Coins that NEVER auto-execute on the AI-analysis path — analysis is sent to Telegram for your decision. Omit to leave unchanged. e.g. ["CC","XRP"]'),
       title:                  z.string().optional().describe('Title for log_dev_issue (required when creating)'),
       detail:                 z.string().optional().describe('Detail/description for log_dev_issue'),
       category:               z.string().optional().describe('Category for log_dev_issue e.g. bug, feature, note'),
@@ -12783,9 +12784,9 @@ let rows;
       dnd_retrace_pct:  z.coerce.number().optional().describe('configure_dnd: #160 %% of move price must retrace before trough arms (default 50)'),
       dnd_bounce_pct:   z.coerce.number().optional().describe('configure_dnd: #160 %% bounce off trough to trigger rebuy (default 8)'),
     },
-    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, away_buy_usd, away_sell_pct, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam, title, detail, category, status: devStatus, source: devSource, related_symbol: relSymbol, dev_log_id, active_workstream, progress, open_threads, next_action, recent_decision, recent_decisions, cs_status, cs_role, cs_theme, cs_strategy_md, pm_decision, pm_principle_tag, pm_conviction, pm_captured_by, pm_supersedes_id, dev_decision, dev_principle_tag, dev_cross_thread, dev_alternatives, dev_related_log, dev_supersedes_id, journal_id, tax_lot_id, away_action, away_coins, sell_floors, per_coin_enabled, catalyst_id, catalyst, catalyst_date, catalyst_type, expected_impact, priced_in_risk, catalyst_confidence, catalyst_source, catalyst_status, abn_alert_floor_pct, abn_broad_floor_pct, abn_broad_threshold, abn_cooldown_min, dnd_action, dnd_coins, dnd_arm_pct, dnd_trail_pct, dnd_sell_pct, dnd_retrace_pct, dnd_bounce_pct, conviction, bull_case, bear_case, invalidation_triggers, supporting_refs, tn_enabled, tn_min_severity, tn_cooldown_min }) => {
+    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, away_buy_usd, away_sell_pct, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam, manual_only_symbols: manualOnlyParam, title, detail, category, status: devStatus, source: devSource, related_symbol: relSymbol, dev_log_id, active_workstream, progress, open_threads, next_action, recent_decision, recent_decisions, cs_status, cs_role, cs_theme, cs_strategy_md, pm_decision, pm_principle_tag, pm_conviction, pm_captured_by, pm_supersedes_id, dev_decision, dev_principle_tag, dev_cross_thread, dev_alternatives, dev_related_log, dev_supersedes_id, journal_id, tax_lot_id, away_action, away_coins, sell_floors, per_coin_enabled, catalyst_id, catalyst, catalyst_date, catalyst_type, expected_impact, priced_in_risk, catalyst_confidence, catalyst_source, catalyst_status, abn_alert_floor_pct, abn_broad_floor_pct, abn_broad_threshold, abn_cooldown_min, dnd_action, dnd_coins, dnd_arm_pct, dnd_trail_pct, dnd_sell_pct, dnd_retrace_pct, dnd_bounce_pct, conviction, bull_case, bear_case, invalidation_triggers, supporting_refs, tn_enabled, tn_min_severity, tn_cooldown_min }) => {
       // Make hodl_symbols accessible in configure_auto_execute via params object
-      const params = { hodl_symbols: hodlSymbolsParam };
+      const params = { hodl_symbols: hodlSymbolsParam, manual_only_symbols: manualOnlyParam };
 
       if (action === 'log_journal') {
         if (!trade_action) return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'trade_action is required for log_journal (e.g. buy, sell, hold, add, reduce, payment, transfer, pass)' }) }] };
@@ -12989,6 +12990,10 @@ let rows;
           require_confidence: require_confidence || existingCfg.require_confidence || 'High',
           cooldown_minutes: cooldown_minutes || existingCfg.cooldown_minutes || 60,
           hodl_symbols: params?.hodl_symbols ?? existingCfg.hodl_symbols ?? defaultHodl,
+          // #304: set ONLY when supplied. Omitted -> the ...existingCfg spread above preserves it (#281).
+          // Deliberately not `?? []` — an empty array is truthy and would defeat the boot seeder's
+          // `!existing.manual_only_symbols` re-patch, silently disarming the guard for good.
+          ...(params?.manual_only_symbols !== undefined ? { manual_only_symbols: params.manual_only_symbols } : {}),
           sell_floors: sell_floors ?? existingCfg.sell_floors ?? {}, // #45 preserved across updates
           per_coin_enabled: per_coin_enabled ?? existingCfg.per_coin_enabled ?? {}, // #24 explicit per-coin opt-in
           updated_at: new Date().toISOString()
