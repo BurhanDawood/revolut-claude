@@ -818,7 +818,11 @@ await db.execute(`CREATE TABLE IF NOT EXISTS abnormal_events (
 // #259 Phase 3: seed/catch-up the hourly rollup in the background (never blocks boot)
 initHourlyRollup().catch(err => console.error('[hourly-rollup] init call error:', err.message));
 // #301 one-off backfill of abnormal events from retained intraday (flag-guarded, fire-and-forget)
-backfillAbnormalEvents().catch(err => console.error('[abn-backfill] call error:', err.message));
+setTimeout(() => backfillAbnormalEvents().catch(err => console.error('[abn-backfill] call error:', err.message)), 15000);
+// #301 DEFERRED deliberately: backfillAbnormalEvents reads ABN_LOOKBACK_DAYS / ABN_K / ABN_FLOOR_PCT /
+// ABN_MAX_GAP_MS, which are `const`s declared ~3000 lines LATER. Calling it during module evaluation
+// hit the temporal dead zone ('Cannot access ABN_LOOKBACK_DAYS before initialization') and the whole
+// backfill aborted. initHourlyRollup above is safe only because it references no later-declared consts.
 
 
 await db.execute(`CREATE TABLE IF NOT EXISTS balance_snapshots (
