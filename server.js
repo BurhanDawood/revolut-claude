@@ -817,6 +817,8 @@ await db.execute(`CREATE TABLE IF NOT EXISTS abnormal_events (
 )`);
 // #259 Phase 3: seed/catch-up the hourly rollup in the background (never blocks boot)
 initHourlyRollup().catch(err => console.error('[hourly-rollup] init call error:', err.message));
+// #301 one-off backfill of abnormal events from retained intraday (flag-guarded, fire-and-forget)
+backfillAbnormalEvents().catch(err => console.error('[abn-backfill] call error:', err.message));
 
 
 await db.execute(`CREATE TABLE IF NOT EXISTS balance_snapshots (
@@ -5291,6 +5293,74 @@ async function initHourlyRollup() {
       console.log('[hourly-rollup] boot catch-up:', JSON.stringify(res));
     }
   } catch (err) { console.error('[hourly-rollup] init error:', err.message); }
+}
+
+// #301 BACKFILL — one-off replay of the abnormal-move detector over RETAINED price_intraday,
+// recovering the ~16 days of irregular-move history that exists today but would otherwise be
+// destroyed by the nightly 30d prune. Uses the SAME maths as the live detector and as
+// get_abnormal_events: an O(n) sliding-window trailing-ABN_LOOKBACK_DAYS mean-abs-move baseline.
+// Idempotent by construction (INSERT IGNORE + UNIQUE(symbol,event_at)), and additionally guarded
+// by a system_config flag so a restart loop can never re-run it.
+// FIDELITY NOTE: the baseline needs 14d of lead-in but intraday only retains ~30d, so the
+// earliest ~14d of the window are computed from a partial sample. Those events are still real
+// detections; treat their baseline/multiple as lower-confidence than the recent ~16d.
+async function backfillAbnormalEvents() {
+  try {
+    const [flagRows] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'abn_backfill_done'");
+    if (flagRows.length && String(flagRows[0].config_value).indexOf('"done":true') !== -1) return;
+    const [symRows] = await db.execute('SELECT DISTINCT symbol FROM price_intraday');
+    const lookbackMs = ABN_LOOKBACK_DAYS * 86400000;
+    let totalEvents = 0, totalSymbols = 0;
+    for (const sr of symRows) {
+      const sym = sr.symbol;
+      let rows;
+      try {
+        [rows] = await db.execute('SELECT price, recorded_at FROM price_intraday WHERE symbol = ? ORDER BY recorded_at ASC', [sym]);
+      } catch (e) { continue; }
+      if (!rows || rows.length < 12) continue;
+      const win = [];
+      let sum = 0;
+      const batch = [];
+      for (let i = 1; i < rows.length; i++) {
+        const pPrev = parseFloat(rows[i - 1].price), pCur = parseFloat(rows[i].price);
+        if (!(pPrev > 0) || !(pCur > 0)) continue;
+        const tCur = new Date(rows[i].recorded_at).getTime();
+        const dt = tCur - new Date(rows[i - 1].recorded_at).getTime();
+        if (!(dt > 0) || dt > ABN_MAX_GAP_MS) continue;
+        while (win.length && win[0].t <= tCur - lookbackMs) { sum -= win[0].m; win.shift(); }
+        const move = (pCur - pPrev) / pPrev * 100;
+        const absMove = Math.abs(move);
+        const baseline = win.length >= 10 ? sum / win.length : null;
+        if (baseline !== null && baseline > 0) {
+          const threshold = ABN_K * baseline;
+          if (absMove >= threshold && absMove >= ABN_FLOOR_PCT) {
+            batch.push([sym, new Date(tCur).toISOString().slice(0, 19).replace('T', ' '),
+              move > 0 ? 'PUMP' : 'DUMP', Number(move.toFixed(4)), Number(absMove.toFixed(4)),
+              Number(baseline.toFixed(6)), Number(threshold.toFixed(4)),
+              Number((absMove / baseline).toFixed(2)), null, pCur, pPrev,
+              Number((dt / 60000).toFixed(2)), win.length, 0,
+              absMove >= (abnConfig.alert_floor_pct || 5.0) ? 1 : 0]);
+          }
+        }
+        win.push({ t: tCur, m: absMove }); sum += absMove;
+      }
+      for (let b = 0; b < batch.length; b += 200) {
+        const slice = batch.slice(b, b + 200);
+        const ph = slice.map(() => '(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').join(',');
+        const vals = [];
+        for (const r of slice) vals.push(...r);
+        try {
+          await db.execute('INSERT IGNORE INTO abnormal_events (symbol, event_at, direction, move_pct, abs_move_pct, baseline_pct, threshold_pct, multiple, p95_pct, last_price, prev_price, interval_min, sample_size, broad_move, would_alert) VALUES ' + ph, vals);
+        } catch (ie) { console.error('[abn-backfill] insert ' + sym + ':', ie.message); }
+      }
+      totalEvents += batch.length; totalSymbols++;
+    }
+    await db.execute(
+      "INSERT INTO system_config (config_key, config_value) VALUES ('abn_backfill_done', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)",
+      [JSON.stringify({ done: true, at: new Date().toISOString(), symbols: totalSymbols, events: totalEvents })]
+    );
+    console.log('[abn-backfill] complete: ' + totalEvents + ' events across ' + totalSymbols + ' symbols');
+  } catch (err) { console.error('[abn-backfill] error:', err.message); }
 }
 
 async function recordDailyPrices() {
