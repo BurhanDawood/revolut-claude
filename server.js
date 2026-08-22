@@ -8532,7 +8532,17 @@ async function handleTrailingStopAlert(symbol, currentPrice, ts, exchange = 'rev
       const [ae93Rows] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'ai_auto_execute'");
       const ae93Cfg = ae93Rows.length ? JSON.parse(ae93Rows[0].config_value) : {};
       const hodl93 = ae93Cfg.hodl_symbols || [];
-      if (hodl93.includes(coinBase) || hodl93.includes(symbol)) {
+      // #306: manual_only_symbols was honoured ONLY on the AI-analysis path (shouldAutoExecute),
+      // so a coin flagged manual_only but absent from hodl_symbols could still be auto-sold HERE —
+      // the flag read as protection and was not. Checked first, and DELIBERATELY NOT DND-overridable:
+      // DND bypasses hodl (a portfolio-role flag), but manual_only is an explicit per-coin
+      // instruction, and #34's own spec requires respecting it unless opted in per-coin.
+      const manual93 = ae93Cfg.manual_only_symbols || [];
+      if (manual93.includes(coinBase) || manual93.includes(symbol)) {
+        console.log('[trailing] #93 ' + coinBase + ' auto_execute=true but manual_only -- falling through to analysis');
+        hodlBlocked = true;
+      }
+      if (!hodlBlocked && (hodl93.includes(coinBase) || hodl93.includes(symbol))) {
         const dndOverride = await isDndCoin(coinBase).catch(() => false);
         if (!dndOverride) {
           console.log('[trailing] #93 ' + coinBase + ' auto_execute=true but hodl -- falling through to analysis');
