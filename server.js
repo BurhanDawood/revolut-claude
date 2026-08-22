@@ -793,6 +793,28 @@ await db.execute(`CREATE TABLE IF NOT EXISTS shadow_tier_fills (
   INDEX idx_shadow_symbol_time (symbol, created_at),
   INDEX idx_shadow_cycle (cycle_id)
 )`);
+await db.execute(`CREATE TABLE IF NOT EXISTS abnormal_events (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  symbol VARCHAR(50) NOT NULL,
+  event_at DATETIME NOT NULL,
+  direction VARCHAR(8) NOT NULL,
+  move_pct DECIMAL(12,4) NOT NULL,
+  abs_move_pct DECIMAL(12,4) NOT NULL,
+  baseline_pct DECIMAL(12,6) NOT NULL,
+  threshold_pct DECIMAL(12,4) NOT NULL,
+  multiple DECIMAL(10,2) NOT NULL,
+  p95_pct DECIMAL(12,4) NULL,
+  last_price DECIMAL(20,10) NOT NULL,
+  prev_price DECIMAL(20,10) NOT NULL,
+  interval_min DECIMAL(8,2) NULL,
+  sample_size INT NULL,
+  broad_move TINYINT(1) DEFAULT 0,
+  would_alert TINYINT(1) DEFAULT 0,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_abn_symbol_time (symbol, event_at),
+  INDEX idx_abn_symbol_time (symbol, event_at),
+  INDEX idx_abn_time (event_at)
+)`);
 // #259 Phase 3: seed/catch-up the hourly rollup in the background (never blocks boot)
 initHourlyRollup().catch(err => console.error('[hourly-rollup] init call error:', err.message));
 
@@ -4115,6 +4137,7 @@ function abnAnalyze(rows) {
     last_price: pLast,
     prev_price: pPrev,
     interval_min: Number((dt / 60000).toFixed(1)),
+    last_at: new Date(last.recorded_at).toISOString().slice(0, 19).replace('T', ' '), // #301 dedup key for abnormal_events
     sample: stats.sample
   };
 }
@@ -4159,6 +4182,28 @@ async function evaluateAbnormalAlerts() {
     const cooldownMs = (abnConfig.cooldown_min || 30) * 60 * 1000;
     // Collect all abnormal coins this cycle (detection threshold: k*baseline, floor 0.4%)
     const abnCoins = Object.keys(states).filter(sym => states[sym] && states[sym].status === 'ABNORMAL');
+    // #301 PERSIST abnormal events BEFORE the correlation-guard return below.
+    // Events were previously computed and discarded, so history was capped at the rolling
+    // ~16d the intraday table retains. Broad-market moves are exactly the regime-change data
+    // most worth keeping, and they hit the early `return` — so this must run first.
+    // UNIQUE(symbol, event_at) makes it idempotent: repeated cron cycles re-see the same
+    // latest move and simply no-op rather than duplicating.
+    try {
+      const abnBroad = abnCoins.filter(sy => states[sy].abs_move >= (abnConfig.broad_floor_pct || 3.0)).length
+        >= (abnConfig.broad_threshold || 5) ? 1 : 0;
+      for (const sy of abnCoins) {
+        const st = states[sy];
+        if (!st || !st.last_at) continue;
+        try {
+          await db.execute(
+            'INSERT IGNORE INTO abnormal_events (symbol, event_at, direction, move_pct, abs_move_pct, baseline_pct, threshold_pct, multiple, p95_pct, last_price, prev_price, interval_min, sample_size, broad_move, would_alert) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+            [sy, st.last_at, st.direction, st.move, st.abs_move, st.baseline, st.threshold, st.multiple,
+             st.p95 ?? null, st.last_price, st.prev_price, st.interval_min ?? null, st.sample ?? null,
+             abnBroad, st.abs_move >= (abnConfig.alert_floor_pct || 5.0) ? 1 : 0]
+          );
+        } catch (ie) { console.error('[abn] persist ' + sy + ':', ie.message); }
+      }
+    } catch (pe) { console.error('[abn] persist block:', pe.message); }
     // CORRELATION GUARD: if >=broad_threshold coins abnormal AND each >= broad_floor_pct -> one summary
     const broadCoins = abnCoins.filter(sym => states[sym].abs_move >= (abnConfig.broad_floor_pct || 3.0));
     if (broadCoins.length >= (abnConfig.broad_threshold || 5)) {
