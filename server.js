@@ -12117,7 +12117,7 @@ let rows;
   server.tool('get_trading_data',
     'Get trading journal entries, active alerts, trader context/profile, rebalancing history, and dev_bridge messages',
     {
-      include: zLoose(z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'dev_bridge', 'coin_strategy', 'reconciliation', 'ledger', 'tax_lots', 'catalysts', 'thesis', 'nudges', 'dev_health', 'dev_recommendations', 'volatility_baseline', 'shadow_fills', 'all']))).optional()
+      include: zLoose(z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'dev_bridge', 'coin_strategy', 'reconciliation', 'ledger', 'tax_lots', 'catalysts', 'thesis', 'nudges', 'dev_health', 'dev_recommendations', 'volatility_baseline', 'shadow_fills', 'abnormal_events', 'all']))).optional()
         .describe('What data to fetch — defaults to all. dev_bridge, coin_strategy and reconciliation are never included in all; request them explicitly'),
       symbol:           z.string().optional().describe('Filter journal by coin e.g. NEAR'),
       limit:            z.coerce.number().optional().describe('Max journal entries to return, default 10'),
@@ -12537,6 +12537,48 @@ let rows;
           }
         } catch (e) { sfOut.error = e.message; }
         result.shadow_fills = sfOut;
+      }
+
+      // abnormal_events (#301) -- PERSISTED irregular-move history. Survives the 30d intraday
+      // prune, so this is the long-horizon record that replay (get_abnormal_events) cannot give
+      // once the underlying captures are gone. Read-only, opt-in.
+      if (fetch.includes('abnormal_events')) {
+        const aeO = { generated_at: new Date().toISOString() };
+        try {
+          const aeLim = Math.min(parseInt(limit) || 200, 1000);
+          let aeSql = 'SELECT * FROM abnormal_events';
+          const aeP = [];
+          if (symbol) {
+            aeSql += ' WHERE symbol = ?';
+            aeP.push(symbol.toUpperCase().includes('-USD') ? symbol.toUpperCase() : symbol.toUpperCase() + '-USD');
+          }
+          aeSql += ' ORDER BY event_at DESC LIMIT ' + aeLim;
+          const [aeR] = await db.execute(aeSql, aeP);
+          aeO.count = aeR.length;
+          if (!aeR.length) {
+            aeO.note = 'no abnormal events persisted yet (#301 started recording on deploy; earlier history is only reachable via get_abnormal_events replay while intraday retains it)';
+            aeO.events = [];
+          } else {
+            const bySym = {}; let pumps = 0, dumps = 0, broad = 0;
+            for (const r of aeR) {
+              bySym[r.symbol] = (bySym[r.symbol] || 0) + 1;
+              if (r.direction === 'PUMP') pumps++; else dumps++;
+              if (r.broad_move) broad++;
+            }
+            aeO.summary = { pumps, dumps, broad_move_events: broad, distinct_symbols: Object.keys(bySym).length,
+              by_symbol: bySym, oldest: new Date(aeR[aeR.length - 1].event_at).toISOString(),
+              newest: new Date(aeR[0].event_at).toISOString() };
+            aeO.events = aeR.map(r => ({
+              t: new Date(r.event_at).toISOString(), symbol: r.symbol, direction: r.direction,
+              move_pct: parseFloat(r.move_pct), multiple: parseFloat(r.multiple),
+              baseline_pct: parseFloat(r.baseline_pct), threshold_pct: parseFloat(r.threshold_pct),
+              price: parseFloat(r.last_price), prev_price: parseFloat(r.prev_price),
+              interval_min: r.interval_min != null ? parseFloat(r.interval_min) : null,
+              sample: r.sample_size, broad_move: !!r.broad_move, would_alert: !!r.would_alert
+            }));
+          }
+        } catch (e) { aeO.error = e.message; }
+        result.abnormal_events = aeO;
       }
 
       // reconciliation -- explicitly excluded from fetchAll; must be requested by name
