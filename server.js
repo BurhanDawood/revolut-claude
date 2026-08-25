@@ -8504,7 +8504,7 @@ async function autoExecuteSell(symbol, maxPct, analysis, confidence) {
 
     if (currentQty <= 0) {
       await sendTelegram(`⚠️ AUTO-EXEC: No ${coinBase} to sell`);
-      return;
+      return { executed: false, reason: 'no_position' }; // #309
     }
 
     const sellQty = currentQty * (maxPct / 100);
@@ -8513,7 +8513,7 @@ async function autoExecuteSell(symbol, maxPct, analysis, confidence) {
     // Dust guard: skip if the sell is negligible
     if (sellQty <= 0 || !isFinite(sellQty) || valueUSD < 1) {
       await sendTelegram('⚠️ AUTO-EXEC skipped: ' + coinBase + ' position is dust (qty ' + currentQty + ', sell value $' + (valueUSD || 0).toFixed(4) + '). Nothing to sell.');
-      return;
+      return { executed: false, reason: 'dust' }; // #309
     }
 
     // #95+#125+#45: HARD ENTRY-FLOOR GUARD — never auto-sell below entry or sell_floors config.
@@ -8538,7 +8538,7 @@ async function autoExecuteSell(symbol, maxPct, analysis, confidence) {
       if (entryFloor === null) {
         await sendTelegram('AUTO-SELL BLOCKED - ' + coinBase + ': no entry floor established (no sell_floors, no pump entry_floor, no entry_price). Never-sell-below-entry cannot be verified - failing safe, position untouched.').catch(() => {});
         console.log('[auto-exec] FLOOR GUARD blocked ' + coinBase + ' sell: entryFloor null - fail-safe hash187');
-        return;
+        return { executed: false, reason: 'no_floor' }; // #309
       }
       if (entryFloor !== null && currentPrice <= entryFloor) {
         await sendTelegram(
@@ -8547,11 +8547,11 @@ async function autoExecuteSell(symbol, maxPct, analysis, confidence) {
           `Never-sell-below-entry guard held. Position untouched — your call.`
         ).catch(() => {});
         console.log(`[auto-exec] FLOOR GUARD blocked ${coinBase} sell: price ${currentPrice} <= floor ${entryFloor}`);
-        return;
+        return { executed: false, reason: 'floor_blocked', floor: entryFloor, price: currentPrice }; // #309
       }
     } catch (e) { console.error('[auto-exec] floor guard error (failing safe — blocking sell):', e.message); 
       await sendTelegram(`🛑 AUTO-SELL BLOCKED — ${coinBase}: floor-guard check errored, failing safe (no sell). Manual review.`).catch(() => {});
-      return;
+      return { executed: false, reason: 'floor_error' }; // #309
     }
 
     await db.execute(
@@ -8613,9 +8613,11 @@ async function autoExecuteSell(symbol, maxPct, analysis, confidence) {
         console.log(`[auto-exec] Stage 3 single-rebuy cascade spawned for pump-armed ${coinBase} after sell`);
       }
     } catch (e) { console.error('[auto-exec] Stage 3 cascade error (non-fatal):', e.message); }
+    return { executed: true, qty: sellQty, price: currentPrice }; // #309
   } catch (e) {
     console.error('[auto-exec] sell error:', e.message);
     await sendTelegram(`❌ AUTO-EXEC FAILED — ${coinBase}\nError: ${e.message}\nManual review needed`);
+    return { executed: false, reason: 'error', message: e.message }; // #309
   }
 }
 
