@@ -8685,18 +8685,50 @@ async function handleTrailingStopAlert(symbol, currentPrice, ts, exchange = 'rev
         const ae93Exchange = ts.exchange || exchange;
         const ae93SellPct = ts.sellPct || 25;
         console.log('[trailing] #93 ' + coinBase + ' auto_execute=true -- bypassing analysis (exchange: ' + ae93Exchange + ', sell_pct: ' + ae93SellPct + ')');
+        let ae93Result = null;
         try {
           const ae93Analysis = '#93 auto-trail breach at $' + fmtPriceShort(currentPrice) + ', trail ' + ts.trailPct + '% from peak $' + fmtPriceShort(ts.peakPrice);
           if (ae93Exchange === 'kraken') {
-            await autoExecuteKrakenSell(symbol, ae93SellPct, ae93Analysis, 'High');
+            ae93Result = await autoExecuteKrakenSell(symbol, ae93SellPct, ae93Analysis, 'High');
           } else {
-            await autoExecuteSell(symbol, ae93SellPct, ae93Analysis, 'High');
+            ae93Result = await autoExecuteSell(symbol, ae93SellPct, ae93Analysis, 'High');
           }
         } catch (ae93Err) {
           console.error('[trailing] #93 auto-exec error:', ae93Err.message);
           await sendTelegram('<b>[#93 AUTO-TRAIL FAILED]</b> ' + coinBase + ' -- ' + (ae93Err.message || '').substring(0, 100) + '. Manual action needed. Trail cleared.').catch(() => {});
         }
-        // Single-use: remove trailing stop after execution (or failure)
+        // #309 RE-ANCHOR ON A BLOCKED SALE.
+        // This previously removed the trail unconditionally -- "after execution (or failure)".
+        // When the Stage-2 floor guard blocked the sale the trail was destroyed anyway, while
+        // pump_armed_rules.armed stayed 1. checkPumpArm only fires on armed = 0, so the rule could
+        // neither re-arm nor breach again: a zombie, neither running nor resettable. Five rules
+        // were found in that state at once (IDEX, ZKJ, HOPR, SPX, TON).
+        // A blocked sale means the POSITION IS STILL THERE and we merely may not sell HERE, so
+        // re-anchor the trail from the current price and keep ratcheting: a continued pump that
+        // lifts peak x (1 - trail) above the floor then sells normally.
+        // setTrailingStop preserves autoExecute/sellPct/exchange from the EXISTING entry, so this
+        // must run INSTEAD of removeTrailingStop, never after it.
+        // NOTE: Revolut only for now -- autoExecuteKrakenSell still returns undefined, so Kraken
+        // coins fall through to the original remove-the-trail behaviour (no regression).
+        const ae93Blocked = ae93Result && ae93Result.executed === false
+          && ['floor_blocked', 'no_floor', 'floor_error'].indexOf(ae93Result.reason) !== -1;
+        if (ae93Blocked) {
+          // No trade occurred, so the execution cooldown must not be held against the next attempt.
+          analysisRateLimit.delete(symbol + '_executed');
+          try {
+            await setTrailingStop(symbol, ts.trailPct, currentPrice, ts.entryPrice, ts.autoExecute, ts.sellPct, ts.exchange);
+            const ae93Floor = ae93Result.floor != null ? fmtPriceShort(ae93Result.floor) : 'unset';
+            await sendTelegram('<b>[#93 FLOOR-BLOCKED]</b> ' + coinBase + ' sale blocked at $' + fmtPriceShort(currentPrice) +
+              ' (floor ' + ae93Floor + ', reason ' + ae93Result.reason + ').\nTrail RE-ANCHORED from here -- still trailing ' + ts.trailPct +
+              '% and still armed. It will sell once a pump lifts the peak far enough to clear the floor.').catch(() => {});
+            console.log('[trailing] #309 ' + coinBase + ' floor-blocked (' + ae93Result.reason + ') -- trail re-anchored at ' + currentPrice + ', NOT cleared');
+          } catch (ae93ReErr) {
+            console.error('[trailing] #309 re-anchor failed:', ae93ReErr.message);
+            await removeTrailingStop(symbol).catch(() => {});
+          }
+          return;
+        }
+        // Executed, dust, no position, or hard error: single-use, remove the trail as before.
         await removeTrailingStop(symbol).catch(() => {});
         return;
       }
