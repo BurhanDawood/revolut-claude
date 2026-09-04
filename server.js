@@ -815,8 +815,46 @@ await db.execute(`CREATE TABLE IF NOT EXISTS abnormal_events (
   INDEX idx_abn_symbol_time (symbol, event_at),
   INDEX idx_abn_time (event_at)
 )`);
+// #312 Build 1 (Parts A+B) — DATA ONLY. Catalogue of market regimes and of the mechanisms
+// already built, so strategy selection becomes a query rather than prose in a chat window.
+// No execution, no simulation: nothing reads these to trade.
+await db.execute(`CREATE TABLE IF NOT EXISTS strategy_scenarios (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  scenario_key VARCHAR(60) NOT NULL,
+  name VARCHAR(120) NOT NULL,
+  description TEXT NULL,
+  detection_signals TEXT NULL,
+  detection_criteria TEXT NULL,
+  data_available TINYINT(1) DEFAULT 1,
+  data_gap TEXT NULL,
+  evidence TEXT NULL,
+  notes TEXT NULL,
+  active TINYINT(1) DEFAULT 1,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_scenario_key (scenario_key)
+)`);
+await db.execute(`CREATE TABLE IF NOT EXISTS strategy_tools (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  tool_key VARCHAR(60) NOT NULL,
+  name VARCHAR(120) NOT NULL,
+  dev_ref VARCHAR(40) NULL,
+  status VARCHAR(24) DEFAULT 'live',
+  what_it_does TEXT NULL,
+  when_it_wins TEXT NULL,
+  when_it_loses TEXT NULL,
+  parameters TEXT NULL,
+  conflicts TEXT NULL,
+  evidence TEXT NULL,
+  active TINYINT(1) DEFAULT 1,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_tool_key (tool_key)
+)`);
 // #259 Phase 3: seed/catch-up the hourly rollup in the background (never blocks boot)
 initHourlyRollup().catch(err => console.error('[hourly-rollup] init call error:', err.message));
+// #312 Build 1: seed the scenario + tool catalogue (idempotent, deferred past module eval like the backfill)
+setTimeout(() => seedStrategyCatalogue().catch(err => console.error('[catalogue] call error:', err.message)), 12000);
 // #301 one-off backfill of abnormal events from retained intraday (flag-guarded, fire-and-forget)
 setTimeout(() => backfillAbnormalEvents().catch(err => console.error('[abn-backfill] call error:', err.message)), 15000);
 // #301 DEFERRED deliberately: backfillAbnormalEvents reads ABN_LOOKBACK_DAYS / ABN_K / ABN_FLOOR_PCT /
@@ -5308,6 +5346,32 @@ async function initHourlyRollup() {
 // FIDELITY NOTE: the baseline needs 14d of lead-in but intraday only retains ~30d, so the
 // earliest ~14d of the window are computed from a partial sample. Those events are still real
 // detections; treat their baseline/multiple as lower-confidence than the recent ~16d.
+// #312 Build 1 seed. INSERT IGNORE keeps it idempotent and never overwrites PM edits —
+// once a row exists, only the upsert action changes it.
+async function seedStrategyCatalogue() {
+  try {
+    const scen = [
+      ['trend_up','Trend up','Higher highs and higher lows; price advancing with structure intact.','MSS (#49) HH/HL on 1h and 4h; trend and mss_status fields.','MSS trend = up AND mss_status not ranging on 1h or 4h.',1,null,'COTI to ATH: sell-100 returned $137, sell-50 $1,084, sell-25 $1,594, pure hold $2,030 on $100 (modelled 23 Aug).'],
+      ['trend_down','Trend down','Lower highs and lower lows; advancing downside structure.','MSS (#49) LH/LL on 1h and 4h.','MSS trend = down AND mss_status not ranging.',1,null,null],
+      ['range','Range','Price contained inside an N-day band; no directional structure.','MSS ranging; price band width over N days.','MSS mss_status = ranging AND N-day high/low band within X%.',1,null,'IDEX 20-29 Aug rose 56.7% but with 10-16% retraces — laddered scale-out returned +29.1% vs hold there.'],
+      ['spike_and_fade','Spike and fade','Frequent abnormal moves that revert quickly; near-symmetric pump/dump split.','abnormal_events (#301) counts by direction; reversal half-life.','High event count with pump/dump split near 1:1 AND short median reversal interval.',1,null,'RSC showed 102 pumps vs 105 dumps in 30 days. IDEX 2-min reversals are faster than the capture cycle can exploit.'],
+      ['regime_expansion','Regime expansion','Volatility baseline itself rising materially versus its own recent past — character change, not just a move.','volatility_baseline (#259) versus its 14d-prior value.','baseline > 14d-prior baseline by a material margin, sustained.',0,'BLOCKING GAP: volatility_baseline is a SNAPSHOT ONLY. The derivative versus 14d-prior is not stored or exposed, so this regime cannot currently be detected automatically. Needs a baseline history series before Part C can use it.','SQD went 0.0868 -> 0.1862 as its advance developed; ILV stayed pinned 0.19-0.22 through a month of chop. BTC baseline rose 0.0229 -> 0.0325 (+42%) over 18-21 Aug while price rose 21.7%.'],
+      ['event_artefact','Event-driven artefact','An elevated reading caused by a one-off event, not by the asset character. Must be labelled so it is not traded as signal.','volatility_baseline decay rate; external event context.','Baseline spikes then decays sharply within days, with a known cause.',1,null,'HFT baseline 0.5104 was purely its Binance delisting window and decayed 51% in four days.']
+    ];
+    for (const s of scen) {
+      await db.execute('INSERT IGNORE INTO strategy_scenarios (scenario_key,name,description,detection_signals,detection_criteria,data_available,data_gap,evidence) VALUES (?,?,?,?,?,?,?,?)', s).catch(() => {});
+    }
+    const tools = [];
+
+    for (const t of tools) {
+      await db.execute('INSERT IGNORE INTO strategy_tools (tool_key,name,dev_ref,status,what_it_does,when_it_wins,when_it_loses,parameters,conflicts,evidence) VALUES (?,?,?,?,?,?,?,?,?,?)', t).catch(() => {});
+    }
+    const [sc] = await db.execute('SELECT COUNT(*) n FROM strategy_scenarios');
+    const [tc] = await db.execute('SELECT COUNT(*) n FROM strategy_tools');
+    console.log('[catalogue] seeded/verified: ' + sc[0].n + ' scenarios, ' + tc[0].n + ' tools');
+  } catch (e) { console.error('[catalogue] seed error:', e.message); }
+}
+
 async function backfillAbnormalEvents() {
   try {
     const [flagRows] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'abn_backfill_done'");
