@@ -12303,7 +12303,7 @@ let rows;
   server.tool('get_trading_data',
     'Get trading journal entries, active alerts, trader context/profile, rebalancing history, and dev_bridge messages',
     {
-      include: zLoose(z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'dev_bridge', 'coin_strategy', 'reconciliation', 'ledger', 'tax_lots', 'catalysts', 'thesis', 'nudges', 'dev_health', 'dev_recommendations', 'volatility_baseline', 'shadow_fills', 'abnormal_events', 'all']))).optional()
+      include: zLoose(z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'dev_bridge', 'coin_strategy', 'reconciliation', 'ledger', 'tax_lots', 'catalysts', 'thesis', 'nudges', 'dev_health', 'dev_recommendations', 'volatility_baseline', 'shadow_fills', 'abnormal_events', 'strategy_catalogue', 'all']))).optional()
         .describe('What data to fetch — defaults to all. dev_bridge, coin_strategy and reconciliation are never included in all; request them explicitly'),
       symbol:           z.string().optional().describe('Filter journal by coin e.g. NEAR'),
       limit:            z.coerce.number().optional().describe('Max journal entries to return, default 10'),
@@ -12765,6 +12765,34 @@ let rows;
           }
         } catch (e) { aeO.error = e.message; }
         result.abnormal_events = aeO;
+      }
+
+      // strategy_catalogue (#312 Build 1) -- scenarios + tools. Read-only, opt-in.
+      // Answers "what regime is this and which tool fits" from data rather than from prose.
+      // data_gap on a scenario means the detection signal is NOT currently computable — treat
+      // that scenario as unusable for automated selection until the gap is closed.
+      if (fetch.includes('strategy_catalogue')) {
+        const cat = { generated_at: new Date().toISOString() };
+        try {
+          const [scRows] = await db.execute('SELECT * FROM strategy_scenarios WHERE active = 1 ORDER BY scenario_key ASC');
+          const [tlRows] = await db.execute('SELECT * FROM strategy_tools WHERE active = 1 ORDER BY tool_key ASC');
+          cat.counts = { scenarios: scRows.length, tools: tlRows.length,
+            scenarios_with_data_gap: scRows.filter(r => !r.data_available).length,
+            tools_live: tlRows.filter(r => r.status === 'live').length };
+          cat.scenarios = scRows.map(r => ({
+            key: r.scenario_key, name: r.name, description: r.description,
+            detection_signals: r.detection_signals, detection_criteria: r.detection_criteria,
+            data_available: !!r.data_available, data_gap: r.data_gap,
+            evidence: r.evidence, notes: r.notes, updated_at: r.updated_at
+          }));
+          cat.tools = tlRows.map(r => ({
+            key: r.tool_key, name: r.name, dev_ref: r.dev_ref, status: r.status,
+            what_it_does: r.what_it_does, when_it_wins: r.when_it_wins, when_it_loses: r.when_it_loses,
+            parameters: r.parameters, conflicts: r.conflicts, evidence: r.evidence, updated_at: r.updated_at
+          }));
+          if (!scRows.length && !tlRows.length) cat.note = 'catalogue empty -- the boot seeder runs 12s after start; check the [catalogue] log line';
+        } catch (e) { cat.error = e.message; }
+        result.strategy_catalogue = cat;
       }
 
       // reconciliation -- explicitly excluded from fetchAll; must be requested by name
