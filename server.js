@@ -13645,6 +13645,64 @@ let rows;
           return { content: [{ type: 'text', text: JSON.stringify({ ok: true, enabled: false }) }] };
         }
         return { content: [{ type: 'text', text: JSON.stringify({ error: 'Unknown dnd_action. Use: status|set_eligible|set_params|activate|deactivate' }) }] };
+      } else if (action === 'upsert_catalogue') {
+        // #312 Build 1d -- PM writes to the scenario/tool catalogue without a Dev build.
+        // Upsert by key: creates if absent, updates only the fields supplied (COALESCE keeps
+        // the rest), so a partial edit never blanks a column. Set cat_active=false to retire
+        // an entry rather than deleting it -- history is worth more than tidiness.
+        const ck = (cat_key || '').trim();
+        if (!ck) return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'cat_key required' }) }] };
+        const kind = (cat_kind || '').toLowerCase();
+        if (kind !== 'scenario' && kind !== 'tool') {
+          return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: "cat_kind must be 'scenario' or 'tool'" }) }] };
+        }
+        const actFlag = cat_active === undefined ? null : (cat_active ? 1 : 0);
+        try {
+          if (kind === 'scenario') {
+            await db.execute(
+              `INSERT INTO strategy_scenarios (scenario_key, name, description, detection_signals, detection_criteria, data_available, data_gap, evidence, notes, active)
+               VALUES (?, ?, ?, ?, ?, COALESCE(?,1), ?, ?, ?, COALESCE(?,1))
+               ON DUPLICATE KEY UPDATE
+                 name=COALESCE(VALUES(name), name),
+                 description=COALESCE(VALUES(description), description),
+                 detection_signals=COALESCE(VALUES(detection_signals), detection_signals),
+                 detection_criteria=COALESCE(VALUES(detection_criteria), detection_criteria),
+                 data_available=COALESCE(?, data_available),
+                 data_gap=COALESCE(VALUES(data_gap), data_gap),
+                 evidence=COALESCE(VALUES(evidence), evidence),
+                 notes=COALESCE(VALUES(notes), notes),
+                 active=COALESCE(?, active)`,
+              [ck, cat_name || null, cat_description || null, cat_detection_signals || null, cat_detection_criteria || null,
+               cat_data_available === undefined ? null : (cat_data_available ? 1 : 0), cat_data_gap || null,
+               cat_evidence || null, cat_notes || null, actFlag,
+               cat_data_available === undefined ? null : (cat_data_available ? 1 : 0), actFlag]
+            );
+            const [row] = await db.execute('SELECT * FROM strategy_scenarios WHERE scenario_key = ?', [ck]);
+            return { content: [{ type: 'text', text: JSON.stringify({ ok: true, action: 'upsert_catalogue', kind: 'scenario', key: ck, row: row[0] || null }, null, 2) }] };
+          }
+          await db.execute(
+            `INSERT INTO strategy_tools (tool_key, name, dev_ref, status, what_it_does, when_it_wins, when_it_loses, parameters, conflicts, evidence, active)
+             VALUES (?, ?, ?, COALESCE(?, 'live'), ?, ?, ?, ?, ?, ?, COALESCE(?,1))
+             ON DUPLICATE KEY UPDATE
+               name=COALESCE(VALUES(name), name),
+               dev_ref=COALESCE(VALUES(dev_ref), dev_ref),
+               status=COALESCE(VALUES(status), status),
+               what_it_does=COALESCE(VALUES(what_it_does), what_it_does),
+               when_it_wins=COALESCE(VALUES(when_it_wins), when_it_wins),
+               when_it_loses=COALESCE(VALUES(when_it_loses), when_it_loses),
+               parameters=COALESCE(VALUES(parameters), parameters),
+               conflicts=COALESCE(VALUES(conflicts), conflicts),
+               evidence=COALESCE(VALUES(evidence), evidence),
+               active=COALESCE(?, active)`,
+            [ck, cat_name || null, cat_dev_ref || null, cat_status || null, cat_what_it_does || null,
+             cat_when_it_wins || null, cat_when_it_loses || null, cat_parameters || null,
+             cat_conflicts || null, cat_evidence || null, actFlag, actFlag]
+          );
+          const [row] = await db.execute('SELECT * FROM strategy_tools WHERE tool_key = ?', [ck]);
+          return { content: [{ type: 'text', text: JSON.stringify({ ok: true, action: 'upsert_catalogue', kind: 'tool', key: ck, row: row[0] || null }, null, 2) }] };
+        } catch (e) {
+          return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: e.message }) }] };
+        }
       } else if (action === 'log_catalyst') {
         const cBase = (symbol || '').toUpperCase().replace('-USD', '');
         if (!cBase) return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'symbol required' }) }] };
