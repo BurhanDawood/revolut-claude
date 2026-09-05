@@ -13006,7 +13006,7 @@ let rows;
   server.tool('manage_trading',
     'Log journal entries, trade intentions, trader preferences, update invested capital, or configure USDT sweep',
     {
-      action:                 z.enum(['log_journal', 'log_intention', 'save_preference', 'update_capital', 'configure_sweep', 'configure_auto_execute', 'log_dev_issue', 'update_session_state', 'upsert_coin_strategy', 'export_dev_log', 'log_research', 'log_pm_decision', 'log_dev_decision', 'void_journal', 'configure_away_mode', 'delete_tax_lot', 'log_catalyst', 'log_thesis', 'configure_abnormal', 'configure_dnd', 'configure_thesis_nudge']).describe('What trading action to perform'),
+      action:                 z.enum(['log_journal', 'log_intention', 'save_preference', 'update_capital', 'configure_sweep', 'configure_auto_execute', 'log_dev_issue', 'update_session_state', 'upsert_coin_strategy', 'export_dev_log', 'log_research', 'log_pm_decision', 'log_dev_decision', 'void_journal', 'configure_away_mode', 'delete_tax_lot', 'log_catalyst', 'log_thesis', 'configure_abnormal', 'configure_dnd', 'configure_thesis_nudge', 'upsert_catalogue']).describe('What trading action to perform'),
       symbol:                 z.string().optional().describe('Coin e.g. NEAR-USD or NEAR'),
       trade_action:           z.enum(['buy', 'sell', 'hold', 'add', 'reduce', 'payment', 'transfer', 'pass']).optional().describe('Trade action for log_journal or log_intention — use pass to log a skipped trade for shadow grading at +7d/+30d'),
       price:                  z.coerce.number().optional().describe('Price for log_journal'),
@@ -13087,6 +13087,24 @@ let rows;
       tn_enabled:           z.coerce.boolean().optional().describe('configure_thesis_nudge: turn the passive Telegram push on/off (#262 Build 2c)'),
       tn_min_severity:      z.coerce.number().optional().describe('configure_thesis_nudge: minimum nudge severity to push (default 3)'),
       tn_cooldown_min:      z.coerce.number().optional().describe('configure_thesis_nudge: per symbol+type re-push cooldown in minutes (default 240)'),
+      cat_kind:               z.enum(['scenario','tool']).optional().describe("#312 upsert_catalogue: which catalogue -- 'scenario' or 'tool'"),
+      cat_key:                z.string().optional().describe('#312 upsert_catalogue: scenario_key or tool_key (unique; creates if absent, updates if present)'),
+      cat_name:               z.string().optional().describe('#312 upsert_catalogue: display name'),
+      cat_active:             z.boolean().optional().describe('#312 upsert_catalogue: set false to retire an entry (kept for history, hidden from reads)'),
+      cat_description:        z.string().optional().describe('#312 scenario: what this regime is'),
+      cat_detection_signals:  z.string().optional().describe('#312 scenario: which data detects it'),
+      cat_detection_criteria: z.string().optional().describe('#312 scenario: concrete thresholds'),
+      cat_data_available:     z.boolean().optional().describe('#312 scenario: is the detection signal computable TODAY? false means unusable for automated selection'),
+      cat_data_gap:           z.string().optional().describe('#312 scenario: what is missing if data_available is false'),
+      cat_dev_ref:            z.string().optional().describe('#312 tool: dev_log reference e.g. #95'),
+      cat_status:             z.string().optional().describe('#312 tool: live | config_only | manual'),
+      cat_what_it_does:       z.string().optional().describe('#312 tool: mechanism in one line'),
+      cat_when_it_wins:       z.string().optional().describe('#312 tool: the conditions it suits'),
+      cat_when_it_loses:      z.string().optional().describe('#312 tool: the conditions it FAILS in -- required for honest selection'),
+      cat_parameters:         z.string().optional().describe('#312 tool: parameter names and sane ranges'),
+      cat_conflicts:          z.string().optional().describe('#312 tool: interactions with other tools'),
+      cat_evidence:           z.string().optional().describe('#312 scenario or tool: observed proof'),
+      cat_notes:              z.string().optional().describe('#312 scenario: freeform notes'),
       dnd_action:       z.enum(['activate','deactivate','set_eligible','set_params','status']).optional().describe('configure_dnd sub-action'),
       dnd_coins:        z.preprocess(v => { if (typeof v === 'string') { try { return JSON.parse(v); } catch(e) { return v; } } return v; }, z.array(z.string())).optional().describe('configure_dnd: coin list e.g. ["BOBA","ENA"]'),
       dnd_arm_pct:      z.coerce.number().optional().describe('configure_dnd: pump %% to arm trail (default 30)'),
@@ -13095,7 +13113,7 @@ let rows;
       dnd_retrace_pct:  z.coerce.number().optional().describe('configure_dnd: #160 %% of move price must retrace before trough arms (default 50)'),
       dnd_bounce_pct:   z.coerce.number().optional().describe('configure_dnd: #160 %% bounce off trough to trigger rebuy (default 8)'),
     },
-    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, away_buy_usd, away_sell_pct, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam, manual_only_symbols: manualOnlyParam, title, detail, category, status: devStatus, source: devSource, related_symbol: relSymbol, dev_log_id, active_workstream, progress, open_threads, next_action, recent_decision, recent_decisions, cs_status, cs_role, cs_theme, cs_strategy_md, pm_decision, pm_principle_tag, pm_conviction, pm_captured_by, pm_supersedes_id, dev_decision, dev_principle_tag, dev_cross_thread, dev_alternatives, dev_related_log, dev_supersedes_id, journal_id, tax_lot_id, away_action, away_coins, sell_floors, per_coin_enabled, catalyst_id, catalyst, catalyst_date, catalyst_type, expected_impact, priced_in_risk, catalyst_confidence, catalyst_source, catalyst_status, abn_alert_floor_pct, abn_broad_floor_pct, abn_broad_threshold, abn_cooldown_min, dnd_action, dnd_coins, dnd_arm_pct, dnd_trail_pct, dnd_sell_pct, dnd_retrace_pct, dnd_bounce_pct, conviction, bull_case, bear_case, invalidation_triggers, supporting_refs, tn_enabled, tn_min_severity, tn_cooldown_min }) => {
+    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, away_buy_usd, away_sell_pct, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam, manual_only_symbols: manualOnlyParam, title, detail, category, status: devStatus, source: devSource, related_symbol: relSymbol, dev_log_id, active_workstream, progress, open_threads, next_action, recent_decision, recent_decisions, cs_status, cs_role, cs_theme, cs_strategy_md, pm_decision, pm_principle_tag, pm_conviction, pm_captured_by, pm_supersedes_id, dev_decision, dev_principle_tag, dev_cross_thread, dev_alternatives, dev_related_log, dev_supersedes_id, journal_id, tax_lot_id, away_action, away_coins, sell_floors, per_coin_enabled, catalyst_id, catalyst, catalyst_date, catalyst_type, expected_impact, priced_in_risk, catalyst_confidence, catalyst_source, catalyst_status, abn_alert_floor_pct, abn_broad_floor_pct, abn_broad_threshold, abn_cooldown_min, dnd_action, dnd_coins, dnd_arm_pct, dnd_trail_pct, dnd_sell_pct, dnd_retrace_pct, dnd_bounce_pct, conviction, bull_case, bear_case, invalidation_triggers, supporting_refs, tn_enabled, tn_min_severity, tn_cooldown_min, cat_kind, cat_key, cat_name, cat_active, cat_description, cat_detection_signals, cat_detection_criteria, cat_data_available, cat_data_gap, cat_dev_ref, cat_status, cat_what_it_does, cat_when_it_wins, cat_when_it_loses, cat_parameters, cat_conflicts, cat_evidence, cat_notes }) => {
       // Make hodl_symbols accessible in configure_auto_execute via params object
       const params = { hodl_symbols: hodlSymbolsParam, manual_only_symbols: manualOnlyParam };
 
