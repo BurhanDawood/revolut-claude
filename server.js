@@ -13661,9 +13661,9 @@ let rows;
           if (kind === 'scenario') {
             await db.execute(
               `INSERT INTO strategy_scenarios (scenario_key, name, description, detection_signals, detection_criteria, data_available, data_gap, evidence, notes, active)
-               VALUES (?, ?, ?, ?, ?, COALESCE(?,1), ?, ?, ?, COALESCE(?,1))
+               VALUES (?, COALESCE(?, ?), ?, ?, ?, COALESCE(?,1), ?, ?, ?, COALESCE(?,1))
                ON DUPLICATE KEY UPDATE
-                 name=COALESCE(VALUES(name), name),
+                 name=COALESCE(?, name),
                  description=COALESCE(VALUES(description), description),
                  detection_signals=COALESCE(VALUES(detection_signals), detection_signals),
                  detection_criteria=COALESCE(VALUES(detection_criteria), detection_criteria),
@@ -13672,9 +13672,10 @@ let rows;
                  evidence=COALESCE(VALUES(evidence), evidence),
                  notes=COALESCE(VALUES(notes), notes),
                  active=COALESCE(?, active)`,
-              [ck, cat_name || null, cat_description || null, cat_detection_signals || null, cat_detection_criteria || null,
+              [ck, cat_name || null, ck, cat_description || null, cat_detection_signals || null, cat_detection_criteria || null,
                cat_data_available === undefined ? null : (cat_data_available ? 1 : 0), cat_data_gap || null,
                cat_evidence || null, cat_notes || null, actFlag,
+               cat_name || null,
                cat_data_available === undefined ? null : (cat_data_available ? 1 : 0), actFlag]
             );
             const [row] = await db.execute('SELECT * FROM strategy_scenarios WHERE scenario_key = ?', [ck]);
@@ -13682,9 +13683,9 @@ let rows;
           }
           await db.execute(
             `INSERT INTO strategy_tools (tool_key, name, dev_ref, status, what_it_does, when_it_wins, when_it_loses, parameters, conflicts, evidence, active)
-             VALUES (?, ?, ?, COALESCE(?, 'live'), ?, ?, ?, ?, ?, ?, COALESCE(?,1))
+             VALUES (?, COALESCE(?, ?), ?, COALESCE(?, 'live'), ?, ?, ?, ?, ?, ?, COALESCE(?,1))
              ON DUPLICATE KEY UPDATE
-               name=COALESCE(VALUES(name), name),
+               name=COALESCE(?, name),
                dev_ref=COALESCE(VALUES(dev_ref), dev_ref),
                status=COALESCE(VALUES(status), status),
                what_it_does=COALESCE(VALUES(what_it_does), what_it_does),
@@ -13694,9 +13695,9 @@ let rows;
                conflicts=COALESCE(VALUES(conflicts), conflicts),
                evidence=COALESCE(VALUES(evidence), evidence),
                active=COALESCE(?, active)`,
-            [ck, cat_name || null, cat_dev_ref || null, cat_status || null, cat_what_it_does || null,
+            [ck, cat_name || null, ck, cat_dev_ref || null, cat_status || null, cat_what_it_does || null,
              cat_when_it_wins || null, cat_when_it_loses || null, cat_parameters || null,
-             cat_conflicts || null, cat_evidence || null, actFlag, actFlag]
+             cat_conflicts || null, cat_evidence || null, actFlag, cat_name || null, actFlag]
           );
           const [row] = await db.execute('SELECT * FROM strategy_tools WHERE tool_key = ?', [ck]);
           return { content: [{ type: 'text', text: JSON.stringify({ ok: true, action: 'upsert_catalogue', kind: 'tool', key: ck, row: row[0] || null }, null, 2) }] };
