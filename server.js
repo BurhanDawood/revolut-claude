@@ -13687,7 +13687,7 @@ let rows;
              ON DUPLICATE KEY UPDATE
                name=COALESCE(?, name),
                dev_ref=COALESCE(VALUES(dev_ref), dev_ref),
-               status=COALESCE(VALUES(status), status),
+               status=COALESCE(?, status),
                what_it_does=COALESCE(VALUES(what_it_does), what_it_does),
                when_it_wins=COALESCE(VALUES(when_it_wins), when_it_wins),
                when_it_loses=COALESCE(VALUES(when_it_loses), when_it_loses),
@@ -13697,7 +13697,7 @@ let rows;
                active=COALESCE(?, active)`,
             [ck, cat_name || null, ck, cat_dev_ref || null, cat_status || null, cat_what_it_does || null,
              cat_when_it_wins || null, cat_when_it_loses || null, cat_parameters || null,
-             cat_conflicts || null, cat_evidence || null, actFlag, cat_name || null, actFlag]
+             cat_conflicts || null, cat_evidence || null, actFlag, cat_name || null, cat_status || null, actFlag]
           );
           const [row] = await db.execute('SELECT * FROM strategy_tools WHERE tool_key = ?', [ck]);
           return { content: [{ type: 'text', text: JSON.stringify({ ok: true, action: 'upsert_catalogue', kind: 'tool', key: ck, row: row[0] || null }, null, 2) }] };
