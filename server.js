@@ -4644,6 +4644,93 @@ function shadowEvalTier(state, bar, cfg, ctx) {
   return { state, fills };
 }
 
+// ── #312 Build 2: BACKTEST HARNESS ───────────────────────────────────────────
+// Replays the SAME evaluator the live shadow uses (shadowEvalTier) over stored
+// bars and scores it against a buy-and-hold baseline. Reusing the evaluator is
+// deliberate: a harness that made different decisions from the live path would
+// predict something other than what the system would actually do.
+//
+// SEPARATION OF CONCERNS: the evaluator DECIDES (which tier, at what trigger
+// price); this accountant PRICES those decisions (fees, slippage). The evaluator
+// is untouched and stays pure.
+//
+// KNOWN APPROXIMATION, stated rather than hidden: shadowEvalTier sizes each tier
+// as a % of its own internally-tracked qty, which is fee-free. The reported
+// terminal value IS fee-adjusted, so later tiers are sized off a slightly
+// optimistic base. At 0.09%/leg over an 8-leg cycle the drift is ~0.7% of
+// position — small, but real, and it biases results mildly OPTIMISTIC.
+//
+// SLIPPAGE IS AN EXPLICIT INPUT, NEVER A HIDDEN DEFAULT. It is the binding
+// constraint on this whole thesis (conservative ladder breaks even at 1.22%/leg,
+// aggressive at 0.66%) and it has never been measured. Callers must pass it and
+// results must be read as a function of it.
+function btComputeMetrics(fills, startQty, startUsd, endPrice, feePct, slipPct) {
+  const fee = feePct / 100, slip = slipPct / 100;
+  let qty = startQty, usd = startUsd;
+  let sellsFilled = 0, buysFilled = 0, grossSold = 0, grossBought = 0;
+  let feesPaid = 0, slipCost = 0;
+  const blocked = {};
+  const cycles = {};
+  for (const f of fills) {
+    const cid = f.cycle_id || 'c0';
+    if (!cycles[cid]) cycles[cid] = { sells: 0, buys: 0 };
+    if (!f.would_have_filled) {
+      const r = f.block_reason || 'unknown';
+      blocked[r] = (blocked[r] || 0) + 1;
+      continue;
+    }
+    if (f.leg === 'sell') {
+      const q = f.intended_qty || 0;
+      const raw = q * f.price;
+      const fillPx = f.price * (1 - slip);
+      const net = q * fillPx * (1 - fee);
+      slipCost += raw - (q * fillPx);
+      feesPaid += q * fillPx * fee;
+      qty -= q; usd += net; grossSold += q;
+      sellsFilled++; cycles[cid].sells++;
+    } else {
+      const spend = f.intended_usd || 0;
+      const fillPx = f.price * (1 + slip);
+      const got = (spend * (1 - fee)) / fillPx;
+      const idealQty = spend / f.price;
+      slipCost += (idealQty - got) * f.price;
+      feesPaid += spend * fee;
+      qty += got; usd -= spend; grossBought += got;
+      buysFilled++; cycles[cid].buys++;
+    }
+  }
+  // HONEST CYCLE ACCOUNTING: a cycle only COUNTS as completed if a buy leg
+  // actually filled. Blocked tiers are still marked done by the evaluator, so
+  // "all tiers visited" would score a cycle where the buy leg never worked as a
+  // success — and "cycles completed" is the gate the go/no-go decision rests on.
+  let completed = 0, abandoned = 0;
+  for (const cid of Object.keys(cycles)) {
+    if (cycles[cid].buys > 0) completed++;
+    else if (cycles[cid].sells > 0) abandoned++;
+  }
+  const terminal = qty * endPrice + usd;
+  const hold = startQty * endPrice + startUsd;
+  return {
+    terminal_value: Number(terminal.toFixed(4)),
+    hold_value: Number(hold.toFixed(4)),
+    vs_hold_pct: hold > 0 ? Number(((terminal / hold - 1) * 100).toFixed(2)) : null,
+    end_qty: Number(qty.toFixed(6)),
+    end_usd: Number(usd.toFixed(4)),
+    end_qty_pct_of_start: startQty > 0 ? Number((qty / startQty * 100).toFixed(1)) : null,
+    gross_sold_qty: Number(grossSold.toFixed(6)),
+    gross_bought_qty: Number(grossBought.toFixed(6)),
+    sells_filled: sellsFilled,
+    buys_filled: buysFilled,
+    cycles_completed: completed,
+    cycles_abandoned_no_buy: abandoned,
+    fills_blocked: fills.filter(f => !f.would_have_filled).length,
+    blocked_by_reason: blocked,
+    fees_paid_usd: Number(feesPaid.toFixed(4)),
+    slippage_cost_usd: Number(slipCost.toFixed(4)),
+    cost_drag_pct_of_hold: hold > 0 ? Number(((feesPaid + slipCost) / hold * 100).toFixed(2)) : null
+  };
+}
+
 async function runFastScan() {
   try {
     // Part A: pump-arm detector -- dynamic over ALL active, unarmed pump_armed_rules (#215 fix;
