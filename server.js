@@ -4731,6 +4731,72 @@ function btComputeMetrics(fills, startQty, startUsd, endPrice, feePct, slipPct) 
   };
 }
 
+async function runLadderBacktest(opts) {
+  const sym = (opts.symbol || '').toUpperCase().includes('-USD')
+    ? opts.symbol.toUpperCase() : (opts.symbol || '').toUpperCase() + '-USD';
+  const src = opts.source === 'intraday' ? 'intraday' : 'hourly';
+  const feePct = opts.fee_pct != null ? Number(opts.fee_pct) : 0.09;
+  const slipPct = opts.slippage_pct != null ? Number(opts.slippage_pct) : 0;
+  let bars = [];
+  if (src === 'hourly') {
+    const [r] = await db.execute(
+      'SELECT hour_bucket AS t, open_price AS o, high_price AS h, low_price AS l, close_price AS c FROM price_intraday_hourly WHERE symbol = ? AND hour_bucket >= ? AND hour_bucket <= ? ORDER BY hour_bucket ASC',
+      [sym, opts.start, opts.end]);
+    bars = r.map(x => ({ t: new Date(x.t).getTime(), h: parseFloat(x.h), l: parseFloat(x.l), c: parseFloat(x.c) }));
+  } else {
+    const [r] = await db.execute(
+      'SELECT recorded_at AS t, price FROM price_intraday WHERE symbol = ? AND recorded_at >= ? AND recorded_at <= ? ORDER BY recorded_at ASC',
+      [sym, opts.start, opts.end]);
+    bars = r.map(x => { const p = parseFloat(x.price); return { t: new Date(x.t).getTime(), h: p, l: p, c: p }; });
+  }
+  if (bars.length < 24) return { ok: false, error: 'insufficient bars: ' + bars.length + ' (need >= 24)', symbol: sym, source: src };
+  const cfg = {
+    arm_pump_pct: Number(opts.arm_pump_pct),
+    arm_window_min: opts.arm_window_min != null ? Number(opts.arm_window_min) : 1440,
+    sell_tiers: opts.sell_tiers, buy_tiers: opts.buy_tiers,
+    tier_cooldown_min: opts.tier_cooldown_min != null ? Number(opts.tier_cooldown_min) : 15,
+    min_tier_usd: opts.min_tier_usd != null ? Number(opts.min_tier_usd) : 2,
+    entry_floor: opts.entry_floor != null ? Number(opts.entry_floor) : null
+  };
+  const startQty = Number(opts.initial_qty), startUsd = opts.initial_usd != null ? Number(opts.initial_usd) : 0;
+  const st = shadowNewState(startQty);
+  const ctx = { availableUsd: startUsd, cycleSeq: 0, cyclesCompleted: 0, cyclesAbandoned: 0 };
+  const fills = [];
+  // CREDIT SIMULATED SALE PROCEEDS TO AVAILABLE CASH.
+  // shadowEvalTier gates buy legs on ctx.availableUsd and never increments it on a
+  // sell — correct for LIVE shadow, where that figure is the real account balance
+  // and does not rise because no real sale occurs. In a BACKTEST it must rise, or
+  // the buy leg can never fire and every cycle scores as abandoned_no_buy.
+  // Credited NET of fees and slippage so the cash path matches the accounting path.
+  const btFee = feePct / 100, btSlip = slipPct / 100;
+  for (const b of bars) {
+    const out = shadowEvalTier(st, b, cfg, ctx);
+    for (const f of out.fills) {
+      if (f.would_have_filled && f.leg === 'sell') {
+        ctx.availableUsd += (f.intended_qty || 0) * f.price * (1 - btSlip) * (1 - btFee);
+      }
+    }
+    fills.push(...out.fills);
+  }
+  const m = btComputeMetrics(fills, startQty, startUsd, bars[bars.length - 1].c, feePct, slipPct);
+  return {
+    ok: true, symbol: sym, source: src,
+    window: { start: new Date(bars[0].t).toISOString(), end: new Date(bars[bars.length - 1].t).toISOString(), bars: bars.length },
+    price: { first: bars[0].c, last: bars[bars.length - 1].c,
+      change_pct: Number(((bars[bars.length - 1].c / bars[0].c - 1) * 100).toFixed(2)) },
+    config: cfg,
+    costs: { fee_pct_per_leg: feePct, slippage_pct_per_leg: slipPct },
+    metrics: m,
+    caveats: [
+      'Slippage is an INPUT, not a measurement. Re-run across a range; the result is only as good as this assumption.',
+      'Tier sizing uses fee-free qty (see btComputeMetrics header) — biases results mildly optimistic, ~0.7% over an 8-leg cycle.',
+      'Fills are assumed at the trigger price within the bar. Optimistic for market orders, roughly fair for limit-at-touch.',
+      'Sample-size gates are NOT applied here (that is Build 3). cycles_completed is reported so you can judge sufficiency yourself.',
+      'Simulated sale proceeds ARE credited to available cash during replay. Live shadow does NOT do this (its balance is the real account), so backtest and live-shadow buy-leg behaviour differ by design — see the comment in runLadderBacktest.'
+    ]
+  };
+}
+
 async function runFastScan() {
   try {
     // Part A: pump-arm detector -- dynamic over ALL active, unarmed pump_armed_rules (#215 fix;
