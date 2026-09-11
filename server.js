@@ -15067,6 +15067,41 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
 
 
   // Tool: manage_sources
+  server.tool('run_backtest',
+    '#312 Build 2. Replay a laddered scale-out/scale-in config over STORED price history and score it against buy-and-hold. Read-only: touches no rules, no config, no live position, and places no orders. Uses the SAME evaluator as the live shadow (shadowEvalTier), so its decisions match what the system would actually do. SLIPPAGE IS A REQUIRED INPUT, not a default: it is the binding constraint on this strategy family (a conservative ladder breaks even near 1.22%/leg, an aggressive one near 0.66%) and has never been measured, so run a RANGE and read the result as a function of it. Granularity matters: source=intraday (2-min, ~30d retention) catches intraday triggers that source=hourly misses, and daily-scale windows understate a strategy that trades intraday.',
+    {
+      symbol:            z.string().describe('Coin symbol, e.g. IDEX or IDEX-USD'),
+      start:             z.string().describe('Window start, UTC, e.g. 2026-08-20 or 2026-08-20T00:00:00Z'),
+      end:               z.string().describe('Window end, UTC, inclusive'),
+      source:            z.enum(['hourly','intraday']).optional().describe("hourly = OHLC rollup, retained indefinitely (default). intraday = 2-min captures, ~30d retention, finer trigger detection"),
+      initial_qty:       z.coerce.number().describe('Starting position size in tokens'),
+      initial_usd:       z.coerce.number().optional().describe('Starting USD. Default 0. Simulated sale proceeds are credited during replay, so the ladder can self-fund even from 0'),
+      arm_pump_pct:      z.coerce.number().describe('Pump %% that arms a cycle, e.g. 20'),
+      arm_window_min:    z.coerce.number().optional().describe('Window in minutes for the arming pump (default 1440)'),
+      sell_tiers:        z.preprocess(v => { if (typeof v === 'string') { try { return JSON.parse(v); } catch(e) { return v; } } return v; }, z.array(z.array(z.number()))).describe('[[retrace_pct, sell_pct], ...] e.g. [[3,50],[7,50]] — sell_pct is %% of the CURRENT position'),
+      buy_tiers:         z.preprocess(v => { if (typeof v === 'string') { try { return JSON.parse(v); } catch(e) { return v; } } return v; }, z.array(z.array(z.number()))).describe('[[drop_pct, buy_pct], ...] e.g. [[10,50],[16,50]] — buy_pct is %% of REMAINING reserved cash'),
+      tier_cooldown_min: z.coerce.number().optional().describe('Minutes between tier fills within a cycle (default 15)'),
+      min_tier_usd:      z.coerce.number().optional().describe('Dust guard: skip any tier below this USD notional (default 2)'),
+      entry_floor:       z.coerce.number().optional().describe('Never sell at or below this price. Omit for no floor. Setting it to the real cost basis shows how often the floor blocks the strategy'),
+      slippage_pct:      z.coerce.number().optional().describe('REQUIRED IN PRACTICE: assumed slippage per leg, e.g. 0.5. Defaults to 0, which is optimistic and should not be trusted alone — sweep 0 / 0.5 / 1.0 / 2.0'),
+      fee_pct:           z.coerce.number().optional().describe('Fee per leg (default 0.09, the observed live Revolut rate)'),
+    },
+    async ({ symbol, start, end, source, initial_qty, initial_usd, arm_pump_pct, arm_window_min, sell_tiers, buy_tiers, tier_cooldown_min, min_tier_usd, entry_floor, slippage_pct, fee_pct }) => {
+      try {
+        if (!Array.isArray(sell_tiers) || !Array.isArray(buy_tiers) || !sell_tiers.length || !buy_tiers.length) {
+          return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'sell_tiers and buy_tiers must both be non-empty arrays of [pct, pct] pairs' }) }] };
+        }
+        const res = await runLadderBacktest({
+          symbol, start, end, source, initial_qty, initial_usd, arm_pump_pct, arm_window_min,
+          sell_tiers, buy_tiers, tier_cooldown_min, min_tier_usd, entry_floor, slippage_pct, fee_pct
+        });
+        return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+      } catch (e) {
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: e.message }) }] };
+      }
+    }
+  );
+
   server.tool('manage_sources',
     'Content intelligence feed: manage YouTube channels and RSS news sources and fetch and read their analysed items. Monitors crypto analyst videos and news articles, pulls transcripts, and analyses each against saved coin strategies for thesis impact. Actions: add (add a YouTube or RSS source with coin tags), list (list all sources), remove (deactivate a source), fetch_now (fetch and analyse latest videos/articles now), get_items (read analysed content items, filter by coin). Use for morning brief content review, checking what analysts and news say about held coins, source feed management, and in-chat research.',
     {
