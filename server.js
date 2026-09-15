@@ -15841,6 +15841,72 @@ app.post('/telegram-webhook', async (req, res) => {
       console.warn('[security] /telegram-webhook rejected: secret token missing or mismatch');
       return res.status(403).json({ ok: false });
     }
+    // ── #316b: inline-keyboard callbacks ──────────────────────────────────────
+    // MUST sit before the `!message.text` guard below — callbacks arrive as
+    // req.body.callback_query, not .message, so that guard silently dropped them.
+    // Routes to the SAME processAlertChoice the text path uses; no new execution path.
+    const cbq = req.body.callback_query;
+    if (cbq) {
+      const cbChatId = cbq.message && cbq.message.chat ? cbq.message.chat.id : null;
+      const ackCb = async (text, alert) => {
+        try {
+          await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/answerCallbackQuery`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ callback_query_id: cbq.id, text: (text || '').substring(0, 190), show_alert: !!alert })
+          });
+        } catch (e) { console.error('[telegram] answerCallbackQuery failed:', e.message); }
+      };
+      // Same hard gate as the text path: the secret token proves the request came from
+      // Telegram, not WHICH user, so the chat must be checked separately. Silent 200.
+      if (!cbChatId || cbChatId.toString() !== TELEGRAM_CHAT_ID.toString()) {
+        console.warn('[security] callback_query from unauthorized chat ' + cbChatId);
+        await ackCb('Unauthorized');
+        return res.status(200).json({ ok: true });
+      }
+      const cbReply = async (text) => {
+        await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chat_id: cbChatId, text, parse_mode: 'HTML' })
+        });
+      };
+      // STALE GUARD: a button tapped days later must not execute a long-dead decision.
+      const cbAgeMs = cbq.message && cbq.message.date ? (Date.now() - cbq.message.date * 1000) : 0;
+      if (cbAgeMs > 24 * 60 * 60 * 1000) {
+        await ackCb('Command expired — that alert is over 24h old. Re-run the analysis if you still want it.', true);
+        return res.status(200).json({ ok: true });
+      }
+      // callback_data is capped at 64 BYTES by Telegram, so keep it minimal: a:<coin>:<choice>
+      const cbData = (cbq.data || '').trim();
+      const cbMatch = cbData.match(/^a:([a-z0-9]{1,12}):([1-5])$/i);
+      if (!cbMatch) {
+        await ackCb('Unrecognised button');
+        return res.status(200).json({ ok: true });
+      }
+      const cbCoin = cbMatch[1].toLowerCase();
+      const cbChoice = parseInt(cbMatch[2], 10);
+      // DOUBLE-ACK RACE: the owner may tap AND type for the same alert within
+      // milliseconds. alertContextBySymbol is the authority — whichever handler
+      // deletes the entry first owns the decision; the loser fails safely here
+      // rather than executing a second time. This is the same pop the text path
+      // performs, so the two cannot both proceed.
+      const cbCtx = alertContextBySymbol.get(cbCoin);
+      if (!cbCtx) {
+        await ackCb('Already resolved (or no active alert for ' + cbCoin.toUpperCase() + ')', true);
+        return res.status(200).json({ ok: true });
+      }
+      alertContextBySymbol.delete(cbCoin);
+      if (lastAlertCoin === cbCoin) lastAlertCoin = null;
+      await ackCb(cbCoin.toUpperCase() + ' -> option ' + cbChoice);
+      try {
+        await processAlertChoice(cbCtx, cbChoice, cbReply);
+        console.log('[telegram] #316b callback ' + cbCoin + ' choice ' + cbChoice + ' routed');
+      } catch (e) {
+        console.error('[telegram] #316b callback error:', e.message);
+        await cbReply('\u26a0\ufe0f ' + cbCoin.toUpperCase() + ' option ' + cbChoice + ' failed: ' + (e.message || '').substring(0, 120));
+      }
+      return res.status(200).json({ ok: true });
+    }
+
     const message = req.body.message;
     if (!message || !message.text) {
       return res.status(200).json({ ok: true });
