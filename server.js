@@ -222,12 +222,38 @@ async function sweepToUSDT(proceedsUsd, sourceSymbol, realisedPnlUsd = null) {
   }
 }
 
-async function sendTelegram(message) {
+// #316c: build an inline keyboard for an alert's numbered menu.
+// Labels are passed per alert type because THE SAME NUMBER MEANS DIFFERENT THINGS:
+// a pump alert has 2=Sell / 3=Buy more, a drop alert has 2=Buy more / 3=Sell. Muscle
+// memory from one would do the opposite on the other — the buttons exist precisely to
+// remove that ambiguity, so the labels MUST come from the same place as the menu text.
+// callback_data is capped at 64 BYTES by Telegram; 'a:<coin>:<n>' stays ~16.
+function buildAlertKeyboard(coinBase, labels) {
+  try {
+    const c = String(coinBase || '').toLowerCase().replace(/[^a-z0-9]/g, '').substring(0, 12);
+    if (!c || !Array.isArray(labels) || !labels.length) return undefined;
+    const row = [];
+    const rows = [];
+    labels.forEach((lab, i) => {
+      if (!lab) return;
+      row.push({ text: String(lab).substring(0, 24), callback_data: 'a:' + c + ':' + (i + 1) });
+      if (row.length === 2) { rows.push(row.splice(0, 2)); }
+    });
+    if (row.length) rows.push(row.slice());
+    return rows.length ? { inline_keyboard: rows } : undefined;
+  } catch (e) { return undefined; }
+}
+
+async function sendTelegram(message, replyMarkup) {
+  // #316c: optional inline keyboard. Omitted -> the payload is byte-identical to before,
+  // so every existing caller is unaffected.
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+  const tgBody = { chat_id: TELEGRAM_CHAT_ID, text: message, parse_mode: 'HTML' };
+  if (replyMarkup) tgBody.reply_markup = replyMarkup;
   await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: message, parse_mode: 'HTML' })
+    body: JSON.stringify(tgBody)
   });
   console.log('Telegram sent:', message.substring(0, 50));
 }
