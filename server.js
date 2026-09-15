@@ -15978,6 +15978,86 @@ app.post('/telegram-webhook', async (req, res) => {
       }
     }
 
+    // ── #316a: read-only status + master kill switch ─────────────────────────
+    // Routed AFTER the admin-delete guard and BEFORE alert-reply parsing, so these
+    // never shadow a numbered reply. Auth is already handled above: the secret
+    // token proves the request came from Telegram, and isAuthorizedAdmin hard-gates
+    // to TELEGRAM_CHAT_ID with a silent 200 for anyone else. No new auth needed.
+    // NOTE: this creates ZERO new autonomous execution paths — /status reads,
+    // /pause and /resume only toggle a flag the existing double-gate already reads.
+    if (commandText === 'status' || commandText === 'pause' || commandText === 'resume' || commandText === 'resume confirm') {
+      let aeCfg = {};
+      try {
+        const [aeRows] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'ai_auto_execute'");
+        aeCfg = aeRows.length ? JSON.parse(aeRows[0].config_value) : {};
+      } catch (e) { aeCfg = {}; }
+
+      if (commandText === 'status') {
+        let usdTxt = 'unknown', pnlTxt = '', armedTxt = '';
+        // AVAILABLE USD IS THE HEADLINE, not P&L. With cash at zero every buy-side
+        // mechanism is inert, so it is the number that decides whether anything can act.
+        try { const u = await getAvailableUSD('revolut'); usdTxt = '$' + Number(u || 0).toFixed(2); } catch (e) {}
+        try {
+          const [pf] = await db.execute('SELECT SUM(quantity * entry_price) AS cost FROM coin_strategy WHERE status = ?', ['active_holding']);
+          if (pf.length && pf[0].cost) pnlTxt = '\nTracked cost basis: $' + Number(pf[0].cost).toFixed(2);
+        } catch (e) {}
+        try {
+          const [ar] = await db.execute('SELECT symbol FROM pump_armed_rules WHERE armed = 1 AND active = 1');
+          armedTxt = ar.length ? '\nArmed loops: ' + ar.map(r => r.symbol.replace('-USD', '')).join(', ') : '\nArmed loops: none';
+        } catch (e) {}
+        const en = aeCfg.enabled === true;
+        await sendReply('<b>STATUS</b>\nAuto-exec: ' + (en ? '\u2705 ENABLED' : '\u23f8\ufe0f PAUSED') +
+          '\nAvailable USD: <b>' + usdTxt + '</b>' + pnlTxt + armedTxt +
+          '\nmanual_only: ' + ((aeCfg.manual_only_symbols || []).join(', ') || 'none') +
+          '\nmax_sell_pct: ' + (aeCfg.max_sell_pct != null ? aeCfg.max_sell_pct : 'unset'));
+        return res.status(200).json({ ok: true });
+      }
+
+      if (commandText === 'pause') {
+        // FAILS SAFE: no confirmation. Toggles the flag ONLY — it must never interrupt
+        // in-flight async work, or a filled trade could be orphaned from its journal
+        // row, manufacturing exactly the reconciliation mess the open bug list is full
+        // of. In-flight cycles finish; the NEXT cycle reads the flag and halts.
+        try {
+          aeCfg.enabled = false;
+          aeCfg.updated_at = new Date().toISOString();
+          await db.execute(
+            "INSERT INTO system_config (config_key, config_value) VALUES ('ai_auto_execute', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)",
+            [JSON.stringify(aeCfg)]);
+          console.log('[telegram] #316 /pause -> ai_auto_execute.enabled = false');
+          await sendReply('\u23f8\ufe0f <b>AUTO-EXEC PAUSED</b>\nEvery autonomous loop is now halted at the next cycle.\nAnything already in flight will finish its current cycle — that is deliberate, so a filled trade is never orphaned from its record.\nSend <code>/resume</code> to re-enable.');
+        } catch (e) {
+          await sendReply('\u26a0\ufe0f Pause FAILED: ' + e.message + '\nAuto-exec state is UNCHANGED. Check the dashboard.');
+        }
+        return res.status(200).json({ ok: true });
+      }
+
+      // /resume is the dangerous direction, so it requires an explicit confirm step.
+      if (commandText === 'resume') {
+        if (aeCfg.enabled === true) {
+          await sendReply('Auto-exec is already <b>ENABLED</b>. Nothing to do.');
+          return res.status(200).json({ ok: true });
+        }
+        await sendReply('\u26a0\ufe0f <b>Re-enable auto-exec?</b>\nThis allows autonomous selling again on every enabled coin.\nReply <code>/resume confirm</code> to proceed, or ignore this message to leave it paused.');
+        return res.status(200).json({ ok: true });
+      }
+
+      if (commandText === 'resume confirm') {
+        try {
+          aeCfg.enabled = true;
+          aeCfg.updated_at = new Date().toISOString();
+          await db.execute(
+            "INSERT INTO system_config (config_key, config_value) VALUES ('ai_auto_execute', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)",
+            [JSON.stringify(aeCfg)]);
+          console.log('[telegram] #316 /resume confirm -> ai_auto_execute.enabled = true');
+          await sendReply('\u2705 <b>AUTO-EXEC RE-ENABLED</b>\nAutonomous loops resume at the next cycle.');
+        } catch (e) {
+          await sendReply('\u26a0\ufe0f Resume FAILED: ' + e.message + '\nAuto-exec remains PAUSED.');
+        }
+        return res.status(200).json({ ok: true });
+      }
+    }
+
     // Coin-prefixed reply: 'xlm 1', 'near 2', 'hft 5' etc.
     const coinPrefixMatch = commandText.match(/^([a-z]+)\s+([1-5])$/);
     if (coinPrefixMatch) {
