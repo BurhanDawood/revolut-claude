@@ -9032,7 +9032,8 @@ async function handleTrailingStopAlert(symbol, currentPrice, ts, exchange = 'rev
       );
 
   const replyMenu = `\n\n1️⃣ Noted — keep watching\n2️⃣ Analyse — run 5-pillar check\n3️⃣ Remove trail — cancel trailing stop\n4️⃣ Acknowledge ⚠️ mutes coin 24h\n💬 Reply number or '<b>${coinBase.toLowerCase()} 2</b>' to target this coin`;
-  await sendTelegram(alertMsg + replyMenu);
+  // #316c: buttons mirror the SAME menu text above — labels and indexes must not drift apart.
+  await sendTelegram(alertMsg + replyMenu, buildAlertKeyboard(coinBase, ['Noted', 'Analyse', 'Remove trail', 'Acknowledge']));
   alertContextBySymbol.set(coinBase.toLowerCase(), { symbol, coinBase, alertType: 'trailing_stop', timestamp: Date.now() });
   lastAlertCoin = coinBase.toLowerCase();
   trailingStopAlerted.set(symbol, Date.now());
@@ -10144,7 +10145,8 @@ async function checkPortfolio() {
           `You hold: ${available.toFixed(4)} ${coinBase}\n\n` +
           `⚡ RECOMMENDATION: ${aiRec}${swingSignal}${trailReminder}${replyMenu}\n\n` +
           `⏰ One reminder in 10 min if no response`;
-        await sendTelegram(alertMessage);
+        // #316c PUMP menu: 2=Sell, 3=Buy more. NOTE the DROP alert below reverses these.
+        await sendTelegram(alertMessage, buildAlertKeyboard(coinBase, ['Hold', 'Sell', 'Buy more', 'Analyse', 'Ignore']));
         alertContextBySymbol.set(coinBase.toLowerCase(), { symbol, coinBase, alertType: 'pump', timestamp: Date.now() });
         lastAlertCoin = coinBase.toLowerCase();
         } // end else (hasAgreedStrategy pump suppression)
