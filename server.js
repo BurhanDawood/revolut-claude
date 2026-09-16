@@ -10223,7 +10223,8 @@ async function checkPortfolio() {
           `You hold: ${available.toFixed(4)} ${coinBase}\n\n` +
           `⚡ RECOMMENDATION: ${aiRec}${swingSignal}${replyMenu}\n\n` +
           `⏰ One reminder in 10 min if no response`;
-        await sendTelegram(alertMessage);
+        // #316c DROP menu: 2=Buy more, 3=Sell — DELIBERATELY the reverse of the pump alert.
+        await sendTelegram(alertMessage, buildAlertKeyboard(coinBase, ['Hold', 'Buy more', 'Sell', 'Analyse', 'Ignore']));
         alertContextBySymbol.set(coinBase.toLowerCase(), { symbol, coinBase, alertType: 'drop', timestamp: Date.now() });
         lastAlertCoin = coinBase.toLowerCase();
         } // end else (hasAgreedStrategy drop suppression)
@@ -10361,7 +10362,7 @@ async function checkPortfolio() {
           const autoLine = autoReady ? `\n\n⚡ AUTO-READY: This setup has worked ${autoReady.winRate}% of the time (${autoReady.sampleSize} trades). Could be automated.` : '';
           alertMessage = `🎯 <b>${symbol} FIXED TARGET HIT!</b>\n\nAnchor: $${anchorStr} → Now $${priceStr} (+${changePct.toFixed(1)}%)${entryLine}${upDescLine}${upWickLine}\n\n⚡ RECOMMENDATION: ${aiRec}${replyMenu}${autoLine}`;
         }
-        await sendTelegram(alertMessage);
+        await sendTelegram(alertMessage, buildAlertKeyboard(coinBase, ['Sell', 'Hold', 'Analyse', 'Acknowledge']));
         targetExtremes.delete(symbol); // reset accumulator — target fired
         // Log send to macro_alerts_sent for cooldown tracking across restarts
         await db.execute(
@@ -10472,7 +10473,7 @@ async function checkPortfolio() {
           const autoLine = autoReady ? `\n\n⚡ AUTO-READY: This setup has worked ${autoReady.winRate}% of the time (${autoReady.sampleSize} trades). Could be automated.` : '';
           alertMessage = `📉 <b>${symbol} FIXED FLOOR HIT!</b>\n\nAnchor: ${formatPrice(target.anchorPrice)} → Now ${formatPrice(currentPrice)} (${changePct.toFixed(1)}%)${entryLine}${dnDescLine}${dnWickLine}\n\n⚡ RECOMMENDATION: ${aiRec}${replyMenu}${autoLine}`;
         }
-        await sendTelegram(alertMessage);
+        await sendTelegram(alertMessage, buildAlertKeyboard(coinBase, ['Buy more', 'Hold', 'Sell', 'Acknowledge']));
         targetExtremes.delete(symbol); // reset accumulator — floor fired
         // Log send for cooldown tracking across restarts
         await db.execute(
