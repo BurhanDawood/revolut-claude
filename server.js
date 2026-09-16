@@ -7306,7 +7306,7 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
       `<b>⏰ REPLY NOW — auto-logs in 30 min</b>\n\n` +
       `Action: ${actionLabel} ~${formatTradeQty(absQty)} tokens at ${formatPrice(price)} ($${valueUsd.toFixed(2)})${pnlLine}${avgEntryLine}${recLine}${reentryLine}\n\n` +
       `Just reply:\n` +
-      `'<b>taking profits, confident</b>' — reason + emotion, done\n` +
+      `'<b>taking profits</b>' — your reason, done\n` +
       `'<b>rebalance [coin]</b>' — bought with proceeds from selling [coin]\n` +
       `'<b>payment</b>' — Revolut payment (excluded from stats)\n` +
       `'<b>transfer</b>' — internal transfer (excluded from stats)\n` +
@@ -16581,27 +16581,15 @@ app.post('/telegram-webhook', async (req, res) => {
 
           if (skip) {
             confirmLines.push(`• ${coinBase}: logged without details`);
-          } else if (!foundEmotion) {
-            // Save reasoning but ask for emotion
-            await db.execute('UPDATE trading_journal SET reasoning = ? WHERE id = ?', [reasoning, pending.journalId]);
-            // Re-add to pending with step to collect emotion
-            const newTimeout = setTimeout(async () => {
-              await db.execute(
-                'UPDATE trading_journal SET emotion = ? WHERE id = ? AND (emotion IS NULL OR emotion = ?)',
-                ['neutral', pending.journalId, 'pending']
-              );
-              pendingTradeContext.delete(symbol);
-              await sendTelegram(`⏰ <b>${coinBase}</b> trade auto-logged without emotion.`);
-              await updateLearningModel().catch(() => {});
-            }, 5 * 60 * 1000); // shorter 5-min timeout for just the emotion
-            pendingTradeContext.set(symbol, { ...pending, timeoutHandle: newTimeout });
-            confirmLines.push(`• ${coinBase}: reasoning saved — how are you feeling? confident / uncertain / fomo / fearful / neutral`);
-            anyUpdated = true;
-            continue;
           } else {
+            // Emotion is NO LONGER REQUESTED. Previously, a reply without an emotion word
+            // triggered a second prompt ("how are you feeling?") plus a 5-min timer — one
+            // trade cost two round-trips. Now it defaults to 'neutral' and confirms at once.
+            // An emotion word typed voluntarily is still captured, so nothing is lost.
+            const resolvedEmotion = foundEmotion || 'neutral';
             await db.execute(
               'UPDATE trading_journal SET reasoning = ?, emotion = ? WHERE id = ?',
-              [reasoning, foundEmotion, pending.journalId]
+              [reasoning, resolvedEmotion, pending.journalId]
             );
             // Fetch action for confirmation line
             const [rows] = await db.execute('SELECT action, outcome_pnl FROM trading_journal WHERE id = ?', [pending.journalId]);
@@ -16611,7 +16599,7 @@ app.post('/telegram-webhook', async (req, res) => {
               ? ` (${parseFloat(row.outcome_pnl) >= 0 ? '+' : ''}${parseFloat(row.outcome_pnl).toFixed(1)}%)`
               : '';
             const resultEmoji = row && row.outcome_pnl != null ? (parseFloat(row.outcome_pnl) >= 0 ? '✅' : '❌') : '📝';
-            confirmLines.push(`• ${coinBase}: ${actionStr}${pnlStr} — ${foundEmotion} ${resultEmoji}`);
+            confirmLines.push(`• ${coinBase}: ${actionStr}${pnlStr} ${resultEmoji}`);
             anyUpdated = true;
           }
         }
