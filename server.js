@@ -228,15 +228,22 @@ async function sweepToUSDT(proceedsUsd, sourceSymbol, realisedPnlUsd = null) {
 // memory from one would do the opposite on the other — the buttons exist precisely to
 // remove that ambiguity, so the labels MUST come from the same place as the menu text.
 // callback_data is capped at 64 BYTES by Telegram; 'a:<coin>:<n>' stays ~16.
-function buildAlertKeyboard(coinBase, labels) {
+function buildAlertKeyboard(coinBase, labels, typeCode) {
+  // typeCode stamps WHICH ALERT TYPE the button belongs to. alertContextBySymbol is
+  // keyed by coin alone and is overwritten by each new alert for that coin, so without
+  // this a button tapped on an older message is applied to whatever context is current.
+  // That is not theoretical: on 16 Sept a tap on a BTC fixed-target alert was handled by
+  // a newer claude_analysis context. Choice 2 meant 'Hold' in both so the outcome was
+  // right BY LUCK — on a pump-vs-drop mismatch, 2 means Sell in one and Buy in the other.
   try {
     const c = String(coinBase || '').toLowerCase().replace(/[^a-z0-9]/g, '').substring(0, 12);
     if (!c || !Array.isArray(labels) || !labels.length) return undefined;
+    const tc = String(typeCode || '').replace(/[^a-z]/g, '').substring(0, 3);
     const row = [];
     const rows = [];
     labels.forEach((lab, i) => {
       if (!lab) return;
-      row.push({ text: String(lab).substring(0, 24), callback_data: 'a:' + c + ':' + (i + 1) });
+      row.push({ text: String(lab).substring(0, 24), callback_data: 'a:' + c + ':' + (i + 1) + (tc ? ':' + tc : '') });
       if (row.length === 2) { rows.push(row.splice(0, 2)); }
     });
     if (row.length) rows.push(row.slice());
@@ -9037,7 +9044,7 @@ async function handleTrailingStopAlert(symbol, currentPrice, ts, exchange = 'rev
   // Cancelling a trail is a real gap - it needs its own action, not a mislabelled mute.
   const replyMenu = `\n\n1️⃣ Noted — keep watching\n2️⃣ Sell advice — AI recommendation\n3️⃣ Acknowledge ⚠️ mutes coin 24h\n💬 Reply number or '<b>${coinBase.toLowerCase()} 2</b>' to target this coin`;
   // #316c: buttons mirror the SAME menu text above — labels and indexes must not drift apart.
-  await sendTelegram(alertMsg + replyMenu, buildAlertKeyboard(coinBase, ['Noted', 'Sell advice', 'Acknowledge']));
+  await sendTelegram(alertMsg + replyMenu, buildAlertKeyboard(coinBase, ['Noted', 'Sell advice', 'Acknowledge'], 'tr'));
   alertContextBySymbol.set(coinBase.toLowerCase(), { symbol, coinBase, alertType: 'trailing_stop', timestamp: Date.now() });
   lastAlertCoin = coinBase.toLowerCase();
   trailingStopAlerted.set(symbol, Date.now());
@@ -10150,7 +10157,7 @@ async function checkPortfolio() {
           `⚡ RECOMMENDATION: ${aiRec}${swingSignal}${trailReminder}${replyMenu}\n\n` +
           `⏰ One reminder in 10 min if no response`;
         // #316c PUMP menu: 2=Sell, 3=Buy more. NOTE the DROP alert below reverses these.
-        await sendTelegram(alertMessage, buildAlertKeyboard(coinBase, ['Hold', 'Sell', 'Buy more', 'Analyse', 'Ignore']));
+        await sendTelegram(alertMessage, buildAlertKeyboard(coinBase, ['Hold', 'Sell', 'Buy more', 'Analyse', 'Ignore'], 'pu'));
         alertContextBySymbol.set(coinBase.toLowerCase(), { symbol, coinBase, alertType: 'pump', timestamp: Date.now() });
         lastAlertCoin = coinBase.toLowerCase();
         } // end else (hasAgreedStrategy pump suppression)
@@ -10228,7 +10235,7 @@ async function checkPortfolio() {
           `⚡ RECOMMENDATION: ${aiRec}${swingSignal}${replyMenu}\n\n` +
           `⏰ One reminder in 10 min if no response`;
         // #316c DROP menu: 2=Buy more, 3=Sell — DELIBERATELY the reverse of the pump alert.
-        await sendTelegram(alertMessage, buildAlertKeyboard(coinBase, ['Hold', 'Buy more', 'Sell', 'Analyse', 'Ignore']));
+        await sendTelegram(alertMessage, buildAlertKeyboard(coinBase, ['Hold', 'Buy more', 'Sell', 'Analyse', 'Ignore'], 'dr'));
         alertContextBySymbol.set(coinBase.toLowerCase(), { symbol, coinBase, alertType: 'drop', timestamp: Date.now() });
         lastAlertCoin = coinBase.toLowerCase();
         } // end else (hasAgreedStrategy drop suppression)
@@ -10366,7 +10373,7 @@ async function checkPortfolio() {
           const autoLine = autoReady ? `\n\n⚡ AUTO-READY: This setup has worked ${autoReady.winRate}% of the time (${autoReady.sampleSize} trades). Could be automated.` : '';
           alertMessage = `🎯 <b>${symbol} FIXED TARGET HIT!</b>\n\nAnchor: $${anchorStr} → Now $${priceStr} (+${changePct.toFixed(1)}%)${entryLine}${upDescLine}${upWickLine}\n\n⚡ RECOMMENDATION: ${aiRec}${replyMenu}${autoLine}`;
         }
-        await sendTelegram(alertMessage, buildAlertKeyboard(coinBase, ['Sell', 'Hold', 'Analyse', 'Acknowledge']));
+        await sendTelegram(alertMessage, buildAlertKeyboard(coinBase, ['Sell', 'Hold', 'Analyse', 'Acknowledge'], 'tu'));
         targetExtremes.delete(symbol); // reset accumulator — target fired
         // Log send to macro_alerts_sent for cooldown tracking across restarts
         await db.execute(
@@ -10477,7 +10484,7 @@ async function checkPortfolio() {
           const autoLine = autoReady ? `\n\n⚡ AUTO-READY: This setup has worked ${autoReady.winRate}% of the time (${autoReady.sampleSize} trades). Could be automated.` : '';
           alertMessage = `📉 <b>${symbol} FIXED FLOOR HIT!</b>\n\nAnchor: ${formatPrice(target.anchorPrice)} → Now ${formatPrice(currentPrice)} (${changePct.toFixed(1)}%)${entryLine}${dnDescLine}${dnWickLine}\n\n⚡ RECOMMENDATION: ${aiRec}${replyMenu}${autoLine}`;
         }
-        await sendTelegram(alertMessage, buildAlertKeyboard(coinBase, ['Buy more', 'Hold', 'Sell', 'Acknowledge']));
+        await sendTelegram(alertMessage, buildAlertKeyboard(coinBase, ['Buy more', 'Hold', 'Sell', 'Acknowledge'], 'td'));
         targetExtremes.delete(symbol); // reset accumulator — floor fired
         // Log send for cooldown tracking across restarts
         await db.execute(
@@ -15926,7 +15933,7 @@ app.post('/telegram-webhook', async (req, res) => {
       }
       // callback_data is capped at 64 BYTES by Telegram, so keep it minimal: a:<coin>:<choice>
       const cbData = (cbq.data || '').trim();
-      const cbMatch = cbData.match(/^a:([a-z0-9]{1,12}):([1-5])$/i);
+      const cbMatch = cbData.match(/^a:([a-z0-9]{1,12}):([1-5])(?::([a-z]{1,3}))?$/i);
       if (!cbMatch) {
         await ackCb('Unrecognised button');
         return res.status(200).json({ ok: true });
@@ -15938,7 +15945,21 @@ app.post('/telegram-webhook', async (req, res) => {
       // deletes the entry first owns the decision; the loser fails safely here
       // rather than executing a second time. This is the same pop the text path
       // performs, so the two cannot both proceed.
+      // TYPE GUARD: refuse if the live context is a DIFFERENT alert type from the one
+      // this button was drawn for — the numbers mean different things per type.
+      const CB_TYPES = { tr: 'trailing_stop', pu: 'pump', dr: 'drop', tu: 'fixed_target_up', td: 'fixed_target_down' };
+      const cbWantType = CB_TYPES[(cbMatch[3] || '').toLowerCase()] || null;
       const cbCtx = alertContextBySymbol.get(cbCoin);
+      if (cbCtx && cbWantType && cbCtx.alertType !== cbWantType) {
+        console.warn('[telegram] #316b superseded tap: button=' + cbWantType + ' live=' + cbCtx.alertType + ' coin=' + cbCoin);
+        await ackCb('That alert was superseded by a newer ' + cbCoin.toUpperCase() + ' alert. Use the latest message.', true);
+        return res.status(200).json({ ok: true });
+      }
+      if (cbCtx && !cbWantType) {
+        // Pre-fix button (no type stamp) — cannot verify which alert it belongs to.
+        await ackCb('This button predates the routing fix. Please reply by number instead.', true);
+        return res.status(200).json({ ok: true });
+      }
       if (!cbCtx) {
         await ackCb('Already resolved (or no active alert for ' + cbCoin.toUpperCase() + ')', true);
         return res.status(200).json({ ok: true });
