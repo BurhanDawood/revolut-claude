@@ -8538,7 +8538,8 @@ ${tsPlanContext}`;
         `⚠️ HODL position — your decision only\n\n` +
         `─────────────────\n` +
         `<b>1</b> Sell  <b>2</b> Hold  <b>3</b> Wait  <b>4</b> Buy  <b>5</b> Dismiss\n` +
-        `💬 Reply number or '<b>${coinBase.toLowerCase()} 2</b>' to target this coin`
+        `💬 Reply number or '<b>${coinBase.toLowerCase()} 2</b>' to target this coin`,
+        buildAlertKeyboard(coinBase, ['Sell', 'Hold', 'Wait', 'Buy', 'Dismiss'], 'ca')
       );
       return;
     }
@@ -8556,7 +8557,8 @@ ${tsPlanContext}`;
         `⚠️ Manual-only position — your decision only\n\n` +
         `─────────────────\n` +
         `<b>1</b> Sell  <b>2</b> Hold  <b>3</b> Wait  <b>4</b> Buy  <b>5</b> Dismiss\n` +
-        `💬 Reply number or '<b>${coinBase.toLowerCase()} 2</b>' to target this coin`
+        `💬 Reply number or '<b>${coinBase.toLowerCase()} 2</b>' to target this coin`,
+        buildAlertKeyboard(coinBase, ['Sell', 'Hold', 'Wait', 'Buy', 'Dismiss'], 'ca')
       );
       return;
     }
@@ -8598,7 +8600,8 @@ ${tsPlanContext}`;
         `${analysis}\n\n` +
         `─────────────────\n` +
         `<b>1</b> Sell  <b>2</b> Hold  <b>3</b> Wait  <b>4</b> Buy  <b>5</b> Dismiss\n` +
-        `💬 Reply number or '<b>${coinBase.toLowerCase()} 2</b>' to target this coin`
+        `💬 Reply number or '<b>${coinBase.toLowerCase()} 2</b>' to target this coin`,
+        buildAlertKeyboard(coinBase, ['Sell', 'Hold', 'Wait', 'Buy', 'Dismiss'], 'ca')
       );
       console.log(`[analysis] Analysis sent to Telegram for ${coinBase} ✅`);
     }
