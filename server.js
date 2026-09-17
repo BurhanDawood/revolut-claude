@@ -9031,9 +9031,13 @@ async function handleTrailingStopAlert(symbol, currentPrice, ts, exchange = 'rev
         (entryLine ? entryLine + '\n' : '')
       );
 
-  const replyMenu = `\n\n1️⃣ Noted — keep watching\n2️⃣ Analyse — run 5-pillar check\n3️⃣ Remove trail — cancel trailing stop\n4️⃣ Acknowledge ⚠️ mutes coin 24h\n💬 Reply number or '<b>${coinBase.toLowerCase()} 2</b>' to target this coin`;
+  // Labels MUST match processAlertChoice's trailing_stop map {1:hold, 2:sell, 3:acknowledge}.
+  // They previously did not: '2 Analyse' ran sell-advice, '3 Remove trail' actually MUTED the
+  // coin and left the trail live, and '4 Acknowledge' was unmapped ('option not valid').
+  // Cancelling a trail is a real gap - it needs its own action, not a mislabelled mute.
+  const replyMenu = `\n\n1️⃣ Noted — keep watching\n2️⃣ Sell advice — AI recommendation\n3️⃣ Acknowledge ⚠️ mutes coin 24h\n💬 Reply number or '<b>${coinBase.toLowerCase()} 2</b>' to target this coin`;
   // #316c: buttons mirror the SAME menu text above — labels and indexes must not drift apart.
-  await sendTelegram(alertMsg + replyMenu, buildAlertKeyboard(coinBase, ['Noted', 'Analyse', 'Remove trail', 'Acknowledge']));
+  await sendTelegram(alertMsg + replyMenu, buildAlertKeyboard(coinBase, ['Noted', 'Sell advice', 'Acknowledge']));
   alertContextBySymbol.set(coinBase.toLowerCase(), { symbol, coinBase, alertType: 'trailing_stop', timestamp: Date.now() });
   lastAlertCoin = coinBase.toLowerCase();
   trailingStopAlerted.set(symbol, Date.now());
@@ -15679,6 +15683,22 @@ async function processAlertChoice(ctx, choice, sendReply) {
   if (alertType === 'claude_analysis_trailing' || alertType === 'claude_analysis_target') {
     const pending = pendingAnalysis.get(symbol);
     pendingAnalysis.delete(symbol);
+
+    // #117 EXTENSION - this branch RETURNS before the reminder-cancel block further
+    // down, so replying to a claude_analysis alert left the fixed-target reminder
+    // interval running. Observed 16 Sept: BTC and AVAX both replied "holding noted"
+    // and still received Reminder 1/3 and 2/3, while JTO/SQD (which take the lower
+    // path) were silenced correctly. Choice 5 calls acknowledgeAlert and clears its
+    // own state, so it is excluded here.
+    if (choice !== 5) {
+      if (activeFixedAlerts.has(symbol)) {
+        clearInterval(activeFixedAlerts.get(symbol));
+        activeFixedAlerts.delete(symbol);
+        console.log('[#117] Cancelled fixed-alert reminder cycle after analysis reply:', symbol);
+      }
+      targetReminderCount.delete(symbol);
+      alertReminderSent.delete(symbol);
+    }
 
     if (choice === 1) {
       const currentPrice = await getCurrentPrice(symbol).catch(() => null);
