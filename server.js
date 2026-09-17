@@ -257,11 +257,43 @@ async function sendTelegram(message, replyMarkup) {
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
   const tgBody = { chat_id: TELEGRAM_CHAT_ID, text: message, parse_mode: 'HTML' };
   if (replyMarkup) tgBody.reply_markup = replyMarkup;
-  await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(tgBody)
-  });
+  // This used to be fire-and-forget: the response was never read, so ANY Telegram
+  // rejection (400 malformed, 429 rate limit, 403) vanished silently and the caller
+  // believed it had sent. That is how the boot 'monitor started' message went missing
+  // on 17 Sept with no trace in the logs.
+  // It matters more now that reply_markup is attached: Telegram rejects the WHOLE
+  // request over a bad keyboard, so a malformed button would suppress the ENTIRE
+  // alert, not just the buttons. An alert without buttons is an inconvenience; an
+  // alert that never arrives is a missed trade. So on failure we RETRY ONCE WITHOUT
+  // the keyboard, degrading to a plain message rather than silence.
+  const tgPost = async (body) => {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    if (r.ok) return { ok: true };
+    let detail = '';
+    try { const j = await r.json(); detail = j.description || ''; } catch (e) {}
+    return { ok: false, status: r.status, detail };
+  };
+  try {
+    const first = await tgPost(tgBody);
+    if (first.ok) return;
+    console.error('[telegram] send REJECTED ' + first.status + ': ' + first.detail +
+      (replyMarkup ? ' (had reply_markup — retrying without it)' : ''));
+    if (replyMarkup) {
+      const plain = { chat_id: TELEGRAM_CHAT_ID, text: message, parse_mode: 'HTML' };
+      const second = await tgPost(plain);
+      if (second.ok) {
+        console.warn('[telegram] recovered: message delivered WITHOUT buttons');
+        return;
+      }
+      console.error('[telegram] retry also failed ' + second.status + ': ' + second.detail);
+    }
+  } catch (e) {
+    console.error('[telegram] send threw:', e.message);
+  }
   console.log('Telegram sent:', message.substring(0, 50));
 }
 
