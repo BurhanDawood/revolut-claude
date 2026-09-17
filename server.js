@@ -8765,8 +8765,12 @@ ${journalContext}`;
       `🧠 <b>AI ANALYSIS — ${coinBase} TARGET HIT</b>\n\n` +
       `${analysis}\n\n` +
       `─────────────────\n` +
-      `<b>1</b> Sell  <b>2</b> Hold  <b>3</b> Ladder  <b>4</b> New target  <b>5</b> Dismiss\n` +
-      `💬 Reply number or '<b>${coinBase.toLowerCase()} 1</b>' to target this coin`
+      // '4 New target' was a mislabel: choice 4 has NO type guard and always raises a BUY
+      // request (50% of available USD, behind approval). Naming it after what it does.
+      // A genuine 'set a new target' action does not exist and would need building.
+      `<b>1</b> Sell  <b>2</b> Hold  <b>3</b> Ladder  <b>4</b> Buy  <b>5</b> Dismiss\n` +
+      `💬 Reply number or '<b>${coinBase.toLowerCase()} 1</b>' to target this coin`,
+      buildAlertKeyboard(coinBase, ['Sell', 'Hold', 'Ladder', 'Buy', 'Dismiss'], 'ca')
     );
     console.log(`[analysis] Fixed target analysis sent to Telegram for ${coinBase} ✅`);
 
@@ -15982,11 +15986,17 @@ app.post('/telegram-webhook', async (req, res) => {
       // performs, so the two cannot both proceed.
       // TYPE GUARD: refuse if the live context is a DIFFERENT alert type from the one
       // this button was drawn for — the numbers mean different things per type.
-      const CB_TYPES = { tr: 'trailing_stop', pu: 'pump', dr: 'drop', tu: 'fixed_target_up', td: 'fixed_target_down' };
+      // 'ca' covers BOTH claude_analysis_trailing and claude_analysis_target: processAlertChoice
+      // handles them in one branch, and choices 3/4 are type-aware inside it, so a tap is valid
+      // against either. Matching on the prefix avoids refusing taps that are actually correct.
+      const CB_TYPES = { tr: 'trailing_stop', pu: 'pump', dr: 'drop', tu: 'fixed_target_up', td: 'fixed_target_down', ca: 'claude_analysis' };
       const cbWantType = CB_TYPES[(cbMatch[3] || '').toLowerCase()] || null;
       const cbCtx = alertContextBySymbol.get(cbCoin);
-      if (cbCtx && cbWantType && cbCtx.alertType !== cbWantType) {
-        console.warn('[telegram] #316b superseded tap: button=' + cbWantType + ' live=' + cbCtx.alertType + ' coin=' + cbCoin);
+      const cbTypeOk = !cbWantType || (cbWantType === 'claude_analysis'
+        ? String(cbCtx && cbCtx.alertType || '').indexOf('claude_analysis') === 0
+        : cbCtx && cbCtx.alertType === cbWantType);
+      if (cbCtx && cbWantType && !cbTypeOk) {
+        console.warn('[telegram] #316b superseded tap: choice=' + cbChoice + ' button=' + cbWantType + ' live=' + cbCtx.alertType + ' coin=' + cbCoin);
         await ackCb('That alert was superseded by a newer ' + cbCoin.toUpperCase() + ' alert. Use the latest message.', true);
         return res.status(200).json({ ok: true });
       }
