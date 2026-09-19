@@ -5755,16 +5755,17 @@ async function fetchExchangeOrders(daysBack = 7, symbolFilter = null) {
       if (start >= end) break;
       let cursor = null, pages = 0, got = 0;
       do {
-        const qs = new URLSearchParams({
-          start_date: new Date(start).toISOString(),
-          end_date: new Date(end).toISOString(),
-          limit: '500'
-        });
-        if (symbolFilter) qs.set('symbols', symbolFilter);
-        if (cursor) qs.set('cursor', cursor);
+        // NO QUERY STRING. The 19 Sep probe tested seven variants: the endpoint is ACCEPTED
+        // with no query and REJECTED with ANY query, whatever the encoding (ISO encoded, raw
+        // colons, epoch millis) and whatever we sign (path+query or bare path). Signing scope
+        // is therefore NOT the issue - the presence of a query string is. Auth, permissions
+        // and transport are all healthy: /balances returned 132 rows in the same run.
+        // So we take what the endpoint gives and filter in JS. Date filtering is applied
+        // below; a symbol filter likewise. Slower than server-side filtering, but it works,
+        // and Build 1 only needs to QUANTIFY drift, not to be efficient about it.
         let page;
         try {
-          page = await revolutRequest('GET', '/orders/historical?' + qs.toString(), null, '/orders/historical');
+          page = await revolutRequest('GET', '/orders/historical');
           // revolutRequest returns the parsed body whatever the status, so an API error
           // arrives as a normal object. Detect it rather than treating it as an empty page.
           if (page && page.message && !page.orders && !Array.isArray(page)) {
@@ -5775,7 +5776,18 @@ async function fetchExchangeOrders(daysBack = 7, symbolFilter = null) {
           out.errors.push({ window: new Date(start).toISOString().slice(0, 10), error: e.message });
           break;
         }
-        const rows = Array.isArray(page) ? page : (page && (page.orders || page.data || page.items)) || [];
+        const rowsAll = Array.isArray(page) ? page : (page && (page.data || page.orders || page.items)) || [];
+        // Capture the envelope's metadata once - it is where any cursor/paging lives, and we
+        // have not yet seen its shape. Needed before a full backfill can be designed.
+        if (!out.metadata && page && page.metadata) out.metadata = page.metadata;
+        // CLIENT-SIDE FILTER, because the venue will not accept query params from us.
+        const rows = rowsAll.filter(o => {
+          const ts = Date.parse(o.created_date || o.created_at || o.updated_date || 0) || 0;
+          if (ts && (ts < start || ts > end)) return false;
+          if (symbolFilter && o.symbol && o.symbol.toUpperCase() !== symbolFilter.toUpperCase()) return false;
+          return true;
+        });
+        out.fetched_total = (out.fetched_total || 0) + rowsAll.length;
         // A 200 with zero rows is ambiguous: it could mean no orders, or it could mean the
         // response envelope is a shape we do not unwrap, or that the date parameters are not
         // in the format the venue expects. Capture the raw shape ONCE so the difference is
@@ -5808,7 +5820,8 @@ async function fetchExchangeOrders(daysBack = 7, symbolFilter = null) {
           });
           got++;
         }
-        cursor = (page && (page.cursor || page.next_cursor)) || null;
+        // No query means no cursor param can be sent, so one page is all we get for now.
+        cursor = null;
         pages++;
       } while (cursor && pages < 20);
       out.windows.push({ from: new Date(start).toISOString().slice(0, 10), to: new Date(end).toISOString().slice(0, 10), orders: got, pages });
@@ -13198,6 +13211,8 @@ let rows;
           exO.windows = ex.windows;
           exO.errors = ex.errors;
           exO.order_count = ex.orders.length;
+          exO.fetched_before_filter = ex.fetched_total || 0;
+          if (ex.metadata) exO.venue_metadata = ex.metadata;
           if (ex.errors.length && !ex.orders.length) {
             exO.note = 'No orders returned and the endpoint errored. FIRST-RUN CHECK: if these are 401s, revolutRequest signs `path` and we pass the query string inside it - the venue may sign only the bare path, which would need a signing change. If they are 400s, the date-range limit is likely tighter than the 7-day window used here.';
           } else {
