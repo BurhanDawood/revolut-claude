@@ -1,11 +1,36 @@
-name: Gemini
-on: [workflow_dispatch]
+name: Gemini Repo Diagnostic
+
+on:
+  workflow_dispatch:
+
 jobs:
-  audit:
+  analyze:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - run: npm install @google/genai
-      - env:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Google Gen AI SDK
+        run: npm install @google/genai
+
+      - name: Run Gemini Audit
+        env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: node --input-type=module -e "import {GoogleGenAI} from '@google/genai'; import fs from 'fs'; const ai = new GoogleGenAI({apiKey: process.env.GEMINI_API_KEY}); const code = fs.existsSync('server.js') ? fs.readFileSync('server.js', 'utf8').slice(0, 15000) : 'none'; ai.models.generateContent({model: 'gemini-2.5-flash', contents: 'Audit server.js:\n' + code}).then(r => console.log('\n--- GEMINI REPORT ---\n' + r.text));"
+        run: |
+          node --input-type=module -e "
+            import { GoogleGenAI } from '@google/genai';
+            import fs from 'fs';
+            const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+            const serverCode = fs.existsSync('server.js') ? fs.readFileSync('server.js', 'utf8').slice(0, 50000) : 'server.js missing';
+            const response = await ai.models.generateContent({
+              model: 'gemini-2.5-flash',
+              contents: 'Analyze this server.js file for architecture logic and potential unhandled promise rejections:\n\n' + serverCode
+            });
+            console.log('\n--- GEMINI AUDIT RESULTS ---\n');
+            console.log(response.text);
+          "
