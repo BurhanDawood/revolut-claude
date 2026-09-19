@@ -5663,6 +5663,40 @@ async function backfillAbnormalEvents() {
   } catch (err) { console.error('[abn-backfill] error:', err.message); }
 }
 
+// ── #326 Build 1: AUTHORITATIVE ORDER READS (READ-ONLY) ──────────────────────
+// The system currently INFERS trades from balance deltas: checkPortfolio compares
+// this scan's balance to the previous one, derives the side from the sign of the
+// change, and books the TICKER PRICE AT SCAN TIME as the execution price. Confirmed
+// in code, not assumed — see the autoLogTrade call sites. Nothing reads the venue's
+// own order history, which is why tranches drift (#320), realised P&L books the scan
+// price (#263), fees are never captured, and partial fills must be reconstructed (#47).
+//
+// This function CHANGES NOTHING. It reads /orders/historical and reports what the
+// venue says. No writes, no tranche updates, no trading-path involvement. Its purpose
+// is to prove the plumbing and QUANTIFY the drift before Build 2 touches any ledger.
+//
+// TWO THINGS TO VERIFY EMPIRICALLY ON FIRST RUN — both are unknowns, not assumptions:
+//  1. SIGNATURE SCOPE. revolutRequest signs `timestamp + method + /api/1.0 + path`.
+//     We pass the query string inside `path`, so it is signed. If Revolut signs only
+//     the bare path, every call returns 401 and this needs a signing change — which is
+//     exactly why this ships read-only first.
+//  2. DATE RANGE. The LLM reference says max 1 WEEK per request; developer.revolut.com
+//     says 30 days for private trades. We use 7 days and page backwards. If 30 works,
+//     the backfill loop gets 4x cheaper — worth testing, but 7 is the safe assumption.
+async function fetchExchangeOrders(daysBack = 7, symbolFilter = null) {
+  const out = { ok: false, windows: [], orders: [], errors: [] };
+  const DAY = 86400000;
+  const WINDOW_DAYS = 7;
+  const now = Date.now();
+  const totalDays = Math.max(1, Math.min(Number(daysBack) || 7, 370));
+  try {
+    // LOOP BODY INSTALLED BY THE FOLLOWING PUSH
+  } catch (e) {
+    out.errors.push({ window: 'outer', error: e.message });
+  }
+  return out;
+}
+
 async function recordDailyPrices() {
   try {
     console.log('Recording daily prices for price_history...');
@@ -12535,7 +12569,7 @@ let rows;
   server.tool('get_trading_data',
     'Get trading journal entries, active alerts, trader context/profile, rebalancing history, and dev_bridge messages',
     {
-      include: zLoose(z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'dev_bridge', 'coin_strategy', 'reconciliation', 'ledger', 'tax_lots', 'catalysts', 'thesis', 'nudges', 'dev_health', 'dev_recommendations', 'volatility_baseline', 'shadow_fills', 'abnormal_events', 'strategy_catalogue', 'all']))).optional()
+      include: zLoose(z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'dev_bridge', 'coin_strategy', 'reconciliation', 'ledger', 'tax_lots', 'catalysts', 'thesis', 'nudges', 'dev_health', 'dev_recommendations', 'volatility_baseline', 'shadow_fills', 'abnormal_events', 'strategy_catalogue', 'exchange_orders', 'all']))).optional()
         .describe('What data to fetch — defaults to all. dev_bridge, coin_strategy and reconciliation are never included in all; request them explicitly'),
       symbol:           z.string().optional().describe('Filter journal by coin e.g. NEAR'),
       limit:            z.coerce.number().optional().describe('Max journal entries to return, default 10'),
