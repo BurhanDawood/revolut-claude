@@ -1,0 +1,44 @@
+name: Gemini Repository Inspector
+
+on:
+  workflow_dispatch: # Allows manual trigger from the GitHub Actions tab
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Google Gen AI SDK
+        run: npm install @google/genai
+
+      - name: Run Gemini Repository Inspection
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          node -e "
+            import { GoogleGenAI } from '@google/genai';
+            import fs from 'fs';
+
+            const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+            
+            const pkg = fs.existsSync('package.json') ? fs.readFileSync('package.json', 'utf8') : '{}';
+            const serverHead = fs.existsSync('server.js') ? fs.readFileSync('server.js', 'utf8').slice(0, 20000) : 'server.js not found';
+
+            const prompt = 'You are an architectural auditor for this repository. Review this package.json and the initial block of server.js. Confirm that you can see the repository structure, verify dependencies, and report back the detected entrypoint and core Express setup:\n\nPackage:\n' + pkg + '\n\nServer Head:\n' + serverHead;
+
+            const response = await ai.models.generateContent({
+              model: 'gemini-2.5-flash',
+              contents: prompt
+            });
+
+            console.log('\n================ GEMINI INSPECTION REPORT ================\n');
+            console.log(response.text);
+            console.log('\n==========================================================\n');
+          "
