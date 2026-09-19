@@ -5690,7 +5690,52 @@ async function fetchExchangeOrders(daysBack = 7, symbolFilter = null) {
   const now = Date.now();
   const totalDays = Math.max(1, Math.min(Number(daysBack) || 7, 370));
   try {
-    // LOOP BODY INSTALLED BY THE FOLLOWING PUSH
+    for (let offset = 0; offset < totalDays; offset += WINDOW_DAYS) {
+      const end = now - offset * DAY;
+      const start = Math.max(now - totalDays * DAY, end - WINDOW_DAYS * DAY);
+      if (start >= end) break;
+      let cursor = null, pages = 0, got = 0;
+      do {
+        const qs = new URLSearchParams({
+          start_date: new Date(start).toISOString(),
+          end_date: new Date(end).toISOString(),
+          limit: '500'
+        });
+        if (symbolFilter) qs.set('symbols', symbolFilter);
+        if (cursor) qs.set('cursor', cursor);
+        let page;
+        try {
+          page = await revolutRequest('GET', '/orders/historical?' + qs.toString());
+        } catch (e) {
+          out.errors.push({ window: new Date(start).toISOString().slice(0, 10), error: e.message });
+          break;
+        }
+        const rows = Array.isArray(page) ? page : (page && (page.orders || page.data || page.items)) || [];
+        for (const o of rows) {
+          out.orders.push({
+            id: o.id || o.venue_order_id || null,
+            symbol: o.symbol || null,
+            side: o.side || null,
+            type: o.type || null,
+            status: o.status || o.state || null,
+            quantity: o.quantity != null ? Number(o.quantity) : null,
+            filled_quantity: o.filled_quantity != null ? Number(o.filled_quantity) : null,
+            price: o.price != null ? Number(o.price) : null,
+            // THE FIELD #263 NEEDS. The venue warns that `price` on a market order may be
+            // either the average execution price OR the submission price, with no way to
+            // tell which - so average_fill_price is the only trustworthy realised figure.
+            average_fill_price: o.average_fill_price != null ? Number(o.average_fill_price) : null,
+            created_date: o.created_date || o.created_at || null,
+            updated_date: o.updated_date || o.updated_at || null
+          });
+          got++;
+        }
+        cursor = (page && (page.cursor || page.next_cursor)) || null;
+        pages++;
+      } while (cursor && pages < 20);
+      out.windows.push({ from: new Date(start).toISOString().slice(0, 10), to: new Date(end).toISOString().slice(0, 10), orders: got, pages });
+    }
+    out.ok = out.errors.length === 0 || out.orders.length > 0;
   } catch (e) {
     out.errors.push({ window: 'outer', error: e.message });
   }
