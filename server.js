@@ -94,11 +94,15 @@ async function getCoinContext(coinBase) {
   return { narrative, role };
 }
 
-async function revolutRequest(method, path, body = null) {
+async function revolutRequest(method, path, body = null, signPathOverride = null) {
+  // signPathOverride: sign a DIFFERENT path from the one fetched. Needed because the venue
+  // rejected a signature computed over path-with-query ("Signature verification rejected",
+  // 19 Sep), so a GET with query params must sign the BARE path while fetching the full URL.
+  // Defaults to null = existing behaviour, so no existing caller changes.
   const timestamp = Date.now().toString();
   // For POST requests include minified JSON body in signature — critical for match
   const bodyString = body ? JSON.stringify(body) : '';
-  const message = `${timestamp}${method}/api/1.0${path}${bodyString}`;
+  const message = `${timestamp}${method}/api/1.0${signPathOverride || path}${bodyString}`;
   const privateKeyPem = PRIVATE_KEY.replace(/\\n/g, '\n');
   const pk = createPrivateKey({ key: privateKeyPem, format: 'pem', type: 'pkcs8' });
   const signature = sign(null, Buffer.from(message, 'utf8'), { key: pk, dsaEncoding: 'ieee-p1363' });
@@ -119,6 +123,14 @@ async function revolutRequest(method, path, body = null) {
   if (method === 'POST') {
     console.log('[revolut] Response status:', response.status);
     console.log('[revolut] Response body:', text);
+  }
+  // Non-2xx was previously INVISIBLE on every non-POST call: the error envelope was parsed
+  // and returned as if it were data, so a rejected request looked like an empty result.
+  // That is how a signature rejection presented as "zero orders, no errors" (19 Sep).
+  // LOG ONLY -- deliberately not throwing, because every existing caller was written against
+  // the old behaviour and changing that on a live trading path is a separate decision.
+  if (!response.ok) {
+    console.error('[revolut] ' + method + ' ' + path.split('?')[0] + ' -> HTTP ' + response.status + ': ' + text.substring(0, 200));
   }
   return JSON.parse(text);
 }
@@ -5705,7 +5717,13 @@ async function fetchExchangeOrders(daysBack = 7, symbolFilter = null) {
         if (cursor) qs.set('cursor', cursor);
         let page;
         try {
-          page = await revolutRequest('GET', '/orders/historical?' + qs.toString());
+          page = await revolutRequest('GET', '/orders/historical?' + qs.toString(), null, '/orders/historical');
+          // revolutRequest returns the parsed body whatever the status, so an API error
+          // arrives as a normal object. Detect it rather than treating it as an empty page.
+          if (page && page.message && !page.orders && !Array.isArray(page)) {
+            out.errors.push({ window: new Date(start).toISOString().slice(0, 10), error: 'API: ' + page.message });
+            break;
+          }
         } catch (e) {
           out.errors.push({ window: new Date(start).toISOString().slice(0, 10), error: e.message });
           break;
