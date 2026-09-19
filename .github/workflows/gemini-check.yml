@@ -11,7 +11,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup Node.js
-        uses: setup-node@v4
+        uses: actions/setup-node@v4
         with:
           node-version: 22
 
@@ -22,15 +22,19 @@ jobs:
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
-          node --input-type=module -e "
-            import { GoogleGenAI } from '@google/genai';
-            import fs from 'fs';
-            const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-            const serverCode = fs.existsSync('server.js') ? fs.readFileSync('server.js', 'utf8').slice(0, 50000) : 'server.js missing';
-            const response = await ai.models.generateContent({
-              model: 'gemini-2.5-flash',
-              contents: 'Analyze this server.js file for architecture logic and potential unhandled promise rejections:\n\n' + serverCode
-            });
-            console.log('\n--- GEMINI AUDIT RESULTS ---\n');
-            console.log(response.text);
-          "
+          node --input-type=module << 'EOF'
+          import { GoogleGenAI } from '@google/genai';
+          import fs from 'fs';
+
+          const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+          const serverCode = fs.existsSync('server.js') ? fs.readFileSync('server.js', 'utf8').slice(0, 50000) : 'server.js missing';
+
+          const response = await ai.models.generateContent({
+            model: 'gemini-2.5-flash',
+            contents: 'Analyze this server.js file for architecture logic and potential unhandled promise rejections:\n\n' + serverCode
+          });
+
+          console.log('\n================ GEMINI AUDIT RESULTS ================\n');
+          console.log(response.text);
+          console.log('\n======================================================\n');
+          EOF
