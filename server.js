@@ -5695,6 +5695,53 @@ async function backfillAbnormalEvents() {
 //  2. DATE RANGE. The LLM reference says max 1 WEEK per request; developer.revolut.com
 //     says 30 days for private trades. We use 7 days and page backwards. If 30 works,
 //     the backfill loop gets 4x cheaper — worth testing, but 7 is the safe assumption.
+// #326 SIGNING PROBE. Both obvious variants were rejected ("Signature verification
+// rejected"): signing path-with-query, and signing the bare path. Guessing further is
+// expensive - each attempt costs a push, a deploy and a connector refresh. So isolate
+// the variable instead: every Revolut call that WORKS today (/balances, /tickers/X) has
+// NO query string, so we have never successfully signed one and do not know the rule.
+// This runs several variants against the live venue and reports the status of each.
+// READ-ONLY: GETs only, no writes, no orders, no trading path. Delete once the answer
+// is known and the working variant is folded into fetchExchangeOrders.
+async function probeOrderSigning() {
+  const out = { ran_at: new Date().toISOString(), variants: [] };
+  const end = Date.now(), start = end - 3 * 86400000;
+  const iso = ms => new Date(ms).toISOString();
+  const attempt = async (label, path, signPath) => {
+    try {
+      const r = await revolutRequest('GET', path, null, signPath);
+      const isErr = r && r.message && !Array.isArray(r) && !r.orders;
+      out.variants.push({
+        variant: label,
+        result: isErr ? ('REJECTED: ' + r.message) : 'ACCEPTED',
+        rows: Array.isArray(r) ? r.length : (r && r.orders ? r.orders.length : null),
+        keys: (r && typeof r === 'object' && !Array.isArray(r)) ? Object.keys(r).slice(0, 8) : null
+      });
+    } catch (e) {
+      out.variants.push({ variant: label, result: 'THREW: ' + e.message });
+    }
+  };
+  // A. No query at all. THE KEY TEST: if this is accepted, signing is fine and the
+  //    problem is purely how the query string is built or encoded.
+  await attempt('A: no query string', '/orders/historical', null);
+  // B. Encoded ISO dates (URLSearchParams percent-encodes the colons), sign path+query.
+  const qsEnc = new URLSearchParams({ start_date: iso(start), end_date: iso(end), limit: '10' }).toString();
+  await attempt('B: encoded ISO, sign path+query', '/orders/historical?' + qsEnc, null);
+  // C. Same request, but sign the BARE path.
+  await attempt('C: encoded ISO, sign bare path', '/orders/historical?' + qsEnc, '/orders/historical');
+  // D. RAW colons - venues often sign the decoded query rather than the encoded form.
+  const qsRaw = 'start_date=' + iso(start) + '&end_date=' + iso(end) + '&limit=10';
+  await attempt('D: raw-colon ISO, sign path+query', '/orders/historical?' + qsRaw, null);
+  // E. Epoch milliseconds instead of ISO - no encoding ambiguity at all.
+  const qsEpoch = 'start_date=' + start + '&end_date=' + end + '&limit=10';
+  await attempt('E: epoch millis, sign path+query', '/orders/historical?' + qsEpoch, null);
+  // F. Epoch millis, bare-path signature.
+  await attempt('F: epoch millis, sign bare path', '/orders/historical?' + qsEpoch, '/orders/historical');
+  // G. A known-good endpoint WITH a query, to prove the transport itself is healthy.
+  await attempt('G: control - /balances no query', '/balances', null);
+  return out;
+}
+
 async function fetchExchangeOrders(daysBack = 7, symbolFilter = null) {
   const out = { ok: false, windows: [], orders: [], errors: [] };
   const DAY = 86400000;
@@ -13185,6 +13232,11 @@ let rows;
             } catch (e) { exO.ledger_comparison_error = e.message; }
           }
           exO.sample = ex.orders.slice(0, 5);
+          // Surface the signing probe whenever the sweep failed, so one call answers
+          // WHICH variant the venue accepts instead of another guess-and-push cycle.
+          if (ex.errors.length && !ex.orders.length) {
+            try { exO.signing_probe = await probeOrderSigning(); } catch (pe) { exO.signing_probe_error = pe.message; }
+          }
           if (ex.probe) exO.raw_response_probe = ex.probe;
         } catch (e) { exO.error = e.message; }
         result.exchange_orders = exO;
