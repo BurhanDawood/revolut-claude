@@ -13106,6 +13106,58 @@ let rows;
         result.strategy_catalogue = cat;
       }
 
+      // exchange_orders (#326 Build 1) -- AUTHORITATIVE order history from the venue.
+      // READ-ONLY: reads /orders/historical and compares it against what our tranches
+      // claim. Writes nothing, changes no tranche, touches no trading path. This exists
+      // to QUANTIFY the drift (#320) before Build 2 is allowed to rebuild anything.
+      if (fetch.includes('exchange_orders')) {
+        const exO = { generated_at: new Date().toISOString() };
+        try {
+          const exDays = Math.min(parseInt(limit) || 30, 370);
+          const exSym = symbol ? (symbol.toUpperCase().includes('-USD') ? symbol.toUpperCase() : symbol.toUpperCase() + '-USD') : null;
+          const ex = await fetchExchangeOrders(exDays, exSym);
+          exO.days_requested = exDays;
+          exO.windows = ex.windows;
+          exO.errors = ex.errors;
+          exO.order_count = ex.orders.length;
+          if (ex.errors.length && !ex.orders.length) {
+            exO.note = 'No orders returned and the endpoint errored. FIRST-RUN CHECK: if these are 401s, revolutRequest signs `path` and we pass the query string inside it - the venue may sign only the bare path, which would need a signing change. If they are 400s, the date-range limit is likely tighter than the 7-day window used here.';
+          } else {
+            const bySym = {};
+            let withAvgFill = 0, withoutAvgFill = 0;
+            for (const o of ex.orders) {
+              const s = o.symbol || 'UNKNOWN';
+              if (!bySym[s]) bySym[s] = { orders: 0, filled_qty_net: 0, buys: 0, sells: 0 };
+              bySym[s].orders++;
+              if (o.side === 'buy') bySym[s].buys++; else if (o.side === 'sell') bySym[s].sells++;
+              const fq = o.filled_quantity || 0;
+              bySym[s].filled_qty_net += (o.side === 'sell' ? -fq : fq);
+              if (o.average_fill_price != null) withAvgFill++; else withoutAvgFill++;
+            }
+            exO.by_symbol = bySym;
+            exO.average_fill_price_coverage = { present: withAvgFill, missing: withoutAvgFill };
+            try {
+              const [tr] = await db.execute(
+                'SELECT symbol, SUM(quantity) AS qty FROM tax_lots WHERE status = ? GROUP BY symbol', ['open']);
+              const ledger = {};
+              for (const r of tr) ledger[r.symbol] = Number(r.qty);
+              const cmp = [];
+              for (const s of Object.keys(bySym)) {
+                const venueNet = Number(bySym[s].filled_qty_net.toFixed(8));
+                const ours = ledger[s] != null ? Number(Number(ledger[s]).toFixed(8)) : null;
+                cmp.push({ symbol: s, venue_net_filled: venueNet, ledger_open_qty: ours,
+                  agrees: ours != null && Math.abs(venueNet - ours) < Math.max(0.0001, Math.abs(venueNet) * 0.01) });
+              }
+              exO.ledger_comparison = cmp;
+              exO.disagreements = cmp.filter(c => !c.agrees).length;
+              exO.comparison_note = 'venue_net_filled is net over the REQUESTED WINDOW ONLY, not all time. A symbol held from before the window will disagree legitimately. Widen days (limit) before treating any single row as drift.';
+            } catch (e) { exO.ledger_comparison_error = e.message; }
+          }
+          exO.sample = ex.orders.slice(0, 5);
+        } catch (e) { exO.error = e.message; }
+        result.exchange_orders = exO;
+      }
+
       // reconciliation -- explicitly excluded from fetchAll; must be requested by name
       if (fetch.includes('reconciliation')) {
         try {
