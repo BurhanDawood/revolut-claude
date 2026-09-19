@@ -5749,10 +5749,13 @@ async function fetchExchangeOrders(daysBack = 7, symbolFilter = null) {
   const now = Date.now();
   const totalDays = Math.max(1, Math.min(Number(daysBack) || 7, 370));
   try {
-    for (let offset = 0; offset < totalDays; offset += WINDOW_DAYS) {
-      const end = now - offset * DAY;
-      const start = Math.max(now - totalDays * DAY, end - WINDOW_DAYS * DAY);
-      if (start >= end) break;
+    // ONE window, not many. With no query string the venue returns its whole recent
+    // history in a single response (next_cursor came back empty), so looping weekly
+    // just re-fetched and re-counted the same rows. Kept as a loop so a future cursor
+    // implementation can restore paging without restructuring.
+    for (let offset = 0; offset < 1; offset++) {
+      const end = now;
+      const start = now - totalDays * DAY;
       let cursor = null, pages = 0, got = 0;
       do {
         // NO QUERY STRING. The 19 Sep probe tested seven variants: the endpoint is ACCEPTED
@@ -5781,10 +5784,20 @@ async function fetchExchangeOrders(daysBack = 7, symbolFilter = null) {
         // have not yet seen its shape. Needed before a full backfill can be designed.
         if (!out.metadata && page && page.metadata) out.metadata = page.metadata;
         // CLIENT-SIDE FILTER, because the venue will not accept query params from us.
+        // created_date arrives as an EPOCH INTEGER (1789778498464), not a string.
+        // Date.parse() on a number returns NaN, so the first version of this filter
+        // silently passed EVERY order in EVERY window and inflated the counts 5x.
+        const tsOf = (o) => {
+          const v = o.created_date || o.created_at || o.updated_date;
+          if (v == null) return 0;
+          return typeof v === 'number' ? v : (Date.parse(v) || 0);
+        };
+        // The venue uses SLASH symbols (COTI/USD); our ledger uses DASH (COTI-USD).
+        const norm = (s) => String(s || '').toUpperCase().replace('/', '-');
         const rows = rowsAll.filter(o => {
-          const ts = Date.parse(o.created_date || o.created_at || o.updated_date || 0) || 0;
+          const ts = tsOf(o);
           if (ts && (ts < start || ts > end)) return false;
-          if (symbolFilter && o.symbol && o.symbol.toUpperCase() !== symbolFilter.toUpperCase()) return false;
+          if (symbolFilter && o.symbol && norm(o.symbol) !== norm(symbolFilter)) return false;
           return true;
         });
         out.fetched_total = (out.fetched_total || 0) + rowsAll.length;
@@ -5804,7 +5817,8 @@ async function fetchExchangeOrders(daysBack = 7, symbolFilter = null) {
         for (const o of rows) {
           out.orders.push({
             id: o.id || o.venue_order_id || null,
-            symbol: o.symbol || null,
+            symbol: o.symbol ? String(o.symbol).toUpperCase().replace('/', '-') : null,
+            symbol_venue: o.symbol || null,
             side: o.side || null,
             type: o.type || null,
             status: o.status || o.state || null,
