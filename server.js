@@ -5711,6 +5711,19 @@ async function fetchExchangeOrders(daysBack = 7, symbolFilter = null) {
           break;
         }
         const rows = Array.isArray(page) ? page : (page && (page.orders || page.data || page.items)) || [];
+        // A 200 with zero rows is ambiguous: it could mean no orders, or it could mean the
+        // response envelope is a shape we do not unwrap, or that the date parameters are not
+        // in the format the venue expects. Capture the raw shape ONCE so the difference is
+        // visible rather than guessed at. Read-only; truncated; no secrets in an order list.
+        if (!rows.length && !out.probe) {
+          out.probe = {
+            response_type: Array.isArray(page) ? 'array' : (page === null ? 'null' : typeof page),
+            top_level_keys: (page && typeof page === 'object' && !Array.isArray(page)) ? Object.keys(page).slice(0, 15) : null,
+            preview: JSON.stringify(page === undefined ? null : page).substring(0, 500),
+            sent_start: new Date(start).toISOString(),
+            sent_end: new Date(end).toISOString()
+          };
+        }
         for (const o of rows) {
           out.orders.push({
             id: o.id || o.venue_order_id || null,
@@ -13138,7 +13151,7 @@ let rows;
             exO.average_fill_price_coverage = { present: withAvgFill, missing: withoutAvgFill };
             try {
               const [tr] = await db.execute(
-                'SELECT symbol, SUM(quantity) AS qty FROM tax_lots WHERE status = ? GROUP BY symbol', ['open']);
+                'SELECT symbol, SUM(quantity) AS qty FROM tax_lots WHERE lot_status = ? GROUP BY symbol', ['open']);
               const ledger = {};
               for (const r of tr) ledger[r.symbol] = Number(r.qty);
               const cmp = [];
@@ -13154,6 +13167,7 @@ let rows;
             } catch (e) { exO.ledger_comparison_error = e.message; }
           }
           exO.sample = ex.orders.slice(0, 5);
+          if (ex.probe) exO.raw_response_probe = ex.probe;
         } catch (e) { exO.error = e.message; }
         result.exchange_orders = exO;
       }
