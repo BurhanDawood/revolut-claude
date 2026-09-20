@@ -44,9 +44,8 @@ jobs:
 
           // NO AUTOMATED REVIEW GATE - deliberate. An earlier APPROVED_BY check was
           // REMOVED because the spec header's own reminder text satisfied it, so it
-          // passed on every spec, reviewed or not. A gate that blocks nothing while
-          // reading as protection is worse than none. Review is the operator's
-          // discipline; the gates below are the ones that actually hold.
+          // passed on every spec. A gate that blocks nothing while reading as
+          // protection is worse than none. The gates below are the ones that hold.
           console.log('Review gate: operator confirmation only (by design).');
 
           const specPath = path.join('specs/gemini-proposals', ticketId + '.md');
@@ -105,8 +104,27 @@ jobs:
               console.error('Nothing written. server.js is untouched.');
               process.exit(1);
             }
-            serverCode = serverCode.replace(searches[i], replaces[i]);
-            console.log('  block ' + (i + 1) + ' applied');
+            const before = serverCode.length;
+
+            // GATE 3 - REPLACER FUNCTION, NOT A STRING. In JS, $' $& $` and $$ inside
+            // a replacement STRING are special: $' means "everything after the match".
+            // Dev-314 block 1 contained `floor $'` - a dollar before a closing quote,
+            // ubiquitous in price-formatting code - and replace() spliced the ENTIRE
+            // REST OF THE FILE in at that point, taking server.js from 1.07 MB to
+            // 5.55 MB. A function's return value is used LITERALLY, so no expansion
+            // is possible. Never revert this to the string form.
+            serverCode = serverCode.replace(searches[i], () => replaces[i]);
+
+            // Belt and braces: the size change must equal replace.length - search.length.
+            // Any other delta means something expanded and the patch is not what was reviewed.
+            const delta = serverCode.length - before;
+            const expect = replaces[i].length - searches[i].length;
+            if (delta !== expect) {
+              console.error('ABORT on block ' + (i + 1) + ': size delta ' + delta + ' but expected ' + expect + '.');
+              console.error('Something expanded during replacement. Nothing committed.');
+              process.exit(1);
+            }
+            console.log('  block ' + (i + 1) + ' applied (delta ' + delta + ')');
           }
 
           fs.writeFileSync('server.js', serverCode);
