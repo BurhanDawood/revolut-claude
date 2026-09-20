@@ -1,0 +1,73 @@
+name: Apply Surgical Patch
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_message:
+        description: 'Commit Message (e.g., Fix #263 auto-sell execution price)'
+        required: true
+        type: string
+      search_block:
+        description: 'SEARCH: The exact lines in server.js to replace'
+        required: true
+        type: string
+      replace_block:
+        description: 'REPLACE: The approved new lines'
+        required: true
+        type: string
+
+# Grants the runner permission to push the fixed code back to main
+permissions:
+  contents: write
+
+jobs:
+  patch-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Apply Patch to server.js
+        env:
+          SEARCH_BLOCK: ${{ inputs.search_block }}
+          REPLACE_BLOCK: ${{ inputs.replace_block }}
+        run: |
+          node -e "
+            const fs = require('fs');
+            const code = fs.readFileSync('server.js', 'utf8');
+            
+            // Normalize line endings to prevent Windows/Linux mismatch errors
+            const safeCode = code.replace(/\r\n/g, '\n');
+            const safeSearch = process.env.SEARCH_BLOCK.replace(/\r\n/g, '\n');
+            const safeReplace = process.env.REPLACE_BLOCK.replace(/\r\n/g, '\n');
+            
+            const occurrences = safeCode.split(safeSearch).length - 1;
+            
+            if (occurrences === 0) {
+              console.error('\n❌ ERROR: Target search block not found. Check exact spacing.');
+              process.exit(1);
+            }
+            if (occurrences > 1) {
+              console.error('\n❌ ERROR: Search block is not unique (' + occurrences + ' matches).');
+              process.exit(1);
+            }
+            
+            fs.writeFileSync('server.js', safeCode.replace(safeSearch, safeReplace));
+            console.log('\n✅ Patch applied successfully to server.js in memory.');
+          "
+
+      - name: Run Syntax Verification
+        run: node --check server.js
+
+      - name: Commit and Push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add server.js
+          git commit -m "${{ inputs.commit_message }}"
+          git push
