@@ -13375,20 +13375,52 @@ let rows;
             exO.by_symbol = bySym;
             exO.average_fill_price_coverage = { present: withAvgFill, missing: withoutAvgFill };
             try {
+              // BASE-SYMBOL KEY. The venue says JTO/USD, this function normalises to
+              // JTO-USD, and tax_lots stores the BARE BASE, JTO. Keying the map by the
+              // raw stored symbol and looking it up by the normalised one meant EVERY
+              // lookup returned null, so the comparison reported a "disagreement" of
+              // null-vs-number for every symbol and told us nothing. Strip to base on
+              // both sides.
+              const baseOf = (x) => String(x || '').toUpperCase().replace('/', '-').replace(/-(USD|USDT|USDC|EUR|GBP)$/, '');
               const [tr] = await db.execute(
                 'SELECT symbol, SUM(quantity) AS qty FROM tax_lots WHERE lot_status = ? GROUP BY symbol', ['open']);
               const ledger = {};
-              for (const r of tr) ledger[r.symbol] = Number(r.qty);
+              for (const r of tr) ledger[baseOf(r.symbol)] = (ledger[baseOf(r.symbol)] || 0) + Number(r.qty);
+
+              // ACTUAL BALANCES are the ground truth worth comparing against. Window-net
+              // only covers the requested days, so a long-held position disagrees with it
+              // legitimately and the number means little. Ledger-vs-balance is the drift
+              // that actually matters: on 19 Sept JTO's ledger claimed 9,330 tokens
+              // against a real balance of 1,089 - an 8.6x overstatement - because sells
+              // never closed lots. Read-only: one GET, no writes.
+              const held = {};
+              try {
+                const bal = await revolutRequest('GET', '/balances');
+                const rows = Array.isArray(bal) ? bal : (bal && (bal.data || bal.balances)) || [];
+                for (const b of rows) {
+                  const cur = baseOf(b.currency || b.symbol || b.asset);
+                  const q = Number(b.balance != null ? b.balance : (b.available != null ? b.available : 0));
+                  if (cur && q) held[cur] = (held[cur] || 0) + q;
+                }
+              } catch (be) { exO.balance_fetch_error = be.message; }
+
               const cmp = [];
-              for (const s of Object.keys(bySym)) {
-                const venueNet = Number(bySym[s].filled_qty_net.toFixed(8));
-                const ours = ledger[s] != null ? Number(Number(ledger[s]).toFixed(8)) : null;
-                cmp.push({ symbol: s, venue_net_filled: venueNet, ledger_open_qty: ours,
-                  agrees: ours != null && Math.abs(venueNet - ours) < Math.max(0.0001, Math.abs(venueNet) * 0.01) });
+              const seen = new Set(Object.keys(bySym).map(baseOf));
+              for (const k of Object.keys(ledger)) seen.add(k);
+              for (const b of seen) {
+                const vKey = Object.keys(bySym).find(x => baseOf(x) === b);
+                const venueNet = vKey ? Number(bySym[vKey].filled_qty_net.toFixed(8)) : null;
+                const ours = ledger[b] != null ? Number(ledger[b].toFixed(8)) : null;
+                const actual = held[b] != null ? Number(held[b].toFixed(8)) : null;
+                const ratio = (ours != null && actual != null && actual > 0) ? Number((ours / actual).toFixed(2)) : null;
+                cmp.push({ symbol: b, venue_net_filled_in_window: venueNet, ledger_open_qty: ours,
+                  actual_balance: actual, ledger_over_actual: ratio,
+                  agrees: ours != null && actual != null && Math.abs(ours - actual) <= Math.max(0.0001, actual * 0.02) });
               }
+              cmp.sort((a, x) => (x.ledger_over_actual || 0) - (a.ledger_over_actual || 0));
               exO.ledger_comparison = cmp;
               exO.disagreements = cmp.filter(c => !c.agrees).length;
-              exO.comparison_note = 'venue_net_filled is net over the REQUESTED WINDOW ONLY, not all time. A symbol held from before the window will disagree legitimately. Widen days (limit) before treating any single row as drift.';
+              exO.comparison_note = 'agrees compares LEDGER open tax_lots against the ACTUAL venue balance (2% tolerance) - that is the #320 drift. ledger_over_actual > 1 means the ledger claims more than is held, i.e. sells did not close lots. venue_net_filled_in_window is net over the REQUESTED WINDOW ONLY and is context, not the drift measure.';
             } catch (e) { exO.ledger_comparison_error = e.message; }
           }
           exO.sample = ex.orders.slice(0, 5);
