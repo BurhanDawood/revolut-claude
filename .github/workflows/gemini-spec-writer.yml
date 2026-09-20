@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       instructions:
-        description: 'Instructions (e.g., Draft patch for auto-sell slippage)'
+        description: 'What to change and why'
         required: true
         type: string
 
@@ -35,73 +35,36 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TICKET_ID: ${{ inputs.ticket_id }}
           INSTRUCTIONS: ${{ inputs.instructions }}
+          BASE_COMMIT: ${{ github.sha }}
         run: |
           node --input-type=module << 'EOF'
           import { GoogleGenAI } from '@google/genai';
           import fs from 'fs';
           import path from 'path';
+          import crypto from 'crypto';
 
           const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-          
-          const serverCode = fs.existsSync('server.js') ? fs.readFileSync('server.js', 'utf8') : 'Missing server.js';
-          
-          const prompt = `
-          You are the lead architect for this system. 
-          Ticket: ${process.env.TICKET_ID}
-          Instructions: ${process.env.INSTRUCTIONS}
-          
-          Based on the instructions, draft the required SEARCH and REPLACE blocks to fix the issue in server.js.
-          
-          CRITICAL: Do not use Base64 encoding. You must format your response to include exact plain-text blocks formatted exactly like this:
-          
-          <<<<<<< SEARCH
-          [exact lines to replace from server.js]
-          =======
-          [new replacement lines]
-          >>>>>>> REPLACE
-          
-          Format the remainder of your response cleanly in Markdown explaining the change so Claude can read and review it easily.
-          
-          Codebase (server.js):
-          ${serverCode}
-          `;
 
-          const response = await ai.models.generateContent({
-            model: 'gemini-3.6-flash',
-            contents: prompt
-          });
-
-          let outputText = response.text;
-          
-          // Automatically extract plain text blocks and compute bulletproof Base64 for the deployer
-          const blockRegex = /<<<<<<< SEARCH\n([\s\S]*?)\n=======\n([\s\S]*?)\n>>>>>>> REPLACE/;
-          const match = outputText.match(blockRegex);
-          
-          if (match) {
-              const searchBase64 = Buffer.from(match[1]).toString('base64');
-              const replaceBase64 = Buffer.from(match[2]).toString('base64');
-              
-              outputText += '\n\n---\n### 🤖 Automated Deployer Data\n';
-              outputText += 'SEARCH_BASE64:\n```text\n' + searchBase64 + '\n```\n\n';
-              outputText += 'REPLACE_BASE64:\n```text\n' + replaceBase64 + '\n```\n';
-          } else {
-              outputText += '\n\n---\n❌ ERROR: Node script could not detect <<<<<<< SEARCH / ======= / >>>>>>> REPLACE blocks to generate Base64.';
+          if (!fs.existsSync('server.js')) {
+            console.error('ABORT: server.js missing.');
+            process.exit(1);
           }
+          const serverCode = fs.readFileSync('server.js', 'utf8').replace(/\r\n/g, '\n');
+          const baseSha = crypto.createHash('sha256').update(serverCode).digest('hex');
 
-          const dir = 'specs/gemini-proposals';
-          if (!fs.existsSync(dir)){
-              fs.mkdirSync(dir, { recursive: true });
-          }
+          const prompt = `You are drafting a surgical patch for a live crypto trading system.
+Ticket: ${process.env.TICKET_ID}
+Instructions: ${process.env.INSTRUCTIONS}
 
-          const filePath = path.join(dir, `${process.env.TICKET_ID}.md`);
-          fs.writeFileSync(filePath, outputText);
-          console.log(`✅ Successfully wrote proposal and computed Base64 to ${filePath}`);
-          EOF
+=== RULES - THESE ARE NOT STYLE PREFERENCES ===
 
-      - name: Commit and Push Proposal
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add specs/
-          git commit -m "Draft Gemini Spec: ${{ inputs.ticket_id }}"
-          git push
+1. VERIFY EVERY IDENTIFIER AGAINST THE CODE BELOW BEFORE YOU USE IT.
+   You have the entire file. Search it. Do not assume a function, column,
+   middleware or table exists because the name sounds right. Past drafts have
+   referenced requireApiToken, sendTelegramAlert and tax_lots.status - none of
+   which existed. This is the single most common defect in these specs, and it
+   is always avoidable by searching the file you were given.
+
+2. EACH SEARCH BLOCK MUST APPEAR EXACTLY ONCE IN server.js.
+   Count the occurrences. If your anchor is not unique, widen it with
+   surrounding lines until it is. A non-unique anchor aborts the deploy.
