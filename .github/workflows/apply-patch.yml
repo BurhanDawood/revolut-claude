@@ -31,33 +31,57 @@ jobs:
           SEARCH_B64: ${{ inputs.search_base64 }}
           REPLACE_B64: ${{ inputs.replace_base64 }}
         run: |
-          node -e "
-            const fs = require('fs');
-            const code = fs.readFileSync('server.js', 'utf8');
-            
-            // Decode Base64 inputs
-            const searchStr = Buffer.from(process.env.SEARCH_B64, 'base64').toString('utf8');
-            const replaceStr = Buffer.from(process.env.REPLACE_B64, 'base64').toString('utf8');
-            
-            // Normalize line endings to prevent Windows/Linux mismatch errors
-            const safeCode = code.replace(/\r\n/g, '\n');
-            const safeSearch = searchStr.replace(/\r\n/g, '\n');
-            const safeReplace = replaceStr.replace(/\r\n/g, '\n');
-            
-            const occurrences = safeCode.split(safeSearch).length - 1;
-            
-            if (occurrences === 0) {
-              console.error('\n❌ ERROR: Target search block not found. Check exact spacing.');
-              process.exit(1);
-            }
-            if (occurrences > 1) {
-              console.error('\n❌ ERROR: Search block is not unique (' + occurrences + ' matches).');
-              process.exit(1);
-            }
-            
-            fs.writeFileSync('server.js', safeCode.replace(safeSearch, safeReplace));
-            console.log('\n✅ Patch applied successfully to server.js in memory.');
-          "
+          node --input-type=module << 'NODEEOF'
+          import fs from 'fs';
+          import crypto from 'crypto';
+
+          const code = fs.readFileSync('server.js', 'utf8');
+
+          const searchStr  = Buffer.from(process.env.SEARCH_B64,  'base64').toString('utf8');
+          const replaceStr = Buffer.from(process.env.REPLACE_B64, 'base64').toString('utf8');
+
+          // Normalise line endings on all three so a CRLF/LF mismatch cannot cause
+          // a silent miss or a wrong match.
+          const safeCode    = code.replace(/\r\n/g, '\n');
+          const safeSearch  = searchStr.replace(/\r\n/g, '\n');
+          const safeReplace = replaceStr.replace(/\r\n/g, '\n');
+
+          const occurrences = safeCode.split(safeSearch).length - 1;
+          if (occurrences === 0) {
+            console.error('ABORT: search block not found. Check exact spacing and indentation.');
+            process.exit(1);
+          }
+          if (occurrences > 1) {
+            console.error('ABORT: search block is not unique (' + occurrences + ' matches). Widen it.');
+            process.exit(1);
+          }
+
+          // REPLACER FUNCTION, NOT A STRING. In JS, $' $& $` and $$ inside a
+          // replacement STRING are special: $' means "everything after the match".
+          // A Dev-314 block contained `floor $'` - a dollar before a closing quote,
+          // ubiquitous in price-formatting code - and the string form spliced the
+          // ENTIRE REST OF THE FILE in at that point, taking server.js from 1.07 MB
+          // to 5.55 MB. A function's return value is used LITERALLY. See #328.
+          // Never revert this to the string form.
+          const patched = safeCode.replace(safeSearch, () => safeReplace);
+
+          // SIZE-DELTA GATE. The length change must equal replace.length - search.length
+          // exactly. Any other delta means something expanded and the patch is not what
+          // was reviewed. This catches expansion even if the function form above is ever
+          // reverted, and it is the gate that was missing when #328 nearly landed.
+          const delta  = patched.length - safeCode.length;
+          const expect = safeReplace.length - safeSearch.length;
+          if (delta !== expect) {
+            console.error('ABORT: size delta ' + delta + ' but expected ' + expect + '.');
+            console.error('Something expanded during replacement. Nothing written.');
+            process.exit(1);
+          }
+
+          fs.writeFileSync('server.js', patched);
+          console.log('Patch applied (delta ' + delta + ').');
+          console.log('POST-SHA: ' + crypto.createHash('sha256').update(patched).digest('hex'));
+          console.log('Give this to Claude to verify what landed.');
+          NODEEOF
 
       - name: Run Syntax Verification
         run: node --check server.js
@@ -67,5 +91,6 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add server.js
+          git diff --cached --quiet && { echo "No change to commit."; exit 1; }
           git commit -m "${{ inputs.commit_message }}"
           git push
