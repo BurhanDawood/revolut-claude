@@ -45,7 +45,7 @@ jobs:
           // NO AUTOMATED REVIEW GATE - deliberate. An earlier APPROVED_BY check was
           // REMOVED because the spec header's own reminder text satisfied it, so it
           // passed on every spec. A gate that blocks nothing while reading as
-          // protection is worse than none. The gates below are the ones that hold.
+          // protection is worse than none.
           console.log('Review gate: operator confirmation only (by design).');
 
           const specPath = path.join('specs/gemini-proposals', ticketId + '.md');
@@ -55,15 +55,29 @@ jobs:
           }
           const spec = fs.readFileSync(specPath, 'utf8');
 
-          let serverCode = fs.readFileSync('server.js', 'utf8').replace(/\r\n/g, '\n');
+          // TARGET FILE comes from the spec header, so the deployer patches whatever
+          // the spec was drafted against. Defaults to server.js for older specs.
+          const tf = spec.match(/^TARGET_FILE:\s*(\S+)\s*$/m);
+          const target = tf ? tf[1] : 'server.js';
+          if (target.indexOf('..') !== -1 || target.startsWith('/') || target.startsWith('.github/')) {
+            console.error('ABORT: refusing to patch ' + target);
+            process.exit(1);
+          }
+          if (!fs.existsSync(target)) {
+            console.error('ABORT: target file not found: ' + target);
+            process.exit(1);
+          }
+          console.log('Target file: ' + target);
+
+          let fileCode = fs.readFileSync(target, 'utf8').replace(/\r\n/g, '\n');
 
           // GATE 1 - BASE DRIFT. Warning, not abort: main legitimately advances
           // between drafting and deploy. Anchor uniqueness below is the real guard.
           const baseSha = spec.match(/BASE_SHA:\s*([0-9a-f]{64})/);
           if (baseSha) {
-            const nowSha = crypto.createHash('sha256').update(serverCode).digest('hex');
+            const nowSha = crypto.createHash('sha256').update(fileCode).digest('hex');
             if (nowSha !== baseSha[1]) {
-              console.log('WARNING: server.js has changed since this spec was drafted.');
+              console.log('WARNING: ' + target + ' has changed since this spec was drafted.');
               console.log('  drafted against: ' + baseSha[1].slice(0, 12));
               console.log('  current:         ' + nowSha.slice(0, 12));
               console.log('  Proceeding - every anchor must still match exactly once.');
@@ -98,26 +112,26 @@ jobs:
           // written and nothing is committed. A half-applied patch leaves the file
           // in a state nobody designed.
           for (let i = 0; i < searches.length; i++) {
-            const hits = serverCode.split(searches[i]).length - 1;
+            const hits = fileCode.split(searches[i]).length - 1;
             if (hits !== 1) {
               console.error('ABORT on block ' + (i + 1) + '/' + searches.length + ': anchor matched ' + hits + ' times, must be exactly 1.');
-              console.error('Nothing written. server.js is untouched.');
+              console.error('Nothing written. ' + target + ' is untouched.');
               process.exit(1);
             }
-            const before = serverCode.length;
+            const before = fileCode.length;
 
             // GATE 3 - REPLACER FUNCTION, NOT A STRING. In JS, $' $& $` and $$ inside
             // a replacement STRING are special: $' means "everything after the match".
-            // Dev-314 block 1 contained `floor $'` - a dollar before a closing quote,
-            // ubiquitous in price-formatting code - and replace() spliced the ENTIRE
-            // REST OF THE FILE in at that point, taking server.js from 1.07 MB to
-            // 5.55 MB. A function's return value is used LITERALLY, so no expansion
-            // is possible. Never revert this to the string form.
-            serverCode = serverCode.replace(searches[i], () => replaces[i]);
+            // A Dev-314 block contained `floor $'` - a dollar before a closing quote,
+            // ubiquitous in price-formatting code - and the string form spliced the
+            // ENTIRE REST OF THE FILE in at that point, taking server.js from 1.07 MB
+            // to 5.55 MB. A function's return value is used LITERALLY. See #328.
+            // Never revert this to the string form.
+            fileCode = fileCode.replace(searches[i], () => replaces[i]);
 
             // Belt and braces: the size change must equal replace.length - search.length.
             // Any other delta means something expanded and the patch is not what was reviewed.
-            const delta = serverCode.length - before;
+            const delta = fileCode.length - before;
             const expect = replaces[i].length - searches[i].length;
             if (delta !== expect) {
               console.error('ABORT on block ' + (i + 1) + ': size delta ' + delta + ' but expected ' + expect + '.');
@@ -127,17 +141,24 @@ jobs:
             console.log('  block ' + (i + 1) + ' applied (delta ' + delta + ')');
           }
 
-          fs.writeFileSync('server.js', serverCode);
+          fs.writeFileSync(target, fileCode);
 
-          try {
-            execSync('node --check server.js', { stdio: 'inherit' });
-            console.log('Syntax check passed.');
-          } catch (err) {
-            console.error('ABORT: syntax check failed. Not committing.');
-            process.exit(1);
+          // Syntax gate applies to JavaScript only. A .md file has no parser, so the
+          // anchor-uniqueness and size-delta gates above are its whole protection -
+          // which is acceptable because docs are not an execution path.
+          if (target.endsWith('.js')) {
+            try {
+              execSync('node --check ' + target, { stdio: 'inherit' });
+              console.log('Syntax check passed.');
+            } catch (err) {
+              console.error('ABORT: syntax check failed. Not committing.');
+              process.exit(1);
+            }
+          } else {
+            console.log('Non-JS target - syntax check skipped.');
           }
 
-          const finalSha = crypto.createHash('sha256').update(serverCode).digest('hex');
+          const finalSha = crypto.createHash('sha256').update(fileCode).digest('hex');
           console.log('POST-SHA: ' + finalSha);
           console.log('Give this to Claude to verify what landed.');
           NODEEOF
@@ -146,7 +167,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add server.js
+          git add -A
           git diff --cached --quiet && { echo "No change to commit."; exit 1; }
           git commit -m "Deploy Spec: ${{ inputs.ticket_id }}"
           git push
