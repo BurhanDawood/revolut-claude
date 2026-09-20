@@ -4645,7 +4645,10 @@ async function checkPumpArm(symbol, currentPrice) {
 function shadowNewState(qty) {
   return { phase:'idle', baseline:null, baseline_at:null, peak:null, qty, qty0:qty, reserved:0, reserved_left:0,
     sell_done:[], buy_done:[], sells_filled:0, buys_filled:0, gross_sold:0, sale_price:null, trough:null,
-    last_fill_at:null, cycle_id:null };
+    last_fill_at:null, cycle_id:null,
+    // #315 re-arming ladder (rule_mode 'rearm'): legs_filled counts completed sell legs
+    // within ONE continuous move; rearm_target is the price that re-arms the next leg.
+    legs_filled:0, rearm_target:null };
 }
 
 function shadowEvalTier(state, bar, cfg, ctx) {
