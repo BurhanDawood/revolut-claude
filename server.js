@@ -4706,7 +4706,19 @@ function shadowEvalTier(state, bar, cfg, ctx) {
         state.legs_filled++;
         state.phase = 'rearm_watch';
         state.buy_done = []; state.reserved_left = state.reserved; state.trough = lo;
-        state.rearm_target = state.sale_price * (1 + Number(cfg.arm_pump_pct) / 100);
+        // TWO WAYS TO DEFINE "it kept running", and the choice decides whether this
+        // design can work at all. Measured on COTI 21 Aug - 18 Sept (+116%):
+        //   rearm_from 'sale' (default): target = sale_price * (1+arm). The sell fires on
+        //     a TRAIL BREACH, i.e. AFTER a 3-7% retrace - so the buy tier at -10% from the
+        //     sale price is ~3x NEARER than a +30% re-arm. The buy always wins the race and
+        //     re-arm NEVER fires. Backtest confirmed: identical to 'single', 4 legs, +1.93%.
+        //   rearm_from 'peak': target = the peak we just retraced from, plus a small
+        //     confirm margin. Regaining the prior high IS "still running", and it is close
+        //     enough to actually compete with the buy tier.
+        state.rearm_peak = state.peak;
+        state.rearm_target = (cfg.rearm_from === 'peak')
+          ? state.peak * (1 + (cfg.rearm_confirm_pct != null ? Number(cfg.rearm_confirm_pct) : 1) / 100)
+          : state.sale_price * (1 + Number(cfg.arm_pump_pct) / 100);
       } else {
         state.phase = 'sold'; state.buy_done = []; state.reserved_left = state.reserved; state.trough = lo;
       }
@@ -4722,8 +4734,11 @@ function shadowEvalTier(state, bar, cfg, ctx) {
     if (lo < state.trough) state.trough = lo;
     if (state.rearm_target && hi >= state.rearm_target) {
       state.phase = 'armed';
-      state.baseline = state.sale_price; state.baseline_at = t; state.peak = hi;
-      state.sell_done = []; state.rearm_target = null;
+      // Baseline becomes the price we re-armed at, so the next leg's trail is measured
+      // from the NEW high rather than from the old sale price.
+      state.baseline = (cfg.rearm_from === 'peak' && state.rearm_peak) ? state.rearm_peak : state.sale_price;
+      state.baseline_at = t; state.peak = hi;
+      state.sell_done = []; state.rearm_target = null; state.rearm_peak = null;
       return { state, fills };
     }
     const rbase = state.sale_price != null ? state.sale_price : px;
