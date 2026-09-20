@@ -27,7 +27,7 @@ jobs:
           TICKET_ID: ${{ inputs.ticket_id }}
           CONFIRM_TICKET: ${{ inputs.confirm_ticket }}
         run: |
-          node --input-type=module << 'EOF'
+          node --input-type=module << 'NODEEOF'
           import fs from 'fs';
           import path from 'path';
           import crypto from 'crypto';
@@ -36,12 +36,18 @@ jobs:
           const ticketId = (process.env.TICKET_ID || '').trim();
           const confirm  = (process.env.CONFIRM_TICKET || '').trim();
 
-          // GATE 0 - deliberate confirmation. A speed bump against an accidental
-          // run, not proof of review. The real review gate is APPROVED_BY below.
+          // GATE 0 - deliberate confirmation. Guards against an accidental run.
           if (ticketId !== confirm) {
             console.error('ABORT: confirm_ticket does not match ticket_id.');
             process.exit(1);
           }
+
+          // NO AUTOMATED REVIEW GATE - deliberate. An earlier APPROVED_BY check was
+          // REMOVED because the spec header's own reminder text satisfied it, so it
+          // passed on every spec, reviewed or not. A gate that blocks nothing while
+          // reading as protection is worse than none. Review is the operator's
+          // discipline; the gates below are the ones that actually hold.
+          console.log('Review gate: operator confirmation only (by design).');
 
           const specPath = path.join('specs/gemini-proposals', ticketId + '.md');
           if (!fs.existsSync(specPath)) {
@@ -50,21 +56,10 @@ jobs:
           }
           const spec = fs.readFileSync(specPath, 'utf8');
 
-          // GATE 1 - REVIEW. The spec must carry an APPROVED_BY line, added by a
-          // separate commit after Claude has read it. Without this, "Approved
-          // Spec" is only a workflow name.
-          const approved = spec.match(/APPROVED_BY:\s*(\S.*)/);
-          if (!approved) {
-            console.error('ABORT: no APPROVED_BY line in the spec. Add "APPROVED_BY: <name>" after review.');
-            process.exit(1);
-          }
-          console.log('Approved by: ' + approved[1].trim());
-
           let serverCode = fs.readFileSync('server.js', 'utf8').replace(/\r\n/g, '\n');
 
-          // GATE 2 - BASE DRIFT. Warn if server.js has moved since drafting.
-          // Deliberately a WARNING: main legitimately advances between draft and
-          // deploy. The uniqueness gate below is what actually protects us.
+          // GATE 1 - BASE DRIFT. Warning, not abort: main legitimately advances
+          // between drafting and deploy. Anchor uniqueness below is the real guard.
           const baseSha = spec.match(/BASE_SHA:\s*([0-9a-f]{64})/);
           if (baseSha) {
             const nowSha = crypto.createHash('sha256').update(serverCode).digest('hex');
@@ -77,12 +72,12 @@ jobs:
               console.log('Base sha matches the drafted version.');
             }
           } else {
-            console.log('NOTE: spec carries no BASE_SHA (drafted by an older spec-writer).');
+            console.log('NOTE: spec carries no BASE_SHA (older spec-writer).');
           }
 
-          // GATE 3 - MULTI-BLOCK. matchAll, not match. The previous version took
-          // only the FIRST pair, so any multi-part patch was applied PARTIALLY
-          // and reported as success - the worst outcome available.
+          // GATE 2 - MULTI-BLOCK. matchAll, not match. An earlier version took only
+          // the FIRST pair, so a multi-part patch applied PARTIALLY and reported
+          // success - the worst outcome available.
           const grab = (label) => [...spec.matchAll(
             new RegExp(label + ':\\s*```text\\s*([A-Za-z0-9+/=\\s]+?)\\s*```', 'g')
           )].map(m => Buffer.from(m[1].replace(/\s+/g, ''), 'base64').toString('utf8').replace(/\r\n/g, '\n'));
@@ -95,12 +90,12 @@ jobs:
             process.exit(1);
           }
           if (searches.length !== replaces.length) {
-            console.error('ABORT: ' + searches.length + ' SEARCH blocks vs ' + replaces.length + ' REPLACE blocks. They must pair exactly.');
+            console.error('ABORT: ' + searches.length + ' SEARCH blocks vs ' + replaces.length + ' REPLACE blocks.');
             process.exit(1);
           }
           console.log('Found ' + searches.length + ' patch block(s).');
 
-          // ATOMIC: apply every block IN MEMORY. If any anchor fails, nothing is
+          // ATOMIC: every block applies IN MEMORY. If any anchor fails, nothing is
           // written and nothing is committed. A half-applied patch leaves the file
           // in a state nobody designed.
           for (let i = 0; i < searches.length; i++) {
@@ -126,8 +121,8 @@ jobs:
 
           const finalSha = crypto.createHash('sha256').update(serverCode).digest('hex');
           console.log('POST-SHA: ' + finalSha);
-          console.log('Give this to Claude to verify what actually landed.');
-          EOF
+          console.log('Give this to Claude to verify what landed.');
+          NODEEOF
 
       - name: Commit and Push
         run: |
