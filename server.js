@@ -15516,15 +15516,18 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
       entry_floor:       z.coerce.number().optional().describe('Never sell at or below this price. Omit for no floor. Setting it to the real cost basis shows how often the floor blocks the strategy'),
       slippage_pct:      z.coerce.number().optional().describe('REQUIRED IN PRACTICE: assumed slippage per leg, e.g. 0.5. Defaults to 0, which is optimistic and should not be trusted alone — sweep 0 / 0.5 / 1.0 / 2.0'),
       fee_pct:           z.coerce.number().optional().describe('Fee per leg (default 0.09, the observed live Revolut rate)'),
+      rule_mode:         z.enum(['single','rearm']).optional().describe("#315. 'single' (default) = one arm, sell tiers, then buy tiers. 'rearm' RE-ARMS at the sale price after each sell leg and watches BOTH directions, so a continued run keeps selling. Each leg needs arm_pump_pct from the NEW baseline, so leg n needs (1+arm)^n overall: at arm=30 two legs need +69% and three need +120%. Sweep arm_pump_pct with this."),
+      max_legs:          z.coerce.number().optional().describe('#315 rearm only: cap on sell legs in one continuous move (default 5)'),
     },
-    async ({ symbol, start, end, source, initial_qty, initial_usd, arm_pump_pct, arm_window_min, sell_tiers, buy_tiers, tier_cooldown_min, min_tier_usd, entry_floor, slippage_pct, fee_pct }) => {
+    async ({ symbol, start, end, source, initial_qty, initial_usd, arm_pump_pct, arm_window_min, sell_tiers, buy_tiers, tier_cooldown_min, min_tier_usd, entry_floor, slippage_pct, fee_pct, rule_mode, max_legs }) => {
       try {
         if (!Array.isArray(sell_tiers) || !Array.isArray(buy_tiers) || !sell_tiers.length || !buy_tiers.length) {
           return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'sell_tiers and buy_tiers must both be non-empty arrays of [pct, pct] pairs' }) }] };
         }
         const res = await runLadderBacktest({
           symbol, start, end, source, initial_qty, initial_usd, arm_pump_pct, arm_window_min,
-          sell_tiers, buy_tiers, tier_cooldown_min, min_tier_usd, entry_floor, slippage_pct, fee_pct
+          sell_tiers, buy_tiers, tier_cooldown_min, min_tier_usd, entry_floor, slippage_pct, fee_pct,
+          rule_mode, max_legs
         });
         return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
       } catch (e) {
