@@ -1,0 +1,94 @@
+name: Gemini Spec Writer
+
+on:
+  workflow_dispatch:
+    inputs:
+      ticket_id:
+        description: 'Ticket ID (e.g., Dev-263)'
+        required: true
+        type: string
+      instructions:
+        description: 'Instructions (e.g., Draft Base64 patch for auto-sell slippage)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  draft-spec:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Google Gen AI SDK
+        run: npm install @google/genai
+
+      - name: Generate Spec via Gemini API
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TICKET_ID: ${{ inputs.ticket_id }}
+          INSTRUCTIONS: ${{ inputs.instructions }}
+        run: |
+          node --input-type=module << 'EOF'
+          import { GoogleGenAI } from '@google/genai';
+          import fs from 'fs';
+          import path from 'path';
+
+          const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+          
+          const serverCode = fs.existsSync('server.js') ? fs.readFileSync('server.js', 'utf8') : 'Missing server.js';
+          
+          const prompt = `
+          You are the lead architect for this system. 
+          Ticket: ${process.env.TICKET_ID}
+          Instructions: ${process.env.INSTRUCTIONS}
+          
+          Based on the instructions, draft the required Base64 SEARCH and REPLACE patch blocks to fix the issue in server.js.
+          
+          CRITICAL: You must format your response to include exact Base64 blocks formatted like this:
+          
+          SEARCH_BASE64:
+          \`\`\`text
+          [base64 string here]
+          \`\`\`
+          
+          REPLACE_BASE64:
+          \`\`\`text
+          [base64 string here]
+          \`\`\`
+          
+          Format the remainder of your response cleanly in Markdown explaining the change so Claude can read and review it easily.
+          
+          Codebase (server.js):
+          ${serverCode}
+          `;
+
+          const response = await ai.models.generateContent({
+            model: 'gemini-3.6-flash',
+            contents: prompt
+          });
+
+          const dir = 'specs/gemini-proposals';
+          if (!fs.existsSync(dir)){
+              fs.mkdirSync(dir, { recursive: true });
+          }
+
+          const filePath = path.join(dir, `${process.env.TICKET_ID}.md`);
+          fs.writeFileSync(filePath, response.text);
+          console.log(`✅ Successfully wrote proposal to ${filePath}`);
+          EOF
+
+      - name: Commit and Push Proposal
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add specs/
+          git commit -m "Draft Gemini Spec: ${{ inputs.ticket_id }}"
+          git push
