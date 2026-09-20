@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       instructions:
-        description: 'Instructions (e.g., Draft Base64 patch for auto-sell slippage)'
+        description: 'Instructions (e.g., Draft patch for auto-sell slippage)'
         required: true
         type: string
 
@@ -50,19 +50,15 @@ jobs:
           Ticket: ${process.env.TICKET_ID}
           Instructions: ${process.env.INSTRUCTIONS}
           
-          Based on the instructions, draft the required Base64 SEARCH and REPLACE patch blocks to fix the issue in server.js.
+          Based on the instructions, draft the required SEARCH and REPLACE blocks to fix the issue in server.js.
           
-          CRITICAL: You must format your response to include exact Base64 blocks formatted like this:
+          CRITICAL: Do not use Base64 encoding. You must format your response to include exact plain-text blocks formatted exactly like this:
           
-          SEARCH_BASE64:
-          \`\`\`text
-          [base64 string here]
-          \`\`\`
-          
-          REPLACE_BASE64:
-          \`\`\`text
-          [base64 string here]
-          \`\`\`
+          <<<<<<< SEARCH
+          [exact lines to replace from server.js]
+          =======
+          [new replacement lines]
+          >>>>>>> REPLACE
           
           Format the remainder of your response cleanly in Markdown explaining the change so Claude can read and review it easily.
           
@@ -75,14 +71,31 @@ jobs:
             contents: prompt
           });
 
+          let outputText = response.text;
+          
+          // Automatically extract plain text blocks and compute bulletproof Base64 for the deployer
+          const blockRegex = /<<<<<<< SEARCH\n([\s\S]*?)\n=======\n([\s\S]*?)\n>>>>>>> REPLACE/;
+          const match = outputText.match(blockRegex);
+          
+          if (match) {
+              const searchBase64 = Buffer.from(match[1]).toString('base64');
+              const replaceBase64 = Buffer.from(match[2]).toString('base64');
+              
+              outputText += '\n\n---\n### 🤖 Automated Deployer Data\n';
+              outputText += 'SEARCH_BASE64:\n```text\n' + searchBase64 + '\n```\n\n';
+              outputText += 'REPLACE_BASE64:\n```text\n' + replaceBase64 + '\n```\n';
+          } else {
+              outputText += '\n\n---\n❌ ERROR: Node script could not detect <<<<<<< SEARCH / ======= / >>>>>>> REPLACE blocks to generate Base64.';
+          }
+
           const dir = 'specs/gemini-proposals';
           if (!fs.existsSync(dir)){
               fs.mkdirSync(dir, { recursive: true });
           }
 
           const filePath = path.join(dir, `${process.env.TICKET_ID}.md`);
-          fs.writeFileSync(filePath, response.text);
-          console.log(`✅ Successfully wrote proposal to ${filePath}`);
+          fs.writeFileSync(filePath, outputText);
+          console.log(`✅ Successfully wrote proposal and computed Base64 to ${filePath}`);
           EOF
 
       - name: Commit and Push Proposal
