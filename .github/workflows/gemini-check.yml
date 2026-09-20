@@ -1,20 +1,21 @@
-name: Gemini Repo Diagnostic
+name: Gemini Post-Push Audit (advisory only)
 
 on:
   push:
-    branches:
-      - main
-  pull_request:
-    branches:
-      - main
+    branches: [ main ]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
-  analyze:
+  audit:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -24,23 +25,59 @@ jobs:
       - name: Install Google Gen AI SDK
         run: npm install @google/genai
 
-      - name: Run Gemini Audit
+      - name: Audit the diff
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
-          node --input-type=module << 'EOF'
+          git diff HEAD~1 HEAD -- server.js > /tmp/change.diff || true
+          node --input-type=module << 'NODEEOF'
           import { GoogleGenAI } from '@google/genai';
           import fs from 'fs';
 
-          const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-          const serverCode = fs.existsSync('server.js') ? fs.readFileSync('server.js', 'utf8').slice(0, 50000) : 'server.js missing';
+          // WHAT THIS IS AND IS NOT:
+          // ADVISORY. It cannot fail the build and does not gate deployment. It
+          // runs on push - the same event Railway deploys on - so it is
+          // CONCURRENT with deploy, never before it. Read it as commentary.
+          // The previous version audited server.js.slice(0, 50000): about 4.6% of
+          // a 1,075,468-character file, always the same opening chunk. It never
+          // saw autoExecuteSell, the Telegram handlers or any trading logic.
+          // Auditing the DIFF reviews exactly what changed - cheaper and relevant.
 
+          const diff = fs.existsSync('/tmp/change.diff') ? fs.readFileSync('/tmp/change.diff', 'utf8') : '';
+          if (!diff.trim()) {
+            console.log('No server.js change in this push. Nothing to audit.');
+            process.exit(0);
+          }
+          if (diff.length > 120000) {
+            console.log('Diff is ' + diff.length + ' chars - too large for a useful audit. Skipping.');
+            process.exit(0);
+          }
+
+          const ask = [
+            'Review this diff from a LIVE crypto trading system (Node 22, Express, MySQL).',
+            '',
+            'Report only concrete problems, in priority order. Say "no issues found" if',
+            'there are none - do not invent findings to seem useful.',
+            '',
+            'Look specifically for:',
+            '- unawaited promises or a missing catch on a path that moves money',
+            '- a guard or safety flag checked on one code path but not its sibling',
+            '- state cleared on one branch but not another',
+            '- an error swallowed so a failure returns plausible data instead of an error',
+            '- SQL column or table names that may not exist',
+            '- anything changing execution behaviour without saying so',
+            '',
+            'DIFF:',
+            diff
+          ].join('\n');
+
+          const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
           const response = await ai.models.generateContent({
             model: 'gemini-3.6-flash',
-            contents: 'Analyze this server.js file for architecture logic and potential unhandled promise rejections:\n\n' + serverCode
+            contents: ask
           });
 
-          console.log('\n================ GEMINI AUDIT RESULTS ================\n');
+          console.log('===== ADVISORY AUDIT (does not gate deploy) =====');
           console.log(response.text);
-          console.log('\n======================================================\n');
-          EOF
+          console.log('===== END - advisory only, verify before acting =====');
+          NODEEOF
