@@ -5742,6 +5742,7 @@ async function probeOrderSigning() {
   return out;
 }
 
+// #326 Build 1: read-only authoritative order reads (see dev_log #326).
 async function fetchExchangeOrders(daysBack = 7, symbolFilter = null) {
   const out = { ok: false, windows: [], orders: [], errors: [] };
   const DAY = 86400000;
