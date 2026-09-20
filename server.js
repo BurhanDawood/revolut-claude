@@ -5948,7 +5948,9 @@ async function fetchExchangeOrders(daysBack = 7, symbolFilter = null) {
 // └ #326 Build 1: Order fills helper (read-only execution breakdown & fees) └
 async function fetchOrderFills(orderId) {
   try {
-    const raw = await revolutRequest('GET', `/orders/${orderId}/fills`);
+    // DOC: GET /orders/fills/{venue_order_id} - segments in THIS order. We had
+    // /orders/{id}/fills, which is transposed, so this never worked.
+    const raw = await revolutRequest('GET', `/orders/fills/${orderId}`);
     return (raw && raw.data) ? raw.data : (raw || []);
   } catch (e) {
     console.error(`[orders-fills] Failed to fetch fills for ${orderId}:`, e.message);
