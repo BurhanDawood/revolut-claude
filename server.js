@@ -4894,7 +4894,7 @@ async function runLadderBacktest(opts) {
   let bars = [];
   if (src === 'hourly') {
     const [r] = await db.execute(
-      'SELECT hour_bucket AS t, open_price AS o, high_price AS h, low_price AS l, close_price AS c FROM price_intraday_hourly WHERE symbol = ? AND hour_bucket >= ? AND hour_bucket <= ? ORDER BY hour_bucket ASC',
+      'SELECT hour_bucket AS t, open_px AS o, high_px AS h, low_px AS l, close_px AS c FROM price_intraday_hourly WHERE symbol = ? AND hour_bucket >= ? AND hour_bucket <= ? ORDER BY hour_bucket ASC',
       [sym, opts.start, opts.end]);
     bars = r.map(x => ({ t: new Date(x.t).getTime(), h: parseFloat(x.h), l: parseFloat(x.l), c: parseFloat(x.c) }));
   } else {
