@@ -15535,8 +15535,10 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
       fee_pct:           z.coerce.number().optional().describe('Fee per leg (default 0.09, the observed live Revolut rate)'),
       rule_mode:         z.enum(['single','rearm']).optional().describe("#315. 'single' (default) = one arm, sell tiers, then buy tiers. 'rearm' RE-ARMS at the sale price after each sell leg and watches BOTH directions, so a continued run keeps selling. Each leg needs arm_pump_pct from the NEW baseline, so leg n needs (1+arm)^n overall: at arm=30 two legs need +69% and three need +120%. Sweep arm_pump_pct with this."),
       max_legs:          z.coerce.number().optional().describe('#315 rearm only: cap on sell legs in one continuous move (default 5)'),
+      rearm_from:        z.enum(['sale','peak']).optional().describe("#315 rearm only. 'sale' (default) re-arms at sale_price*(1+arm) - MEASURED ON COTI THIS NEVER FIRES: the sell happens on a trail breach, so the buy tier at -10% from the sale price is ~3x nearer than a +30% re-arm, the buy always wins the race, and the result is identical to 'single'. 'peak' re-arms on regaining the peak just retraced from, which is close enough to compete."),
+      rearm_confirm_pct: z.coerce.number().optional().describe("#315 rearm_from='peak' only: percent above the prior peak needed to confirm the run continues (default 1)"),
     },
-    async ({ symbol, start, end, source, initial_qty, initial_usd, arm_pump_pct, arm_window_min, sell_tiers, buy_tiers, tier_cooldown_min, min_tier_usd, entry_floor, slippage_pct, fee_pct, rule_mode, max_legs }) => {
+    async ({ symbol, start, end, source, initial_qty, initial_usd, arm_pump_pct, arm_window_min, sell_tiers, buy_tiers, tier_cooldown_min, min_tier_usd, entry_floor, slippage_pct, fee_pct, rule_mode, max_legs, rearm_from, rearm_confirm_pct }) => {
       try {
         if (!Array.isArray(sell_tiers) || !Array.isArray(buy_tiers) || !sell_tiers.length || !buy_tiers.length) {
           return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'sell_tiers and buy_tiers must both be non-empty arrays of [pct, pct] pairs' }) }] };
@@ -15544,7 +15546,7 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
         const res = await runLadderBacktest({
           symbol, start, end, source, initial_qty, initial_usd, arm_pump_pct, arm_window_min,
           sell_tiers, buy_tiers, tier_cooldown_min, min_tier_usd, entry_floor, slippage_pct, fee_pct,
-          rule_mode, max_legs
+          rule_mode, max_legs, rearm_from, rearm_confirm_pct
         });
         return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
       } catch (e) {
