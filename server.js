@@ -11582,6 +11582,36 @@ app.get('/api/xrp-locations', async (req, res) => {
 });
 
 // GET /api/abnormal - #50 Build 2 abnormal-move read (Phase A, always live-computes).
+// #326 Phase 1: Authoritative historical order & fill inspection endpoint
+app.get('/api/dev/orders-sync', async (req, res) => {
+  try {
+    const days = Math.min(parseInt(req.query.days || '7', 10), 30);
+    const symbol = req.query.symbol || null;
+    const orderId = req.query.order_id || null;
+
+    if (orderId) {
+      const fills = await fetchOrderFills(orderId);
+      return res.json({ ok: true, type: 'order_fills', order_id: orderId, fills });
+    }
+
+    const result = await fetchExchangeOrders(days, symbol);
+    res.json({
+      ok: result.ok,
+      type: 'historical_orders',
+      query: { days, symbol },
+      total_fetched: result.fetched_total || 0,
+      orders_count: result.orders.length,
+      windows: result.windows,
+      metadata: result.metadata || null,
+      probe: result.probe || null,
+      errors: result.errors,
+      sample_orders: result.orders.slice(0, 10)
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 app.get('/api/abnormal', async (req, res) => {
   try {
     const states = await computeAbnormalMoves();
