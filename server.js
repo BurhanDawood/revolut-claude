@@ -102,7 +102,15 @@ async function revolutRequest(method, path, body = null, signPathOverride = null
   const timestamp = Date.now().toString();
   // For POST requests include minified JSON body in signature — critical for match
   const bodyString = body ? JSON.stringify(body) : '';
-  const message = `${timestamp}${method}/api/1.0${signPathOverride || path}${bodyString}`;
+  // THE VENUE SIGNS path + query CONCATENATED WITH NO SEPARATOR - the '?' is NOT
+  // part of the message. Docs: "Request path (starting from /api) ... Query string
+  // (without ?, e.g. limit=10)". We previously signed the raw path WITH the '?' still
+  // in it, so EVERY request carrying a query string failed signature verification.
+  // That is the whole explanation for #326 Build 1: a 7-variant probe on 19 Sept
+  // varied WHAT to sign and HOW to encode the dates but never varied the SEPARATOR,
+  // so all seven were rejected and the endpoint looked like it refused query strings.
+  const [signPathPart, signQueryPart] = String(signPathOverride || path).split('?');
+  const message = `${timestamp}${method}/api/1.0${signPathPart}${signQueryPart || ''}${bodyString}`;
   const privateKeyPem = PRIVATE_KEY.replace(/\\n/g, '\n');
   const pk = createPrivateKey({ key: privateKeyPem, format: 'pem', type: 'pkcs8' });
   const signature = sign(null, Buffer.from(message, 'utf8'), { key: pk, dsaEncoding: 'ieee-p1363' });
