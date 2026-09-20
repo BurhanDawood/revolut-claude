@@ -7,6 +7,10 @@ on:
         description: 'Ticket ID to deploy (e.g., Dev-263)'
         required: true
         type: string
+      confirm_ticket:
+        description: 'Retype the SAME ticket ID to confirm Claude has reviewed it'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -18,60 +22,111 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-
       - name: Extract, Patch, and Verify
         env:
           TICKET_ID: ${{ inputs.ticket_id }}
+          CONFIRM_TICKET: ${{ inputs.confirm_ticket }}
         run: |
           node --input-type=module << 'EOF'
           import fs from 'fs';
           import path from 'path';
+          import crypto from 'crypto';
           import { execSync } from 'child_process';
 
-          const ticketId = process.env.TICKET_ID;
-          const specPath = path.join('specs/gemini-proposals', `${ticketId}.md`);
-          
+          const ticketId = (process.env.TICKET_ID || '').trim();
+          const confirm  = (process.env.CONFIRM_TICKET || '').trim();
+
+          // GATE 0 - deliberate confirmation. A speed bump against an accidental
+          // run, not proof of review. The real review gate is APPROVED_BY below.
+          if (ticketId !== confirm) {
+            console.error('ABORT: confirm_ticket does not match ticket_id.');
+            process.exit(1);
+          }
+
+          const specPath = path.join('specs/gemini-proposals', ticketId + '.md');
           if (!fs.existsSync(specPath)) {
-            console.error(`❌ Spec file not found at ${specPath}`);
+            console.error('ABORT: spec not found at ' + specPath);
             process.exit(1);
           }
+          const spec = fs.readFileSync(specPath, 'utf8');
 
-          const specContent = fs.readFileSync(specPath, 'utf8');
-          
-          // Extract Base64 blocks using Regex
-          const searchMatch = specContent.match(/SEARCH_BASE64:\s*```text\s*([A-Za-z0-9+/=\s]+)\s*```/);
-          const replaceMatch = specContent.match(/REPLACE_BASE64:\s*```text\s*([A-Za-z0-9+/=\s]+)\s*```/);
-
-          if (!searchMatch || !replaceMatch) {
-            console.error('❌ Could not find cleanly formatted SEARCH_BASE64 and REPLACE_BASE64 blocks in the spec.');
+          // GATE 1 - REVIEW. The spec must carry an APPROVED_BY line, added by a
+          // separate commit after Claude has read it. Without this, "Approved
+          // Spec" is only a workflow name.
+          const approved = spec.match(/APPROVED_BY:\s*(\S.*)/);
+          if (!approved) {
+            console.error('ABORT: no APPROVED_BY line in the spec. Add "APPROVED_BY: <name>" after review.');
             process.exit(1);
           }
+          console.log('Approved by: ' + approved[1].trim());
 
-          const searchStr = Buffer.from(searchMatch[1].replace(/\s+/g, ''), 'base64').toString('utf8');
-          const replaceStr = Buffer.from(replaceMatch[1].replace(/\s+/g, ''), 'base64').toString('utf8');
+          let serverCode = fs.readFileSync('server.js', 'utf8').replace(/\r\n/g, '\n');
 
-          let serverCode = fs.readFileSync('server.js', 'utf8');
-          
-          if (serverCode.split(searchStr).length - 1 !== 1) {
-            console.error('❌ Search block must match exactly ONCE in server.js to ensure safe patching.');
-            process.exit(1);
+          // GATE 2 - BASE DRIFT. Warn if server.js has moved since drafting.
+          // Deliberately a WARNING: main legitimately advances between draft and
+          // deploy. The uniqueness gate below is what actually protects us.
+          const baseSha = spec.match(/BASE_SHA:\s*([0-9a-f]{64})/);
+          if (baseSha) {
+            const nowSha = crypto.createHash('sha256').update(serverCode).digest('hex');
+            if (nowSha !== baseSha[1]) {
+              console.log('WARNING: server.js has changed since this spec was drafted.');
+              console.log('  drafted against: ' + baseSha[1].slice(0, 12));
+              console.log('  current:         ' + nowSha.slice(0, 12));
+              console.log('  Proceeding - every anchor must still match exactly once.');
+            } else {
+              console.log('Base sha matches the drafted version.');
+            }
+          } else {
+            console.log('NOTE: spec carries no BASE_SHA (drafted by an older spec-writer).');
           }
 
-          serverCode = serverCode.replace(searchStr, replaceStr);
+          // GATE 3 - MULTI-BLOCK. matchAll, not match. The previous version took
+          // only the FIRST pair, so any multi-part patch was applied PARTIALLY
+          // and reported as success - the worst outcome available.
+          const grab = (label) => [...spec.matchAll(
+            new RegExp(label + ':\\s*```text\\s*([A-Za-z0-9+/=\\s]+?)\\s*```', 'g')
+          )].map(m => Buffer.from(m[1].replace(/\s+/g, ''), 'base64').toString('utf8').replace(/\r\n/g, '\n'));
+
+          const searches = grab('SEARCH_BASE64');
+          const replaces = grab('REPLACE_BASE64');
+
+          if (!searches.length) {
+            console.error('ABORT: no SEARCH_BASE64 blocks found.');
+            process.exit(1);
+          }
+          if (searches.length !== replaces.length) {
+            console.error('ABORT: ' + searches.length + ' SEARCH blocks vs ' + replaces.length + ' REPLACE blocks. They must pair exactly.');
+            process.exit(1);
+          }
+          console.log('Found ' + searches.length + ' patch block(s).');
+
+          // ATOMIC: apply every block IN MEMORY. If any anchor fails, nothing is
+          // written and nothing is committed. A half-applied patch leaves the file
+          // in a state nobody designed.
+          for (let i = 0; i < searches.length; i++) {
+            const hits = serverCode.split(searches[i]).length - 1;
+            if (hits !== 1) {
+              console.error('ABORT on block ' + (i + 1) + '/' + searches.length + ': anchor matched ' + hits + ' times, must be exactly 1.');
+              console.error('Nothing written. server.js is untouched.');
+              process.exit(1);
+            }
+            serverCode = serverCode.replace(searches[i], replaces[i]);
+            console.log('  block ' + (i + 1) + ' applied');
+          }
+
           fs.writeFileSync('server.js', serverCode);
-          console.log(`✅ Successfully patched server.js for ${ticketId}`);
 
           try {
             execSync('node --check server.js', { stdio: 'inherit' });
-            console.log('✅ Syntax verification passed.');
+            console.log('Syntax check passed.');
           } catch (err) {
-            console.error('❌ Syntax verification failed. Aborting deploy.');
+            console.error('ABORT: syntax check failed. Not committing.');
             process.exit(1);
           }
+
+          const finalSha = crypto.createHash('sha256').update(serverCode).digest('hex');
+          console.log('POST-SHA: ' + finalSha);
+          console.log('Give this to Claude to verify what actually landed.');
           EOF
 
       - name: Commit and Push
@@ -79,5 +134,6 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add server.js
+          git diff --cached --quiet && { echo "No change to commit."; exit 1; }
           git commit -m "Deploy Spec: ${{ inputs.ticket_id }}"
           git push
