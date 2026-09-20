@@ -5847,6 +5847,17 @@ async function fetchExchangeOrders(daysBack = 7, symbolFilter = null) {
   return out;
 }
 
+// └ #326 Build 1: Order fills helper (read-only execution breakdown & fees) └
+async function fetchOrderFills(orderId) {
+  try {
+    const raw = await revolutRequest('GET', `/orders/${orderId}/fills`);
+    return (raw && raw.data) ? raw.data : (raw || []);
+  } catch (e) {
+    console.error(`[orders-fills] Failed to fetch fills for ${orderId}:`, e.message);
+    return { error: e.message };
+  }
+}
+
 async function recordDailyPrices() {
   try {
     console.log('Recording daily prices for price_history...');
