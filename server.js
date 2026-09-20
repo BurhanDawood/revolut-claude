@@ -5847,13 +5847,11 @@ async function fetchExchangeOrders(daysBack = 7, symbolFilter = null) {
   const now = Date.now();
   const totalDays = Math.max(1, Math.min(Number(daysBack) || 7, 370));
   try {
-    // ONE window, not many. With no query string the venue returns its whole recent
-    // history in a single response (next_cursor came back empty), so looping weekly
-    // just re-fetched and re-counted the same rows. Kept as a loop so a future cursor
-    // implementation can restore paging without restructuring.
-    for (let offset = 0; offset < 1; offset++) {
-      const end = now;
-      const start = now - totalDays * DAY;
+    // WEEKLY WINDOWS restored: the venue caps a date range at 1 week (#330).
+    for (let offset = 0; offset < totalDays; offset += WINDOW_DAYS) {
+      const end = now - offset * DAY;
+      const start = Math.max(now - totalDays * DAY, end - WINDOW_DAYS * DAY);
+      if (start >= end) break;
       let cursor = null, pages = 0, got = 0;
       do {
         // SERVER-SIDE FILTERING RESTORED (#330). The 19 Sept conclusion that this endpoint
