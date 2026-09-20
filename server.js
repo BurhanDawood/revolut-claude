@@ -3520,11 +3520,12 @@ async function armReboundTracker(symbol, salePrice, referenceBase, params, saleP
     );
     const coinBaseTrk = symbol.replace('-USD', '');
     console.log('[trough] ' + symbol + ' armed: sale=' + salePrice + ' base=' + referenceBase + ' gate=' + retraceGate.toFixed(8) + ' (' + retracePct + '% of move) proceeds=$' + (proceedsUsd != null ? proceedsUsd.toFixed(2) : 'n/a'));
+    const floorAnchor = (salePrice != null && salePrice > 0) ? salePrice : entryFloor;
     await sendTelegram(
       '<b>[#130 TROUGH ARMED] ' + coinBaseTrk + '</b>\n\n' +
       'Sell @ $' + salePrice + ' (base $' + referenceBase + ')\n' +
       'Retrace gate: $' + retraceGate.toFixed(8) + ' (' + retracePct + '% of move)\n' +
-      'On bounce: ' + bouncePct + '% off trough, floor $' + (entryFloor != null ? (entryFloor * (1 - buybackFloorPct/100)).toFixed(8) : 'n/a') + '\n' +
+      'On bounce: ' + bouncePct + '% off trough, floor $' + (floorAnchor != null ? (floorAnchor * (1 - buybackFloorPct/100)).toFixed(8) : 'n/a') + '\n' +
       'Rebuy size: $' + (proceedsUsd != null ? proceedsUsd.toFixed(2) : 'n/a')
     ).catch(() => {});
   } catch (e) { console.error('[trough] armReboundTracker error:', e.message); }
@@ -3544,11 +3545,12 @@ async function updateTroughTracker(symbol, currentPrice) {
       console.log('[trough] ' + symbol + ' retrace gate met @ ' + currentPrice + ' - tracking trough');
       return { action: 'tracking' };
     }
+    const floorAnchor = (t.salePrice != null && t.salePrice > 0) ? t.salePrice : t.entryFloor;
     if (currentPrice < t.troughLow) {
       t.troughLow = currentPrice;
       await db.execute('UPDATE pump_armed_rules SET trough_low=? WHERE symbol=? AND active=1', [currentPrice, symbol]);
-      if (t.entryFloor) {
-        const rebuyFloor = t.entryFloor * (1 - t.buybackFloorPct / 100);
+      if (floorAnchor) {
+        const rebuyFloor = floorAnchor * (1 - t.buybackFloorPct / 100);
         if (currentPrice < rebuyFloor) {
           console.log('[trough] ' + symbol + ' trough ' + currentPrice + ' below floor ' + rebuyFloor + ' - alert only');
           return { action: 'alert', trough: currentPrice, rebuyFloor };
@@ -3558,8 +3560,8 @@ async function updateTroughTracker(symbol, currentPrice) {
     }
     const bounceTarget = t.troughLow * (1 + t.bouncePct / 100);
     if (currentPrice >= bounceTarget) {
-      if (t.entryFloor) {
-        const rebuyFloor = t.entryFloor * (1 - t.buybackFloorPct / 100);
+      if (floorAnchor) {
+        const rebuyFloor = floorAnchor * (1 - t.buybackFloorPct / 100);
         if (t.troughLow < rebuyFloor) {
           console.log('[trough] ' + symbol + ' bounce confirmed but trough ' + t.troughLow + ' below floor - alert only');
           return { action: 'alert', trough: t.troughLow, rebuyFloor };
@@ -5210,12 +5212,16 @@ async function runFastScan() {
           ).catch(() => {});
         } else if (ttResult.action === 'alert') {
           console.log('[trough] ' + ttBase + ' FLOOR BREACH: trough ' + ttResult.trough + ' below rebuyFloor ' + ttResult.rebuyFloor);
-          await sendTelegram(
-            '<b>[#130 TROUGH FLOOR BREACH] ' + ttBase + '</b>\n\n' +
-            'Trough $' + ttResult.trough.toFixed(8) + ' below rebuy floor $' + ttResult.rebuyFloor.toFixed(8) + '.\n' +
-            'Auto-buy disabled. Manual decision needed.'
-          ).catch(() => {});
-          await clearTroughTracker(ttSymbol);
+          const lastAlert = analysisRateLimit.get('trough_floor_' + ttSymbol);
+          const ONE_HOUR = 60 * 60 * 1000;
+          if (!lastAlert || Date.now() - lastAlert > ONE_HOUR) {
+            analysisRateLimit.set('trough_floor_' + ttSymbol, Date.now());
+            await sendTelegram(
+              '<b>[#130 TROUGH FLOOR BREACH] ' + ttBase + '</b>\n\n' +
+              'Trough $' + ttResult.trough.toFixed(8) + ' below rebuy floor $' + ttResult.rebuyFloor.toFixed(8) + '.\n' +
+              'Auto-buy paused. Tracker kept alive for manual review or recovery.'
+            ).catch(() => {});
+          }
         }
       }
     }
@@ -15058,14 +15064,15 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
       arm_window_min: z.coerce.number().optional().describe('Window in minutes for the pump to count (default 60)'),
       rebuy_pct:      z.coerce.number().optional().describe('Retrace %% below sale price to place rebuy (default 8). e.g. 70 = buy back 70%% below the auto-sell price'),
       retrace_pct:    z.coerce.number().optional().describe('#130 %% giveback of the pump that ARMS trough-detect (default 50)'),
-      bounce_pct:     z.coerce.number().optional().describe('#130 %% bounce off the tracked trough LOW that FIRES the rebuy (default 8)'),
+      bounce_pct:        z.coerce.number().optional().describe('#130 %% bounce off the tracked trough LOW that FIRES the rebuy (default 8)'),
+      buyback_floor_pct: z.coerce.number().optional().describe('#130 %% below sale_price (or entry_floor) before auto-rebuy is blocked (default 5)'),
       rule_mode:        z.enum(['single','tiered']).optional().describe("#282 'single' (default, today's behaviour) or 'tiered' (laddered scale-out/scale-in; config only for now)"),
       sell_tiers:       z.array(z.array(z.coerce.number())).optional().describe('#282 [[retrace_pct, sell_pct], ...] ascending by retrace_pct; sell_pct is %% of the CURRENT position. Cumulative must be <= max_sell_pct'),
       buy_tiers:        z.array(z.array(z.coerce.number())).optional().describe('#282 [[drop_pct, buy_pct], ...] ascending by drop_pct; buy_pct is %% of REMAINING reserved cash'),
       tier_cooldown_min: z.coerce.number().optional().describe('#282 minutes between intra-cycle tier fills (default 15). Global cooldown_minutes still governs re-arming'),
       min_tier_usd:     z.coerce.number().optional().describe('#282 dust guard — skip and mark-filled any tier below this USD notional (default 2.0)'),
     },
-    async ({ symbol, arm_pump_pct, trail_pct, sell_pct, entry_floor, arm_window_min, rebuy_pct, retrace_pct, bounce_pct, rule_mode, sell_tiers, buy_tiers, tier_cooldown_min, min_tier_usd }) => {
+    async ({ symbol, arm_pump_pct, trail_pct, sell_pct, entry_floor, arm_window_min, rebuy_pct, retrace_pct, bounce_pct, buyback_floor_pct, rule_mode, sell_tiers, buy_tiers, tier_cooldown_min, min_tier_usd }) => {
       try {
         const sym = symbol.includes('-USD') ? symbol.toUpperCase() : `${symbol.toUpperCase()}-USD`;
 
@@ -15111,12 +15118,12 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
         }
 
         await db.execute(
-          `INSERT INTO pump_armed_rules (symbol, arm_pump_pct, arm_window_min, trail_pct, sell_pct, entry_floor, rebuy_pct, retrace_pct, bounce_pct, rule_mode, sell_tiers, buy_tiers, tier_cooldown_min, min_tier_usd, armed, baseline_price, baseline_at, active)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, 'single'), ?, ?, COALESCE(?, 15), COALESCE(?, 2.0), 0, NULL, NULL, 1)
-           ON DUPLICATE KEY UPDATE arm_pump_pct=VALUES(arm_pump_pct), arm_window_min=VALUES(arm_window_min), trail_pct=VALUES(trail_pct), sell_pct=VALUES(sell_pct), entry_floor=VALUES(entry_floor), rebuy_pct=VALUES(rebuy_pct), retrace_pct=VALUES(retrace_pct), bounce_pct=VALUES(bounce_pct), rule_mode=COALESCE(?, rule_mode), sell_tiers=COALESCE(?, sell_tiers), buy_tiers=COALESCE(?, buy_tiers), tier_cooldown_min=COALESCE(?, tier_cooldown_min), min_tier_usd=COALESCE(?, min_tier_usd), armed=0, baseline_price=NULL, baseline_at=NULL, active=1, updated_at=CURRENT_TIMESTAMP`,
-          [sym, arm_pump_pct, arm_window_min || 60, trail_pct, sell_pct ?? 50, entry_floor ?? null, rebuy_pct ?? 8, retrace_pct ?? 50, bounce_pct ?? 8,
+          `INSERT INTO pump_armed_rules (symbol, arm_pump_pct, arm_window_min, trail_pct, sell_pct, entry_floor, rebuy_pct, retrace_pct, bounce_pct, buyback_floor_pct, rule_mode, sell_tiers, buy_tiers, tier_cooldown_min, min_tier_usd, armed, baseline_price, baseline_at, active)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, 'single'), ?, ?, COALESCE(?, 15), COALESCE(?, 2.0), 0, NULL, NULL, 1)
+           ON DUPLICATE KEY UPDATE arm_pump_pct=VALUES(arm_pump_pct), arm_window_min=VALUES(arm_window_min), trail_pct=VALUES(trail_pct), sell_pct=VALUES(sell_pct), entry_floor=VALUES(entry_floor), rebuy_pct=VALUES(rebuy_pct), retrace_pct=VALUES(retrace_pct), bounce_pct=VALUES(bounce_pct), buyback_floor_pct=COALESCE(?, buyback_floor_pct), rule_mode=COALESCE(?, rule_mode), sell_tiers=COALESCE(?, sell_tiers), buy_tiers=COALESCE(?, buy_tiers), tier_cooldown_min=COALESCE(?, tier_cooldown_min), min_tier_usd=COALESCE(?, min_tier_usd), armed=0, baseline_price=NULL, baseline_at=NULL, active=1, updated_at=CURRENT_TIMESTAMP`,
+          [sym, arm_pump_pct, arm_window_min || 60, trail_pct, sell_pct ?? 50, entry_floor ?? null, rebuy_pct ?? 8, retrace_pct ?? 50, bounce_pct ?? 8, buyback_floor_pct ?? 5,
            rule_mode ?? null, stJson, btJson, tier_cooldown_min ?? null, min_tier_usd ?? null,
-           rule_mode ?? null, stJson, btJson, tier_cooldown_min ?? null, min_tier_usd ?? null]
+           buyback_floor_pct ?? null, rule_mode ?? null, stJson, btJson, tier_cooldown_min ?? null, min_tier_usd ?? null]
         );
         await sendTelegram(
           `🎯 <b>PUMP-ARM RULE SET — ${sym.replace('-USD','')}</b>\n\n` +
@@ -15126,11 +15133,12 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
           `Sell %% (Stage 2): ${sell_pct ?? 50}%\n` +
           `Rebuy retrace: ${rebuy_pct ?? 8}%\n` +
           `Trough-arm retrace: ${retrace_pct ?? 50}%, bounce: ${bounce_pct ?? 8}%\n` +
+          `Buyback floor: ${buyback_floor_pct ?? 5}%\n` +
           `${tierInfo ? `Mode: TIERED — sell ${stJson}, buy ${btJson}\nCumulative sell ${tierInfo.cumulative_sell_pct}% (cap ${tierInfo.max_sell_pct}%)\n` : ''}` +
           `\n` +
           `⚠️ Stage 1 active — arms + alerts only, no auto-sell yet.` + conflictWarning
         ).catch(() => {});
-        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, symbol: sym, arm_pump_pct, trail_pct, arm_window_min: arm_window_min || 60, sell_pct: sell_pct ?? 50, entry_floor: entry_floor ?? null, rebuy_pct: rebuy_pct ?? 8, retrace_pct: retrace_pct ?? 50, bounce_pct: bounce_pct ?? 8, rule_mode: rule_mode ?? null, sell_tiers: stJson ? JSON.parse(stJson) : null, buy_tiers: btJson ? JSON.parse(btJson) : null, tier_cooldown_min: tier_cooldown_min ?? null, min_tier_usd: min_tier_usd ?? null, tier_validation: tierInfo, conflict_warning: conflictWarning || null, note: 'Stage 1 — arms trailing stop on pump, no auto-sell. #282 tier config is stored but NOT executed yet.' }) }] };
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, symbol: sym, arm_pump_pct, trail_pct, arm_window_min: arm_window_min || 60, sell_pct: sell_pct ?? 50, entry_floor: entry_floor ?? null, rebuy_pct: rebuy_pct ?? 8, retrace_pct: retrace_pct ?? 50, bounce_pct: bounce_pct ?? 8, buyback_floor_pct: buyback_floor_pct ?? 5, rule_mode: rule_mode ?? null, sell_tiers: stJson ? JSON.parse(stJson) : null, buy_tiers: btJson ? JSON.parse(btJson) : null, tier_cooldown_min: tier_cooldown_min ?? null, min_tier_usd: min_tier_usd ?? null, tier_validation: tierInfo, conflict_warning: conflictWarning || null, note: 'Stage 1 — arms trailing stop on pump, no auto-sell. #282 tier config is stored but NOT executed yet.' }) }] };
       } catch (e) {
         return { content: [{ type: 'text', text: JSON.stringify({ error: e.message }) }] };
       }
