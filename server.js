@@ -4895,7 +4895,11 @@ async function runLadderBacktest(opts) {
     sell_tiers: opts.sell_tiers, buy_tiers: opts.buy_tiers,
     tier_cooldown_min: opts.tier_cooldown_min != null ? Number(opts.tier_cooldown_min) : 15,
     min_tier_usd: opts.min_tier_usd != null ? Number(opts.min_tier_usd) : 2,
-    entry_floor: opts.entry_floor != null ? Number(opts.entry_floor) : null
+    entry_floor: opts.entry_floor != null ? Number(opts.entry_floor) : null,
+    // #315: 'rearm' re-arms at the sale price after each sell leg instead of going
+    // straight to the buy side. Omitted/'single' = unchanged behaviour.
+    rule_mode: opts.rule_mode === 'rearm' ? 'rearm' : 'single',
+    max_legs: opts.max_legs != null ? Number(opts.max_legs) : 5
   };
   const startQty = Number(opts.initial_qty), startUsd = opts.initial_usd != null ? Number(opts.initial_usd) : 0;
   const st = shadowNewState(startQty);
