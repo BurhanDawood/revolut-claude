@@ -4692,7 +4692,62 @@ function shadowEvalTier(state, bar, cfg, ctx) {
       state.last_fill_at = t; state.sale_price = trigPx; state.sells_filled++; state.gross_sold += qty;
     }
     if (state.sell_done.length === cfg.sell_tiers.length) {
-      state.phase = 'sold'; state.buy_done = []; state.reserved_left = state.reserved; state.trough = lo;
+      // #315 RE-ARMING LADDER. Default ('single'/'tiered') behaviour is unchanged: go
+      // straight to the buy side. In 'rearm' mode the position instead watches BOTH
+      // directions at once - up for another arm%% leg, down for the buy tiers - which
+      // is Bryan's design: "sell 50%, if it runs another 30%% sell 50%% again; if it
+      // retraces, buy back".
+      // NOTE ON WHY arm%% MATTERS MORE THAN THE STATE MACHINE: each leg needs arm%% from
+      // the NEW baseline, so leg n needs (1+arm)^n overall. At arm=30 two legs need
+      // +69%% and three need +120%%. COTI's strongest 4-day run in Sept was +61%% -- one
+      // leg - so at 30 this mode is INDISTINGUISHABLE from a one-shot sell. That is the
+      // question this backtest exists to answer before anything is built for real.
+      if (cfg.rule_mode === 'rearm' && state.legs_filled < (cfg.max_legs != null ? cfg.max_legs : 5)) {
+        state.legs_filled++;
+        state.phase = 'rearm_watch';
+        state.buy_done = []; state.reserved_left = state.reserved; state.trough = lo;
+        state.rearm_target = state.sale_price * (1 + Number(cfg.arm_pump_pct) / 100);
+      } else {
+        state.phase = 'sold'; state.buy_done = []; state.reserved_left = state.reserved; state.trough = lo;
+      }
+    }
+    return { state, fills };
+  }
+
+  // #315: watching BOTH directions. Whichever triggers first wins - a fresh leg up, or
+  // the buy tiers down. Deliberately NOT modelling "continuous trough buying"; PM flagged
+  // that as needing its own design pass, so this reuses the existing discrete buy tiers.
+  if (state.phase === 'rearm_watch') {
+    if (hi > state.peak) state.peak = hi;
+    if (lo < state.trough) state.trough = lo;
+    if (state.rearm_target && hi >= state.rearm_target) {
+      state.phase = 'armed';
+      state.baseline = state.sale_price; state.baseline_at = t; state.peak = hi;
+      state.sell_done = []; state.rearm_target = null;
+      return { state, fills };
+    }
+    const rbase = state.sale_price != null ? state.sale_price : px;
+    for (let j = 0; j < cfg.buy_tiers.length; j++) {
+      if (state.buy_done.indexOf(j) !== -1) continue;
+      const drop = Number(cfg.buy_tiers[j][0]), pct = Number(cfg.buy_tiers[j][1]);
+      const trigPx = rbase * (1 - drop / 100);
+      if (lo > trigPx) continue;
+      const obs = (trigPx - rbase) / rbase * 100;
+      if (!coolOk()) { rec('buy', j, drop, obs, trigPx, null, null, false, 'tier_cooldown'); break; }
+      const usd = state.reserved_left * (pct / 100);
+      if (usd < minUsd) { rec('buy', j, drop, obs, trigPx, null, usd, false, 'below_min_tier_usd'); state.buy_done.push(j); continue; }
+      if (ctx.availableUsd < usd) { rec('buy', j, drop, obs, trigPx, usd / trigPx, usd, false, 'insufficient_usd'); state.buy_done.push(j); continue; }
+      rec('buy', j, drop, obs, trigPx, usd / trigPx, usd, true, null);
+      state.qty += usd / trigPx; state.reserved_left -= usd; ctx.availableUsd -= usd;
+      state.buy_done.push(j); state.last_fill_at = t; state.buys_filled++;
+    }
+    if (state.buy_done.length === cfg.buy_tiers.length) {
+      if (state.buys_filled > 0) ctx.cyclesCompleted++; else ctx.cyclesAbandoned++;
+      ctx.lastOutcome = { cycle: state.cycle_id, sells_filled: state.sells_filled,
+        buys_filled: state.buys_filled, legs: state.legs_filled,
+        outcome: state.buys_filled > 0 ? 'completed' : 'abandoned_no_buy' };
+      state.phase = 'idle'; state.baseline = px; state.baseline_at = t; state.reserved = 0;
+      state.legs_filled = 0; state.rearm_target = null;
     }
     return { state, fills };
   }
