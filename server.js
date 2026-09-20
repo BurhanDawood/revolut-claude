@@ -4914,7 +4914,9 @@ async function runLadderBacktest(opts) {
     // #315: 'rearm' re-arms at the sale price after each sell leg instead of going
     // straight to the buy side. Omitted/'single' = unchanged behaviour.
     rule_mode: opts.rule_mode === 'rearm' ? 'rearm' : 'single',
-    max_legs: opts.max_legs != null ? Number(opts.max_legs) : 5
+    max_legs: opts.max_legs != null ? Number(opts.max_legs) : 5,
+    rearm_from: opts.rearm_from === 'peak' ? 'peak' : 'sale',
+    rearm_confirm_pct: opts.rearm_confirm_pct != null ? Number(opts.rearm_confirm_pct) : 1
   };
   const startQty = Number(opts.initial_qty), startUsd = opts.initial_usd != null ? Number(opts.initial_usd) : 0;
   const st = shadowNewState(startQty);
