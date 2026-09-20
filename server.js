@@ -5936,8 +5936,7 @@ async function fetchExchangeOrders(daysBack = 7, symbolFilter = null) {
           });
           got++;
         }
-        // No query means no cursor param can be sent, so one page is all we get for now.
-        cursor = null;
+        cursor = (page && page.metadata && page.metadata.next_cursor) || null;
         pages++;
       } while (cursor && pages < 20);
       out.windows.push({ from: new Date(start).toISOString().slice(0, 10), to: new Date(end).toISOString().slice(0, 10), orders: got, pages });
