@@ -4,19 +4,18 @@ on:
   workflow_dispatch:
     inputs:
       commit_message:
-        description: 'Commit Message (e.g., Fix #263 auto-sell execution price)'
+        description: 'Commit Message'
         required: true
         type: string
-      search_block:
-        description: 'SEARCH: The exact lines in server.js to replace'
+      search_base64:
+        description: 'SEARCH block (Base64 encoded)'
         required: true
         type: string
-      replace_block:
-        description: 'REPLACE: The approved new lines'
+      replace_base64:
+        description: 'REPLACE block (Base64 encoded)'
         required: true
         type: string
 
-# Grants the runner permission to push the fixed code back to main
 permissions:
   contents: write
 
@@ -27,24 +26,23 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-
       - name: Apply Patch to server.js
         env:
-          SEARCH_BLOCK: ${{ inputs.search_block }}
-          REPLACE_BLOCK: ${{ inputs.replace_block }}
+          SEARCH_B64: ${{ inputs.search_base64 }}
+          REPLACE_B64: ${{ inputs.replace_base64 }}
         run: |
           node -e "
             const fs = require('fs');
             const code = fs.readFileSync('server.js', 'utf8');
             
+            // Decode Base64 inputs
+            const searchStr = Buffer.from(process.env.SEARCH_B64, 'base64').toString('utf8');
+            const replaceStr = Buffer.from(process.env.REPLACE_B64, 'base64').toString('utf8');
+            
             // Normalize line endings to prevent Windows/Linux mismatch errors
             const safeCode = code.replace(/\r\n/g, '\n');
-            const safeSearch = process.env.SEARCH_BLOCK.replace(/\r\n/g, '\n');
-            const safeReplace = process.env.REPLACE_BLOCK.replace(/\r\n/g, '\n');
+            const safeSearch = searchStr.replace(/\r\n/g, '\n');
+            const safeReplace = replaceStr.replace(/\r\n/g, '\n');
             
             const occurrences = safeCode.split(safeSearch).length - 1;
             
