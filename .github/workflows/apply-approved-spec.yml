@@ -1,0 +1,83 @@
+name: Deploy Approved Spec
+
+on:
+  workflow_dispatch:
+    inputs:
+      ticket_id:
+        description: 'Ticket ID to deploy (e.g., Dev-263)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  deploy-spec:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Extract, Patch, and Verify
+        env:
+          TICKET_ID: ${{ inputs.ticket_id }}
+        run: |
+          node --input-type=module << 'EOF'
+          import fs from 'fs';
+          import path from 'path';
+          import { execSync } from 'child_process';
+
+          const ticketId = process.env.TICKET_ID;
+          const specPath = path.join('specs/gemini-proposals', `${ticketId}.md`);
+          
+          if (!fs.existsSync(specPath)) {
+            console.error(`❌ Spec file not found at ${specPath}`);
+            process.exit(1);
+          }
+
+          const specContent = fs.readFileSync(specPath, 'utf8');
+          
+          // Extract Base64 blocks using Regex
+          const searchMatch = specContent.match(/SEARCH_BASE64:\s*```text\s*([A-Za-z0-9+/=\s]+)\s*```/);
+          const replaceMatch = specContent.match(/REPLACE_BASE64:\s*```text\s*([A-Za-z0-9+/=\s]+)\s*```/);
+
+          if (!searchMatch || !replaceMatch) {
+            console.error('❌ Could not find cleanly formatted SEARCH_BASE64 and REPLACE_BASE64 blocks in the spec.');
+            process.exit(1);
+          }
+
+          const searchStr = Buffer.from(searchMatch[1].replace(/\s+/g, ''), 'base64').toString('utf8');
+          const replaceStr = Buffer.from(replaceMatch[1].replace(/\s+/g, ''), 'base64').toString('utf8');
+
+          let serverCode = fs.readFileSync('server.js', 'utf8');
+          
+          if (serverCode.split(searchStr).length - 1 !== 1) {
+            console.error('❌ Search block must match exactly ONCE in server.js to ensure safe patching.');
+            process.exit(1);
+          }
+
+          serverCode = serverCode.replace(searchStr, replaceStr);
+          fs.writeFileSync('server.js', serverCode);
+          console.log(`✅ Successfully patched server.js for ${ticketId}`);
+
+          try {
+            execSync('node --check server.js', { stdio: 'inherit' });
+            console.log('✅ Syntax verification passed.');
+          } catch (err) {
+            console.error('❌ Syntax verification failed. Aborting deploy.');
+            process.exit(1);
+          }
+          EOF
+
+      - name: Commit and Push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add server.js
+          git commit -m "Deploy Spec: ${{ inputs.ticket_id }}"
+          git push
