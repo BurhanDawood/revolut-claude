@@ -5856,17 +5856,23 @@ async function fetchExchangeOrders(daysBack = 7, symbolFilter = null) {
       const start = now - totalDays * DAY;
       let cursor = null, pages = 0, got = 0;
       do {
-        // NO QUERY STRING. The 19 Sep probe tested seven variants: the endpoint is ACCEPTED
-        // with no query and REJECTED with ANY query, whatever the encoding (ISO encoded, raw
-        // colons, epoch millis) and whatever we sign (path+query or bare path). Signing scope
-        // is therefore NOT the issue - the presence of a query string is. Auth, permissions
-        // and transport are all healthy: /balances returned 132 rows in the same run.
-        // So we take what the endpoint gives and filter in JS. Date filtering is applied
-        // below; a symbol filter likewise. Slower than server-side filtering, but it works,
-        // and Build 1 only needs to QUANTIFY drift, not to be efficient about it.
+        // SERVER-SIDE FILTERING RESTORED (#330). The 19 Sept conclusion that this endpoint
+        // "rejects any query string" was WRONG. The real fault was in our signing: the venue
+        // concatenates path + query with NO separator, so the '?' must be stripped from the
+        // signed message. Seven probe variants all failed because none of them varied the
+        // separator. With that fixed, query params work as documented.
+        // Per the docs: start_date/end_date are int64 epoch MILLISECONDS, max range 1 week,
+        // limit up to 1900, cursor-paginated.
+        const qs = new URLSearchParams({
+          start_date: String(start),
+          end_date: String(end),
+          limit: '1900'
+        });
+        if (symbolFilter) qs.set('symbols', String(symbolFilter).toUpperCase().replace('/', '-'));
+        if (cursor) qs.set('cursor', cursor);
         let page;
         try {
-          page = await revolutRequest('GET', '/orders/historical');
+          page = await revolutRequest('GET', '/orders/historical?' + qs.toString());
           // revolutRequest returns the parsed body whatever the status, so an API error
           // arrives as a normal object. Detect it rather than treating it as an empty page.
           if (page && page.message && !page.orders && !Array.isArray(page)) {
