@@ -2534,22 +2534,126 @@ function getCapitalSummary(portfolioValue) {
 
 async function updateInvestedCapital(newTotal, note) {
   const change = newTotal - totalInvestedCapital;
+  const safeNote = note ? String(note).substring(0, 200) : null; // invested_capital.note is VARCHAR(200)
   // Block suspicious single-cycle drops > $200 — real payments are rarely this large
   if (change < -200) {
     console.error(`[capital] SUSPICIOUS DROP BLOCKED: $${totalInvestedCapital.toFixed(2)} → $${newTotal.toFixed(2)} (-$${Math.abs(change).toFixed(2)}) | reason: ${note}`);
+    // #336: STORE the blocked change so a button can confirm exactly this one. Previously nothing
+    // was stored and 'confirm capital X' set capital to whatever number was typed.
+    let pendingId = null;
+    try {
+      await ensurePendingCapTable();
+      const [pins] = await db.execute(
+        'INSERT INTO pending_capital_changes (prev_total, delta, note) VALUES (?, ?, ?)',
+        [totalInvestedCapital, change, safeNote]
+      );
+      pendingId = pins && pins.insertId ? pins.insertId : null;
+    } catch (e) { console.error('[capital] could not store pending change:', e.message); }
+    const pendingKb = pendingId ? buildAlertKeyboard(String(pendingId), ['Confirm', 'Cancel'], 'cc') : undefined;
     await sendTelegram(
       `⚠️ <b>CAPITAL CHANGE BLOCKED</b>\n\n` +
       `Old: $${totalInvestedCapital.toFixed(2)}\n` +
       `New: $${newTotal.toFixed(2)}\n` +
       `Change: -$${Math.abs(change).toFixed(2)}\n` +
       `Reason: ${note || 'unknown'}\n\n` +
-      `Reply '<b>confirm capital ${newTotal.toFixed(2)}</b>' to approve\n` +
-      `Or '<b>skip capital</b>' to cancel`
+      (pendingId ? `Tap <b>Confirm</b> to apply it or <b>Cancel</b> to leave capital unchanged.\n` : '') +
+      `Or reply '<b>confirm capital ${newTotal.toFixed(2)}</b>' / '<b>skip capital</b>'`,
+      pendingKb
     ).catch(() => {});
     return; // Block the change — do not update DB or in-memory value
   }
+  // DATABASE FIRST, THEN MEMORY. The old order set memory first with no rollback, so a failed
+  // INSERT (21 Sept: 'Data too long for column note') returned an error yet had ALREADY moved
+  // capital in memory - a retry then moved it twice, and a restart would silently revert it.
+  await db.execute('INSERT INTO invested_capital (total_invested, note) VALUES (?, ?)', [newTotal, safeNote]);
   totalInvestedCapital = newTotal;
-  await db.execute('INSERT INTO invested_capital (total_invested, note) VALUES (?, ?)', [newTotal, note || null]);
+}
+
+// #336 pending_capital_changes - created lazily so no separate migration edit is needed.
+let _pendingCapTableReady = false;
+async function ensurePendingCapTable() {
+  if (_pendingCapTableReady) return;
+  await db.execute(`CREATE TABLE IF NOT EXISTS pending_capital_changes (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    prev_total DECIMAL(20,4),
+    delta DECIMAL(20,4),
+    note VARCHAR(200),
+    status VARCHAR(16) DEFAULT 'pending',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    resolved_at TIMESTAMP NULL
+  )`);
+  _pendingCapTableReady = true;
+}
+
+// #336 STATELESS MONEY BUTTONS. callback_data is a:<databaseId>:<choice>:<type>.
+// Unlike the #316 alert buttons these do NOT use alertContextBySymbol, which is in-memory and
+// wiped on every restart - that would make a payment unreversible after a deploy. They read the
+// database and CLAIM the row atomically (affectedRows === 1), so a double tap, a stale button, or a
+// tap after a restart can never act twice or act on the wrong row.
+//   np = 'Not a payment' / 'Not a withdrawal' (id = trading_journal row)
+//   cc = capital change Confirm (1) / Cancel (2) (id = pending_capital_changes row)
+async function handleMoneyButton(typeCode, idStr, choice, reply) {
+  const id = parseInt(idStr, 10);
+  if (!Number.isFinite(id) || id <= 0) { await reply('\u26a0\ufe0f That button has no valid reference.'); return; }
+
+  if (typeCode === 'np') {
+    const [rows] = await db.execute('SELECT * FROM trading_journal WHERE id = ?', [id]);
+    const row = rows && rows[0];
+    if (!row || row.action !== 'payment') { await reply('Already handled - that entry has already been reversed or changed.'); return; }
+    // CLAIM: only the tap that actually deletes the row proceeds. A second tap gets 0 rows.
+    const [del] = await db.execute("DELETE FROM trading_journal WHERE id = ? AND action = 'payment'", [id]);
+    if (!del || del.affectedRows !== 1) { await reply('Already handled.'); return; }
+    const kind = row.symbol === 'USD' ? 'withdrawal' : 'payment';
+    await db.execute('INSERT INTO archived_journal (original_id, row_json, linked_summary, archive_reason) VALUES (?, ?, ?, ?)',
+      [id, JSON.stringify(row), 'button', 'Button: not a ' + kind]).catch(e => console.error('[money-btn] archive failed:', e.message));
+    await db.execute('DELETE FROM coin_cash_flows WHERE journal_id = ?', [id]).catch(() => {});
+    const amt = parseFloat(row.quantity) || 0;
+    const before = totalInvestedCapital;
+    try {
+      await updateInvestedCapital(before + amt, 'Button reversal of j' + id + ': +$' + amt.toFixed(2));
+    } catch (e) {
+      await reply('\u26a0\ufe0f Entry j' + id + ' was removed but the capital update FAILED: ' + e.message + '. Capital is unchanged at $' + before.toFixed(2) + '. The entry is archived and can be restored.');
+      return;
+    }
+    await reply('\u2705 Reversed - not a ' + kind + ' ($' + amt.toFixed(2) + ').\nCapital: $' + before.toFixed(2) + ' \u2192 $' + totalInvestedCapital.toFixed(2));
+    return;
+  }
+
+  if (typeCode === 'cc') {
+    await ensurePendingCapTable();
+    if (choice === 2) {
+      const [up] = await db.execute("UPDATE pending_capital_changes SET status = 'cancelled', resolved_at = NOW() WHERE id = ? AND status = 'pending'", [id]);
+      if (!up || up.affectedRows !== 1) { await reply('Already handled.'); return; }
+      await reply('\u2705 Capital change cancelled. Capital unchanged at $' + totalInvestedCapital.toFixed(2) + '.');
+      return;
+    }
+    const [up] = await db.execute("UPDATE pending_capital_changes SET status = 'confirmed', resolved_at = NOW() WHERE id = ? AND status = 'pending'", [id]);
+    if (!up || up.affectedRows !== 1) { await reply('Already handled.'); return; }
+    const [prow] = await db.execute('SELECT delta, note FROM pending_capital_changes WHERE id = ?', [id]);
+    const delta = prow && prow[0] ? parseFloat(prow[0].delta) : NaN;
+    if (!Number.isFinite(delta)) {
+      await db.execute("UPDATE pending_capital_changes SET status = 'pending', resolved_at = NULL WHERE id = ?", [id]).catch(() => {});
+      await reply('\u26a0\ufe0f Could not read that change. Nothing was applied.');
+      return;
+    }
+    // Apply the stored DELTA to CURRENT capital - never the old absolute target. Other payments may
+    // have moved capital since the block, and writing a stale absolute figure would erase them.
+    // Confirm deliberately bypasses the guard: the owner is explicitly approving this change.
+    const before = totalInvestedCapital;
+    const target = before + delta;
+    try {
+      await db.execute('INSERT INTO invested_capital (total_invested, note) VALUES (?, ?)',
+        [target, ('Confirmed via button: ' + (prow[0].note || '')).substring(0, 200)]);
+      totalInvestedCapital = target;
+    } catch (e) {
+      await db.execute("UPDATE pending_capital_changes SET status = 'pending', resolved_at = NULL WHERE id = ?", [id]).catch(() => {});
+      await reply('\u26a0\ufe0f Could not apply: ' + e.message + '. Nothing changed - tap Confirm again.');
+      return;
+    }
+    await reply('\u2705 Capital change confirmed.\nCapital: $' + before.toFixed(2) + ' \u2192 $' + target.toFixed(2));
+    return;
+  }
+  await reply('\u26a0\ufe0f Unrecognised button.');
 }
 
 function fmtCapitalConfirm(cap, portfolioValue) {
