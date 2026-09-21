@@ -14075,6 +14075,22 @@ let rows;
         }
         else                                    newTotal = amount;
         await updateInvestedCapital(newTotal, note || `${capital_type}: $${amount}`);
+        // REPORT WHAT WAS STORED, NOT WHAT WAS REQUESTED. updateInvestedCapital
+        // silently RETURNS WITHOUT WRITING on any single drop over $200 and asks
+        // Bryan to confirm via Telegram. This handler used to report its own
+        // arithmetic (new_total: newTotal, ok: true) regardless - so a BLOCKED
+        // write came back as a success. On 21 Sept a $395.33 correction was
+        // reported as applied while the guard had blocked it. totalInvestedCapital
+        // only moves if the write actually happened, so compare against it.
+        const stored = totalInvestedCapital;
+        const applied = Math.abs(stored - newTotal) < 0.005;
+        if (!applied) {
+          return { content: [{ type: 'text', text: JSON.stringify({
+            ok: false, blocked: true, capital_type,
+            previous_total: previous, requested_total: newTotal, stored_total: stored,
+            reason: 'Change NOT applied. Drops over $200 are held by the capital guard pending Telegram confirmation. Reply "confirm capital ' + newTotal.toFixed(2) + '" in Telegram to approve, or "skip capital" to cancel.'
+          }) }] };
+        }
         const portfolioValue = await getCurrentPortfolioValue();
         const cap = getCapitalSummary(portfolioValue);
         return { content: [{ type: 'text', text: JSON.stringify({ ok: true, capital_type, previous_total: previous, new_total: newTotal, portfolio_value: portfolioValue.toFixed(2), pl_usd: cap.pnl.toFixed(2), pl_pct: cap.pnlPct.toFixed(2) }) }] };
