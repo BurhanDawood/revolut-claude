@@ -6159,9 +6159,18 @@ async function reconcileTransactions(daysBack = 30, dryRun = null) {
         const amtDiff = Math.abs(txAmt - jVal);
         const amtTolerance = Math.max(1.0, txAmt * 0.03);
         const jMs = j.created_at ? new Date(j.created_at).getTime() : 0;
-        const timeDiff = Math.abs(txMs - jMs);
+        // DIRECTIONAL, NOT SYMMETRIC. A genuine duplicate is the heuristic logging the SAME
+        // payment, which always happens on a scan cycle AFTER the transaction. A journal row
+        // created well BEFORE a transaction cannot be a record of it. The old Math.abs() let a
+        // post-cutover payment match an older row: on 21 Sept a Tesco card payment of 5.228 USDT
+        // (12:01) soft-matched backfill row 3354 ($5.27, created 00:27 - ELEVEN HOURS earlier) and
+        // would have been filed as a duplicate and NEVER WRITTEN, while the heuristic had ALSO
+        // missed it (masked by a same-window JTO->USD->USDT auto top-up that left USDT net +3.75).
+        // Both systems would have lost it. 30 min of slack before the tx allows for clock skew.
+        const earliestDup = txMs - 30 * 60 * 1000;
+        const latestDup = txMs + 48 * 60 * 60 * 1000;
 
-        if (amtDiff <= amtTolerance && timeDiff <= 48 * 60 * 60 * 1000) {
+        if (amtDiff <= amtTolerance && jMs >= earliestDup && jMs <= latestDup) {
           softMatch = j;
         }
       }
