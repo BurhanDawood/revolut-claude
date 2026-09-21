@@ -2209,6 +2209,20 @@ try {
   console.error('[config] Failed to seed usdt_sweep_config:', e.message);
 }
 
+// Seed reconciler cutover timestamp and write switch (Dev-334)
+try {
+  await db.execute(
+    `INSERT INTO system_config (config_key, config_value) VALUES ('reconciler_cutover_ms', ?) ON DUPLICATE KEY UPDATE config_key = config_key`,
+    [Date.now().toString()]
+  );
+  await db.execute(
+    `INSERT INTO system_config (config_key, config_value) VALUES ('reconciler_writes_enabled', 'false') ON DUPLICATE KEY UPDATE config_key = config_key`
+  );
+  console.log('[config] Reconciler cutover and write switch seeded');
+} catch (e) {
+  console.error('[config] Failed to seed reconciler cutover/write config:', e.message);
+}
+
 seedLegacyTranches().catch(e => console.error('[tranches] Startup seed failed:', e.message));
 
 // ── Auto-execute: enable in DB + startup status log ──────────────────────────
@@ -6035,10 +6049,17 @@ async function fetchTransactions(daysBack = 30) {
   return out;
 }
 
-async function reconcileTransactions(daysBack = 30, dryRun = true) {
-  if (!dryRun) {
-    throw new Error('Live execution not supported; dryRun must be true');
+async function reconcileTransactions(daysBack = 30, dryRun = null) {
+  const [cfgRows] = await db.execute(
+    "SELECT config_key, config_value FROM system_config WHERE config_key IN ('reconciler_writes_enabled', 'reconciler_cutover_ms')"
+  ).catch(() => [[]]);
+  let configWritesEnabled = false;
+  let cutoverMs = Date.now();
+  for (const row of cfgRows) {
+    if (row.config_key === 'reconciler_writes_enabled') configWritesEnabled = (row.config_value === 'true');
+    if (row.config_key === 'reconciler_cutover_ms') cutoverMs = parseInt(row.config_value, 10);
   }
+  const isDryRun = (dryRun === true) || !configWritesEnabled;
 
   const txResult = await fetchTransactions(daysBack);
   const truncated = !txResult.ok || (txResult.errors && txResult.errors.length > 0);
@@ -6047,16 +6068,32 @@ async function reconcileTransactions(daysBack = 30, dryRun = true) {
   const [journalRows] = await db.execute(
     `SELECT id, symbol, action, price, quantity, value_usd, reasoning, venue_tx_id, created_at
      FROM trading_journal
-     WHERE action IN ('payment', 'transfer')
-     AND created_at >= DATE_SUB(NOW(), INTERVAL ? DAY)`,
-    [windowDays]
+     WHERE action IN ('payment', 'transfer', 'deposit')
+     OR venue_tx_id IS NOT NULL`
   );
+
+  // Pre-fetch ticker map for GBP/EUR and crypto rate fallbacks
+  let tickerPriceMap = {};
+  try {
+    const tickerResponse = await revolutRequest('GET', '/tickers');
+    const tickerList = Array.isArray(tickerResponse) ? tickerResponse : (tickerResponse?.data || []);
+    for (const t of tickerList) {
+      if (t.symbol) {
+        const p = parseFloat(t.last_price || t.mid || t.ask || t.bid);
+        if (p) {
+          tickerPriceMap[t.symbol] = p;
+          tickerPriceMap[t.symbol.replace('/', '-')] = p;
+        }
+      }
+    }
+  } catch (e) { /* ignore */ }
 
   const alreadyReconciled = [];
   const possibleDuplicate = [];
   const wouldLog = [];
   const receives = [];
   const needsPrice = [];
+  const writtenRows = [];
   let totalCapitalDecrement = 0;
 
   const rawTxs = txResult.transactions || [];
@@ -6069,9 +6106,17 @@ async function reconcileTransactions(daysBack = 30, dryRun = true) {
       continue;
     }
 
-    // DEFECT 1: ALLOWLIST TYPE FILTER. Only 'send' and 'receive' types are considered.
+    // Only 'send' and 'receive' types are considered
     const txType = (tx.type || '').toLowerCase();
     if (txType !== 'send' && txType !== 'receive') {
+      continue;
+    }
+
+    const txTime = tx.created_date || tx.processed_date || Date.now();
+    const txMs = typeof txTime === 'number' ? txTime : new Date(txTime).getTime();
+
+    // CUTOVER GUARD: Reconciler must ONLY ever process/write transactions created AFTER cutover
+    if (txMs <= cutoverMs) {
       continue;
     }
 
@@ -6081,9 +6126,8 @@ async function reconcileTransactions(daysBack = 30, dryRun = true) {
     if (txAmt <= 0) continue;
 
     const currency = ((tx.source && tx.source.currency) || (tx.destination && tx.destination.currency) || 'USD').toUpperCase();
-    const txTime = tx.created_date || tx.processed_date || Date.now();
-    const txMs = typeof txTime === 'number' ? txTime : new Date(txTime).getTime();
 
+    // Exact deduplication by venue_tx_id
     let exactMatch = null;
     let softMatch = null;
 
@@ -6132,17 +6176,44 @@ async function reconcileTransactions(daysBack = 30, dryRun = true) {
         candidate_created_at: softMatch.created_at
       });
     } else {
-      // DEFECT 2 & 3: USD Valuation and Classification
+      // STANDING RULES: send -> payment, receive -> deposit
+      const action = txType === 'send' ? 'payment' : 'deposit';
+
       const txDate = new Date(txMs);
       const hourMs = Math.floor(txDate.getTime() / 3600000) * 3600000;
       const hourBucketStr = new Date(hourMs).toISOString().slice(0, 19).replace('T', ' ');
 
       let priceUsed = null;
-      let hourBucket = null;
+      let hourBucket = hourBucketStr;
 
       if (currency === 'USD' || currency === 'USDT') {
         priceUsed = 1.0;
-        hourBucket = hourBucketStr;
+      } else if (currency === 'GBP' || currency === 'EUR') {
+        const usdtPair = `USDT-${currency}`;
+        const usdtSlashPair = `USDT/${currency}`;
+        const directUsdPair = `${currency}-USD`;
+        const directUsdSlash = `${currency}/USD`;
+        const directUsdtPair = `${currency}-USDT`;
+
+        if (tickerPriceMap[usdtPair] && tickerPriceMap[usdtPair] > 0) {
+          priceUsed = 1.0 / tickerPriceMap[usdtPair];
+        } else if (tickerPriceMap[usdtSlashPair] && tickerPriceMap[usdtSlashPair] > 0) {
+          priceUsed = 1.0 / tickerPriceMap[usdtSlashPair];
+        } else if (tickerPriceMap[directUsdPair] && tickerPriceMap[directUsdPair] > 0) {
+          priceUsed = tickerPriceMap[directUsdPair];
+        } else if (tickerPriceMap[directUsdSlash] && tickerPriceMap[directUsdSlash] > 0) {
+          priceUsed = tickerPriceMap[directUsdSlash];
+        } else if (tickerPriceMap[directUsdtPair] && tickerPriceMap[directUsdtPair] > 0) {
+          priceUsed = tickerPriceMap[directUsdtPair];
+        } else {
+          const [priceRows] = await db.execute(
+            `SELECT close_px FROM price_intraday_hourly WHERE symbol = ? AND hour_bucket = ? LIMIT 1`,
+            [directUsdPair, hourBucketStr]
+          );
+          if (priceRows.length > 0) {
+            priceUsed = parseFloat(priceRows[0].close_px);
+          }
+        }
       } else {
         const pairSymbol = `${currency}-USD`;
         const [priceRows] = await db.execute(
@@ -6153,95 +6224,168 @@ async function reconcileTransactions(daysBack = 30, dryRun = true) {
           priceUsed = parseFloat(priceRows[0].close_px);
           const hbVal = priceRows[0].hour_bucket;
           hourBucket = hbVal instanceof Date ? hbVal.toISOString().slice(0, 19).replace('T', ' ') : String(hbVal);
+        } else if (tickerPriceMap[pairSymbol] && tickerPriceMap[pairSymbol] > 0) {
+          priceUsed = tickerPriceMap[pairSymbol];
+        } else {
+          const liveP = await getCurrentPrice(pairSymbol).catch(() => null);
+          if (liveP && liveP > 0) priceUsed = liveP;
         }
       }
 
-      if (priceUsed === null) {
-        // Price not found — DO NOT fall back to raw amount
-        needsPrice.push({
-          tx_id: tx.id,
-          tx_type: tx.type,
-          token_amount: txAmt,
-          tx_amount: txAmt,
-          currency,
-          action: txType === 'send' ? 'payment' : 'review',
-          hour_bucket: hourBucketStr,
-          price_used: null,
-          value_usd: null,
-          invested_capital_decrement: null,
-          journal_row: {
-            symbol: currency,
-            action: txType === 'send' ? 'payment' : 'review',
-            price: null,
-            quantity: txAmt,
+      if (isDryRun) {
+        // DRY RUN MODE: report what would be done, write nothing, send nothing
+        if (priceUsed === null) {
+          needsPrice.push({
+            tx_id: tx.id,
+            tx_type: tx.type,
+            token_amount: txAmt,
+            tx_amount: txAmt,
+            currency,
+            action,
+            hour_bucket: hourBucketStr,
+            price_used: null,
             value_usd: null,
-            reasoning: `Revolut X transaction ${tx.id} (${tx.type})`,
-            venue_tx_id: tx.id,
-            created_at: tx.created_date || tx.processed_date || new Date().toISOString()
-          }
-        });
-      } else if (txType === 'receive') {
-        // DEFECT 3: RECEIVES. Classify as 'review', never 'payment', zero capital decrement.
-        const valueUsd = parseFloat((txAmt * priceUsed).toFixed(2));
-        receives.push({
-          tx_id: tx.id,
-          tx_type: tx.type,
-          token_amount: txAmt,
-          tx_amount: txAmt,
-          currency,
-          action: 'review',
-          price_used: priceUsed,
-          hour_bucket: hourBucket,
-          value_usd: valueUsd,
-          invested_capital_decrement: 0,
-          journal_row: {
-            symbol: currency,
-            action: 'review',
-            price: priceUsed,
-            quantity: txAmt,
+            invested_capital_change: null,
+            journal_row: {
+              symbol: currency,
+              action,
+              price: null,
+              quantity: txAmt,
+              value_usd: null,
+              reasoning: `Revolut X transaction ${tx.id} (${tx.type})`,
+              venue_tx_id: tx.id,
+              created_at: tx.created_date || tx.processed_date || new Date().toISOString()
+            }
+          });
+        } else {
+          const valueUsd = parseFloat((txAmt * priceUsed).toFixed(2));
+          const capChange = action === 'payment' ? -valueUsd : valueUsd;
+          if (action === 'payment') totalCapitalDecrement += valueUsd;
+
+          const item = {
+            tx_id: tx.id,
+            tx_type: tx.type,
+            token_amount: txAmt,
+            tx_amount: txAmt,
+            currency,
+            action,
+            price_used: priceUsed,
+            hour_bucket: hourBucket,
             value_usd: valueUsd,
-            reasoning: `Revolut X transaction ${tx.id} (${tx.type})`,
-            venue_tx_id: tx.id,
-            created_at: tx.created_date || tx.processed_date || new Date().toISOString()
-          }
-        });
+            invested_capital_change: capChange,
+            journal_row: {
+              symbol: currency,
+              action,
+              price: priceUsed,
+              quantity: txAmt,
+              value_usd: valueUsd,
+              reasoning: `Revolut X transaction ${tx.id} (${tx.type})`,
+              venue_tx_id: tx.id,
+              created_at: tx.created_date || tx.processed_date || new Date().toISOString()
+            }
+          };
+
+          if (action === 'deposit') receives.push(item);
+          else wouldLog.push(item);
+        }
       } else {
-        // txType === 'send': DEFECT 2: Use USD value for capital decrement
-        const valueUsd = parseFloat((txAmt * priceUsed).toFixed(2));
-        const decAmount = valueUsd;
-        totalCapitalDecrement += decAmount;
+        // WRITE MODE: perform actual writes, update capital, send alert with #316 buttons
+        if (priceUsed !== null) {
+          const valueUsd = parseFloat((txAmt * priceUsed).toFixed(2));
+          const capBefore = totalInvestedCapital;
+          const note = `Reconciler ${action}: tx ${tx.id} ($${valueUsd.toFixed(2)})`;
 
-        const journalRow = {
-          symbol: currency,
-          action: 'payment',
-          price: priceUsed,
-          quantity: txAmt,
-          value_usd: valueUsd,
-          reasoning: `Revolut X transaction ${tx.id} (${tx.type})`,
-          venue_tx_id: tx.id,
-          created_at: tx.created_date || tx.processed_date || new Date().toISOString()
-        };
+          if (action === 'payment') {
+            await updateInvestedCapital(totalInvestedCapital - valueUsd, note);
+          } else if (action === 'deposit') {
+            await updateInvestedCapital(totalInvestedCapital + valueUsd, note);
+          }
 
-        wouldLog.push({
-          tx_id: tx.id,
-          tx_type: tx.type,
-          token_amount: txAmt,
-          tx_amount: txAmt,
-          currency,
-          action: 'payment',
-          price_used: priceUsed,
-          hour_bucket: hourBucket,
-          value_usd: valueUsd,
-          journal_row: journalRow,
-          invested_capital_decrement: decAmount
-        });
+          const capitalBlocked = (totalInvestedCapital === capBefore);
+          let reasoningStr = `Revolut X transaction ${tx.id} (${tx.type})`;
+          if (capitalBlocked) reasoningStr += ' [pending_capital_confirmation]';
+
+          const [ins] = await db.execute(
+            `INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source, venue_tx_id)
+             VALUES (?, ?, ?, ?, ?, ?, 'neutral', 'reconciler', ?)`,
+            [currency, action, priceUsed, txAmt, valueUsd, reasoningStr, tx.id]
+          );
+          const journalId = ins.insertId;
+
+          const actionHeader = action === 'payment' ? '💳 <b>RECONCILER PAYMENT' : '📥 <b>RECONCILER DEPOSIT';
+          const capNote = capitalBlocked ? '\n⚠️ Capital drop > $200 BLOCKED (pending confirmation)\n' : '';
+          const priceDisplay = (currency !== 'USD' && currency !== 'USDT') ? ` @ $${priceUsed.toFixed(4)}` : '';
+          const alertMsg = `${actionHeader} — ${currency}</b>\n\n` +
+            `Amount: ${txAmt} ${currency}${priceDisplay}\n` +
+            `Value: $${valueUsd.toFixed(2)}\n` +
+            `Transaction ID: ${tx.id}\n` +
+            capNote +
+            `\nChoose an action:`;
+
+          const keyboard = buildAlertKeyboard(currency, ['Correct', 'Internal transfer', 'Skip'], 'rc');
+          await sendTelegram(alertMsg, keyboard);
+
+          alertContextBySymbol.set(currency.toLowerCase(), {
+            symbol: `${currency}-USD`,
+            coinBase: currency,
+            alertType: 'reconciler',
+            journalId,
+            txId: tx.id,
+            action,
+            valueUsd,
+            priceUsed,
+            capitalBlocked,
+            timestamp: Date.now()
+          });
+          lastAlertCoin = currency.toLowerCase();
+
+          writtenRows.push({ journal_id: journalId, tx_id: tx.id, currency, action, value_usd: valueUsd, capital_blocked: capitalBlocked });
+        } else {
+          // Rate unknown — insert journal row with no capital change, alert user
+          const reasoningStr = `Revolut X transaction ${tx.id} (${tx.type}) [no_capital_change: unknown price]`;
+          const [ins] = await db.execute(
+            `INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source, venue_tx_id)
+             VALUES (?, ?, NULL, ?, NULL, ?, 'neutral', 'reconciler', ?)`,
+            [currency, action, txAmt, reasoningStr, tx.id]
+          );
+          const journalId = ins.insertId;
+
+          const actionHeader = action === 'payment' ? '💳 <b>RECONCILER PAYMENT' : '📥 <b>RECONCILER DEPOSIT';
+          const alertMsg = `${actionHeader} — ${currency}</b>\n\n` +
+            `Amount: ${txAmt} ${currency}\n` +
+            `Value: UNKNOWN\n` +
+            `Transaction ID: ${tx.id}\n\n` +
+            `⚠️ Exchange rate unknown — NO capital change made. Needs manual entry.\n\n` +
+            `Choose an action:`;
+
+          const keyboard = buildAlertKeyboard(currency, ['Correct', 'Internal transfer', 'Skip'], 'rc');
+          await sendTelegram(alertMsg, keyboard);
+
+          alertContextBySymbol.set(currency.toLowerCase(), {
+            symbol: `${currency}-USD`,
+            coinBase: currency,
+            alertType: 'reconciler',
+            journalId,
+            txId: tx.id,
+            action,
+            valueUsd: null,
+            priceUsed: null,
+            capitalBlocked: false,
+            timestamp: Date.now()
+          });
+          lastAlertCoin = currency.toLowerCase();
+
+          writtenRows.push({ journal_id: journalId, tx_id: tx.id, currency, action, value_usd: null, unknown_price: true });
+        }
       }
     }
   }
 
   return {
     ok: true,
-    dryRun: true,
+    dryRun: isDryRun,
+    reconciler_writes_enabled: configWritesEnabled,
+    cutoverMs,
     daysBack,
     truncated,
     already_reconciled: alreadyReconciled,
@@ -6249,6 +6393,7 @@ async function reconcileTransactions(daysBack = 30, dryRun = true) {
     would_log: wouldLog,
     receives,
     needs_price: needsPrice,
+    written_rows: writtenRows,
     summary: {
       total_transactions: rawTxs.length,
       already_reconciled_count: alreadyReconciled.length,
@@ -6256,6 +6401,7 @@ async function reconcileTransactions(daysBack = 30, dryRun = true) {
       would_log_count: wouldLog.length,
       receives_count: receives.length,
       needs_price_count: needsPrice.length,
+      written_count: writtenRows.length,
       total_capital_decrement: parseFloat(totalCapitalDecrement.toFixed(2))
     }
   };
@@ -13877,7 +14023,7 @@ let rows;
       if (fetch.includes('reconcile_transactions')) {
         try {
           const days = Math.min(parseInt(limit) || 30, 370);
-          result.reconcile_transactions = await reconcileTransactions(days, true);
+          result.reconcile_transactions = await reconcileTransactions(days);
         } catch (e) { result.reconcile_transactions = { error: e.message }; }
       }
 
@@ -16602,6 +16748,82 @@ app.post('/api/kraken/trade', async (req, res) => {
 async function processAlertChoice(ctx, choice, sendReply) {
   const { symbol, coinBase, alertType } = ctx;
 
+  // ── Reconciler write alert responses (Dev-334) ──────────────────────────────
+  if (alertType === 'reconciler') {
+    const { journalId, txId, action: origAction, valueUsd } = ctx;
+    if (choice === 1) {
+      // 'Correct': no-op, acknowledges
+      await sendReply(`✅ <b>Reconciler ${origAction} confirmed for ${coinBase} (tx ${txId}).</b>`);
+      return;
+    } else if (choice === 2) {
+      // 'Internal transfer': change action to 'transfer' & reverse capital change
+      const [jrows] = await db.execute('SELECT * FROM trading_journal WHERE id = ?', [journalId]);
+      if (!jrows.length || jrows[0].action === 'transfer') {
+        await sendReply(`ℹ️ ${coinBase} transaction ${txId} is already marked as transfer.`);
+        return;
+      }
+      const vrow = jrows[0];
+      const curAction = vrow.action;
+      const curVal = vrow.value_usd !== null ? parseFloat(vrow.value_usd) : null;
+      const isPendingCap = (vrow.reasoning || '').includes('pending_capital_confirmation') || (vrow.reasoning || '').includes('no_capital_change');
+
+      await db.execute(
+        "UPDATE trading_journal SET action = 'transfer', reasoning = CONCAT(COALESCE(reasoning,''), ' [corrected_to_transfer]') WHERE id = ?",
+        [journalId]
+      );
+
+      if (curVal !== null && curVal > 0 && !isPendingCap) {
+        if (curAction === 'payment') {
+          const newCap = totalInvestedCapital + curVal;
+          await updateInvestedCapital(newCap, `Reconciler correction: reversed payment for tx ${txId}`);
+        } else if (curAction === 'deposit') {
+          const newCap = totalInvestedCapital - curVal;
+          await updateInvestedCapital(newCap, `Reconciler correction: reversed deposit for tx ${txId}`);
+        }
+      }
+      await sendReply(`🔄 <b>${coinBase} transaction ${txId} changed to internal transfer.</b>\nCapital change reversed.`);
+      return;
+    } else if (choice === 3) {
+      // 'Skip': reverse capital change & void journal row
+      const [jrows] = await db.execute('SELECT * FROM trading_journal WHERE id = ?', [journalId]);
+      if (!jrows.length) {
+        await sendReply(`ℹ️ ${coinBase} transaction ${txId} was already skipped/voided.`);
+        return;
+      }
+      const vrow = jrows[0];
+      const curAction = vrow.action;
+      const curVal = vrow.value_usd !== null ? parseFloat(vrow.value_usd) : null;
+      const isPendingCap = (vrow.reasoning || '').includes('pending_capital_confirmation') || (vrow.reasoning || '').includes('no_capital_change');
+
+      if (curVal !== null && curVal > 0 && !isPendingCap) {
+        if (curAction === 'payment') {
+          const newCap = totalInvestedCapital + curVal;
+          await updateInvestedCapital(newCap, `Reconciler correction: reversed payment for tx ${txId}`);
+        } else if (curAction === 'deposit') {
+          const newCap = totalInvestedCapital - curVal;
+          await updateInvestedCapital(newCap, `Reconciler correction: reversed deposit for tx ${txId}`);
+        }
+      }
+
+      const [ccf] = await db.execute('SELECT COUNT(*) AS n FROM coin_cash_flows WHERE journal_id = ?', [journalId]).catch(() => [[{ n: 0 }]]);
+      const [txl] = await db.execute('SELECT COUNT(*) AS n FROM tax_lots WHERE journal_id = ?', [journalId]).catch(() => [[{ n: 0 }]]);
+      const [rbl] = await db.execute('SELECT COUNT(*) AS n FROM rebalance_log WHERE out_journal_id = ? OR in_journal_id = ?', [journalId, journalId]).catch(() => [[{ n: 0 }]]);
+      const [tin] = await db.execute('SELECT COUNT(*) AS n FROM trade_intentions WHERE matched_journal_id = ?', [journalId]).catch(() => [[{ n: 0 }]]);
+      const ccfN = (ccf[0] && ccf[0].n) || 0, txlN = (txl[0] && txl[0].n) || 0, rblN = (rbl[0] && rbl[0].n) || 0, tinN = (tin[0] && tin[0].n) || 0;
+      const linkedSummary = 'coin_cash_flows:' + ccfN + '(cascaded) tax_lots:' + txlN + ' rebalance_log:' + rblN + ' trade_intentions:' + tinN;
+
+      await db.execute(
+        'INSERT INTO archived_journal (original_id, row_json, linked_summary, archive_reason) VALUES (?, ?, ?, ?)',
+        [journalId, JSON.stringify(vrow), linkedSummary, `Reconciler correction: skipped tx ${txId}`]
+      );
+      await db.execute('DELETE FROM coin_cash_flows WHERE journal_id = ?', [journalId]);
+      await db.execute('DELETE FROM trading_journal WHERE id = ?', [journalId]);
+
+      await sendReply(`🗑 <b>${coinBase} transaction ${txId} skipped and voided.</b>\nCapital change reversed.`);
+      return;
+    }
+  }
+
   // ── Claude analysis responses (trailing stop or fixed target) ─────────────
   if (alertType === 'claude_analysis_trailing' || alertType === 'claude_analysis_target') {
     const pending = pendingAnalysis.get(symbol);
@@ -16866,7 +17088,7 @@ app.post('/telegram-webhook', async (req, res) => {
       // 'ca' covers BOTH claude_analysis_trailing and claude_analysis_target: processAlertChoice
       // handles them in one branch, and choices 3/4 are type-aware inside it, so a tap is valid
       // against either. Matching on the prefix avoids refusing taps that are actually correct.
-      const CB_TYPES = { tr: 'trailing_stop', pu: 'pump', dr: 'drop', tu: 'fixed_target_up', td: 'fixed_target_down', ca: 'claude_analysis' };
+      const CB_TYPES = { tr: 'trailing_stop', pu: 'pump', dr: 'drop', tu: 'fixed_target_up', td: 'fixed_target_down', ca: 'claude_analysis', rc: 'reconciler' };
       const cbWantType = CB_TYPES[(cbMatch[3] || '').toLowerCase()] || null;
       const cbCtx = alertContextBySymbol.get(cbCoin);
       const cbTypeOk = !cbWantType || (cbWantType === 'claude_analysis'
