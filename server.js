@@ -2833,6 +2833,171 @@ async function handleTradeButton(idStr, choice, reply) {
   await reply('\u2705 ' + coin + ': ' + doneMsg);
 }
 
+// #338 TRADE APPROVAL BUTTONS. Unlike the money/trade buttons these stay IN-MEMORY on purpose: a pending
+// trade is lost on restart, so an Approve button can never execute a request made before a deploy at a
+// stale price - it simply reports "expired". Each request gets a time-based id, so an id issued before a
+// restart can never coincide with one issued after it.
+const TRADE_APPROVAL_TTL_MS = 12.5 * 60 * 1000;
+// Id = time (base36, 8 chars) + a per-process counter (4 chars). The counter makes ids unique even for
+// requests created in the same millisecond (a ladder queued in one call); the time part keeps an id from
+// before a restart from ever matching one issued after it. Random suffixes were tested and COLLIDED
+// (28 in 5,000) - a collision could let one trade's Approve button execute a different trade.
+let _tradeSeq = 0;
+function stampTrade(t) {
+  if (t && !t._tid) {
+    _tradeSeq = (_tradeSeq + 1) % 1679616;   // 36^4
+    t._tid = Date.now().toString(36) + _tradeSeq.toString(36).padStart(4, '0');
+  }
+  return t;
+}
+function tradeExpired(t) {
+  return !!(t && t.timestamp && (Date.now() - t.timestamp) > TRADE_APPROVAL_TTL_MS);
+}
+function tradeApprovalKeyboard(t) {
+  return t && t._tid ? buildAlertKeyboard(t._tid, ['Approve', 'Reject'], 'ta') : undefined;
+}
+
+// The execution code below is moved VERBATIM out of the typed 'approve trade' handler, so the typed
+// command and the Approve button place orders through literally the same code.
+async function executeApprovedKraken(t) {
+          try {
+            const result = await executeKrakenTrade(t.symbol, t.side, t.orderType, t.volume, t.price);
+            const coinBase = t.symbol.replace('-USD', '');
+            const krakenSource = t.source === 'claude_mcp' ? 'claude_mcp' : 'manual';
+            // Prefer explicit valueUSD; derive qty when volume was estimated from value_usd
+            const kQtyForJournal = parseFloat(t.volume) || (t.valueUSD && t.price ? t.valueUSD / t.price : 0);
+            const kValueUSD = t.valueUSD ? parseFloat(t.valueUSD) : (t.price * kQtyForJournal);
+            const kReasoning = 'Kraken trade approved via Telegram' + (t.qtyEstimated ? ' [qty estimated from value_usd]' : '');
+            const [kJrnIns] = await db.execute(
+              'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+              [coinBase, t.side, t.price, kQtyForJournal, kValueUSD, kReasoning, 'confident', krakenSource]
+            ).catch(e => { console.error('[kraken] Journal insert failed:', e.message); return [{}]; });
+            if (t.side === 'sell' && kJrnIns && kJrnIns.insertId) await recordRealisedPnl(kJrnIns.insertId, t.symbol, t.price, kQtyForJournal).catch(() => {});
+
+            // Tranche tracking
+            if (t.side.toLowerCase() === 'buy') {
+              await db.execute(
+                `INSERT INTO position_tranches (symbol, exchange, quantity, entry_price, entry_date, remaining_quantity, is_legacy, notes)
+                 VALUES (?, 'kraken', ?, ?, NOW(), ?, 0, ?)`,
+                [coinBase, kQtyForJournal, t.price, kQtyForJournal, `Buy via Claude approval — Kraken`]
+              ).catch(e => console.error('[tranches] Insert failed:', e.message));
+            } else if (t.side.toLowerCase() === 'sell') {
+              await reduceTranches(coinBase, 'kraken', kQtyForJournal)
+                .catch(e => console.error('[tranches] Reduce failed:', e.message));
+            }
+
+            await sendTelegram(`${t.side === 'sell' ? '✅' : '🟢'} MCP ${t.side.toUpperCase()} ${formatTradeQty(kQtyForJournal)} ${coinBase} @ ${formatPrice(t.price)} = $${kValueUSD?.toFixed(2)} 🦑 ✓${t.qtyEstimated ? ' (qty est)' : ''}`);
+          } catch (e) {
+            await sendTelegram(`❌ Kraken trade failed: ${e.message}`);
+          }
+        }
+
+async function executeApprovedRevolut(t) {
+          try {
+            const result = await placeRevolutOrder(t.symbol, t.side, t.orderType, t.baseSize, t.price, t.valueUsd);
+            // #47 B2a: a LIMIT order rests — skip the placement pipeline; pollPendingOrders() runs journal/tranche/entry/sweep on the confirmed FILL.
+            if (String(t.orderType).toLowerCase() === 'limit') {
+              await sendTelegram('📌 LIMIT ' + t.side.toUpperCase() + ' ' + formatTradeQty(t.baseSize) + ' ' + t.symbol.replace('-USD','') + ' resting @ ' + formatPrice(t.price) + ' — will log on fill.').catch(() => {});
+              return;
+            }
+            const coinBase = t.symbol.replace('-USD', '');
+            const executedPrice = t.price || await getCurrentPrice(t.symbol).catch(() => 0) || 0;
+            // Prefer explicit value_usd for value; derive quantity from it when baseSize was estimated
+            const qtyForJournal = parseFloat(t.baseSize) || (t.valueUsd && executedPrice ? t.valueUsd / executedPrice : 0);
+            const valueUSD = t.valueUsd ? parseFloat(t.valueUsd) : (executedPrice * qtyForJournal);
+
+            // Check for matching trade intention
+            const matchedIntention = await findMatchingIntention(t.symbol, t.side);
+            const baseReasoning = matchedIntention ? matchedIntention.reasoning : 'Revolut X trade approved via Telegram';
+            const reasoning = t.qtyEstimated ? baseReasoning + ' [qty estimated from value_usd]' : baseReasoning;
+
+            const revolutSource = t.source === 'claude_mcp' ? 'claude_mcp' : 'manual';
+            const [rJrnIns] = await db.execute(
+              'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+              [coinBase, t.side, executedPrice, qtyForJournal, valueUSD, reasoning, 'confident', revolutSource]
+            ).catch(e => { console.error('[revolut] Journal insert failed:', e.message); return [{}]; });
+            if (t.side === 'sell' && rJrnIns && rJrnIns.insertId) await recordRealisedPnl(rJrnIns.insertId, t.symbol, executedPrice, qtyForJournal).catch(() => {});
+
+            if (matchedIntention) {
+              await db.execute('UPDATE trade_intentions SET matched_at = NOW() WHERE id = ?', [matchedIntention.id]).catch(() => {});
+            }
+
+            // Update avg entry price on buy (respecting cost basis)
+            if (t.side.toLowerCase() === 'buy') {
+              const prevQty = previousBalances.get(t.symbol) || 0;
+              const existingEntry = entryPrices.get(t.symbol);
+              const isCycleBuyback = prevQty === 0 && existingEntry != null;
+              if (existingEntry && prevQty > 0) {
+                const newQty = prevQty + qtyForJournal;
+                const newAvgEntry = ((prevQty * existingEntry) + (qtyForJournal * executedPrice)) / newQty;
+                await updateEntryPrice(t.symbol, newAvgEntry, false);
+              } else if (isCycleBuyback) {
+                await updateEntryPrice(t.symbol, executedPrice, true);
+              } else if (!existingEntry) {
+                await updateEntryPrice(t.symbol, executedPrice, false);
+              }
+            }
+
+            // Tranche tracking
+            if (t.side.toLowerCase() === 'buy') {
+              await db.execute(
+                `INSERT INTO position_tranches (symbol, exchange, quantity, entry_price, entry_date, remaining_quantity, is_legacy, notes)
+                 VALUES (?, 'revolut', ?, ?, NOW(), ?, 0, ?)`,
+                [coinBase, qtyForJournal, executedPrice, qtyForJournal,
+                 `Buy via Claude approval — Order ${result?.client_order_id || 'unknown'}`]
+              ).catch(e => console.error('[tranches] Insert failed:', e.message));
+            } else if (t.side.toLowerCase() === 'sell') {
+              await reduceTranches(coinBase, 'revolut', qtyForJournal)
+                .catch(e => console.error('[tranches] Reduce failed:', e.message));
+            }
+
+            await sendTelegram(`${t.side === 'sell' ? '✅' : '🟢'} MCP ${t.side.toUpperCase()} ${formatTradeQty(qtyForJournal)} ${coinBase} @ ${formatPrice(executedPrice)} = $${valueUSD.toFixed(2)} 🔄 ✓${t.qtyEstimated ? ' (qty est)' : ''}`);
+
+            // USDT sweep — convert a % of sell proceeds to USDT for dry-powder reserves
+            if (t.side.toLowerCase() === 'sell') {
+              const proceeds = executedPrice * parseFloat(t.baseSize);
+              const _swEp12 = entryPrices.get(t.symbol) || 0;
+              const _swProfit12 = _swEp12 > 0 ? (executedPrice - _swEp12) * parseFloat(t.baseSize) : null; // #26 Bug1
+              await sweepToUSDT(proceeds, t.symbol, _swProfit12).catch(() => {});
+            }
+          } catch (e) {
+            console.error('[revolut] Trade execution failed:', e.message);
+            await sendTelegram(`❌ Revolut X trade failed: ${e.message}`);
+          }
+        }
+
+async function handleTradeApprovalButton(tid, choice, reply) {
+  // FIND AND CLAIM SYNCHRONOUSLY. Nothing below awaits until the trade has been removed from every
+  // pending structure, so two taps - or a tap and a typed approve - can never both obtain it.
+  let t = null, exchange = null;
+  if (pendingRevolutTrade && pendingRevolutTrade._tid === tid) {
+    t = pendingRevolutTrade; exchange = 'revolut'; pendingRevolutTrade = null;
+    if (pendingRevolutTradeReminder) { clearInterval(pendingRevolutTradeReminder); pendingRevolutTradeReminder = null; }
+  } else if (pendingKrakenTrade && pendingKrakenTrade._tid === tid) {
+    t = pendingKrakenTrade; exchange = 'kraken'; pendingKrakenTrade = null;
+    if (pendingKrakenTradeReminder) { clearInterval(pendingKrakenTradeReminder); pendingKrakenTradeReminder = null; }
+  } else {
+    const i = pendingMcpTradeQueue.findIndex(q => q && q._tid === tid);
+    if (i >= 0) {
+      const { _exchange, ...rest } = pendingMcpTradeQueue.splice(i, 1)[0];
+      t = rest; exchange = _exchange === 'kraken' ? 'kraken' : 'revolut';
+    }
+  }
+  if (!t) { await reply('Already handled or expired - nothing was executed.'); return; }
+  const coinBase = String(t.symbol || '').replace('-USD', '');
+  const label = String(t.side || '').toUpperCase() + ' ' + formatTradeQty(t.volume || t.baseSize) + ' ' + coinBase +
+    ' on ' + (exchange === 'kraken' ? 'Kraken' : 'Revolut X');
+  if (choice !== 1) { await reply('\u274c Rejected - ' + label + ' was NOT executed.'); return; }
+  if (tradeExpired(t)) {
+    await reply('\u23f0 Expired - ' + label + ' was requested ' + Math.round((Date.now() - t.timestamp) / 60000) +
+      ' min ago, so it was NOT executed. Request it again at the current price.');
+    return;
+  }
+  await reply('\u2705 Executing ' + label + '...');
+  if (exchange === 'kraken') await executeApprovedKraken(t);
+  else await executeApprovedRevolut(t);
+}
+
 function fmtCapitalConfirm(cap, portfolioValue) {
   const pnlSign = cap.pnl >= 0 ? '+' : '';
   const breakEvenStr = cap.pnl < 0
@@ -15975,13 +16140,15 @@ let rows;
       const estBaseSize = volume || (value_usd && livePrice ? value_usd / livePrice : 0);
       // #44: push to queue (not single-slot) to preserve laddered orders
       if (exchange === 'revolut') {
-        pendingMcpTradeQueue.push({ _exchange: 'revolut', symbol: sym, side, orderType: order_type, baseSize: estBaseSize, valueUsd: value_usd || null, price: livePrice, valueUSD: tradeValueUSD, timestamp: Date.now(), source: 'claude_mcp', qtyEstimated: !volume && !!value_usd });
+        pendingMcpTradeQueue.push(stampTrade({ _exchange: 'revolut', symbol: sym, side, orderType: order_type, baseSize: estBaseSize, valueUsd: value_usd || null, price: livePrice, valueUSD: tradeValueUSD, timestamp: Date.now(), source: 'claude_mcp', qtyEstimated: !volume && !!value_usd }));
       } else {
-        pendingMcpTradeQueue.push({ _exchange: 'kraken', symbol: sym, side, orderType: order_type, volume: estBaseSize, price: livePrice, valueUSD: tradeValueUSD, timestamp: Date.now(), source: 'claude_mcp', qtyEstimated: !volume && !!value_usd });
+        pendingMcpTradeQueue.push(stampTrade({ _exchange: 'kraken', symbol: sym, side, orderType: order_type, volume: estBaseSize, price: livePrice, valueUSD: tradeValueUSD, timestamp: Date.now(), source: 'claude_mcp', qtyEstimated: !volume && !!value_usd }));
       }
 
       const checklistMsg = await checkPreTrade(coinBase, side, tradeValueUSD, livePrice).catch(() => '');
-      await sendTelegram(checklistMsg + formatApprovalRequest(coinBase, side, volume || null, livePrice, tradeValueUSD, exchange));
+      // #338: Approve / Reject bound to THIS request - not to whatever happens to be next in the queue.
+      const queuedTrade = pendingMcpTradeQueue[pendingMcpTradeQueue.length - 1];
+      await sendTelegram(checklistMsg + formatApprovalRequest(coinBase, side, volume || null, livePrice, tradeValueUSD, exchange), tradeApprovalKeyboard(queuedTrade));
 
       const queueDepth = pendingMcpTradeQueue.length;
       const queueNote  = queueDepth > 1 ? ` (${queueDepth} trades queued — reply 'approve trade' for each in order)` : '';
@@ -17259,17 +17426,18 @@ async function processAlertChoice(ctx, choice, sendReply) {
       if (currentQty <= 0) { await sendReply(`⚠️ No ${coinBase} balance found — nothing to sell`); return; }
       const sellQty = currentQty * 0.25;
       const valueUSD = sellQty * currentPrice;
-      pendingRevolutTrade = { symbol, side: 'sell', orderType: 'market', baseSize: sellQty, price: currentPrice, valueUSD, timestamp: Date.now(), source: 'claude_analysis' };
+      pendingRevolutTrade = stampTrade({ symbol, side: 'sell', orderType: 'market', baseSize: sellQty, price: currentPrice, valueUSD, timestamp: Date.now(), source: 'claude_analysis' });
       await db.execute(
         `INSERT INTO trade_intentions (symbol, action, reasoning, emotion, expires_at) VALUES (?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL 1 HOUR))`,
         [symbol, 'sell', `Claude analysis: SELL after trailing stop alert — ladder 25% out`, 'confident']
       ).catch(() => {});
-      await sendReply(
+      await sendTelegram(
         `🔔 <b>SELL REQUEST — ${coinBase}</b>\n\n` +
         `Selling 25% = ${sellQty.toFixed(4)} ${coinBase}\n` +
         `@ ~$${currentPrice.toFixed(4)} = ~$${valueUSD.toFixed(2)}\n\n` +
-        `👍 approve  👎 cancel\n` +
-        `Auto-cancels in 12.5 min if no response`
+        `Tap <b>Approve</b> or <b>Reject</b> (or reply 👍 / 👎)\n` +
+        `Auto-cancels in 12.5 min if no response`,
+        tradeApprovalKeyboard(pendingRevolutTrade)
       );
       setTimeout(() => startTradeApprovalReminder('revolut'), 2.5 * 60 * 1000);
 
@@ -17291,12 +17459,13 @@ async function processAlertChoice(ctx, choice, sendReply) {
         const currentQty = parseFloat(asset?.available || 0);
         const sellQty = currentQty * 0.25;
         const valueUSD = sellQty * currentPrice;
-        pendingRevolutTrade = { symbol, side: 'sell', orderType: 'market', baseSize: sellQty, price: currentPrice, valueUSD, timestamp: Date.now(), source: 'claude_analysis' };
-        await sendReply(
+        pendingRevolutTrade = stampTrade({ symbol, side: 'sell', orderType: 'market', baseSize: sellQty, price: currentPrice, valueUSD, timestamp: Date.now(), source: 'claude_analysis' });
+        await sendTelegram(
           `🔔 <b>LADDER SELL — ${coinBase}</b>\n\n` +
           `Selling 25% = ${sellQty.toFixed(4)} ${coinBase}\n` +
           `@ ~$${currentPrice.toFixed(4)} = ~$${valueUSD.toFixed(2)}\n\n` +
-          `👍 approve  👎 cancel`
+          `Tap <b>Approve</b> or <b>Reject</b> (or reply 👍 / 👎)`,
+          tradeApprovalKeyboard(pendingRevolutTrade)
         );
         setTimeout(() => startTradeApprovalReminder('revolut'), 2.5 * 60 * 1000);
       } else {
@@ -17314,18 +17483,19 @@ async function processAlertChoice(ctx, choice, sendReply) {
       if (availableUSD < 10) { await sendReply(`⚠️ Insufficient USD to buy ${coinBase}\nAvailable: $${availableUSD.toFixed(2)} (min $10)`); return; }
       const buyUSD = Math.min(availableUSD * 0.50, availableUSD - 5);
       const buyQty = buyUSD / currentPrice;
-      pendingRevolutTrade = { symbol, side: 'buy', orderType: 'market', baseSize: buyQty, price: currentPrice, valueUSD: buyUSD, timestamp: Date.now(), source: 'claude_analysis' };
+      pendingRevolutTrade = stampTrade({ symbol, side: 'buy', orderType: 'market', baseSize: buyQty, price: currentPrice, valueUSD: buyUSD, timestamp: Date.now(), source: 'claude_analysis' });
       await db.execute(
         `INSERT INTO trade_intentions (symbol, action, reasoning, emotion, expires_at) VALUES (?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL 1 HOUR))`,
         [symbol, 'buy', `Claude analysis: adding to ${coinBase} after trailing stop consolidation signal`, 'confident']
       ).catch(() => {});
-      await sendReply(
+      await sendTelegram(
         `🔔 <b>BUY REQUEST — ${coinBase}</b>\n\n` +
         `Buying $${buyUSD.toFixed(2)} worth = ${buyQty.toFixed(4)} ${coinBase}\n` +
         `@ ~$${currentPrice.toFixed(4)}\n` +
         `Available USD: $${availableUSD.toFixed(2)}\n\n` +
-        `👍 approve  👎 cancel\n` +
-        `Auto-cancels in 12.5 min if no response`
+        `Tap <b>Approve</b> or <b>Reject</b> (or reply 👍 / 👎)\n` +
+        `Auto-cancels in 12.5 min if no response`,
+        tradeApprovalKeyboard(pendingRevolutTrade)
       );
       setTimeout(() => startTradeApprovalReminder('revolut'), 2.5 * 60 * 1000);
 
@@ -17536,10 +17706,11 @@ app.post('/telegram-webhook', async (req, res) => {
       // They carry a database id and read the database, so they keep working after a restart and
       // can never act on the wrong row. Every other button path below is unchanged.
       const cbMoneyType = (cbMatch[3] || '').toLowerCase();
-      if (cbMoneyType === 'np' || cbMoneyType === 'cc' || cbMoneyType === 'td') {
+      if (cbMoneyType === 'np' || cbMoneyType === 'cc' || cbMoneyType === 'td' || cbMoneyType === 'ta') {
         await ackCb('Working...');
         try {
-          if (cbMoneyType === 'td') await handleTradeButton(cbCoin, cbChoice, cbReply);
+          if (cbMoneyType === 'ta') await handleTradeApprovalButton(cbCoin, cbChoice, cbReply);
+          else if (cbMoneyType === 'td') await handleTradeButton(cbCoin, cbChoice, cbReply);
           else await handleMoneyButton(cbMoneyType, cbCoin, cbChoice, cbReply);
         } catch (e) {
           console.error('[money-btn] ' + cbMoneyType + ' ' + cbCoin + ' failed:', e.message);
@@ -18469,16 +18640,17 @@ app.post('/telegram-webhook', async (req, res) => {
       pendingUndo.delete(sym);
       const coinBase = sym.replace('-USD', '');
       if (undo.action === 'sell') {
-        pendingRevolutTrade = {
+        pendingRevolutTrade = stampTrade({
           symbol: sym, side: 'buy', orderType: 'market',
           baseSize: undo.qty, price: undo.price,
           valueUSD: undo.qty * undo.price,
           timestamp: Date.now(), source: 'undo'
-        };
-        await sendReply(
+        });
+        await sendTelegram(
           `⏪ <b>UNDO — ${coinBase}</b>\n\n` +
           `Buying back ${undo.qty.toFixed(4)} ${coinBase}\n` +
-          `👍 confirm undo  👎 keep as is`
+          `Tap <b>Approve</b> to buy back, or <b>Reject</b> to keep as is (or reply 👍 / 👎)`,
+          tradeApprovalKeyboard(pendingRevolutTrade)
         );
       }
       return res.status(200).json({ ok: true });
@@ -18628,40 +18800,15 @@ app.post('/telegram-webhook', async (req, res) => {
         const t = pendingKrakenTrade;
         pendingKrakenTrade = null;
         if (pendingKrakenTradeReminder) { clearInterval(pendingKrakenTradeReminder); pendingKrakenTradeReminder = null; }
+        // #338: never execute a stale request. Slot trades already auto-cancel at 12.5 min, but QUEUED
+        // trades and UNDO buy-backs had no expiry at all and could execute hours later at an old price.
+        if (tradeExpired(t)) {
+          await sendReply('\u23f0 Expired - that Kraken request is ' + Math.round((Date.now() - t.timestamp) / 60000) + ' min old, so it was NOT executed. Request it again at the current price.');
+          return res.status(200).json({ ok: true });
+        }
         await sendReply(`⏳ Executing ${t.side.toUpperCase()} ${t.volume} ${t.symbol.replace('-USD','')} on Kraken…`);
         res.status(200).json({ ok: true });
-        (async () => {
-          try {
-            const result = await executeKrakenTrade(t.symbol, t.side, t.orderType, t.volume, t.price);
-            const coinBase = t.symbol.replace('-USD', '');
-            const krakenSource = t.source === 'claude_mcp' ? 'claude_mcp' : 'manual';
-            // Prefer explicit valueUSD; derive qty when volume was estimated from value_usd
-            const kQtyForJournal = parseFloat(t.volume) || (t.valueUSD && t.price ? t.valueUSD / t.price : 0);
-            const kValueUSD = t.valueUSD ? parseFloat(t.valueUSD) : (t.price * kQtyForJournal);
-            const kReasoning = 'Kraken trade approved via Telegram' + (t.qtyEstimated ? ' [qty estimated from value_usd]' : '');
-            const [kJrnIns] = await db.execute(
-              'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-              [coinBase, t.side, t.price, kQtyForJournal, kValueUSD, kReasoning, 'confident', krakenSource]
-            ).catch(e => { console.error('[kraken] Journal insert failed:', e.message); return [{}]; });
-            if (t.side === 'sell' && kJrnIns && kJrnIns.insertId) await recordRealisedPnl(kJrnIns.insertId, t.symbol, t.price, kQtyForJournal).catch(() => {});
-
-            // Tranche tracking
-            if (t.side.toLowerCase() === 'buy') {
-              await db.execute(
-                `INSERT INTO position_tranches (symbol, exchange, quantity, entry_price, entry_date, remaining_quantity, is_legacy, notes)
-                 VALUES (?, 'kraken', ?, ?, NOW(), ?, 0, ?)`,
-                [coinBase, kQtyForJournal, t.price, kQtyForJournal, `Buy via Claude approval — Kraken`]
-              ).catch(e => console.error('[tranches] Insert failed:', e.message));
-            } else if (t.side.toLowerCase() === 'sell') {
-              await reduceTranches(coinBase, 'kraken', kQtyForJournal)
-                .catch(e => console.error('[tranches] Reduce failed:', e.message));
-            }
-
-            await sendTelegram(`${t.side === 'sell' ? '✅' : '🟢'} MCP ${t.side.toUpperCase()} ${formatTradeQty(kQtyForJournal)} ${coinBase} @ ${formatPrice(t.price)} = $${kValueUSD?.toFixed(2)} 🦑 ✓${t.qtyEstimated ? ' (qty est)' : ''}`);
-          } catch (e) {
-            await sendTelegram(`❌ Kraken trade failed: ${e.message}`);
-          }
-        })();
+        executeApprovedKraken(t);   // #338: same code as before, now shared with the Approve button
         return;
       }
 
@@ -18669,81 +18816,15 @@ app.post('/telegram-webhook', async (req, res) => {
         const t = pendingRevolutTrade;
         pendingRevolutTrade = null;
         if (pendingRevolutTradeReminder) { clearInterval(pendingRevolutTradeReminder); pendingRevolutTradeReminder = null; }
+        // #338: never execute a stale request. Slot trades already auto-cancel at 12.5 min, but QUEUED
+        // trades and UNDO buy-backs had no expiry at all and could execute hours later at an old price.
+        if (tradeExpired(t)) {
+          await sendReply('\u23f0 Expired - that Revolut X request is ' + Math.round((Date.now() - t.timestamp) / 60000) + ' min old, so it was NOT executed. Request it again at the current price.');
+          return res.status(200).json({ ok: true });
+        }
         await sendReply(`⏳ Executing ${t.side.toUpperCase()} ${formatTradeQty(t.baseSize)} ${t.symbol.replace('-USD','')} on Revolut X…`);
         res.status(200).json({ ok: true });
-        (async () => {
-          try {
-            const result = await placeRevolutOrder(t.symbol, t.side, t.orderType, t.baseSize, t.price, t.valueUsd);
-            // #47 B2a: a LIMIT order rests — skip the placement pipeline; pollPendingOrders() runs journal/tranche/entry/sweep on the confirmed FILL.
-            if (String(t.orderType).toLowerCase() === 'limit') {
-              await sendTelegram('📌 LIMIT ' + t.side.toUpperCase() + ' ' + formatTradeQty(t.baseSize) + ' ' + t.symbol.replace('-USD','') + ' resting @ ' + formatPrice(t.price) + ' — will log on fill.').catch(() => {});
-              return;
-            }
-            const coinBase = t.symbol.replace('-USD', '');
-            const executedPrice = t.price || await getCurrentPrice(t.symbol).catch(() => 0) || 0;
-            // Prefer explicit value_usd for value; derive quantity from it when baseSize was estimated
-            const qtyForJournal = parseFloat(t.baseSize) || (t.valueUsd && executedPrice ? t.valueUsd / executedPrice : 0);
-            const valueUSD = t.valueUsd ? parseFloat(t.valueUsd) : (executedPrice * qtyForJournal);
-
-            // Check for matching trade intention
-            const matchedIntention = await findMatchingIntention(t.symbol, t.side);
-            const baseReasoning = matchedIntention ? matchedIntention.reasoning : 'Revolut X trade approved via Telegram';
-            const reasoning = t.qtyEstimated ? baseReasoning + ' [qty estimated from value_usd]' : baseReasoning;
-
-            const revolutSource = t.source === 'claude_mcp' ? 'claude_mcp' : 'manual';
-            const [rJrnIns] = await db.execute(
-              'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-              [coinBase, t.side, executedPrice, qtyForJournal, valueUSD, reasoning, 'confident', revolutSource]
-            ).catch(e => { console.error('[revolut] Journal insert failed:', e.message); return [{}]; });
-            if (t.side === 'sell' && rJrnIns && rJrnIns.insertId) await recordRealisedPnl(rJrnIns.insertId, t.symbol, executedPrice, qtyForJournal).catch(() => {});
-
-            if (matchedIntention) {
-              await db.execute('UPDATE trade_intentions SET matched_at = NOW() WHERE id = ?', [matchedIntention.id]).catch(() => {});
-            }
-
-            // Update avg entry price on buy (respecting cost basis)
-            if (t.side.toLowerCase() === 'buy') {
-              const prevQty = previousBalances.get(t.symbol) || 0;
-              const existingEntry = entryPrices.get(t.symbol);
-              const isCycleBuyback = prevQty === 0 && existingEntry != null;
-              if (existingEntry && prevQty > 0) {
-                const newQty = prevQty + qtyForJournal;
-                const newAvgEntry = ((prevQty * existingEntry) + (qtyForJournal * executedPrice)) / newQty;
-                await updateEntryPrice(t.symbol, newAvgEntry, false);
-              } else if (isCycleBuyback) {
-                await updateEntryPrice(t.symbol, executedPrice, true);
-              } else if (!existingEntry) {
-                await updateEntryPrice(t.symbol, executedPrice, false);
-              }
-            }
-
-            // Tranche tracking
-            if (t.side.toLowerCase() === 'buy') {
-              await db.execute(
-                `INSERT INTO position_tranches (symbol, exchange, quantity, entry_price, entry_date, remaining_quantity, is_legacy, notes)
-                 VALUES (?, 'revolut', ?, ?, NOW(), ?, 0, ?)`,
-                [coinBase, qtyForJournal, executedPrice, qtyForJournal,
-                 `Buy via Claude approval — Order ${result?.client_order_id || 'unknown'}`]
-              ).catch(e => console.error('[tranches] Insert failed:', e.message));
-            } else if (t.side.toLowerCase() === 'sell') {
-              await reduceTranches(coinBase, 'revolut', qtyForJournal)
-                .catch(e => console.error('[tranches] Reduce failed:', e.message));
-            }
-
-            await sendTelegram(`${t.side === 'sell' ? '✅' : '🟢'} MCP ${t.side.toUpperCase()} ${formatTradeQty(qtyForJournal)} ${coinBase} @ ${formatPrice(executedPrice)} = $${valueUSD.toFixed(2)} 🔄 ✓${t.qtyEstimated ? ' (qty est)' : ''}`);
-
-            // USDT sweep — convert a % of sell proceeds to USDT for dry-powder reserves
-            if (t.side.toLowerCase() === 'sell') {
-              const proceeds = executedPrice * parseFloat(t.baseSize);
-              const _swEp12 = entryPrices.get(t.symbol) || 0;
-              const _swProfit12 = _swEp12 > 0 ? (executedPrice - _swEp12) * parseFloat(t.baseSize) : null; // #26 Bug1
-              await sweepToUSDT(proceeds, t.symbol, _swProfit12).catch(() => {});
-            }
-          } catch (e) {
-            console.error('[revolut] Trade execution failed:', e.message);
-            await sendTelegram(`❌ Revolut X trade failed: ${e.message}`);
-          }
-        })();
+        executeApprovedRevolut(t);  // #338: same code as before, now shared with the Approve button
         return;
       }
 
