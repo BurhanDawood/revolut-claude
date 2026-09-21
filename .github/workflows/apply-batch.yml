@@ -1,0 +1,89 @@
+name: Apply Batch Patch
+
+# ONE paste per change set. The batch blob carries the commit message, every edit, and two
+# fingerprints: the exact server.js it was built for (base) and the exact result that was
+# reviewed and tested (after). Anything else stops the run with nothing written.
+
+on:
+  workflow_dispatch:
+    inputs:
+      batch:
+        description: 'Batch (one Base64 blob from Claude)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  batch-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Apply Batch to server.js
+        env:
+          BATCH_B64: ${{ inputs.batch }}
+        run: |
+          node --input-type=module << 'NODEEOF'
+          import fs from 'fs';
+          import crypto from 'crypto';
+          const sha = (s) => crypto.createHash('sha256').update(s).digest('hex');
+          const fail = (m) => { console.error('ABORT: ' + m); console.error('Nothing was written.'); process.exit(1); };
+
+          let batch;
+          try {
+            const raw = (process.env.BATCH_B64 || '').replace(/\s+/g, '');
+            batch = JSON.parse(Buffer.from(raw, 'base64').toString('utf8'));
+          } catch (e) {
+            fail('the batch could not be read - most likely a truncated paste. ' + e.message);
+          }
+          if (!batch || !Array.isArray(batch.edits) || batch.edits.length === 0) fail('the batch contains no edits.');
+          if (!batch.base || !batch.after || !batch.m) fail('the batch is missing its base, after or message.');
+
+          const original = fs.readFileSync('server.js', 'utf8').replace(/\r\n/g, '\n');
+          const baseSha = sha(original);
+
+          // BASE CHECK. server.js must be EXACTLY the version these edits were built for.
+          // Running the same batch twice, or batches out of order, therefore stops here.
+          if (!baseSha.startsWith(batch.base)) {
+            fail('server.js is at ' + baseSha.slice(0, 16) + ' but this batch was built for ' + batch.base + ' - already applied, or out of order.');
+          }
+
+          let code = original;
+          batch.edits.forEach((e, i) => {
+            const s = Buffer.from(e.s, 'base64').toString('utf8').replace(/\r\n/g, '\n');
+            const r = Buffer.from(e.r, 'base64').toString('utf8').replace(/\r\n/g, '\n');
+            const n = code.split(s).length - 1;
+            if (n !== 1) fail('edit ' + (i + 1) + ' of ' + batch.edits.length + ' matched ' + n + ' times - it must match exactly once.');
+            const before = code.length;
+            // Replacer FUNCTION, never a string: $' $& $` $$ are special in a replacement
+            // string and once spliced the rest of the file into server.js. See #328.
+            code = code.replace(s, () => r);
+            if (code.length - before !== r.length - s.length) fail('edit ' + (i + 1) + ' changed size unexpectedly - something expanded.');
+          });
+
+          // AFTER CHECK. The result must be byte-for-byte what Claude reviewed and tested.
+          const afterSha = sha(code);
+          if (!afterSha.startsWith(batch.after)) {
+            fail('the result would be ' + afterSha.slice(0, 16) + ' but the reviewed result is ' + batch.after + '.');
+          }
+
+          fs.writeFileSync('server.js', code);
+          const msg = String(batch.m).slice(0, 300) + '\n\n[batch: ' + batch.edits.length + ' edits, ' + baseSha.slice(0, 16) + ' -> ' + afterSha.slice(0, 16) + ']\n';
+          fs.writeFileSync('/tmp/commit_msg.txt', msg);
+          console.log('Applied ' + batch.edits.length + ' edits: ' + baseSha.slice(0, 16) + ' -> ' + afterSha.slice(0, 16));
+          NODEEOF
+
+      - name: Run Syntax Verification
+        run: node --check server.js
+
+      - name: Commit and Push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add server.js
+          git diff --cached --quiet && { echo "No change to commit."; exit 1; }
+          git commit -F /tmp/commit_msg.txt
+          git push
