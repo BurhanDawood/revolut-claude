@@ -16784,16 +16784,30 @@ async function processAlertChoice(ctx, choice, sendReply) {
         [journalId]
       );
 
+      // Report what capital ACTUALLY did. updateInvestedCapital silently returns without
+      // writing on any single drop over two hundred dollars (the capital guard), so reversing
+      // a large DEPOSIT - the common 'internal transfer' case, e.g. crypto in from Kraken -
+      // is HELD pending Telegram confirmation. The reply used to say 'Capital change
+      // reversed.' unconditionally, the same false-success bug fixed in update_capital.
+      let capNote = 'Capital change reversed.';
+      let capHeld = false;
       if (curVal !== null && curVal > 0 && !isPendingCap) {
-        if (curAction === 'payment') {
-          const newCap = totalInvestedCapital + curVal;
-          await updateInvestedCapital(newCap, `Reconciler correction: reversed payment for tx ${txId}`);
-        } else if (curAction === 'deposit') {
-          const newCap = totalInvestedCapital - curVal;
-          await updateInvestedCapital(newCap, `Reconciler correction: reversed deposit for tx ${txId}`);
+        const capTarget = curAction === 'payment' ? totalInvestedCapital + curVal
+                        : curAction === 'deposit' ? totalInvestedCapital - curVal : null;
+        if (capTarget !== null) {
+          await updateInvestedCapital(capTarget, `Reconciler correction: reversed ${curAction} for tx ${txId}`);
+          if (Math.abs(totalInvestedCapital - capTarget) >= 0.005) {
+            capHeld = true;
+            capNote = 'Capital reversal is HELD by the capital guard. Reply "confirm capital ' + capTarget.toFixed(2) + '" to apply it, or "skip capital" to leave capital unchanged.';
+          }
         }
+      } else if (isPendingCap) {
+        capNote = 'No capital change to reverse - the original write never moved capital.';
       }
-      await sendReply(`🔄 <b>${coinBase} transaction ${txId} changed to internal transfer.</b>\nCapital change reversed.`);
+      if (capHeld) {
+        await db.execute("UPDATE trading_journal SET reasoning = CONCAT(COALESCE(reasoning,''), ' [capital_reversal_pending]') WHERE id = ?", [journalId]);
+      }
+      await sendReply(`🔄 <b>${coinBase} transaction ${txId} changed to internal transfer.</b>\n${capNote}`);
       return;
     } else if (choice === 3) {
       // 'Skip': reverse capital change & void journal row
@@ -16807,14 +16821,25 @@ async function processAlertChoice(ctx, choice, sendReply) {
       const curVal = vrow.value_usd !== null ? parseFloat(vrow.value_usd) : null;
       const isPendingCap = (vrow.reasoning || '').includes('pending_capital_confirmation') || (vrow.reasoning || '').includes('no_capital_change');
 
+      // Report what capital ACTUALLY did. updateInvestedCapital silently returns without
+      // writing on any single drop over two hundred dollars (the capital guard), so reversing
+      // a large DEPOSIT - the common 'internal transfer' case, e.g. crypto in from Kraken -
+      // is HELD pending Telegram confirmation. The reply used to say 'Capital change
+      // reversed.' unconditionally, the same false-success bug fixed in update_capital.
+      let capNote = 'Capital change reversed.';
+      let capHeld = false;
       if (curVal !== null && curVal > 0 && !isPendingCap) {
-        if (curAction === 'payment') {
-          const newCap = totalInvestedCapital + curVal;
-          await updateInvestedCapital(newCap, `Reconciler correction: reversed payment for tx ${txId}`);
-        } else if (curAction === 'deposit') {
-          const newCap = totalInvestedCapital - curVal;
-          await updateInvestedCapital(newCap, `Reconciler correction: reversed deposit for tx ${txId}`);
+        const capTarget = curAction === 'payment' ? totalInvestedCapital + curVal
+                        : curAction === 'deposit' ? totalInvestedCapital - curVal : null;
+        if (capTarget !== null) {
+          await updateInvestedCapital(capTarget, `Reconciler correction: reversed ${curAction} for tx ${txId}`);
+          if (Math.abs(totalInvestedCapital - capTarget) >= 0.005) {
+            capHeld = true;
+            capNote = 'Capital reversal is HELD by the capital guard. Reply "confirm capital ' + capTarget.toFixed(2) + '" to apply it, or "skip capital" to leave capital unchanged.';
+          }
         }
+      } else if (isPendingCap) {
+        capNote = 'No capital change to reverse - the original write never moved capital.';
       }
 
       const [ccf] = await db.execute('SELECT COUNT(*) AS n FROM coin_cash_flows WHERE journal_id = ?', [journalId]).catch(() => [[{ n: 0 }]]);
@@ -16826,12 +16851,12 @@ async function processAlertChoice(ctx, choice, sendReply) {
 
       await db.execute(
         'INSERT INTO archived_journal (original_id, row_json, linked_summary, archive_reason) VALUES (?, ?, ?, ?)',
-        [journalId, JSON.stringify(vrow), linkedSummary, `Reconciler correction: skipped tx ${txId}`]
+        [journalId, JSON.stringify(vrow), linkedSummary, `Reconciler correction: skipped tx ${txId}` + (capHeld ? ' [capital_reversal_pending]' : '')]
       );
       await db.execute('DELETE FROM coin_cash_flows WHERE journal_id = ?', [journalId]);
       await db.execute('DELETE FROM trading_journal WHERE id = ?', [journalId]);
 
-      await sendReply(`🗑 <b>${coinBase} transaction ${txId} skipped and voided.</b>\nCapital change reversed.`);
+      await sendReply(`🗑 <b>${coinBase} transaction ${txId} skipped and voided.</b>\n${capNote}`);
       return;
     }
   }
