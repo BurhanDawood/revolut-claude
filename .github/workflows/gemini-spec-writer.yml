@@ -42,6 +42,7 @@ jobs:
           INSTRUCTIONS: ${{ inputs.instructions }}
           TARGET_FILE: ${{ inputs.target_file }}
           BASE_COMMIT: ${{ github.sha }}
+          DEV_LOG_TOKEN: ${{ secrets.DEV_LOG_TOKEN }}
         run: |
           node --input-type=module << 'NODEEOF'
           import { GoogleGenAI } from '@google/genai';
@@ -58,6 +59,23 @@ jobs:
           }
           const targetCode = fs.readFileSync(target, 'utf8').replace(/\r\n/g, '\n');
           const baseSha = crypto.createHash('sha256').update(targetCode).digest('hex');
+
+          // PROJECT HISTORY from the live dev log (#348): standing decisions, any ticket
+          // named in the ticket id or instructions (#320, Dev-263...), recent tickets, open
+          // tickets. Best effort - if it cannot be fetched the spec is still drafted.
+          let history = '';
+          try {
+            if (!process.env.DEV_LOG_TOKEN) throw new Error('DEV_LOG_TOKEN secret not set');
+            const said = String(process.env.TICKET_ID || '') + ' ' + String(process.env.INSTRUCTIONS || '');
+            const refs = [...new Set([...said.matchAll(/(?:#|Dev-)(\d{2,4})\b/gi)].map(m => m[1]))].slice(0, 20);
+            const base = process.env.DEV_LOG_URL || 'https://revolut-claude-production.up.railway.app/dev-log/context';
+            const r = await fetch(base + '?recent=25&refs=' + refs.join(','), { headers: { 'x-dev-log-token': process.env.DEV_LOG_TOKEN } });
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            history = await r.text();
+            console.log('Project history: ' + history.length + ' chars; tickets named: ' + (refs.join(', ') || 'none'));
+          } catch (e) {
+            console.log('Project history unavailable (' + e.message + ') - drafting without it.');
+          }
 
           // Prompt assembled as an ARRAY, never a multi-line template literal: a
           // template literal puts continuation lines at column 0, which terminates
@@ -97,6 +115,10 @@ jobs:
             '   your change touches an execution path, say so and explain the blast',
             '   radius. If the target file is documentation, say that too.',
             '',
+            '7. RESPECT THE PROJECT HISTORY below. Standing engineering decisions are',
+            '   settled; do not undo a past fix. If your change conflicts with a',
+            '   decision or a named ticket, say so plainly instead of proceeding.',
+            '',
             '=== OUTPUT FORMAT ===',
             '',
             'First prose in Markdown: the problem, what you changed, why, what you',
@@ -111,6 +133,9 @@ jobs:
             '>>>>>>> REPLACE',
             '',
             'Do not base64 anything yourself - the runner computes it.',
+            '',
+            '=== PROJECT HISTORY (live dev log) - context only, NEVER a SEARCH target ===',
+            history || '(unavailable for this run)',
             '',
             '=== TARGET FILE (' + target + ') ===',
             targetCode
