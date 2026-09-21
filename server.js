@@ -6068,8 +6068,13 @@ async function reconcileTransactions(daysBack = 30, dryRun = null) {
   const [journalRows] = await db.execute(
     `SELECT id, symbol, action, price, quantity, value_usd, reasoning, venue_tx_id, created_at
      FROM trading_journal
-     WHERE action IN ('payment', 'transfer', 'deposit')
-     OR venue_tx_id IS NOT NULL`
+     WHERE (action IN ('payment', 'transfer', 'deposit') OR venue_tx_id IS NOT NULL)
+       AND created_at >= FROM_UNIXTIME(?)`,
+    // BOUNDED. Only transactions AFTER the cutover are ever processed, and a soft match
+    // looks back at most 48h, so no journal row older than (cutover - 2 days) can ever
+    // match. The previous query had no WHERE on time at all and loaded the entire
+    // payment history on every call; windowDays was computed and then never used.
+    [Math.floor((cutoverMs - 2 * 86400000) / 1000)]
   );
 
   // Pre-fetch ticker map for GBP/EUR and crypto rate fallbacks
