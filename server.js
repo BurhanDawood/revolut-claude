@@ -16468,8 +16468,9 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
             results.push({ symbol: coinBase, type, status: 'ok', detail: 'logged as transfer, capital unchanged' });
 
           } else if (type === 'payment') {
-            await db.execute('UPDATE trading_journal SET action = ?, reasoning = ?, emotion = ?, notes = ? WHERE id = ?',
-              ['payment', 'Revolut payment made using this asset', 'neutral', 'excluded_from_stats', pending.journalId]);
+            // #337: no 'notes' column exists on trading_journal - see the typed-payment fix. This threw too.
+            await db.execute('UPDATE trading_journal SET action = ?, reasoning = ?, emotion = ? WHERE id = ?',
+              ['payment', 'Revolut payment made using this asset', 'neutral', pending.journalId]);
             try {
               const [jRows] = await db.execute('SELECT value_usd FROM trading_journal WHERE id = ?', [pending.journalId]);
               const payVal = jRows[0]?.value_usd ? Math.abs(parseFloat(jRows[0].value_usd)) : null;
@@ -18164,8 +18165,11 @@ app.post('/telegram-webhook', async (req, res) => {
         pendingTradeContext.delete(symbol);
 
         await db.execute(
-          'UPDATE trading_journal SET action = ?, reasoning = ?, emotion = ?, notes = ? WHERE id = ?',
-          ['payment', 'Revolut payment made using this asset', 'neutral', 'excluded_from_stats', pending.journalId]
+          // #337: there is NO 'notes' column on trading_journal - writing it threw 'Unknown column', AFTER the
+          // timer and pending state had already been cleared, so a typed 'payment' left the trade permanently
+          // unresolved and capital never adjusted. Payments are identified by action = 'payment'.
+          'UPDATE trading_journal SET action = ?, reasoning = ?, emotion = ? WHERE id = ?',
+          ['payment', 'Revolut payment made using this asset', 'neutral', pending.journalId]
         );
 
         // AUTO-DEDUCT FROM INVESTED CAPITAL
