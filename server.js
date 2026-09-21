@@ -6718,6 +6718,123 @@ async function fetchTransactions(daysBack = 30) {
   return out;
 }
 
+// #342 (#326 Build 2a) LEDGER REBUILD - DRY RUN. READ-ONLY: fetches, computes and reports. Writes nothing.
+// Differs from fetchTransactions deliberately: it RETRIES rate limits instead of silently skipping the rest of a
+// window, allows far more pages per window (a busy month exceeds 2,000 records), keeps each record WHOLE (so a
+// fee field, if the venue sends one, is not discarded), de-duplicates the boundary millisecond two windows share,
+// and reports any window it could not complete - a rebuild from partial history must never look complete.
+async function fetchAllTransactionsForRebuild(daysBack) {
+  const out = { rows: [], windows: [], incomplete: [], requests: 0, retries: 0 };
+  const DAY = 86400000, WIN = 30;                       // the venue caps a transactions range at 30 days
+  const now = Date.now();
+  const total = Math.max(1, Math.min(Number(daysBack) || 370, 1100));
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  for (let offset = 0; offset < total; offset += WIN) {
+    const end = now - offset * DAY;
+    const start = Math.max(now - total * DAY, end - WIN * DAY);
+    if (start >= end) break;
+    let cursor = null, pages = 0, got = 0, failed = null;
+    do {
+      const qs = new URLSearchParams({ start_date: String(start), end_date: String(end), limit: '100' });
+      if (cursor) qs.set('cursor', cursor);
+      let page = null, attempt = 0;
+      for (;;) {
+        out.requests++;
+        await sleep(120);                                  // pace requests; bursts are what trip the limit
+        try { page = await revolutRequest('GET', '/transactions?' + qs.toString()); }
+        catch (e) { page = { message: e.message }; }
+        const isErr = page && page.message && !page.data && !Array.isArray(page);
+        if (!isErr) break;
+        if (/rate limit/i.test(String(page.message)) && attempt < 6) { attempt++; out.retries++; await sleep(1500 * Math.pow(2, attempt - 1)); continue; }
+        failed = String(page.message); break;
+      }
+      if (failed) break;
+      const rowsAll = Array.isArray(page) ? page : (page && (page.data || page.items)) || [];
+      for (const t of rowsAll) {
+        const ts = Number(t.created_date || t.processed_date || 0);
+        if (ts && (ts < start || ts > end)) continue;
+        out.rows.push(t); got++;
+      }
+      const nc = page && page.metadata && page.metadata.next_cursor;
+      cursor = (nc && typeof nc === 'string' && nc.trim() !== '') ? nc : null;
+      pages++;
+    } while (cursor && pages < 200);
+    if (cursor && !failed) failed = 'page cap reached - more records exist in this window';
+    const w = { from: new Date(start).toISOString().slice(0, 10), to: new Date(end).toISOString().slice(0, 10), rows: got, pages };
+    out.windows.push(w);
+    if (failed) out.incomplete.push({ ...w, reason: failed });
+  }
+  const seen = new Set();
+  out.rows = out.rows.filter(t => { const k = t.id || JSON.stringify(t); if (seen.has(k)) return false; seen.add(k); return true; });
+  return out;
+}
+
+// Replays ONE coin's completed history in time order. Buys add quantity and dollar cost; sells, card spends and
+// transfers out remove quantity at the running average (average-cost method, so they never change the average);
+// receives, rewards and un-stakes add quantity with NO known cost and are reported separately.
+// Three averages are reported because it is not yet known which one the Revolut app shows:
+//   avg_cost           - running average-cost of what is held now
+//   avg_buys_since_zero - plain weighted average of every buy since the position was last empty
+//   avg_all_buys        - plain weighted average of every buy in the whole window
+function rebuildPositionFromTransactions(rows, coin) {
+  const C = String(coin).toUpperCase();
+  const USDLIKE = { USD: 1, USDT: 1, USDC: 1 };
+  const num = (x) => { const n = parseFloat(x); return Number.isFinite(n) ? n : 0; };
+  const ts = (t) => Number(t.processed_date || t.created_date || 0);
+  const evs = rows.filter(t => t && t.status === 'completed' &&
+      ((t.source && String(t.source.currency).toUpperCase() === C) || (t.destination && String(t.destination.currency).toUpperCase() === C)))
+    .sort((a, b) => ts(a) - ts(b) || Number(a.created_date || 0) - Number(b.created_date || 0));
+  let qty = 0, cost = 0, peak = 0, realised = 0;
+  let sinceZeroQty = 0, sinceZeroUsd = 0, allBuyQty = 0, allBuyUsd = 0;
+  const byType = {}, flags = { negative_balance: 0, first_negative_at: null, non_usd_trades: 0, no_cost_inflow_qty: 0 };
+  let nonUsdSinceZero = 0;   // a trade priced in another coin has no dollar cost: the average of THIS holding is then unknowable
+  for (const t of evs) {
+    const type = String(t.type || 'unknown');
+    const src = t.source || {}, dst = t.destination || {};
+    const inflow = dst && String(dst.currency).toUpperCase() === C;
+    const q = inflow ? num(dst.amount) : num(src.amount);
+    const other = inflow ? src : dst;
+    const otherCur = other && other.currency ? String(other.currency).toUpperCase() : null;
+    const usd = otherCur && USDLIKE[otherCur] ? num(other.amount) : null;
+    if (!byType[type]) byType[type] = { n: 0, qty: 0 };
+    byType[type].n++; byType[type].qty += inflow ? q : -q;
+    if (otherCur && !USDLIKE[otherCur] && (type === 'buy' || type === 'sell')) { flags.non_usd_trades++; if (type === 'buy') nonUsdSinceZero++; }
+    if (inflow) {
+      if (usd !== null && type === 'buy') {
+        qty += q; cost += usd; sinceZeroQty += q; sinceZeroUsd += usd; allBuyQty += q; allBuyUsd += usd;
+      } else {
+        qty += q; flags.no_cost_inflow_qty += q;           // receive / reward / un_stake: cost unknown
+      }
+    } else {
+      const avg = qty > 0 ? cost / qty : 0;
+      if (type === 'sell' && usd !== null) realised += usd - avg * q;
+      cost -= avg * Math.min(q, Math.max(qty, 0));
+      qty -= q;
+      if (qty < -Math.max(1e-8, peak * 1e-6)) {
+        flags.negative_balance++;
+        if (!flags.first_negative_at) flags.first_negative_at = new Date(ts(t)).toISOString();
+        qty = 0; cost = 0;                                  // history before the window is missing
+      }
+    }
+    if (qty > peak) peak = qty;
+    if (qty <= Math.max(1e-8, peak * 1e-6)) { qty = Math.max(qty, 0); cost = 0; sinceZeroQty = 0; sinceZeroUsd = 0; nonUsdSinceZero = 0; }
+  }
+  const r8 = (x) => Number(x.toFixed(8)), r6 = (x) => Number(x.toFixed(6));
+  for (const k of Object.keys(byType)) byType[k].qty = r8(byType[k].qty);
+  return {
+    coin: C, events: evs.length,
+    first_event: evs.length ? new Date(ts(evs[0])).toISOString() : null,
+    rebuilt_qty: r8(qty),
+    // NULL rather than wrong: a buy paid in another coin would otherwise count as zero-cost and drag the average down
+    avg_cost: qty > 0 && nonUsdSinceZero === 0 ? r6(cost / qty) : null,
+    avg_note: nonUsdSinceZero > 0 ? 'unknown - part of this holding was bought with another coin' : (flags.no_cost_inflow_qty > 0 ? 'includes units transferred in, counted at zero cost' : null),
+    avg_buys_since_zero: sinceZeroQty > 0 ? r6(sinceZeroUsd / sinceZeroQty) : null,
+    avg_all_buys: allBuyQty > 0 ? r6(allBuyUsd / allBuyQty) : null,
+    realised_pnl_usd: Number(realised.toFixed(2)),
+    by_type: byType, flags: { ...flags, no_cost_inflow_qty: r8(flags.no_cost_inflow_qty) }
+  };
+}
+
 async function reconcileTransactions(daysBack = 30, dryRun = null) {
   const [cfgRows] = await db.execute(
     "SELECT config_key, config_value FROM system_config WHERE config_key IN ('reconciler_writes_enabled', 'reconciler_cutover_ms')"
@@ -14068,7 +14185,7 @@ let rows;
   server.tool('get_trading_data',
     'Get trading journal entries, active alerts, trader context/profile, rebalancing history, and dev_bridge messages',
     {
-      include: zLoose(z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'dev_bridge', 'coin_strategy', 'reconciliation', 'ledger', 'tax_lots', 'catalysts', 'thesis', 'nudges', 'dev_health', 'dev_recommendations', 'volatility_baseline', 'shadow_fills', 'abnormal_events', 'strategy_catalogue', 'exchange_orders', 'transactions', 'reconcile_transactions', 'all']))).optional()
+      include: zLoose(z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'dev_bridge', 'coin_strategy', 'reconciliation', 'ledger', 'tax_lots', 'catalysts', 'thesis', 'nudges', 'dev_health', 'dev_recommendations', 'volatility_baseline', 'shadow_fills', 'abnormal_events', 'strategy_catalogue', 'exchange_orders', 'transactions', 'reconcile_transactions', 'ledger_rebuild', 'all']))).optional()
         .describe('What data to fetch — defaults to all. dev_bridge, coin_strategy and reconciliation are never included in all; request them explicitly'),
       symbol:           z.string().optional().describe('Filter journal by coin e.g. NEAR'),
       limit:            z.coerce.number().optional().describe('Max journal entries to return, default 10'),
@@ -14558,6 +14675,72 @@ let rows;
           if (!scRows.length && !tlRows.length) cat.note = 'catalogue empty -- the boot seeder runs 12s after start; check the [catalogue] log line';
         } catch (e) { cat.error = e.message; }
         result.strategy_catalogue = cat;
+      }
+
+      // ledger_rebuild (#342, #326 Build 2a) -- DRY RUN. READ-ONLY. Replays the venue's own transaction record to
+      // compute each coin's true quantity and average entry, and compares it with the actual balance and with what
+      // our ledger currently claims. Writes nothing. limit = days of history (default 370); symbol = one coin.
+      if (fetch.includes('ledger_rebuild')) {
+        const lr = { generated_at: new Date().toISOString(), read_only: true };
+        try {
+          const days = Math.min(parseInt(limit) || 370, 1100);
+          const tx = await fetchAllTransactionsForRebuild(days);
+          lr.days_requested = days;
+          lr.records_fetched = tx.rows.length; lr.requests = tx.requests; lr.rate_limit_retries = tx.retries;
+          lr.incomplete_windows = tx.incomplete;
+          lr.history_complete = tx.incomplete.length === 0;
+          const tsOf = (t) => Number(t.processed_date || t.created_date || 0);
+          const allTs = tx.rows.map(tsOf).filter(Boolean);
+          lr.earliest_record = allTs.length ? new Date(Math.min(...allTs)).toISOString() : null;
+          lr.windows_with_records = tx.windows.filter(w => w.rows > 0).length + ' of ' + tx.windows.length;
+          const counts = {};
+          for (const t of tx.rows) { const k = (t.type || '?') + ':' + (t.status || '?'); counts[k] = (counts[k] || 0) + 1; }
+          lr.counts = counts;
+          const samples = {};
+          for (const t of tx.rows) { if (t.status === 'completed' && !samples[t.type]) samples[t.type] = JSON.stringify(t).substring(0, 700); }
+          lr.raw_samples = samples;
+          const base = (x) => String(x || '').toUpperCase().replace('/', '-').replace(/-(USD|USDT|USDC|EUR|GBP)$/, '');
+          const held = {};
+          try {
+            const bal = await revolutRequest('GET', '/balances');
+            const rows = Array.isArray(bal) ? bal : (bal && (bal.data || bal.balances)) || [];
+            for (const b of rows) { const c = base(b.currency || b.symbol); const q = Number(b.balance != null ? b.balance : (b.available != null ? b.available : 0)); if (c) held[c] = (held[c] || 0) + q; }
+          } catch (be) { lr.balance_error = be.message; }
+          const tr = {};
+          try {
+            const [rows] = await db.execute('SELECT symbol, SUM(remaining_quantity) AS q, SUM(remaining_quantity * entry_price) AS c FROM position_tranches WHERE remaining_quantity > 0 GROUP BY symbol');
+            for (const r of rows) tr[base(r.symbol)] = { q: Number(r.q), avg: Number(r.q) > 0 ? Number(r.c) / Number(r.q) : null };
+          } catch (te) { lr.tranche_error = te.message; }
+          const pendingOut = {};
+          for (const t of tx.rows) if (t.status === 'pending' && t.source && t.source.currency) { const c = String(t.source.currency).toUpperCase(); pendingOut[c] = (pendingOut[c] || 0) + (parseFloat(t.source.amount) || 0); }
+          const SKIP = { USD: 1, USDT: 1, USDC: 1, EUR: 1, GBP: 1 };
+          let coins;
+          if (symbol) coins = [base(symbol)];
+          else { const s = new Set(); for (const t of tx.rows) for (const side of [t.source, t.destination]) if (side && side.currency && !SKIP[String(side.currency).toUpperCase()]) s.add(String(side.currency).toUpperCase()); coins = [...s]; }
+          const results = [];
+          for (const c of coins) {
+            const r = rebuildPositionFromTransactions(tx.rows, c);
+            const actual = held[c] != null ? Number(held[c].toFixed(8)) : 0;
+            r.actual_balance = actual;
+            r.pending_out_qty = pendingOut[c] ? Number(pendingOut[c].toFixed(8)) : 0;
+            r.qty_matches_balance = Math.abs(r.rebuilt_qty - actual) <= Math.max(1e-6, actual * 0.005);
+            r.ledger_tranche_qty = tr[c] ? Number(tr[c].q.toFixed(8)) : null;
+            r.ledger_tranche_avg = tr[c] && tr[c].avg != null ? Number(tr[c].avg.toFixed(6)) : null;
+            const ep = entryPrices.get(c + '-USD');
+            r.portfolio_entry_price = ep != null ? Number(Number(ep).toFixed(6)) : null;
+            results.push(r);
+          }
+          if (symbol) lr.position = results[0];
+          else {
+            // all coins: compact rows only - the full per-coin detail is one symbol-filtered call away
+            lr.coins = results.filter(r => r.events > 0).map(r => ({ coin: r.coin, rebuilt_qty: r.rebuilt_qty, actual_balance: r.actual_balance,
+              matches: r.qty_matches_balance, avg_cost: r.avg_cost, portfolio_entry: r.portfolio_entry_price, ledger_qty: r.ledger_tranche_qty,
+              negative_balance: r.flags.negative_balance, no_cost_inflow_qty: r.flags.no_cost_inflow_qty }))
+              .sort((a, b) => (a.matches === b.matches) ? 0 : (a.matches ? 1 : -1));
+            lr.matching = lr.coins.filter(r => r.matches).length + ' of ' + lr.coins.length;
+          }
+        } catch (e) { lr.error = e.message; }
+        result.ledger_rebuild = lr;
       }
 
       // exchange_orders (#326 Build 1) -- AUTHORITATIVE order history from the venue.
