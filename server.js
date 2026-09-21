@@ -6146,7 +6146,14 @@ async function reconcileTransactions(daysBack = 30, dryRun = null) {
         break;
       }
 
-      if (!exactMatch) {
+      // A row that already carries a venue_tx_id belongs to EXACTLY ONE transaction and
+      // must never be soft-matched to another. Without this, once the reconciler is the
+      // only writer, a second payment of a similar amount within 48h (YouTube retries,
+      // Turbify x3, two ~$5.43 Google Cloud charges) fuzzy-matches the FIRST payment's own
+      // row, lands in possible_duplicate, and is NEVER WRITTEN - silently re-creating the
+      // exact missed-payment bug this reconciler exists to eliminate. Only legacy heuristic
+      // rows (no venue_tx_id) may be soft-matched, and only during the overlap window.
+      if (!exactMatch && !j.venue_tx_id) {
         const jVal = Math.abs(parseFloat(j.value_usd || 0)) || Math.abs(parseFloat(j.quantity || 0)) || 0;
         const amtDiff = Math.abs(txAmt - jVal);
         const amtTolerance = Math.max(1.0, txAmt * 0.03);
