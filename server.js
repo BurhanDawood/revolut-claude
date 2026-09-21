@@ -17000,7 +17000,18 @@ async function processAlertChoice(ctx, choice, sendReply) {
       console.log('[#117] Cancelled fixed-alert reminder cycle after reply:', symbol);
     }
     targetReminderCount.delete(symbol);
-    alertReminderSent.delete(symbol);
+    // SCAN-LOOP ALERTS (pump / drop / swing) do not use a timer. Each scan cycle RE-CHECKS state
+    // and sends a reminder when alertFirstSent is set, 10 min have passed, and alertReminderSent is
+    // NOT set. So deleting alertReminderSent here - the original #117 behaviour - did not suppress
+    // their reminder; it was the very condition that allowed it. Observed 21 Sept: AST pump alert
+    // 11:25, Hold tapped 11:27, reminder still sent 11:45. Marking the reminder SENT tells the loop
+    // the prompt was answered: it skips the nag and goes straight to the same auto-acknowledge it
+    // would have reached after the reminder anyway. End state unchanged; only the nag is gone.
+    if (alertFirstSent.has(symbol)) {
+      alertReminderSent.set(symbol, Date.now());
+    } else {
+      alertReminderSent.delete(symbol);
+    }
   }
 
   // Fetch price once for use in confirmations below
