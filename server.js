@@ -10451,8 +10451,15 @@ async function checkPortfolio() {
 
           // Guard 1: USDT→USD conversion (dry powder) — check BEFORE the >$100 cap
           // so large conversions are never mis-flagged as suspected card payments
+          // A USDT drop is FULLY explained by a conversion when USD rose by AT LEAST as much - there is
+          // nothing left over to be a payment. The old test only accepted a near-EXACT match (within 2%),
+          // so when USD rose by MORE (a same-window coin sale also landing in USD), it was not seen as a
+          // conversion, #146 subtracted the whole USD rise, and the payment went NEGATIVE - adding phantom
+          // capital. 21 Sept: USDT -3.75 converted, USD +6.71 (3.74 from USDT + 3.00 from a JTO sale)
+          // gave 3.75 - 6.71 = -2.96, journal 3360; same bug as journal 3250. With this clause the
+          // partial-offset path below only runs when usdIncrease < decrease, so it can never go negative.
           const isUSDConversion = usdIncrease > 0 &&
-            Math.abs(usdIncrease - decrease) / decrease < 0.02;
+            (Math.abs(usdIncrease - decrease) / decrease < 0.02 || usdIncrease >= decrease);
           // #146: partial USD offset fix -- subtract USDT->USD conversion leg before logging card payment
           const partialUSDOffset = (!isUSDConversion && usdIncrease > 0.50) ? usdIncrease : 0;
           const netPaymentAmt = parseFloat((decrease - partialUSDOffset).toFixed(2));
