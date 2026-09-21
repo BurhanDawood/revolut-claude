@@ -2391,7 +2391,9 @@ function startTradeApprovalReminder(exchange) {
     // Send reminder using standard approval format
     await sendTelegram(
       formatApprovalRequest(coinBase, current.side, current.volume || current.baseSize, current.price, current.valueUSD, exchange) +
-      `\n\n⏰ Reminder ${reminderCount}/${maxReminders} — auto-cancels in ${((maxReminders - reminderCount) * 2.5).toFixed(0)} min`
+      `\n\n⏰ Reminder ${reminderCount}/${maxReminders} — auto-cancels in ${((maxReminders - reminderCount) * 2.5).toFixed(0)} min`,
+      // #339: reminders carry Approve / Reject for the SAME trade - with thumbs-up retired they were otherwise a dead end.
+      tradeApprovalKeyboard(current)
     ).catch(e => console.error('[trade reminder] telegram failed:', e.message));
     console.log(`[trade] Reminder ${reminderCount}/${maxReminders} sent for ${exchange} ${coinBase}`);
   }, reminderInterval);
@@ -3308,7 +3310,7 @@ async function logClaudeCall(reason, model, usage) {
  *   formatSystemAlert() — informational only, no numbered options, no response needed
  *
  * TYPE 3 — APPROVAL REQUIRED 🔔
- *   formatApprovalRequest() — 👍/👎 only, auto-cancels after 12 min
+ *   formatApprovalRequest() — Approve/Reject buttons (#338/#339), auto-cancels after 12 min
  *
  * EXCEPTION — AI ANALYSIS 🧠
  *   Numbered 1-5 options ONLY here — the ONE place that requests Bryan's decision
@@ -3420,7 +3422,7 @@ function formatApprovalRequest(coinBase, side, qty, price, valueUsd, exchange) {
     `Price: ~${price ? formatPrice(price) : 'market'}\n` +
     `Value: ~$${valueUsd ? parseFloat(valueUsd).toFixed(2) : '?'}\n` +
     `Exchange: ${exchangeLabel}\n\n` +
-    `👍 Execute  👎 Cancel\n` +
+    `Tap <b>Approve</b> or <b>Reject</b> (or type <b>approve trade</b> / <b>cancel trade</b>)\n` +
     `⏰ Auto-cancels in 12 min if no response`
   );
 }
@@ -17435,7 +17437,7 @@ async function processAlertChoice(ctx, choice, sendReply) {
         `🔔 <b>SELL REQUEST — ${coinBase}</b>\n\n` +
         `Selling 25% = ${sellQty.toFixed(4)} ${coinBase}\n` +
         `@ ~$${currentPrice.toFixed(4)} = ~$${valueUSD.toFixed(2)}\n\n` +
-        `Tap <b>Approve</b> or <b>Reject</b> (or reply 👍 / 👎)\n` +
+        `Tap <b>Approve</b> or <b>Reject</b> (or type <b>approve trade</b> / <b>cancel trade</b>)\n` +
         `Auto-cancels in 12.5 min if no response`,
         tradeApprovalKeyboard(pendingRevolutTrade)
       );
@@ -17464,7 +17466,7 @@ async function processAlertChoice(ctx, choice, sendReply) {
           `🔔 <b>LADDER SELL — ${coinBase}</b>\n\n` +
           `Selling 25% = ${sellQty.toFixed(4)} ${coinBase}\n` +
           `@ ~$${currentPrice.toFixed(4)} = ~$${valueUSD.toFixed(2)}\n\n` +
-          `Tap <b>Approve</b> or <b>Reject</b> (or reply 👍 / 👎)`,
+          `Tap <b>Approve</b> or <b>Reject</b> (or type <b>approve trade</b> / <b>cancel trade</b>)`,
           tradeApprovalKeyboard(pendingRevolutTrade)
         );
         setTimeout(() => startTradeApprovalReminder('revolut'), 2.5 * 60 * 1000);
@@ -17493,7 +17495,7 @@ async function processAlertChoice(ctx, choice, sendReply) {
         `Buying $${buyUSD.toFixed(2)} worth = ${buyQty.toFixed(4)} ${coinBase}\n` +
         `@ ~$${currentPrice.toFixed(4)}\n` +
         `Available USD: $${availableUSD.toFixed(2)}\n\n` +
-        `Tap <b>Approve</b> or <b>Reject</b> (or reply 👍 / 👎)\n` +
+        `Tap <b>Approve</b> or <b>Reject</b> (or type <b>approve trade</b> / <b>cancel trade</b>)\n` +
         `Auto-cancels in 12.5 min if no response`,
         tradeApprovalKeyboard(pendingRevolutTrade)
       );
@@ -18649,7 +18651,7 @@ app.post('/telegram-webhook', async (req, res) => {
         await sendTelegram(
           `⏪ <b>UNDO — ${coinBase}</b>\n\n` +
           `Buying back ${undo.qty.toFixed(4)} ${coinBase}\n` +
-          `Tap <b>Approve</b> to buy back, or <b>Reject</b> to keep as is (or reply 👍 / 👎)`,
+          `Tap <b>Approve</b> to buy back, or <b>Reject</b> to keep as is (or type <b>approve trade</b> / <b>cancel trade</b>)`,
           tradeApprovalKeyboard(pendingRevolutTrade)
         );
       }
@@ -18765,9 +18767,18 @@ app.post('/telegram-webhook', async (req, res) => {
     }
 
     // --- Command: approve trade / cancel trade ---
-    if (/^approve\s+trade$/i.test(commandText) ||
-        rawText.trim() === '👍' ||
-        /^\u{1F44D}/u.test(rawText.trim())) {
+    // #339: a thumbs-up NO LONGER approves trades (owner decision, 21 Sept) - one sent in reply to anything
+    // else would have placed whatever order was pending. It is still caught HERE, so it cannot fall through to
+    // handlers it never reached before (e.g. the swing-alert 'hold', which can set a +15% sell target). It only
+    // explains how to approve. Thumbs-down still cancels - that direction is safe.
+    if (rawText.trim() === '👍' || /^\u{1F44D}/u.test(rawText.trim())) {
+      const anyPendingTrade = !!(pendingRevolutTrade || pendingKrakenTrade || pendingMcpTradeQueue.length);
+      await sendReply(anyPendingTrade
+        ? '👍 no longer approves trades. Tap <b>Approve</b> on the request, or type <b>approve trade</b>. Nothing was executed.'
+        : 'ℹ️ No pending trade to approve.');
+      return res.status(200).json({ ok: true });
+    }
+    if (/^approve\s+trade$/i.test(commandText)) {
       console.log('[approve] pendingKrakenTrade:', pendingKrakenTrade ? JSON.stringify(pendingKrakenTrade) : 'null');
       console.log('[approve] pendingRevolutTrade:', pendingRevolutTrade ? JSON.stringify(pendingRevolutTrade) : 'null');
 
