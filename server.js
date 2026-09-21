@@ -2656,6 +2656,183 @@ async function handleMoneyButton(typeCode, idStr, choice, reply) {
   await reply('\u26a0\ufe0f Unrecognised button.');
 }
 
+// #337 TRADE DETECTED BUTTONS. Same stateless design as #336: callback_data a:<journalId>:<choice>:td.
+// The meaning of each choice is STORED in trade_alert_choices when the alert is drawn, so a button
+// always does exactly what its label said - even after a restart, and even if new trades have since
+// landed in the time window (re-deriving the options at tap time could shift them).
+let _tradeChoiceTableReady = false;
+async function ensureTradeChoiceTable() {
+  if (_tradeChoiceTableReady) return;
+  await db.execute(`CREATE TABLE IF NOT EXISTS trade_alert_choices (
+    journal_id INT NOT NULL,
+    choice TINYINT NOT NULL,
+    act VARCHAR(16) NOT NULL,
+    from_coin VARCHAR(16) NULL,
+    label VARCHAR(32) NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (journal_id, choice)
+  )`);
+  _tradeChoiceTableReady = true;
+}
+
+// Builds the buttons for one Trade Detected alert and stores what each one means.
+// BUY:  up to two 'From <coin>' (coins SOLD within 15 min before / 2 min after this buy - the likeliest
+//       source of the funds), then Dip buy / Transfer in / Skip.
+// SELL: Took profit or Cut loss (chosen from the ACTUAL realised P&L), Top-up for spending, Paid with it,
+//       Rebalance, Skip. Transfer is deliberately omitted on sells (owner's choice, 21 Sept).
+// All time windows are computed in SQL relative to the row's own created_at, so no JS Date / timezone
+// conversion can shift them.
+async function buildTradeKeyboard(journalId, coinBase, action) {
+  await ensureTradeChoiceTable();
+  const [jr] = await db.execute('SELECT created_at, realised_pnl_usd FROM trading_journal WHERE id = ?', [journalId]);
+  if (!jr || !jr[0]) return undefined;
+  const coin = String(coinBase || '').replace('-USD', '').toUpperCase();
+  const isBuy = action === 'buy' || action === 'add';
+  const opts = [];
+  if (isBuy) {
+    const [sells] = await db.execute(
+      `SELECT s.symbol FROM trading_journal s JOIN trading_journal b ON b.id = ?
+       WHERE s.action = 'sell' AND s.symbol NOT IN (?, ?)
+         AND s.created_at BETWEEN DATE_SUB(b.created_at, INTERVAL 15 MINUTE) AND DATE_ADD(b.created_at, INTERVAL 2 MINUTE)
+       ORDER BY ABS(TIMESTAMPDIFF(SECOND, s.created_at, b.created_at)) ASC, s.value_usd DESC LIMIT 10`,
+      [journalId, coin, coin + '-USD']
+    );
+    const seen = new Set();
+    for (const r of sells) {
+      const c = String(r.symbol).replace('-USD', '').toUpperCase();
+      if (!c || seen.has(c)) continue;
+      seen.add(c);
+      opts.push({ label: 'From ' + c, act: 'rebalance', from: c });
+      if (opts.length >= 2) break;
+    }
+    opts.push({ label: 'Dip buy', act: 'reason', from: null });
+    opts.push({ label: 'Transfer in', act: 'transfer', from: null });
+    opts.push({ label: 'Skip', act: 'skip', from: null });
+  } else {
+    const pnl = jr[0].realised_pnl_usd === null || jr[0].realised_pnl_usd === undefined ? null : parseFloat(jr[0].realised_pnl_usd);
+    opts.push({ label: pnl === null || !Number.isFinite(pnl) ? 'Planned exit' : (pnl >= 0 ? 'Took profit' : 'Cut loss'), act: 'reason', from: null });
+    opts.push({ label: 'Top-up for spending', act: 'topup', from: null });
+    opts.push({ label: 'Paid with it', act: 'payment', from: null });
+    opts.push({ label: 'Rebalance', act: 'rebalance_out', from: null });
+    opts.push({ label: 'Skip', act: 'skip', from: null });
+  }
+  const top = opts.slice(0, 5);
+  for (let i = 0; i < top.length; i++) {
+    await db.execute(
+      'INSERT INTO trade_alert_choices (journal_id, choice, act, from_coin, label) VALUES (?, ?, ?, ?, ?) ' +
+      'ON DUPLICATE KEY UPDATE act = VALUES(act), from_coin = VALUES(from_coin), label = VALUES(label)',
+      [journalId, i + 1, top[i].act, top[i].from, top[i].label]
+    );
+  }
+  return buildAlertKeyboard(String(journalId), top.map(o => o.label), 'td');
+}
+
+// Stops the in-memory 30-min timer for a trade once it has been answered (if the server has not
+// restarted since, the timer is still pending and would otherwise post "auto-logged without context").
+function clearPendingTradeFor(coin, journalId) {
+  for (const key of [coin + '-USD', coin]) {
+    const p = pendingTradeContext.get(key);
+    if (p && p.journalId === journalId) { clearTimeout(p.timeoutHandle); pendingTradeContext.delete(key); }
+  }
+}
+
+async function handleTradeButton(idStr, choice, reply) {
+  const id = parseInt(idStr, 10);
+  if (!Number.isFinite(id) || id <= 0) { await reply('\u26a0\ufe0f That button has no valid reference.'); return; }
+  await ensureTradeChoiceTable();
+  const [cr] = await db.execute('SELECT act, from_coin, label FROM trade_alert_choices WHERE journal_id = ? AND choice = ?', [id, choice]);
+  const opt = cr && cr[0];
+  if (!opt) { await reply('\u26a0\ufe0f That option is no longer available.'); return; }
+  const [jr] = await db.execute('SELECT * FROM trading_journal WHERE id = ?', [id]);
+  const row = jr && jr[0];
+  if (!row) { await reply('Already handled - that trade no longer exists.'); return; }
+  const coin = String(row.symbol).replace('-USD', '').toUpperCase();
+  // A trade is answerable while it is 'auto-detected' OR 'no reason provided' - so a button still works
+  // AFTER the 30-min timer has fired. Previously the reason was simply lost once the timer went off.
+  // Every reason written below differs from both, so this claim succeeds for exactly one tap.
+  const UNRESOLVED = "reasoning IN ('auto-detected', 'no reason provided')";
+  const claim = async (setSql, params) => {
+    const [up] = await db.execute('UPDATE trading_journal SET ' + setSql + ' WHERE id = ? AND ' + UNRESOLVED, [...params, id]);
+    return !!(up && up.affectedRows === 1);
+  };
+  const alreadyMsg = 'Already handled - this trade already has a reason: ' + String(row.reasoning || '').substring(0, 70);
+
+  if (opt.act === 'rebalance' || opt.act === 'rebalance_out') {
+    const isOut = opt.act === 'rebalance_out';
+    let other;
+    if (isOut) {
+      // SELL side: the buy it funded may have happened AFTER the alert was drawn, so find it now.
+      const [br] = await db.execute(
+        `SELECT b.id, b.symbol, b.price, b.value_usd, b.quantity FROM trading_journal b JOIN trading_journal s ON s.id = ?
+         WHERE b.action IN ('buy', 'add') AND b.symbol NOT IN (?, ?)
+           AND b.created_at BETWEEN DATE_SUB(s.created_at, INTERVAL 2 MINUTE) AND DATE_ADD(s.created_at, INTERVAL 60 MINUTE)
+         ORDER BY ABS(TIMESTAMPDIFF(SECOND, b.created_at, s.created_at)) ASC LIMIT 1`,
+        [id, coin, coin + '-USD']
+      );
+      other = br && br[0];
+      if (!other) { await reply('No buy found within an hour of this sale yet. Buy first and tap Rebalance again - or choose another reason.'); return; }
+    } else {
+      // BUY side: pair with the sale of the named coin. Only a plain 'sell' qualifies - never a trade
+      // already recorded as a payment, whose capital deduction pairing would contradict.
+      const fc = String(opt.from_coin || '').toUpperCase();
+      const [sr] = await db.execute(
+        `SELECT s.id, s.symbol, s.price, s.value_usd, s.quantity FROM trading_journal s JOIN trading_journal b ON b.id = ?
+         WHERE s.action = 'sell' AND s.symbol IN (?, ?)
+           AND s.created_at BETWEEN DATE_SUB(b.created_at, INTERVAL 15 MINUTE) AND DATE_ADD(b.created_at, INTERVAL 2 MINUTE)
+         ORDER BY ABS(TIMESTAMPDIFF(SECOND, s.created_at, b.created_at)) ASC LIMIT 1`,
+        [id, fc, fc + '-USD']
+      );
+      other = sr && sr[0];
+      if (!other) { await reply('Could not find the ' + fc + ' sale for this buy any more. Choose another reason.'); return; }
+    }
+    const otherCoin = String(other.symbol).replace('-USD', '').toUpperCase();
+    const reason = isOut ? ('Rebalance exit -- rotating into ' + otherCoin) : ('Rebalance entry -- rotated from ' + otherCoin);
+    if (!(await claim('reasoning = ?, emotion = ?', [reason, 'neutral']))) { await reply(alreadyMsg); return; }
+    clearPendingTradeFor(coin, id);
+    const sellSide = isOut ? row : other, buySide = isOut ? other : row;
+    await logRebalancePair({
+      sellSymbol: String(sellSide.symbol).replace('-USD', '').toUpperCase(), sellJournalId: sellSide.id,
+      sellPrice: parseFloat(sellSide.price), sellValueUsd: Math.abs(parseFloat(sellSide.value_usd || 0)), sellQty: parseFloat(sellSide.quantity || 0),
+      buySymbol: String(buySide.symbol).replace('-USD', '').toUpperCase(), buyJournalId: buySide.id,
+      buyPrice: parseFloat(buySide.price), buyValueUsd: Math.abs(parseFloat(buySide.value_usd || 0)), buyQty: parseFloat(buySide.quantity || 0)
+    }).catch(e => console.error('[trade-btn] logRebalancePair failed:', e.message));
+    await reply('\u2705 Rebalance recorded: ' + (isOut ? coin + ' \u2192 ' + otherCoin : otherCoin + ' \u2192 ' + coin) + '.');
+    return;
+  }
+
+  let setSql, params, doneMsg;
+  if (opt.act === 'reason') { setSql = 'reasoning = ?, emotion = ?'; params = [opt.label, 'neutral']; doneMsg = 'Noted: ' + opt.label + '.'; }
+  else if (opt.act === 'topup') { setSql = 'reasoning = ?, emotion = ?'; params = ['Sold to top up for card spending - capital is counted on the card payment itself', 'neutral']; doneMsg = 'Noted: top-up for spending. Capital unchanged - the card payment itself counts it.'; }
+  else if (opt.act === 'transfer') { setSql = "action = 'transfer', reasoning = ?, emotion = ?"; params = ['Internal transfer - invested capital unchanged', 'neutral']; doneMsg = 'Logged as a transfer - capital unchanged.'; }
+  else if (opt.act === 'payment') { setSql = "action = 'payment', reasoning = ?, emotion = ?"; params = ['Paid directly with ' + coin + ' via card', 'neutral']; doneMsg = 'Logged as a payment made with ' + coin + '.'; }
+  else if (opt.act === 'skip') { setSql = 'reasoning = ?, emotion = ?'; params = ['Skipped via button - no reason given', 'neutral']; doneMsg = 'Skipped.'; }
+  else { await reply('\u26a0\ufe0f Unrecognised option.'); return; }
+
+  if (!(await claim(setSql, params))) { await reply(alreadyMsg); return; }
+  clearPendingTradeFor(coin, id);
+
+  if (opt.act === 'payment') {
+    // The coin ITSELF was spent, so it leaves invested capital. (A top-up sale does NOT - its card
+    // payment already counts the spending; deducting here too would count it twice.)
+    const val = Math.abs(parseFloat(row.value_usd) || 0);
+    if (val > 0) {
+      const before = totalInvestedCapital;
+      try {
+        await updateInvestedCapital(before - val, 'Paid with ' + coin + ' (trade j' + id + '): -$' + val.toFixed(2));
+      } catch (e) {
+        await reply('\u26a0\ufe0f Logged as a payment, but the capital update FAILED: ' + e.message + '. Capital unchanged at $' + before.toFixed(2) + '.');
+        return;
+      }
+      const applied = Math.abs(totalInvestedCapital - (before - val)) < 0.005;
+      doneMsg += applied
+        ? '\nCapital: $' + before.toFixed(2) + ' \u2192 $' + totalInvestedCapital.toFixed(2)
+        : '\nCapital change HELD for your confirmation - see the capital alert.';
+    }
+  }
+  await updateLearningModel().catch(() => {});
+  await reply('\u2705 ' + coin + ': ' + doneMsg);
+}
+
 function fmtCapitalConfirm(cap, portfolioValue) {
   const pnlSign = cap.pnl >= 0 ? '+' : '';
   const breakEvenStr = cap.pnl < 0
