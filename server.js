@@ -17101,6 +17101,16 @@ async function processAlertChoice(ctx, choice, sendReply) {
     if (alertFirstSent.has(symbol)) {
       const origPct = Math.round((customThresholds[symbol] !== undefined ? customThresholds[symbol] : PUMP_THRESHOLD) * 100);
       const isPump = alertType === 'pump';
+      // SET HELD STATE IMMEDIATELY, defaulting to the coin's original threshold. Previously held
+      // state was only set once a step button was pressed - but the #117 block has ALREADY set
+      // alertReminderSent on this Hold tap, so any scan cycle running before the step was chosen
+      // found no held state, saw the reminder flag, and AUTO-ACKNOWLEDGED the coin (24h mute) -
+      // the exact opposite of what Hold is for. The held check sits before the reminder logic in
+      // both scan branches, so setting it here silences the alert at once. Choosing +5/+10/+30
+      // simply overwrites it; never choosing one leaves the original threshold in place.
+      if (currentPriceForConfirm) {
+        alertHeldAt.set(symbol, { price: currentPriceForConfirm, stepPct: origPct, direction: isPump ? 'up' : 'down', at: Date.now() });
+      }
       const labels = isPump
         ? ['+5%', '+10%', `+${origPct}% original`, '+30%']
         : ['-5%', '-10%', `-${origPct}% original`, '-30%'];
