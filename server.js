@@ -10661,19 +10661,25 @@ async function checkPortfolio() {
               } else {
                 if (partialUSDOffset > 0) console.log(`[usdt] #146 Partial USD offset $${partialUSDOffset.toFixed(2)} (USDT->USD conversion leg) -- net card payment: $${netPaymentAmt.toFixed(2)}`);
                 else console.log(`[usdt] Auto-logging card payment $${netPaymentAmt.toFixed(2)} (no offsetting increase, no recent trade)`);
-                await db.execute(
+                const [ins146] = await db.execute(
                   `INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
                   ['USDT', 'payment', 1.00, netPaymentAmt, netPaymentAmt,
                    `Auto-logged card payment -- $${netPaymentAmt.toFixed(2)} USDT${partialUSDOffset > 0 ? ' (#146: $' + partialUSDOffset.toFixed(2) + ' USDT->USD conversion excluded)' : ' (no offsetting balance increase)'}`, 'neutral', 'revolut_card']
-                ).catch(() => {});
+                ).catch(() => [null]);
+                const jid146 = ins146 && ins146.insertId ? ins146.insertId : null;
                 const prevCap = totalInvestedCapital;
                 const newCap  = totalInvestedCapital - netPaymentAmt;
                 await updateInvestedCapital(newCap, `Card payment auto-logged: -$${netPaymentAmt.toFixed(2)}`);
+                // Report what capital ACTUALLY did - a payment over $200 is HELD by the guard.
+                const applied146 = Math.abs(totalInvestedCapital - newCap) < 0.005;
                 await sendTelegram(
                   `💳 PAYMENT $${netPaymentAmt.toFixed(2)} USDT\n` +
-                  `Capital: $${prevCap.toFixed(2)} → $${newCap.toFixed(2)}\n\n` +
-                  `Tap '<b>skip payment ${netPaymentAmt.toFixed(2)}</b>' if not a payment.`
+                  (applied146
+                    ? `Capital: $${prevCap.toFixed(2)} \u2192 $${totalInvestedCapital.toFixed(2)}\n\n`
+                    : `Capital change HELD for your confirmation - see the capital alert.\n\n`) +
+                  `Tap <b>Not a payment</b> if it wasn't one, or reply '<b>skip payment ${netPaymentAmt.toFixed(2)}</b>'.`,
+                  jid146 ? buildAlertKeyboard(String(jid146), ['Not a payment'], 'np') : undefined
                 ).catch(() => {});
               } // end limit-reserve guard (#127)
               }
@@ -10706,20 +10712,25 @@ async function checkPortfolio() {
               ).catch(() => [[]]);
               if (dupe159.length === 0) {
                 console.log(`[usdt] #159 Auto-logging hidden payment $${hidden159.toFixed(2)} (USD->USDT conversion masked it)`);
-                await db.execute(
+                const [ins159] = await db.execute(
                   `INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
                   ['USDT', 'payment', 1.00, hidden159, hidden159,
                    `#159 Auto-logged card payment $${hidden159.toFixed(2)} USDT — masked by simultaneous USD\u2192USDT conversion ($${usdOut159.toFixed(2)} USD out, $${usdtIn159.toFixed(2)} USDT in)`,
                    'neutral', 'revolut_card']
-                ).catch(() => {});
+                ).catch(() => [null]);
+                const jid159 = ins159 && ins159.insertId ? ins159.insertId : null;
                 const prevCap159 = totalInvestedCapital;
                 const newCap159  = totalInvestedCapital - hidden159;
                 await updateInvestedCapital(newCap159, `#159 Hidden card payment auto-logged: -$${hidden159.toFixed(2)}`);
+                const applied159 = Math.abs(totalInvestedCapital - newCap159) < 0.005;
                 await sendTelegram(
                   `\ud83d\udcb3 PAYMENT $${hidden159.toFixed(2)} USDT\n` +
                   `(#159: masked by USD\u2192USDT conversion in same window)\n` +
-                  `Capital: $${prevCap159.toFixed(2)} \u2192 $${newCap159.toFixed(2)}\n\n` +
-                  `Tap '<b>skip payment ${hidden159.toFixed(2)}</b>' if not a payment.`
+                  (applied159
+                    ? `Capital: $${prevCap159.toFixed(2)} \u2192 $${totalInvestedCapital.toFixed(2)}\n\n`
+                    : `Capital change HELD for your confirmation - see the capital alert.\n\n`) +
+                  `Tap <b>Not a payment</b> if it wasn't one, or reply '<b>skip payment ${hidden159.toFixed(2)}</b>'.`,
+                  jid159 ? buildAlertKeyboard(String(jid159), ['Not a payment'], 'np') : undefined
                 ).catch(() => {});
               }
             }
