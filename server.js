@@ -6055,6 +6055,8 @@ async function reconcileTransactions(daysBack = 30, dryRun = true) {
   const alreadyReconciled = [];
   const possibleDuplicate = [];
   const wouldLog = [];
+  const receives = [];
+  const needsPrice = [];
   let totalCapitalDecrement = 0;
 
   const rawTxs = txResult.transactions || [];
@@ -6062,14 +6064,14 @@ async function reconcileTransactions(daysBack = 30, dryRun = true) {
   for (const tx of rawTxs) {
     if (!tx || !tx.id) continue;
     const status = (tx.status || '').toLowerCase();
-    // ALLOWLIST, NOT DENYLIST. The previous check tested status === 'cancelled'
-    // (two L's, per the published enum) but the LIVE API returns 'canceled' (one L):
-    // by_status on 21 Sept was { pending: 3, completed: 183, canceled: 18 }. The
-    // denylist never matched, so all 18 declined card payments would have passed
-    // through as real, and 'pending' was never excluded either. Only a settled
-    // 'completed' transaction is final. An allowlist is immune to misspellings and
-    // to statuses nobody anticipated.
+    // Allowlist: only settled 'completed' transactions are evaluated
     if (status !== 'completed') {
+      continue;
+    }
+
+    // DEFECT 1: ALLOWLIST TYPE FILTER. Only 'send' and 'receive' types are considered.
+    const txType = (tx.type || '').toLowerCase();
+    if (txType !== 'send' && txType !== 'receive') {
       continue;
     }
 
@@ -6078,9 +6080,7 @@ async function reconcileTransactions(daysBack = 30, dryRun = true) {
     const txAmt = srcAmt || dstAmt || 0;
     if (txAmt <= 0) continue;
 
-    const currency = (tx.source && tx.source.currency) || (tx.destination && tx.destination.currency) || 'USD';
-    const txType = (tx.type || '').toLowerCase();
-    const action = txType === 'send' ? 'payment' : 'transfer';
+    const currency = ((tx.source && tx.source.currency) || (tx.destination && tx.destination.currency) || 'USD').toUpperCase();
     const txTime = tx.created_date || tx.processed_date || Date.now();
     const txMs = typeof txTime === 'number' ? txTime : new Date(txTime).getTime();
 
@@ -6132,29 +6132,110 @@ async function reconcileTransactions(daysBack = 30, dryRun = true) {
         candidate_created_at: softMatch.created_at
       });
     } else {
-      const decAmount = action === 'payment' ? txAmt : 0;
-      totalCapitalDecrement += decAmount;
+      // DEFECT 2 & 3: USD Valuation and Classification
+      const txDate = new Date(txMs);
+      const hourMs = Math.floor(txDate.getTime() / 3600000) * 3600000;
+      const hourBucketStr = new Date(hourMs).toISOString().slice(0, 19).replace('T', ' ');
 
-      const journalRow = {
-        symbol: currency.toUpperCase(),
-        action,
-        price: 1.0,
-        quantity: txAmt,
-        value_usd: txAmt,
-        reasoning: `Revolut X transaction ${tx.id} (${tx.type})`,
-        venue_tx_id: tx.id,
-        created_at: tx.created_date || tx.processed_date || new Date().toISOString()
-      };
+      let priceUsed = null;
+      let hourBucket = null;
 
-      wouldLog.push({
-        tx_id: tx.id,
-        tx_type: tx.type,
-        tx_amount: txAmt,
-        currency,
-        action,
-        journal_row: journalRow,
-        invested_capital_decrement: decAmount
-      });
+      if (currency === 'USD' || currency === 'USDT') {
+        priceUsed = 1.0;
+        hourBucket = hourBucketStr;
+      } else {
+        const pairSymbol = `${currency}-USD`;
+        const [priceRows] = await db.execute(
+          `SELECT close_px, hour_bucket FROM price_intraday_hourly WHERE symbol = ? AND hour_bucket = ? LIMIT 1`,
+          [pairSymbol, hourBucketStr]
+        );
+        if (priceRows.length > 0) {
+          priceUsed = parseFloat(priceRows[0].close_px);
+          const hbVal = priceRows[0].hour_bucket;
+          hourBucket = hbVal instanceof Date ? hbVal.toISOString().slice(0, 19).replace('T', ' ') : String(hbVal);
+        }
+      }
+
+      if (priceUsed === null) {
+        // Price not found — DO NOT fall back to raw amount
+        needsPrice.push({
+          tx_id: tx.id,
+          tx_type: tx.type,
+          token_amount: txAmt,
+          tx_amount: txAmt,
+          currency,
+          action: txType === 'send' ? 'payment' : 'review',
+          hour_bucket: hourBucketStr,
+          price_used: null,
+          value_usd: null,
+          invested_capital_decrement: null,
+          journal_row: {
+            symbol: currency,
+            action: txType === 'send' ? 'payment' : 'review',
+            price: null,
+            quantity: txAmt,
+            value_usd: null,
+            reasoning: `Revolut X transaction ${tx.id} (${tx.type})`,
+            venue_tx_id: tx.id,
+            created_at: tx.created_date || tx.processed_date || new Date().toISOString()
+          }
+        });
+      } else if (txType === 'receive') {
+        // DEFECT 3: RECEIVES. Classify as 'review', never 'payment', zero capital decrement.
+        const valueUsd = parseFloat((txAmt * priceUsed).toFixed(2));
+        receives.push({
+          tx_id: tx.id,
+          tx_type: tx.type,
+          token_amount: txAmt,
+          tx_amount: txAmt,
+          currency,
+          action: 'review',
+          price_used: priceUsed,
+          hour_bucket: hourBucket,
+          value_usd: valueUsd,
+          invested_capital_decrement: 0,
+          journal_row: {
+            symbol: currency,
+            action: 'review',
+            price: priceUsed,
+            quantity: txAmt,
+            value_usd: valueUsd,
+            reasoning: `Revolut X transaction ${tx.id} (${tx.type})`,
+            venue_tx_id: tx.id,
+            created_at: tx.created_date || tx.processed_date || new Date().toISOString()
+          }
+        });
+      } else {
+        // txType === 'send': DEFECT 2: Use USD value for capital decrement
+        const valueUsd = parseFloat((txAmt * priceUsed).toFixed(2));
+        const decAmount = valueUsd;
+        totalCapitalDecrement += decAmount;
+
+        const journalRow = {
+          symbol: currency,
+          action: 'payment',
+          price: priceUsed,
+          quantity: txAmt,
+          value_usd: valueUsd,
+          reasoning: `Revolut X transaction ${tx.id} (${tx.type})`,
+          venue_tx_id: tx.id,
+          created_at: tx.created_date || tx.processed_date || new Date().toISOString()
+        };
+
+        wouldLog.push({
+          tx_id: tx.id,
+          tx_type: tx.type,
+          token_amount: txAmt,
+          tx_amount: txAmt,
+          currency,
+          action: 'payment',
+          price_used: priceUsed,
+          hour_bucket: hourBucket,
+          value_usd: valueUsd,
+          journal_row: journalRow,
+          invested_capital_decrement: decAmount
+        });
+      }
     }
   }
 
@@ -6166,12 +6247,16 @@ async function reconcileTransactions(daysBack = 30, dryRun = true) {
     already_reconciled: alreadyReconciled,
     possible_duplicate: possibleDuplicate,
     would_log: wouldLog,
+    receives,
+    needs_price: needsPrice,
     summary: {
       total_transactions: rawTxs.length,
       already_reconciled_count: alreadyReconciled.length,
       possible_duplicate_count: possibleDuplicate.length,
       would_log_count: wouldLog.length,
-      total_capital_decrement: totalCapitalDecrement
+      receives_count: receives.length,
+      needs_price_count: needsPrice.length,
+      total_capital_decrement: parseFloat(totalCapitalDecrement.toFixed(2))
     }
   };
 }
