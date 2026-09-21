@@ -3,6 +3,7 @@ name: Apply Batch Patch
 # ONE paste per change set. The batch blob carries the commit message, every edit, and two
 # fingerprints: the exact server.js it was built for (base) and the exact result that was
 # reviewed and tested (after). Anything else stops the run with nothing written.
+# v2: also accepts COMPRESSED batches (gzip), typically 8x shorter. Older batches still work.
 
 on:
   workflow_dispatch:
@@ -29,13 +30,17 @@ jobs:
           node --input-type=module << 'NODEEOF'
           import fs from 'fs';
           import crypto from 'crypto';
+          import zlib from 'zlib';
           const sha = (s) => crypto.createHash('sha256').update(s).digest('hex');
           const fail = (m) => { console.error('ABORT: ' + m); console.error('Nothing was written.'); process.exit(1); };
 
           let batch;
           try {
             const raw = (process.env.BATCH_B64 || '').replace(/\s+/g, '');
-            batch = JSON.parse(Buffer.from(raw, 'base64').toString('utf8'));
+            let buf = Buffer.from(raw, 'base64');
+            // v2: a compressed batch starts with the gzip signature 1f 8b.
+            if (buf.length > 2 && buf[0] === 0x1f && buf[1] === 0x8b) buf = zlib.gunzipSync(buf);
+            batch = JSON.parse(buf.toString('utf8'));
           } catch (e) {
             fail('the batch could not be read - most likely a truncated paste. ' + e.message);
           }
@@ -53,8 +58,10 @@ jobs:
 
           let code = original;
           batch.edits.forEach((e, i) => {
-            const s = Buffer.from(e.s, 'base64').toString('utf8').replace(/\r\n/g, '\n');
-            const r = Buffer.from(e.r, 'base64').toString('utf8').replace(/\r\n/g, '\n');
+            // v2 batches carry the text directly (enc: 'raw'); v1 batches carry each block in Base64.
+            const dec = (x) => batch.enc === 'raw' ? String(x) : Buffer.from(x, 'base64').toString('utf8');
+            const s = dec(e.s).replace(/\r\n/g, '\n');
+            const r = dec(e.r).replace(/\r\n/g, '\n');
             const n = code.split(s).length - 1;
             if (n !== 1) fail('edit ' + (i + 1) + ' of ' + batch.edits.length + ' matched ' + n + ' times - it must match exactly once.');
             const before = code.length;
