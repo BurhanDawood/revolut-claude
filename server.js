@@ -2726,7 +2726,8 @@ async function buildTradeKeyboard(journalId, coinBase, action) {
       [journalId, i + 1, top[i].act, top[i].from, top[i].label]
     );
   }
-  return buildAlertKeyboard(String(journalId), top.map(o => o.label), 'td');
+  // #340: 'tj', NOT 'td' - 'td' already belongs to fixed-target DOWN alerts (see CB_TYPES).
+  return buildAlertKeyboard(String(journalId), top.map(o => o.label), 'tj');
 }
 
 // Stops the in-memory 30-min timer for a trade once it has been answered (if the server has not
@@ -2998,6 +2999,15 @@ async function handleTradeApprovalButton(tid, choice, reply) {
   await reply('\u2705 Executing ' + label + '...');
   if (exchange === 'kraken') await executeApprovedKraken(t);
   else await executeApprovedRevolut(t);
+}
+
+// #340 Mute 24h button - stateless (the coin is in the button), so it works after a restart. Does exactly what
+// typed 'acknowledge COIN' does: a 24h mute persisted to ignored_coins. Never a permanent ignore.
+async function handleMuteButton(coin, reply) {
+  const c = String(coin || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  if (!c) { await reply('\u26a0\ufe0f That button has no valid coin.'); return; }
+  await acknowledgeAlert(c + '-USD');
+  await reply('\ud83d\udd15 ' + c + ' muted for 24h.');
 }
 
 function fmtCapitalConfirm(cap, portfolioValue) {
@@ -11404,7 +11414,7 @@ async function checkPortfolio() {
               `🔔 <b>REMINDER — ${coinBase} PUMP ALERT</b>\n\n` +
               `Still up ${pct}% in 24h.\n` +
               `This is the final reminder.\n\n` +
-              `1️⃣ Hold\n2️⃣ Sell advice\n3️⃣ Buy more\n4️⃣ Analyse\n5️⃣ Acknowledge ⚠️ mutes coin 24h`
+              `1️⃣ Hold\n2️⃣ Sell advice\n3️⃣ Buy more\n4️⃣ Analyse\n5️⃣ Ignore ⚠️ PERMANENTLY (use 'acknowledge COIN' to mute 24h)`
             );
             await db.execute(
               'INSERT INTO alert_reminders (symbol, alert_date, count) VALUES (?, CURDATE(), 1) ON DUPLICATE KEY UPDATE count = count + 1',
@@ -11494,7 +11504,7 @@ async function checkPortfolio() {
               `🔔 <b>REMINDER — ${coinBase} DROP ALERT</b>\n\n` +
               `Still down ${pct}% in 24h.\n` +
               `This is the final reminder.\n\n` +
-              `1️⃣ Hold\n2️⃣ Buy more\n3️⃣ Sell advice\n4️⃣ Analyse\n5️⃣ Acknowledge ⚠️ mutes coin 24h`
+              `1️⃣ Hold\n2️⃣ Buy more\n3️⃣ Sell advice\n4️⃣ Analyse\n5️⃣ Ignore ⚠️ PERMANENTLY (use 'acknowledge COIN' to mute 24h)`
             );
             await db.execute(
               'INSERT INTO alert_reminders (symbol, alert_date, count) VALUES (?, CURDATE(), 1) ON DUPLICATE KEY UPDATE count = count + 1',
@@ -12139,7 +12149,12 @@ async function checkPortfolio() {
         const threshold = customThresholds[symbol] !== undefined ? customThresholds[symbol] : PUMP_THRESHOLD;
 
         // Pump alert
-        if (change >= threshold && !alertState.active.has(symbol) && !alertState.acknowledged.has(symbol) && !ignoredCoins.has(symbol)) {
+        // #340: (1) IGNORE RESIDUE - positions under $1 do not alert (21 Sept: 0.0001 ADA, worth $0.00002, alerted
+        //       repeatedly). (2) The condition checked alertState.active but NOTHING ever set it for Kraken, so the
+        //       same alert re-fired on every 5-minute scan. It is now marked active on sending, as the Revolut alert
+        //       is, and clears the same way (acknowledge / ignore / threshold change).
+        if (change >= threshold && asset.valueUSD >= 1 && !alertState.active.has(symbol) && !alertState.acknowledged.has(symbol) && !ignoredCoins.has(symbol)) {
+          alertState.active.set(symbol, true);
           const pct   = (change * 100).toFixed(1);
           const aiRec = alertRecommendations.get(symbol)?.rec || 'HOLD - Monitor closely.';
           const trailReminderKraken = trailingStops.has(symbol)
@@ -12152,8 +12167,17 @@ async function checkPortfolio() {
             `Baseline: ${fmtPriceShort(basePrices[symbol])} → Now ${fmtPriceShort(asset.price)} (+${pct}%)\n` +
             `You hold: ${asset.quantity.toFixed(4)} ${coinBase} on Kraken\n\n` +
             `⚡ RECOMMENDATION: ${aiRec}${krakenGate.text || ''}` + trailReminderKraken + `\n\n` +
-            `Reply 'acknowledge ${coinBase}' to mute ⚠️ (24h)`
+            `Tap a button, or reply 'acknowledge ${coinBase}' to mute (24h)`,
+            // #340 buttons. Analyse reuses the pump menu's analysis (choice 4 - read-only advice, safe for a Kraken
+            // coin). The pump menu's other options are deliberately NOT offered: its 'Ignore' is PERMANENT, and this
+            // alert promises a 24h mute - so Mute is its own button doing exactly what 'acknowledge' does.
+            (() => { const kc = String(coinBase).toLowerCase().replace(/[^a-z0-9]/g, '').substring(0, 12);
+              return kc ? { inline_keyboard: [[
+                { text: 'Analyse', callback_data: 'a:' + kc + ':4:pu' },
+                { text: 'Mute 24h', callback_data: 'a:' + kc + ':1:mu' }
+              ]] } : undefined; })()
           );
+          alertContextBySymbol.set(coinBase.toLowerCase(), { symbol, coinBase, alertType: 'pump', timestamp: Date.now() });
         }
 
         // Trailing stop check for Kraken assets
@@ -17708,11 +17732,18 @@ app.post('/telegram-webhook', async (req, res) => {
       // They carry a database id and read the database, so they keep working after a restart and
       // can never act on the wrong row. Every other button path below is unchanged.
       const cbMoneyType = (cbMatch[3] || '').toLowerCase();
-      if (cbMoneyType === 'np' || cbMoneyType === 'cc' || cbMoneyType === 'td' || cbMoneyType === 'ta') {
+      // #340 COLLISION FIX: 'td' was already the code for fixed-target DOWN alerts, so from #334 until now every
+      // down-target button was sent to the trade handler and refused. A Trade Detected button carries a NUMERIC
+      // journal id, a down-target button carries a COIN, and no coin symbol is all digits - so only a numeric 'td'
+      // is a trade button. Any other 'td' now falls through to the alert handler below, as it did before #334.
+      // New Trade Detected buttons use 'tj'; numeric 'td' keeps already-sent ones working.
+      const cbIsTradeJournal = cbMoneyType === 'tj' || (cbMoneyType === 'td' && /^\d+$/.test(cbCoin));
+      if (cbMoneyType === 'np' || cbMoneyType === 'cc' || cbIsTradeJournal || cbMoneyType === 'ta' || cbMoneyType === 'mu') {
         await ackCb('Working...');
         try {
           if (cbMoneyType === 'ta') await handleTradeApprovalButton(cbCoin, cbChoice, cbReply);
-          else if (cbMoneyType === 'td') await handleTradeButton(cbCoin, cbChoice, cbReply);
+          else if (cbMoneyType === 'mu') await handleMuteButton(cbCoin, cbReply);
+          else if (cbIsTradeJournal) await handleTradeButton(cbCoin, cbChoice, cbReply);
           else await handleMoneyButton(cbMoneyType, cbCoin, cbChoice, cbReply);
         } catch (e) {
           console.error('[money-btn] ' + cbMoneyType + ' ' + cbCoin + ' failed:', e.message);
