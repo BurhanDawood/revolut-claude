@@ -6861,6 +6861,133 @@ function rebuildPositionFromTransactions(rows, coin) {
   };
 }
 
+// #345 (#326 Build 2b) LEDGER REBUILD - APPLY. Rewrites the Revolut position ledger and entry prices from the venue's
+// own transaction record, using the replay proven in #342-#344 (JTO matches the app to 6 decimals, 127/128 coins
+// reconcile). It only ever touches a coin whose rebuilt quantity matches its real balance exactly. Kraken lots, tax
+// lots, the journal, alerts and capital are never touched. Every change is logged so it can be reversed EXACTLY
+// (ledger_rebuild_undo) without disturbing anything recorded afterwards; a full snapshot is kept as well.
+async function planLedgerRebuild() {
+  const tx = await fetchAllTransactionsForRebuild(730);
+  if (tx.incomplete.length) return { ok: false, error: 'Transaction history came back incomplete - nothing will be written.', incomplete: tx.incomplete };
+  const base = (x) => String(x || '').toUpperCase().replace('/', '-').replace(/-(USD|USDT|USDC|EUR|GBP)$/, '');
+  const bal = await revolutRequest('GET', '/balances');
+  const brows = Array.isArray(bal) ? bal : (bal && (bal.data || bal.balances)) || [];
+  if (!brows.length) return { ok: false, error: 'Could not read Revolut X balances - nothing will be written.' };
+  const held = {};
+  for (const b of brows) { const c = base(b.currency || b.symbol); const q = Number(b.balance != null ? b.balance : (b.available != null ? b.available : 0)); if (c) held[c] = (held[c] || 0) + q; }
+  // entry_prices is keyed by coin, not exchange: a coin also held on Kraken must not have its entry overwritten
+  // from Revolut history alone. If Kraken cannot be read, stop rather than guess.
+  const krakenHeld = new Set();
+  try { const k = await getKrakenBalances(); for (const a of (k.balances || [])) if ((Number(a.valueUSD) || 0) >= 1) krakenHeld.add(base(a.standard || a.symbol)); }
+  catch (e) { return { ok: false, error: 'Could not read Kraken balances - nothing will be written.' }; }
+  const pendingOut = {};
+  for (const t of tx.rows) if (t.status === 'pending' && t.source && t.source.currency) { const c = String(t.source.currency).toUpperCase(); pendingOut[c] = (pendingOut[c] || 0) + (parseFloat(t.source.amount) || 0); }
+  const [trRows] = await db.execute("SELECT symbol, SUM(remaining_quantity) AS q FROM position_tranches WHERE exchange <> 'kraken' AND remaining_quantity > 0 GROUP BY symbol");
+  const trancheQty = {}; for (const r of trRows) { const c = base(r.symbol); trancheQty[c] = (trancheQty[c] || 0) + Number(r.q); }
+  const SKIP = { USD: 1, USDT: 1, USDC: 1, EUR: 1, GBP: 1 };
+  const coins = new Set(Object.keys(trancheQty));
+  for (const t of tx.rows) for (const s of [t.source, t.destination]) if (s && s.currency) coins.add(String(s.currency).toUpperCase());
+  for (const c of Object.keys(held)) if (held[c] > 0) coins.add(c);
+  const plan = [], skipped = [];
+  for (const c of coins) {
+    if (SKIP[c]) continue;
+    const actual = held[c] || 0, oldTr = trancheQty[c] || 0;
+    if (actual <= 0 && oldTr <= 0) continue;                    // nothing held, nothing claimed: nothing to do
+    const r = rebuildPositionFromTransactions(tx.rows, c);
+    const pend = pendingOut[c] || 0, tol = Math.max(1e-6, actual * 0.005);
+    const matches = Math.abs(r.rebuilt_qty - pend - actual) <= tol || Math.abs(r.rebuilt_qty - pend + (r.staked_qty || 0) - actual) <= tol;
+    if (!matches) { skipped.push({ coin: c, reason: 'rebuilt quantity does not match the balance - left untouched', rebuilt: r.rebuilt_qty, actual }); continue; }
+    const oldEntryRaw = entryPrices.get(c + '-USD');
+    const oldEntry = oldEntryRaw != null ? Number(oldEntryRaw) : null;
+    let newEntry = null, entryNote = null;
+    if (actual > 0) {
+      if (krakenHeld.has(c)) entryNote = 'also held on Kraken - entry price left unchanged';
+      else if (!r.avg_trustworthy || !(r.avg_cost > 0)) entryNote = 'no trustworthy average - entry price left unchanged';
+      else if (actual * r.avg_cost < 1) entryNote = 'dust under $1 - entry price left unchanged';
+      else newEntry = r.avg_cost;
+    }
+    if (entryNote) skipped.push({ coin: c, reason: entryNote });
+    const trancheEntry = newEntry != null ? newEntry : (oldEntry != null ? oldEntry : (r.avg_cost || 0));
+    plan.push({ coin: c, held: Number(actual.toFixed(8)), old_tranche_qty: Number(oldTr.toFixed(8)), new_tranche_qty: Number(actual.toFixed(8)),
+      tranche_entry: trancheEntry, old_entry: oldEntry, new_entry: newEntry,
+      entry_changes: newEntry != null && (oldEntry == null || Math.abs(oldEntry - newEntry) > 1e-10),
+      value_usd: Number((actual * (r.avg_cost || trancheEntry || 0)).toFixed(2)) });
+  }
+  plan.sort((a, b) => b.value_usd - a.value_usd);
+  return { ok: true, records: tx.rows.length, plan, skipped };
+}
+
+async function applyLedgerRebuild(plan, runId) {
+  // DDL first: MySQL commits implicitly on CREATE TABLE, so none of it may sit inside the transaction.
+  await db.execute(`CREATE TABLE IF NOT EXISTS ledger_rebuild_log (
+    id INT AUTO_INCREMENT PRIMARY KEY, run_id VARCHAR(40) NOT NULL, kind VARCHAR(20) NOT NULL, ref VARCHAR(60) NOT NULL,
+    old_value VARCHAR(60) NULL, new_value VARCHAR(60) NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, INDEX idx_run (run_id))`);
+  const tag = String(runId).replace(/[^a-z0-9_]/gi, '').toLowerCase();
+  await db.execute('CREATE TABLE snap_tranches_' + tag + ' AS SELECT * FROM position_tranches');
+  await db.execute('CREATE TABLE snap_entries_' + tag + ' AS SELECT * FROM entry_prices');
+  const conn = await db.getConnection();
+  const changedEntries = [];
+  const counts = { lots_closed: 0, lots_added: 0, entries_changed: 0 };
+  try {
+    await conn.beginTransaction();
+    const log = (kind, ref, oldV, newV) => conn.execute('INSERT INTO ledger_rebuild_log (run_id, kind, ref, old_value, new_value) VALUES (?, ?, ?, ?, ?)',
+      [runId, kind, String(ref), oldV == null ? null : String(oldV), newV == null ? null : String(newV)]);
+    for (const p of plan) {
+      const [open] = await conn.execute("SELECT id, remaining_quantity FROM position_tranches WHERE symbol IN (?, ?) AND exchange <> 'kraken' AND remaining_quantity > 0 FOR UPDATE", [p.coin, p.coin + '-USD']);
+      for (const o of open) { await log('lot_closed', o.id, o.remaining_quantity, 0); counts.lots_closed++; }
+      if (open.length) await conn.execute('UPDATE position_tranches SET remaining_quantity = 0 WHERE id IN (' + open.map(() => '?').join(',') + ')', open.map(o => o.id));
+      if (p.held > 0) {
+        const [ins] = await conn.execute(
+          "INSERT INTO position_tranches (symbol, exchange, quantity, entry_price, entry_date, remaining_quantity, is_legacy, notes) VALUES (?, 'revolut', ?, ?, NOW(), ?, 0, ?)",
+          [p.coin, p.held, p.tranche_entry, p.held, '#345 rebuilt from Revolut X transactions - average cost, fees included']);
+        await log('lot_added', ins.insertId, null, p.held); counts.lots_added++;
+      }
+      if (p.entry_changes) {
+        const sym = p.coin + '-USD';
+        const [ex] = await conn.execute('SELECT entry_price FROM entry_prices WHERE symbol = ? FOR UPDATE', [sym]);
+        if (ex.length) {
+          await conn.execute('UPDATE entry_prices SET entry_price = ? WHERE symbol = ?', [p.new_entry, sym]);
+          await log('entry_changed', sym, ex[0].entry_price, p.new_entry);
+        } else {
+          await conn.execute('INSERT INTO entry_prices (symbol, entry_price, original_entry_price, original_entry_date, cycle_count) VALUES (?, ?, ?, NOW(), 0)', [sym, p.new_entry, p.new_entry]);
+          await log('entry_added', sym, null, p.new_entry);
+        }
+        changedEntries.push([sym, p.new_entry]); counts.entries_changed++;
+      }
+    }
+    await conn.commit();
+  } catch (e) {
+    await conn.rollback().catch(() => {});
+    throw e;
+  } finally { conn.release(); }
+  for (const [sym, v] of changedEntries) entryPrices.set(sym, Number(v));   // memory follows the database, only after commit
+  return counts;
+}
+
+async function undoLedgerRebuild(runId) {
+  const [rows] = await db.execute('SELECT * FROM ledger_rebuild_log WHERE run_id = ? ORDER BY id DESC', [runId]);
+  if (!rows.length) return { ok: false, error: 'No rebuild run with id ' + runId };
+  if (rows.some(r => r.kind === 'undone')) return { ok: false, error: 'Run ' + runId + ' has already been undone.' };
+  const conn = await db.getConnection();
+  const touched = new Set(); const counts = { lots_reopened: 0, lots_removed: 0, entries_restored: 0 };
+  try {
+    await conn.beginTransaction();
+    for (const r of rows) {
+      if (r.kind === 'lot_closed') { await conn.execute('UPDATE position_tranches SET remaining_quantity = ? WHERE id = ?', [r.old_value, r.ref]); counts.lots_reopened++; }
+      else if (r.kind === 'lot_added') { await conn.execute('DELETE FROM position_tranches WHERE id = ?', [r.ref]); counts.lots_removed++; }
+      else if (r.kind === 'entry_changed') { await conn.execute('UPDATE entry_prices SET entry_price = ? WHERE symbol = ?', [r.old_value, r.ref]); touched.add(r.ref); counts.entries_restored++; }
+      else if (r.kind === 'entry_added') { await conn.execute('DELETE FROM entry_prices WHERE symbol = ?', [r.ref]); touched.add(r.ref); counts.entries_restored++; }
+    }
+    await conn.execute("INSERT INTO ledger_rebuild_log (run_id, kind, ref) VALUES (?, 'undone', '-')", [runId]);
+    await conn.commit();
+  } catch (e) { await conn.rollback().catch(() => {}); throw e; } finally { conn.release(); }
+  for (const sym of touched) {
+    const [er] = await db.execute('SELECT entry_price FROM entry_prices WHERE symbol = ?', [sym]);
+    if (er.length) entryPrices.set(sym, Number(er[0].entry_price)); else entryPrices.delete(sym);
+  }
+  return { ok: true, run_id: runId, ...counts };
+}
+
 async function reconcileTransactions(daysBack = 30, dryRun = null) {
   const [cfgRows] = await db.execute(
     "SELECT config_key, config_value FROM system_config WHERE config_key IN ('reconciler_writes_enabled', 'reconciler_cutover_ms')"
@@ -15209,7 +15336,7 @@ let rows;
   server.tool('manage_trading',
     'Log journal entries, trade intentions, trader preferences, update invested capital, or configure USDT sweep',
     {
-      action:                 z.enum(['log_journal', 'log_intention', 'save_preference', 'update_capital', 'configure_sweep', 'configure_auto_execute', 'log_dev_issue', 'update_session_state', 'upsert_coin_strategy', 'export_dev_log', 'log_research', 'log_pm_decision', 'log_dev_decision', 'void_journal', 'configure_away_mode', 'delete_tax_lot', 'log_catalyst', 'log_thesis', 'configure_abnormal', 'configure_dnd', 'configure_thesis_nudge', 'upsert_catalogue']).describe('What trading action to perform'),
+      action:                 z.enum(['log_journal', 'log_intention', 'save_preference', 'update_capital', 'configure_sweep', 'configure_auto_execute', 'log_dev_issue', 'update_session_state', 'upsert_coin_strategy', 'export_dev_log', 'log_research', 'log_pm_decision', 'log_dev_decision', 'void_journal', 'configure_away_mode', 'delete_tax_lot', 'log_catalyst', 'log_thesis', 'configure_abnormal', 'configure_dnd', 'configure_thesis_nudge', 'upsert_catalogue', 'ledger_rebuild_apply', 'ledger_rebuild_undo']).describe('What trading action to perform'),
       symbol:                 z.string().optional().describe('Coin e.g. NEAR-USD or NEAR'),
       trade_action:           z.enum(['buy', 'sell', 'hold', 'add', 'reduce', 'payment', 'transfer', 'pass']).optional().describe('Trade action for log_journal or log_intention — use pass to log a skipped trade for shadow grading at +7d/+30d'),
       price:                  z.coerce.number().optional().describe('Price for log_journal'),
@@ -15274,6 +15401,8 @@ let rows;
       dev_supersedes_id:    z.coerce.number().optional().describe('log_dev_decision: id of an older decision this replaces'),
       journal_id:           z.coerce.number().optional().describe('void_journal: trading_journal row id to archive + delete'),
       tax_lot_id:           z.coerce.number().optional().describe('delete_tax_lot: tax_lots.id row to read and hard-delete'),
+      ledger_confirm:       z.boolean().optional().describe('#345 ledger_rebuild_apply: must be exactly true to WRITE. Omitted = preview only, nothing written.'),
+      ledger_run_id:        z.string().optional().describe('#345 ledger_rebuild_undo: the run_id returned by the apply to reverse'),
       catalyst_id:          z.coerce.number().optional().describe('log_catalyst: existing catalyst_calendar id to update (omit to insert new)'),
       catalyst:             z.string().optional().describe('log_catalyst: the catalyst description'),
       catalyst_date:        z.string().optional().describe('log_catalyst: date YYYY-MM-DD (or null if undated)'),
@@ -15316,7 +15445,7 @@ let rows;
       dnd_retrace_pct:  z.coerce.number().optional().describe('configure_dnd: #160 %% of move price must retrace before trough arms (default 50)'),
       dnd_bounce_pct:   z.coerce.number().optional().describe('configure_dnd: #160 %% bounce off trough to trigger rebuy (default 8)'),
     },
-    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, away_buy_usd, away_sell_pct, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam, manual_only_symbols: manualOnlyParam, title, detail, category, status: devStatus, source: devSource, related_symbol: relSymbol, dev_log_id, active_workstream, progress, open_threads, next_action, recent_decision, recent_decisions, cs_status, cs_role, cs_theme, cs_strategy_md, pm_decision, pm_principle_tag, pm_conviction, pm_captured_by, pm_supersedes_id, dev_decision, dev_principle_tag, dev_cross_thread, dev_alternatives, dev_related_log, dev_supersedes_id, journal_id, tax_lot_id, away_action, away_coins, sell_floors, per_coin_enabled, catalyst_id, catalyst, catalyst_date, catalyst_type, expected_impact, priced_in_risk, catalyst_confidence, catalyst_source, catalyst_status, abn_alert_floor_pct, abn_broad_floor_pct, abn_broad_threshold, abn_cooldown_min, dnd_action, dnd_coins, dnd_arm_pct, dnd_trail_pct, dnd_sell_pct, dnd_retrace_pct, dnd_bounce_pct, conviction, bull_case, bear_case, invalidation_triggers, supporting_refs, tn_enabled, tn_min_severity, tn_cooldown_min, cat_kind, cat_key, cat_name, cat_active, cat_description, cat_detection_signals, cat_detection_criteria, cat_data_available, cat_data_gap, cat_dev_ref, cat_status, cat_what_it_does, cat_when_it_wins, cat_when_it_loses, cat_parameters, cat_conflicts, cat_evidence, cat_notes }) => {
+    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, away_buy_usd, away_sell_pct, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam, manual_only_symbols: manualOnlyParam, title, detail, category, status: devStatus, source: devSource, related_symbol: relSymbol, dev_log_id, active_workstream, progress, open_threads, next_action, recent_decision, recent_decisions, cs_status, cs_role, cs_theme, cs_strategy_md, pm_decision, pm_principle_tag, pm_conviction, pm_captured_by, pm_supersedes_id, dev_decision, dev_principle_tag, dev_cross_thread, dev_alternatives, dev_related_log, dev_supersedes_id, journal_id, tax_lot_id, away_action, away_coins, sell_floors, per_coin_enabled, catalyst_id, catalyst, catalyst_date, catalyst_type, expected_impact, priced_in_risk, catalyst_confidence, catalyst_source, catalyst_status, abn_alert_floor_pct, abn_broad_floor_pct, abn_broad_threshold, abn_cooldown_min, dnd_action, dnd_coins, dnd_arm_pct, dnd_trail_pct, dnd_sell_pct, dnd_retrace_pct, dnd_bounce_pct, conviction, bull_case, bear_case, invalidation_triggers, supporting_refs, tn_enabled, tn_min_severity, tn_cooldown_min, cat_kind, cat_key, cat_name, cat_active, cat_description, cat_detection_signals, cat_detection_criteria, cat_data_available, cat_data_gap, cat_dev_ref, cat_status, cat_what_it_does, cat_when_it_wins, cat_when_it_loses, cat_parameters, cat_conflicts, cat_evidence, cat_notes, ledger_confirm, ledger_run_id }) => {
       // Make hodl_symbols accessible in configure_auto_execute via params object
       const params = { hodl_symbols: hodlSymbolsParam, manual_only_symbols: manualOnlyParam };
 
@@ -16034,6 +16163,27 @@ let rows;
           deleted_row: { symbol: tlrow.symbol, exchange: tlrow.exchange, quantity: tlrow.quantity, cost_basis_usd: tlrow.cost_basis_usd, cost_per_unit: tlrow.cost_per_unit, acquired_at: tlrow.acquired_at, lot_status: tlrow.lot_status, journal_id: tlrow.journal_id },
           note: 'Hard-deleted from tax_lots. Not restorable via archived_journal.'
         }) }] };
+      } else if (action === 'ledger_rebuild_apply') {
+        // #345 PREVIEW BY DEFAULT. Writes only when ledger_confirm is exactly boolean true.
+        const reply = (o) => ({ content: [{ type: 'text', text: JSON.stringify(o) }] });
+        const p = await planLedgerRebuild();
+        if (!p.ok) return reply(p);
+        const entries = p.plan.filter(x => x.entry_changes).map(x => ({ coin: x.coin, from: x.old_entry, to: x.new_entry, value_usd: x.value_usd }));
+        const lots = p.plan.filter(x => Math.abs(x.old_tranche_qty - x.new_tranche_qty) > 1e-8).map(x => ({ coin: x.coin, ledger_qty_from: x.old_tranche_qty, to: x.new_tranche_qty }));
+        if (ledger_confirm !== true) {
+          return reply({ ok: true, preview: true, written: false, records_replayed: p.records, coins_in_plan: p.plan.length,
+            entry_price_changes: entries, ledger_quantity_changes: lots, left_untouched: p.skipped,
+            note: 'PREVIEW - nothing written. Every held coin is also re-pooled into one lot at its real quantity. Call again with ledger_confirm: true to apply.' });
+        }
+        const runId = 'r345_' + Date.now();
+        const counts = await applyLedgerRebuild(p.plan, runId);
+        console.log('[ledger-rebuild] applied run ' + runId + ': ' + JSON.stringify(counts));
+        return reply({ ok: true, applied: true, run_id: runId, ...counts, entry_price_changes: entries, ledger_quantity_changes: lots.length,
+          undo: "manage_trading action 'ledger_rebuild_undo' with ledger_run_id '" + runId + "'" });
+      } else if (action === 'ledger_rebuild_undo') {
+        if (!ledger_run_id) return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'ledger_run_id required' }) }] };
+        const u = await undoLedgerRebuild(String(ledger_run_id));
+        return { content: [{ type: 'text', text: JSON.stringify(u) }] };
       }
     }
   );
