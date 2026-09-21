@@ -1,0 +1,192 @@
+name: Gemini Analyst
+
+# Analysis only - Gemini reasons, Claude changes the live system. The brief for each
+# job lives in a dev-log ticket: run with task_id Dev-NNN and the ticket's full text
+# reaches Gemini through the project-history briefing. Output: docs/gemini/<task_id>.md
+# (docs/ is outside Railway's watch patterns, so this never restarts the server).
+
+on:
+  workflow_dispatch:
+    inputs:
+      task_id:
+        description: 'Dev-log ticket, e.g. Dev-342'
+        required: true
+        type: string
+      task:
+        description: 'Brief (optional - "See ticket" is enough when the ticket holds it)'
+        required: false
+        default: 'See the ticket named in task_id for the full brief.'
+        type: string
+      context_files:
+        description: 'Repo files Gemini reads, comma-separated'
+        required: false
+        default: 'server.js'
+        type: string
+      history_since:
+        description: 'Optional YYYY-MM-DD: include the FULL dev log since this date'
+        required: false
+        default: ''
+        type: string
+      model:
+        description: 'Gemini model'
+        required: false
+        default: 'gemini-3.6-flash'
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: gemini-analyst
+  cancel-in-progress: false
+
+jobs:
+  analyse:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Google Gen AI SDK
+        run: npm install @google/genai
+
+      - name: Analyse via Gemini API
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          DEV_LOG_TOKEN: ${{ secrets.DEV_LOG_TOKEN }}
+          TASK_ID: ${{ inputs.task_id }}
+          TASK: ${{ inputs.task }}
+          CONTEXT_FILES: ${{ inputs.context_files }}
+          HISTORY_SINCE: ${{ inputs.history_since }}
+          MODEL: ${{ inputs.model }}
+          BASE_COMMIT: ${{ github.sha }}
+        run: |
+          node --input-type=module << 'NODEEOF'
+          import { GoogleGenAI } from '@google/genai';
+          import fs from 'fs';
+          import path from 'path';
+
+          const id = String(process.env.TASK_ID || '').trim();
+          if (!/^[A-Za-z0-9._-]{1,60}$/.test(id)) {
+            console.error('ABORT: task_id may contain only letters, digits, dot, dash, underscore');
+            process.exit(1);
+          }
+          const task = String(process.env.TASK || '').trim();
+
+          // Context files: inside the repo only, must exist, 2.5M characters in total at most.
+          const files = String(process.env.CONTEXT_FILES || 'server.js').split(',').map(s => s.trim()).filter(Boolean);
+          const parts = [];
+          let total = 0;
+          for (const f of files) {
+            const norm = path.normalize(f);
+            if (path.isAbsolute(norm) || norm === '..' || norm.startsWith('..' + path.sep)) {
+              console.error('ABORT: outside the repo: ' + f);
+              process.exit(1);
+            }
+            if (!fs.existsSync(norm) || !fs.statSync(norm).isFile()) {
+              console.error('ABORT: file not found: ' + f);
+              process.exit(1);
+            }
+            const txt = fs.readFileSync(norm, 'utf8').replace(/\r\n/g, '\n');
+            total += txt.length;
+            if (total > 2500000) {
+              console.error('ABORT: context files exceed 2,500,000 characters - name fewer files');
+              process.exit(1);
+            }
+            parts.push({ f: norm, txt });
+          }
+
+          // Project history from the live dev log (#348/#350). Best effort.
+          let history = '';
+          try {
+            if (!process.env.DEV_LOG_TOKEN) throw new Error('DEV_LOG_TOKEN secret not set');
+            const said = id + ' ' + task;
+            const refs = [...new Set([...said.matchAll(/(?:#|Dev-)(\d{2,4})\b/gi)].map(m => m[1]))].slice(0, 20);
+            const since = /^\d{4}-\d{2}-\d{2}$/.test(String(process.env.HISTORY_SINCE || '').trim()) ? String(process.env.HISTORY_SINCE).trim() : '';
+            const base = process.env.DEV_LOG_URL || 'https://revolut-claude-production.up.railway.app/dev-log/context';
+            const url = base + '?recent=25&refs=' + refs.join(',') + (since ? '&since=' + since : '');
+            const r = await fetch(url, { headers: { 'x-dev-log-token': process.env.DEV_LOG_TOKEN } });
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            history = await r.text();
+            console.log('Project history: ' + history.length + ' chars; tickets named: ' + (refs.join(', ') || 'none') + (since ? '; full since ' + since : ''));
+          } catch (e) {
+            console.log('Project history unavailable (' + e.message + ') - analysing without it.');
+          }
+
+          // Prompt assembled as an ARRAY of single-line strings: a multi-line template
+          // literal would put lines at column 0 and end the YAML block early.
+          const rules = [
+            'You are the ANALYST for a live crypto trading system. You reason; Claude implements and verifies every change against the live system.',
+            'Task ' + id + ': ' + task,
+            '',
+            '=== YOUR ROLE - RULES, NOT STYLE PREFERENCES ===',
+            '1. ANALYSIS ONLY. Do not write patches or SEARCH/REPLACE blocks. Where code should change, say WHAT and WHY; Claude writes the edit.',
+            '2. EVIDENCE FOR EVERY CLAIM. Name the file and function and quote at most two lines. If you cannot point to it in the files below, it is an assumption: label it so.',
+            '3. VERIFY IDENTIFIERS. Search the files. Never assume a function, table, column or route exists because the name sounds right.',
+            '4. CITE ONLY TICKETS THAT APPEAR IN THE PROJECT HISTORY BELOW. If you need one that is not there, say so.',
+            '5. MARK UNCERTAINTY. Put [VERIFY] beside anything that depends on the live system: database contents, runtime state, prices, environment variables.',
+            '6. THINK ADVERSARIALLY. Every state a feature can be in, every race, every malformed or hostile input, and what happens in each. The dangerous cases matter most.',
+            '7. RESPECT STANDING DECISIONS in the project history. If a finding conflicts with one, say so plainly rather than recommending around it.',
+            '8. SAY WHAT YOU DID NOT CHECK. An honest gap is worth more than false confidence.',
+            '',
+            '=== OUTPUT - Markdown, these sections in this order ===',
+            '## Summary (at most 5 lines)',
+            '## Findings (numbered; each with severity HIGH / MEDIUM / LOW, evidence, and why it matters)',
+            '## Test cases (tables where the task calls for a matrix: case | input | expected | current behaviour)',
+            '## Recommendations for Claude (what to change and why - no code)',
+            '## [VERIFY] list',
+            '## Not checked',
+            'If the brief asks for a document (for example a rewrite), put the COMPLETE document under Recommendations for Claude.',
+            '',
+            '=== PROJECT HISTORY (live dev log) - includes the task brief when a ticket is named ===',
+            history || '(unavailable for this run)',
+            ''
+          ];
+          for (const p of parts) {
+            rules.push('=== FILE: ' + p.f + ' ===');
+            rules.push(p.txt);
+            rules.push('');
+          }
+
+          const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+          const model = String(process.env.MODEL || 'gemini-3.6-flash').trim();
+          const response = await ai.models.generateContent({ model, contents: rules.join('\n') });
+          const out = String(response.text || '');
+          if (!out.trim()) {
+            console.error('ABORT: Gemini returned an empty response');
+            process.exit(1);
+          }
+
+          const head = [
+            '# Gemini analysis: ' + id,
+            '',
+            'TASK: ' + task.replace(/\s+/g, ' ').slice(0, 500),
+            'FILES READ: ' + parts.map(p => p.f + ' (' + p.txt.length + ' chars)').join(', '),
+            'PROJECT HISTORY: ' + (history ? history.length + ' chars' : 'unavailable'),
+            'MODEL: ' + model,
+            'BASE_COMMIT: ' + process.env.BASE_COMMIT,
+            'DRAFTED: ' + new Date().toISOString(),
+            'STATUS: awaiting Claude review - nothing here has been verified against the live system',
+            '',
+            '---',
+            ''
+          ].join('\n');
+          fs.mkdirSync('docs/gemini', { recursive: true });
+          fs.writeFileSync(path.join('docs/gemini', id + '.md'), head + out + '\n');
+          console.log('Wrote docs/gemini/' + id + '.md (' + out.length + ' chars)');
+          NODEEOF
+
+      - name: Commit and Push Report
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/gemini/
+          git diff --cached --quiet && { echo "No report change."; exit 0; }
+          git commit -m "Gemini analysis: ${{ inputs.task_id }}"
+          git pull --rebase
+          git push
