@@ -667,7 +667,6 @@
   <button class="tab-btn active" onclick="switchTab('portfolio')">Portfolio</button>
   <button class="tab-btn" onclick="switchTab('activity')">📋 Activity</button>
   <button class="tab-btn" onclick="switchTab('journal')">📓 Journal</button>
-  <button class="tab-btn" onclick="switchTab('rebalancing')">📊 Rebalancing</button>
   <button class="tab-btn" onclick="switchTab('kraken')">🦑 Kraken</button>
   <button class="tab-btn" onclick="switchTab('scorecards')">📊 Scorecards</button>
   <button class="tab-btn" onclick="switchTab('concentration')">Conc %</button>
@@ -903,64 +902,6 @@
     <div class="learning-text" id="learning-text">Loading…</div>
   </div>
 
-  <!-- Add Trade form -->
-  <div class="card">
-    <div class="card-title">Log a Trade</div>
-
-    <div class="form-row">
-      <label class="form-label">Coin</label>
-      <input class="form-input" type="text" id="j-coin" placeholder="CC, SOL, HYPE…" maxlength="10" />
-    </div>
-
-    <div class="form-row">
-      <label class="form-label">Action</label>
-      <div class="action-group" id="j-action-group">
-        <button class="action-btn" onclick="selectAction('buy')">Buy</button>
-        <button class="action-btn" onclick="selectAction('sell')">Sell</button>
-        <button class="action-btn" onclick="selectAction('hold')">Hold</button>
-        <button class="action-btn" onclick="selectAction('add')">Add</button>
-        <button class="action-btn" onclick="selectAction('reduce')">Reduce</button>
-      </div>
-    </div>
-
-    <div class="form-row">
-      <label class="form-label">Price (USD)</label>
-      <input class="form-input" type="number" id="j-price" placeholder="0.00" step="any" min="0" />
-    </div>
-
-    <div class="form-row">
-      <label class="form-label">Quantity (optional)</label>
-      <input class="form-input" type="number" id="j-qty" placeholder="0" step="any" min="0" />
-    </div>
-
-    <div class="form-row">
-      <label class="form-label">Reasoning (optional)</label>
-      <textarea class="form-input form-textarea" id="j-reasoning" placeholder="Why this trade?"></textarea>
-    </div>
-
-    <div class="form-row">
-      <label class="form-label">Emotion</label>
-      <div class="emotion-group" id="j-emotion-group">
-        <button class="emotion-btn" onclick="selectEmotion('confident')">Confident</button>
-        <button class="emotion-btn" onclick="selectEmotion('uncertain')">Uncertain</button>
-        <button class="emotion-btn" onclick="selectEmotion('fomo')">FOMO</button>
-        <button class="emotion-btn" onclick="selectEmotion('fearful')">Fearful</button>
-        <button class="emotion-btn" onclick="selectEmotion('neutral')">Neutral</button>
-      </div>
-    </div>
-
-    <div class="form-row">
-      <label class="form-label">Followed Claude's Recommendation?</label>
-      <div class="action-group" id="j-followed-group">
-        <button class="action-btn" onclick="selectFollowed('yes')">Yes</button>
-        <button class="action-btn" onclick="selectFollowed('no')">No</button>
-        <button class="action-btn selected" onclick="selectFollowed('na')">N/A</button>
-      </div>
-    </div>
-
-    <button class="btn-accent" onclick="submitJournalEntry()">Log Trade</button>
-  </div>
-
   <!-- Journal entries -->
   <div class="card">
     <div class="card-title">Recent Trades</div>
@@ -975,135 +916,9 @@
     <div id="profile-list">
       <div class="empty-state">No preferences saved yet.</div>
     </div>
-    <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;">
-      <input class="form-input" type="text" id="pref-input" placeholder="e.g. I prefer swing trading over day trading" style="flex:1;min-width:180px;" />
-      <button class="btn-outline" onclick="addPreference()">Add</button>
-    </div>
   </div>
 
 </div><!-- /tab-journal -->
-
-<!-- ══════════════════════════════════ REBALANCING TAB ═══════════════════ -->
-<div id="tab-rebalancing" class="tab-content">
-
-  <!-- Rebalancing Tracker -->
-  <div class="card" id="rebal-tracker-card">
-    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;flex-wrap:wrap;gap:8px">
-      <div class="card-title" style="margin:0">🔄 Rebalancing Tracker</div>
-      <div id="rebal-tracker-meta" style="font-size:0.75rem;color:var(--text-muted)">Loading…</div>
-    </div>
-    <div id="rebal-accuracy-bar" class="rebal-accuracy-bar" style="display:none">
-      <div class="rebal-accuracy-pct" id="rebal-accuracy-pct">—</div>
-      <div>
-        <div style="font-weight:700;font-size:0.9rem" id="rebal-accuracy-label">ACCURACY</div>
-        <div class="rebal-accuracy-label" id="rebal-accuracy-sub">— decisions</div>
-      </div>
-      <div style="margin-left:auto;text-align:right">
-        <div style="font-size:0.72rem;color:var(--text-muted)">Avg 7d gain</div>
-        <div style="font-weight:700" id="rebal-avg-pnl">—</div>
-      </div>
-    </div>
-    <div style="overflow-x:auto">
-      <table class="rebal-tracker-table">
-        <thead>
-          <tr>
-            <th>Date</th>
-            <th>Sold</th>
-            <th>Bought</th>
-            <th>7d Result</th>
-            <th>30d Result</th>
-            <th>Outcome</th>
-          </tr>
-        </thead>
-        <tbody id="rebal-tracker-body">
-          <tr><td colspan="6" style="text-align:center;color:var(--text-muted);padding:20px">No rebalances logged yet</td></tr>
-        </tbody>
-      </table>
-    </div>
-  </div>
-
-  <!-- Health Overview -->
-  <div class="card">
-    <div class="card-title">Portfolio Health</div>
-    <div class="health-grid">
-      <canvas id="health-donut" width="130" height="130"></canvas>
-      <div>
-        <div class="health-legend">
-          <div class="legend-item"><div class="legend-dot" style="background:#00ffc8"></div><span id="leg-winning">Winning — 0</span></div>
-          <div class="legend-item"><div class="legend-dot" style="background:#ffcc00"></div><span id="leg-small">Small loss (0–20%) — 0</span></div>
-          <div class="legend-item"><div class="legend-dot" style="background:#ff7800"></div><span id="leg-moderate">Moderate loss (20–50%) — 0</span></div>
-          <div class="legend-item"><div class="legend-dot" style="background:#ff4d6a"></div><span id="leg-severe">Severe loss (50%+) — 0</span></div>
-          <div class="legend-item"><div class="legend-dot" style="background:#555"></div><span id="leg-none">No entry set — 0</span></div>
-        </div>
-      </div>
-    </div>
-    <div class="rb-summary-row">
-      <div class="rb-stat">
-        <div class="rb-stat-label">Portfolio Value</div>
-        <div class="rb-stat-value" id="rb-total-value">—</div>
-      </div>
-      <div class="rb-stat">
-        <div class="rb-stat-label">Unrealised Loss</div>
-        <div class="rb-stat-value" id="rb-total-loss" style="color:var(--danger)">—</div>
-      </div>
-      <div class="rb-stat">
-        <div class="rb-stat-label">Recovery Needed</div>
-        <div class="rb-stat-value" id="rb-recovery-pct" style="color:var(--warn)">—</div>
-      </div>
-    </div>
-  </div>
-
-  <!-- Position Table -->
-  <div class="card">
-    <div class="card-title">Positions — Sorted by P&L (worst first)</div>
-    <div style="overflow-x:auto">
-      <table class="rb-table">
-        <thead>
-          <tr>
-            <th>Coin</th>
-            <th>Value</th>
-            <th>Entry</th>
-            <th>P&L %</th>
-            <th>P&L $</th>
-            <th>Recovery Needed</th>
-            <th>Status</th>
-            <th></th>
-          </tr>
-        </thead>
-        <tbody id="rb-positions-body">
-          <tr><td colspan="8" style="text-align:center;color:var(--text-muted);padding:20px">Loading…</td></tr>
-        </tbody>
-      </table>
-    </div>
-  </div>
-
-  <!-- Rebalancing Recommendations -->
-  <div class="card">
-    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;flex-wrap:wrap;gap:8px">
-      <div class="card-title" style="margin:0">🤖 AI Rebalancing Plan</div>
-      <button class="btn-accent btn-sm" id="rb-refresh-btn" onclick="runRebalancingAnalysis()">Refresh Analysis</button>
-    </div>
-    <div class="analysis-meta" id="rb-analysis-date">No analysis yet — click Refresh Analysis</div>
-    <div class="analysis-text" id="rb-analysis-text">Run an analysis to get Claude's rebalancing recommendations for your portfolio.</div>
-  </div>
-
-  <!-- Freed Capital Calculator -->
-  <div class="card">
-    <div class="card-title">💰 Freed Capital Calculator</div>
-    <div style="font-size:0.8rem;color:var(--text-muted);margin-bottom:12px">Select positions to sell and see how much capital you'd free up:</div>
-    <div id="cap-calc-list">
-      <div class="empty-state">Loading positions…</div>
-    </div>
-    <div class="freed-total" id="freed-total-box" style="display:none">
-      <div>
-        <div class="freed-label">Capital Freed</div>
-        <div style="font-size:0.72rem;color:var(--text-muted);margin-top:2px" id="freed-count">0 positions selected</div>
-      </div>
-      <div class="freed-amount" id="freed-amount">$0</div>
-    </div>
-  </div>
-
-</div><!-- /tab-rebalancing -->
 
 <!-- ════════════════════════════════════ KRAKEN TAB ══════════════════════ -->
 <div id="tab-kraken" class="tab-content">
@@ -1121,31 +936,6 @@
     <div id="kraken-holdings"><div class="empty-state">Loading…</div></div>
   </div>
 
-  <!-- Trade execution panel -->
-  <div class="card">
-    <div class="card-title">⚡ Execute Trade</div>
-    <div style="display:flex;flex-direction:column;gap:10px">
-      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-        <select id="k-side" style="background:var(--surface2);color:var(--text);border:1px solid rgba(255,255,255,0.1);border-radius:6px;padding:6px 10px;font-size:0.9rem">
-          <option value="buy">Buy</option>
-          <option value="sell">Sell</option>
-        </select>
-        <input id="k-symbol" type="text" placeholder="Symbol e.g. ZK" style="width:90px;background:var(--surface2);color:var(--text);border:1px solid rgba(255,255,255,0.1);border-radius:6px;padding:6px 10px;font-size:0.9rem" />
-        <input id="k-volume" type="number" placeholder="Volume" min="0" step="any" style="width:110px;background:var(--surface2);color:var(--text);border:1px solid rgba(255,255,255,0.1);border-radius:6px;padding:6px 10px;font-size:0.9rem" />
-        <select id="k-ordertype" style="background:var(--surface2);color:var(--text);border:1px solid rgba(255,255,255,0.1);border-radius:6px;padding:6px 10px;font-size:0.9rem">
-          <option value="market">Market</option>
-          <option value="limit">Limit</option>
-        </select>
-        <input id="k-price" type="number" placeholder="Limit price" min="0" step="any" style="width:120px;background:var(--surface2);color:var(--text);border:1px solid rgba(255,255,255,0.1);border-radius:6px;padding:6px 10px;font-size:0.9rem" />
-      </div>
-      <div id="k-trade-preview" style="font-size:0.82rem;color:var(--text-muted);min-height:18px"></div>
-      <button class="btn-outline" onclick="submitKrakenTrade()" style="align-self:flex-start">Send to Telegram for Approval</button>
-      <div style="font-size:0.75rem;color:var(--text-muted)">
-        Trade request will be sent to Telegram. Reply <b>'approve trade'</b> to execute or <b>'cancel trade'</b> to abort.
-      </div>
-    </div>
-  </div>
-
 </div><!-- /tab-kraken -->
 
 <!-- ════════════════════════════════════ ACTIVITY TAB ════════════════════ -->
@@ -1154,7 +944,7 @@
   <div class="card">
     <div class="card-title">📋 Activity Feed</div>
     <p style="color:var(--text-muted);font-size:0.78rem;margin:0 0 14px">
-      All trades, payments, sweeps and transfers. Tap Edit on any entry to correct the reason or type.
+      All trades, payments, sweeps and transfers.
     </p>
 
     <div class="filter-bar">

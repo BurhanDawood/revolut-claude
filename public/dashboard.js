@@ -1,6 +1,6 @@
 // dashboard.js v3.1.0 — matched to dashboard.html
 
-var DASHBOARD_VERSION = '3.1.0';
+var DASHBOARD_VERSION = '3.2.0';   // #352 dashboard audit (Dev-343)
 var csMap = {};
 var ledgerCache = null;
 console.log('Dashboard v' + DASHBOARD_VERSION);
@@ -68,12 +68,20 @@ function showToast(msg, isError) {
   setTimeout(function() { t.className = 'toast'; }, 3000);
 }
 
+// #352: a failed load used to return null silently and leave panels on 'Loading...' forever. Now it says so - at most
+// one notice every 10 seconds, so a burst of failures (for example the server restarting) shows once, not twenty times.
+var _lastLoadWarn = 0;
 function fetchData(url) {
   return fetch(url).then(function(r) {
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return r.json();
   }).catch(function(e) {
     console.error('Fetch error ' + url + ':', e.message);
+    var now = Date.now();
+    if (now - _lastLoadWarn > 10000) {
+      _lastLoadWarn = now;
+      showToast('Some data did not load (' + e.message + ') - it will retry on the next refresh', true);
+    }
     return null;
   });
 }
@@ -92,7 +100,6 @@ function switchTab(name) {
   });
   if (name === 'activity') loadActivity('all');
   if (name === 'kraken') loadKraken();
-  if (name === 'rebalancing') loadRebalancing();
   if (name === 'journal') { loadJournalEntries(); loadJournalStats(); }
   if (name === 'scorecards') loadScorecards();
   if (name === 'concentration') loadConcentration();
@@ -543,24 +550,6 @@ function loadKraken() {
   });
 }
 
-function submitKrakenTrade() {
-  var symbol = ($('k-symbol') || {}).value || '';
-  var side = ($('k-side') || {}).value || 'buy';
-  var orderType = ($('k-ordertype') || {}).value || 'market';
-  var volume = ($('k-volume') || {}).value || '';
-  var price = ($('k-price') || {}).value || '';
-  var preview = $('k-trade-preview');
-  if (!symbol || !volume) { showToast('Symbol and volume required', true); return; }
-  var body = { exchange: 'kraken', symbol: symbol, side: side, order_type: orderType, volume: volume };
-  if (orderType === 'limit' && price) body.price = price;
-  if (preview) preview.textContent = 'Sending to Telegram...';
-  fetch('/api/trade/execute', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
-    .then(function(r) { return r.json(); }).then(function(d) {
-      showToast('Trade sent to Telegram');
-      if (preview) preview.textContent = d.message || 'Sent for approval';
-    }).catch(function() { showToast('Failed to submit trade', true); });
-}
-
 // ── Activity ──────────────────────────────────────────────────────
 
 var currentFilter = 'all';
@@ -634,40 +623,6 @@ function loadJournalStats() {
   });
 }
 
-function selectAction(val) {
-  document.querySelectorAll('#j-action-group .action-btn').forEach(function(b) {
-    b.classList.toggle('selected', b.getAttribute('onclick') && b.getAttribute('onclick').indexOf("'" + val + "'") > -1);
-  });
-}
-function selectEmotion(val) {
-  document.querySelectorAll('#j-emotion-group .emotion-btn').forEach(function(b) {
-    b.classList.toggle('selected', b.getAttribute('onclick') && b.getAttribute('onclick').indexOf("'" + val + "'") > -1);
-  });
-}
-function selectFollowed(val) {
-  document.querySelectorAll('#j-followed-group .action-btn').forEach(function(b) {
-    b.classList.toggle('selected', b.getAttribute('onclick') && b.getAttribute('onclick').indexOf("'" + val + "'") > -1);
-  });
-}
-
-function submitJournalEntry() {
-  var coin = ($('j-coin') || {}).value || '';
-  var price = parseFloat(($('j-price') || {}).value);
-  var qty = parseFloat(($('j-qty') || {}).value) || null;
-  var reasoning = ($('j-reasoning') || {}).value || null;
-  var actionEl = document.querySelector('#j-action-group .action-btn.selected');
-  var emotionEl = document.querySelector('#j-emotion-group .emotion-btn.selected');
-  var action = actionEl ? (actionEl.getAttribute('onclick').match(/'([^']+)'/) || [])[1] : null;
-  var emotion = emotionEl ? (emotionEl.getAttribute('onclick').match(/'([^']+)'/) || [])[1] : 'neutral';
-  if (!coin || !action || !price) { showToast('Coin, action and price required', true); return; }
-  fetch('/api/journal', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ symbol: coin, action: action, price: price, quantity: qty, reasoning: reasoning, emotion: emotion })
-  }).then(function(r) {
-    if (r.ok) { showToast('Trade logged'); loadJournalEntries(); loadJournalStats(); }
-    else showToast('Failed to log trade', true);
-  }).catch(function() { showToast('Failed to log trade', true); });
-}
-
 // ── Profile ───────────────────────────────────────────────────────
 
 function loadProfile() {
@@ -684,49 +639,6 @@ function loadProfile() {
     el.innerHTML = html;
     if (data && data.learning_model) setText('learning-text', data.learning_model);
   });
-}
-
-function addPreference() {
-  var input = $('pref-input');
-  var val = input ? input.value.trim() : '';
-  if (!val) return;
-  fetch('/api/profile/preference', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ preference: val }) })
-    .then(function(r) {
-      if (r.ok) { showToast('Preference saved'); if (input) input.value = ''; loadProfile(); }
-      else showToast('Failed', true);
-    }).catch(function() { showToast('Failed', true); });
-}
-
-// ── Rebalancing ───────────────────────────────────────────────────
-
-function loadRebalancing() {
-  fetchData('/api/rebalancing').then(function(data) {
-    if (!data) return;
-    setText('rb-total-value', fmtUSD(data.total_value));
-    setText('rb-total-loss', fmtUSD(data.total_loss));
-    setText('rb-recovery-pct', data.recovery_pct != null ? fmtPct(data.recovery_pct) : '—');
-    setText('rb-analysis-date', data.analysis_date ? new Date(data.analysis_date).toLocaleDateString() : 'No analysis yet');
-    if (data.analysis) setText('rb-analysis-text', data.analysis);
-    var h = data.health || {};
-    setText('leg-winning', 'Winning — ' + (h.winning || 0));
-    setText('leg-small', 'Small loss (0–20%) — ' + (h.small || 0));
-    setText('leg-moderate', 'Moderate loss (20–50%) — ' + (h.moderate || 0));
-    setText('leg-severe', 'Severe loss (50%+) — ' + (h.severe || 0));
-    setText('leg-none', 'No entry set — ' + (h.no_entry || 0));
-    setText('pnl-winners', h.winning || 0);
-    setText('pnl-losers', (h.small || 0) + (h.moderate || 0) + (h.severe || 0));
-    setText('pnl-total-unreal', fmtUSD(data.total_unrealised));
-  });
-}
-
-function runRebalancingAnalysis() {
-  var btn = $('rb-refresh-btn');
-  if (btn) { btn.disabled = true; btn.textContent = 'Analysing...'; }
-  fetch('/api/rebalancing/analyse', { method: 'POST' }).then(function() {
-    showToast('Analysis requested');
-    setTimeout(loadRebalancing, 3000);
-  }).catch(function() { showToast('Failed', true); })
-    .finally(function() { if (btn) { btn.disabled = false; btn.textContent = 'Refresh Analysis'; } });
 }
 
 // ── Trailing stops ────────────────────────────────────────────────

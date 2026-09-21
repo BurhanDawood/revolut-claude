@@ -13206,6 +13206,9 @@ app.use((req, res, next) => {
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
+// #352: /dashboard.html served straight from public/ would skip the key helper that GET / injects (#349), so every
+// panel would fail with 401. Registered BEFORE express.static so it wins (a route added after it would never run).
+app.get('/dashboard.html', (req, res) => res.redirect(302, '/'));
 app.use(express.static(join(__dirname, 'public')));
 
 // Clean URL for usage monitor
