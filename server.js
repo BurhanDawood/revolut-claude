@@ -2332,6 +2332,58 @@ async function reduceTranches(symbol, exchange, qtySold) {
   }
 }
 
+// #347 ROOT FIX FOR SALES NOT CLOSING LOTS (#320). autoLogTrade - which handles every trade made in the app - added a
+// lot on each buy but never reduced lots on a sale; only approved trades and limit fills did. Rather than subtract the
+// size of each sale (fragile: the detector debounces repeat trades, suppresses limit orders, and lets price-deviated
+// approved fills through, so a subtraction could run twice or not at all), this brings a coin's Revolut lots DOWN to
+// its real holding. That is idempotent: run it twice, or after an approved trade already reduced them, and it does
+// nothing. The holding is read from Revolut as AVAILABLE + RESERVED - the detector passes 'available' only, and a
+// limit sell lowers that without selling anything. Each run WRITES the target quantity rather than subtracting, so
+// concurrent runs converge on the same answer (tested); runs are also queued per coin as a second layer. It never ADDS lots; a missing buy lot is left for the nightly re-sync (#346). Kraken is untouched.
+const _lotSyncChains = new Map();
+function syncRevolutLotsDownToBalance(coinBase) {
+  const c = String(coinBase || '').toUpperCase().replace(/-USD$/, '');
+  if (!c) return Promise.resolve({ skipped: 'no coin' });
+  const prev = _lotSyncChains.get(c) || Promise.resolve();
+  const next = prev.catch(() => {}).then(() => _syncRevolutLotsDownToBalanceNow(c));
+  _lotSyncChains.set(c, next);
+  return next;
+}
+async function _syncRevolutLotsDownToBalanceNow(c) {
+  try {
+    const bal = await revolutRequest('GET', '/balances');
+    const rows = Array.isArray(bal) ? bal : (bal && (bal.data || bal.balances)) || [];
+    if (!rows.length) return { skipped: 'balances unreadable' };            // never shrink lots on a failed read
+    const has = (v) => v !== undefined && v !== null && v !== '';
+    const row = rows.find(b => String(b.currency || '').toUpperCase() === c);
+    let total = 0;
+    if (row) {
+      total = (has(row.available) || has(row.reserved))
+        ? (parseFloat(row.available) || 0) + (parseFloat(row.reserved) || 0)
+        : parseFloat(has(row.total) ? row.total : row.balance);
+    }
+    if (!Number.isFinite(total) || total < 0) return { skipped: 'balance not a number' };
+    const [lots] = await db.execute(
+      "SELECT id, remaining_quantity FROM position_tranches WHERE symbol IN (?, ?) AND exchange <> 'kraken' AND remaining_quantity > 0 ORDER BY entry_date ASC, id ASC",
+      [c, c + '-USD']);
+    const held = lots.reduce((a, l) => a + Number(l.remaining_quantity), 0);
+    let excess = held - total;
+    if (excess <= Math.max(1e-8, total * 1e-6)) return { ok: true, reduced: 0 };
+    const cutTotal = excess;
+    for (const l of lots) {                                                  // oldest lots first, as reduceTranches does
+      if (excess <= 1e-12) break;
+      const q = Number(l.remaining_quantity), cut = Math.min(q, excess);
+      await db.execute('UPDATE position_tranches SET remaining_quantity = ?, updated_at = NOW() WHERE id = ?', [q - cut, l.id]);
+      excess -= cut;
+    }
+    console.log('[tranches] #347 ' + c + ' lots brought down to holding ' + total + ' (reduced by ' + cutTotal + ')');
+    return { ok: true, reduced: cutTotal, holding: total };
+  } catch (e) {
+    console.error('[tranches] #347 sync ' + c + ' failed:', e.message);
+    return { ok: false, error: e.message };
+  }
+}
+
 // ── Do-Not-Disturb Helper ─────────────────────────────────────────────────────
 
 function hasAgreedStrategy(symbol) {
@@ -2950,8 +3002,8 @@ async function executeApprovedRevolut(t) {
                  `Buy via Claude approval — Order ${result?.client_order_id || 'unknown'}`]
               ).catch(e => console.error('[tranches] Insert failed:', e.message));
             } else if (t.side.toLowerCase() === 'sell') {
-              await reduceTranches(coinBase, 'revolut', qtyForJournal)
-                .catch(e => console.error('[tranches] Reduce failed:', e.message));
+              // #347: match lots to the real holding instead of subtracting the sale - idempotent with the detector
+              await syncRevolutLotsDownToBalance(coinBase);
             }
 
             await sendTelegram(`${t.side === 'sell' ? '✅' : '🟢'} MCP ${t.side.toUpperCase()} ${formatTradeQty(qtyForJournal)} ${coinBase} @ ${formatPrice(executedPrice)} = $${valueUSD.toFixed(2)} 🔄 ✓${t.qtyEstimated ? ' (qty est)' : ''}`);
@@ -4791,7 +4843,7 @@ async function runLimitFillPipeline(order, filledQty, avgPrice) {
         [coinBase, qty, price, qty, 'Limit fill - order ' + order.order_id]
       ).catch(e => console.error('[tranches] B2a insert failed:', e.message));
     } else if (side === 'sell') {
-      await reduceTranches(coinBase, 'revolut', qty).catch(e => console.error('[tranches] B2a reduce failed:', e.message));
+      await syncRevolutLotsDownToBalance(coinBase);   // #347: idempotent - see syncRevolutLotsDownToBalance
       if (journalId) await recordRealisedPnl(journalId, symbol, price, qty).catch(() => {});
     }
     await sendTelegram((side === 'sell' ? '✅' : '🟢') + ' LIMIT FILLED — ' + side.toUpperCase() + ' ' + formatTradeQty(qty) + ' ' + coinBase + ' @ ' + formatPrice(price) + ' = $' + valueUSD.toFixed(2) + ' 🔄').catch(() => {});
@@ -11846,6 +11898,8 @@ async function checkPortfolio() {
               const action = qtyChange > 0 ? 'buy' : 'sell';
               console.log(`[detect] ${symbol} ${action}: ${prevQty} → ${available} ($${valueUsd.toFixed(2)})`);
               autoLogTrade(symbol, action, currentPrice, qtyChange, available).catch(e => console.error('autoLogTrade failed:', e.message));
+              // #347: lots follow the sale regardless of whether autoLogTrade logs it (debounce / dedupe / limit suppression)
+              if (action === 'sell') syncRevolutLotsDownToBalance(symbol).catch(() => {});
             } else {
               console.log(`[balance] ${symbol} change $${(Math.abs(qtyChange) * currentPrice).toFixed(4)} below $0.10 threshold — skipping`);
             }
@@ -12099,6 +12153,7 @@ async function checkPortfolio() {
           if (exitPrice) {
             console.log(`Balance change detected: ${sym} from ${prevQty} to 0 action: sell (full exit)`);
             autoLogTrade(sym, 'sell', exitPrice, -prevQty, 0).catch(e => console.error('autoLogTrade failed:', e.message));
+            syncRevolutLotsDownToBalance(sym).catch(() => {});   // #347
           }
           previousBalances.delete(sym);
           await db.execute('DELETE FROM balance_snapshots WHERE symbol = ?', [sym]).catch(() => {});
