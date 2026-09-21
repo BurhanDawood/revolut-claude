@@ -53,7 +53,7 @@ jobs:
           node-version: 22
 
       - name: Install Google Gen AI SDK
-        run: npm install @google/genai
+        run: npm install --no-save --no-package-lock @google/genai   # never touch package.json - it triggers a server redeploy
 
       - name: Analyse via Gemini API
         env:
@@ -188,5 +188,5 @@ jobs:
           git add docs/gemini/
           git diff --cached --quiet && { echo "No report change."; exit 0; }
           git commit -m "Gemini analysis: ${{ inputs.task_id }}"
-          git pull --rebase
+          git pull --rebase --autostash
           git push
