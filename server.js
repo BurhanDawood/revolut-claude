@@ -13214,11 +13214,20 @@ app.get('/dev-log/context', async (req, res) => {
       const [rr] = await db.execute('SELECT id, title, status, created_at, detail FROM dev_log WHERE id IN (' + refs.map(() => '?').join(',') + ') ORDER BY id DESC', refs);
       md += '## Tickets named in this request (full text)\n\n' + (rr.length ? rr.map(r => '### #' + r.id + ' - ' + r.title + '\n' + r.status + ' | ' + day(r.created_at) + '\n\n' + cut(r.detail, 12000) + '\n').join('\n') : '(none found for ' + refs.join(', ') + ')') + '\n\n';
     }
-    const [rec] = await db.execute('SELECT id, title, status, created_at, detail FROM dev_log ORDER BY id DESC LIMIT ' + recent);
-    md += '## Most recent ' + rec.length + ' tickets (summaries)\n\n' + rec.map(r => '### #' + r.id + ' - ' + r.title + '\n' + r.status + ' | ' + day(r.created_at) + '\n\n' + cut(r.detail, 1500) + '\n').join('\n') + '\n\n';
+    // #350 FULL-HISTORY MODE (?since=YYYY-MM-DD): every ticket created on or after that date, in full, oldest first -
+    // for documentation work such as the ARCHITECTURE.md rewrite. Without it, the usual recent summaries.
+    const since = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.since || '')) ? String(req.query.since) : null;
+    if (since) {
+      const [all] = await db.execute('SELECT id, title, status, created_at, detail FROM dev_log WHERE created_at >= ? ORDER BY id ASC', [since + ' 00:00:00']);
+      md += '## Full history since ' + since + ' (' + all.length + ' tickets, oldest first)\n\n' + all.map(r => '### #' + r.id + ' - ' + r.title + '\n' + r.status + ' | ' + day(r.created_at) + '\n\n' + cut(r.detail, 20000) + '\n').join('\n') + '\n\n';
+    } else {
+      const [rec] = await db.execute('SELECT id, title, status, created_at, detail FROM dev_log ORDER BY id DESC LIMIT ' + recent);
+      md += '## Most recent ' + rec.length + ' tickets (summaries)\n\n' + rec.map(r => '### #' + r.id + ' - ' + r.title + '\n' + r.status + ' | ' + day(r.created_at) + '\n\n' + cut(r.detail, 1500) + '\n').join('\n') + '\n\n';
+    }
     const [open] = await db.execute("SELECT id, title FROM dev_log WHERE status <> 'resolved' ORDER BY id DESC LIMIT 80");
     md += '## Open tickets\n\n' + (open.length ? open.map(r => '- #' + r.id + ' ' + r.title).join('\n') : '(none)') + '\n';
-    res.type('text/markdown').send(md.length > 200000 ? md.slice(0, 200000) + '\n\n[... briefing capped at 200,000 characters]' : md);
+    const CAP = since ? 900000 : 200000;   // #350: full-history mode needs more room
+    res.type('text/markdown').send(md.length > CAP ? md.slice(0, CAP) + '\n\n[... briefing capped at ' + CAP + ' characters]' : md);
   } catch (e) { res.status(500).type('text/plain').send('error: ' + e.message); }
 });
 
