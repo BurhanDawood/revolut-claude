@@ -6790,6 +6790,7 @@ function rebuildPositionFromTransactions(rows, coin) {
   let nonUsdSinceZero = 0;   // a trade priced in another coin has no dollar cost: the average of THIS holding is then unknowable
   // #343 STAKING is not a sale: staked coins keep their cost in a separate bucket and bring it back on un-stake.
   let stakedQty = 0, stakedCost = 0, rewardQty = 0;
+  let lastZeroAt = null, lastNegativeAt = null;   // #344: is today's average built on complete data?
   for (const t of evs) {
     const type = String(t.type || 'unknown');
     const src = t.source || {}, dst = t.destination || {};
@@ -6811,7 +6812,11 @@ function rebuildPositionFromTransactions(rows, coin) {
         qty += q; cost += back; stakedQty -= fromBucket; stakedCost -= back;
         if (q - fromBucket > 1e-9) flags.no_cost_inflow_qty += q - fromBucket;   // staked before the history begins
       } else if (type === 'reward') {
-        qty += q; rewardQty += q;                          // genuinely new coins: zero cost, reported separately
+        // #344: while a coin is staked, the venue credits rewards INTO the staked position - the un-stake then returns
+        // principal PLUS rewards (proven on NEAR: -215.13566 staked, +3.11715644 rewards, +218.25281644 un-staked).
+        // Crediting them to the held quantity as well counted every reward twice.
+        if (stakedQty > 0) stakedQty += q; else qty += q;
+        rewardQty += q;                                    // genuinely new coins: zero cost, reported separately
       } else {
         qty += q; flags.no_cost_inflow_qty += q;           // receive / transfer in: cost unknown
       }
@@ -6827,11 +6832,12 @@ function rebuildPositionFromTransactions(rows, coin) {
       if (qty < -Math.max(1e-8, peak * 1e-6)) {
         flags.negative_balance++;
         if (!flags.first_negative_at) flags.first_negative_at = new Date(ts(t)).toISOString();
+        lastNegativeAt = ts(t);
         qty = 0; cost = 0;                                  // history before the window is missing
       }
     }
     if (qty > peak) peak = qty;
-    if (qty <= Math.max(1e-8, peak * 1e-6)) { qty = Math.max(qty, 0); cost = 0; sinceZeroQty = 0; sinceZeroUsd = 0; nonUsdSinceZero = 0; }
+    if (qty <= Math.max(1e-8, peak * 1e-6)) { qty = Math.max(qty, 0); cost = 0; sinceZeroQty = 0; sinceZeroUsd = 0; nonUsdSinceZero = 0; if (stakedQty <= 1e-8) lastZeroAt = ts(t); }
   }
   const r8 = (x) => Number(x.toFixed(8)), r6 = (x) => Number(x.toFixed(6));
   for (const k of Object.keys(byType)) byType[k].qty = r8(byType[k].qty);
@@ -6846,6 +6852,11 @@ function rebuildPositionFromTransactions(rows, coin) {
     avg_all_buys: allBuyQty > 0 ? r6(allBuyUsd / allBuyQty) : null,
     realised_pnl_usd: Number(realised.toFixed(2)),
     staked_qty: r8(stakedQty), reward_qty: r8(rewardQty),
+    last_fully_exited: lastZeroAt ? new Date(lastZeroAt).toISOString() : null,
+    last_negative: lastNegativeAt ? new Date(lastNegativeAt).toISOString() : null,
+    // The average is only trustworthy if no gap in the data falls inside the CURRENT holding - i.e. after the last
+    // time the position was fully exited. A gap before that was wiped out by the exit and cannot affect today.
+    avg_trustworthy: qty > 0 && nonUsdSinceZero === 0 && !(lastNegativeAt && (!lastZeroAt || lastNegativeAt >= lastZeroAt)),
     by_type: byType, flags: { ...flags, no_cost_inflow_qty: r8(flags.no_cost_inflow_qty) }
   };
 }
@@ -14752,7 +14763,7 @@ let rows;
           else {
             // all coins: compact rows only - the full per-coin detail is one symbol-filtered call away
             lr.coins = results.filter(r => r.events > 0).map(r => ({ coin: r.coin, rebuilt_qty: r.rebuilt_qty, actual_balance: r.actual_balance,
-              matches: r.qty_matches_balance, avg_cost: r.avg_cost, portfolio_entry: r.portfolio_entry_price, ledger_qty: r.ledger_tranche_qty,
+              matches: r.qty_matches_balance, avg_cost: r.avg_cost, avg_trustworthy: r.avg_trustworthy, portfolio_entry: r.portfolio_entry_price, ledger_qty: r.ledger_tranche_qty,
               negative_balance: r.flags.negative_balance, no_cost_inflow_qty: r.flags.no_cost_inflow_qty }))
               .sort((a, b) => (a.matches === b.matches) ? 0 : (a.matches ? 1 : -1));
             lr.matching = lr.coins.filter(r => r.matches).length + ' of ' + lr.coins.length;
