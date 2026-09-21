@@ -5961,6 +5961,79 @@ async function fetchOrderFills(orderId) {
   }
 }
 
+// Dev-331: read-only Revolut X transactions fetcher (GET /1.0/transactions)
+async function fetchTransactions(daysBack = 30) {
+  const out = { ok: false, windows: [], transactions: [], errors: [] };
+  const DAY = 86400000;
+  const WINDOW_DAYS = 30; // Revolut X transactions API range limit <= 30 days
+  const now = Date.now();
+  const totalDays = Math.max(1, Math.min(Number(daysBack) || 30, 370));
+  try {
+    for (let offset = 0; offset < totalDays; offset += WINDOW_DAYS) {
+      const end = now - offset * DAY;
+      const start = Math.max(now - totalDays * DAY, end - WINDOW_DAYS * DAY);
+      if (start >= end) break;
+      let cursor = null, pages = 0, got = 0;
+      do {
+        const qs = new URLSearchParams({
+          start_date: String(start),
+          end_date: String(end),
+          limit: '100'
+        });
+        if (cursor) qs.set('cursor', cursor);
+        let page;
+        try {
+          page = await revolutRequest('GET', '/transactions?' + qs.toString());
+          if (page && page.message && !page.data && !Array.isArray(page)) {
+            out.errors.push({ window: new Date(start).toISOString().slice(0, 10), error: 'API: ' + page.message });
+            break;
+          }
+        } catch (e) {
+          out.errors.push({ window: new Date(start).toISOString().slice(0, 10), error: e.message });
+          break;
+        }
+        const rowsAll = Array.isArray(page) ? page : (page && (page.data || page.items)) || [];
+        if (!out.metadata && page && page.metadata) out.metadata = page.metadata;
+
+        const tsOf = (t) => {
+          const v = t.created_date || t.processed_date || t.created_at;
+          if (v == null) return 0;
+          return typeof v === 'number' ? v : (Date.parse(v) || 0);
+        };
+
+        const rows = rowsAll.filter(t => {
+          const ts = tsOf(t);
+          if (ts && (ts < start || ts > end)) return false;
+          return true;
+        });
+
+        out.fetched_total = (out.fetched_total || 0) + rowsAll.length;
+
+        for (const t of rows) {
+          out.transactions.push({
+            id: t.id || null,
+            status: t.status || null,
+            type: t.type || null,
+            source: t.source || null,
+            destination: t.destination || null,
+            created_date: t.created_date || null,
+            processed_date: t.processed_date || null
+          });
+          got++;
+        }
+        const nextCursor = page && page.metadata && page.metadata.next_cursor;
+        cursor = (nextCursor && typeof nextCursor === 'string' && nextCursor.trim() !== '') ? nextCursor : null;
+        pages++;
+      } while (cursor && pages < 20);
+      out.windows.push({ from: new Date(start).toISOString().slice(0, 10), to: new Date(end).toISOString().slice(0, 10), transactions: got, pages });
+    }
+    out.ok = out.errors.length === 0 || out.transactions.length > 0;
+  } catch (e) {
+    out.errors.push({ window: 'outer', error: e.message });
+  }
+  return out;
+}
+
 async function recordDailyPrices() {
   try {
     console.log('Recording daily prices for price_history...');
@@ -12863,7 +12936,7 @@ let rows;
   server.tool('get_trading_data',
     'Get trading journal entries, active alerts, trader context/profile, rebalancing history, and dev_bridge messages',
     {
-      include: zLoose(z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'dev_bridge', 'coin_strategy', 'reconciliation', 'ledger', 'tax_lots', 'catalysts', 'thesis', 'nudges', 'dev_health', 'dev_recommendations', 'volatility_baseline', 'shadow_fills', 'abnormal_events', 'strategy_catalogue', 'exchange_orders', 'all']))).optional()
+      include: zLoose(z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'dev_bridge', 'coin_strategy', 'reconciliation', 'ledger', 'tax_lots', 'catalysts', 'thesis', 'nudges', 'dev_health', 'dev_recommendations', 'volatility_baseline', 'shadow_fills', 'abnormal_events', 'strategy_catalogue', 'exchange_orders', 'transactions', 'all']))).optional()
         .describe('What data to fetch — defaults to all. dev_bridge, coin_strategy and reconciliation are never included in all; request them explicitly'),
       symbol:           z.string().optional().describe('Filter journal by coin e.g. NEAR'),
       limit:            z.coerce.number().optional().describe('Max journal entries to return, default 10'),
@@ -13445,6 +13518,133 @@ let rows;
           if (ex.probe) exO.raw_response_probe = ex.probe;
         } catch (e) { exO.error = e.message; }
         result.exchange_orders = exO;
+      }
+
+      // transactions (Dev-331) -- READ-ONLY integration of Revolut X GET /1.0/transactions
+      if (fetch.includes('transactions')) {
+        const txO = { generated_at: new Date().toISOString() };
+        try {
+          const txDays = Math.min(parseInt(limit) || 30, 370);
+          const txRes = await fetchTransactions(txDays);
+          txO.days_requested = txDays;
+          txO.windows = txRes.windows;
+          txO.errors = txRes.errors;
+          txO.total_count = txRes.transactions.length;
+          txO.fetched_total = txRes.fetched_total || 0;
+          if (txRes.metadata) txO.venue_metadata = txRes.metadata;
+
+          const byStatus = {};
+          const byType = {
+            transfers_and_payments: { send: 0, receive: 0 },
+            trades: { buy: 0, sell: 0 },
+            other: {}
+          };
+
+          for (const t of txRes.transactions) {
+            const st = t.status || 'unknown';
+            byStatus[st] = (byStatus[st] || 0) + 1;
+
+            const tp = t.type || 'unknown';
+            if (tp === 'send' || tp === 'receive') {
+              byType.transfers_and_payments[tp] = (byType.transfers_and_payments[tp] || 0) + 1;
+            } else if (tp === 'buy' || tp === 'sell') {
+              byType.trades[tp] = (byType.trades[tp] || 0) + 1;
+            } else {
+              byType.other[tp] = (byType.other[tp] || 0) + 1;
+            }
+          }
+
+          txO.by_status = byStatus;
+          txO.by_type = byType;
+          txO.recent_sample = txRes.transactions.slice(0, 5);
+
+          // Comparison section: compare send/receive transactions against trading_journal
+          const sendReceiveTxs = txRes.transactions.filter(t => t.type === 'send' || t.type === 'receive');
+
+          let journalRows = [];
+          try {
+            [journalRows] = await db.execute(
+              `SELECT id, symbol, action, price, quantity, value_usd, created_at, reasoning, source 
+               FROM trading_journal 
+               WHERE action IN ('payment', 'transfer') OR symbol IN ('USD', 'USDT', 'USDC', 'EUR', 'GBP')
+               ORDER BY created_at DESC LIMIT 500`
+            );
+          } catch (e) {
+            txO.comparison_error = e.message;
+          }
+
+          const matched = [];
+          const unmatched = [];
+
+          // Matching tolerances:
+          // Timestamp: within 24 hours (86,400,000 ms)
+          // Amount: within $1.00 or 3%
+          const TIME_TOLERANCE_MS = 24 * 60 * 60 * 1000;
+
+          for (const tx of sendReceiveTxs) {
+            const txTs = tx.created_date || tx.processed_date || 0;
+            const srcAmt = tx.source && tx.source.amount ? parseFloat(tx.source.amount) : 0;
+            const dstAmt = tx.destination && tx.destination.amount ? parseFloat(tx.destination.amount) : 0;
+            const txAmt = srcAmt || dstAmt || 0;
+            const txCurr = (tx.source && tx.source.currency) || (tx.destination && tx.destination.currency) || '';
+
+            let matchFound = null;
+            for (const j of journalRows) {
+              const jTs = j.created_at ? new Date(j.created_at).getTime() : 0;
+              if (Math.abs(txTs - jTs) > TIME_TOLERANCE_MS) continue;
+
+              const jVal = Math.abs(parseFloat(j.value_usd || 0)) || Math.abs(parseFloat(j.quantity || 0)) || 0;
+              const amtDiff = Math.abs(txAmt - jVal);
+              const amtTolerance = Math.max(1.0, txAmt * 0.03);
+
+              if (amtDiff <= amtTolerance) {
+                matchFound = j;
+                break;
+              }
+            }
+
+            if (matchFound) {
+              matched.push({
+                tx_id: tx.id,
+                tx_type: tx.type,
+                tx_amount: txAmt,
+                tx_currency: txCurr,
+                tx_date: tx.created_date || tx.processed_date,
+                journal_id: matchFound.id,
+                journal_action: matchFound.action,
+                journal_symbol: matchFound.symbol,
+                journal_value_usd: matchFound.value_usd,
+                journal_date: matchFound.created_at
+              });
+            } else {
+              unmatched.push({
+                tx_id: tx.id,
+                tx_type: tx.type,
+                tx_status: tx.status,
+                tx_amount: txAmt,
+                tx_currency: txCurr,
+                tx_date: tx.created_date || tx.processed_date,
+                source: tx.source,
+                destination: tx.destination
+              });
+            }
+          }
+
+          txO.comparison = {
+            total_send_receive: sendReceiveTxs.length,
+            matched_count: matched.length,
+            unmatched_count: unmatched.length,
+            matched_sample: matched.slice(0, 5),
+            unmatched_rows: unmatched,
+            matching_tolerances: {
+              timestamp_tolerance: '24 hours (86,400,000 ms) between transaction created/processed date and trading_journal created_at',
+              amount_tolerance: 'within $1.00 or 3% between transaction amount and trading_journal value_usd/quantity',
+              note: 'Near-misses may be matching artefacts rather than true matches.'
+            }
+          };
+
+        } catch (e) { txO.error = e.message; }
+        result.transactions = txO;
       }
 
       // reconciliation -- explicitly excluded from fetchAll; must be requested by name
