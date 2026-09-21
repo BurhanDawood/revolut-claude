@@ -17337,6 +17337,20 @@ app.post('/telegram-webhook', async (req, res) => {
       }
       const cbCoin = cbMatch[1].toLowerCase();
       const cbChoice = parseInt(cbMatch[2], 10);
+      // #336 STATELESS MONEY BUTTONS route here, BEFORE the alertContextBySymbol lookup below.
+      // They carry a database id and read the database, so they keep working after a restart and
+      // can never act on the wrong row. Every other button path below is unchanged.
+      const cbMoneyType = (cbMatch[3] || '').toLowerCase();
+      if (cbMoneyType === 'np' || cbMoneyType === 'cc') {
+        await ackCb('Working...');
+        try {
+          await handleMoneyButton(cbMoneyType, cbCoin, cbChoice, cbReply);
+        } catch (e) {
+          console.error('[money-btn] ' + cbMoneyType + ' ' + cbCoin + ' failed:', e.message);
+          await cbReply('\u26a0\ufe0f Button failed: ' + (e.message || '').substring(0, 150));
+        }
+        return res.status(200).json({ ok: true });
+      }
       // DOUBLE-ACK RACE: the owner may tap AND type for the same alert within
       // milliseconds. alertContextBySymbol is the authority — whichever handler
       // deletes the entry first owns the decision; the loser fails safely here
