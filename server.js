@@ -3010,6 +3010,216 @@ async function handleMuteButton(coin, reply) {
   await reply('\ud83d\udd15 ' + c + ' muted for 24h.');
 }
 
+// #341 SWING SIGNAL ACTION, moved out of the webhook so typed replies ('hold ADA') and the swing buttons run
+// the same code. None of these actions place an order: ack mutes, hold/dust set price-alert targets, sell/buy
+// fetch AI advice and set an alert. Only change from the original: it returns instead of answering the webhook.
+async function runSwingAction(swSymbol, swCoinBase, swCtx, swAction, sendReply) {
+          console.log(`[swing] Reply '${swAction}' for ${swSymbol} (direction: ${swCtx.direction})`);
+
+          // Stop the swing alert and clear context
+          await acknowledgeAlert(swSymbol);
+          lastSwingAlertContext.delete(swSymbol);
+          if (mostRecentSwingAlert?.symbol === swSymbol) mostRecentSwingAlert = null;
+          // Backdate cooldown by 2h so 4h remaining window = 6h total from now
+          swingAlertCooldown.set(swSymbol, Date.now() - (2 * 60 * 60 * 1000));
+          await db.execute(
+            'INSERT INTO swing_cooldowns (symbol, last_alert_at) VALUES (?, DATE_SUB(NOW(), INTERVAL 2 HOUR)) ON DUPLICATE KEY UPDATE last_alert_at = DATE_SUB(NOW(), INTERVAL 2 HOUR), updated_at = CURRENT_TIMESTAMP',
+            [swSymbol]
+          ).catch(e => console.error('Failed to persist swing cooldown:', e.message));
+          console.log('[swing] Cooldown extended (4h remaining) for', swSymbol, 'after user reply:', swAction);
+
+          const isPump = swCtx.direction === 'pump';
+          const currentPrice = await getCurrentPrice(swSymbol).catch(() => swCtx.price);
+
+          if (swAction === 'ack') {
+            await sendReply(`✅ ${swCoinBase} alerts stopped.`);
+            return;
+          }
+
+          if (swAction === 'hold') {
+            if (isPump) {
+              // Holding through pump → sell alert at +15% (only if no existing target)
+              const existing = priceTargets.get(swSymbol);
+              if (existing && existing.direction === 'up') {
+                await sendReply(
+                  `✅ Holding <b>${swCoinBase}</b> logged.\n` +
+                  `📌 You already have a sell target at ${fmtPriceShort(existing.targetPrice)} — keeping that.`
+                );
+              } else {
+                const sellTarget = currentPrice * 1.15;
+                await setAbsolutePriceTarget(swSymbol, sellTarget, 'up',
+                  JSON.stringify({ source: 'swing_hold', direction: 'up' })).catch(() => {});
+                await sendReply(
+                  `✅ Holding <b>${swCoinBase}</b> logged.\n` +
+                  `🎯 Sell alert set at ${fmtPriceShort(sellTarget)} (+15% from here)\n` +
+                  `I'll notify you when it hits your target!`
+                );
+              }
+            } else {
+              // Holding through dip → recovery alert at entry or +20% (only if no existing target)
+              const existing = priceTargets.get(swSymbol);
+              if (existing && existing.direction === 'up') {
+                await sendReply(
+                  `✅ Holding <b>${swCoinBase}</b> logged.\n` +
+                  `📌 You already have a recovery target at ${fmtPriceShort(existing.targetPrice)} — keeping that.`
+                );
+              } else {
+                const entryP = entryPrices.get(swSymbol);
+                const recoverTarget = (entryP && entryP > currentPrice) ? entryP : currentPrice * 1.20;
+                const label = (entryP && entryP > currentPrice) ? 'entry price' : '+20% from here';
+                await setAbsolutePriceTarget(swSymbol, recoverTarget, 'up',
+                  JSON.stringify({ source: 'swing_hold', direction: 'up' })).catch(() => {});
+                await sendReply(
+                  `✅ Holding <b>${swCoinBase}</b> logged.\n` +
+                  `🎯 Recovery alert set at ${fmtPriceShort(recoverTarget)} (${label})\n` +
+                  `I'll notify you when it recovers!`
+                );
+              }
+            }
+            return;
+          }
+
+          if (swAction === 'dust') {
+            if (isPump) {
+              // Dust in pump → retrace buy alert at -20%
+              const buyBackTarget = currentPrice * 0.80;
+              await setAbsolutePriceTarget(swSymbol, buyBackTarget, 'down',
+                JSON.stringify({ source: 'swing_dust', direction: 'down' })).catch(() => {});
+              await sendReply(
+                `✅ Noted — dust position in <b>${swCoinBase}</b>.\n` +
+                `🎯 Retrace buy alert set at ${fmtPriceShort(buyBackTarget)} (-20%)\n` +
+                `I'll alert you if it retraces for a better entry!`
+              );
+            } else {
+              // Dust in dip → recovery watch at +20%
+              const watchTarget = currentPrice * 1.20;
+              await setAbsolutePriceTarget(swSymbol, watchTarget, 'up',
+                JSON.stringify({ source: 'swing_dust', direction: 'up' })).catch(() => {});
+              await sendReply(
+                `✅ Noted — dust position in <b>${swCoinBase}</b>.\n` +
+                `🎯 Recovery watch set at ${fmtPriceShort(watchTarget)} (+20%)\n` +
+                `I'll alert you if it recovers!`
+              );
+            }
+            return;
+          }
+
+          // For 'sell' and 'buy' — call Claude async, set alert, chunk response
+          await sendReply(swAction === 'sell'
+            ? `🔍 Getting sell advice for <b>${swCoinBase}</b>...`
+            : `🔍 Getting buy advice for <b>${swCoinBase}</b>...`
+          );
+          // (the caller answers the webhook once this returns - the advice itself runs in the background)
+
+          (async () => {
+            try {
+              if (swAction === 'sell') {
+                const r = await anthropic.messages.create({
+                  model: 'claude-sonnet-4-6',
+                  max_tokens: 600,
+                  tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+                  messages: [{ role: 'user', content: `Sell advice for ${swSymbol}. Current price: ${fmtPriceShort(currentPrice)}. Extreme pump signal — ${((swCtx.price > 0 ? (currentPrice - swCtx.price) / swCtx.price * 100 : 0)).toFixed(1)}% above baseline. Take profits now or wait? Give specific sell price levels and a buy-back level for re-entry after retrace. Under 250 words.` }]
+                });
+                const blk = [...r.content].reverse().find(b => b.type === 'text');
+                const buyBackTarget = currentPrice * 0.85;
+                await setAbsolutePriceTarget(swSymbol, buyBackTarget, 'down',
+                  JSON.stringify({ source: 'swing_sell', direction: 'down' })).catch(() => {});
+                const msg =
+                  `📈 <b>SELL ADVICE — ${swCoinBase}</b>\n\n` +
+                  (blk ? blk.text : 'Sell advice unavailable.') +
+                  `\n\n🎯 <b>Buy-back alert set at ${fmtPriceShort(buyBackTarget)} (-15%)</b>\n` +
+                  `I'll alert you when ${swCoinBase} retraces for re-entry!`;
+                await sendTelegramChunked(msg);
+
+              } else { // buy
+                const r = await anthropic.messages.create({
+                  model: 'claude-sonnet-4-6',
+                  max_tokens: 600,
+                  tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+                  messages: [{ role: 'user', content: `Buy advice for ${swSymbol}. Current price: ${fmtPriceShort(currentPrice)}. Extreme dip signal — ${((swCtx.price > 0 ? (swCtx.price - currentPrice) / swCtx.price * 100 : 0)).toFixed(1)}% below baseline. Good buy opportunity? Give specific entry levels and a profit-taking target. Under 250 words.` }]
+                });
+                const blk = [...r.content].reverse().find(b => b.type === 'text');
+                const sellTarget = currentPrice * 1.20;
+                await setAbsolutePriceTarget(swSymbol, sellTarget, 'up',
+                  JSON.stringify({ source: 'swing_buy', direction: 'up' })).catch(() => {});
+                const msg =
+                  `📉 <b>BUY ADVICE — ${swCoinBase}</b>\n\n` +
+                  (blk ? blk.text : 'Buy advice unavailable.') +
+                  `\n\n🎯 <b>Sell alert set at ${fmtPriceShort(sellTarget)} (+20%)</b>\n` +
+                  `I'll alert you when ${swCoinBase} hits your profit target!`;
+                await sendTelegramChunked(msg);
+              }
+            } catch (e) {
+              console.error('[swing] Reply handler error:', e.message);
+              await sendReply(`❌ Error: ${e.message}`);
+            }
+          })();
+          return;
+        }
+
+// Swing buttons: a:<coin>:<n>:sd (extreme DIP) or :sp (extreme PUMP). Separate codes because choice 1 means
+// Buy on a dip and Sell on a pump: if a newer signal of the other direction replaced the context for the
+// same coin, a button on the old message must refuse rather than act on the new one.
+async function handleSwingButton(coin, choice, typeCode, reply) {
+  const c = String(coin || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const sym = c + '-USD';
+  const want = typeCode === 'sp' ? 'pump' : 'dip';
+  const ctx = lastSwingAlertContext.get(sym);
+  if (!ctx || Date.now() - ctx.timestamp >= 30 * 60 * 1000) {   // same 30-min window as the typed replies
+    await reply('That ' + c + ' swing signal has expired (signals last 30 min). Nothing changed.'); return;
+  }
+  if (ctx.direction !== want) {
+    await reply('That ' + c + ' signal was replaced by a newer ' + ctx.direction + ' signal - use the buttons on that one. Nothing changed.'); return;
+  }
+  const action = (want === 'pump' ? { 1: 'sell', 2: 'hold', 3: 'dust', 4: 'ack' } : { 1: 'buy', 2: 'hold', 3: 'dust', 4: 'ack' })[choice];
+  if (!action) { await reply('\u26a0\ufe0f Unrecognised option.'); return; }
+  // CLAIM SYNCHRONOUSLY: no await between reading the signal and removing it, so a double tap cannot
+  // request advice twice or set two targets.
+  lastSwingAlertContext.delete(sym);
+  await runSwingAction(sym, c, ctx, action, reply);
+}
+
+// #341 REBALANCE CONFIRMATION, moved out of the webhook so typed yes/no and the buttons share it.
+async function applyRebalanceConfirm(conf, isYes, sendReply) {
+  if (isYes) {
+    // Guard: the pair may already be recorded - e.g. via a Trade Detected 'From <coin>' button (#334). Logging it
+    // again would duplicate its rebalancing_tracker / rebalance_log rows.
+    const [rr] = await db.execute('SELECT id, reasoning FROM trading_journal WHERE id IN (?, ?)', [conf.sellJournalId, conf.buyJournalId]).catch(() => [[]]);
+    if (rr && rr.length === 2 && rr.every(x => /^Rebalance (entry|exit)/.test(String(x.reasoning || '')))) {
+      await sendReply('\u2705 Already recorded as a rebalance: ' + conf.sellSymbol + ' \u2192 ' + conf.buySymbol + '. Nothing added.');
+      return;
+    }
+    // --- original typed-yes handling, unchanged ---
+          // Clear both from pendingTradeContext
+          const sellKey = [...pendingTradeContext.keys()].find(k => k.replace('-USD','') === conf.sellSymbol);
+          const buyKey  = [...pendingTradeContext.keys()].find(k => k.replace('-USD','') === conf.buySymbol);
+          if (sellKey) { clearTimeout(pendingTradeContext.get(sellKey).timeoutHandle); pendingTradeContext.delete(sellKey); }
+          if (buyKey)  { clearTimeout(pendingTradeContext.get(buyKey).timeoutHandle);  pendingTradeContext.delete(buyKey);  }
+          await logRebalancePair(conf);
+          const rebalDate = new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+          await sendReply(
+            `✅ Rebalancing logged!\n` +
+            `📤 OUT: ${conf.sellSymbol} @ $${conf.sellPrice?.toFixed(4)}\n` +
+            `📥 IN: ${conf.buySymbol} @ $${conf.buyPrice?.toFixed(4)}\n\n` +
+            `I'll check back in 7 days — did ${conf.buySymbol} outperform ${conf.sellSymbol}? 📊`
+          );
+        } else {
+          // User wants separate trade logging — individual context messages already sent, nothing more to do
+          await sendReply(`OK, logging as separate trades. Reply to each trade prompt for details.`);
+        }
+}
+
+// Rebalancing Detected buttons: a:<buyJournalId>:<1 yes|2 no>:rp. The pending pair lives in ONE slot, so typed
+// 'yes' confirms whichever pair is newest. A button is bound to ITS pair and refuses if that pair was replaced.
+async function handleRebalanceConfirmButton(id, choice, reply) {
+  const conf = pendingRebalanceConfirm.get('main');
+  if (!conf || String(conf.buyJournalId) !== String(id)) {
+    await reply('That rebalance is no longer waiting - it was answered, or replaced by a newer pair. Nothing changed.'); return;
+  }
+  pendingRebalanceConfirm.delete('main');   // claim synchronously
+  await applyRebalanceConfirm(conf, choice === 1, reply);
+}
+
 function fmtCapitalConfirm(cap, portfolioValue) {
   const pnlSign = cap.pnl >= 0 ? '+' : '';
   const breakEvenStr = cap.pnl < 0
@@ -8036,9 +8246,10 @@ async function checkForRebalancePair(newSymbol, newAction, newJournalId, newPric
         `📤 Sold ${sellSymbol}: ${sellQty?.toFixed(4)} tokens @ $${sellPrice?.toFixed(4)} ($${sellValueUsd?.toFixed(2)})\n` +
         `📥 Bought ${buySymbol}: ${buyQty?.toFixed(4)} tokens @ $${buyPrice?.toFixed(4)} ($${buyValueUsd?.toFixed(2)})\n\n` +
         `Is this a rebalancing or separate trades?\n` +
-        `Reply:\n` +
+        `Tap a button, or reply:\n` +
         `<b>yes</b> — log as rebalance, track 7-day performance\n` +
-        `<b>no</b> — log as separate trades (will ask for details)`
+        `<b>no</b> — log as separate trades (will ask for details)`,
+        buildAlertKeyboard(String(buyJournalId), ['Yes, rebalance', 'No, separate'], 'rp')   // #341: bound to THIS pair
       );
       return; // Only fire once per pair
     }
@@ -11985,7 +12196,11 @@ async function checkPortfolio() {
                 `🔔 <b>REMINDER — ${coinBase} SWING ${swDir} SIGNAL</b>\n\n` +
                 `Still ${swPct}% outside 7-day average.\n` +
                 `This is the final reminder.\n\n` +
-                `Reply 'acknowledge ${coinBase}' to mute ⚠️ (24h)`
+                `Tap a button, or reply 'acknowledge ${coinBase}' to mute (24h)`,
+                // #341: same buttons as the signal it reminds you about (the signal context lasts 30 min)
+                isExtremePump
+                  ? buildAlertKeyboard(coinBase, ['Sell advice', 'Hold', 'Dust', 'Mute 24h'], 'sp')
+                  : buildAlertKeyboard(coinBase, ['Buy advice', 'Hold', 'Dust', 'Mute 24h'], 'sd')
               );
             }
             continue; // already alerted this cycle — skip re-send
@@ -12023,12 +12238,12 @@ async function checkPortfolio() {
             `• RSI likely oversold at this level ✅\n\n` +
             entryLine +
             dipRecLine + `\n\n` +
-            `Reply:\n` +
+            `Tap a button, or reply:\n` +
             `'buy ${coinBase}' - get buy advice + auto-set buy and sell alerts\n` +
             `'hold ${coinBase}' - already holding, set recovery alerts\n` +
             `'dust ${coinBase}' - dust position, watch for further drop\n` +
             `'acknowledge ${coinBase}' - dismiss this alert`;
-          await sendTelegram(swingMsg);
+          await sendTelegram(swingMsg, buildAlertKeyboard(coinBase, ['Buy advice', 'Hold', 'Dust', 'Mute 24h'], 'sd'));   // #341
           // Store context so webhook replies can respond intelligently
           lastSwingAlertContext.set(symbol, { direction: 'dip', price: currentPrice, timestamp: Date.now() });
           mostRecentSwingAlert = { symbol, coinBase, direction: 'dip', price: currentPrice, timestamp: Date.now() };
@@ -12063,12 +12278,12 @@ async function checkPortfolio() {
             entryLine +
             `⚡ <b>RECOMMENDATION:</b> Sell signal based on your swing strategy.\n` +
             pumpRecLine + `\n\n` +
-            `Reply:\n` +
+            `Tap a button, or reply:\n` +
             `'sell ${coinBase}' - get sell advice + auto-set profit targets\n` +
             `'hold ${coinBase}' - I'm holding, set sell alert at next resistance\n` +
             `'dust ${coinBase}' - dust position, set retrace buy alert\n` +
             `'acknowledge ${coinBase}' - dismiss this alert`;
-          await sendTelegram(swingMsg);
+          await sendTelegram(swingMsg, buildAlertKeyboard(coinBase, ['Sell advice', 'Hold', 'Dust', 'Mute 24h'], 'sp'));   // #341
           // Store context so webhook replies can respond intelligently
           lastSwingAlertContext.set(symbol, { direction: 'pump', price: currentPrice, timestamp: Date.now() });
           mostRecentSwingAlert = { symbol, coinBase, direction: 'pump', price: currentPrice, timestamp: Date.now() };
@@ -12189,7 +12404,7 @@ async function checkPortfolio() {
               `Peak: ${fmtPriceShort(result.ts.peakPrice)} | Current: ${fmtPriceShort(asset.price)}\n` +
               `Trail: ${result.ts.trailPct}% | Stop: ${fmtPriceShort(result.ts.stopPrice)}\n\n` +
               `💡 Come to Claude to evaluate before deciding!\n\n` +
-              `Reply 'acknowledge ${coinBase}' to dismiss`
+              `🔕 ${coinBase} alerts are now muted for 24h.`   // #341: it IS muted just below - no reply needed
             );
             await acknowledgeAlert(symbol);
             trailingStopAlerted.set(symbol, Date.now());
@@ -12340,7 +12555,9 @@ cron.schedule('5 9 * * 1', async () => {
       await sendTelegram(
         `📊 <b>WEEKLY REBALANCING CHECK</b>\n\n` +
         `You have <b>${severelyDown.length}</b> position${severelyDown.length > 1 ? 's' : ''} down more than 50%:\n${coinList}\n\n` +
-        `Reply <b>'rebalance'</b> for full analysis and recommendations.`
+        // #341: there is NO 'rebalance' analysis command. Typing it did nothing useful - or, if a detected pair was
+        // waiting, CONFIRMED that pair ('rebalance' counts as yes there). Point to a real route instead.
+        `Ask Claude to review these positions when you have a moment.`
       );
     }
   } catch (e) {
@@ -17738,10 +17955,13 @@ app.post('/telegram-webhook', async (req, res) => {
       // is a trade button. Any other 'td' now falls through to the alert handler below, as it did before #334.
       // New Trade Detected buttons use 'tj'; numeric 'td' keeps already-sent ones working.
       const cbIsTradeJournal = cbMoneyType === 'tj' || (cbMoneyType === 'td' && /^\d+$/.test(cbCoin));
-      if (cbMoneyType === 'np' || cbMoneyType === 'cc' || cbIsTradeJournal || cbMoneyType === 'ta' || cbMoneyType === 'mu') {
+      if (cbMoneyType === 'np' || cbMoneyType === 'cc' || cbIsTradeJournal || cbMoneyType === 'ta' || cbMoneyType === 'mu' ||
+          cbMoneyType === 'sd' || cbMoneyType === 'sp' || cbMoneyType === 'rp') {
         await ackCb('Working...');
         try {
           if (cbMoneyType === 'ta') await handleTradeApprovalButton(cbCoin, cbChoice, cbReply);
+          else if (cbMoneyType === 'sd' || cbMoneyType === 'sp') await handleSwingButton(cbCoin, cbChoice, cbMoneyType, cbReply);
+          else if (cbMoneyType === 'rp') await handleRebalanceConfirmButton(cbCoin, cbChoice, cbReply);
           else if (cbMoneyType === 'mu') await handleMuteButton(cbCoin, cbReply);
           else if (cbIsTradeJournal) await handleTradeButton(cbCoin, cbChoice, cbReply);
           else await handleMoneyButton(cbMoneyType, cbCoin, cbChoice, cbReply);
@@ -18083,24 +18303,8 @@ app.post('/telegram-webhook', async (req, res) => {
       if (isYes || isNo) {
         const conf = pendingRebalanceConfirm.get('main');
         pendingRebalanceConfirm.delete('main');
-        if (isYes) {
-          // Clear both from pendingTradeContext
-          const sellKey = [...pendingTradeContext.keys()].find(k => k.replace('-USD','') === conf.sellSymbol);
-          const buyKey  = [...pendingTradeContext.keys()].find(k => k.replace('-USD','') === conf.buySymbol);
-          if (sellKey) { clearTimeout(pendingTradeContext.get(sellKey).timeoutHandle); pendingTradeContext.delete(sellKey); }
-          if (buyKey)  { clearTimeout(pendingTradeContext.get(buyKey).timeoutHandle);  pendingTradeContext.delete(buyKey);  }
-          await logRebalancePair(conf);
-          const rebalDate = new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-          await sendReply(
-            `✅ Rebalancing logged!\n` +
-            `📤 OUT: ${conf.sellSymbol} @ $${conf.sellPrice?.toFixed(4)}\n` +
-            `📥 IN: ${conf.buySymbol} @ $${conf.buyPrice?.toFixed(4)}\n\n` +
-            `I'll check back in 7 days — did ${conf.buySymbol} outperform ${conf.sellSymbol}? 📊`
-          );
-        } else {
-          // User wants separate trade logging — individual context messages already sent, nothing more to do
-          await sendReply(`OK, logging as separate trades. Reply to each trade prompt for details.`);
-        }
+        // #341: shared with the Rebalancing Detected buttons - see applyRebalanceConfirm.
+        await applyRebalanceConfirm(conf, isYes, sendReply);
         return res.status(200).json({ ok: true });
       }
     }
@@ -19197,147 +19401,9 @@ app.post('/telegram-webhook', async (req, res) => {
           isSwingDismiss                        ? 'ack'  : null;
 
         if (swAction) {
-          console.log(`[swing] Reply '${swAction}' for ${swSymbol} (direction: ${swCtx.direction})`);
-
-          // Stop the swing alert and clear context
-          await acknowledgeAlert(swSymbol);
-          lastSwingAlertContext.delete(swSymbol);
-          if (mostRecentSwingAlert?.symbol === swSymbol) mostRecentSwingAlert = null;
-          // Backdate cooldown by 2h so 4h remaining window = 6h total from now
-          swingAlertCooldown.set(swSymbol, Date.now() - (2 * 60 * 60 * 1000));
-          await db.execute(
-            'INSERT INTO swing_cooldowns (symbol, last_alert_at) VALUES (?, DATE_SUB(NOW(), INTERVAL 2 HOUR)) ON DUPLICATE KEY UPDATE last_alert_at = DATE_SUB(NOW(), INTERVAL 2 HOUR), updated_at = CURRENT_TIMESTAMP',
-            [swSymbol]
-          ).catch(e => console.error('Failed to persist swing cooldown:', e.message));
-          console.log('[swing] Cooldown extended (4h remaining) for', swSymbol, 'after user reply:', swAction);
-
-          const isPump = swCtx.direction === 'pump';
-          const currentPrice = await getCurrentPrice(swSymbol).catch(() => swCtx.price);
-
-          if (swAction === 'ack') {
-            await sendReply(`✅ ${swCoinBase} alerts stopped.`);
-            return res.status(200).json({ ok: true });
-          }
-
-          if (swAction === 'hold') {
-            if (isPump) {
-              // Holding through pump → sell alert at +15% (only if no existing target)
-              const existing = priceTargets.get(swSymbol);
-              if (existing && existing.direction === 'up') {
-                await sendReply(
-                  `✅ Holding <b>${swCoinBase}</b> logged.\n` +
-                  `📌 You already have a sell target at ${fmtPriceShort(existing.targetPrice)} — keeping that.`
-                );
-              } else {
-                const sellTarget = currentPrice * 1.15;
-                await setAbsolutePriceTarget(swSymbol, sellTarget, 'up',
-                  JSON.stringify({ source: 'swing_hold', direction: 'up' })).catch(() => {});
-                await sendReply(
-                  `✅ Holding <b>${swCoinBase}</b> logged.\n` +
-                  `🎯 Sell alert set at ${fmtPriceShort(sellTarget)} (+15% from here)\n` +
-                  `I'll notify you when it hits your target!`
-                );
-              }
-            } else {
-              // Holding through dip → recovery alert at entry or +20% (only if no existing target)
-              const existing = priceTargets.get(swSymbol);
-              if (existing && existing.direction === 'up') {
-                await sendReply(
-                  `✅ Holding <b>${swCoinBase}</b> logged.\n` +
-                  `📌 You already have a recovery target at ${fmtPriceShort(existing.targetPrice)} — keeping that.`
-                );
-              } else {
-                const entryP = entryPrices.get(swSymbol);
-                const recoverTarget = (entryP && entryP > currentPrice) ? entryP : currentPrice * 1.20;
-                const label = (entryP && entryP > currentPrice) ? 'entry price' : '+20% from here';
-                await setAbsolutePriceTarget(swSymbol, recoverTarget, 'up',
-                  JSON.stringify({ source: 'swing_hold', direction: 'up' })).catch(() => {});
-                await sendReply(
-                  `✅ Holding <b>${swCoinBase}</b> logged.\n` +
-                  `🎯 Recovery alert set at ${fmtPriceShort(recoverTarget)} (${label})\n` +
-                  `I'll notify you when it recovers!`
-                );
-              }
-            }
-            return res.status(200).json({ ok: true });
-          }
-
-          if (swAction === 'dust') {
-            if (isPump) {
-              // Dust in pump → retrace buy alert at -20%
-              const buyBackTarget = currentPrice * 0.80;
-              await setAbsolutePriceTarget(swSymbol, buyBackTarget, 'down',
-                JSON.stringify({ source: 'swing_dust', direction: 'down' })).catch(() => {});
-              await sendReply(
-                `✅ Noted — dust position in <b>${swCoinBase}</b>.\n` +
-                `🎯 Retrace buy alert set at ${fmtPriceShort(buyBackTarget)} (-20%)\n` +
-                `I'll alert you if it retraces for a better entry!`
-              );
-            } else {
-              // Dust in dip → recovery watch at +20%
-              const watchTarget = currentPrice * 1.20;
-              await setAbsolutePriceTarget(swSymbol, watchTarget, 'up',
-                JSON.stringify({ source: 'swing_dust', direction: 'up' })).catch(() => {});
-              await sendReply(
-                `✅ Noted — dust position in <b>${swCoinBase}</b>.\n` +
-                `🎯 Recovery watch set at ${fmtPriceShort(watchTarget)} (+20%)\n` +
-                `I'll alert you if it recovers!`
-              );
-            }
-            return res.status(200).json({ ok: true });
-          }
-
-          // For 'sell' and 'buy' — call Claude async, set alert, chunk response
-          await sendReply(swAction === 'sell'
-            ? `🔍 Getting sell advice for <b>${swCoinBase}</b>...`
-            : `🔍 Getting buy advice for <b>${swCoinBase}</b>...`
-          );
-          res.status(200).json({ ok: true });
-
-          (async () => {
-            try {
-              if (swAction === 'sell') {
-                const r = await anthropic.messages.create({
-                  model: 'claude-sonnet-4-6',
-                  max_tokens: 600,
-                  tools: [{ type: 'web_search_20250305', name: 'web_search' }],
-                  messages: [{ role: 'user', content: `Sell advice for ${swSymbol}. Current price: ${fmtPriceShort(currentPrice)}. Extreme pump signal — ${((swCtx.price > 0 ? (currentPrice - swCtx.price) / swCtx.price * 100 : 0)).toFixed(1)}% above baseline. Take profits now or wait? Give specific sell price levels and a buy-back level for re-entry after retrace. Under 250 words.` }]
-                });
-                const blk = [...r.content].reverse().find(b => b.type === 'text');
-                const buyBackTarget = currentPrice * 0.85;
-                await setAbsolutePriceTarget(swSymbol, buyBackTarget, 'down',
-                  JSON.stringify({ source: 'swing_sell', direction: 'down' })).catch(() => {});
-                const msg =
-                  `📈 <b>SELL ADVICE — ${swCoinBase}</b>\n\n` +
-                  (blk ? blk.text : 'Sell advice unavailable.') +
-                  `\n\n🎯 <b>Buy-back alert set at ${fmtPriceShort(buyBackTarget)} (-15%)</b>\n` +
-                  `I'll alert you when ${swCoinBase} retraces for re-entry!`;
-                await sendTelegramChunked(msg);
-
-              } else { // buy
-                const r = await anthropic.messages.create({
-                  model: 'claude-sonnet-4-6',
-                  max_tokens: 600,
-                  tools: [{ type: 'web_search_20250305', name: 'web_search' }],
-                  messages: [{ role: 'user', content: `Buy advice for ${swSymbol}. Current price: ${fmtPriceShort(currentPrice)}. Extreme dip signal — ${((swCtx.price > 0 ? (swCtx.price - currentPrice) / swCtx.price * 100 : 0)).toFixed(1)}% below baseline. Good buy opportunity? Give specific entry levels and a profit-taking target. Under 250 words.` }]
-                });
-                const blk = [...r.content].reverse().find(b => b.type === 'text');
-                const sellTarget = currentPrice * 1.20;
-                await setAbsolutePriceTarget(swSymbol, sellTarget, 'up',
-                  JSON.stringify({ source: 'swing_buy', direction: 'up' })).catch(() => {});
-                const msg =
-                  `📉 <b>BUY ADVICE — ${swCoinBase}</b>\n\n` +
-                  (blk ? blk.text : 'Buy advice unavailable.') +
-                  `\n\n🎯 <b>Sell alert set at ${fmtPriceShort(sellTarget)} (+20%)</b>\n` +
-                  `I'll alert you when ${swCoinBase} hits your profit target!`;
-                await sendTelegramChunked(msg);
-              }
-            } catch (e) {
-              console.error('[swing] Reply handler error:', e.message);
-              await sendReply(`❌ Error: ${e.message}`);
-            }
-          })();
-          return;
+          // #341: the action is shared with the swing buttons - see runSwingAction.
+          await runSwingAction(swSymbol, swCoinBase, swCtx, swAction, sendReply);
+          return res.status(200).json({ ok: true });
         }
       }
     }
