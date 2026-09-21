@@ -8391,14 +8391,14 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
       `💰 <b>TRADE DETECTED — ${symbol}</b>\n` +
       `<b>⏰ REPLY NOW — auto-logs in 30 min</b>\n\n` +
       `Action: ${actionLabel} ~${formatTradeQty(absQty)} tokens at ${formatPrice(price)} ($${valueUsd.toFixed(2)})${pnlLine}${avgEntryLine}${recLine}${reentryLine}\n\n` +
-      `Just reply:\n` +
-      `'<b>taking profits</b>' — your reason, done\n` +
-      `'<b>rebalance [coin]</b>' — bought with proceeds from selling [coin]\n` +
-      `'<b>payment</b>' — Revolut payment (excluded from stats)\n` +
-      `'<b>transfer</b>' — internal transfer (excluded from stats)\n` +
-      `'<b>skip</b>' — log without details\n\n` +
-      `Reply before the timer fires or trade logs without context.`;
-    await sendTelegram(msg);
+      `Tap a reason below - it still works after the 30-min timer.\n` +
+      `Or reply '<b>taking profits</b>', '<b>rebalance [coin]</b>', '<b>payment</b>', '<b>transfer</b>' or '<b>skip</b>'.`;
+    // #337: stateless buttons bound to this journal row. If building them fails, the alert still
+    // goes out without buttons and the typed replies above keep working.
+    let tradeKb;
+    try { tradeKb = await buildTradeKeyboard(journalId, coinBase, action); }
+    catch (e) { console.error('[trade-btn] keyboard build failed:', e.message); }
+    await sendTelegram(msg, tradeKb);
 
     // Set 30-minute timeout to auto-complete
     const timeoutHandle = setTimeout(async () => {
