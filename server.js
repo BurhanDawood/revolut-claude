@@ -13180,6 +13180,36 @@ app.use(express.static(join(__dirname, 'public')));
 // Clean URL for usage monitor
 app.get('/usage', (req, res) => res.sendFile(join(__dirname, 'public', 'claude-usage-monitor.html')));
 
+// #348 PROJECT HISTORY FOR THE GEMINI SPEC WRITER. Deliberately NOT under /api/: GET routes there are open to anyone,
+// and this is not. It has its OWN key (DEV_LOG_TOKEN, sent as the x-dev-log-token header) that grants nothing else,
+// and it is FAIL-CLOSED - with the variable unset it refuses every request. Read-only. Returns a focused briefing:
+// standing engineering decisions, the full text of tickets named in ?refs=, summaries of the ?recent= latest tickets,
+// and the open-ticket list. Capped so it never dwarfs the code it accompanies.
+app.get('/dev-log/context', async (req, res) => {
+  const tok = process.env.DEV_LOG_TOKEN;
+  if (!tok || tok.length < 24 || req.headers['x-dev-log-token'] !== tok) return res.status(401).type('text/plain').send('unauthorized');
+  try {
+    const refs = [...new Set(String(req.query.refs || '').split(',').map(s => parseInt(s, 10)).filter(n => Number.isFinite(n) && n > 0))].slice(0, 20);
+    const recent = Math.min(Math.max(parseInt(req.query.recent, 10) || 25, 0), 60);
+    const cut = (s, n) => { s = String(s || ''); return s.length > n ? s.slice(0, n) + ' [...]' : s; };
+    const day = (d) => d ? new Date(d).toISOString().slice(0, 10) : 'n/a';
+    let md = '# Project history (generated ' + new Date().toISOString() + ')\n\nReference only, newest first. [...] marks truncation.\n\n';
+    try {
+      const [dec] = await db.execute("SELECT id, decision, principle_tag, related_dev_log FROM dev_decisions WHERE status = 'active' ORDER BY id DESC");
+      md += '## Standing engineering decisions - do not contradict these\n\n' + (dec.length ? dec.map(d => '- D' + d.id + (d.principle_tag ? ' [' + d.principle_tag + ']' : '') + ': ' + cut(d.decision, 700) + (d.related_dev_log ? ' (tickets ' + d.related_dev_log + ')' : '')).join('\n') : '(none)') + '\n\n';
+    } catch (e) { md += '## Standing engineering decisions\n\n(unavailable: ' + e.message + ')\n\n'; }
+    if (refs.length) {
+      const [rr] = await db.execute('SELECT id, title, status, created_at, detail FROM dev_log WHERE id IN (' + refs.map(() => '?').join(',') + ') ORDER BY id DESC', refs);
+      md += '## Tickets named in this request (full text)\n\n' + (rr.length ? rr.map(r => '### #' + r.id + ' - ' + r.title + '\n' + r.status + ' | ' + day(r.created_at) + '\n\n' + cut(r.detail, 12000) + '\n').join('\n') : '(none found for ' + refs.join(', ') + ')') + '\n\n';
+    }
+    const [rec] = await db.execute('SELECT id, title, status, created_at, detail FROM dev_log ORDER BY id DESC LIMIT ' + recent);
+    md += '## Most recent ' + rec.length + ' tickets (summaries)\n\n' + rec.map(r => '### #' + r.id + ' - ' + r.title + '\n' + r.status + ' | ' + day(r.created_at) + '\n\n' + cut(r.detail, 1500) + '\n').join('\n') + '\n\n';
+    const [open] = await db.execute("SELECT id, title FROM dev_log WHERE status <> 'resolved' ORDER BY id DESC LIMIT 80");
+    md += '## Open tickets\n\n' + (open.length ? open.map(r => '- #' + r.id + ' ' + r.title).join('\n') : '(none)') + '\n';
+    res.type('text/markdown').send(md.length > 200000 ? md.slice(0, 200000) + '\n\n[... briefing capped at 200,000 characters]' : md);
+  } catch (e) { res.status(500).type('text/plain').send('error: ' + e.message); }
+});
+
 // CORS middleware
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
