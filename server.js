@@ -1382,6 +1382,7 @@ await safeAddColumn('auto_trade_rules', 'proceeds_reserved', 'DECIMAL(12,2) NULL
 await safeAddColumn('trading_journal',  'source',          "VARCHAR(20) DEFAULT 'auto_detected'");
 await safeAddColumn('trading_journal',  'updated_at',      'TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP');
 await safeAddColumn('trading_journal',  'realised_pnl_usd', 'DECIMAL(20,8) NULL');
+await safeAddColumn('trading_journal',  'venue_tx_id',     'VARCHAR(64) NULL UNIQUE');
 await safeAddColumn('trailing_stops',   'auto_execute',    'TINYINT(1) NOT NULL DEFAULT 0'); // #93
 await safeAddColumn('price_targets',    'sell_pct',        'DECIMAL(5,2) NULL'); // #144 per-rung sell %% override for Away Mode up-targets
 await safeAddColumn('trailing_stops',   'sell_pct',        'DECIMAL(10,4) DEFAULT 25.0');   // #93
@@ -6032,6 +6033,140 @@ async function fetchTransactions(daysBack = 30) {
     out.errors.push({ window: 'outer', error: e.message });
   }
   return out;
+}
+
+async function reconcileTransactions(daysBack = 30, dryRun = true) {
+  if (!dryRun) {
+    throw new Error('Live execution not supported; dryRun must be true');
+  }
+
+  const txResult = await fetchTransactions(daysBack);
+  const truncated = !txResult.ok || (txResult.errors && txResult.errors.length > 0);
+
+  const windowDays = Math.max(1, parseInt(daysBack) || 30) + 7;
+  const [journalRows] = await db.execute(
+    `SELECT id, symbol, action, price, quantity, value_usd, reasoning, venue_tx_id, created_at
+     FROM trading_journal
+     WHERE action IN ('payment', 'transfer')
+     AND created_at >= DATE_SUB(NOW(), INTERVAL ? DAY)`,
+    [windowDays]
+  );
+
+  const alreadyReconciled = [];
+  const possibleDuplicate = [];
+  const wouldLog = [];
+  let totalCapitalDecrement = 0;
+
+  const rawTxs = txResult.transactions || [];
+
+  for (const tx of rawTxs) {
+    if (!tx || !tx.id) continue;
+    const status = (tx.status || '').toLowerCase();
+    if (status === 'cancelled' || status === 'rejected' || status === 'failed') {
+      continue;
+    }
+
+    const srcAmt = tx.source && tx.source.amount ? parseFloat(tx.source.amount) : 0;
+    const dstAmt = tx.destination && tx.destination.amount ? parseFloat(tx.destination.amount) : 0;
+    const txAmt = srcAmt || dstAmt || 0;
+    if (txAmt <= 0) continue;
+
+    const currency = (tx.source && tx.source.currency) || (tx.destination && tx.destination.currency) || 'USD';
+    const txType = (tx.type || '').toLowerCase();
+    const action = txType === 'send' ? 'payment' : 'transfer';
+    const txTime = tx.created_date || tx.processed_date || Date.now();
+    const txMs = typeof txTime === 'number' ? txTime : new Date(txTime).getTime();
+
+    let exactMatch = null;
+    let softMatch = null;
+
+    for (const j of journalRows) {
+      if (j.venue_tx_id && String(j.venue_tx_id) === String(tx.id)) {
+        exactMatch = j;
+        break;
+      }
+      if (j.reasoning && String(j.reasoning).includes(String(tx.id))) {
+        exactMatch = j;
+        break;
+      }
+
+      if (!exactMatch) {
+        const jVal = Math.abs(parseFloat(j.value_usd || 0)) || Math.abs(parseFloat(j.quantity || 0)) || 0;
+        const amtDiff = Math.abs(txAmt - jVal);
+        const amtTolerance = Math.max(1.0, txAmt * 0.03);
+        const jMs = j.created_at ? new Date(j.created_at).getTime() : 0;
+        const timeDiff = Math.abs(txMs - jMs);
+
+        if (amtDiff <= amtTolerance && timeDiff <= 48 * 60 * 60 * 1000) {
+          softMatch = j;
+        }
+      }
+    }
+
+    if (exactMatch) {
+      alreadyReconciled.push({
+        tx_id: tx.id,
+        tx_type: tx.type,
+        tx_amount: txAmt,
+        currency,
+        matched_journal_id: exactMatch.id,
+        matched_venue_tx_id: exactMatch.venue_tx_id
+      });
+    } else if (softMatch) {
+      possibleDuplicate.push({
+        tx_id: tx.id,
+        tx_type: tx.type,
+        tx_amount: txAmt,
+        currency,
+        created_date: tx.created_date || tx.processed_date,
+        candidate_journal_id: softMatch.id,
+        candidate_action: softMatch.action,
+        candidate_value_usd: softMatch.value_usd,
+        candidate_created_at: softMatch.created_at
+      });
+    } else {
+      const decAmount = action === 'payment' ? txAmt : 0;
+      totalCapitalDecrement += decAmount;
+
+      const journalRow = {
+        symbol: currency.toUpperCase(),
+        action,
+        price: 1.0,
+        quantity: txAmt,
+        value_usd: txAmt,
+        reasoning: `Revolut X transaction ${tx.id} (${tx.type})`,
+        venue_tx_id: tx.id,
+        created_at: tx.created_date || tx.processed_date || new Date().toISOString()
+      };
+
+      wouldLog.push({
+        tx_id: tx.id,
+        tx_type: tx.type,
+        tx_amount: txAmt,
+        currency,
+        action,
+        journal_row: journalRow,
+        invested_capital_decrement: decAmount
+      });
+    }
+  }
+
+  return {
+    ok: true,
+    dryRun: true,
+    daysBack,
+    truncated,
+    already_reconciled: alreadyReconciled,
+    possible_duplicate: possibleDuplicate,
+    would_log: wouldLog,
+    summary: {
+      total_transactions: rawTxs.length,
+      already_reconciled_count: alreadyReconciled.length,
+      possible_duplicate_count: possibleDuplicate.length,
+      would_log_count: wouldLog.length,
+      total_capital_decrement: totalCapitalDecrement
+    }
+  };
 }
 
 async function recordDailyPrices() {
@@ -13645,6 +13780,13 @@ let rows;
 
         } catch (e) { txO.error = e.message; }
         result.transactions = txO;
+      }
+
+      if (fetch.includes('reconcile_transactions')) {
+        try {
+          const days = Math.min(parseInt(limit) || 30, 370);
+          result.reconcile_transactions = await reconcileTransactions(days, true);
+        } catch (e) { result.reconcile_transactions = { error: e.message }; }
       }
 
       // reconciliation -- explicitly excluded from fetchAll; must be requested by name
