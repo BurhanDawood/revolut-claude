@@ -17535,10 +17535,11 @@ app.post('/telegram-webhook', async (req, res) => {
       // They carry a database id and read the database, so they keep working after a restart and
       // can never act on the wrong row. Every other button path below is unchanged.
       const cbMoneyType = (cbMatch[3] || '').toLowerCase();
-      if (cbMoneyType === 'np' || cbMoneyType === 'cc') {
+      if (cbMoneyType === 'np' || cbMoneyType === 'cc' || cbMoneyType === 'td') {
         await ackCb('Working...');
         try {
-          await handleMoneyButton(cbMoneyType, cbCoin, cbChoice, cbReply);
+          if (cbMoneyType === 'td') await handleTradeButton(cbCoin, cbChoice, cbReply);
+          else await handleMoneyButton(cbMoneyType, cbCoin, cbChoice, cbReply);
         } catch (e) {
           console.error('[money-btn] ' + cbMoneyType + ' ' + cbCoin + ' failed:', e.message);
           await cbReply('\u26a0\ufe0f Button failed: ' + (e.message || '').substring(0, 150));
