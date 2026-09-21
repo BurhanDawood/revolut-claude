@@ -673,6 +673,7 @@ const targetReminderCount = new Map(); // symbol -> number of reminders sent (re
 const trailingStopReminderCount = new Map(); // symbol -> number of notifications sent (resets on acknowledge/remove/new-set)
 const alertFirstSent = new Map();    // symbol -> timestamp when first pump/drop/swing alert was sent
 const alertReminderSent = new Map(); // symbol -> timestamp when single follow-up reminder was sent
+const alertHeldAt = new Map();       // symbol -> { price, stepPct, direction, at }
 const activeSecondaryAlerts = {}; // `${symbol}:${price}` -> true — fired secondary rec-based alerts
 const lastBalances = {};
 const customThresholds = {};
@@ -10888,6 +10889,18 @@ async function checkPortfolio() {
         const pct = (change * 100).toFixed(1);
         const coinBase = asset.currency;
         const now = Date.now();
+        if (alertHeldAt.has(symbol)) {
+          const held = alertHeldAt.get(symbol);
+          if (now - held.at > 24 * 60 * 60 * 1000) {
+            alertHeldAt.delete(symbol);
+          } else if (held.direction === 'up' && currentPrice >= held.price * (1 + held.stepPct / 100)) {
+            alertHeldAt.delete(symbol);
+            alertFirstSent.delete(symbol);
+            alertReminderSent.delete(symbol);
+          } else if (held.direction === 'up') {
+            continue;
+          }
+        }
         const firstSent = alertFirstSent.get(symbol);
         const reminderSent = alertReminderSent.get(symbol);
         const tenMinutes = 10 * 60 * 1000;
@@ -10966,6 +10979,18 @@ async function checkPortfolio() {
         const pct = (Math.abs(change) * 100).toFixed(1);
         const coinBase = asset.currency;
         const now = Date.now();
+        if (alertHeldAt.has(symbol)) {
+          const held = alertHeldAt.get(symbol);
+          if (now - held.at > 24 * 60 * 60 * 1000) {
+            alertHeldAt.delete(symbol);
+          } else if (held.direction === 'down' && currentPrice <= held.price * (1 - held.stepPct / 100)) {
+            alertHeldAt.delete(symbol);
+            alertFirstSent.delete(symbol);
+            alertReminderSent.delete(symbol);
+          } else if (held.direction === 'down') {
+            continue;
+          }
+        }
         const firstSent = alertFirstSent.get(symbol);
         const reminderSent = alertReminderSent.get(symbol);
         const tenMinutes = 10 * 60 * 1000;
@@ -16760,6 +16785,34 @@ app.post('/api/kraken/trade', async (req, res) => {
 async function processAlertChoice(ctx, choice, sendReply) {
   const { symbol, coinBase, alertType } = ctx;
 
+  if (alertType === 'hold_step') {
+    const stepPct = [5, 10, ctx.origPct || 20, 30][choice - 1];
+    if (!stepPct) {
+      await sendReply(`⚠️ Invalid option`);
+      return;
+    }
+    const currentPrice = await getCurrentPrice(symbol).catch(() => null);
+    if (!currentPrice) {
+      await sendReply(`⚠️ Could not fetch price for ${coinBase}`);
+      return;
+    }
+    const direction = ctx.direction || 'up';
+    alertHeldAt.set(symbol, {
+      price: currentPrice,
+      stepPct,
+      direction,
+      at: Date.now()
+    });
+
+    const targetPrice = direction === 'down'
+      ? currentPrice * (1 - stepPct / 100)
+      : currentPrice * (1 + stepPct / 100);
+    const dirText = direction === 'down' ? 'below' : 'above';
+    const signStr = direction === 'down' ? '-' : '+';
+    await sendReply(`Holding ${coinBase.toUpperCase()} @ ${formatPrice(currentPrice)} - will alert again ${dirText} ${formatPrice(targetPrice)} (${signStr}${stepPct}%)`);
+    return;
+  }
+
   // ── Reconciler write alert responses (Dev-334) ──────────────────────────────
   if (alertType === 'reconciler') {
     const { journalId, txId, action: origAction, valueUsd } = ctx;
@@ -17044,6 +17097,34 @@ async function processAlertChoice(ctx, choice, sendReply) {
     }
     return;
   }
+  if ((alertType === 'pump' || alertType === 'drop') && action === 'hold') {
+    if (alertFirstSent.has(symbol)) {
+      const origPct = Math.round((customThresholds[symbol] !== undefined ? customThresholds[symbol] : PUMP_THRESHOLD) * 100);
+      const isPump = alertType === 'pump';
+      const labels = isPump
+        ? ['+5%', '+10%', `+${origPct}% original`, '+30%']
+        : ['-5%', '-10%', `-${origPct}% original`, '-30%'];
+
+      alertContextBySymbol.set(coinBase.toLowerCase(), {
+        symbol,
+        coinBase,
+        alertType: 'hold_step',
+        direction: isPump ? 'up' : 'down',
+        origPct,
+        timestamp: Date.now()
+      });
+      lastAlertCoin = coinBase.toLowerCase();
+
+      const keyboard = buildAlertKeyboard(coinBase, labels, 'hs');
+      await sendReply(
+        `<b>HOLD ${coinBase.toUpperCase()}</b>\n` +
+        `How much further before alerting again?\n\n` +
+        `Or reply '<b>${coinBase.toLowerCase()} hold &lt;number&gt;</b>' for any custom %`,
+        keyboard
+      );
+      return;
+    }
+  }
   if (action === 'hold') {
     await sendReply(
       `✅ <b>HOLD — ${coinBase}</b>\n` +
@@ -17136,7 +17217,7 @@ app.post('/telegram-webhook', async (req, res) => {
       // 'ca' covers BOTH claude_analysis_trailing and claude_analysis_target: processAlertChoice
       // handles them in one branch, and choices 3/4 are type-aware inside it, so a tap is valid
       // against either. Matching on the prefix avoids refusing taps that are actually correct.
-      const CB_TYPES = { tr: 'trailing_stop', pu: 'pump', dr: 'drop', tu: 'fixed_target_up', td: 'fixed_target_down', ca: 'claude_analysis', rc: 'reconciler' };
+      const CB_TYPES = { tr: 'trailing_stop', pu: 'pump', dr: 'drop', tu: 'fixed_target_up', td: 'fixed_target_down', ca: 'claude_analysis', rc: 'reconciler', hs: 'hold_step' };
       const cbWantType = CB_TYPES[(cbMatch[3] || '').toLowerCase()] || null;
       const cbCtx = alertContextBySymbol.get(cbCoin);
       const cbTypeOk = !cbWantType || (cbWantType === 'claude_analysis'
