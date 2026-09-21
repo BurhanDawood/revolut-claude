@@ -13157,20 +13157,32 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// #43 — auth gate on state-changing API routes.
-// GETs stay open (dashboard reads). Fail-closed if
-// API_TOKEN unset. /mcp + /telegram-webhook unaffected
-// (different path prefix). /api/bridge exempt (own
-// BRIDGE_TOKEN check).
-const API_WRITE_EXEMPT = ['/api/pause', '/api/resume', '/api/sweep/config', '/api/bridge'];
+// #349 AUTH GATE ON EVERY DATA ROUTE (replaces #43). #43 guarded only NON-GET /api/ requests, so every read - balances,
+// capital, journal, tax export - was public, and pause / resume / sweep writes needed no key at all (#341).
+// It also compared paths case-sensitively, so ANY write - trades, capital, P&L fixes - could be reached with no key by
+// writing the path in capitals ('/API/revolut/trade'). Proven against real Express before this fix.
+// Two keys, least privilege:
+//   DASHBOARD_TOKEN - every READ, plus the dashboard's own three actions (pause, resume, sweep settings). It CANNOT
+//                     reach anything else: no trading, capital, entry-price or data-fix endpoint.
+//   API_TOKEN       - everything. Deliberately UNSET: every other write stays switched off exactly as before.
+// Both fail closed (unset, or under 24 characters, grants nothing). Header only: x-api-token.
+// Left open on purpose: /api/health (liveness only) and /api/bridge (checks its own BRIDGE_TOKEN). Outside this gate
+// and unchanged: /telegram-webhook (own secret), /mcp-<secret>, /dev-log/context (own key), /telegram-setup.
+const DASHBOARD_WRITES = ['/api/pause', '/api/resume', '/api/sweep/config'];
 app.use((req, res, next) => {
-  if (!req.path.startsWith('/api/')) return next();
-  if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
-  if (API_WRITE_EXEMPT.includes(req.path)) return next();
-  if (!process.env.API_TOKEN || req.headers['x-api-token'] !== process.env.API_TOKEN) {
-    return res.status(401).json({ error: 'unauthorized' });
-  }
-  return next();
+  // LOWER-CASED: Express matches routes case-insensitively, so '/API/revolut/trade' reaches the same handler as
+  // '/api/revolut/trade'. #43 compared case-sensitively and could be bypassed that way - including trade and capital
+  // writes (found and proven 21 Sept). Every comparison below uses this lower-cased path.
+  const p = req.path.toLowerCase();
+  if (!(p.startsWith('/api/') || p.startsWith('/portfolio/'))) return next();
+  if (req.method === 'OPTIONS') return next();                                   // CORS preflight carries no data
+  if (p === '/api/health' || p === '/api/bridge') return next();
+  const sent = req.headers['x-api-token'];
+  const matches = (v) => typeof v === 'string' && v.length >= 24 && sent === v;
+  if (matches(process.env.API_TOKEN)) return next();
+  const isRead = req.method === 'GET' || req.method === 'HEAD';
+  if ((isRead || DASHBOARD_WRITES.includes(p)) && matches(process.env.DASHBOARD_TOKEN)) return next();
+  return res.status(401).json({ error: 'unauthorized' });
 });
 
 const __filename = fileURLToPath(import.meta.url);
@@ -17547,7 +17559,55 @@ if (MCP_PATH_SECRET) {
 
 
 app.get('/', (req, res) => {
-  res.sendFile(join(__dirname, 'public', 'dashboard.html'));
+  // #349: serve the dashboard with the key helper injected FIRST in <head>, so it is in place before dashboard.js
+  // (loaded at the end of <body>) makes a single request. The page itself holds no data; its requests carry the key.
+  try {
+    const html = readFileSync(join(__dirname, 'public', 'dashboard.html'), 'utf8');
+    res.set('Cache-Control', 'no-store').type('html').send(html.replace('<head>', '<head>\n<script src="/dashboard-auth.js"></script>'));
+  } catch (e) { res.status(500).type('text/plain').send('dashboard unavailable'); }
+});
+
+// #349 Key helper for the dashboard. Asks for the dashboard key ONCE per device, keeps it in that browser, and adds it
+// to every request the page makes to /api/ or /portfolio/ on this server. If the key is rejected it asks once more;
+// all requests fired together share one prompt. Requests to any other address are left untouched.
+app.get('/dashboard-auth.js', (req, res) => {
+  res.set('Cache-Control', 'no-store').type('application/javascript').send(`(function () {
+  var STORE = 'rx_dashboard_key';
+  var orig = window.fetch.bind(window);
+  function stored() { try { return localStorage.getItem(STORE); } catch (e) { return null; } }
+  function save(k) { try { if (k) localStorage.setItem(STORE, k); else localStorage.removeItem(STORE); } catch (e) {} }
+  function ask(again) {
+    var k = window.prompt(again ? 'That key was not accepted. Enter your dashboard key:' : 'Enter your dashboard key (asked once on this device):');
+    k = k ? String(k).trim() : '';
+    save(k); return k;
+  }
+  function guarded(u) {
+    try { var p = new URL(u, location.href);
+      return p.origin === location.origin && (p.pathname.indexOf('/api/') === 0 || p.pathname.indexOf('/portfolio/') === 0);
+    } catch (e) { return false; }
+  }
+  function withKey(init, k) {
+    var o = Object.assign({}, init || {}); var h = new Headers(o.headers || {});
+    if (k) h.set('x-api-token', k); o.headers = h; return o;
+  }
+  var askedAgain = false, declined = false;   // cancel once = stop asking for the rest of this page visit
+  function current() { var k = stored(); if (k) return k; if (declined) return ''; k = ask(false); if (!k) declined = true; return k; }
+  window.fetch = function (input, init) {
+    var url = typeof input === 'string' ? input : ((input && input.url) || '');
+    if (!guarded(url)) return orig(input, init);
+    var used = current();
+    return orig(input, withKey(init, used)).then(function (r) {
+      if (r.status !== 401 || !used) return r;          // no key was offered (you cancelled): do not nag
+      var now = stored();
+      if (now && now !== used) return orig(input, withKey(init, now));   // another request already fixed the key
+      if (askedAgain) return r;
+      askedAgain = true;
+      var k = ask(true);
+      return k ? orig(input, withKey(init, k)) : r;
+    });
+  };
+})();
+`);
 });
 
 // GET /api/rebalancing/positions — live portfolio positions with P&L
