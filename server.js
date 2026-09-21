@@ -6062,7 +6062,14 @@ async function reconcileTransactions(daysBack = 30, dryRun = true) {
   for (const tx of rawTxs) {
     if (!tx || !tx.id) continue;
     const status = (tx.status || '').toLowerCase();
-    if (status === 'cancelled' || status === 'rejected' || status === 'failed') {
+    // ALLOWLIST, NOT DENYLIST. The previous check tested status === 'cancelled'
+    // (two L's, per the published enum) but the LIVE API returns 'canceled' (one L):
+    // by_status on 21 Sept was { pending: 3, completed: 183, canceled: 18 }. The
+    // denylist never matched, so all 18 declined card payments would have passed
+    // through as real, and 'pending' was never excluded either. Only a settled
+    // 'completed' transaction is final. An allowlist is immune to misspellings and
+    // to statuses nobody anticipated.
+    if (status !== 'completed') {
       continue;
     }
 
