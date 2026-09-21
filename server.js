@@ -6840,16 +6840,19 @@ function rebuildPositionFromTransactions(rows, coin) {
     if (qty <= Math.max(1e-8, peak * 1e-6)) { qty = Math.max(qty, 0); cost = 0; sinceZeroQty = 0; sinceZeroUsd = 0; nonUsdSinceZero = 0; if (stakedQty <= 1e-8) lastZeroAt = ts(t); }
   }
   const r8 = (x) => Number(x.toFixed(8)), r6 = (x) => Number(x.toFixed(6));
+  // #346 PRECISION: averages are rounded to SIGNIFICANT figures, not decimal places. 6 decimals left IDEX ($0.000971) with
+  // 3 significant digits (up to 0.06% off) and would have made a $0.000001 coin's average meaningless.
+  const sig = (x) => Number(Number(x).toPrecision(10));
   for (const k of Object.keys(byType)) byType[k].qty = r8(byType[k].qty);
   return {
     coin: C, events: evs.length,
     first_event: evs.length ? new Date(ts(evs[0])).toISOString() : null,
     rebuilt_qty: r8(qty),
     // NULL rather than wrong: a buy paid in another coin would otherwise count as zero-cost and drag the average down
-    avg_cost: qty > 0 && nonUsdSinceZero === 0 ? r6(cost / qty) : null,
+    avg_cost: qty > 0 && nonUsdSinceZero === 0 ? sig(cost / qty) : null,
     avg_note: nonUsdSinceZero > 0 ? 'unknown - part of this holding was bought with another coin' : (flags.no_cost_inflow_qty > 0 ? 'includes units transferred in, counted at zero cost' : (rewardQty > 0 ? 'includes staking rewards at zero cost' : null)),
-    avg_buys_since_zero: sinceZeroQty > 0 ? r6(sinceZeroUsd / sinceZeroQty) : null,
-    avg_all_buys: allBuyQty > 0 ? r6(allBuyUsd / allBuyQty) : null,
+    avg_buys_since_zero: sinceZeroQty > 0 ? sig(sinceZeroUsd / sinceZeroQty) : null,
+    avg_all_buys: allBuyQty > 0 ? sig(allBuyUsd / allBuyQty) : null,
     realised_pnl_usd: Number(realised.toFixed(2)),
     staked_qty: r8(stakedQty), reward_qty: r8(rewardQty),
     last_fully_exited: lastZeroAt ? new Date(lastZeroAt).toISOString() : null,
@@ -6895,7 +6898,10 @@ async function planLedgerRebuild() {
     if (actual <= 0 && oldTr <= 0) continue;                    // nothing held, nothing claimed: nothing to do
     const r = rebuildPositionFromTransactions(tx.rows, c);
     const pend = pendingOut[c] || 0, tol = Math.max(1e-6, actual * 0.005);
-    const matches = Math.abs(r.rebuilt_qty - pend - actual) <= tol || Math.abs(r.rebuilt_qty - pend + (r.staked_qty || 0) - actual) <= tol;
+    let matches = Math.abs(r.rebuilt_qty - pend - actual) <= tol || Math.abs(r.rebuilt_qty - pend + (r.staked_qty || 0) - actual) <= tol;
+    // #346: a ZERO balance with a replay residue worth under $1 (e.g. SOL 0.0023 - an un-itemised network fee on a transfer
+    // out) is an exited coin: close its lots. Needs a known average to value the residue; otherwise it stays skipped.
+    if (!matches && actual <= 0 && r.avg_cost > 0 && Math.abs(r.rebuilt_qty - pend) * r.avg_cost < 1) matches = true;
     if (!matches) { skipped.push({ coin: c, reason: 'rebuilt quantity does not match the balance - left untouched', rebuilt: r.rebuilt_qty, actual }); continue; }
     const oldEntryRaw = entryPrices.get(c + '-USD');
     const oldEntry = oldEntryRaw != null ? Number(oldEntryRaw) : null;
@@ -6917,14 +6923,18 @@ async function planLedgerRebuild() {
   return { ok: true, records: tx.rows.length, plan, skipped };
 }
 
-async function applyLedgerRebuild(plan, runId) {
+async function applyLedgerRebuild(plan, runId, opts = {}) {
   // DDL first: MySQL commits implicitly on CREATE TABLE, so none of it may sit inside the transaction.
   await db.execute(`CREATE TABLE IF NOT EXISTS ledger_rebuild_log (
     id INT AUTO_INCREMENT PRIMARY KEY, run_id VARCHAR(40) NOT NULL, kind VARCHAR(20) NOT NULL, ref VARCHAR(60) NOT NULL,
     old_value VARCHAR(60) NULL, new_value VARCHAR(60) NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, INDEX idx_run (run_id))`);
   const tag = String(runId).replace(/[^a-z0-9_]/gi, '').toLowerCase();
-  await db.execute('CREATE TABLE snap_tranches_' + tag + ' AS SELECT * FROM position_tranches');
-  await db.execute('CREATE TABLE snap_entries_' + tag + ' AS SELECT * FROM entry_prices');
+  // #346: the nightly re-sync passes snapshot:false - two new tables every night would pile up, and its change log
+  // already makes every run exactly reversible. The nightly database backup covers the rest.
+  if (opts.snapshot !== false) {
+    await db.execute('CREATE TABLE snap_tranches_' + tag + ' AS SELECT * FROM position_tranches');
+    await db.execute('CREATE TABLE snap_entries_' + tag + ' AS SELECT * FROM entry_prices');
+  }
   const conn = await db.getConnection();
   const changedEntries = [];
   const counts = { lots_closed: 0, lots_added: 0, entries_changed: 0 };
@@ -6986,6 +6996,48 @@ async function undoLedgerRebuild(runId) {
     if (er.length) entryPrices.set(sym, Number(er[0].entry_price)); else entryPrices.delete(sym);
   }
   return { ok: true, run_id: runId, ...counts };
+}
+
+// #346 NIGHTLY LEDGER RE-SYNC (02:40 London, before the 03:00 reconciliation so its drift report checks the corrected
+// ledger). Same plan and safety checks as the one-off run. Writes ONLY coins that have actually drifted: a lot quantity
+// that no longer matches the balance, or an entry price more than 0.01% off. Quiet nights change nothing and say
+// nothing. Per-trade updates use the REQUESTED price and no fee, so a little drift every day is expected.
+let _ledgerResyncRunning = false;
+async function runNightlyLedgerResync() {
+  if (_ledgerResyncRunning) return { ok: false, skipped: 'already running' };
+  _ledgerResyncRunning = true;
+  const fmtP = (v) => v == null ? '-' : '$' + Number(v).toPrecision(5);
+  try {
+    const p = await planLedgerRebuild();
+    if (!p.ok) {
+      await sendTelegram('\u26a0\ufe0f <b>Nightly ledger re-sync skipped</b>\n' + p.error + ' Nothing was changed - it will try again tomorrow night.').catch(() => {});
+      return { ok: false, error: p.error };
+    }
+    const qtyDrift = (x) => Math.abs(x.old_tranche_qty - x.new_tranche_qty) > Math.max(1e-8, Math.abs(x.held) * 1e-6);
+    const entryDrift = (x) => x.entry_changes && (x.old_entry == null || Math.abs(x.new_entry - x.old_entry) / Math.abs(x.old_entry) > 0.0001);
+    const changed = p.plan.filter(x => qtyDrift(x) || entryDrift(x));
+    for (const x of changed) if (!entryDrift(x)) x.entry_changes = false;   // below 0.01%: leave the entry alone
+    const heldMismatch = p.skipped.filter(s => /does not match/.test(s.reason) && s.actual > 0);
+    if (!changed.length) {
+      console.log('[ledger-resync] nothing drifted' + (heldMismatch.length ? '; unreconciled held coins: ' + heldMismatch.map(s => s.coin).join(', ') : ''));
+      return { ok: true, changed: 0, unreconciled: heldMismatch.map(s => s.coin) };
+    }
+    const runId = 'nightly_' + Date.now();
+    const counts = await applyLedgerRebuild(changed, runId, { snapshot: false });
+    const ent = changed.filter(x => x.entry_changes), lots = changed.filter(qtyDrift);
+    let msg = '\ud83d\udd04 <b>Nightly ledger re-sync</b>\n';
+    if (ent.length) msg += '\nEntry prices corrected:\n' + ent.slice(0, 8).map(x => '\u2022 ' + x.coin + ': ' + fmtP(x.old_entry) + ' \u2192 ' + fmtP(x.new_entry)).join('\n') + (ent.length > 8 ? '\n\u2026 and ' + (ent.length - 8) + ' more' : '') + '\n';
+    if (lots.length) msg += '\nPosition quantities corrected: ' + lots.slice(0, 8).map(x => x.coin).join(', ') + (lots.length > 8 ? ' and ' + (lots.length - 8) + ' more' : '') + '\n';
+    if (heldMismatch.length) msg += '\n\u26a0\ufe0f Could not reconcile (left untouched): ' + heldMismatch.map(s => s.coin).join(', ') + '\n';
+    msg += '\nUndo if needed: run <code>' + runId + '</code>';
+    await sendTelegram(msg).catch(() => {});
+    console.log('[ledger-resync] ' + runId + ' ' + JSON.stringify(counts));
+    return { ok: true, run_id: runId, changed: changed.length, entries: ent.map(x => ({ coin: x.coin, from: x.old_entry, to: x.new_entry })), lots: lots.map(x => ({ coin: x.coin, from: x.old_tranche_qty, to: x.new_tranche_qty })), unreconciled: heldMismatch.map(s => s.coin), ...counts };
+  } catch (e) {
+    console.error('[ledger-resync] failed:', e.message);
+    await sendTelegram('\u26a0\ufe0f <b>Nightly ledger re-sync failed</b> - ' + String(e.message).substring(0, 150) + '. Nothing was changed (all-or-nothing).').catch(() => {});
+    return { ok: false, error: e.message };
+  } finally { _ledgerResyncRunning = false; }
 }
 
 async function reconcileTransactions(daysBack = 30, dryRun = null) {
@@ -12794,6 +12846,7 @@ cron.schedule('45 3 * * *', runCapitalIntegrityCheck, { timezone: 'Europe/London
 cron.schedule('50 3 * * *', runPumpArmStalenessCheck, { timezone: 'Europe/London' }); // #222 stuck-armed staleness alert
 cron.schedule('55 2 * * *', backupServerJsToDrive, { timezone: 'Europe/London' }); // nightly server.js snapshot → revolut-claude-backups
 cron.schedule('30 3 * * *', backupDatabaseToDrive, { timezone: 'Europe/London' }); // #12 nightly DB backup
+cron.schedule('40 2 * * *', runNightlyLedgerResync, { timezone: 'Europe/London' }); // #346 ledger + entry prices from venue transactions
 
 // Morning briefing disabled — sendMorningBriefing() kept for manual use
 // cron.schedule('5 9 * * *', async () => {
@@ -15336,7 +15389,7 @@ let rows;
   server.tool('manage_trading',
     'Log journal entries, trade intentions, trader preferences, update invested capital, or configure USDT sweep',
     {
-      action:                 z.enum(['log_journal', 'log_intention', 'save_preference', 'update_capital', 'configure_sweep', 'configure_auto_execute', 'log_dev_issue', 'update_session_state', 'upsert_coin_strategy', 'export_dev_log', 'log_research', 'log_pm_decision', 'log_dev_decision', 'void_journal', 'configure_away_mode', 'delete_tax_lot', 'log_catalyst', 'log_thesis', 'configure_abnormal', 'configure_dnd', 'configure_thesis_nudge', 'upsert_catalogue', 'ledger_rebuild_apply', 'ledger_rebuild_undo']).describe('What trading action to perform'),
+      action:                 z.enum(['log_journal', 'log_intention', 'save_preference', 'update_capital', 'configure_sweep', 'configure_auto_execute', 'log_dev_issue', 'update_session_state', 'upsert_coin_strategy', 'export_dev_log', 'log_research', 'log_pm_decision', 'log_dev_decision', 'void_journal', 'configure_away_mode', 'delete_tax_lot', 'log_catalyst', 'log_thesis', 'configure_abnormal', 'configure_dnd', 'configure_thesis_nudge', 'upsert_catalogue', 'ledger_rebuild_apply', 'ledger_rebuild_undo', 'ledger_resync_now']).describe('What trading action to perform'),
       symbol:                 z.string().optional().describe('Coin e.g. NEAR-USD or NEAR'),
       trade_action:           z.enum(['buy', 'sell', 'hold', 'add', 'reduce', 'payment', 'transfer', 'pass']).optional().describe('Trade action for log_journal or log_intention — use pass to log a skipped trade for shadow grading at +7d/+30d'),
       price:                  z.coerce.number().optional().describe('Price for log_journal'),
@@ -16180,6 +16233,10 @@ let rows;
         console.log('[ledger-rebuild] applied run ' + runId + ': ' + JSON.stringify(counts));
         return reply({ ok: true, applied: true, run_id: runId, ...counts, entry_price_changes: entries, ledger_quantity_changes: lots.length,
           undo: "manage_trading action 'ledger_rebuild_undo' with ledger_run_id '" + runId + "'" });
+      } else if (action === 'ledger_resync_now') {
+        // #346: run tonight's re-sync immediately - same drift-only rules, same Telegram summary.
+        const r = await runNightlyLedgerResync();
+        return { content: [{ type: 'text', text: JSON.stringify(r) }] };
       } else if (action === 'ledger_rebuild_undo') {
         if (!ledger_run_id) return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'ledger_run_id required' }) }] };
         const u = await undoLedgerRebuild(String(ledger_run_id));
