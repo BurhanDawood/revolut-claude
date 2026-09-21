@@ -6788,6 +6788,8 @@ function rebuildPositionFromTransactions(rows, coin) {
   let sinceZeroQty = 0, sinceZeroUsd = 0, allBuyQty = 0, allBuyUsd = 0;
   const byType = {}, flags = { negative_balance: 0, first_negative_at: null, non_usd_trades: 0, no_cost_inflow_qty: 0 };
   let nonUsdSinceZero = 0;   // a trade priced in another coin has no dollar cost: the average of THIS holding is then unknowable
+  // #343 STAKING is not a sale: staked coins keep their cost in a separate bucket and bring it back on un-stake.
+  let stakedQty = 0, stakedCost = 0, rewardQty = 0;
   for (const t of evs) {
     const type = String(t.type || 'unknown');
     const src = t.source || {}, dst = t.destination || {};
@@ -6802,9 +6804,21 @@ function rebuildPositionFromTransactions(rows, coin) {
     if (inflow) {
       if (usd !== null && type === 'buy') {
         qty += q; cost += usd; sinceZeroQty += q; sinceZeroUsd += usd; allBuyQty += q; allBuyUsd += usd;
+      } else if (type === 'un_stake') {
+        // coins coming back from staking carry the cost they left with
+        const fromBucket = Math.min(q, stakedQty);
+        const back = stakedQty > 0 ? stakedCost * (fromBucket / stakedQty) : 0;
+        qty += q; cost += back; stakedQty -= fromBucket; stakedCost -= back;
+        if (q - fromBucket > 1e-9) flags.no_cost_inflow_qty += q - fromBucket;   // staked before the history begins
+      } else if (type === 'reward') {
+        qty += q; rewardQty += q;                          // genuinely new coins: zero cost, reported separately
       } else {
-        qty += q; flags.no_cost_inflow_qty += q;           // receive / reward / un_stake: cost unknown
+        qty += q; flags.no_cost_inflow_qty += q;           // receive / transfer in: cost unknown
       }
+    } else if (type === 'stake') {
+      // moved into staking, NOT disposed of: take it out of the held quantity with its share of the cost
+      const avg = qty > 0 ? cost / qty : 0; const mv = Math.min(q, Math.max(qty, 0));
+      stakedQty += mv; stakedCost += avg * mv; qty -= mv; cost -= avg * mv;
     } else {
       const avg = qty > 0 ? cost / qty : 0;
       if (type === 'sell' && usd !== null) realised += usd - avg * q;
@@ -6827,10 +6841,11 @@ function rebuildPositionFromTransactions(rows, coin) {
     rebuilt_qty: r8(qty),
     // NULL rather than wrong: a buy paid in another coin would otherwise count as zero-cost and drag the average down
     avg_cost: qty > 0 && nonUsdSinceZero === 0 ? r6(cost / qty) : null,
-    avg_note: nonUsdSinceZero > 0 ? 'unknown - part of this holding was bought with another coin' : (flags.no_cost_inflow_qty > 0 ? 'includes units transferred in, counted at zero cost' : null),
+    avg_note: nonUsdSinceZero > 0 ? 'unknown - part of this holding was bought with another coin' : (flags.no_cost_inflow_qty > 0 ? 'includes units transferred in, counted at zero cost' : (rewardQty > 0 ? 'includes staking rewards at zero cost' : null)),
     avg_buys_since_zero: sinceZeroQty > 0 ? r6(sinceZeroUsd / sinceZeroQty) : null,
     avg_all_buys: allBuyQty > 0 ? r6(allBuyUsd / allBuyQty) : null,
     realised_pnl_usd: Number(realised.toFixed(2)),
+    staked_qty: r8(stakedQty), reward_qty: r8(rewardQty),
     by_type: byType, flags: { ...flags, no_cost_inflow_qty: r8(flags.no_cost_inflow_qty) }
   };
 }
@@ -14723,7 +14738,10 @@ let rows;
             const actual = held[c] != null ? Number(held[c].toFixed(8)) : 0;
             r.actual_balance = actual;
             r.pending_out_qty = pendingOut[c] ? Number(pendingOut[c].toFixed(8)) : 0;
-            r.qty_matches_balance = Math.abs(r.rebuilt_qty - actual) <= Math.max(1e-6, actual * 0.005);
+            // #343: the venue removes a PENDING card payment from the balance before it completes, so compare after it
+            r.rebuilt_less_pending = Number((r.rebuilt_qty - r.pending_out_qty).toFixed(8));
+            r.qty_matches_balance = Math.abs(r.rebuilt_less_pending - actual) <= Math.max(1e-6, actual * 0.005)
+              || Math.abs(r.rebuilt_less_pending + (r.staked_qty || 0) - actual) <= Math.max(1e-6, actual * 0.005);   // in case the balance counts staked coins
             r.ledger_tranche_qty = tr[c] ? Number(tr[c].q.toFixed(8)) : null;
             r.ledger_tranche_avg = tr[c] && tr[c].avg != null ? Number(tr[c].avg.toFixed(6)) : null;
             const ep = entryPrices.get(c + '-USD');
