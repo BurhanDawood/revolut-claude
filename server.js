@@ -4,7 +4,7 @@ import cors from 'cors';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
-import { createPrivateKey, sign, createHash, createHmac, randomUUID } from 'crypto';
+import { createPrivateKey, sign, createHash, createHmac, randomUUID, timingSafeEqual } from 'crypto';
 import { fileURLToPath } from 'url';
 import { readFileSync } from 'fs';
 import { dirname, join } from 'path';
@@ -13169,7 +13169,26 @@ app.use(express.json());
 // Left open on purpose: /api/health (liveness only) and /api/bridge (checks its own BRIDGE_TOKEN). Outside this gate
 // and unchanged: /telegram-webhook (own secret), /mcp-<secret>, /dev-log/context (own key), /telegram-setup.
 const DASHBOARD_WRITES = ['/api/pause', '/api/resume', '/api/sweep/config'];
+// #351 (from the Dev-342 security review): routes that act or spend even on a GET. They need the FULL key, which is
+// deliberately unset, so they are OFF. /api/test/macro-news resets a rate limit and runs a paid Claude call plus
+// Telegram; /telegram-setup re-registers the webhook. Matched with case and trailing slashes normalised, and for every
+// method - Express runs GET handlers for HEAD too.
+const FULL_KEY_ONLY = ['/api/test/macro-news', '/telegram-setup'];
+// #351 Constant-time key comparison. Unequal lengths return false at once (reveals only the length, which is fixed).
+function safeEqual(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const x = Buffer.from(a), y = Buffer.from(b);
+  return x.length === y.length && timingSafeEqual(x, y);
+}
 app.use((req, res, next) => {
+  // #351: refuse any path containing '//'. Express does not merge slashes when matching routes (tested: these return
+  // 404), so nothing is reachable this way today - but the gate should not depend on that.
+  if (req.path.includes('//')) return res.status(400).json({ error: 'bad path' });
+  const fk = req.path.toLowerCase().replace(/\/+$/, '');
+  if (FULL_KEY_ONLY.includes(fk)) {
+    const k = process.env.API_TOKEN;
+    return (typeof k === 'string' && k.length >= 24 && safeEqual(req.headers['x-api-token'], k)) ? next() : res.status(401).json({ error: 'unauthorized' });
+  }
   // LOWER-CASED: Express matches routes case-insensitively, so '/API/revolut/trade' reaches the same handler as
   // '/api/revolut/trade'. #43 compared case-sensitively and could be bypassed that way - including trade and capital
   // writes (found and proven 21 Sept). Every comparison below uses this lower-cased path.
@@ -13178,7 +13197,7 @@ app.use((req, res, next) => {
   if (req.method === 'OPTIONS') return next();                                   // CORS preflight carries no data
   if (p === '/api/health' || p === '/api/bridge') return next();
   const sent = req.headers['x-api-token'];
-  const matches = (v) => typeof v === 'string' && v.length >= 24 && sent === v;
+  const matches = (v) => typeof v === 'string' && v.length >= 24 && safeEqual(sent, v);   // #351 constant-time
   if (matches(process.env.API_TOKEN)) return next();
   const isRead = req.method === 'GET' || req.method === 'HEAD';
   if ((isRead || DASHBOARD_WRITES.includes(p)) && matches(process.env.DASHBOARD_TOKEN)) return next();
@@ -13199,7 +13218,7 @@ app.get('/usage', (req, res) => res.sendFile(join(__dirname, 'public', 'claude-u
 // and the open-ticket list. Capped so it never dwarfs the code it accompanies.
 app.get('/dev-log/context', async (req, res) => {
   const tok = process.env.DEV_LOG_TOKEN;
-  if (!tok || tok.length < 24 || req.headers['x-dev-log-token'] !== tok) return res.status(401).type('text/plain').send('unauthorized');
+  if (!tok || tok.length < 24 || !safeEqual(req.headers['x-dev-log-token'], tok)) return res.status(401).type('text/plain').send('unauthorized');   // #351 constant-time
   try {
     const refs = [...new Set(String(req.query.refs || '').split(',').map(s => parseInt(s, 10)).filter(n => Number.isFinite(n) && n > 0))].slice(0, 20);
     const recent = Math.min(Math.max(parseInt(req.query.recent, 10) || 25, 0), 60);
@@ -13609,7 +13628,7 @@ app.post('/api/targets/:symbol', async (req, res) => {
 // POST /api/bridge — dev_bridge ingestion (Claude→Railway). Token-protected.
 app.post('/api/bridge', async (req, res) => {
   // AUTH — required, unlike the other open routes
-  if (!process.env.BRIDGE_TOKEN || req.headers['x-bridge-token'] !== process.env.BRIDGE_TOKEN) {
+  if (!process.env.BRIDGE_TOKEN || !safeEqual(req.headers['x-bridge-token'], process.env.BRIDGE_TOKEN)) {   // #351 constant-time
     return res.status(401).json({ error: 'Unauthorized' });
   }
   const { type, payload, ref_devlog_id } = req.body;
@@ -18471,7 +18490,7 @@ app.post('/telegram-webhook', async (req, res) => {
   try {
     // hash189 SECURITY: verify Telegram secret token; fail-closed if unset or mismatched
     const expectedWebhookSecret = process.env.TELEGRAM_WEBHOOK_SECRET;
-    if (!expectedWebhookSecret || req.headers['x-telegram-bot-api-secret-token'] !== expectedWebhookSecret) {
+    if (!expectedWebhookSecret || !safeEqual(req.headers['x-telegram-bot-api-secret-token'], expectedWebhookSecret)) {   // #351 constant-time
       console.warn('[security] /telegram-webhook rejected: secret token missing or mismatch');
       return res.status(403).json({ ok: false });
     }
