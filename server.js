@@ -12936,7 +12936,7 @@ let rows;
   server.tool('get_trading_data',
     'Get trading journal entries, active alerts, trader context/profile, rebalancing history, and dev_bridge messages',
     {
-      include: zLoose(z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'dev_bridge', 'coin_strategy', 'reconciliation', 'ledger', 'tax_lots', 'catalysts', 'thesis', 'nudges', 'dev_health', 'dev_recommendations', 'volatility_baseline', 'shadow_fills', 'abnormal_events', 'strategy_catalogue', 'exchange_orders', 'transactions', 'all']))).optional()
+      include: zLoose(z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'dev_bridge', 'coin_strategy', 'reconciliation', 'ledger', 'tax_lots', 'catalysts', 'thesis', 'nudges', 'dev_health', 'dev_recommendations', 'volatility_baseline', 'shadow_fills', 'abnormal_events', 'strategy_catalogue', 'exchange_orders', 'transactions', 'reconcile_transactions', 'all']))).optional()
         .describe('What data to fetch — defaults to all. dev_bridge, coin_strategy and reconciliation are never included in all; request them explicitly'),
       symbol:           z.string().optional().describe('Filter journal by coin e.g. NEAR'),
       limit:            z.coerce.number().optional().describe('Max journal entries to return, default 10'),
