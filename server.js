@@ -10535,17 +10535,23 @@ async function checkPortfolio() {
             const w = pendingFiatWithdrawal;
             pendingFiatWithdrawal = null;
             console.log('[withdrawal] #136 Parked $' + w.toFixed(2) + ' confirmed as genuine withdrawal — auto-logging now');
-            await db.execute(
+            const [insW] = await db.execute(
               'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
               ['USD', 'payment', 1.00, w, w, 'Auto-logged fiat withdrawal — $' + w.toFixed(2) + ' USD left account (#136 1-cycle delay)', 'neutral', 'fiat_withdrawal']
-            ).catch(() => {});
+            ).catch(() => [null]);
+            const wJid = insW && insW.insertId ? insW.insertId : null;
             const prevCapW2 = totalInvestedCapital;
             const newCapW2  = totalInvestedCapital - w;
             await updateInvestedCapital(newCapW2, 'Fiat withdrawal auto-logged: -$' + w.toFixed(2));
+            // Report what capital ACTUALLY did - a withdrawal over $200 is HELD by the guard.
+            const appliedW = Math.abs(totalInvestedCapital - newCapW2) < 0.005;
             await sendTelegram(
               '💸 WITHDRAWAL $' + w.toFixed(2) + ' USD\n' +
-              'Capital: $' + prevCapW2.toFixed(2) + ' → $' + newCapW2.toFixed(2) + '\n\n' +
-              "Tap '<b>skip payment " + w.toFixed(2) + "</b>' if not a withdrawal."
+              (appliedW
+                ? 'Capital: $' + prevCapW2.toFixed(2) + ' \u2192 $' + totalInvestedCapital.toFixed(2) + '\n\n'
+                : 'Capital change HELD for your confirmation - see the capital alert.\n\n') +
+              "Tap <b>Not a withdrawal</b> if it wasn't one, or reply '<b>skip payment " + w.toFixed(2) + "</b>'.",
+              wJid ? buildAlertKeyboard(String(wJid), ['Not a withdrawal'], 'np') : undefined
             ).catch(() => {});
           }
         }
