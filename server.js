@@ -15840,6 +15840,19 @@ let rows;
         const existingCfg = existingCfgRows.length ? JSON.parse(existingCfgRows[0].config_value) : {};
 
         const defaultHodl = ['ENA','JTO','RENDER','INJ','FET','ALGO','AVAX','ADA','HBAR','ILV','PYTH','SUPER','SEI','MOG','HFT','CRO','FLR','POL','XLM','BONK'];
+        // #353 MERGE the per-coin maps. Naming ONE coin used to REPLACE the whole map, silently deleting every other
+        // coin's sell floor or auto-exec opt-in. Now only the coins named change. Keys are stored as the bare coin
+        // (e.g. JTO), which is how autoExecuteSell and shouldAutoExecute read them. In sell_floors a value of 0
+        // removes that coin's floor; in per_coin_enabled, false stays false (an explicit opt-out).
+        const mergeCoinMap = (oldM, newM, zeroDeletes) => {
+          if (newM === undefined || newM === null) return oldM ?? {};
+          const out = { ...(oldM || {}) };
+          for (const [k, v] of Object.entries(newM)) {
+            const coin = String(k).toUpperCase().replace(/-USD$/, '');
+            if (v === null || (zeroDeletes && Number(v) === 0)) delete out[coin]; else out[coin] = v;
+          }
+          return out;
+        };
         const config = {
           ...existingCfg, // #281 merge-not-replace: preserve every key this handler does not explicitly manage (e.g. manual_only_symbols) — explicit fields below still override
           enabled: enabled ?? existingCfg.enabled ?? false,
@@ -15852,8 +15865,8 @@ let rows;
           // Deliberately not `?? []` — an empty array is truthy and would defeat the boot seeder's
           // `!existing.manual_only_symbols` re-patch, silently disarming the guard for good.
           ...(params?.manual_only_symbols !== undefined ? { manual_only_symbols: params.manual_only_symbols } : {}),
-          sell_floors: sell_floors ?? existingCfg.sell_floors ?? {}, // #45 preserved across updates
-          per_coin_enabled: per_coin_enabled ?? existingCfg.per_coin_enabled ?? {}, // #24 explicit per-coin opt-in
+          sell_floors: mergeCoinMap(existingCfg.sell_floors, sell_floors, true), // #45 preserved; #353 per-coin merge
+          per_coin_enabled: mergeCoinMap(existingCfg.per_coin_enabled, per_coin_enabled, false), // #24 opt-in; #353 per-coin merge
           updated_at: new Date().toISOString()
         };
         // Always saves to system_config — NOT trader_profile
@@ -16618,7 +16631,7 @@ let rows;
   server.tool('manage_auto_rules',
     'Manage automatic trade rules — list, remove, disable or enable a rule by ID. reset_cycle (#278) clears STALE pump-loop runtime state for a symbol (armed, armed_since, ringfenced sale_proceeds_usd, trough fields, baseline, tier_state) while PRESERVING all config; it refuses on a live cycle (sale_price set) unless force=true.',
     {
-      action:  z.enum(['list', 'remove', 'disable', 'enable', 'pump_status', 'loop_enable', 'loop_disable', 'reset_cycle']).describe('Action to perform'),
+      action:  z.enum(['list', 'remove', 'disable', 'enable', 'pump_status', 'loop_enable', 'loop_disable', 'reset_cycle', 'loop_audit']).describe('Action to perform. loop_audit (#353, read-only): every gate that decides whether each pump loop can really auto-sell, with both floors against the real cost.'),
       rule_id: z.coerce.number().optional().describe('Rule ID to remove, disable or enable'),
       symbol: z.string().optional().describe('Symbol e.g. BOBA-USD for loop_enable/loop_disable/reset_cycle'),
       force:  z.boolean().optional().describe('#278 reset_cycle only — override the live-cycle guard (sale_price set). Default false.'),
@@ -16628,6 +16641,69 @@ let rows;
         if (action === 'list') {
           const [rules] = await db.execute('SELECT * FROM auto_trade_rules ORDER BY created_at DESC');
           return { content: [{ type: 'text', text: JSON.stringify({ rules, active: rules.filter(r => r.active) }, null, 2) }] };
+        }
+        if (action === 'loop_audit') {
+          // #353 READ-ONLY. One row per active pump loop (plus any coin with a sell_floors entry): every gate on the
+          // pump-loop auto-sell path (handleTrailingStopAlert #93 -> autoExecuteSell) in the order they apply, both
+          // floors against the real cost, and whether a sale could actually happen at today's price.
+          // NOTE: that path does NOT read ai_auto_execute.enabled - the master switch does not stop pump-loop sells.
+          const [rules] = await db.execute('SELECT * FROM pump_armed_rules WHERE active = 1 ORDER BY symbol');
+          const [aeR] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'ai_auto_execute'");
+          const ae = aeR.length ? JSON.parse(aeR[0].config_value) : {};
+          const sf = ae.sell_floors || {}, hodl = ae.hodl_symbols || [], mo = ae.manual_only_symbols || [];
+          const dnd = await getDndMode().catch(() => ({ enabled: false, coins: [] }));
+          const dndCoins = dnd && dnd.enabled && Array.isArray(dnd.coins) ? dnd.coins.map(c => String(c).toUpperCase()) : [];
+          const held = {}; let balancesOk = false;
+          try {
+            const bal = await revolutRequest('GET', '/balances');
+            const rows = Array.isArray(bal) ? bal : (bal && (bal.data || bal.balances)) || [];
+            for (const b of rows) held[String(b.currency || '').toUpperCase()] = (parseFloat(b.available) || 0) + (parseFloat(b.reserved) || 0);
+            balancesOk = rows.length > 0;
+          } catch (e) { /* reported below */ }
+          const px = {};
+          try {
+            const tk = await revolutRequest('GET', '/tickers');
+            const tl = Array.isArray(tk) ? tk : (tk && tk.data) || [];
+            for (const t of tl) { if (!t.symbol) continue; const p = parseFloat(t.last_price || t.mid || t.ask || t.bid); if (p) px[t.symbol.replace('/', '-')] = p; }
+          } catch (e) { /* reported below */ }
+          const coins = [...new Set([...rules.map(r => r.symbol.replace('-USD', '')), ...Object.keys(sf).map(k => k.toUpperCase())])].sort();
+          const r6 = (v) => v == null ? null : Number(Number(v).toPrecision(6));
+          const loops = coins.map(c => {
+            const rule = rules.find(r => r.symbol === c + '-USD') || null;
+            const cost = entryPrices.has(c + '-USD') ? Number(entryPrices.get(c + '-USD')) : null;
+            const sfv = sf[c] != null && Number(sf[c]) > 0 ? Number(sf[c]) : null;
+            const rf = rule && rule.entry_floor != null && Number(rule.entry_floor) > 0 ? Number(rule.entry_floor) : null;
+            const eff = sfv != null ? sfv : (rf != null ? rf : (cost != null && cost > 0 ? cost : null));
+            const src = sfv != null ? 'sell_floors' : (rf != null ? 'rule' : (eff != null ? 'entry_price' : 'none'));
+            const price = px[c + '-USD'] ?? null, qty = held[c] ?? 0, usd = price != null ? qty * price : null;
+            const blocks = [];
+            if (!rule) blocks.push('no active pump rule');
+            else if (Number(rule.loop_enabled) !== 1) blocks.push('loop disabled (alerts only)');
+            if (mo.includes(c) || mo.includes(c + '-USD')) blocks.push('manual_only');
+            if ((hodl.includes(c) || hodl.includes(c + '-USD')) && !dndCoins.includes(c)) blocks.push('hodl (not in DnD)');
+            if (eff == null) blocks.push('no floor (fails safe)');
+            if (usd != null && usd < 1) blocks.push('dust (< $1)');
+            let floorVsCost = 'unknown - no real cost';
+            if (eff != null && cost != null && cost > 0) {
+              const d = (eff - cost) / cost * 100;
+              floorVsCost = Math.abs(d) < 0.1 ? 'at cost' : (d < 0 ? `BELOW COST by ${(-d).toFixed(1)}% - could auto-sell at a loss` : `above cost by ${d.toFixed(1)}% - blocks sales between cost and floor`);
+            }
+            const canSell = blocks.length === 0;
+            return {
+              coin: c, held_usd: usd != null ? Number(usd.toFixed(2)) : null, price: r6(price), real_cost: r6(cost),
+              floor_rule: r6(rf), floor_sell_floors: r6(sfv), floor_effective: r6(eff), floor_source: src, floor_vs_cost: floorVsCost,
+              loop_enabled: rule ? Number(rule.loop_enabled) : null, armed: rule ? Number(rule.armed) : null,
+              arm: rule ? `+${Number(rule.arm_pump_pct)}% in ${Number(rule.arm_window_min)}min, trail ${Number(rule.trail_pct)}%, sell ${Number(rule.sell_pct)}%` : null,
+              blocked_by: blocks,
+              verdict: !canSell ? 'CANNOT auto-sell' : (price != null && eff != null && price <= eff ? `can auto-sell only above ${r6(eff)} (price is at/below the floor)` : 'CAN auto-sell on a trail breach')
+            };
+          });
+          return { content: [{ type: 'text', text: JSON.stringify({
+            read_only: true, balances_read: balancesOk, prices_read: Object.keys(px).length > 0,
+            master_auto_execute: ae.enabled === true,
+            note: 'The pump-loop sell path does NOT check master_auto_execute - turning it off does not stop these loops. Floor priority: sell_floors > rule floor > entry price.',
+            dnd_coins: dndCoins, loops
+          }, null, 2) }] };
         }
         if (action === 'pump_status') {
           const [prules] = await db.execute('SELECT * FROM pump_armed_rules ORDER BY symbol');
@@ -17066,28 +17142,58 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
           conflictWarning = `\n\n⚠️ CONFLICT: an existing trailing stop for ${sym.replace('-USD','')} was found (peak ${existingTs.peakPrice}, stop ${existingTs.stopPrice}, auto_execute=${existingTs.autoExecute}) that is NOT from the pump-loop's own last arm cycle -- likely a leftover manual trailing stop (manage_alerts set_trailing). Recommend remove_trailing before relying on this arm, or the two mechanisms may conflict exactly as happened with IDEX/GHIBLI.`;
         }
 
-        await db.execute(
-          `INSERT INTO pump_armed_rules (symbol, arm_pump_pct, arm_window_min, trail_pct, sell_pct, entry_floor, rebuy_pct, retrace_pct, bounce_pct, buyback_floor_pct, rule_mode, sell_tiers, buy_tiers, tier_cooldown_min, min_tier_usd, armed, baseline_price, baseline_at, active)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, 'single'), ?, ?, COALESCE(?, 15), COALESCE(?, 2.0), 0, NULL, NULL, 1)
-           ON DUPLICATE KEY UPDATE arm_pump_pct=VALUES(arm_pump_pct), arm_window_min=VALUES(arm_window_min), trail_pct=VALUES(trail_pct), sell_pct=VALUES(sell_pct), entry_floor=VALUES(entry_floor), rebuy_pct=VALUES(rebuy_pct), retrace_pct=VALUES(retrace_pct), bounce_pct=VALUES(bounce_pct), buyback_floor_pct=COALESCE(?, buyback_floor_pct), rule_mode=COALESCE(?, rule_mode), sell_tiers=COALESCE(?, sell_tiers), buy_tiers=COALESCE(?, buy_tiers), tier_cooldown_min=COALESCE(?, tier_cooldown_min), min_tier_usd=COALESCE(?, min_tier_usd), armed=0, baseline_price=NULL, baseline_at=NULL, active=1, updated_at=CURRENT_TIMESTAMP`,
-          [sym, arm_pump_pct, arm_window_min || 60, trail_pct, sell_pct ?? 50, entry_floor ?? null, rebuy_pct ?? 8, retrace_pct ?? 50, bounce_pct ?? 8, buyback_floor_pct ?? 5,
-           rule_mode ?? null, stJson, btJson, tier_cooldown_min ?? null, min_tier_usd ?? null,
-           buyback_floor_pct ?? null, rule_mode ?? null, stJson, btJson, tier_cooldown_min ?? null, min_tier_usd ?? null]
-        );
+        // #353 MERGE, NOT RESET. Before this, EVERY call overwrote window / sell % / floor / rebuy / retrace / bounce with
+        // the call's values or DEFAULTS (21 Sept: COTI's 24h window became 60 min and its 100% sell 50%), wiped the floor
+        // when it was omitted, and on every update DISARMED the loop (armed=0, baseline cleared) and forced active=1.
+        // Now an update to an ACTIVE rule changes only the fields supplied. Runtime state (armed, sale / trough state) is
+        // never touched by a config change; the baseline restarts only if the arm trigger itself changed and the loop is
+        // not armed. An INACTIVE or missing rule is a fresh set-up (defaults, re-activated) - unchanged from before.
+        const [exRows] = await db.execute('SELECT * FROM pump_armed_rules WHERE symbol = ? LIMIT 1', [sym]);
+        const ex = exRows.length && Number(exRows[0].active) === 1 ? exRows[0] : null;
+        const changed = [];
+        if (ex) {
+          const same = (x, y) => (x == null && y == null) || (x != null && y != null && (Number(x) === Number(y) || String(x) === String(y)));
+          const sets = [], vals = [];
+          const put = (col, v) => { if (v === undefined || v === null) return; sets.push(col + ' = ?'); vals.push(v); if (!same(ex[col], v)) changed.push(col); };
+          put('arm_pump_pct', arm_pump_pct); put('arm_window_min', arm_window_min); put('trail_pct', trail_pct); put('sell_pct', sell_pct);
+          put('entry_floor', entry_floor); put('rebuy_pct', rebuy_pct); put('retrace_pct', retrace_pct); put('bounce_pct', bounce_pct);
+          put('buyback_floor_pct', buyback_floor_pct); put('rule_mode', rule_mode); put('tier_cooldown_min', tier_cooldown_min); put('min_tier_usd', min_tier_usd);
+          if (stJson !== null) { sets.push('sell_tiers = ?'); vals.push(stJson); changed.push('sell_tiers'); }
+          if (btJson !== null) { sets.push('buy_tiers = ?'); vals.push(btJson); changed.push('buy_tiers'); }
+          if ((changed.includes('arm_pump_pct') || changed.includes('arm_window_min')) && Number(ex.armed) !== 1) sets.push('baseline_price = NULL', 'baseline_at = NULL');
+          sets.push('updated_at = CURRENT_TIMESTAMP');
+          vals.push(sym);
+          await db.execute('UPDATE pump_armed_rules SET ' + sets.join(', ') + ' WHERE symbol = ?', vals);
+        } else {
+          await db.execute(
+            `INSERT INTO pump_armed_rules (symbol, arm_pump_pct, arm_window_min, trail_pct, sell_pct, entry_floor, rebuy_pct, retrace_pct, bounce_pct, buyback_floor_pct, rule_mode, sell_tiers, buy_tiers, tier_cooldown_min, min_tier_usd, armed, baseline_price, baseline_at, active)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, 'single'), ?, ?, COALESCE(?, 15), COALESCE(?, 2.0), 0, NULL, NULL, 1)
+             ON DUPLICATE KEY UPDATE arm_pump_pct=VALUES(arm_pump_pct), arm_window_min=VALUES(arm_window_min), trail_pct=VALUES(trail_pct), sell_pct=VALUES(sell_pct), entry_floor=VALUES(entry_floor), rebuy_pct=VALUES(rebuy_pct), retrace_pct=VALUES(retrace_pct), bounce_pct=VALUES(bounce_pct), buyback_floor_pct=COALESCE(?, buyback_floor_pct), rule_mode=COALESCE(?, rule_mode), sell_tiers=COALESCE(?, sell_tiers), buy_tiers=COALESCE(?, buy_tiers), tier_cooldown_min=COALESCE(?, tier_cooldown_min), min_tier_usd=COALESCE(?, min_tier_usd), armed=0, baseline_price=NULL, baseline_at=NULL, active=1, updated_at=CURRENT_TIMESTAMP`,
+            [sym, arm_pump_pct, arm_window_min || 60, trail_pct, sell_pct ?? 50, entry_floor ?? null, rebuy_pct ?? 8, retrace_pct ?? 50, bounce_pct ?? 8, buyback_floor_pct ?? 5,
+             rule_mode ?? null, stJson, btJson, tier_cooldown_min ?? null, min_tier_usd ?? null,
+             buyback_floor_pct ?? null, rule_mode ?? null, stJson, btJson, tier_cooldown_min ?? null, min_tier_usd ?? null]
+          );
+        }
+        const [finRows] = await db.execute('SELECT * FROM pump_armed_rules WHERE symbol = ? LIMIT 1', [sym]);
+        const fin = finRows[0] || {};
+        const num = (v) => v == null ? null : Number(v);
         await sendTelegram(
-          `🎯 <b>PUMP-ARM RULE SET — ${sym.replace('-USD','')}</b>\n\n` +
-          `Arms when +${arm_pump_pct}% within ${arm_window_min || 60}min\n` +
-          `Then trails ${trail_pct}% below peak\n` +
-          `${entry_floor ? `Floor: ${entry_floor}\n` : ''}` +
-          `Sell %% (Stage 2): ${sell_pct ?? 50}%\n` +
-          `Rebuy retrace: ${rebuy_pct ?? 8}%\n` +
-          `Trough-arm retrace: ${retrace_pct ?? 50}%, bounce: ${bounce_pct ?? 8}%\n` +
-          `Buyback floor: ${buyback_floor_pct ?? 5}%\n` +
-          `${tierInfo ? `Mode: TIERED — sell ${stJson}, buy ${btJson}\nCumulative sell ${tierInfo.cumulative_sell_pct}% (cap ${tierInfo.max_sell_pct}%)\n` : ''}` +
-          `\n` +
-          `⚠️ Stage 1 active — arms + alerts only, no auto-sell yet.` + conflictWarning
+          `🎯 <b>PUMP-ARM RULE ${ex ? 'UPDATED' : 'SET'} — ${sym.replace('-USD','')}</b>\n\n` +
+          (ex ? `Changed: ${changed.length ? changed.join(', ') : 'nothing'}\n\n` : '') +
+          `Arms when +${num(fin.arm_pump_pct)}% within ${num(fin.arm_window_min)}min\n` +
+          `Then trails ${num(fin.trail_pct)}% below peak\n` +
+          `Floor: ${fin.entry_floor != null ? num(fin.entry_floor) : 'none on the rule (sell_floors / entry price apply)'}\n` +
+          `Sell on breach: ${num(fin.sell_pct)}%\n` +
+          `Trough-arm retrace: ${num(fin.retrace_pct)}%, bounce: ${num(fin.bounce_pct)}%, buyback floor: ${num(fin.buyback_floor_pct)}%\n` +
+          `Auto-sell: ${Number(fin.loop_enabled) === 1 ? 'ON (loop enabled)' : 'OFF (alerts only)'}` +
+          `${Number(fin.armed) === 1 ? '\nArmed state kept - this change did not disarm the loop.' : ''}` +
+          `${tierInfo ? `\nMode: TIERED — sell ${stJson}, buy ${btJson} (cumulative sell ${tierInfo.cumulative_sell_pct}%, cap ${tierInfo.max_sell_pct}%)` : ''}` + conflictWarning
         ).catch(() => {});
-        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, symbol: sym, arm_pump_pct, trail_pct, arm_window_min: arm_window_min || 60, sell_pct: sell_pct ?? 50, entry_floor: entry_floor ?? null, rebuy_pct: rebuy_pct ?? 8, retrace_pct: retrace_pct ?? 50, bounce_pct: bounce_pct ?? 8, buyback_floor_pct: buyback_floor_pct ?? 5, rule_mode: rule_mode ?? null, sell_tiers: stJson ? JSON.parse(stJson) : null, buy_tiers: btJson ? JSON.parse(btJson) : null, tier_cooldown_min: tier_cooldown_min ?? null, min_tier_usd: min_tier_usd ?? null, tier_validation: tierInfo, conflict_warning: conflictWarning || null, note: 'Stage 1 — arms trailing stop on pump, no auto-sell. #282 tier config is stored but NOT executed yet.' }) }] };
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, mode: ex ? 'updated' : 'created', changed, rule: {
+          symbol: sym, arm_pump_pct: num(fin.arm_pump_pct), arm_window_min: num(fin.arm_window_min), trail_pct: num(fin.trail_pct), sell_pct: num(fin.sell_pct),
+          entry_floor: num(fin.entry_floor), rebuy_pct: num(fin.rebuy_pct), retrace_pct: num(fin.retrace_pct), bounce_pct: num(fin.bounce_pct),
+          buyback_floor_pct: num(fin.buyback_floor_pct), rule_mode: fin.rule_mode, tier_cooldown_min: num(fin.tier_cooldown_min), min_tier_usd: num(fin.min_tier_usd),
+          loop_enabled: num(fin.loop_enabled), armed: num(fin.armed), active: num(fin.active) }, tier_validation: tierInfo, conflict_warning: conflictWarning || null }) }] };
       } catch (e) {
         return { content: [{ type: 'text', text: JSON.stringify({ error: e.message }) }] };
       }
