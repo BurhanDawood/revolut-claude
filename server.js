@@ -143,8 +143,9 @@ async function revolutRequest(method, path, body = null, signPathOverride = null
   return JSON.parse(text);
 }
 
-async function placeRevolutOrder(symbol, side, orderType, baseSize, price = null, valueUsd = null) {
-  const clientOrderId = randomUUID();
+async function placeRevolutOrder(symbol, side, orderType, baseSize, price = null, valueUsd = null, callerClientOrderId = null) {
+  // #359: a caller may supply the id, so it can record 'about to place order X' BEFORE placing it (crash recovery).
+  const clientOrderId = callerClientOrderId || randomUUID();
 
   // Orders API uses dash format (LINK-USD), tickers API uses slash (LINK/USD)
   const revolutSymbol = symbol.includes('-USD') ? symbol.toUpperCase() : `${symbol.toUpperCase()}-USD`;
@@ -5964,6 +5965,220 @@ async function runLadderShadowTick(nowMs) {
   } finally { _ladderShadowBusy = false; }
 }
 
+// ── #359 LIVE LADDER EXECUTOR ──────────────────────────────────────────────────────
+// Places REAL orders for the pump-loop ladder (#356 shadowEvalLadder, Dev-348 spec, reviewed in Dev-353/#354).
+// SAFETY, not style:
+//   * OFF by default twice over: the ladder-wide switch (system_config ladder_live_enabled) AND each coin's row.
+//     The Auto-exec master switch does not govern it (PM #27).
+//   * ONE ENGINE PER COIN: starting a coin disables its single-mode loop (loop_enabled 0, disarmed, trailing stop and
+//     trough trackers cleared) and refuses while a single-mode cycle, DnD or Away Mode is live on it. If the old loop
+//     is switched back on later, the ladder stops trading that coin and says so.
+//   * INTENT BEFORE ORDER: the order id and what the order will do are written first (compare-and-set); if that write
+//     does not land, nothing is placed. Next tick, an intent is CONFIRMED before anything else happens on that coin:
+//     pending_orders by client_order_id (then GET /orders/{id}), else the balance change. 'Pending' is not 'filled' -
+//     it waits. Unconfirmable after 3 minutes -> HALT the coin and tell Bryan. NEVER re-place an order on a guess.
+//   * Position = min(real holding available+reserved, cap_usd / start price) every tick, so manual trades are seen.
+//     A sale ORDERS at most what is AVAILABLE. Buys use exact USD cash, capped by the ring-fenced proceeds.
+//   * Any order that does not go through (rejected, dust, error) HALTS the coin rather than retrying every 30 s.
+//     A floor block re-anchors the trail instead (as the evaluator and live #309 do).
+//   * A position gone (manual full exit) halts the coin. Every real order is announced on Telegram.
+let _ladderLiveReady = false, _ladderLiveBusy = false;
+const LADDER_INTENT_TIMEOUT_MS = 3 * 60 * 1000;
+async function ensureLadderLiveTables() {
+  if (_ladderLiveReady) return;
+  await db.execute(`CREATE TABLE IF NOT EXISTS ladder_live (
+    symbol VARCHAR(20) NOT NULL PRIMARY KEY,
+    cfg TEXT NOT NULL, state TEXT NULL, intent TEXT NULL,
+    cap_usd DECIMAL(20,4) NOT NULL, start_price DECIMAL(30,12) NOT NULL,
+    active TINYINT(1) NOT NULL DEFAULT 0,
+    started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)`);
+  await db.execute(`CREATE TABLE IF NOT EXISTS ladder_live_fills (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    symbol VARCHAR(20) NOT NULL, cycle_id VARCHAR(20) NULL, leg VARCHAR(8) NOT NULL, tier INT NULL,
+    price DECIMAL(30,12) NULL, qty DECIMAL(30,10) NULL, usd DECIMAL(20,6) NULL,
+    client_order_id VARCHAR(64) NULL, status VARCHAR(20) NOT NULL, note VARCHAR(200) NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_llf_sym (symbol, created_at))`);
+  _ladderLiveReady = true;
+}
+async function ladderConfirmIntent(intent, bal, nowMs) {
+  try {
+    const [po] = await db.execute('SELECT order_id, status FROM pending_orders WHERE client_order_id = ? LIMIT 1', [intent.client_order_id]);
+    if (po.length) {
+      let s = String(po[0].status || '').toLowerCase();
+      if (!/^(filled|completed)$/.test(s) && po[0].order_id && String(po[0].order_id) !== String(intent.client_order_id)) {
+        try { const rr = await revolutRequest('GET', '/orders/' + po[0].order_id); const d = (rr && rr.data) || rr || {}; s = String(d.state || d.status || s).toLowerCase(); } catch (e) { /* keep s */ }
+      }
+      if (/^(filled|completed)$/.test(s)) return { status: 'filled', evidence: 'order ' + s };
+      if (/(reject|cancel|fail|expire)/.test(s)) return { status: 'rejected', evidence: 'order ' + s };
+      // new / pending / partially filled: WAIT - pending is not filled
+    } else {
+      // Not recorded: the process may have stopped just before or just after sending. Look at the money.
+      const coin = String(intent.symbol || '').replace('-USD', '');
+      const cr = bal.find(x => String(x.currency || '').toUpperCase() === coin);
+      const total = cr ? (parseFloat(cr.available) || 0) + (parseFloat(cr.reserved) || 0) : 0;
+      const ur = bal.find(x => String(x.currency || '').toUpperCase() === 'USD');
+      const usd = ur ? parseFloat(ur.available) || 0 : 0;
+      if (intent.kind === 'sell' && total <= intent.holding_before - 0.9 * intent.qty) return { status: 'filled', evidence: 'holding fell by the order size' };
+      if (intent.kind === 'buy' && usd <= intent.usd_before - 0.9 * intent.usd) return { status: 'filled', evidence: 'USD fell by the order size' };
+    }
+  } catch (e) { /* fall through to the timeout */ }
+  return { status: ((nowMs || Date.now()) - intent.at > LADDER_INTENT_TIMEOUT_MS) ? 'unconfirmed' : 'wait' };
+}
+async function ladderLogFill(sym, intent, status, note) {
+  await db.execute('INSERT INTO ladder_live_fills (symbol, cycle_id, leg, tier, price, qty, usd, client_order_id, status, note) VALUES (?,?,?,?,?,?,?,?,?,?)',
+    [sym, intent.cycle || null, intent.kind, intent.tier != null ? intent.tier : null, intent.ref_price || null,
+     intent.qty != null ? intent.qty : null, intent.usd != null ? intent.usd : null, intent.client_order_id, status, String(note || '').slice(0, 200)])
+    .catch(e => console.error('[ladder-live] fill log failed:', e.message));
+}
+async function runLadderLiveTick(nowMs) {
+  if (_ladderLiveBusy) return { skipped: 'busy' };
+  _ladderLiveBusy = true;
+  try {
+    await ensureLadderLiveTables();
+    const [rows] = await db.execute('SELECT * FROM ladder_live WHERE active = 1 OR intent IS NOT NULL');
+    if (!rows.length) return { rows: 0 };
+    const [sw] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'ladder_live_enabled'").catch(() => [[]]);
+    const enabled = !!(sw.length && sw[0].config_value === 'true');
+    let bal = [];
+    try { const b = await revolutRequest('GET', '/balances'); bal = Array.isArray(b) ? b : (b && (b.data || b.balances)) || []; }
+    catch (e) { return { error: 'balances: ' + e.message }; }
+    if (!bal.length) return { error: 'balances unreadable - nothing done' };
+    const px = {};
+    try {
+      const tk = await revolutRequest('GET', '/tickers');
+      const tl = Array.isArray(tk) ? tk : (tk && tk.data) || [];
+      for (const t of tl) { if (!t.symbol) continue; const p = parseFloat(t.last_price || t.mid || t.ask || t.bid); if (p) px[t.symbol.replace('/', '-')] = p; }
+    } catch (e) { return { error: 'tickers: ' + e.message }; }
+    let aeCfg = {};
+    try { const [a] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'ai_auto_execute'"); if (a.length) aeCfg = JSON.parse(a[0].config_value); } catch (e) { aeCfg = {}; }
+    const now = nowMs || Date.now();
+    const fmt = (v) => v == null ? '-' : '$' + Number(v).toPrecision(5);
+    const hold = (c) => { const x = bal.find(b => String(b.currency || '').toUpperCase() === c); return { total: x ? (parseFloat(x.available) || 0) + (parseFloat(x.reserved) || 0) : 0, avail: x ? parseFloat(x.available) || 0 : 0 }; };
+    const ur = bal.find(b => String(b.currency || '').toUpperCase() === 'USD');
+    const usdAvail = ur ? parseFloat(ur.available) || 0 : 0;
+    const tell = (coin, lines) => sendTelegram('\ud83d\udea8 <b>LADDER - ' + coin + '</b> (REAL MONEY)\n\n' + lines.join('\n')).catch(() => {});
+    const halt = async (sym, st, reason) => {
+      const s2 = Object.assign({}, st || {}, { halted_reason: reason, halted_at: now });
+      await db.execute('UPDATE ladder_live SET state = ?, intent = NULL, active = 0 WHERE symbol = ?', [JSON.stringify(s2), sym]);
+    };
+    const report = [];
+    for (const r of rows) {
+      const sym = r.symbol, coin = sym.replace('-USD', '');
+      let st = null; try { st = r.state ? JSON.parse(r.state) : null; } catch (e) { st = null; }
+      let intent = null; try { intent = r.intent ? JSON.parse(r.intent) : null; } catch (e) { intent = null; }
+
+      // 1. An order in flight is confirmed BEFORE anything else happens on this coin.
+      if (intent) {
+        const c = await ladderConfirmIntent(intent, bal, now);
+        if (c.status === 'wait') { report.push({ symbol: sym, intent: 'waiting' }); continue; }
+        if (c.status === 'filled') {
+          await db.execute('UPDATE ladder_live SET state = ?, intent = NULL WHERE symbol = ?', [JSON.stringify(intent.next_state), sym]);
+          await ladderLogFill(sym, intent, 'confirmed', c.evidence);
+          await tell(coin, ['Earlier ' + intent.kind + ' order CONFIRMED (' + c.evidence + ') and recorded.']);
+          report.push({ symbol: sym, intent: 'confirmed' }); continue;
+        }
+        const why = c.status === 'rejected'
+          ? 'the ' + intent.kind + ' order was ' + c.evidence.replace('order ', '')
+          : 'an ' + intent.kind + ' order (id ' + intent.client_order_id + ') could not be confirmed within 3 minutes';
+        await halt(sym, Object.assign({}, st || {}, { halted_intent: intent }), why);
+        await ladderLogFill(sym, intent, c.status, why);
+        await tell(coin, ['HALTED - ' + why + '.', 'Please check the Revolut app. Nothing more will trade on ' + coin + ' until you restart it.']);
+        report.push({ symbol: sym, intent: c.status }); continue;
+      }
+      if (!enabled || Number(r.active) !== 1) continue;
+
+      // 2. One engine per coin.
+      const [pr] = await db.execute('SELECT loop_enabled, sale_price, entry_floor FROM pump_armed_rules WHERE symbol = ? AND active = 1 LIMIT 1', [sym]).catch(() => [[]]);
+      if (pr.length && Number(pr[0].loop_enabled) === 1) {
+        if (!st || !st.conflict_noted) {
+          await tell(coin, ['Not trading: the old single-mode loop for ' + coin + ' has been switched back on. One engine per coin - switch one of them off.']);
+          const s2 = Object.assign({}, st || {}, { conflict_noted: true }); await db.execute('UPDATE ladder_live SET state = ? WHERE symbol = ?', [JSON.stringify(s2), sym]);
+        }
+        continue;
+      }
+      const p = px[sym]; if (!p) continue;
+      const h = hold(coin);
+      if (h.total * p < 1) {
+        await halt(sym, st, 'position gone (manual exit?)');
+        await tell(coin, ['HALTED - no ' + coin + ' left to manage (sold or moved outside the ladder?). Restart it if that was intended.']);
+        continue;
+      }
+      const cfg = JSON.parse(r.cfg);
+      const position = Math.min(h.total, Number(r.cap_usd) / Number(r.start_price));
+      if (!st || !st.phase) st = shadowNewState(position);
+      if (st.conflict_noted) delete st.conflict_noted;
+      st.qty = position;                                   // the REAL position every tick - manual trades are seen
+      const fl = ladderEffectiveFloor(coin, aeCfg, pr && pr[0]);
+      const runCfg = Object.assign({}, LADDER_DEFAULTS, cfg, { rule_mode: 'ladder', entry_floor: fl.floor });
+      const ctx = { availableUsd: usdAvail, cycleSeq: st.cycle_seq || 0, cyclesCompleted: 0, cyclesAbandoned: 0 };
+      const phaseBefore = st.phase;
+      const next = JSON.parse(JSON.stringify(st));
+      const out = shadowEvalLadder(next, { t: now, o: p, h: p, l: p, c: p }, runCfg, ctx);
+      next.cycle_seq = ctx.cycleSeq;
+      const msgs = [];
+      if (phaseBefore === 'idle' && next.phase === 'armed') msgs.push('Armed: up ' + (((p / next.cycle_base) - 1) * 100).toFixed(1) + '% from ' + fmt(next.cycle_base) + '. Trailing ' + runCfg.trail_pct + '% below the peak.');
+      for (const o of (ctx.outcomes || [])) msgs.push('Cycle ended: ' + o.outcome.replace(/_/g, ' ') + ' (' + o.legs + ' sale(s), ' + o.buys_filled + ' buy(s)).');
+      const act = out.fills.find(f => f.would_have_filled);
+      if (!act) {
+        const blk = out.fills.find(f => f.block_reason === 'below_entry_floor');
+        if (blk && next.floor_note_cycle !== blk.cycle_id) { msgs.push('Sale held by the floor (' + fmt(fl.floor) + ') at ' + fmt(blk.price) + '.'); next.floor_note_cycle = blk.cycle_id; }
+        if (JSON.stringify(next) !== JSON.stringify(st)) await db.execute('UPDATE ladder_live SET state = ? WHERE symbol = ?', [JSON.stringify(next), sym]);
+        if (msgs.length) await tell(coin, msgs);
+        report.push({ symbol: sym, phase: next.phase }); continue;
+      }
+
+      // 3. A REAL ORDER: intent first, then the order, then commit.
+      const clientOrderId = randomUUID();
+      const intentObj = { symbol: sym, kind: act.leg, tier: act.tier, cycle: act.cycle_id, client_order_id: clientOrderId, ref_price: act.price, at: now,
+        holding_before: h.total, usd_before: usdAvail, next_state: next };
+      if (act.leg === 'sell') intentObj.qty = Math.min(act.intended_qty, h.avail);
+      else intentObj.usd = Math.min(act.intended_usd, usdAvail);
+      if ((act.leg === 'sell' ? intentObj.qty * p : intentObj.usd) < Number(runCfg.min_tier_usd)) {
+        await halt(sym, st, act.leg === 'sell' ? 'too little AVAILABLE to sell (the rest is reserved)' : 'too little USD cash to buy back');
+        await tell(coin, ['HALTED - ' + (act.leg === 'sell' ? 'too little ' + coin + ' is available to sell (the rest is reserved)' : 'too little USD cash for the buy-back') + '.']);
+        continue;
+      }
+      const [iw] = await db.execute('UPDATE ladder_live SET intent = ? WHERE symbol = ? AND intent IS NULL AND active = 1', [JSON.stringify(intentObj), sym]);
+      if (!(iw && iw.affectedRows === 1)) { report.push({ symbol: sym, skipped: 'intent not recorded - no order placed' }); continue; }
+      let placed = null, err = null, floorBlocked = false;
+      try {
+        if (act.leg === 'sell') {
+          const res = await autoExecuteSell(sym, null, 'Pump-loop ladder, sell leg ' + (act.tier + 1), 'High',
+            { sellQty: intentObj.qty, skipCascade: true, clientOrderId, source: 'ladder', silent: true });
+          if (res && res.executed) placed = { qty: res.qty, price: res.price };
+          else { err = (res && (res.reason || res.message)) || 'not executed'; floorBlocked = !!(res && res.reason === 'floor_blocked'); }
+        } else {
+          await placeRevolutOrder(sym, 'buy', 'market', null, null, intentObj.usd.toFixed(2), clientOrderId);
+          placed = { usd: intentObj.usd, price: p, qty: intentObj.usd / p };
+          await db.execute("INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source) VALUES (?, 'buy', ?, ?, ?, ?, 'neutral', 'ladder')",
+            [coin, p, placed.qty, intentObj.usd, 'Pump-loop ladder buy-back tier ' + (act.tier + 1) + ' (' + act.cycle_id + ')']).catch(e => console.error('[ladder-live] journal failed:', e.message));
+        }
+      } catch (e) { err = e.message; }
+      if (placed) {
+        await db.execute('UPDATE ladder_live SET state = ?, intent = NULL WHERE symbol = ?', [JSON.stringify(next), sym]);
+        await ladderLogFill(sym, intentObj, 'placed', act.leg === 'sell' ? 'sold ' + placed.qty : 'bought $' + intentObj.usd.toFixed(2));
+        msgs.unshift(act.leg === 'sell'
+          ? 'SOLD ' + Number(placed.qty).toPrecision(6) + ' ' + coin + ' at ~' + fmt(placed.price) + ' (~$' + (placed.qty * placed.price).toFixed(2) + ') - sell leg ' + (act.tier + 1) + '.'
+          : 'BOUGHT back $' + intentObj.usd.toFixed(2) + ' of ' + coin + ' at ~' + fmt(p) + ' - tier ' + (act.tier + 1) + '.');
+      } else if (floorBlocked) {
+        const s2 = Object.assign({}, st, { peak: p });                  // re-anchor the trail, as the evaluator does
+        await db.execute('UPDATE ladder_live SET state = ?, intent = NULL WHERE symbol = ?', [JSON.stringify(s2), sym]);
+        await ladderLogFill(sym, intentObj, 'floor_blocked', 'floor ' + fl.floor);
+        msgs.unshift('Sale held by the floor at the last moment - the trail restarts from here.');
+      } else {
+        await halt(sym, st, 'order failed: ' + err);
+        await ladderLogFill(sym, intentObj, 'failed', err);
+        msgs.unshift('HALTED - the ' + act.leg + ' order did not go through: ' + String(err).slice(0, 120) + '. Nothing more will trade on ' + coin + ' until you restart it.');
+      }
+      await tell(coin, msgs);
+      report.push({ symbol: sym, order: placed ? act.leg : 'none' });
+    }
+    return { rows: rows.length, enabled, report };
+  } finally { _ladderLiveBusy = false; }
+}
+
 async function runFastScan() {
   try {
     // Part A: pump-arm detector -- dynamic over ALL active, unarmed pump_armed_rules (#215 fix;
@@ -6071,6 +6286,7 @@ async function runFastScan() {
 
     // #358 ladder shadow - also BEFORE the early return below, or it would only run while something is armed.
     await runLadderShadowTick().catch(e => console.error('[ladder-shadow] tick failed:', e.message));
+    await runLadderLiveTick().catch(e => console.error('[ladder-live] tick failed:', e.message));   // #359
 
     if (trailingStops.size === 0 && troughTrackers.size === 0 && standaloneTroughTrackers.size === 0) return; // #264: was `trailingStops.size===0` only, which returned BEFORE Part C(#130 trough)/Part D(#143 standalone) and the shared price map — starving both trough subsystems whenever no trailing stop was armed (IDEX rebuy stalled 5h). Bail only when ALL THREE are empty; Parts C/D keep their own size guards.
     const fsRevolutPrices = {};
@@ -9055,6 +9271,16 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
       }
     } catch (e) { console.error('[autoLog] Intention dedup check error:', e.message); }
 
+    // #359 CHECK 1b: the live ladder's own trade. Its journal row IS the record, so never raise a Trade Detected alert
+    // for it - whatever the price (CHECK 2 below only suppresses within 0.5%, and a volatile coin can move more than that
+    // between the order and this scan, which would REPLACE the ladder's row and send Bryan buttons for its own trade).
+    try {
+      const [lad] = await db.execute(
+        "SELECT id FROM trading_journal WHERE symbol IN (?, ?) AND action = ? AND source = 'ladder' AND created_at > DATE_SUB(NOW(), INTERVAL 60 MINUTE) AND ABS(value_usd - ?) < (? * 0.20 + 0.01) LIMIT 1",
+        [coinBase, symbol, action, valueUsd, valueUsd]);
+      if (lad.length) { console.log('[autoLog] Suppressing - the live ladder\'s own trade (id=' + lad[0].id + ')'); return; }
+    } catch (e) { console.error('[autoLog] ladder check error:', e.message); }
+
     // CHECK 2: Already logged by Claude MCP / auto rule? (#20: price-deviated fill)
     let staleClaudeMcpRowId = null;
     try {
@@ -10948,7 +11174,7 @@ ${journalContext}`;
   }
 }
 
-async function autoExecuteSell(symbol, maxPct, analysis, confidence) {
+async function autoExecuteSell(symbol, maxPct, analysis, confidence, opts = {}) {
   const coinBase = symbol.replace('-USD', '');
   try {
     const currentPrice = await getCurrentPrice(symbol);
@@ -10961,7 +11187,11 @@ async function autoExecuteSell(symbol, maxPct, analysis, confidence) {
       return { executed: false, reason: 'no_position' }; // #309
     }
 
-    const sellQty = currentQty * (maxPct / 100);
+    // #359 opts (optional; existing callers unchanged): sellQty = exact quantity, capped at what is AVAILABLE (reserved
+    // coins back open orders / card authorisations and cannot be sold); skipCascade = no Stage-3 single-mode rebuy (the
+    // ladder buys back itself - two engines must never chase one pullback); clientOrderId; source ('ladder' is
+    // recognised by the trade detector); silent = no success message (the ladder sends its own).
+    const sellQty = (opts.sellQty != null) ? Math.min(Number(opts.sellQty), currentQty) : currentQty * (maxPct / 100);
     const valueUSD = sellQty * currentPrice;
 
     // Dust guard: skip if the sell is negligible
@@ -11013,13 +11243,13 @@ async function autoExecuteSell(symbol, maxPct, analysis, confidence) {
       [symbol, 'sell', `AI auto-execution [${confidence}]: ${analysis.substring(0, 150)}`, 'confident']
     ).catch(() => {});
 
-    await placeRevolutOrder(symbol, 'sell', 'market', sellQty);
+    const aeOrder = await placeRevolutOrder(symbol, 'sell', 'market', sellQty, null, null, opts.clientOrderId || null);
 
     const [aeRevIns] = await db.execute(
       `INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       [coinBase, 'sell', currentPrice, sellQty, valueUSD,
        `AI auto-executed [${confidence} confidence]: ${analysis.substring(0, 200)}`,
-       'confident', 'ai_auto']
+       'confident', opts.source || 'ai_auto']
     ).catch(e => { console.error('[auto-exec] journal insert:', e.message); return [{}]; });
     if (aeRevIns && aeRevIns.insertId) await recordRealisedPnl(aeRevIns.insertId, symbol, currentPrice, sellQty).catch(() => {});
 
@@ -11028,7 +11258,7 @@ async function autoExecuteSell(symbol, maxPct, analysis, confidence) {
 
     const reasonMatch = analysis.match(/REASON:\s*(.+)/i);
     const reason = reasonMatch ? reasonMatch[1].trim() : 'Trailing stop triggered';
-    await sendTelegram(formatAutoExecuteMessage(coinBase, 'sell', sellQty, currentPrice, valueUSD, reason, confidence));
+    if (!opts.silent) await sendTelegram(formatAutoExecuteMessage(coinBase, 'sell', sellQty, currentPrice, valueUSD, reason, confidence));
     console.log(`[auto-exec] SELL ${sellQty.toFixed(4)} ${coinBase} @ $${currentPrice.toFixed(4)}`);
 
     // #112 Fix 4: notify of any UP trim targets still live ABOVE the executed sell price (stale trim flag).
@@ -11049,7 +11279,7 @@ async function autoExecuteSell(symbol, maxPct, analysis, confidence) {
 
     // #95 Stage 3: pump-armed sell → spawn ONE buyback rung (no deeper averaging-down).
     // A buy only ever exists as the back-half of a completed sell. max_cascades:0 stops the rebuy from cascading deeper.
-    try {
+    if (!opts.skipCascade) try {   // #359: the ladder does its own buy-back
       const [parRows] = await db.execute('SELECT * FROM pump_armed_rules WHERE symbol = ? AND active = 1 LIMIT 1', [symbol]);
       if (parRows.length) {
         const syntheticRule = {
@@ -11067,7 +11297,7 @@ async function autoExecuteSell(symbol, maxPct, analysis, confidence) {
         console.log(`[auto-exec] Stage 3 single-rebuy cascade spawned for pump-armed ${coinBase} after sell`);
       }
     } catch (e) { console.error('[auto-exec] Stage 3 cascade error (non-fatal):', e.message); }
-    return { executed: true, qty: sellQty, price: currentPrice }; // #309
+    return { executed: true, qty: sellQty, price: currentPrice, client_order_id: aeOrder && aeOrder.client_order_id, journal_id: aeRevIns && aeRevIns.insertId }; // #309 #359
   } catch (e) {
     console.error('[auto-exec] sell error:', e.message);
     await sendTelegram(`❌ AUTO-EXEC FAILED — ${coinBase}\nError: ${e.message}\nManual review needed`);
@@ -16999,17 +17229,80 @@ let rows;
   server.tool('manage_auto_rules',
     'Manage automatic trade rules — list, remove, disable or enable a rule by ID. reset_cycle (#278) clears STALE pump-loop runtime state for a symbol (armed, armed_since, ringfenced sale_proceeds_usd, trough fields, baseline, tier_state) while PRESERVING all config; it refuses on a live cycle (sale_price set) unless force=true.',
     {
-      action:  z.enum(['list', 'remove', 'disable', 'enable', 'pump_status', 'loop_enable', 'loop_disable', 'reset_cycle', 'loop_audit', 'ladder_shadow_start', 'ladder_shadow_stop', 'ladder_shadow_status']).describe('Action to perform. ladder_shadow_start/stop/status (#358): paper-trade the pump-loop ladder on the live price - symbol + ladder_cfg {arm_pump_pct, trail_pct, ...}; never trades. loop_audit (#353, read-only): every gate that decides whether each pump loop can really auto-sell, with both floors against the real cost.'),
+      action:  z.enum(['list', 'remove', 'disable', 'enable', 'pump_status', 'loop_enable', 'loop_disable', 'reset_cycle', 'loop_audit', 'ladder_shadow_start', 'ladder_shadow_stop', 'ladder_shadow_status', 'ladder_live_start', 'ladder_live_stop', 'ladder_live_status', 'ladder_live_switch']).describe('Action to perform. ladder_live_* (#359): REAL-MONEY ladder - start (symbol, cap_usd, ladder_cfg; takes the coin over from its single-mode loop), stop, status, switch (ladder_on true/false, ladder-wide). ladder_shadow_start/stop/status (#358): paper-trade the pump-loop ladder on the live price - symbol + ladder_cfg {arm_pump_pct, trail_pct, ...}; never trades. loop_audit (#353, read-only): every gate that decides whether each pump loop can really auto-sell, with both floors against the real cost.'),
       rule_id: z.coerce.number().optional().describe('Rule ID to remove, disable or enable'),
       symbol: z.string().optional().describe('Symbol e.g. BOBA-USD for loop_enable/loop_disable/reset_cycle'),
       force:  z.boolean().optional().describe('#278 reset_cycle only — override the live-cycle guard (sale_price set). Default false.'),
+      cap_usd: z.coerce.number().optional().describe('#359 ladder_live_start: the most USD of the holding the ladder may manage (required)'),
+      ladder_on: z.preprocess(v => v === 'true' ? true : (v === 'false' ? false : v), z.boolean()).optional().describe('#359 ladder_live_switch: true = the live ladder may trade, false = it may not (ladder-wide)'),
       ladder_cfg: z.preprocess(v => { if (typeof v === 'string') { try { return JSON.parse(v); } catch (e) { return v; } } return v; }, z.record(z.any())).optional().describe('#358 ladder_shadow_start: {arm_pump_pct, trail_pct} required; optional sell_pct, max_legs, retrace_pct, bounce_pct, buy_pct, further_drop_pct, buyback_ceiling_pct, abandon_hours, paper_slippage_pct'),
     },
-    async ({ action, rule_id, symbol, force, ladder_cfg }) => {
+    async ({ action, rule_id, symbol, force, ladder_cfg, cap_usd, ladder_on }) => {
       try {
         if (action === 'list') {
           const [rules] = await db.execute('SELECT * FROM auto_trade_rules ORDER BY created_at DESC');
           return { content: [{ type: 'text', text: JSON.stringify({ rules, active: rules.filter(r => r.active) }, null, 2) }] };
+        }
+        if (action === 'ladder_live_start' || action === 'ladder_live_stop' || action === 'ladder_live_status' || action === 'ladder_live_switch') {
+          // #359 REAL-MONEY ladder controls.
+          await ensureLadderLiveTables();
+          const sym = symbol ? (symbol.toUpperCase().includes('-USD') ? symbol.toUpperCase() : symbol.toUpperCase() + '-USD') : null;
+          const [swr] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'ladder_live_enabled'").catch(() => [[]]);
+          const switchOn = !!(swr.length && swr[0].config_value === 'true');
+          if (action === 'ladder_live_switch') {
+            if (typeof ladder_on !== 'boolean') throw new Error('ladder_on must be true or false');
+            await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('ladder_live_enabled', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)", [ladder_on ? 'true' : 'false']);
+            await sendTelegram(ladder_on ? '\ud83d\udea8 <b>LADDER switched ON</b> - coins started on the live ladder may now place REAL orders.' : '\u23f8\ufe0f <b>LADDER switched OFF</b> - no live ladder orders will be placed (orders already in flight are still confirmed).').catch(() => {});
+            return { content: [{ type: 'text', text: JSON.stringify({ ok: true, ladder_live_enabled: ladder_on }) }] };
+          }
+          if (action === 'ladder_live_start') {
+            if (!sym) throw new Error('symbol required');
+            if (KRAKEN_MONITORED_COINS.includes(sym)) throw new Error('Kraken coins are not supported by the live ladder yet');
+            const c = ladder_cfg && typeof ladder_cfg === 'object' ? ladder_cfg : {};
+            if (!(Number(c.arm_pump_pct) > 0) || !(Number(c.trail_pct) > 0)) throw new Error('ladder_cfg needs arm_pump_pct and trail_pct');
+            if (!(Number(cap_usd) > 0)) throw new Error('cap_usd required: the most USD of the holding the ladder may manage');
+            const coin = sym.replace('-USD', '');
+            if (await isDndCoin(coin).catch(() => false)) throw new Error(coin + ' is in Do-Not-Disturb mode - one engine per coin');
+            if (await isAwayActionable(coin).catch(() => false)) throw new Error(coin + ' is in Away Mode - one engine per coin');
+            const [ex] = await db.execute('SELECT intent FROM ladder_live WHERE symbol = ?', [sym]);
+            if (ex.length && ex[0].intent) throw new Error('an order is in flight on ' + coin + ' - wait for it to be confirmed');
+            const [pr] = await db.execute('SELECT sale_price FROM pump_armed_rules WHERE symbol = ? AND active = 1 LIMIT 1', [sym]);
+            if (pr.length && pr[0].sale_price != null) throw new Error('a single-mode cycle is live on ' + coin + ' (it has sold and is waiting to buy back) - let it finish or reset_cycle first');
+            const bal = await revolutRequest('GET', '/balances');
+            const brows = Array.isArray(bal) ? bal : (bal && (bal.data || bal.balances)) || [];
+            const row = brows.find(b => String(b.currency || '').toUpperCase() === coin);
+            const qty = row ? (parseFloat(row.available) || 0) + (parseFloat(row.reserved) || 0) : 0;
+            const price = await getCurrentPrice(sym);
+            if (!(qty > 0) || !(price > 0)) throw new Error('need a holding and a price (holding ' + qty + ', price ' + price + ')');
+            // Hand the coin over: the old single-mode loop stops, fully.
+            if (pr.length) await db.execute('UPDATE pump_armed_rules SET loop_enabled = 0, armed = 0 WHERE symbol = ?', [sym]);
+            await removeTrailingStop(sym).catch(() => {});
+            troughTrackers.delete(sym); standaloneTroughTrackers.delete(sym);
+            const cfg = {};
+            for (const [k, v] of Object.entries(Object.assign({}, LADDER_DEFAULTS, c))) if (!/^paper_/.test(k) && v !== null && v !== '' && isFinite(Number(v))) cfg[k] = Number(v);
+            await db.execute('INSERT INTO ladder_live (symbol, cfg, state, intent, cap_usd, start_price, active) VALUES (?, ?, NULL, NULL, ?, ?, 1) ON DUPLICATE KEY UPDATE cfg = VALUES(cfg), state = NULL, intent = NULL, cap_usd = VALUES(cap_usd), start_price = VALUES(start_price), active = 1, started_at = CURRENT_TIMESTAMP',
+              [sym, JSON.stringify(cfg), Number(cap_usd), price]);
+            const managed = Math.min(qty, Number(cap_usd) / price);
+            await sendTelegram('\ud83d\udea8 <b>LADDER set up for ' + coin + '</b> (REAL MONEY)\n\nManages up to $' + Number(cap_usd).toFixed(2) + ' = ' + managed.toPrecision(6) + ' ' + coin + ' of your ' + qty.toPrecision(6) +
+              '\nArms on +' + cfg.arm_pump_pct + '%, trails ' + cfg.trail_pct + '%, sells ' + cfg.sell_pct + '% per leg (max ' + cfg.max_legs + '), buys back ' + cfg.buy_pct + '% then the rest.' +
+              '\nThe old single-mode loop for ' + coin + ' is now OFF.' +
+              '\n\nLadder-wide switch: ' + (switchOn ? 'ON - it can trade now.' : 'OFF - nothing will trade until it is switched on.')).catch(() => {});
+            return { content: [{ type: 'text', text: JSON.stringify({ ok: true, symbol: sym, cap_usd: Number(cap_usd), managed_qty: managed, start_price: price, cfg, ladder_live_enabled: switchOn }) }] };
+          }
+          if (action === 'ladder_live_stop') {
+            if (!sym) throw new Error('symbol required');
+            const [u] = await db.execute('UPDATE ladder_live SET active = 0 WHERE symbol = ?', [sym]);
+            return { content: [{ type: 'text', text: JSON.stringify({ ok: true, symbol: sym, stopped: !!(u && u.affectedRows), note: 'The old single-mode loop stays OFF - switch it back on yourself if you want it (loop_enable).' }) }] };
+          }
+          const [rows] = sym ? await db.execute('SELECT * FROM ladder_live WHERE symbol = ?', [sym]) : await db.execute('SELECT * FROM ladder_live ORDER BY symbol');
+          const out = [];
+          for (const r of rows) {
+            let st = null; try { st = r.state ? JSON.parse(r.state) : null; } catch (e) { st = null; }
+            const [fills] = await db.execute('SELECT created_at, cycle_id, leg, tier, price, qty, usd, status, note FROM ladder_live_fills WHERE symbol = ? ORDER BY id DESC LIMIT 20', [r.symbol]);
+            out.push({ symbol: r.symbol, active: Number(r.active) === 1, cap_usd: Number(r.cap_usd), start_price: Number(r.start_price), started_at: r.started_at, cfg: JSON.parse(r.cfg),
+              phase: st ? st.phase : 'not yet evaluated', halted_reason: st && st.halted_reason || null, order_in_flight: !!r.intent, recent: fills });
+          }
+          return { content: [{ type: 'text', text: JSON.stringify({ ladder_live_enabled: switchOn, ladders: out }, null, 2) }] };
         }
         if (action === 'ladder_shadow_start' || action === 'ladder_shadow_stop' || action === 'ladder_shadow_status') {
           // #358 paper trading of the ladder. Nothing here can place an order.
