@@ -15101,7 +15101,7 @@ let rows;
   server.tool('get_trading_data',
     'Get trading journal entries, active alerts, trader context/profile, rebalancing history, and dev_bridge messages',
     {
-      include: zLoose(z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'dev_bridge', 'coin_strategy', 'reconciliation', 'ledger', 'tax_lots', 'catalysts', 'thesis', 'nudges', 'dev_health', 'dev_recommendations', 'volatility_baseline', 'shadow_fills', 'abnormal_events', 'strategy_catalogue', 'exchange_orders', 'transactions', 'reconcile_transactions', 'ledger_rebuild', 'all']))).optional()
+      include: zLoose(z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'dev_bridge', 'coin_strategy', 'reconciliation', 'ledger', 'tax_lots', 'catalysts', 'thesis', 'nudges', 'dev_health', 'dev_recommendations', 'volatility_baseline', 'shadow_fills', 'abnormal_events', 'strategy_catalogue', 'exchange_orders', 'transactions', 'reconcile_transactions', 'ledger_rebuild', 'slippage_audit', 'all']))).optional()
         .describe('What data to fetch — defaults to all. dev_bridge, coin_strategy and reconciliation are never included in all; request them explicitly'),
       symbol:           z.string().optional().describe('Filter journal by coin e.g. NEAR'),
       limit:            z.coerce.number().optional().describe('Max journal entries to return, default 10'),
@@ -15666,6 +15666,112 @@ let rows;
       // READ-ONLY: reads /orders/historical and compares it against what our tranches
       // claim. Writes nothing, changes no tranche, touches no trading path. This exists
       // to QUANTIFY the drift (#320) before Build 2 is allowed to rebuild anything.
+      if (fetch.includes('slippage_audit')) {
+        // #360 (1a of #326/#357) MEASURED SLIPPAGE, READ-ONLY. Every backtest so far has taken slippage as an INPUT -
+        // the COTI ladder's +12% rests on a figure that was typed in, and #312 puts a conservative ladder's break-even
+        // near 1.22% per leg. The venue already knows the truth: GET /orders/historical carries average_fill_price for
+        // every order the system has placed, and the journal holds the price the loop THOUGHT it was trading at.
+        // Slippage = the gap. Positive means worse for us (sold lower / bought higher than booked).
+        // Segmented as PM asked (#357), because one blended average understates what a ladder leg pays:
+        //   * side, and the market's direction in the 30 minutes BEFORE the order - a sell leg fires during a retrace,
+        //     into thinning bids, which is the worst liquidity moment and NOT the same population as a calm-market buy;
+        //   * per coin (book depth differs wildly: IDEX/XAN vs DASH/CC);
+        //   * automatic vs manual, which differ in timing and urgency;
+        //   * n per bucket, always reported - a thin sample is said to be thin rather than dressed up as a number.
+        const sa = { generated_at: new Date().toISOString(), read_only: true };
+        try {
+          const days = Math.min(parseInt(limit) || 90, 370);
+          const symF = symbol ? (symbol.toUpperCase().includes('-USD') ? symbol.toUpperCase() : symbol.toUpperCase() + '-USD') : null;
+          const ex = await fetchExchangeOrders(days, symF);
+          sa.days_requested = days;
+          sa.venue_orders = ex.orders.length;
+          sa.errors = ex.errors;
+          const baseOf = (x) => String(x || '').toUpperCase().replace('/', '-').replace(/-(USD|USDT|USDC|EUR|GBP)$/, '');
+          const tsOf = (o) => { const v = o.created_date || o.created_at || o.updated_date; return v == null ? 0 : (typeof v === 'number' ? v : (Date.parse(v) || 0)); };
+          const rows = [];
+          const unmatched = [];
+          for (const o of ex.orders) {
+            const fill = o.average_fill_price != null ? Number(o.average_fill_price) : null;
+            const qty = Number(o.filled_quantity || 0);
+            const when = tsOf(o);
+            if (!(fill > 0) || !(qty > 0) || !when) continue;
+            if (String(o.order_type || o.type || 'market').toLowerCase() !== 'market') continue;   // limit orders choose their price
+            const coin = baseOf(o.symbol), side = String(o.side || '').toLowerCase();
+            if (side !== 'buy' && side !== 'sell') continue;
+            // Match to what we booked: the venue order id first (exact), then the journal by coin/side/size/time.
+            let j = null, how = null;
+            try {
+              const [po] = await db.execute('SELECT linked_journal_id FROM pending_orders WHERE order_id = ? OR client_order_id = ? LIMIT 1', [String(o.id || o.venue_order_id || ''), String(o.client_order_id || '')]);
+              if (po.length && po[0].linked_journal_id) {
+                const [jr] = await db.execute('SELECT id, symbol, action, price, quantity, value_usd, source, created_at FROM trading_journal WHERE id = ?', [po[0].linked_journal_id]);
+                if (jr.length) { j = jr[0]; how = 'order id'; }
+              }
+            } catch (e) { /* fall through to the time/size match */ }
+            if (!j) {
+              const [jr] = await db.execute(
+                `SELECT id, symbol, action, price, quantity, value_usd, source, created_at,
+                        ABS(TIMESTAMPDIFF(SECOND, created_at, FROM_UNIXTIME(?))) AS dt
+                   FROM trading_journal
+                  WHERE symbol IN (?, ?) AND action = ? AND price > 0 AND quantity > 0
+                    AND ABS(quantity - ?) <= ? AND ABS(TIMESTAMPDIFF(SECOND, created_at, FROM_UNIXTIME(?))) <= 1200
+                  ORDER BY dt ASC LIMIT 1`,
+                [Math.floor(when / 1000), coin, coin + '-USD', side, qty, qty * 0.01, Math.floor(when / 1000)]);
+              if (jr.length) { j = jr[0]; how = 'coin/size/time'; }
+            }
+            if (!j) { unmatched.push({ coin, side, qty, at: new Date(when).toISOString(), fill }); continue; }
+            const booked = Number(j.price);
+            if (!(booked > 0)) continue;
+            // Positive = worse for us.
+            const slipPct = (side === 'sell' ? (booked - fill) / booked : (fill - booked) / booked) * 100;
+            // What the market was doing in the 30 minutes BEFORE the order, and whether that was unusual for this coin.
+            let cond = 'unknown', moveBefore = null, unusual = null;
+            try {
+              const [pb] = await db.execute(
+                `SELECT price FROM price_intraday WHERE symbol IN (?, ?) AND recorded_at BETWEEN FROM_UNIXTIME(?) AND FROM_UNIXTIME(?) ORDER BY recorded_at ASC`,
+                [coin, coin + '-USD', Math.floor(when / 1000) - 1800, Math.floor(when / 1000)]);
+              if (pb.length >= 2) {
+                const a0 = Number(pb[0].price), a1 = Number(pb[pb.length - 1].price);
+                moveBefore = (a1 - a0) / a0 * 100;
+                cond = moveBefore <= -1 ? 'falling' : (moveBefore >= 1 ? 'rising' : 'calm');
+                const [bl] = await db.execute(
+                  `SELECT AVG(ABS(chg)) AS base FROM (
+                     SELECT (price / LAG(price) OVER (ORDER BY recorded_at) - 1) * 100 AS chg
+                       FROM price_intraday WHERE symbol IN (?, ?) AND recorded_at > DATE_SUB(FROM_UNIXTIME(?), INTERVAL 14 DAY) AND recorded_at <= FROM_UNIXTIME(?)
+                   ) t WHERE chg IS NOT NULL`, [coin, coin + '-USD', Math.floor(when / 1000), Math.floor(when / 1000)]);
+                const base = bl.length && bl[0].base != null ? Number(bl[0].base) * 15 : null;   // 30 min ~ 15 two-minute steps
+                if (base > 0) unusual = Math.abs(moveBefore) >= 3 * base;
+              }
+            } catch (e) { /* condition stays unknown */ }
+            const src = String(j.source || 'unknown');
+            rows.push({ coin, side, qty, usd: Number(j.value_usd || qty * fill), booked, fill,
+              slip_pct: Number(slipPct.toFixed(4)), at: new Date(when).toISOString(), matched_by: how,
+              source: src, automatic: ['ai_auto', 'auto_rule', 'ladder', 'claude_mcp'].includes(src),
+              condition: cond, move_before_pct: moveBefore == null ? null : Number(moveBefore.toFixed(3)), unusual_for_this_coin: unusual });
+          }
+          const stat = (list) => {
+            if (!list.length) return { n: 0 };
+            const v = list.map(x => x.slip_pct).sort((a, b) => a - b);
+            const q = (p) => v[Math.min(v.length - 1, Math.max(0, Math.round((v.length - 1) * p)))];
+            const usd = list.reduce((a, x) => a + (Number(x.usd) || 0), 0);
+            return { n: v.length, thin_sample: v.length < 5, median_pct: Number(q(0.5).toFixed(3)), mean_pct: Number((v.reduce((a, b) => a + b, 0) / v.length).toFixed(3)),
+              p90_pct: Number(q(0.9).toFixed(3)), worst_pct: Number(v[v.length - 1].toFixed(3)), best_pct: Number(v[0].toFixed(3)), total_usd_traded: Number(usd.toFixed(2)) };
+          };
+          const group = (keyFn) => { const m = {}; for (const r of rows) { const k = keyFn(r); (m[k] = m[k] || []).push(r); } const out = {}; for (const k of Object.keys(m).sort()) out[k] = stat(m[k]); return out; };
+          sa.matched_orders = rows.length;
+          sa.unmatched_venue_orders = { count: unmatched.length, note: 'Filled market orders with no journal row within 20 minutes - trades the system never recorded (relevant to Build 3).', sample: unmatched.slice(0, 10) };
+          sa.overall = stat(rows);
+          sa.by_side = group(r => r.side);
+          sa.by_side_and_condition = group(r => r.side + ' / ' + r.condition);
+          sa.by_coin = group(r => r.coin);
+          sa.by_coin_and_side = group(r => r.coin + ' ' + r.side);
+          sa.automatic_vs_manual = group(r => r.automatic ? 'automatic' : 'manual/detected');
+          sa.unusual_window = group(r => r.unusual_for_this_coin === true ? 'unusual move for this coin' : (r.unusual_for_this_coin === false ? 'normal conditions' : 'unknown'));
+          sa.worst_10 = rows.slice().sort((a, b) => b.slip_pct - a.slip_pct).slice(0, 10);
+          sa.how_to_read = 'slip_pct is positive when the fill was WORSE than the price the system booked (sold lower / bought higher). A ladder sell leg fires during a retrace, so "sell / falling" is the bucket to price a leg from - not "overall". Buckets with thin_sample true have fewer than 5 trades: treat as anecdote. Limit orders are excluded (they choose their own price); price_intraday only reaches back ~30 days, so older orders show condition "unknown".';
+        } catch (e) { sa.error = e.message; }
+        out.slippage_audit = sa;
+      }
+
       if (fetch.includes('exchange_orders')) {
         const exO = { generated_at: new Date().toISOString() };
         try {
