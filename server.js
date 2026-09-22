@@ -94,7 +94,10 @@ async function getCoinContext(coinBase) {
   return { narrative, role };
 }
 
-async function revolutRequest(method, path, body = null, signPathOverride = null) {
+async function revolutRequest(method, path, body = null, signPathOverride = null, opts = null) {
+  // #370 opts.withStatus: return { status, ok, body } instead of the parsed body, so a caller can tell a rate limit or a
+  // rejected request from a genuinely empty answer (see the #326 note below: errors otherwise look like data). Opt-in -
+  // every existing caller is unchanged.
   // signPathOverride: sign a DIFFERENT path from the one fetched. Needed because the venue
   // rejected a signature computed over path-with-query ("Signature verification rejected",
   // 19 Sep), so a GET with query params must sign the BARE path while fetching the full URL.
@@ -140,6 +143,7 @@ async function revolutRequest(method, path, body = null, signPathOverride = null
   if (!response.ok) {
     console.error('[revolut] ' + method + ' ' + path.split('?')[0] + ' -> HTTP ' + response.status + ': ' + text.substring(0, 200));
   }
+  if (opts && opts.withStatus) { let parsed = null; try { parsed = JSON.parse(text); } catch (e) { parsed = { raw: text.substring(0, 200) }; } return { status: response.status, ok: response.ok, body: parsed }; }
   return JSON.parse(text);
 }
 
@@ -1361,6 +1365,7 @@ await safeAddColumn('pump_armed_rules', 'armed_since',      'TIMESTAMP NULL');
 await safeAddColumn('pump_armed_rules', 'cycle_count',       'INT DEFAULT 0');
 await safeAddColumn('pump_armed_rules', 'max_cycles',        'INT DEFAULT 10');
 await safeAddColumn('pump_armed_rules', 'loop_realized_pnl', 'DECIMAL(20,8) DEFAULT 0');
+await safeAddColumn('price_intraday_hourly', 'source', "VARCHAR(8) NOT NULL DEFAULT 'own'");   // #370 'own' = our capture, 'venue' = Revolut candles
 // #362 (1b of #326): what the venue ACTUALLY did with each of our own orders.
 await safeAddColumn('trading_journal', 'venue_order_id', 'VARCHAR(64) NULL');
 await safeAddColumn('trading_journal', 'fill_price', 'DECIMAL(30,12) NULL');
@@ -6090,6 +6095,99 @@ async function runFillEnrichment() {
     console.error('[fill-enrich] run failed:', e.message);
     return { error: e.message };
   } finally { _fillEnrichBusy = false; }
+}
+
+
+// ── #370 CANDLES BACKFILL (#326 item 6, PM #31 step 1) ─────────────────────────────
+// Our own price history only starts ~26 June (we can only store prices we saw). Revolut keeps OHLC candles per
+// pair: GET /candles/{symbol}?interval=60&since=ms&until=ms, at most 100 candles per request, up to ~50,000 back.
+// This walks each coin BACKWARDS from now, 100 hours at a time, and stores hourly candles in price_intraday_hourly -
+// the table every backtest, regime_frequency and baseline already reads - with INSERT IGNORE, so it can only FILL
+// hours we never captured and never overwrites a price our own capture recorded (those rows keep source 'own').
+// Where a pair had no trades, Revolut fills candles from the mid price, so candles exist for every hour a coin is
+// listed: several EMPTY windows in a row (with HTTP 200) therefore means we have reached its listing date.
+// Status-aware: a rate limit (429) waits and retries; an unknown pair (400/404) skips the coin; any other error
+// retries then records the error - an error is NEVER mistaken for 'no history'. Paced, runs in the background,
+// progress persisted so a restart can resume where it stopped. Read-only against the venue.
+let _candlesJob = null;
+const CANDLES_STATE_KEY = 'candles_backfill';
+async function candlesState() {
+  try { const [r] = await db.execute('SELECT config_value FROM system_config WHERE config_key = ?', [CANDLES_STATE_KEY]); return r.length ? JSON.parse(r[0].config_value) : null; }
+  catch (e) { return null; }
+}
+async function candlesSave(st) {
+  st.updated_at = new Date().toISOString();
+  await db.execute('INSERT INTO system_config (config_key, config_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)', [CANDLES_STATE_KEY, JSON.stringify(st)]).catch(() => {});
+}
+async function candlesBackfillWorker(st, opt = {}) {
+  const H = 3600000, gapMs = opt.gapMs != null ? opt.gapMs : 700, sleep = opt.sleep || ((ms) => new Promise(r => setTimeout(r, ms)));
+  const sinceFloor = Number(st.since_ms);
+  for (const coin of st.order) {
+    const c = st.coins[coin];
+    if (!c || c.status === 'done' || c.status === 'not_on_revolut_x') continue;
+    if (_candlesJob && _candlesJob.stop) break;
+    c.status = 'running';
+    let until = c.oldest_ms ? Number(c.oldest_ms) : Math.floor(Date.now() / H) * H;
+    let empties = 0, errors = 0;
+    while (until > sinceFloor) {
+      if (_candlesJob && _candlesJob.stop) { c.status = 'stopped'; break; }
+      const since = Math.max(sinceFloor, until - 100 * H);
+      const qs = new URLSearchParams({ interval: '60', since: String(since), until: String(until) });
+      let r;
+      try { r = await revolutRequest('GET', '/candles/' + coin + '-USD?' + qs.toString(), null, null, { withStatus: true }); }
+      catch (e) { r = { status: 0, ok: false, body: { message: e.message } }; }
+      c.requests = (c.requests || 0) + 1;
+      if (r.status === 429) { await sleep(opt.rateWaitMs || 30000); continue; }                       // slow down, same window
+      if (r.status === 400 || r.status === 404) {
+        if (!c.candles) { c.status = 'not_on_revolut_x'; c.note = 'HTTP ' + r.status + ': ' + JSON.stringify(r.body).slice(0, 120); break; }
+        c.status = 'done'; c.note = 'venue refused older windows (HTTP ' + r.status + ')'; break;
+      }
+      if (!r.ok) {
+        errors++;
+        if (errors >= 3) { c.status = 'error'; c.note = 'HTTP ' + r.status + ': ' + JSON.stringify(r.body).slice(0, 120); break; }
+        await sleep(opt.errorWaitMs || 5000); continue;
+      }
+      errors = 0;
+      const list = (r.body && Array.isArray(r.body.data)) ? r.body.data : [];
+      if (!list.length) {
+        empties++;
+        if (empties >= 5) { c.status = 'done'; c.note = 'history starts here (5 empty windows in a row)'; break; }
+      } else {
+        empties = 0;
+        const rows = [];
+        for (const k of list) {
+          const t = Number(k.start); const o = parseFloat(k.open), h = parseFloat(k.high), l = parseFloat(k.low), cl = parseFloat(k.close);
+          if (!(t > 0) || !(o > 0) || !(h > 0) || !(l > 0) || !(cl > 0)) continue;
+          const hb = new Date(Math.floor(t / H) * H).toISOString().slice(0, 19).replace('T', ' ');
+          rows.push([coin + '-USD', hb, o, h, l, cl]);
+          if (!c.earliest_ms || t < c.earliest_ms) c.earliest_ms = t;
+        }
+        if (rows.length) {
+          const ph = rows.map(() => "(?, ?, ?, ?, ?, ?, 0, 'venue')").join(', ');
+          const [ins] = await db.execute('INSERT IGNORE INTO price_intraday_hourly (symbol, hour_bucket, open_px, high_px, low_px, close_px, sample_count, source) VALUES ' + ph, rows.flat());
+          c.candles = (c.candles || 0) + rows.length;
+          c.inserted = (c.inserted || 0) + (ins && ins.affectedRows != null ? ins.affectedRows : 0);
+        }
+      }
+      until = since;
+      c.oldest_ms = until;
+      if (c.requests % 10 === 0) await candlesSave(st);
+      await sleep(gapMs);
+    }
+    if (c.status === 'running') c.status = until <= sinceFloor ? 'done' : c.status;
+    if (c.status === 'done' && until <= sinceFloor && !c.note) c.note = 'reached the start date asked for';
+    if (c.earliest_ms) c.history_from = new Date(c.earliest_ms).toISOString().slice(0, 10);
+    await candlesSave(st);
+  }
+  st.running = false; st.finished_at = new Date().toISOString();
+  await candlesSave(st);
+  return st;
+}
+function candlesSummary(st) {
+  if (!st) return { note: 'no backfill has been run' };
+  const coins = {};
+  for (const k of st.order || []) { const c = st.coins[k] || {}; coins[k] = { status: c.status, history_from: c.history_from || null, candles: c.candles || 0, new_rows: c.inserted || 0, requests: c.requests || 0, note: c.note || null }; }
+  return { running: !!(st.running && _candlesJob), interrupted: !!(st.running && !_candlesJob), started_at: st.started_at, finished_at: st.finished_at || null, since: new Date(Number(st.since_ms)).toISOString().slice(0, 10), coins };
 }
 
 // ── #359 LIVE LADDER EXECUTOR ──────────────────────────────────────────────────────
@@ -16487,7 +16585,7 @@ let rows;
   server.tool('manage_trading',
     'Log journal entries, trade intentions, trader preferences, update invested capital, or configure USDT sweep',
     {
-      action:                 z.enum(['log_journal', 'log_intention', 'save_preference', 'update_capital', 'configure_sweep', 'configure_auto_execute', 'log_dev_issue', 'update_session_state', 'upsert_coin_strategy', 'export_dev_log', 'log_research', 'log_pm_decision', 'log_dev_decision', 'void_journal', 'configure_away_mode', 'delete_tax_lot', 'log_catalyst', 'log_thesis', 'configure_abnormal', 'configure_dnd', 'configure_thesis_nudge', 'upsert_catalogue', 'ledger_rebuild_apply', 'ledger_rebuild_undo', 'ledger_resync_now', 'reconciler_switch']).describe('What trading action to perform'),
+      action:                 z.enum(['log_journal', 'log_intention', 'save_preference', 'update_capital', 'configure_sweep', 'configure_auto_execute', 'log_dev_issue', 'update_session_state', 'upsert_coin_strategy', 'export_dev_log', 'log_research', 'log_pm_decision', 'log_dev_decision', 'void_journal', 'configure_away_mode', 'delete_tax_lot', 'log_catalyst', 'log_thesis', 'configure_abnormal', 'configure_dnd', 'configure_thesis_nudge', 'upsert_catalogue', 'ledger_rebuild_apply', 'ledger_rebuild_undo', 'ledger_resync_now', 'reconciler_switch', 'candles_backfill']).describe('What trading action to perform'),
       symbol:                 z.string().optional().describe('Coin e.g. NEAR-USD or NEAR'),
       trade_action:           z.enum(['buy', 'sell', 'hold', 'add', 'reduce', 'payment', 'transfer', 'pass']).optional().describe('Trade action for log_journal or log_intention — use pass to log a skipped trade for shadow grading at +7d/+30d'),
       price:                  z.coerce.number().optional().describe('Price for log_journal'),
@@ -16596,9 +16694,12 @@ let rows;
       dnd_retrace_pct:  z.coerce.number().optional().describe('configure_dnd: #160 %% of move price must retrace before trough arms (default 50)'),
       dnd_bounce_pct:   z.coerce.number().optional().describe('configure_dnd: #160 %% bounce off trough to trigger rebuy (default 8)'),
       // #355 Only a real true/false: z.coerce.boolean('false') is TRUE, which would turn the reconciler ON when asked to switch it off.
+      candles_op:       z.enum(['start', 'status', 'stop']).optional().describe('#370 candles_backfill: start (or resume) / status / stop'),
+      candles_symbols:  zLoose(z.array(z.string())).optional().describe('#370 candles_backfill start: coins to fill, e.g. ["NEAR","ENA"]. Omit for held coins plus every coin with a saved strategy.'),
+      candles_since:    z.string().optional().describe('#370 candles_backfill start: earliest date to reach back to, YYYY-MM-DD (default 2023-01-01; each coin stops at its own listing date)'),
       reconciler_on:    z.preprocess(v => v === 'true' ? true : (v === 'false' ? false : v), z.boolean()).optional().describe('#355 reconciler_switch: true = record card payments/deposits from Revolut transactions (runs once immediately, then every 30 min); false = dry run only'),
     },
-    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, away_buy_usd, away_sell_pct, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam, manual_only_symbols: manualOnlyParam, title, detail, category, status: devStatus, source: devSource, related_symbol: relSymbol, dev_log_id, active_workstream, progress, open_threads, next_action, recent_decision, recent_decisions, cs_status, cs_role, cs_theme, cs_strategy_md, pm_decision, pm_principle_tag, pm_conviction, pm_captured_by, pm_supersedes_id, dev_decision, dev_principle_tag, dev_cross_thread, dev_alternatives, dev_related_log, dev_supersedes_id, journal_id, tax_lot_id, away_action, away_coins, sell_floors, per_coin_enabled, catalyst_id, catalyst, catalyst_date, catalyst_type, expected_impact, priced_in_risk, catalyst_confidence, catalyst_source, catalyst_status, abn_alert_floor_pct, abn_broad_floor_pct, abn_broad_threshold, abn_cooldown_min, dnd_action, dnd_coins, dnd_arm_pct, dnd_trail_pct, dnd_sell_pct, dnd_retrace_pct, dnd_bounce_pct, conviction, bull_case, bear_case, invalidation_triggers, supporting_refs, tn_enabled, tn_min_severity, tn_cooldown_min, cat_kind, cat_key, cat_name, cat_active, cat_description, cat_detection_signals, cat_detection_criteria, cat_data_available, cat_data_gap, cat_dev_ref, cat_status, cat_what_it_does, cat_when_it_wins, cat_when_it_loses, cat_parameters, cat_conflicts, cat_evidence, cat_notes, ledger_confirm, ledger_run_id, reconciler_on }) => {
+    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, away_buy_usd, away_sell_pct, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam, manual_only_symbols: manualOnlyParam, title, detail, category, status: devStatus, source: devSource, related_symbol: relSymbol, dev_log_id, active_workstream, progress, open_threads, next_action, recent_decision, recent_decisions, cs_status, cs_role, cs_theme, cs_strategy_md, pm_decision, pm_principle_tag, pm_conviction, pm_captured_by, pm_supersedes_id, dev_decision, dev_principle_tag, dev_cross_thread, dev_alternatives, dev_related_log, dev_supersedes_id, journal_id, tax_lot_id, away_action, away_coins, sell_floors, per_coin_enabled, catalyst_id, catalyst, catalyst_date, catalyst_type, expected_impact, priced_in_risk, catalyst_confidence, catalyst_source, catalyst_status, abn_alert_floor_pct, abn_broad_floor_pct, abn_broad_threshold, abn_cooldown_min, dnd_action, dnd_coins, dnd_arm_pct, dnd_trail_pct, dnd_sell_pct, dnd_retrace_pct, dnd_bounce_pct, conviction, bull_case, bear_case, invalidation_triggers, supporting_refs, tn_enabled, tn_min_severity, tn_cooldown_min, cat_kind, cat_key, cat_name, cat_active, cat_description, cat_detection_signals, cat_detection_criteria, cat_data_available, cat_data_gap, cat_dev_ref, cat_status, cat_what_it_does, cat_when_it_wins, cat_when_it_loses, cat_parameters, cat_conflicts, cat_evidence, cat_notes, ledger_confirm, ledger_run_id, reconciler_on, candles_op, candles_symbols, candles_since }) => {
       // Make hodl_symbols accessible in configure_auto_execute via params object
       const params = { hodl_symbols: hodlSymbolsParam, manual_only_symbols: manualOnlyParam };
 
@@ -17346,6 +17447,42 @@ let rows;
         console.log('[ledger-rebuild] applied run ' + runId + ': ' + JSON.stringify(counts));
         return reply({ ok: true, applied: true, run_id: runId, ...counts, entry_price_changes: entries, ledger_quantity_changes: lots.length,
           undo: "manage_trading action 'ledger_rebuild_undo' with ledger_run_id '" + runId + "'" });
+      } else if (action === 'candles_backfill') {
+        // #370 Revolut candle history into price_intraday_hourly. Background job; read-only against the venue.
+        const op = candles_op || 'status';
+        let st = await candlesState();
+        if (op === 'status') return { content: [{ type: 'text', text: JSON.stringify(candlesSummary(st), null, 2) }] };
+        if (op === 'stop') {
+          if (_candlesJob) _candlesJob.stop = true;
+          return { content: [{ type: 'text', text: JSON.stringify({ ok: true, stopping: !!_candlesJob, note: 'Progress is kept - start again to resume.' }) }] };
+        }
+        if (_candlesJob) return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'already running', status: candlesSummary(st) }) }] };
+        let coins = Array.isArray(candles_symbols) && candles_symbols.length ? candles_symbols.map(s => String(s).toUpperCase().replace(/-USD$/, '')) : null;
+        if (!coins) {
+          const set = new Set();
+          try {
+            const b = await revolutRequest('GET', '/balances'); const rows = Array.isArray(b) ? b : (b && (b.data || b.balances)) || [];
+            for (const x of rows) { const c = String(x.currency || '').toUpperCase(); if (!/^(USD|USDT|USDC|GBP|EUR)$/.test(c) && ((parseFloat(x.available) || 0) + (parseFloat(x.reserved) || 0)) > 0) set.add(c); }
+          } catch (e) {}
+          try { const [cs] = await db.execute('SELECT symbol FROM coin_strategy'); for (const x of cs) set.add(String(x.symbol || '').toUpperCase().replace(/-USD$/, '')); } catch (e) {}
+          coins = [...set].filter(c => c && !/^(USD|USDT|USDC|GBP|EUR)$/.test(c)).sort();
+        }
+        const sinceMs = Date.parse((candles_since || '2023-01-01') + 'T00:00:00Z');
+        if (!(sinceMs > 0)) throw new Error('candles_since must be YYYY-MM-DD');
+        // Resume: keep finished coins and each unfinished coin's progress; add any new coins.
+        if (!st || st.since_ms !== sinceMs) st = { since_ms: sinceMs, coins: {}, order: [] };
+        for (const c of coins) { if (!st.coins[c]) st.coins[c] = { status: 'queued' }; if (!st.order.includes(c)) st.order.push(c); }
+        st.running = true; st.started_at = new Date().toISOString(); delete st.finished_at;
+        await candlesSave(st);
+        _candlesJob = { stop: false };
+        const todo = st.order.filter(c => !['done', 'not_on_revolut_x'].includes(st.coins[c].status));
+        candlesBackfillWorker(st).then(async (fin) => {
+          _candlesJob = null;
+          const lines = fin.order.map(c => { const x = fin.coins[c]; return c + ': ' + (x.status === 'done' ? 'from ' + (x.history_from || '?') + ' (' + (x.inserted || 0) + ' new hours)' : x.status + (x.note ? ' - ' + x.note.slice(0, 60) : '')); });
+          await sendTelegram('\ud83d\udd6f\ufe0f <b>Candle history backfill finished</b>\n\n' + lines.join('\n')).catch(() => {});
+        }).catch(async (e) => { _candlesJob = null; st.running = false; st.error = e.message; await candlesSave(st); console.error('[candles] job failed:', e.message); });
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, started: true, coins: st.order.length, to_fetch: todo, since: candles_since || '2023-01-01',
+          note: 'Runs in the background (~100 hours of history per request, paced). Check with candles_op status; a Telegram message arrives when it finishes.' }) }] };
       } else if (action === 'reconciler_switch') {
         // #355 The reconciler's on/off switch - reconciler_writes_enabled had no setter at all. OFF = dry run only.
         // Turning it ON runs it once straight away and reports what it did; the #354 30-minute schedule then takes over.
