@@ -5399,7 +5399,140 @@ function shadowNewState(qty) {
     legs_filled:0, rearm_target:null };
 }
 
+// ── #356 PUMP-LOOP LADDER (Dev-348 spec, PM decision #24) ─────────────────────
+// Bryan's design: sell sell_pct (default 50%) of the CURRENT position on a trail breach after a pump; if the pump
+// carries on (price regains the leg's peak + rearm_confirm_pct) re-arm and sell again, up to max_legs; if it pulls
+// back through the retrace gate, track the low and buy back half the proceeds on a bounce_pct bounce; if it then
+// falls a further further_drop_pct below that buy, track a new low and buy the rest on the next bounce.
+// PURE (no I/O) like shadowEvalTier, and reports fills in the same shape, so the #312 backtest runner and the
+// live shadow can use it unchanged. Rules that are NOT style choices:
+//   * ONE action per bar. A crash through several levels in one tick never sells two legs (Gemini's vector 6 was
+//     rejected in review: a second leg only exists after a re-arm, which needs the price to regain the peak).
+//   * Gap-aware fills: a sell whose stop the price jumped past fills at the open, not at the stop; a buy whose
+//     bounce level was jumped past fills at the open - never at a price the market skipped.
+//   * The floor blocks any sale at or below it; the trail then re-anchors (as live #309 does).
+//   * Re-arm beats buy-back when both are possible (price back above the peak = the run continued).
+//   * Buy-back is abandoned above sale_price * (1 + buyback_ceiling_pct) once no leg remains, and the reserved
+//     cash is released after abandon_hours with no qualifying bounce.
+//   * Bounce is measured from the low of EARLIER bars, then this bar's low updates it - never assumes a bar's
+//     high came after its low.
+function shadowEvalLadder(state, bar, cfg, ctx) {
+  const fills = [];
+  const t = bar.t, hi = bar.h, lo = bar.l, px = bar.c, op = bar.o != null ? bar.o : bar.c;
+  const num = (v, d) => (v === undefined || v === null || v === '') ? d : Number(v);
+  const P = {
+    arm: num(cfg.arm_pump_pct, 30), winMs: num(cfg.arm_window_min, 1440) * 60000,
+    trail: num(cfg.trail_pct, 7), sellPct: num(cfg.sell_pct, 50), maxLegs: num(cfg.max_legs, 2),
+    confirm: num(cfg.rearm_confirm_pct, 1), retrace: num(cfg.retrace_pct, 50), bounce: num(cfg.bounce_pct, 5),
+    buyPct: num(cfg.buy_pct, 50), further: num(cfg.further_drop_pct, 10), ceiling: num(cfg.buyback_ceiling_pct, 15),
+    abandonMs: num(cfg.abandon_hours, 48) * 3600000, cdMs: num(cfg.tier_cooldown_min, 15) * 60000,
+    minUsd: num(cfg.min_tier_usd, 2), floor: cfg.entry_floor ? Number(cfg.entry_floor) : null
+  };
+  // A price EXACTLY at a level counts (1.10 * 1.05 is 1.1550000000000002 in floating point).
+  const EPS = 1e-9, atOrAbove = (x, lvl) => x >= lvl * (1 - EPS), atOrBelow = (x, lvl) => x <= lvl * (1 + EPS);
+  const coolOk = () => !state.last_fill_at || (t - state.last_fill_at) >= P.cdMs;
+  const rec = (leg, tier, trigPx, price, qty, usd, ok, reason) => fills.push({
+    t, leg, tier, trigger_pct: null, observed_pct: 0, price, trigger_price: trigPx,
+    intended_qty: qty, intended_usd: usd == null ? null : Number(usd.toFixed(4)),
+    would_have_filled: ok, block_reason: ok ? null : reason, phase: state.phase,
+    available_usd: ctx.availableUsd, position_qty: Number(state.qty.toFixed(6)), cycle_id: state.cycle_id });
+  const end = (outcome) => {
+    if (outcome === 'completed') ctx.cyclesCompleted++; else ctx.cyclesAbandoned++;
+    ctx.lastOutcome = { cycle: state.cycle_id, legs: state.legs_filled, buys_filled: state.buys_filled, outcome };
+    (ctx.outcomes = ctx.outcomes || []).push(ctx.lastOutcome);
+    state.phase = 'idle'; state.baseline = px; state.baseline_at = t; state.reserved = 0; state.reserved_left = 0;
+    state.legs_filled = 0; state.rearm_target = null; state.trough = null; state.gate = null; state.buy1_price = null;
+  };
+  const rearmIf = () => {
+    if (state.legs_filled < P.maxLegs && state.rearm_target && atOrAbove(hi, state.rearm_target)) {
+      state.phase = 'armed'; state.peak = hi; state.rearm_target = null; state.trough = null;
+      return true;
+    }
+    return false;
+  };
+  const buy = (tier, trig, share) => {
+    const price = op > trig ? op : trig;
+    if (!coolOk()) { rec('buy', tier, trig, price, null, null, false, 'tier_cooldown'); return 'wait'; }
+    const usd = state.reserved_left * share;
+    if (usd < P.minUsd) { rec('buy', tier, trig, price, null, usd, false, 'below_min_tier_usd'); return 'dust'; }
+    if (ctx.availableUsd < usd - 1e-9) { rec('buy', tier, trig, price, usd / price, usd, false, 'insufficient_usd'); return 'dust'; }
+    rec('buy', tier, trig, price, usd / price, usd, true, null);
+    state.qty += usd / price; state.reserved_left -= usd; ctx.availableUsd -= usd;
+    state.last_fill_at = t; state.last_buy_at = t; state.buys_filled++;
+    return 'filled';
+  };
+
+  if (state.phase === 'idle') {
+    if (state.baseline == null) { state.baseline = px; state.baseline_at = t; }
+    if (t - state.baseline_at > P.winMs) { state.baseline = px; state.baseline_at = t; }
+    if (atOrAbove(hi, state.baseline * (1 + P.arm / 100))) {
+      state.phase = 'armed'; state.cycle_id = 'c' + (++ctx.cycleSeq); state.cycle_base = state.baseline;
+      state.peak = hi; state.legs_filled = 0; state.buys_filled = 0; state.sells_filled = 0;
+      state.reserved = 0; state.reserved_left = 0; state.qty0 = state.qty;
+    }
+    return { state, fills };
+  }
+
+  if (state.phase === 'armed') {
+    if (hi > state.peak) state.peak = hi;
+    const trig = state.peak * (1 - P.trail / 100);
+    if (!atOrBelow(lo, trig)) return { state, fills };
+    const price = op < trig ? op : trig;
+    if (!coolOk()) { rec('sell', state.legs_filled, trig, price, null, null, false, 'tier_cooldown'); return { state, fills }; }
+    const qty = state.qty * (P.sellPct / 100), usd = qty * price;
+    if (P.floor && price <= P.floor) {
+      rec('sell', state.legs_filled, trig, price, qty, usd, false, 'below_entry_floor');
+      state.peak = px;                        // re-anchor the trail here, as live #309 does
+      return { state, fills };
+    }
+    if (usd < P.minUsd) { rec('sell', state.legs_filled, trig, price, qty, usd, false, 'below_min_tier_usd'); end('abandoned_dust'); return { state, fills }; }
+    rec('sell', state.legs_filled, trig, price, qty, usd, true, null);
+    state.qty -= qty; state.reserved += usd; state.reserved_left += usd;
+    state.legs_filled++; state.sells_filled++; state.sale_price = price; state.last_sale_at = t; state.last_fill_at = t;
+    state.rearm_target = state.peak * (1 + P.confirm / 100);
+    state.gate = state.peak - (state.peak - state.cycle_base) * (P.retrace / 100);
+    state.phase = 'watch'; state.trough = null;
+    return { state, fills };
+  }
+
+  if (state.phase === 'watch' || state.phase === 'trough1') {
+    if (rearmIf()) return { state, fills };
+    if (state.legs_filled >= P.maxLegs && atOrAbove(hi, state.sale_price * (1 + P.ceiling / 100))) { end('abandoned_ceiling'); return { state, fills }; }
+    if (t - state.last_sale_at > P.abandonMs) { end('abandoned_timeout'); return { state, fills }; }
+    if (state.phase === 'watch') {
+      if (atOrBelow(lo, state.gate)) { state.phase = 'trough1'; state.trough = lo; }
+      return { state, fills };
+    }
+    const trig = state.trough * (1 + P.bounce / 100);
+    if (atOrAbove(hi, trig)) {
+      const r = buy(0, trig, P.buyPct / 100);
+      if (r === 'filled') { state.buy1_price = fills[fills.length - 1].price; state.phase = 'watch2'; state.trough = null; return { state, fills }; }
+      if (r === 'dust') { end('abandoned_dust'); return { state, fills }; }
+    }
+    if (lo < state.trough) state.trough = lo;
+    return { state, fills };
+  }
+
+  if (state.phase === 'watch2' || state.phase === 'trough2') {
+    if (rearmIf()) return { state, fills };
+    if (t - state.last_buy_at > P.abandonMs) { end('completed'); return { state, fills }; }   // tier 1 filled; release the rest
+    if (state.phase === 'watch2') {
+      if (atOrBelow(lo, state.buy1_price * (1 - P.further / 100))) { state.phase = 'trough2'; state.trough = lo; }
+      return { state, fills };
+    }
+    const trig = state.trough * (1 + P.bounce / 100);
+    if (atOrAbove(hi, trig)) {
+      const r = buy(1, trig, 1);
+      if (r === 'filled' || r === 'dust') { end('completed'); return { state, fills }; }
+    }
+    if (lo < state.trough) state.trough = lo;
+    return { state, fills };
+  }
+  return { state, fills };
+}
+
 function shadowEvalTier(state, bar, cfg, ctx) {
+  if (cfg && cfg.rule_mode === 'ladder') return shadowEvalLadder(state, bar, cfg, ctx);   // #356
   const fills = [];
   const t = bar.t, hi = bar.h, lo = bar.l, px = bar.c;
   const cdMs = (cfg.tier_cooldown_min != null ? cfg.tier_cooldown_min : 15) * 60000;
@@ -5644,7 +5777,7 @@ async function runLadderBacktest(opts) {
     const [r] = await db.execute(
       'SELECT hour_bucket AS t, open_px AS o, high_px AS h, low_px AS l, close_px AS c FROM price_intraday_hourly WHERE symbol = ? AND hour_bucket >= ? AND hour_bucket <= ? ORDER BY hour_bucket ASC',
       [sym, opts.start, opts.end]);
-    bars = r.map(x => ({ t: new Date(x.t).getTime(), h: parseFloat(x.h), l: parseFloat(x.l), c: parseFloat(x.c) }));
+    bars = r.map(x => ({ t: new Date(x.t).getTime(), o: x.o != null ? parseFloat(x.o) : undefined, h: parseFloat(x.h), l: parseFloat(x.l), c: parseFloat(x.c) }));   // #356 keep the open (gap-aware fills)
   } else {
     const [r] = await db.execute(
       'SELECT recorded_at AS t, price FROM price_intraday WHERE symbol = ? AND recorded_at >= ? AND recorded_at <= ? ORDER BY recorded_at ASC',
@@ -5661,8 +5794,11 @@ async function runLadderBacktest(opts) {
     entry_floor: opts.entry_floor != null ? Number(opts.entry_floor) : null,
     // #315: 'rearm' re-arms at the sale price after each sell leg instead of going
     // straight to the buy side. Omitted/'single' = unchanged behaviour.
-    rule_mode: opts.rule_mode === 'rearm' ? 'rearm' : 'single',
-    max_legs: opts.max_legs != null ? Number(opts.max_legs) : 5,
+    rule_mode: opts.rule_mode === 'rearm' ? 'rearm' : (opts.rule_mode === 'ladder' ? 'ladder' : 'single'),
+    // #356 ladder parameters (ignored by the other modes)
+    trail_pct: opts.trail_pct, sell_pct: opts.sell_pct, retrace_pct: opts.retrace_pct, bounce_pct: opts.bounce_pct,
+    buy_pct: opts.buy_pct, further_drop_pct: opts.further_drop_pct, buyback_ceiling_pct: opts.buyback_ceiling_pct, abandon_hours: opts.abandon_hours,
+    max_legs: opts.max_legs != null ? Number(opts.max_legs) : (opts.rule_mode === 'ladder' ? 2 : 5),
     rearm_from: opts.rearm_from === 'peak' ? 'peak' : 'sale',
     rearm_confirm_pct: opts.rearm_confirm_pct != null ? Number(opts.rearm_confirm_pct) : 1
   };
@@ -5687,6 +5823,7 @@ async function runLadderBacktest(opts) {
     fills.push(...out.fills);
   }
   const m = btComputeMetrics(fills, startQty, startUsd, bars[bars.length - 1].c, feePct, slipPct);
+  if (cfg.rule_mode === 'ladder') m.cycle_outcomes = ctx.outcomes || [];   // #356 how each cycle ended
   return {
     ok: true, symbol: sym, source: src,
     window: { start: new Date(bars[0].t).toISOString(), end: new Date(bars[bars.length - 1].t).toISOString(), bars: bars.length },
@@ -17696,27 +17833,36 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
       initial_usd:       z.coerce.number().optional().describe('Starting USD. Default 0. Simulated sale proceeds are credited during replay, so the ladder can self-fund even from 0'),
       arm_pump_pct:      z.coerce.number().describe('Pump %% that arms a cycle, e.g. 20'),
       arm_window_min:    z.coerce.number().optional().describe('Window in minutes for the arming pump (default 1440)'),
-      sell_tiers:        z.preprocess(v => { if (typeof v === 'string') { try { return JSON.parse(v); } catch(e) { return v; } } return v; }, z.array(z.array(z.number()))).describe('[[retrace_pct, sell_pct], ...] e.g. [[3,50],[7,50]] — sell_pct is %% of the CURRENT position'),
-      buy_tiers:         z.preprocess(v => { if (typeof v === 'string') { try { return JSON.parse(v); } catch(e) { return v; } } return v; }, z.array(z.array(z.number()))).describe('[[drop_pct, buy_pct], ...] e.g. [[10,50],[16,50]] — buy_pct is %% of REMAINING reserved cash'),
+      sell_tiers:        z.preprocess(v => { if (typeof v === 'string') { try { return JSON.parse(v); } catch(e) { return v; } } return v; }, z.array(z.array(z.number()))).optional().describe('[[retrace_pct, sell_pct], ...] e.g. [[3,50],[7,50]] — sell_pct is %% of the CURRENT position'),
+      buy_tiers:         z.preprocess(v => { if (typeof v === 'string') { try { return JSON.parse(v); } catch(e) { return v; } } return v; }, z.array(z.array(z.number()))).optional().describe('[[drop_pct, buy_pct], ...] e.g. [[10,50],[16,50]] — buy_pct is %% of REMAINING reserved cash'),
       tier_cooldown_min: z.coerce.number().optional().describe('Minutes between tier fills within a cycle (default 15)'),
       min_tier_usd:      z.coerce.number().optional().describe('Dust guard: skip any tier below this USD notional (default 2)'),
       entry_floor:       z.coerce.number().optional().describe('Never sell at or below this price. Omit for no floor. Setting it to the real cost basis shows how often the floor blocks the strategy'),
       slippage_pct:      z.coerce.number().optional().describe('REQUIRED IN PRACTICE: assumed slippage per leg, e.g. 0.5. Defaults to 0, which is optimistic and should not be trusted alone — sweep 0 / 0.5 / 1.0 / 2.0'),
       fee_pct:           z.coerce.number().optional().describe('Fee per leg (default 0.09, the observed live Revolut rate)'),
-      rule_mode:         z.enum(['single','rearm']).optional().describe("#315. 'single' (default) = one arm, sell tiers, then buy tiers. 'rearm' RE-ARMS at the sale price after each sell leg and watches BOTH directions, so a continued run keeps selling. Each leg needs arm_pump_pct from the NEW baseline, so leg n needs (1+arm)^n overall: at arm=30 two legs need +69% and three need +120%. Sweep arm_pump_pct with this."),
+      rule_mode:         z.enum(['single','rearm','ladder']).optional().describe("'single' (default) and 'rearm' (#315) use sell_tiers/buy_tiers. 'ladder' (#356, Bryan's design, PM #24): sell sell_pct of the position on a trail_pct breach after an arm_pump_pct pump; re-arm when price regains the leg peak + rearm_confirm_pct (up to max_legs, default 2); after a retrace_pct giveback of the pump, buy buy_pct of the proceeds on a bounce_pct bounce off the low, then the rest after a further further_drop_pct fall and another bounce. Abandons buy-back above sale*(1+buyback_ceiling_pct) with no legs left, or after abandon_hours."),
+      trail_pct:         z.coerce.number().optional().describe('#356 ladder: trail %% below the peak that triggers a sell leg (default 7)'),
+      sell_pct:          z.coerce.number().optional().describe('#356 ladder: %% of the CURRENT position sold per leg (default 50)'),
+      retrace_pct:       z.coerce.number().optional().describe('#356 ladder: giveback %% of the whole pump that starts trough tracking (default 50)'),
+      bounce_pct:        z.coerce.number().optional().describe('#356 ladder: bounce %% off the tracked low that fires a buy tier (default 5)'),
+      buy_pct:           z.coerce.number().optional().describe('#356 ladder: %% of the reserved proceeds bought at tier 1 (default 50; tier 2 buys the rest)'),
+      further_drop_pct:  z.coerce.number().optional().describe('#356 ladder: fall below the tier-1 buy that starts tracking for tier 2 (default 10)'),
+      buyback_ceiling_pct: z.coerce.number().optional().describe('#356 ladder: abandon buy-back if price rises this %% above the sale with no legs left (default 15)'),
+      abandon_hours:     z.coerce.number().optional().describe('#356 ladder: release reserved cash after this many hours with no qualifying bounce (default 48)'),
       max_legs:          z.coerce.number().optional().describe('#315 rearm only: cap on sell legs in one continuous move (default 5)'),
       rearm_from:        z.enum(['sale','peak']).optional().describe("#315 rearm only. 'sale' (default) re-arms at sale_price*(1+arm) - MEASURED ON COTI THIS NEVER FIRES: the sell happens on a trail breach, so the buy tier at -10% from the sale price is ~3x nearer than a +30% re-arm, the buy always wins the race, and the result is identical to 'single'. 'peak' re-arms on regaining the peak just retraced from, which is close enough to compete."),
       rearm_confirm_pct: z.coerce.number().optional().describe("#315 rearm_from='peak' only: percent above the prior peak needed to confirm the run continues (default 1)"),
     },
-    async ({ symbol, start, end, source, initial_qty, initial_usd, arm_pump_pct, arm_window_min, sell_tiers, buy_tiers, tier_cooldown_min, min_tier_usd, entry_floor, slippage_pct, fee_pct, rule_mode, max_legs, rearm_from, rearm_confirm_pct }) => {
+    async ({ symbol, start, end, source, initial_qty, initial_usd, arm_pump_pct, arm_window_min, sell_tiers, buy_tiers, tier_cooldown_min, min_tier_usd, entry_floor, slippage_pct, fee_pct, rule_mode, max_legs, rearm_from, rearm_confirm_pct, trail_pct, sell_pct, retrace_pct, bounce_pct, buy_pct, further_drop_pct, buyback_ceiling_pct, abandon_hours }) => {
       try {
-        if (!Array.isArray(sell_tiers) || !Array.isArray(buy_tiers) || !sell_tiers.length || !buy_tiers.length) {
+        if (rule_mode !== 'ladder' && (!Array.isArray(sell_tiers) || !Array.isArray(buy_tiers) || !sell_tiers.length || !buy_tiers.length)) {   // #356: ladder does not use tiers
           return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'sell_tiers and buy_tiers must both be non-empty arrays of [pct, pct] pairs' }) }] };
         }
         const res = await runLadderBacktest({
           symbol, start, end, source, initial_qty, initial_usd, arm_pump_pct, arm_window_min,
           sell_tiers, buy_tiers, tier_cooldown_min, min_tier_usd, entry_floor, slippage_pct, fee_pct,
-          rule_mode, max_legs, rearm_from, rearm_confirm_pct
+          rule_mode, max_legs, rearm_from, rearm_confirm_pct,
+          trail_pct, sell_pct, retrace_pct, bounce_pct, buy_pct, further_drop_pct, buyback_ceiling_pct, abandon_hours   // #356
         });
         return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
       } catch (e) {
