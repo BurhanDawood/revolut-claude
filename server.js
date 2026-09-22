@@ -15769,7 +15769,7 @@ let rows;
           sa.worst_10 = rows.slice().sort((a, b) => b.slip_pct - a.slip_pct).slice(0, 10);
           sa.how_to_read = 'slip_pct is positive when the fill was WORSE than the price the system booked (sold lower / bought higher). A ladder sell leg fires during a retrace, so "sell / falling" is the bucket to price a leg from - not "overall". Buckets with thin_sample true have fewer than 5 trades: treat as anecdote. Limit orders are excluded (they choose their own price); price_intraday only reaches back ~30 days, so older orders show condition "unknown".';
         } catch (e) { sa.error = e.message; }
-        out.slippage_audit = sa;
+        result.slippage_audit = sa;   // #361: the surrounding function's accumulator is `result` (was `out` - runtime error)
       }
 
       if (fetch.includes('exchange_orders')) {
