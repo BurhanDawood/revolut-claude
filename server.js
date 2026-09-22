@@ -1361,6 +1361,12 @@ await safeAddColumn('pump_armed_rules', 'armed_since',      'TIMESTAMP NULL');
 await safeAddColumn('pump_armed_rules', 'cycle_count',       'INT DEFAULT 0');
 await safeAddColumn('pump_armed_rules', 'max_cycles',        'INT DEFAULT 10');
 await safeAddColumn('pump_armed_rules', 'loop_realized_pnl', 'DECIMAL(20,8) DEFAULT 0');
+// #362 (1b of #326): what the venue ACTUALLY did with each of our own orders.
+await safeAddColumn('trading_journal', 'venue_order_id', 'VARCHAR(64) NULL');
+await safeAddColumn('trading_journal', 'fill_price', 'DECIMAL(30,12) NULL');
+await safeAddColumn('trading_journal', 'fee_usd', 'DECIMAL(20,8) NULL');
+await safeAddColumn('trading_journal', 'fee_currency', 'VARCHAR(12) NULL');
+await safeAddColumn('trading_journal', 'slip_pct', 'DECIMAL(10,4) NULL');
 await safeAddColumn('pump_armed_rules', 'rebuy_pct',       'DECIMAL(10,4) DEFAULT 8.0'); // #131
 await safeAddColumn('pump_armed_rules', 'sale_price',      'DECIMAL(20,10) NULL'); // #130
 await safeAddColumn('pump_armed_rules', 'reference_base',  'DECIMAL(20,10) NULL'); // #130
@@ -2975,6 +2981,7 @@ async function executeApprovedRevolut(t) {
               [coinBase, t.side, executedPrice, qtyForJournal, valueUSD, reasoning, 'confident', revolutSource]
             ).catch(e => { console.error('[revolut] Journal insert failed:', e.message); return [{}]; });
             if (t.side === 'sell' && rJrnIns && rJrnIns.insertId) await recordRealisedPnl(rJrnIns.insertId, t.symbol, executedPrice, qtyForJournal).catch(() => {});
+      await queueFillEnrichment(rJrnIns && rJrnIns.insertId, (result && result.data ? (result.data.venue_order_id || result.data.id) : null) || (result && result.client_order_id), t.symbol, t.side, executedPrice, qtyForJournal, 'claude_mcp');   // #362
 
             if (matchedIntention) {
               await db.execute('UPDATE trade_intentions SET matched_at = NOW() WHERE id = ?', [matchedIntention.id]).catch(() => {});
@@ -5965,6 +5972,110 @@ async function runLadderShadowTick(nowMs) {
   } finally { _ladderShadowBusy = false; }
 }
 
+
+// ── #362 (1b of #326/#357) FILL PRICE AND FEE FOR OUR OWN ORDERS ──────────────────
+// Every market order the system places is booked at the price the scan happened to see. The venue knows better:
+// average_fill_price is the quantity-weighted execution price, and total_fee is what the trade actually cost.
+// Without them: realised P&L is wrong by the slippage (#263), the single-mode loop's LOSS CIRCUIT-BREAKER
+// (rearmPumpLoopAfterBuyback guard 3) is measuring a number we know is wrong, tax lots understate cost (UK S104,
+// Dev-344), and the measured-slippage sample (#360) contains only 9 of our own trades.
+// Fills are not always readable the instant an order returns, and in-process timers die on a deploy. So an order
+// QUEUES itself here and the 30-second scan collects the details - restart-safe by construction. Read-only against
+// the venue: it corrects our own records and places nothing.
+let _fillEnrichReady = false, _fillEnrichBusy = false;
+async function ensureFillEnrichTable() {
+  if (_fillEnrichReady) return;
+  await db.execute(`CREATE TABLE IF NOT EXISTS fill_enrichment (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    journal_id INT NOT NULL,
+    order_id VARCHAR(64) NOT NULL,
+    symbol VARCHAR(20) NOT NULL,
+    side VARCHAR(8) NOT NULL,
+    booked_price DECIMAL(30,12) NULL,
+    qty DECIMAL(30,10) NULL,
+    source VARCHAR(24) NULL,
+    attempts INT NOT NULL DEFAULT 0,
+    next_try_at TIMESTAMP NULL,
+    done TINYINT(1) NOT NULL DEFAULT 0,
+    outcome VARCHAR(40) NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_fe_open (done, next_try_at))`);
+  _fillEnrichReady = true;
+}
+// Called right after one of OUR orders is placed. Never throws into the trading path.
+async function queueFillEnrichment(journalId, orderId, symbol, side, bookedPrice, qty, source) {
+  try {
+    if (!journalId || !orderId) return;
+    await ensureFillEnrichTable();
+    await db.execute('INSERT INTO fill_enrichment (journal_id, order_id, symbol, side, booked_price, qty, source, next_try_at) VALUES (?, ?, ?, ?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL 20 SECOND))',
+      [journalId, String(orderId), symbol, String(side).toLowerCase(), bookedPrice != null ? bookedPrice : null, qty != null ? qty : null, source || null]);
+    await db.execute('UPDATE trading_journal SET venue_order_id = ? WHERE id = ? AND venue_order_id IS NULL', [String(orderId), journalId]).catch(() => {});
+  } catch (e) { console.error('[fill-enrich] queue failed:', e.message); }
+}
+async function runFillEnrichment() {
+  if (_fillEnrichBusy) return { skipped: 'busy' };
+  _fillEnrichBusy = true;
+  try {
+    await ensureFillEnrichTable();
+    const [rows] = await db.execute('SELECT * FROM fill_enrichment WHERE done = 0 AND (next_try_at IS NULL OR next_try_at <= NOW()) ORDER BY id ASC LIMIT 10');
+    if (!rows.length) return { pending: 0 };
+    const done = [];
+    for (const r of rows) {
+      let d = null;
+      try {
+        const resp = await revolutRequest('GET', '/orders/' + r.order_id);
+        d = (resp && resp.data) || resp || null;
+      } catch (e) { d = null; }
+      const state = String((d && (d.state || d.status)) || '').toLowerCase();
+      const avg = d && d.average_fill_price != null ? Number(d.average_fill_price) : null;
+      const filledQty = d && d.filled_quantity != null ? Number(d.filled_quantity) : null;
+      const fee = d && d.total_fee != null ? Number(d.total_fee) : null;
+      const feeCur = d && d.fee_currency ? String(d.fee_currency) : null;
+      // Not readable yet, or still working: back off (20s, 1m, 2m, 5m, 10m...) and try again.
+      if (!(avg > 0) || (state && !/^(filled|completed|partially_filled)$/.test(state))) {
+        const attempts = Number(r.attempts) + 1;
+        if (attempts >= 8) {
+          await db.execute("UPDATE fill_enrichment SET attempts = ?, done = 1, outcome = ? WHERE id = ?", [attempts, state ? ('gave up: ' + state).slice(0, 40) : 'gave up: no fill data', r.id]);
+          done.push({ id: r.id, outcome: 'gave up' });
+        } else {
+          const mins = [0, 1, 2, 5, 10, 20, 40, 60][attempts] || 60;
+          await db.execute('UPDATE fill_enrichment SET attempts = ?, next_try_at = DATE_ADD(NOW(), INTERVAL ? MINUTE) WHERE id = ?', [attempts, mins, r.id]);
+        }
+        continue;
+      }
+      const booked = r.booked_price != null ? Number(r.booked_price) : null;
+      const qty = filledQty != null && filledQty > 0 ? filledQty : (r.qty != null ? Number(r.qty) : null);
+      const side = String(r.side).toLowerCase();
+      // Positive slip = worse for us (sold lower / bought higher than booked).
+      const slip = booked > 0 ? ((side === 'sell' ? (booked - avg) / booked : (avg - booked) / booked) * 100) : null;
+      // Fee in USD: the venue may charge in the base coin, in which case value it at the fill price.
+      let feeUsd = null;
+      if (fee != null && isFinite(fee)) {
+        const base = String(r.symbol).replace('-USD', '').toUpperCase();
+        feeUsd = (!feeCur || /^(USD|USDT|USDC)$/i.test(feeCur)) ? fee : (feeCur.toUpperCase() === base ? fee * avg : null);
+      }
+      await db.execute('UPDATE trading_journal SET fill_price = ?, price = ?, value_usd = ?, fee_usd = ?, fee_currency = ?, slip_pct = ? WHERE id = ?',
+        [avg, avg, qty != null ? Number((qty * avg).toFixed(4)) : null, feeUsd, feeCur, slip != null ? Number(slip.toFixed(4)) : null, r.journal_id]);
+      // Realised P&L must follow the real sale price, not the scan price (#263).
+      if (side === 'sell' && qty > 0) await recordRealisedPnl(r.journal_id, String(r.symbol).includes('-USD') ? r.symbol : r.symbol + '-USD', avg, qty).catch(() => {});
+      await db.execute('UPDATE pending_orders SET avg_fill_price = ?, filled_quantity = ?, status = ? WHERE order_id = ?', [avg, qty, state || 'filled', r.order_id]).catch(() => {});
+      await db.execute("UPDATE fill_enrichment SET done = 1, outcome = 'enriched' WHERE id = ?", [r.id]);
+      done.push({ id: r.id, journal_id: r.journal_id, coin: r.symbol, side, booked, fill: avg, slip_pct: slip, fee_usd: feeUsd });
+      console.log('[fill-enrich] ' + r.symbol + ' ' + side + ' booked ' + booked + ' -> filled ' + avg + (slip != null ? ' (' + slip.toFixed(3) + '%)' : '') + (feeUsd != null ? ', fee $' + feeUsd.toFixed(4) : ''));
+      // A fill far from what the loop thought it was trading at is worth knowing about at the time.
+      if (slip != null && slip >= 2) {
+        await sendTelegram('\u26a0\ufe0f <b>Fill ' + slip.toFixed(2) + '% worse than expected</b>\n\n' + String(r.symbol).replace('-USD', '') + ' ' + side +
+          ': expected ~' + Number(booked).toPrecision(5) + ', filled at ' + Number(avg).toPrecision(5) +
+          (feeUsd != null ? '\nFee: $' + feeUsd.toFixed(4) : '') + '\nThe records and P&L have been corrected to the real fill.').catch(() => {});
+      }
+    }
+    return { processed: rows.length, done };
+  } catch (e) {
+    console.error('[fill-enrich] run failed:', e.message);
+    return { error: e.message };
+  } finally { _fillEnrichBusy = false; }
+}
+
 // ── #359 LIVE LADDER EXECUTOR ──────────────────────────────────────────────────────
 // Places REAL orders for the pump-loop ladder (#356 shadowEvalLadder, Dev-348 spec, reviewed in Dev-353/#354).
 // SAFETY, not style:
@@ -6150,10 +6261,11 @@ async function runLadderLiveTick(nowMs) {
           if (res && res.executed) placed = { qty: res.qty, price: res.price };
           else { err = (res && (res.reason || res.message)) || 'not executed'; floorBlocked = !!(res && res.reason === 'floor_blocked'); }
         } else {
-          await placeRevolutOrder(sym, 'buy', 'market', null, null, intentObj.usd.toFixed(2), clientOrderId);
-          placed = { usd: intentObj.usd, price: p, qty: intentObj.usd / p };
-          await db.execute("INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source) VALUES (?, 'buy', ?, ?, ?, ?, 'neutral', 'ladder')",
-            [coin, p, placed.qty, intentObj.usd, 'Pump-loop ladder buy-back tier ' + (act.tier + 1) + ' (' + act.cycle_id + ')']).catch(e => console.error('[ladder-live] journal failed:', e.message));
+          const buyRes = await placeRevolutOrder(sym, 'buy', 'market', null, null, intentObj.usd.toFixed(2), clientOrderId);
+          placed = { usd: intentObj.usd, price: p, qty: intentObj.usd / p, order_id: (buyRes && buyRes.data ? (buyRes.data.venue_order_id || buyRes.data.id) : null) || clientOrderId };
+          const [ladJ] = await db.execute("INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source) VALUES (?, 'buy', ?, ?, ?, ?, 'neutral', 'ladder')",
+            [coin, p, placed.qty, intentObj.usd, 'Pump-loop ladder buy-back tier ' + (act.tier + 1) + ' (' + act.cycle_id + ')']).catch(e => { console.error('[ladder-live] journal failed:', e.message); return [null]; });
+          await queueFillEnrichment(ladJ && ladJ.insertId, placed.order_id, sym, 'buy', p, placed.qty, 'ladder');   // #362
         }
       } catch (e) { err = e.message; }
       if (placed) {
@@ -6287,6 +6399,7 @@ async function runFastScan() {
     // #358 ladder shadow - also BEFORE the early return below, or it would only run while something is armed.
     await runLadderShadowTick().catch(e => console.error('[ladder-shadow] tick failed:', e.message));
     await runLadderLiveTick().catch(e => console.error('[ladder-live] tick failed:', e.message));   // #359
+    await runFillEnrichment().catch(e => console.error('[fill-enrich] tick failed:', e.message));   // #362
 
     if (trailingStops.size === 0 && troughTrackers.size === 0 && standaloneTroughTrackers.size === 0) return; // #264: was `trailingStops.size===0` only, which returned BEFORE Part C(#130 trough)/Part D(#143 standalone) and the shared price map — starving both trough subsystems whenever no trailing stop was armed (IDEX rebuy stalled 5h). Bail only when ALL THREE are empty; Parts C/D keep their own size guards.
     const fsRevolutPrices = {};
@@ -11258,6 +11371,8 @@ async function autoExecuteSell(symbol, maxPct, analysis, confidence, opts = {}) 
 
     const reasonMatch = analysis.match(/REASON:\s*(.+)/i);
     const reason = reasonMatch ? reasonMatch[1].trim() : 'Trailing stop triggered';
+    // #362: ask the venue what it actually filled at and charged, then correct this row.
+    await queueFillEnrichment(aeRevIns && aeRevIns.insertId, aeOrder && (aeOrder.data ? (aeOrder.data.venue_order_id || aeOrder.data.id) : null) || (aeOrder && aeOrder.client_order_id), symbol, 'sell', currentPrice, sellQty, opts.source || 'ai_auto');
     if (!opts.silent) await sendTelegram(formatAutoExecuteMessage(coinBase, 'sell', sellQty, currentPrice, valueUSD, reason, confidence));
     console.log(`[auto-exec] SELL ${sellQty.toFixed(4)} ${coinBase} @ $${currentPrice.toFixed(4)}`);
 
