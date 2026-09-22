@@ -2870,7 +2870,9 @@ async function handleTradeButton(idStr, choice, reply) {
     // The coin ITSELF was spent, so it leaves invested capital. (A top-up sale does NOT - its card
     // payment already counts the spending; deducting here too would count it twice.)
     const val = Math.abs(parseFloat(row.value_usd) || 0);
-    if (val > 0) {
+    // #354: if the reconciler has already matched this record to a Revolut transaction, it owns the capital.
+    if (row.venue_tx_id) { doneMsg += '\nCapital unchanged - the reconciler has already counted this payment.'; }
+    else if (val > 0) {
       const before = totalInvestedCapital;
       try {
         await updateInvestedCapital(before - val, 'Paid with ' + coin + ' (trade j' + id + '): -$' + val.toFixed(2));
@@ -7103,6 +7105,12 @@ async function reconcileTransactions(daysBack = 30, dryRun = null) {
     if (row.config_key === 'reconciler_cutover_ms') cutoverMs = parseInt(row.config_value, 10);
   }
   const isDryRun = (dryRun === true) || !configWritesEnabled;
+  // #354: never two WRITE runs at once (the 30-min schedule and a manual call could overlap).
+  if (!isDryRun) {
+    if (_reconcileWriting) return { ok: false, skipped: 'a write run is already in progress' };
+    _reconcileWriting = true;
+  }
+  try {
 
   const txResult = await fetchTransactions(daysBack);
   const truncated = !txResult.ok || (txResult.errors && txResult.errors.length > 0);
@@ -7111,7 +7119,7 @@ async function reconcileTransactions(daysBack = 30, dryRun = null) {
   const [journalRows] = await db.execute(
     `SELECT id, symbol, action, price, quantity, value_usd, reasoning, venue_tx_id, created_at
      FROM trading_journal
-     WHERE (action IN ('payment', 'transfer', 'deposit') OR venue_tx_id IS NOT NULL)
+     WHERE (action IN ('payment', 'transfer', 'deposit', 'sell') OR venue_tx_id IS NOT NULL)   -- #354: sells too
        AND created_at >= FROM_UNIXTIME(?)`,
     // BOUNDED. Only transactions AFTER the cutover are ever processed, and a soft match
     // looks back at most 48h, so no journal row older than (cutover - 2 days) can ever
@@ -7142,111 +7150,174 @@ async function reconcileTransactions(daysBack = 30, dryRun = null) {
   const receives = [];
   const needsPrice = [];
   const writtenRows = [];
+  const linked = [];               // #354 transactions matched to an existing record of the SAME payment
   let totalCapitalDecrement = 0;
 
   const rawTxs = txResult.transactions || [];
 
+  // #354 MATCHING, REBUILT. Before this a soft match compared the transaction's TOKEN amount with a journal row's
+  // USD value (39.9 JTO vs $20.34 - never equal, so a card payment the detector logged as a sale, or that Bryan
+  // marked 'Paid with it', would be deducted a SECOND time); the tolerance was +/-$1 with no one-to-one rule, so
+  // Tesco (5.228 USDT) and the next day's 5.42 USDT payment would both have claimed the watcher's single $5.42 row
+  // and Tesco would never have been counted; and a possible duplicate was neither written, linked nor reported.
+  // Now: (1) compare TOKEN quantities, same coin only; (2) STRICT tolerance - a cent for USD/USDT (the watcher
+  // rounds to cents), 0.1% for coins; window 30 min before to 72 h after the transaction (card payments settle up
+  // up to days later - 7-day window for coins, 72 h for USD/USDT, plus 12 h after settlement); (3) every pairing is decided globally, closest first, and a record can belong to ONE
+  // transaction only; PENDING transactions claim their record too, so a settled payment cannot take a record that
+  // belongs to one still pending; (4) a STRICT match to a payment/deposit record is LINKED (no capital change); a
+  // strict match to a SALE record (the detector's view of a coin card payment) is RELABELLED a payment and
+  // deducted once; a LOOSE-only match is reported to Bryan once and not counted; no match is written as before.
+  const DEAD = ['cancelled', 'canceled', 'failed', 'declined', 'rejected', 'reverted', 'reversed'];
+  const STABLE = (c) => c === 'USD' || c === 'USDT';
+  const coinOf = (s) => String(s || '').toUpperCase().replace(/-USD$/, '');
+  const UNRESOLVED = ['auto-detected', 'no reason provided'];
+  const txs = [];
   for (const tx of rawTxs) {
     if (!tx || !tx.id) continue;
     const status = (tx.status || '').toLowerCase();
-    // Allowlist: only settled 'completed' transactions are evaluated
-    if (status !== 'completed') {
-      continue;
-    }
-
-    // Only 'send' and 'receive' types are considered
+    if (DEAD.includes(status)) continue;
     const txType = (tx.type || '').toLowerCase();
-    if (txType !== 'send' && txType !== 'receive') {
-      continue;
-    }
-
+    if (txType !== 'send' && txType !== 'receive') continue;
     const txTime = tx.created_date || tx.processed_date || Date.now();
     const txMs = typeof txTime === 'number' ? txTime : new Date(txTime).getTime();
-
     // CUTOVER GUARD: Reconciler must ONLY ever process/write transactions created AFTER cutover
-    if (txMs <= cutoverMs) {
-      continue;
-    }
-
+    if (txMs <= cutoverMs) continue;
     const srcAmt = tx.source && tx.source.amount ? parseFloat(tx.source.amount) : 0;
     const dstAmt = tx.destination && tx.destination.amount ? parseFloat(tx.destination.amount) : 0;
     const txAmt = srcAmt || dstAmt || 0;
     if (txAmt <= 0) continue;
-
     const currency = ((tx.source && tx.source.currency) || (tx.destination && tx.destination.currency) || 'USD').toUpperCase();
-
-    // Exact deduplication by venue_tx_id
-    let exactMatch = null;
-    let softMatch = null;
-
+    let exact = null;
     for (const j of journalRows) {
-      if (j.venue_tx_id && String(j.venue_tx_id) === String(tx.id)) {
-        exactMatch = j;
-        break;
-      }
-      if (j.reasoning && String(j.reasoning).includes(String(tx.id))) {
-        exactMatch = j;
-        break;
-      }
+      if ((j.venue_tx_id && String(j.venue_tx_id) === String(tx.id)) || (j.reasoning && String(j.reasoning).includes(String(tx.id)))) { exact = j; break; }
+    }
+    txs.push({ tx, status, settled: status === 'completed', txType, txMs, txAmt, currency, exact, match: null, kind: null });
+  }
+  const claimed = new Set();
+  const fits = (t, j, loose) => {
+    if (j.venue_tx_id || claimed.has(j.id)) return null;
+    const jc = coinOf(j.symbol);
+    if (jc !== t.currency && !(STABLE(t.currency) && STABLE(jc))) return null;
+    const act = String(j.action || '');
+    if (t.txType === 'send' && !(act === 'payment' || (!loose && act === 'sell'))) return null;
+    if (t.txType === 'receive' && !(act === 'deposit' || act === 'transfer')) return null;
+    const jMs = j.created_at ? new Date(j.created_at).getTime() : 0;
+    // Window: 30 min before the payment to 72 h after for USD/USDT (round amounts repeat, and the watcher logs
+    // them at once) but 7 DAYS for coins: the detector only records a coin card payment when it SETTLES, and a
+    // Friday payment can settle on Monday evening. Coin matches need the exact token amount (8 decimals), so a
+    // wide window cannot pair unrelated trades. Where Revolut gives a settlement time, 12 h after it also counts.
+    const procMs = t.tx.processed_date ? Number(t.tx.processed_date) : 0;
+    const spanMs = (loose ? 48 : (STABLE(t.currency) ? 72 : 7 * 24)) * 3600 * 1000;
+    const latest = Math.max(t.txMs + spanMs, procMs ? procMs + 12 * 3600 * 1000 : 0);
+    if (jMs < t.txMs - 30 * 60 * 1000 || jMs > latest) return null;
+    const q = Math.abs(parseFloat(j.quantity || 0));
+    const d = Math.abs(q - t.txAmt);
+    const tol = loose ? Math.max(STABLE(t.currency) ? 1.0 : 0, t.txAmt * 0.03)
+                      : (STABLE(t.currency) ? Math.max(0.011, t.txAmt * 0.002) : t.txAmt * 0.001);
+    return d <= tol ? { d, dt: Math.abs(jMs - t.txMs) } : null;
+  };
+  const assign = (pool, loose) => {
+    const pairs = [];
+    for (const t of pool) for (const j of journalRows) { const f = fits(t, j, loose); if (f) pairs.push({ t, j, ...f }); }
+    pairs.sort((x, y) => (x.d - y.d) || (x.dt - y.dt));
+    for (const p of pairs) {
+      if (p.t.match || claimed.has(p.j.id)) continue;
+      p.t.match = p.j; claimed.add(p.j.id);
+      p.t.kind = loose ? 'loose' : (String(p.j.action) === 'sell' ? 'relabel' : 'link');
+    }
+  };
+  assign(txs.filter(t => !t.exact), false);                    // strict - pending transactions claim too
+  assign(txs.filter(t => !t.exact && !t.match && t.settled), true);  // loose - settled only, unclaimed records only
 
-      // A row that already carries a venue_tx_id belongs to EXACTLY ONE transaction and
-      // must never be soft-matched to another. Without this, once the reconciler is the
-      // only writer, a second payment of a similar amount within 48h (YouTube retries,
-      // Turbify x3, two ~$5.43 Google Cloud charges) fuzzy-matches the FIRST payment's own
-      // row, lands in possible_duplicate, and is NEVER WRITTEN - silently re-creating the
-      // exact missed-payment bug this reconciler exists to eliminate. Only legacy heuristic
-      // rows (no venue_tx_id) may be soft-matched, and only during the overlap window.
-      if (!exactMatch && !j.venue_tx_id) {
-        const jVal = Math.abs(parseFloat(j.value_usd || 0)) || Math.abs(parseFloat(j.quantity || 0)) || 0;
-        const amtDiff = Math.abs(txAmt - jVal);
-        const amtTolerance = Math.max(1.0, txAmt * 0.03);
-        const jMs = j.created_at ? new Date(j.created_at).getTime() : 0;
-        // DIRECTIONAL, NOT SYMMETRIC. A genuine duplicate is the heuristic logging the SAME
-        // payment, which always happens on a scan cycle AFTER the transaction. A journal row
-        // created well BEFORE a transaction cannot be a record of it. The old Math.abs() let a
-        // post-cutover payment match an older row: on 21 Sept a Tesco card payment of 5.228 USDT
-        // (12:01) soft-matched backfill row 3354 ($5.27, created 00:27 - ELEVEN HOURS earlier) and
-        // would have been filed as a duplicate and NEVER WRITTEN, while the heuristic had ALSO
-        // missed it (masked by a same-window JTO->USD->USDT auto top-up that left USDT net +3.75).
-        // Both systems would have lost it. 30 min of slack before the tx allows for clock skew.
-        const earliestDup = txMs - 30 * 60 * 1000;
-        const latestDup = txMs + 48 * 60 * 60 * 1000;
+  // Loose-match notices are sent once per transaction (remembered across runs).
+  let flagged = [];
+  try {
+    const [fr] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'reconciler_flagged_tx'");
+    if (fr.length) flagged = JSON.parse(fr[0].config_value) || [];
+  } catch (e) { flagged = []; }
+  let flaggedChanged = false;
 
-        if (amtDiff <= amtTolerance && jMs >= earliestDup && jMs <= latestDup) {
-          softMatch = j;
+  for (const t of txs) {
+    if (!t.settled) continue;          // pending: claims its record (above) but is never written
+    const { tx, txType, txMs, txAmt, currency } = t;
+
+    if (t.exact) {
+      alreadyReconciled.push({ tx_id: tx.id, tx_type: tx.type, tx_amount: txAmt, currency, matched_journal_id: t.exact.id, matched_venue_tx_id: t.exact.venue_tx_id });
+      continue;
+    }
+
+    if (t.kind === 'link' || t.kind === 'relabel') {
+      const j = t.match;
+      const rebalanced = t.kind === 'relabel' && /^Rebalance/i.test(String(j.reasoning || ''));
+      if (rebalanced) {
+        // Bryan paired this 'sale' with a buy - a card payment cannot also be a rebalance. Ask, don't guess.
+        t.kind = 'loose';
+      } else {
+        const valueUsd = Math.abs(parseFloat(j.value_usd || 0)) || null;
+        const item = { tx_id: tx.id, tx_type: tx.type, tx_amount: txAmt, currency, journal_id: j.id, journal_action: j.action,
+          kind: t.kind, value_usd: valueUsd, capital_change: t.kind === 'relabel' && valueUsd ? -valueUsd : 0 };
+        if (isDryRun) {
+          if (t.kind === 'relabel' && valueUsd) totalCapitalDecrement += valueUsd;
+          linked.push(item);
+          continue;
         }
+        if (t.kind === 'link') {
+          const [up] = await db.execute('UPDATE trading_journal SET venue_tx_id = ? WHERE id = ? AND venue_tx_id IS NULL', [tx.id, j.id]);
+          item.done = up && up.affectedRows === 1 ? 'linked' : 'already linked';
+          linked.push(item);
+          continue;
+        }
+        // RELABEL: the coins were SENT (a card payment), not sold. Compare-and-set, so a button tap at the same moment
+        // cannot also deduct: once the reason changes, the alert's buttons answer 'already handled'.
+        const prior = UNRESOLVED.includes(String(j.reasoning || '')) ? null : String(j.reasoning || '');
+        const reason = ('Card payment with ' + currency + ' (Revolut tx ' + tx.id + ') - recorded by the reconciler' + (prior ? '; the alert had been answered: ' + prior : '')).slice(0, 480);
+        const [up] = await db.execute(
+          "UPDATE trading_journal SET action = 'payment', emotion = 'neutral', venue_tx_id = ?, reasoning = ? WHERE id = ? AND venue_tx_id IS NULL AND action = 'sell'",
+          [tx.id, reason, j.id]);
+        if (!(up && up.affectedRows === 1)) {
+          // Changed under us - most likely Bryan tapped 'Paid with it' (already deducted). Link only.
+          await db.execute('UPDATE trading_journal SET venue_tx_id = ? WHERE id = ? AND venue_tx_id IS NULL', [tx.id, j.id]);
+          item.kind = 'link'; item.capital_change = 0; item.done = 'row changed concurrently - linked only';
+          linked.push(item);
+          continue;
+        }
+        let capMsg = '';
+        if (valueUsd) {
+          const before = totalInvestedCapital;
+          await updateInvestedCapital(before - valueUsd, 'Reconciler: card payment with ' + currency + ' (j' + j.id + ', tx ' + tx.id + '): -$' + valueUsd.toFixed(2));
+          const applied = Math.abs(totalInvestedCapital - (before - valueUsd)) < 0.005;
+          capMsg = applied ? '\nCapital: $' + before.toFixed(2) + ' \u2192 $' + totalInvestedCapital.toFixed(2)
+                           : '\n\u26a0\ufe0f Capital change HELD for your confirmation - see the capital alert.';
+          item.done = applied ? 'relabelled + deducted' : 'relabelled, capital held for confirmation';
+        } else { item.done = 'relabelled (no USD value on the record - capital unchanged)'; }
+        linked.push(item);
+        await sendTelegram('\ud83d\udcb3 <b>Card payment with ' + currency + '</b>\n\n' + txAmt + ' ' + currency + (valueUsd ? ' ($' + valueUsd.toFixed(2) + ')' : '') +
+          '\nIt was logged as a sale (journal #' + j.id + ') - it was a card payment, so it is now recorded as one.' +
+          (prior ? '\nYour earlier answer on that alert was: ' + prior.slice(0, 80) : '') + capMsg).catch(() => {});
+        continue;
       }
     }
 
-    if (exactMatch) {
-      alreadyReconciled.push({
-        tx_id: tx.id,
-        tx_type: tx.type,
-        tx_amount: txAmt,
-        currency,
-        matched_journal_id: exactMatch.id,
-        matched_venue_tx_id: exactMatch.venue_tx_id
-      });
-    } else if (softMatch) {
-      possibleDuplicate.push({
-        tx_id: tx.id,
-        tx_type: tx.type,
-        tx_amount: txAmt,
-        currency,
-        created_date: tx.created_date || tx.processed_date,
-        candidate_journal_id: softMatch.id,
-        candidate_action: softMatch.action,
-        candidate_value_usd: softMatch.value_usd,
-        candidate_created_at: softMatch.created_at
-      });
-    } else {
-      // STANDING RULES: send -> payment, receive -> deposit
-      const action = txType === 'send' ? 'payment' : 'deposit';
+    if (t.kind === 'loose') {
+      const j = t.match;
+      const item = { tx_id: tx.id, tx_type: tx.type, tx_amount: txAmt, currency, created_date: tx.created_date || tx.processed_date,
+        candidate_journal_id: j.id, candidate_action: j.action, candidate_quantity: j.quantity, candidate_value_usd: j.value_usd, candidate_created_at: j.created_at };
+      possibleDuplicate.push(item);
+      if (!isDryRun && !flagged.includes(String(tx.id))) {
+        flagged.push(String(tx.id)); flaggedChanged = true;
+        await sendTelegram('\u26a0\ufe0f <b>Possible duplicate - NOT counted</b>\n\nRevolut ' + txType + ': ' + txAmt + ' ' + currency +
+          ' (' + new Date(txMs).toISOString().slice(0, 16).replace('T', ' ') + ' UTC)\nlooks like journal #' + j.id + ' (' + j.action + ' ' + j.quantity + ')' +
+          ' but not closely enough to be sure.\n\nCapital is unchanged. If they are two separate payments, ask Claude to record this one.').catch(() => {});
+      }
+      continue;
+    }
 
+    // NO MATCH - record it, exactly as before.
+    {
+      const action = txType === 'send' ? 'payment' : 'deposit';
       const txDate = new Date(txMs);
       const hourMs = Math.floor(txDate.getTime() / 3600000) * 3600000;
       const hourBucketStr = new Date(hourMs).toISOString().slice(0, 19).replace('T', ' ');
-
       let priceUsed = null;
       let hourBucket = hourBucketStr;
 
@@ -7444,6 +7515,10 @@ async function reconcileTransactions(daysBack = 30, dryRun = null) {
       }
     }
   }
+  if (flaggedChanged) {
+    await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('reconciler_flagged_tx', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)",
+      [JSON.stringify(flagged.slice(-300))]).catch(() => {});
+  }
 
   return {
     ok: true,
@@ -7454,6 +7529,7 @@ async function reconcileTransactions(daysBack = 30, dryRun = null) {
     truncated,
     already_reconciled: alreadyReconciled,
     possible_duplicate: possibleDuplicate,
+    linked,   // #354
     would_log: wouldLog,
     receives,
     needs_price: needsPrice,
@@ -7462,6 +7538,8 @@ async function reconcileTransactions(daysBack = 30, dryRun = null) {
       total_transactions: rawTxs.length,
       already_reconciled_count: alreadyReconciled.length,
       possible_duplicate_count: possibleDuplicate.length,
+      linked_count: linked.length,   // #354
+      pending_seen: txs.filter(t => !t.settled).length,
       would_log_count: wouldLog.length,
       receives_count: receives.length,
       needs_price_count: needsPrice.length,
@@ -7469,7 +7547,9 @@ async function reconcileTransactions(daysBack = 30, dryRun = null) {
       total_capital_decrement: parseFloat(totalCapitalDecrement.toFixed(2))
     }
   };
+  } finally { if (!isDryRun) _reconcileWriting = false; }
 }
+let _reconcileWriting = false;
 
 async function recordDailyPrices() {
   try {
@@ -12902,6 +12982,16 @@ cron.schedule('50 3 * * *', runPumpArmStalenessCheck, { timezone: 'Europe/London
 cron.schedule('55 2 * * *', backupServerJsToDrive, { timezone: 'Europe/London' }); // nightly server.js snapshot → revolut-claude-backups
 cron.schedule('30 3 * * *', backupDatabaseToDrive, { timezone: 'Europe/London' }); // #12 nightly DB backup
 cron.schedule('40 2 * * *', runNightlyLedgerResync, { timezone: 'Europe/London' }); // #346 ledger + entry prices from venue transactions
+// #354 Reconciler every 30 min - ONLY while reconciler_writes_enabled is on (dry runs on a timer would be pointless).
+cron.schedule('7,37 * * * *', async () => {
+  try {
+    const [r] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'reconciler_writes_enabled'");
+    if (!r.length || r[0].config_value !== 'true') return;
+    const res = await reconcileTransactions(10);
+    if (res && res.summary && (res.summary.written_count || res.summary.linked_count || res.summary.possible_duplicate_count))
+      console.log('[reconciler] scheduled run: ' + JSON.stringify(res.summary));
+  } catch (e) { console.error('[reconciler] scheduled run failed:', e.message); }
+});
 
 // Morning briefing disabled — sendMorningBriefing() kept for manual use
 // cron.schedule('5 9 * * *', async () => {
