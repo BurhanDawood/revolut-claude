@@ -15873,7 +15873,7 @@ let rows;
         const rf = { generated_at: new Date().toISOString(), read_only: true, window_days: 7 };
         try {
           const days = Math.min(parseInt(limit) || 90, 180);
-          let coins = [];
+          let coins = []; const valueUsd = {};   // #368 for the dollar-weighted total
           if (symbol) coins = [symbol.toUpperCase().replace(/-USD$/, '')];
           else {
             const b = await revolutRequest('GET', '/balances').catch(() => null);
@@ -15881,10 +15881,10 @@ let rows;
             const px = {};
             try { const tk = await revolutRequest('GET', '/tickers'); for (const t of (Array.isArray(tk) ? tk : (tk && tk.data) || [])) { const p = parseFloat(t.last_price || t.mid || 0); if (t.symbol && p) px[t.symbol.replace('/', '-')] = p; } } catch (e) {}
             for (const r of rows) { const c = String(r.currency || '').toUpperCase(); const q = (parseFloat(r.available) || 0) + (parseFloat(r.reserved) || 0);
-              if (!/^(USD|USDT|USDC|GBP|EUR)$/.test(c) && q > 0 && (px[c + '-USD'] || 0) * q >= 20) coins.push(c); }
+              if (!/^(USD|USDT|USDC|GBP|EUR)$/.test(c) && q > 0 && (px[c + '-USD'] || 0) * q >= 20) { coins.push(c); valueUsd[c] = (px[c + '-USD'] || 0) * q; } }
           }
-          const tally = (list) => { const t = { rising_hard: 0, rising_grind: 0, rise_then_fall: 0, falling: 0, flat_choppy: 0 }; for (const x of list) t[x]++; const n = list.length || 1; const pct = {}; for (const k of Object.keys(t)) pct[k] = Number((t[k] / n * 100).toFixed(1)); return { windows: list.length, share_pct: pct }; };
-          const all = [], per = {};
+          const tally = (list) => { const t = { rising_hard: 0, rising_grind: 0, choppy_uptrend: 0, rise_then_fall: 0, falling: 0, flat_choppy: 0 }; for (const x of list) t[x]++; const n = list.length || 1; const pct = {}; for (const k of Object.keys(t)) pct[k] = Number((t[k] / n * 100).toFixed(1)); return { windows: list.length, share_pct: pct }; };
+          const all = [], allNonOverlap = [], per = {};
           for (const coin of coins.sort()) {
             const [bars] = await db.execute(
               `SELECT DATE(hour_bucket) AS d, MAX(high_px) AS h, MIN(low_px) AS l,
@@ -15903,17 +15903,30 @@ let rows;
               let lab;
               if (chg >= 25) lab = 'rising_hard';
               else if (run >= 15 && fromHigh <= -10 && chg < 8) lab = 'rise_then_fall';
+              // #368 PM: a path that retraces 10%+ but still ENDS above +8% is a choppy uptrend - plausibly the ladder's
+              // best case (sell into the pop, rebuy the dip, trend carries on). It was being filed as rising.
+              else if (run >= 15 && fromHigh <= -10 && chg >= 8) lab = 'choppy_uptrend';
               else if (chg >= 8 && !bigDay) lab = 'rising_grind';
               else if (chg >= 8) lab = 'rising_hard';          // +8..25% but with a 12%+ day: a pump, not a grind
               else if (chg <= -8) lab = 'falling';
               else lab = 'flat_choppy';
               labels.push(lab); all.push(lab);
             }
-            per[coin] = tally(labels);
+            // #368 non-overlapping cross-check: every 7th window only. If this disagrees with the rolling view, the
+            // overlap is doing too much of the work.
+            const nonOverlap = labels.filter((_, k) => k % 7 === 0); allNonOverlap.push(...nonOverlap);
+            per[coin] = Object.assign(tally(labels), { non_overlapping: tally(nonOverlap), value_usd: valueUsd[coin] != null ? Number(valueUsd[coin].toFixed(2)) : null });
           }
           rf.days = days; rf.coins = coins;
-          rf.all_coins = tally(all);
+          rf.all_coins = tally(all);   // equal weight per WINDOW: what Bryan's coins do
+          rf.all_coins_non_overlapping = tally(allNonOverlap);
+          // #368 dollar-weighted: each coin's regime shares weighted by what it is worth - the decision-relevant view
+          { const tot = Object.values(per).reduce((a, x) => a + (x && x.value_usd ? x.value_usd : 0), 0); const dw = {};
+            for (const [c, x] of Object.entries(per)) { if (!x || !x.share_pct || !x.value_usd || !tot) continue; for (const [k, v] of Object.entries(x.share_pct)) dw[k] = (dw[k] || 0) + v * x.value_usd / tot; }
+            for (const k of Object.keys(dw)) dw[k] = Number(dw[k].toFixed(1));
+            rf.all_coins_dollar_weighted = tot ? { book_value_usd: Number(tot.toFixed(2)), share_pct: dw } : { note: 'no holding values (symbol filter used)' }; }
           rf.by_coin = per;
+          rf.regime_rules = 'rising_hard: ends >= +25%, or +8-25% with a 12%+ day | rising_grind: +8-25%, no 12% day | choppy_uptrend: ran >= +15%, closed 10%+ below that high, still ended >= +8% | rise_then_fall: same run and giveback but ended < +8% | falling: <= -8% | flat_choppy: the rest';
           rf.ladder_performance_for_reference = { flat_choppy: '+12.4% vs hold, 70% retained (COTI, floor off)', falling: '+12.0%, 53% retained (JTO)', rising_grind: '0.00%, 100% retained - inert (JTO)', rising_hard: '+0.17%, 38.2% retained (COTI)', rise_then_fall: 'NOT YET MEASURED on real data - the retention floor costs here (synthetic: -11% vs -6.6% without it)' };
           rf.how_to_read = 'Share of rolling 7-day windows in each regime. Expected value per regime = frequency here x performance per regime. Overlapping windows are not independent - read the shares as relative frequency, not a probability.';
         } catch (e) { rf.error = e.message; }
