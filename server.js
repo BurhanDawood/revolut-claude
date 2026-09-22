@@ -5435,6 +5435,12 @@ function shadowEvalLadder(state, bar, cfg, ctx) {
     trail: num(cfg.trail_pct, 7), sellPct: num(cfg.sell_pct, 50), maxLegs: num(cfg.max_legs, 2),
     confirm: num(cfg.rearm_confirm_pct, 1), retrace: num(cfg.retrace_pct, 50), bounce: num(cfg.bounce_pct, 5),
     buyPct: num(cfg.buy_pct, 70), further: num(cfg.further_drop_pct, 10), ceiling: num(cfg.buyback_ceiling_pct, 15),
+    // #364 RETENTION FLOOR: the fewest coins this ladder may ever leave you holding (absolute, set by the caller from
+    // the starting position). Measured 22 Sept: in COTI's +139.7% run the ladder kept pace in dollars but ended with
+    // 38.2% of the coins - in a rise that keeps going, that missing exposure IS the loss (the FET / IDEX failure).
+    // A leg that would breach the floor is TRIMMED to what is allowed; at the floor it stops selling. Buy-backs are
+    // unaffected, so the position can recover.
+    minQty: num(cfg.min_qty, 0),
     abandonMs: num(cfg.abandon_hours, 48) * 3600000, cdMs: num(cfg.tier_cooldown_min, 15) * 60000,
     minUsd: num(cfg.min_tier_usd, 2), floor: cfg.entry_floor ? Number(cfg.entry_floor) : null
   };
@@ -5492,7 +5498,13 @@ function shadowEvalLadder(state, bar, cfg, ctx) {
     if (!atOrBelow(lo, trig)) return { state, fills };
     const price = op < trig ? op : trig;
     if (!coolOk()) { rec('sell', state.legs_filled, trig, price, null, null, false, 'tier_cooldown'); return { state, fills }; }
-    const qty = state.qty * (P.sellPct / 100), usd = qty * price;
+    const sellable = P.minQty > 0 ? Math.max(0, state.qty - P.minQty) : state.qty;
+    if (sellable <= 0) {
+      rec('sell', state.legs_filled, trig, price, 0, 0, false, 'retention_floor');
+      state.peak = px;                        // re-anchor, as with a blocked floor sale
+      return { state, fills };
+    }
+    const qty = Math.min(state.qty * (P.sellPct / 100), sellable), usd = qty * price;
     if (P.floor && price <= P.floor) {
       rec('sell', state.legs_filled, trig, price, qty, usd, false, 'below_entry_floor');
       state.peak = px;                        // re-anchor the trail here, as live #309 does
@@ -5811,6 +5823,9 @@ async function runLadderBacktest(opts) {
     // #356 ladder parameters (ignored by the other modes)
     trail_pct: opts.trail_pct, sell_pct: opts.sell_pct, retrace_pct: opts.retrace_pct, bounce_pct: opts.bounce_pct,
     buy_pct: opts.buy_pct, further_drop_pct: opts.further_drop_pct, buyback_ceiling_pct: opts.buyback_ceiling_pct, abandon_hours: opts.abandon_hours,
+    // #364 retention floor as an absolute quantity, from the starting position
+    retention_floor_pct: opts.retention_floor_pct != null ? Number(opts.retention_floor_pct) : 50,
+    min_qty: startQty * ((opts.retention_floor_pct != null ? Number(opts.retention_floor_pct) : 50) / 100),
     max_legs: opts.max_legs != null ? Number(opts.max_legs) : (opts.rule_mode === 'ladder' ? 2 : 5),
     rearm_from: (opts.rearm_from === 'peak' || opts.rule_mode === 'ladder') ? 'peak' : 'sale',   // #357 ladder always re-arms from the peak
     rearm_confirm_pct: opts.rearm_confirm_pct != null ? Number(opts.rearm_confirm_pct) : 1
@@ -5894,7 +5909,7 @@ function ladderEffectiveFloor(coin, aeCfg, rule) {
   if (ep != null && Number(ep) > 0) return { floor: Number(ep), source: 'entry price' };
   return { floor: null, source: 'none' };
 }
-const LADDER_DEFAULTS = { arm_window_min: 1440, sell_pct: 50, max_legs: 2, rearm_confirm_pct: 1, retrace_pct: 50, bounce_pct: 5,
+const LADDER_DEFAULTS = { arm_window_min: 1440, sell_pct: 50, max_legs: 2, rearm_confirm_pct: 1, retrace_pct: 50, bounce_pct: 5, retention_floor_pct: 50,
   buy_pct: 70, further_drop_pct: 10, buyback_ceiling_pct: 15, abandon_hours: 48, tier_cooldown_min: 15, min_tier_usd: 2,
   paper_slippage_pct: 0.5, paper_fee_pct: 0.09 };
 async function runLadderShadowTick(nowMs) {
@@ -5924,7 +5939,8 @@ async function runLadderShadowTick(nowMs) {
       if (!st || !st.phase) { st = shadowNewState(Number(r.start_qty)); st.paper_cash = 0; }
       const [pr] = await db.execute('SELECT entry_floor FROM pump_armed_rules WHERE symbol = ? AND active = 1 LIMIT 1', [sym]).catch(() => [[]]);
       const fl = ladderEffectiveFloor(coin, aeCfg, pr && pr[0]);
-      const runCfg = Object.assign({}, LADDER_DEFAULTS, cfg, { rule_mode: 'ladder', entry_floor: fl.floor });
+      const runCfg = Object.assign({}, LADDER_DEFAULTS, cfg, { rule_mode: 'ladder', entry_floor: fl.floor,
+        min_qty: Number(r.start_qty) * (Number(cfg.retention_floor_pct != null ? cfg.retention_floor_pct : LADDER_DEFAULTS.retention_floor_pct) / 100) });   // #364
       const fee = Number(runCfg.paper_fee_pct) / 100, slip = Number(runCfg.paper_slippage_pct) / 100;
       const ctx = { availableUsd: Number(st.paper_cash || 0), cycleSeq: st.cycle_seq || 0, cyclesCompleted: 0, cyclesAbandoned: 0 };
       const phaseBefore = st.phase, before = JSON.stringify(st);
@@ -6100,7 +6116,7 @@ async function ensureLadderLiveTables() {
   await db.execute(`CREATE TABLE IF NOT EXISTS ladder_live (
     symbol VARCHAR(20) NOT NULL PRIMARY KEY,
     cfg TEXT NOT NULL, state TEXT NULL, intent TEXT NULL,
-    cap_usd DECIMAL(20,4) NOT NULL, start_price DECIMAL(30,12) NOT NULL,
+    cap_usd DECIMAL(20,4) NOT NULL, start_price DECIMAL(30,12) NOT NULL, start_qty DECIMAL(30,10) NULL,
     active TINYINT(1) NOT NULL DEFAULT 0,
     started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)`);
@@ -6113,6 +6129,7 @@ async function ensureLadderLiveTables() {
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     INDEX idx_llf_sym (symbol, created_at))`);
   await safeAddColumn('ladder_live_fills', 'journal_id', 'INT NULL').catch(() => {});   // #363
+  await safeAddColumn('ladder_live', 'start_qty', 'DECIMAL(30,10) NULL').catch(() => {});   // #364
   _ladderLiveReady = true;
 }
 async function ladderConfirmIntent(intent, bal, nowMs) {
@@ -6257,7 +6274,9 @@ async function runLadderLiveTick(nowMs) {
       if (st.conflict_noted) delete st.conflict_noted;
       st.qty = position;                                   // the REAL position every tick - manual trades are seen
       const fl = ladderEffectiveFloor(coin, aeCfg, pr && pr[0]);
-      const runCfg = Object.assign({}, LADDER_DEFAULTS, cfg, { rule_mode: 'ladder', entry_floor: fl.floor });
+      const startManaged = r.start_qty != null && Number(r.start_qty) > 0 ? Number(r.start_qty) : position;   // #364
+      const runCfg = Object.assign({}, LADDER_DEFAULTS, cfg, { rule_mode: 'ladder', entry_floor: fl.floor,
+        min_qty: startManaged * (Number(cfg.retention_floor_pct != null ? cfg.retention_floor_pct : LADDER_DEFAULTS.retention_floor_pct) / 100) });   // #364
       const ctx = { availableUsd: usdAvail, cycleSeq: st.cycle_seq || 0, cyclesCompleted: 0, cyclesAbandoned: 0 };
       const phaseBefore = st.phase;
       const next = JSON.parse(JSON.stringify(st));
@@ -17561,11 +17580,12 @@ let rows;
             troughTrackers.delete(sym); standaloneTroughTrackers.delete(sym);
             const cfg = {};
             for (const [k, v] of Object.entries(Object.assign({}, LADDER_DEFAULTS, c))) if (!/^paper_/.test(k) && v !== null && v !== '' && isFinite(Number(v))) cfg[k] = Number(v);
-            await db.execute('INSERT INTO ladder_live (symbol, cfg, state, intent, cap_usd, start_price, active) VALUES (?, ?, NULL, NULL, ?, ?, 1) ON DUPLICATE KEY UPDATE cfg = VALUES(cfg), state = NULL, intent = NULL, cap_usd = VALUES(cap_usd), start_price = VALUES(start_price), active = 1, started_at = CURRENT_TIMESTAMP',
-              [sym, JSON.stringify(cfg), Number(cap_usd), price]);
             const managed = Math.min(qty, Number(cap_usd) / price);
+            await db.execute('INSERT INTO ladder_live (symbol, cfg, state, intent, cap_usd, start_price, start_qty, active) VALUES (?, ?, NULL, NULL, ?, ?, ?, 1) ON DUPLICATE KEY UPDATE cfg = VALUES(cfg), state = NULL, intent = NULL, cap_usd = VALUES(cap_usd), start_price = VALUES(start_price), start_qty = VALUES(start_qty), active = 1, started_at = CURRENT_TIMESTAMP',
+              [sym, JSON.stringify(cfg), Number(cap_usd), price, managed]);
             await sendTelegram('\ud83d\udea8 <b>LADDER set up for ' + coin + '</b> (REAL MONEY)\n\nManages up to $' + Number(cap_usd).toFixed(2) + ' = ' + managed.toPrecision(6) + ' ' + coin + ' of your ' + qty.toPrecision(6) +
               '\nArms on +' + cfg.arm_pump_pct + '%, trails ' + cfg.trail_pct + '%, sells ' + cfg.sell_pct + '% per leg (max ' + cfg.max_legs + '), buys back ' + cfg.buy_pct + '% then the rest.' +
+              '\nIt will never sell you below ' + (cfg.retention_floor_pct || 50) + '% of that (' + (managed * ((cfg.retention_floor_pct || 50) / 100)).toPrecision(6) + ' ' + coin + ').' +
               '\nThe old single-mode loop for ' + coin + ' is now OFF.' +
               '\n\nLadder-wide switch: ' + (switchOn ? 'ON - it can trade now.' : 'OFF - nothing will trade until it is switched on.')).catch(() => {});
             return { content: [{ type: 'text', text: JSON.stringify({ ok: true, symbol: sym, cap_usd: Number(cap_usd), managed_qty: managed, start_price: price, cfg, ladder_live_enabled: switchOn }) }] };
@@ -17583,6 +17603,9 @@ let rows;
             out.push({ symbol: r.symbol, active: Number(r.active) === 1, cap_usd: Number(r.cap_usd), start_price: Number(r.start_price), started_at: r.started_at, cfg: JSON.parse(r.cfg),
               phase: st ? st.phase : 'not yet evaluated', halted_reason: st && st.halted_reason || null, order_in_flight: !!r.intent,
               realized_pnl_usd: st && st.realized_pnl_usd != null ? Number(st.realized_pnl_usd) : 0, cycles_done: st && st.cycles_done ? Number(st.cycles_done) : 0,
+              start_qty: r.start_qty != null ? Number(r.start_qty) : null,
+              retention_floor_qty: r.start_qty != null ? Number(r.start_qty) * ((JSON.parse(r.cfg).retention_floor_pct || 50) / 100) : null,
+              coins_retained_pct: (st && st.qty != null && r.start_qty) ? Number((Number(st.qty) / Number(r.start_qty) * 100).toFixed(1)) : null,   // #364
               last_cycle: st && st.last_cycle || null, stops_at: 'a negative running total, or ' + ((JSON.parse(r.cfg).max_cycles_before_review) || 10) + ' cycles',
               recent: fills });   // #363
           }
@@ -18596,11 +18619,12 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
       further_drop_pct:  z.coerce.number().optional().describe('#356 ladder: fall below the tier-1 buy that starts tracking for tier 2 (default 10)'),
       buyback_ceiling_pct: z.coerce.number().optional().describe('#356 ladder: abandon buy-back if price rises this %% above the sale with no legs left (default 15)'),
       abandon_hours:     z.coerce.number().optional().describe('#356 ladder: release reserved cash after this many hours with no qualifying bounce (default 48)'),
+      retention_floor_pct: z.coerce.number().optional().describe('#364 ladder: the ladder may never sell you below this %% of the starting position (default 50). Bounds the rising-market case where it keeps pace in dollars but ends holding a fraction of the coins.'),
       max_legs:          z.coerce.number().optional().describe('#315 rearm only: cap on sell legs in one continuous move (default 5)'),
       rearm_from:        z.enum(['sale','peak']).optional().describe("#315 rearm only. 'sale' (default) re-arms at sale_price*(1+arm) - MEASURED ON COTI THIS NEVER FIRES: the sell happens on a trail breach, so the buy tier at -10% from the sale price is ~3x nearer than a +30% re-arm, the buy always wins the race, and the result is identical to 'single'. 'peak' re-arms on regaining the peak just retraced from, which is close enough to compete."),
       rearm_confirm_pct: z.coerce.number().optional().describe("#315 rearm_from='peak' only: percent above the prior peak needed to confirm the run continues (default 1)"),
     },
-    async ({ symbol, start, end, source, initial_qty, initial_usd, arm_pump_pct, arm_window_min, sell_tiers, buy_tiers, tier_cooldown_min, min_tier_usd, entry_floor, slippage_pct, fee_pct, rule_mode, max_legs, rearm_from, rearm_confirm_pct, trail_pct, sell_pct, retrace_pct, bounce_pct, buy_pct, further_drop_pct, buyback_ceiling_pct, abandon_hours }) => {
+    async ({ symbol, start, end, source, initial_qty, initial_usd, arm_pump_pct, arm_window_min, sell_tiers, buy_tiers, tier_cooldown_min, min_tier_usd, entry_floor, slippage_pct, fee_pct, rule_mode, max_legs, rearm_from, rearm_confirm_pct, trail_pct, sell_pct, retrace_pct, bounce_pct, buy_pct, further_drop_pct, buyback_ceiling_pct, abandon_hours, retention_floor_pct }) => {
       try {
         if (rule_mode !== 'ladder' && (!Array.isArray(sell_tiers) || !Array.isArray(buy_tiers) || !sell_tiers.length || !buy_tiers.length)) {   // #356: ladder does not use tiers
           return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'sell_tiers and buy_tiers must both be non-empty arrays of [pct, pct] pairs' }) }] };
@@ -18609,7 +18633,8 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
           symbol, start, end, source, initial_qty, initial_usd, arm_pump_pct, arm_window_min,
           sell_tiers, buy_tiers, tier_cooldown_min, min_tier_usd, entry_floor, slippage_pct, fee_pct,
           rule_mode, max_legs, rearm_from, rearm_confirm_pct,
-          trail_pct, sell_pct, retrace_pct, bounce_pct, buy_pct, further_drop_pct, buyback_ceiling_pct, abandon_hours   // #356
+          trail_pct, sell_pct, retrace_pct, bounce_pct, buy_pct, further_drop_pct, buyback_ceiling_pct, abandon_hours,   // #356
+          retention_floor_pct   // #364
         });
         return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
       } catch (e) {
