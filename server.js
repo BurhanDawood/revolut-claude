@@ -5401,6 +5401,8 @@ function shadowNewState(qty) {
 
 // ── #356 PUMP-LOOP LADDER (Dev-348 spec, PM decision #24) ─────────────────────
 // Bryan's design: sell sell_pct (default 50%) of the CURRENT position on a trail breach after a pump; if the pump
+// [#357: tier 1 buys buy_pct = 70% of the proceeds by default - Bryan, 22 Sept, after backtests showed 50% left only
+//  a third of the coins after 7 COTI cycles; 70% kept 59% for a slightly better result.]
 // carries on (price regains the leg's peak + rearm_confirm_pct) re-arm and sell again, up to max_legs; if it pulls
 // back through the retrace gate, track the low and buy back half the proceeds on a bounce_pct bounce; if it then
 // falls a further further_drop_pct below that buy, track a new low and buy the rest on the next bounce.
@@ -5424,7 +5426,7 @@ function shadowEvalLadder(state, bar, cfg, ctx) {
     arm: num(cfg.arm_pump_pct, 30), winMs: num(cfg.arm_window_min, 1440) * 60000,
     trail: num(cfg.trail_pct, 7), sellPct: num(cfg.sell_pct, 50), maxLegs: num(cfg.max_legs, 2),
     confirm: num(cfg.rearm_confirm_pct, 1), retrace: num(cfg.retrace_pct, 50), bounce: num(cfg.bounce_pct, 5),
-    buyPct: num(cfg.buy_pct, 50), further: num(cfg.further_drop_pct, 10), ceiling: num(cfg.buyback_ceiling_pct, 15),
+    buyPct: num(cfg.buy_pct, 70), further: num(cfg.further_drop_pct, 10), ceiling: num(cfg.buyback_ceiling_pct, 15),
     abandonMs: num(cfg.abandon_hours, 48) * 3600000, cdMs: num(cfg.tier_cooldown_min, 15) * 60000,
     minUsd: num(cfg.min_tier_usd, 2), floor: cfg.entry_floor ? Number(cfg.entry_floor) : null
   };
@@ -5453,11 +5455,14 @@ function shadowEvalLadder(state, bar, cfg, ctx) {
   const buy = (tier, trig, share) => {
     const price = op > trig ? op : trig;
     if (!coolOk()) { rec('buy', tier, trig, price, null, null, false, 'tier_cooldown'); return 'wait'; }
-    const usd = state.reserved_left * share;
-    if (usd < P.minUsd) { rec('buy', tier, trig, price, null, usd, false, 'below_min_tier_usd'); return 'dust'; }
-    if (ctx.availableUsd < usd - 1e-9) { rec('buy', tier, trig, price, usd / price, usd, false, 'insufficient_usd'); return 'dust'; }
+    // #357 Spend what is ACTUALLY available, capped at the reserved share. Reserved proceeds are GROSS; the cash a
+    // sale really produced is NET of fees and slippage, so 'buy the rest' used to exceed it by a hair and be refused
+    // outright (backtest COTI 22 Sept: a whole cycle abandoned). Live, the cash may also have been spent meanwhile.
+    const want = state.reserved_left * share;
+    const usd = Math.min(want, Math.max(0, ctx.availableUsd));
+    if (usd < P.minUsd) { rec('buy', tier, trig, price, null, usd, false, want >= P.minUsd ? 'insufficient_usd' : 'below_min_tier_usd'); return 'dust'; }
     rec('buy', tier, trig, price, usd / price, usd, true, null);
-    state.qty += usd / price; state.reserved_left -= usd; ctx.availableUsd -= usd;
+    state.qty += usd / price; state.reserved_left = Math.max(0, state.reserved_left - want); ctx.availableUsd -= usd;   // #357 the tier's share is used up even if capped
     state.last_fill_at = t; state.last_buy_at = t; state.buys_filled++;
     return 'filled';
   };
@@ -5799,7 +5804,7 @@ async function runLadderBacktest(opts) {
     trail_pct: opts.trail_pct, sell_pct: opts.sell_pct, retrace_pct: opts.retrace_pct, bounce_pct: opts.bounce_pct,
     buy_pct: opts.buy_pct, further_drop_pct: opts.further_drop_pct, buyback_ceiling_pct: opts.buyback_ceiling_pct, abandon_hours: opts.abandon_hours,
     max_legs: opts.max_legs != null ? Number(opts.max_legs) : (opts.rule_mode === 'ladder' ? 2 : 5),
-    rearm_from: opts.rearm_from === 'peak' ? 'peak' : 'sale',
+    rearm_from: (opts.rearm_from === 'peak' || opts.rule_mode === 'ladder') ? 'peak' : 'sale',   // #357 ladder always re-arms from the peak
     rearm_confirm_pct: opts.rearm_confirm_pct != null ? Number(opts.rearm_confirm_pct) : 1
   };
   const startQty = Number(opts.initial_qty), startUsd = opts.initial_usd != null ? Number(opts.initial_usd) : 0;
@@ -17845,7 +17850,7 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
       sell_pct:          z.coerce.number().optional().describe('#356 ladder: %% of the CURRENT position sold per leg (default 50)'),
       retrace_pct:       z.coerce.number().optional().describe('#356 ladder: giveback %% of the whole pump that starts trough tracking (default 50)'),
       bounce_pct:        z.coerce.number().optional().describe('#356 ladder: bounce %% off the tracked low that fires a buy tier (default 5)'),
-      buy_pct:           z.coerce.number().optional().describe('#356 ladder: %% of the reserved proceeds bought at tier 1 (default 50; tier 2 buys the rest)'),
+      buy_pct:           z.coerce.number().optional().describe('#356 ladder: %% of the reserved proceeds bought at tier 1 (default 70 - owner choice #357; tier 2 buys the rest)'),
       further_drop_pct:  z.coerce.number().optional().describe('#356 ladder: fall below the tier-1 buy that starts tracking for tier 2 (default 10)'),
       buyback_ceiling_pct: z.coerce.number().optional().describe('#356 ladder: abandon buy-back if price rises this %% above the sale with no legs left (default 15)'),
       abandon_hours:     z.coerce.number().optional().describe('#356 ladder: release reserved cash after this many hours with no qualifying bounce (default 48)'),
