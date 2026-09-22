@@ -5440,12 +5440,18 @@ function shadowEvalLadder(state, bar, cfg, ctx) {
     // 38.2% of the coins - in a rise that keeps going, that missing exposure IS the loss (the FET / IDEX failure).
     // A leg that would breach the floor is TRIMMED to what is allowed; at the floor it stops selling. Buy-backs are
     // unaffected, so the position can recover.
-    minQty: num(cfg.min_qty, 0),
+    retentionPct: num(cfg.retention_floor_pct, 0),
+    minQtyAbs: num(cfg.min_qty, 0),
     abandonMs: num(cfg.abandon_hours, 48) * 3600000, cdMs: num(cfg.tier_cooldown_min, 15) * 60000,
     minUsd: num(cfg.min_tier_usd, 2), floor: cfg.entry_floor ? Number(cfg.entry_floor) : null
   };
   // A price EXACTLY at a level counts (1.10 * 1.05 is 1.1550000000000002 in floating point).
   const EPS = 1e-9, atOrAbove = (x, lvl) => x >= lvl * (1 - EPS), atOrBelow = (x, lvl) => x <= lvl * (1 + EPS);
+  // #366 (PM spec): the retention baseline is the LARGEST position this ladder has seen - set at activation and
+  // RATCHETED UP if Bryan adds coins or a buy-back restores them. It never falls on a sell, or the floor would
+  // chase the position down and four cycles of 'sell half' would end at 6% while never breaching a per-cycle floor.
+  if (P.retentionPct > 0) state.retention_base = Math.max(Number(state.retention_base || 0), state.qty);
+  const minQty = Math.max(P.minQtyAbs, P.retentionPct > 0 ? Number(state.retention_base || 0) * (P.retentionPct / 100) : 0);
   const coolOk = () => !state.last_fill_at || (t - state.last_fill_at) >= P.cdMs;
   const rec = (leg, tier, trigPx, price, qty, usd, ok, reason) => fills.push({
     t, leg, tier, trigger_pct: null, observed_pct: 0, price, trigger_price: trigPx,
@@ -5498,18 +5504,13 @@ function shadowEvalLadder(state, bar, cfg, ctx) {
     if (!atOrBelow(lo, trig)) return { state, fills };
     const price = op < trig ? op : trig;
     if (!coolOk()) { rec('sell', state.legs_filled, trig, price, null, null, false, 'tier_cooldown'); return { state, fills }; }
-    const sellable = P.minQty > 0 ? Math.max(0, state.qty - P.minQty) : state.qty;
-    if (sellable <= 0) {
-      rec('sell', state.legs_filled, trig, price, 0, 0, false, 'retention_floor');
-      state.peak = px;                        // re-anchor, as with a blocked floor sale
-      return { state, fills };
-    }
+    // #366 ONE refusal path for both guards (PM: they must not diverge). Neither consumes the arm - the trail
+    // re-anchors here and the loop stays armed, so a later breach can still sell once the block clears (#323 shape).
+    const refuse = (reason) => { rec('sell', state.legs_filled, trig, price, 0, 0, false, reason); state.peak = px; return { state, fills }; };
+    const sellable = minQty > 0 ? Math.max(0, state.qty - minQty) : state.qty;
+    if (sellable <= 0) return refuse('retention_floor');
     const qty = Math.min(state.qty * (P.sellPct / 100), sellable), usd = qty * price;
-    if (P.floor && price <= P.floor) {
-      rec('sell', state.legs_filled, trig, price, qty, usd, false, 'below_entry_floor');
-      state.peak = px;                        // re-anchor the trail here, as live #309 does
-      return { state, fills };
-    }
+    if (P.floor && price <= P.floor) return refuse('below_entry_floor');   // #366 same path as the retention floor
     if (usd < P.minUsd) { rec('sell', state.legs_filled, trig, price, qty, usd, false, 'below_min_tier_usd'); end('abandoned_dust'); return { state, fills }; }
     rec('sell', state.legs_filled, trig, price, qty, usd, true, null);
     state.qty -= qty; state.reserved += usd; state.reserved_left += usd;
@@ -5830,7 +5831,6 @@ async function runLadderBacktest(opts) {
     rearm_confirm_pct: opts.rearm_confirm_pct != null ? Number(opts.rearm_confirm_pct) : 1
   };
   const startQty = Number(opts.initial_qty), startUsd = opts.initial_usd != null ? Number(opts.initial_usd) : 0;
-  cfg.min_qty = startQty * (Number(cfg.retention_floor_pct) / 100);   // #365: set AFTER startQty exists (it is declared below the cfg literal)
   const st = shadowNewState(startQty);
   const ctx = { availableUsd: startUsd, cycleSeq: 0, cyclesCompleted: 0, cyclesAbandoned: 0 };
   const fills = [];
@@ -5940,7 +5940,7 @@ async function runLadderShadowTick(nowMs) {
       const [pr] = await db.execute('SELECT entry_floor FROM pump_armed_rules WHERE symbol = ? AND active = 1 LIMIT 1', [sym]).catch(() => [[]]);
       const fl = ladderEffectiveFloor(coin, aeCfg, pr && pr[0]);
       const runCfg = Object.assign({}, LADDER_DEFAULTS, cfg, { rule_mode: 'ladder', entry_floor: fl.floor,
-        min_qty: Number(r.start_qty) * (Number(cfg.retention_floor_pct != null ? cfg.retention_floor_pct : LADDER_DEFAULTS.retention_floor_pct) / 100) });   // #364
+        retention_floor_pct: Number(cfg.retention_floor_pct != null ? cfg.retention_floor_pct : LADDER_DEFAULTS.retention_floor_pct) });   // #364/#366
       const fee = Number(runCfg.paper_fee_pct) / 100, slip = Number(runCfg.paper_slippage_pct) / 100;
       const ctx = { availableUsd: Number(st.paper_cash || 0), cycleSeq: st.cycle_seq || 0, cyclesCompleted: 0, cyclesAbandoned: 0 };
       const phaseBefore = st.phase, before = JSON.stringify(st);
@@ -6274,9 +6274,8 @@ async function runLadderLiveTick(nowMs) {
       if (st.conflict_noted) delete st.conflict_noted;
       st.qty = position;                                   // the REAL position every tick - manual trades are seen
       const fl = ladderEffectiveFloor(coin, aeCfg, pr && pr[0]);
-      const startManaged = r.start_qty != null && Number(r.start_qty) > 0 ? Number(r.start_qty) : position;   // #364
       const runCfg = Object.assign({}, LADDER_DEFAULTS, cfg, { rule_mode: 'ladder', entry_floor: fl.floor,
-        min_qty: startManaged * (Number(cfg.retention_floor_pct != null ? cfg.retention_floor_pct : LADDER_DEFAULTS.retention_floor_pct) / 100) });   // #364
+        retention_floor_pct: Number(cfg.retention_floor_pct != null ? cfg.retention_floor_pct : LADDER_DEFAULTS.retention_floor_pct) });   // #364/#366
       const ctx = { availableUsd: usdAvail, cycleSeq: st.cycle_seq || 0, cyclesCompleted: 0, cyclesAbandoned: 0 };
       const phaseBefore = st.phase;
       const next = JSON.parse(JSON.stringify(st));
@@ -17604,8 +17603,9 @@ let rows;
               phase: st ? st.phase : 'not yet evaluated', halted_reason: st && st.halted_reason || null, order_in_flight: !!r.intent,
               realized_pnl_usd: st && st.realized_pnl_usd != null ? Number(st.realized_pnl_usd) : 0, cycles_done: st && st.cycles_done ? Number(st.cycles_done) : 0,
               start_qty: r.start_qty != null ? Number(r.start_qty) : null,
-              retention_floor_qty: r.start_qty != null ? Number(r.start_qty) * ((JSON.parse(r.cfg).retention_floor_pct || 50) / 100) : null,
-              coins_retained_pct: (st && st.qty != null && r.start_qty) ? Number((Number(st.qty) / Number(r.start_qty) * 100).toFixed(1)) : null,   // #364
+              retention_base_qty: st && st.retention_base != null ? Number(st.retention_base) : (r.start_qty != null ? Number(r.start_qty) : null),   // #366 ratchets up only
+              retention_floor_qty: (() => { const b = st && st.retention_base != null ? Number(st.retention_base) : (r.start_qty != null ? Number(r.start_qty) : null); return b == null ? null : b * ((JSON.parse(r.cfg).retention_floor_pct || 50) / 100); })(),
+              coins_retained_pct: (() => { const b = st && st.retention_base != null ? Number(st.retention_base) : (r.start_qty != null ? Number(r.start_qty) : null); return (st && st.qty != null && b) ? Number((Number(st.qty) / b * 100).toFixed(1)) : null; })(),   // #364
               last_cycle: st && st.last_cycle || null, stops_at: 'a negative running total, or ' + ((JSON.parse(r.cfg).max_cycles_before_review) || 10) + ' cycles',
               recent: fills });   // #363
           }
