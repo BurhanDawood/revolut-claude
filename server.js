@@ -15294,7 +15294,7 @@ let rows;
   server.tool('get_trading_data',
     'Get trading journal entries, active alerts, trader context/profile, rebalancing history, and dev_bridge messages',
     {
-      include: zLoose(z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'dev_bridge', 'coin_strategy', 'reconciliation', 'ledger', 'tax_lots', 'catalysts', 'thesis', 'nudges', 'dev_health', 'dev_recommendations', 'volatility_baseline', 'shadow_fills', 'abnormal_events', 'strategy_catalogue', 'exchange_orders', 'transactions', 'reconcile_transactions', 'ledger_rebuild', 'slippage_audit', 'all']))).optional()
+      include: zLoose(z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'dev_bridge', 'coin_strategy', 'reconciliation', 'ledger', 'tax_lots', 'catalysts', 'thesis', 'nudges', 'dev_health', 'dev_recommendations', 'volatility_baseline', 'shadow_fills', 'abnormal_events', 'strategy_catalogue', 'exchange_orders', 'transactions', 'reconcile_transactions', 'ledger_rebuild', 'slippage_audit', 'regime_frequency', 'all']))).optional()
         .describe('What data to fetch — defaults to all. dev_bridge, coin_strategy and reconciliation are never included in all; request them explicitly'),
       symbol:           z.string().optional().describe('Filter journal by coin e.g. NEAR'),
       limit:            z.coerce.number().optional().describe('Max journal entries to return, default 10'),
@@ -15859,6 +15859,67 @@ let rows;
       // READ-ONLY: reads /orders/historical and compares it against what our tranches
       // claim. Writes nothing, changes no tranche, touches no trading path. This exists
       // to QUANTIFY the drift (#320) before Build 2 is allowed to rebuild anything.
+      if (fetch.includes('regime_frequency')) {
+        // #367 READ-ONLY (PM ask, 22 Sept): how often does each price regime actually happen in the coins Bryan holds?
+        // The ladder has per-regime PERFORMANCE (flat +12.4% / falling +12.0% / rising grind 0% / rising hard +0.17%
+        // but 38% retained) but no FREQUENCY, and expected value is frequency x performance. Rise-then-fall - the
+        // regime where the #364 retention floor COSTS money - may be the modal path for this book (XAN, CC, IDEX, COTI).
+        // Deliberately crude, as asked: rolling 7-day windows of daily bars (from the hourly rollup, kept since ~26 Jun).
+        //   rising_hard     : ends >= +25%
+        //   rising_grind    : ends +8% .. +25% with no single day of >= +12% (the ladder's JTO arm level)
+        //   rise_then_fall  : ran up >= +15% inside the window, then closed >= 10% below that high, ending < +8%
+        //   falling         : ends <= -8% (and not rise_then_fall)
+        //   flat_choppy     : everything else
+        const rf = { generated_at: new Date().toISOString(), read_only: true, window_days: 7 };
+        try {
+          const days = Math.min(parseInt(limit) || 90, 180);
+          let coins = [];
+          if (symbol) coins = [symbol.toUpperCase().replace(/-USD$/, '')];
+          else {
+            const b = await revolutRequest('GET', '/balances').catch(() => null);
+            const rows = Array.isArray(b) ? b : (b && (b.data || b.balances)) || [];
+            const px = {};
+            try { const tk = await revolutRequest('GET', '/tickers'); for (const t of (Array.isArray(tk) ? tk : (tk && tk.data) || [])) { const p = parseFloat(t.last_price || t.mid || 0); if (t.symbol && p) px[t.symbol.replace('/', '-')] = p; } } catch (e) {}
+            for (const r of rows) { const c = String(r.currency || '').toUpperCase(); const q = (parseFloat(r.available) || 0) + (parseFloat(r.reserved) || 0);
+              if (!/^(USD|USDT|USDC|GBP|EUR)$/.test(c) && q > 0 && (px[c + '-USD'] || 0) * q >= 20) coins.push(c); }
+          }
+          const tally = (list) => { const t = { rising_hard: 0, rising_grind: 0, rise_then_fall: 0, falling: 0, flat_choppy: 0 }; for (const x of list) t[x]++; const n = list.length || 1; const pct = {}; for (const k of Object.keys(t)) pct[k] = Number((t[k] / n * 100).toFixed(1)); return { windows: list.length, share_pct: pct }; };
+          const all = [], per = {};
+          for (const coin of coins.sort()) {
+            const [bars] = await db.execute(
+              `SELECT DATE(hour_bucket) AS d, MAX(high_px) AS h, MIN(low_px) AS l,
+                      SUBSTRING_INDEX(GROUP_CONCAT(close_px ORDER BY hour_bucket DESC), ',', 1) AS c
+                 FROM price_intraday_hourly WHERE symbol IN (?, ?) AND hour_bucket >= DATE_SUB(NOW(), INTERVAL ? DAY)
+                GROUP BY DATE(hour_bucket) ORDER BY d ASC`, [coin, coin + '-USD', days + 7]);
+            const d = bars.map(x => ({ h: Number(x.h), l: Number(x.l), c: Number(x.c) })).filter(x => x.c > 0 && x.h > 0);
+            if (d.length < 8) { per[coin] = { note: 'fewer than 8 days of history' }; continue; }
+            const labels = [];
+            for (let i = 7; i < d.length; i++) {
+              const start = d[i - 7].c, w = d.slice(i - 6, i + 1), end = d[i].c;
+              const chg = (end / start - 1) * 100;
+              let hi = start, hiIdx = -1; w.forEach((x, k) => { if (x.h > hi) { hi = x.h; hiIdx = k; } });
+              const run = (hi / start - 1) * 100, fromHigh = (end / hi - 1) * 100;
+              let bigDay = false; for (let k = 0; k < w.length; k++) { const prev = k === 0 ? start : w[k - 1].c; if ((w[k].h / prev - 1) * 100 >= 12) bigDay = true; }
+              let lab;
+              if (chg >= 25) lab = 'rising_hard';
+              else if (run >= 15 && fromHigh <= -10 && chg < 8) lab = 'rise_then_fall';
+              else if (chg >= 8 && !bigDay) lab = 'rising_grind';
+              else if (chg >= 8) lab = 'rising_hard';          // +8..25% but with a 12%+ day: a pump, not a grind
+              else if (chg <= -8) lab = 'falling';
+              else lab = 'flat_choppy';
+              labels.push(lab); all.push(lab);
+            }
+            per[coin] = tally(labels);
+          }
+          rf.days = days; rf.coins = coins;
+          rf.all_coins = tally(all);
+          rf.by_coin = per;
+          rf.ladder_performance_for_reference = { flat_choppy: '+12.4% vs hold, 70% retained (COTI, floor off)', falling: '+12.0%, 53% retained (JTO)', rising_grind: '0.00%, 100% retained - inert (JTO)', rising_hard: '+0.17%, 38.2% retained (COTI)', rise_then_fall: 'NOT YET MEASURED on real data - the retention floor costs here (synthetic: -11% vs -6.6% without it)' };
+          rf.how_to_read = 'Share of rolling 7-day windows in each regime. Expected value per regime = frequency here x performance per regime. Overlapping windows are not independent - read the shares as relative frequency, not a probability.';
+        } catch (e) { rf.error = e.message; }
+        result.regime_frequency = rf;
+      }
+
       if (fetch.includes('slippage_audit')) {
         // #360 (1a of #326/#357) MEASURED SLIPPAGE, READ-ONLY. Every backtest so far has taken slippage as an INPUT -
         // the COTI ladder's +12% rests on a figure that was typed in, and #312 puts a conservative ladder's break-even
