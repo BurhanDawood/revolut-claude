@@ -6109,8 +6109,10 @@ async function ensureLadderLiveTables() {
     symbol VARCHAR(20) NOT NULL, cycle_id VARCHAR(20) NULL, leg VARCHAR(8) NOT NULL, tier INT NULL,
     price DECIMAL(30,12) NULL, qty DECIMAL(30,10) NULL, usd DECIMAL(20,6) NULL,
     client_order_id VARCHAR(64) NULL, status VARCHAR(20) NOT NULL, note VARCHAR(200) NULL,
+    journal_id INT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     INDEX idx_llf_sym (symbol, created_at))`);
+  await safeAddColumn('ladder_live_fills', 'journal_id', 'INT NULL').catch(() => {});   // #363
   _ladderLiveReady = true;
 }
 async function ladderConfirmIntent(intent, bal, nowMs) {
@@ -6137,12 +6139,45 @@ async function ladderConfirmIntent(intent, bal, nowMs) {
   } catch (e) { /* fall through to the timeout */ }
   return { status: ((nowMs || Date.now()) - intent.at > LADDER_INTENT_TIMEOUT_MS) ? 'unconfirmed' : 'wait' };
 }
-async function ladderLogFill(sym, intent, status, note) {
-  await db.execute('INSERT INTO ladder_live_fills (symbol, cycle_id, leg, tier, price, qty, usd, client_order_id, status, note) VALUES (?,?,?,?,?,?,?,?,?,?)',
+async function ladderLogFill(sym, intent, status, note, journalId) {
+  await db.execute('INSERT INTO ladder_live_fills (symbol, cycle_id, leg, tier, price, qty, usd, client_order_id, status, note, journal_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
     [sym, intent.cycle || null, intent.kind, intent.tier != null ? intent.tier : null, intent.ref_price || null,
-     intent.qty != null ? intent.qty : null, intent.usd != null ? intent.usd : null, intent.client_order_id, status, String(note || '').slice(0, 200)])
+     intent.qty != null ? intent.qty : null, intent.usd != null ? intent.usd : null, intent.client_order_id, status, String(note || '').slice(0, 200), journalId || null])
     .catch(e => console.error('[ladder-live] fill log failed:', e.message));
 }
+// #363 (1c of #326/#357, PM #28) LADDER LOSS CUT-OUT. The single-mode loop has had a circuit-breaker since #130
+// (rearmPumpLoopAfterBuyback guard 3: cumulative loop P&L negative -> loop_enabled = 0). The ladder had NONE - it
+// could have run unbounded cycles, four market-order legs each, with nothing to stop it. This closes that gap, and
+// measures it from the REAL fills and fees captured by #362 rather than the price the scan happened to see.
+// A cycle's result, in money: cash taken in on the sell legs, minus cash paid out on the buy legs, plus the value
+// of any EXTRA coins the cycle ended up holding (buying back more coins than were sold is the whole point).
+async function ladderCycleResult(sym, cycleId, priceNow) {
+  const [rows] = await db.execute("SELECT leg, qty, usd, price, journal_id FROM ladder_live_fills WHERE symbol = ? AND cycle_id = ? AND status IN ('placed','confirmed')", [sym, cycleId]);
+  if (!rows.length) return null;
+  let cashIn = 0, cashOut = 0, coinsSold = 0, coinsBought = 0, fees = 0, enriched = 0;
+  for (const f of rows) {
+    let px = f.price != null ? Number(f.price) : null, qty = f.qty != null ? Number(f.qty) : null, usd = f.usd != null ? Number(f.usd) : null, fee = 0;
+    if (f.journal_id) {
+      const [j] = await db.execute('SELECT price, fill_price, quantity, value_usd, fee_usd FROM trading_journal WHERE id = ?', [f.journal_id]);
+      if (j.length) {
+        if (j[0].fill_price != null) { px = Number(j[0].fill_price); enriched++; }
+        else if (j[0].price != null) px = Number(j[0].price);
+        if (j[0].quantity != null) qty = Number(j[0].quantity);
+        if (j[0].value_usd != null) usd = Number(j[0].value_usd);
+        if (j[0].fee_usd != null) fee = Number(j[0].fee_usd);
+      }
+    }
+    fees += fee;
+    if (f.leg === 'sell') { const v = usd != null ? usd : (qty || 0) * (px || 0); cashIn += v - fee; coinsSold += qty || 0; }
+    else { const v = usd != null ? usd : (qty || 0) * (px || 0); cashOut += v + fee; coinsBought += (px > 0 ? v / px : 0); }
+  }
+  const coinDelta = coinsBought - coinsSold;
+  const pnl = (cashIn - cashOut) + coinDelta * priceNow;
+  return { cycle: cycleId, pnl_usd: Number(pnl.toFixed(4)), cash_in: Number(cashIn.toFixed(4)), cash_out: Number(cashOut.toFixed(4)),
+    coins_sold: coinsSold, coins_bought: coinsBought, coin_delta: coinDelta, fees_usd: Number(fees.toFixed(4)),
+    legs: rows.length, priced_from_real_fills: enriched + '/' + rows.length };
+}
+
 async function runLadderLiveTick(nowMs) {
   if (_ladderLiveBusy) return { skipped: 'busy' };
   _ladderLiveBusy = true;
@@ -6230,7 +6265,31 @@ async function runLadderLiveTick(nowMs) {
       next.cycle_seq = ctx.cycleSeq;
       const msgs = [];
       if (phaseBefore === 'idle' && next.phase === 'armed') msgs.push('Armed: up ' + (((p / next.cycle_base) - 1) * 100).toFixed(1) + '% from ' + fmt(next.cycle_base) + '. Trailing ' + runCfg.trail_pct + '% below the peak.');
-      for (const o of (ctx.outcomes || [])) msgs.push('Cycle ended: ' + o.outcome.replace(/_/g, ' ') + ' (' + o.legs + ' sale(s), ' + o.buys_filled + ' buy(s)).');
+      for (const o of (ctx.outcomes || [])) {
+        msgs.push('Cycle ended: ' + o.outcome.replace(/_/g, ' ') + ' (' + o.legs + ' sale(s), ' + o.buys_filled + ' buy(s)).');
+        // #363 What did that cycle actually achieve, at real fills and fees?
+        const res = await ladderCycleResult(sym, o.cycle, p).catch(() => null);
+        if (res) {
+          next.realized_pnl_usd = Number((Number(next.realized_pnl_usd || 0) + res.pnl_usd).toFixed(4));
+          next.cycles_done = Number(next.cycles_done || 0) + 1;
+          next.last_cycle = res;
+          msgs.push('Result: ' + (res.pnl_usd >= 0 ? '+' : '') + '$' + res.pnl_usd.toFixed(2) + ' this cycle (' + (res.coin_delta >= 0 ? '+' : '') + Number(res.coin_delta).toPrecision(4) + ' ' + coin +
+            ', fees $' + res.fees_usd.toFixed(2) + ', priced from real fills ' + res.priced_from_real_fills + '). Running total: ' + (next.realized_pnl_usd >= 0 ? '+' : '') + '$' + next.realized_pnl_usd.toFixed(2) + ' over ' + next.cycles_done + ' cycle(s).');
+          const capCycles = Number(runCfg.max_cycles_before_review || 10);
+          if (next.realized_pnl_usd < 0) {
+            await halt(sym, next, 'loss cut-out: running total ' + next.realized_pnl_usd.toFixed(2));
+            await tell(coin, msgs.concat(['STOPPED - the ladder is down $' + Math.abs(next.realized_pnl_usd).toFixed(2) + ' overall on ' + coin + ', so it will not trade it again until you restart it.']));
+            report.push({ symbol: sym, halted: 'loss cut-out' });
+            continue;
+          }
+          if (next.cycles_done >= capCycles) {
+            await halt(sym, next, 'reached ' + capCycles + ' cycles - review');
+            await tell(coin, msgs.concat(['PAUSED after ' + capCycles + ' cycles (running total ' + (next.realized_pnl_usd >= 0 ? '+' : '') + '$' + next.realized_pnl_usd.toFixed(2) + '). Restart it if you are happy with how it is going.']));
+            report.push({ symbol: sym, halted: 'cycle cap' });
+            continue;
+          }
+        }
+      }
       const act = out.fills.find(f => f.would_have_filled);
       if (!act) {
         const blk = out.fills.find(f => f.block_reason === 'below_entry_floor');
@@ -6258,19 +6317,20 @@ async function runLadderLiveTick(nowMs) {
         if (act.leg === 'sell') {
           const res = await autoExecuteSell(sym, null, 'Pump-loop ladder, sell leg ' + (act.tier + 1), 'High',
             { sellQty: intentObj.qty, skipCascade: true, clientOrderId, source: 'ladder', silent: true });
-          if (res && res.executed) placed = { qty: res.qty, price: res.price };
+          if (res && res.executed) placed = { qty: res.qty, price: res.price, journal_id: res.journal_id };   // #363
           else { err = (res && (res.reason || res.message)) || 'not executed'; floorBlocked = !!(res && res.reason === 'floor_blocked'); }
         } else {
           const buyRes = await placeRevolutOrder(sym, 'buy', 'market', null, null, intentObj.usd.toFixed(2), clientOrderId);
           placed = { usd: intentObj.usd, price: p, qty: intentObj.usd / p, order_id: (buyRes && buyRes.data ? (buyRes.data.venue_order_id || buyRes.data.id) : null) || clientOrderId };
           const [ladJ] = await db.execute("INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source) VALUES (?, 'buy', ?, ?, ?, ?, 'neutral', 'ladder')",
             [coin, p, placed.qty, intentObj.usd, 'Pump-loop ladder buy-back tier ' + (act.tier + 1) + ' (' + act.cycle_id + ')']).catch(e => { console.error('[ladder-live] journal failed:', e.message); return [null]; });
-          await queueFillEnrichment(ladJ && ladJ.insertId, placed.order_id, sym, 'buy', p, placed.qty, 'ladder');   // #362
+          placed.journal_id = ladJ && ladJ.insertId;   // #363
+          await queueFillEnrichment(placed.journal_id, placed.order_id, sym, 'buy', p, placed.qty, 'ladder');   // #362
         }
       } catch (e) { err = e.message; }
       if (placed) {
         await db.execute('UPDATE ladder_live SET state = ?, intent = NULL WHERE symbol = ?', [JSON.stringify(next), sym]);
-        await ladderLogFill(sym, intentObj, 'placed', act.leg === 'sell' ? 'sold ' + placed.qty : 'bought $' + intentObj.usd.toFixed(2));
+        await ladderLogFill(sym, intentObj, 'placed', act.leg === 'sell' ? 'sold ' + placed.qty : 'bought $' + intentObj.usd.toFixed(2), placed.journal_id);   // #363
         msgs.unshift(act.leg === 'sell'
           ? 'SOLD ' + Number(placed.qty).toPrecision(6) + ' ' + coin + ' at ~' + fmt(placed.price) + ' (~$' + (placed.qty * placed.price).toFixed(2) + ') - sell leg ' + (act.tier + 1) + '.'
           : 'BOUGHT back $' + intentObj.usd.toFixed(2) + ' of ' + coin + ' at ~' + fmt(p) + ' - tier ' + (act.tier + 1) + '.');
@@ -17521,7 +17581,10 @@ let rows;
             let st = null; try { st = r.state ? JSON.parse(r.state) : null; } catch (e) { st = null; }
             const [fills] = await db.execute('SELECT created_at, cycle_id, leg, tier, price, qty, usd, status, note FROM ladder_live_fills WHERE symbol = ? ORDER BY id DESC LIMIT 20', [r.symbol]);
             out.push({ symbol: r.symbol, active: Number(r.active) === 1, cap_usd: Number(r.cap_usd), start_price: Number(r.start_price), started_at: r.started_at, cfg: JSON.parse(r.cfg),
-              phase: st ? st.phase : 'not yet evaluated', halted_reason: st && st.halted_reason || null, order_in_flight: !!r.intent, recent: fills });
+              phase: st ? st.phase : 'not yet evaluated', halted_reason: st && st.halted_reason || null, order_in_flight: !!r.intent,
+              realized_pnl_usd: st && st.realized_pnl_usd != null ? Number(st.realized_pnl_usd) : 0, cycles_done: st && st.cycles_done ? Number(st.cycles_done) : 0,
+              last_cycle: st && st.last_cycle || null, stops_at: 'a negative running total, or ' + ((JSON.parse(r.cfg).max_cycles_before_review) || 10) + ' cycles',
+              recent: fills });   // #363
           }
           return { content: [{ type: 'text', text: JSON.stringify({ ladder_live_enabled: switchOn, ladders: out }, null, 2) }] };
         }
