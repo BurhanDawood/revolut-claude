@@ -15925,9 +15925,24 @@ let rows;
             for (const [c, x] of Object.entries(per)) { if (!x || !x.share_pct || !x.value_usd || !tot) continue; for (const [k, v] of Object.entries(x.share_pct)) dw[k] = (dw[k] || 0) + v * x.value_usd / tot; }
             for (const k of Object.keys(dw)) dw[k] = Number(dw[k].toFixed(1));
             rf.all_coins_dollar_weighted = tot ? { book_value_usd: Number(tot.toFixed(2)), share_pct: dw } : { note: 'no holding values (symbol filter used)' }; }
+          // #369 PM: the dollar-weighted row is ~71% CC, a coin that will never be laddered (role 'anchor'), so it mostly
+          // describes the anchor, not the ladder's opportunity set. This row leaves out anchor / hodl coins (by their
+          // coin_strategy role, not by name).
+          try {
+            const [cs] = await db.execute('SELECT symbol, role FROM coin_strategy');
+            const roleOf = {}; for (const x of cs) roleOf[String(x.symbol || '').toUpperCase().replace(/-USD$/, '')] = String(x.role || '').toLowerCase();
+            const excluded = Object.keys(per).filter(c => /^(anchor|hodl)$/.test(roleOf[c] || ''));
+            const lad = Object.entries(per).filter(([c, x]) => !excluded.includes(c) && x && x.value_usd && x.share_pct);
+            const tot2 = lad.reduce((a, [, x]) => a + x.value_usd, 0); const dw2 = {};
+            for (const [, x] of lad) for (const [k, v] of Object.entries(x.share_pct)) dw2[k] = (dw2[k] || 0) + v * x.value_usd / tot2;
+            for (const k of Object.keys(dw2)) dw2[k] = Number(dw2[k].toFixed(1));
+            rf.ladderable_book_dollar_weighted = tot2 ? { book_value_usd: Number(tot2.toFixed(2)), excluded_by_role: excluded.map(c => c + ' (' + roleOf[c] + ')'), share_pct: dw2 } : { note: 'nothing ladderable with a known value' };
+          } catch (e) { rf.ladderable_book_dollar_weighted = { error: e.message }; }
           rf.by_coin = per;
           rf.regime_rules = 'rising_hard: ends >= +25%, or +8-25% with a 12%+ day | rising_grind: +8-25%, no 12% day | choppy_uptrend: ran >= +15%, closed 10%+ below that high, still ended >= +8% | rise_then_fall: same run and giveback but ended < +8% | falling: <= -8% | flat_choppy: the rest';
-          rf.ladder_performance_for_reference = { flat_choppy: '+12.4% vs hold, 70% retained (COTI, floor off)', falling: '+12.0%, 53% retained (JTO)', rising_grind: '0.00%, 100% retained - inert (JTO)', rising_hard: '+0.17%, 38.2% retained (COTI)', rise_then_fall: 'NOT YET MEASURED on real data - the retention floor costs here (synthetic: -11% vs -6.6% without it)' };
+          // #369 The per-regime ladder PERFORMANCE is deliberately NOT embedded here: backtest results baked into code go
+          // stale (this table still said rise_then_fall was unmeasured after it had been measured). Read it from the dev log.
+          rf.ladder_performance = 'See dev log #366, #370, #371 for measured per-regime ladder results - each is one or two cycles, so read with the sample size.';
           rf.how_to_read = 'Share of rolling 7-day windows in each regime. Expected value per regime = frequency here x performance per regime. Overlapping windows are not independent - read the shares as relative frequency, not a probability.';
         } catch (e) { rf.error = e.message; }
         result.regime_frequency = rf;
