@@ -5825,12 +5825,12 @@ async function runLadderBacktest(opts) {
     buy_pct: opts.buy_pct, further_drop_pct: opts.further_drop_pct, buyback_ceiling_pct: opts.buyback_ceiling_pct, abandon_hours: opts.abandon_hours,
     // #364 retention floor as an absolute quantity, from the starting position
     retention_floor_pct: opts.retention_floor_pct != null ? Number(opts.retention_floor_pct) : 50,
-    min_qty: startQty * ((opts.retention_floor_pct != null ? Number(opts.retention_floor_pct) : 50) / 100),
     max_legs: opts.max_legs != null ? Number(opts.max_legs) : (opts.rule_mode === 'ladder' ? 2 : 5),
     rearm_from: (opts.rearm_from === 'peak' || opts.rule_mode === 'ladder') ? 'peak' : 'sale',   // #357 ladder always re-arms from the peak
     rearm_confirm_pct: opts.rearm_confirm_pct != null ? Number(opts.rearm_confirm_pct) : 1
   };
   const startQty = Number(opts.initial_qty), startUsd = opts.initial_usd != null ? Number(opts.initial_usd) : 0;
+  cfg.min_qty = startQty * (Number(cfg.retention_floor_pct) / 100);   // #365: set AFTER startQty exists (it is declared below the cfg literal)
   const st = shadowNewState(startQty);
   const ctx = { availableUsd: startUsd, cycleSeq: 0, cyclesCompleted: 0, cyclesAbandoned: 0 };
   const fills = [];
