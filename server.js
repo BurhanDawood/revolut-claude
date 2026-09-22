@@ -5847,6 +5847,123 @@ async function runLadderBacktest(opts) {
   };
 }
 
+// ── #358 LADDER SHADOW (paper trading) ───────────────────────────────────────────
+// Runs Bryan's pump-loop ladder (#356 shadowEvalLadder) against the LIVE price on every fast scan, on a PAPER
+// position: it starts from the real holding at the moment shadowing starts, then trades on paper only.
+// Deliberately SEPARATE from pump_armed_rules: the live pump-arm loop ignores rule_mode, so relabelling a live rule
+// would not stop its real selling - and a shadow must never share state with anything that trades.
+// Sales credit SIMULATED proceeds net of fee and an assumed slippage, so the buy side is really exercised (the #282
+// shadow uses the real USD balance, which a shadow sale never raises). Buys pay fee and slippage too.
+// The floor each tick is the one the live sell path uses (sell_floors > rule floor > entry price), so the shadow is
+// blocked exactly where the real thing would be. It NEVER places an order.
+let _ladderShadowReady = false, _ladderShadowBusy = false;
+async function ensureLadderShadowTables() {
+  if (_ladderShadowReady) return;
+  await db.execute(`CREATE TABLE IF NOT EXISTS ladder_shadow (
+    symbol VARCHAR(20) NOT NULL PRIMARY KEY,
+    cfg TEXT NOT NULL,
+    state TEXT NULL,
+    start_qty DECIMAL(30,10) NOT NULL,
+    start_price DECIMAL(30,12) NOT NULL,
+    active TINYINT(1) NOT NULL DEFAULT 1,
+    started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)`);
+  await db.execute(`CREATE TABLE IF NOT EXISTS ladder_shadow_fills (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    symbol VARCHAR(20) NOT NULL, cycle_id VARCHAR(20) NULL, leg VARCHAR(8) NOT NULL, tier INT NULL, phase VARCHAR(16) NULL,
+    price DECIMAL(30,12) NULL, trigger_price DECIMAL(30,12) NULL, qty DECIMAL(30,10) NULL, usd DECIMAL(20,6) NULL,
+    filled TINYINT(1) NOT NULL DEFAULT 0, block_reason VARCHAR(40) NULL,
+    paper_qty DECIMAL(30,10) NULL, paper_cash DECIMAL(20,6) NULL, note VARCHAR(120) NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_ls_sym (symbol, created_at))`);
+  _ladderShadowReady = true;
+}
+function ladderEffectiveFloor(coin, aeCfg, rule) {
+  const sf = (aeCfg && aeCfg.sell_floors) || {};
+  if (sf[coin] != null && Number(sf[coin]) > 0) return { floor: Number(sf[coin]), source: 'sell_floors' };
+  if (rule && rule.entry_floor != null && Number(rule.entry_floor) > 0) return { floor: Number(rule.entry_floor), source: 'rule floor' };
+  const ep = entryPrices.get(coin + '-USD');
+  if (ep != null && Number(ep) > 0) return { floor: Number(ep), source: 'entry price' };
+  return { floor: null, source: 'none' };
+}
+const LADDER_DEFAULTS = { arm_window_min: 1440, sell_pct: 50, max_legs: 2, rearm_confirm_pct: 1, retrace_pct: 50, bounce_pct: 5,
+  buy_pct: 70, further_drop_pct: 10, buyback_ceiling_pct: 15, abandon_hours: 48, tier_cooldown_min: 15, min_tier_usd: 2,
+  paper_slippage_pct: 0.5, paper_fee_pct: 0.09 };
+async function runLadderShadowTick(nowMs) {
+  if (_ladderShadowBusy) return { skipped: 'busy' };
+  _ladderShadowBusy = true;
+  try {
+    await ensureLadderShadowTables();
+    const [rows] = await db.execute('SELECT * FROM ladder_shadow WHERE active = 1');
+    if (!rows.length) return { rows: 0 };
+    const px = {};
+    try {
+      const tk = await revolutRequest('GET', '/tickers');
+      const tl = Array.isArray(tk) ? tk : (tk && tk.data) || [];
+      for (const t of tl) { if (!t.symbol) continue; const p = parseFloat(t.last_price || t.mid || t.ask || t.bid); if (p) px[t.symbol.replace('/', '-')] = p; }
+    } catch (e) { return { error: 'tickers: ' + e.message }; }
+    let aeCfg = {};
+    try { const [a] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'ai_auto_execute'"); if (a.length) aeCfg = JSON.parse(a[0].config_value); } catch (e) { aeCfg = {}; }
+    const now = nowMs || Date.now();
+    const fmt = (v) => v == null ? '-' : '$' + Number(v).toPrecision(5);
+    const report = [];
+    for (const r of rows) {
+      const sym = r.symbol, coin = sym.replace('-USD', '');
+      const p = px[sym];
+      if (!p) continue;
+      let cfg = {}; try { cfg = JSON.parse(r.cfg); } catch (e) { continue; }
+      let st = null; try { st = r.state ? JSON.parse(r.state) : null; } catch (e) { st = null; }
+      if (!st || !st.phase) { st = shadowNewState(Number(r.start_qty)); st.paper_cash = 0; }
+      const [pr] = await db.execute('SELECT entry_floor FROM pump_armed_rules WHERE symbol = ? AND active = 1 LIMIT 1', [sym]).catch(() => [[]]);
+      const fl = ladderEffectiveFloor(coin, aeCfg, pr && pr[0]);
+      const runCfg = Object.assign({}, LADDER_DEFAULTS, cfg, { rule_mode: 'ladder', entry_floor: fl.floor });
+      const fee = Number(runCfg.paper_fee_pct) / 100, slip = Number(runCfg.paper_slippage_pct) / 100;
+      const ctx = { availableUsd: Number(st.paper_cash || 0), cycleSeq: st.cycle_seq || 0, cyclesCompleted: 0, cyclesAbandoned: 0 };
+      const phaseBefore = st.phase, before = JSON.stringify(st);
+      const out = shadowEvalLadder(st, { t: now, o: p, h: p, l: p, c: p }, runCfg, ctx);
+      for (const f of out.fills) {
+        if (f.would_have_filled && f.leg === 'sell') ctx.availableUsd += f.intended_qty * f.price * (1 - slip) * (1 - fee);
+        if (f.would_have_filled && f.leg === 'buy') st.qty -= f.intended_qty - (f.intended_usd * (1 - fee)) / (f.price * (1 + slip));   // pay slippage + fee on the buy
+      }
+      st.paper_cash = Number(ctx.availableUsd.toFixed(6)); st.cycle_seq = ctx.cycleSeq;
+      const msgs = [];
+      if (phaseBefore === 'idle' && st.phase === 'armed') {
+        msgs.push('armed - up ' + (((p / st.cycle_base) - 1) * 100).toFixed(1) + '% from ' + fmt(st.cycle_base) + '. Now trailing ' + runCfg.trail_pct + '% below the peak.');
+        st.floor_note_cycle = null;
+      }
+      for (const f of out.fills) {
+        await db.execute('INSERT INTO ladder_shadow_fills (symbol, cycle_id, leg, tier, phase, price, trigger_price, qty, usd, filled, block_reason, paper_qty, paper_cash, note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+          [sym, f.cycle_id || null, f.leg, f.tier, f.phase || null, f.price, f.trigger_price, f.intended_qty, f.intended_usd, f.would_have_filled ? 1 : 0, f.block_reason, st.qty, st.paper_cash, 'floor from ' + fl.source])
+          .catch(e => console.error('[ladder-shadow] fill insert failed:', e.message));
+        if (f.would_have_filled) {
+          msgs.push(f.leg === 'sell'
+            ? 'would SELL ' + Number(f.intended_qty).toPrecision(6) + ' ' + coin + ' (' + runCfg.sell_pct + '%) at ' + fmt(f.price) + ' = $' + Number(f.intended_usd).toFixed(2)
+            : 'would BUY back $' + Number(f.intended_usd).toFixed(2) + ' (tier ' + (f.tier + 1) + ') at ' + fmt(f.price));
+        } else if (f.block_reason === 'below_entry_floor') {
+          if (st.floor_note_cycle !== f.cycle_id) { msgs.push('sale BLOCKED by the floor (' + fmt(fl.floor) + ', ' + fl.source + ') at ' + fmt(f.price) + ' - the live loop would be blocked too.'); st.floor_note_cycle = f.cycle_id; }
+        } else if (f.block_reason && f.block_reason !== 'tier_cooldown') {
+          msgs.push(f.leg + ' skipped: ' + f.block_reason);
+        }
+      }
+      for (const o of (ctx.outcomes || [])) {
+        await db.execute("INSERT INTO ladder_shadow_fills (symbol, cycle_id, leg, filled, block_reason, paper_qty, paper_cash, note) VALUES (?, ?, 'cycle', 0, ?, ?, ?, ?)",
+          [sym, o.cycle || null, o.outcome, st.qty, st.paper_cash, 'legs ' + o.legs + ', buys ' + o.buys_filled]).catch(() => {});
+        msgs.push('cycle ended: ' + o.outcome.replace(/_/g, ' ') + ' (' + o.legs + ' sale(s), ' + o.buys_filled + ' buy(s)).');
+      }
+      if (msgs.length) {
+        const paperVal = st.qty * p + st.paper_cash, holdVal = Number(r.start_qty) * p;
+        await sendTelegram('\ud83e\uddea <b>SHADOW ' + coin + '</b> - paper only, nothing traded\n\n' + msgs.join('\n') +
+          '\n\nPaper: ' + Number(st.qty).toPrecision(6) + ' ' + coin + ' + $' + st.paper_cash.toFixed(2) + ' = $' + paperVal.toFixed(2) +
+          ' vs holding $' + holdVal.toFixed(2) + ' (' + ((paperVal / holdVal - 1) * 100).toFixed(2) + '%)').catch(() => {});
+      }
+      const after = JSON.stringify(st);
+      if (after !== before) await db.execute('UPDATE ladder_shadow SET state = ? WHERE symbol = ?', [after, sym]);
+      report.push({ symbol: sym, phase: st.phase, fills: out.fills.length });
+    }
+    return { rows: rows.length, report };
+  } finally { _ladderShadowBusy = false; }
+}
+
 async function runFastScan() {
   try {
     // Part A: pump-arm detector -- dynamic over ALL active, unarmed pump_armed_rules (#215 fix;
@@ -5951,6 +6068,9 @@ async function runFastScan() {
         }
       }
     } catch (e) { console.error('[shadow] evaluation error:', e.message); }
+
+    // #358 ladder shadow - also BEFORE the early return below, or it would only run while something is armed.
+    await runLadderShadowTick().catch(e => console.error('[ladder-shadow] tick failed:', e.message));
 
     if (trailingStops.size === 0 && troughTrackers.size === 0 && standaloneTroughTrackers.size === 0) return; // #264: was `trailingStops.size===0` only, which returned BEFORE Part C(#130 trough)/Part D(#143 standalone) and the shared price map — starving both trough subsystems whenever no trailing stop was armed (IDEX rebuy stalled 5h). Bail only when ALL THREE are empty; Parts C/D keep their own size guards.
     const fsRevolutPrices = {};
@@ -16879,16 +16999,61 @@ let rows;
   server.tool('manage_auto_rules',
     'Manage automatic trade rules — list, remove, disable or enable a rule by ID. reset_cycle (#278) clears STALE pump-loop runtime state for a symbol (armed, armed_since, ringfenced sale_proceeds_usd, trough fields, baseline, tier_state) while PRESERVING all config; it refuses on a live cycle (sale_price set) unless force=true.',
     {
-      action:  z.enum(['list', 'remove', 'disable', 'enable', 'pump_status', 'loop_enable', 'loop_disable', 'reset_cycle', 'loop_audit']).describe('Action to perform. loop_audit (#353, read-only): every gate that decides whether each pump loop can really auto-sell, with both floors against the real cost.'),
+      action:  z.enum(['list', 'remove', 'disable', 'enable', 'pump_status', 'loop_enable', 'loop_disable', 'reset_cycle', 'loop_audit', 'ladder_shadow_start', 'ladder_shadow_stop', 'ladder_shadow_status']).describe('Action to perform. ladder_shadow_start/stop/status (#358): paper-trade the pump-loop ladder on the live price - symbol + ladder_cfg {arm_pump_pct, trail_pct, ...}; never trades. loop_audit (#353, read-only): every gate that decides whether each pump loop can really auto-sell, with both floors against the real cost.'),
       rule_id: z.coerce.number().optional().describe('Rule ID to remove, disable or enable'),
       symbol: z.string().optional().describe('Symbol e.g. BOBA-USD for loop_enable/loop_disable/reset_cycle'),
       force:  z.boolean().optional().describe('#278 reset_cycle only — override the live-cycle guard (sale_price set). Default false.'),
+      ladder_cfg: z.preprocess(v => { if (typeof v === 'string') { try { return JSON.parse(v); } catch (e) { return v; } } return v; }, z.record(z.any())).optional().describe('#358 ladder_shadow_start: {arm_pump_pct, trail_pct} required; optional sell_pct, max_legs, retrace_pct, bounce_pct, buy_pct, further_drop_pct, buyback_ceiling_pct, abandon_hours, paper_slippage_pct'),
     },
-    async ({ action, rule_id, symbol, force }) => {
+    async ({ action, rule_id, symbol, force, ladder_cfg }) => {
       try {
         if (action === 'list') {
           const [rules] = await db.execute('SELECT * FROM auto_trade_rules ORDER BY created_at DESC');
           return { content: [{ type: 'text', text: JSON.stringify({ rules, active: rules.filter(r => r.active) }, null, 2) }] };
+        }
+        if (action === 'ladder_shadow_start' || action === 'ladder_shadow_stop' || action === 'ladder_shadow_status') {
+          // #358 paper trading of the ladder. Nothing here can place an order.
+          await ensureLadderShadowTables();
+          const sym = symbol ? (symbol.toUpperCase().includes('-USD') ? symbol.toUpperCase() : symbol.toUpperCase() + '-USD') : null;
+          if (action === 'ladder_shadow_start') {
+            if (!sym) throw new Error('symbol required');
+            const c = ladder_cfg && typeof ladder_cfg === 'object' ? ladder_cfg : {};
+            if (!(Number(c.arm_pump_pct) > 0) || !(Number(c.trail_pct) > 0)) throw new Error('ladder_cfg needs arm_pump_pct and trail_pct (the per-coin settings from the backtest)');
+            const cfg = {};
+            for (const [k, v] of Object.entries(Object.assign({}, LADDER_DEFAULTS, c))) if (v !== null && v !== '' && isFinite(Number(v))) cfg[k] = Number(v);
+            const coin = sym.replace('-USD', '');
+            const bal = await revolutRequest('GET', '/balances');
+            const brows = Array.isArray(bal) ? bal : (bal && (bal.data || bal.balances)) || [];
+            const row = brows.find(b => String(b.currency || '').toUpperCase() === coin);
+            const qty = row ? (parseFloat(row.available) || 0) + (parseFloat(row.reserved) || 0) : 0;
+            const price = await getCurrentPrice(sym);
+            if (!(qty > 0) || !(price > 0)) throw new Error('need a holding and a price to start from (holding ' + qty + ', price ' + price + ')');
+            await db.execute('INSERT INTO ladder_shadow (symbol, cfg, state, start_qty, start_price, active) VALUES (?, ?, NULL, ?, ?, 1) ON DUPLICATE KEY UPDATE cfg = VALUES(cfg), state = NULL, start_qty = VALUES(start_qty), start_price = VALUES(start_price), active = 1, started_at = CURRENT_TIMESTAMP',
+              [sym, JSON.stringify(cfg), qty, price]);
+            await sendTelegram('\ud83e\uddea <b>SHADOW ' + coin + ' started</b> - paper only, nothing will be traded\n\nPaper position: ' + qty.toPrecision(6) + ' ' + coin + ' at $' + Number(price).toPrecision(5) +
+              '\nArms on +' + cfg.arm_pump_pct + '% in ' + (cfg.arm_window_min / 60) + 'h, trails ' + cfg.trail_pct + '%, sells ' + cfg.sell_pct + '% per leg (max ' + cfg.max_legs + '), buys back ' + cfg.buy_pct + '% then the rest.' +
+              '\nYou will see a message whenever it arms, would trade, or finishes a cycle.').catch(() => {});
+            return { content: [{ type: 'text', text: JSON.stringify({ ok: true, symbol: sym, start_qty: qty, start_price: price, cfg }) }] };
+          }
+          if (action === 'ladder_shadow_stop') {
+            if (!sym) throw new Error('symbol required');
+            const [u] = await db.execute('UPDATE ladder_shadow SET active = 0 WHERE symbol = ?', [sym]);
+            return { content: [{ type: 'text', text: JSON.stringify({ ok: true, symbol: sym, stopped: !!(u && u.affectedRows) }) }] };
+          }
+          const [rows] = sym ? await db.execute('SELECT * FROM ladder_shadow WHERE symbol = ?', [sym]) : await db.execute('SELECT * FROM ladder_shadow ORDER BY symbol');
+          const out = [];
+          for (const r of rows) {
+            let st = null; try { st = r.state ? JSON.parse(r.state) : null; } catch (e) { st = null; }
+            const px = await getCurrentPrice(r.symbol).catch(() => null);
+            const q = st && st.phase ? Number(st.qty) : Number(r.start_qty), cash = st && st.paper_cash ? Number(st.paper_cash) : 0;
+            const paperVal = px ? q * px + cash : null, holdVal = px ? Number(r.start_qty) * px : null;
+            const [fills] = await db.execute('SELECT created_at, cycle_id, leg, tier, price, qty, usd, filled, block_reason, note FROM ladder_shadow_fills WHERE symbol = ? AND created_at >= ? ORDER BY id DESC LIMIT 30', [r.symbol, r.started_at]);
+            out.push({ symbol: r.symbol, active: Number(r.active) === 1, started_at: r.started_at, cfg: JSON.parse(r.cfg), phase: st ? st.phase : 'idle (not yet evaluated)',
+              start: { qty: Number(r.start_qty), price: Number(r.start_price) }, paper: { qty: q, cash, value: paperVal },
+              hold_value: holdVal, vs_hold_pct: paperVal && holdVal ? Number(((paperVal / holdVal - 1) * 100).toFixed(2)) : null,
+              price_now: px, recent: fills });
+          }
+          return { content: [{ type: 'text', text: JSON.stringify({ paper_only: true, shadows: out }, null, 2) }] };
         }
         if (action === 'loop_audit') {
           // #353 READ-ONLY. One row per active pump loop (plus any coin with a sell_floors entry): every gate on the
