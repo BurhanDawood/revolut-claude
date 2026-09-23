@@ -1425,6 +1425,8 @@ await db.execute(`CREATE TABLE IF NOT EXISTS standalone_trough_trackers (
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 )`).catch(e => console.error('[migration] standalone_trough_trackers:', e.message));
+await safeAddColumn('standalone_trough_trackers', 'arm_below', 'DECIMAL(24,12) NULL');   // #394 retrace gate: dormant until price <= this
+await safeAddColumn('standalone_trough_trackers', 'gate_hit', 'TINYINT NOT NULL DEFAULT 0');
 await db.execute('CREATE TABLE IF NOT EXISTS archived_journal (id INT AUTO_INCREMENT PRIMARY KEY, original_id INT NOT NULL, row_json TEXT NOT NULL, linked_summary VARCHAR(255), archive_reason VARCHAR(255), archived_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)').catch(e => console.error('[migration] archived_journal:', e.message));
   await db.execute("ALTER TABLE research_history MODIFY COLUMN drift_verdict TEXT")
     .then(() => console.log('[migration] research_history.drift_verdict widened to TEXT'))
@@ -1939,13 +1941,14 @@ try {
   if (ttRows.length) console.log('[trough] Loaded ' + ttRows.length + ' active trough tracker(s) from DB');
 } catch (e) { console.error('[trough] boot-load failed:', e.message); }
 try {
-  const [stRows] = await db.execute('SELECT symbol, buy_usd, bounce_pct, entry_floor, exchange, trough_price FROM standalone_trough_trackers');
+  const [stRows] = await db.execute('SELECT symbol, buy_usd, bounce_pct, entry_floor, exchange, trough_price, arm_below, gate_hit FROM standalone_trough_trackers');   // #394
   for (const r of stRows) {
     standaloneTroughTrackers.set(r.symbol, {
       buyUsd: parseFloat(r.buy_usd), bouncePct: parseFloat(r.bounce_pct || 8),
       entryFloor: r.entry_floor ? parseFloat(r.entry_floor) : null,
       exchange: r.exchange || 'revolut',
-      troughPrice: r.trough_price ? parseFloat(r.trough_price) : null
+      troughPrice: r.trough_price ? parseFloat(r.trough_price) : null,
+      armBelow: r.arm_below != null && parseFloat(r.arm_below) > 0 ? parseFloat(r.arm_below) : null, gateHit: parseInt(r.gate_hit) === 1   // #394
     });
   }
   if (stRows.length) console.log('[trough-st] Loaded ' + stRows.length + ' tracker(s)');
@@ -4362,20 +4365,25 @@ async function clearTroughTracker(symbol) {
   } catch (e) { console.error('[trough] clearTroughTracker error:', e.message); }
 }
 
-async function armStandaloneTrough(symbol, buyUsd, bouncePct, entryFloor, exchange) {
+async function armStandaloneTrough(symbol, buyUsd, bouncePct, entryFloor, exchange, armBelow = null) {
+  // #394 (PM #400) armBelow: a RETRACE GATE. The tracker stays DORMANT - tracking no low, buying nothing - until the price
+  // falls to armBelow; only then does it start ratcheting the low and watching for the bounce. Without it (null) it
+  // behaves exactly as before and starts tracking immediately.
   standaloneTroughTrackers.set(symbol, {
     buyUsd: parseFloat(buyUsd), bouncePct: parseFloat(bouncePct || 8),
     entryFloor: entryFloor ? parseFloat(entryFloor) : null,
-    exchange: exchange || 'revolut', troughPrice: null, createdAt: Date.now()
+    exchange: exchange || 'revolut', troughPrice: null, createdAt: Date.now(),
+    armBelow: Number(armBelow) > 0 ? Number(armBelow) : null, gateHit: false
   });
   try {
     await db.execute(
-      'INSERT INTO standalone_trough_trackers (symbol,buy_usd,bounce_pct,entry_floor,exchange) VALUES (?,?,?,?,?) ON DUPLICATE KEY UPDATE buy_usd=VALUES(buy_usd),bounce_pct=VALUES(bounce_pct),entry_floor=VALUES(entry_floor),exchange=VALUES(exchange),trough_price=NULL,updated_at=NOW()',
-      [symbol, buyUsd, bouncePct||8, entryFloor||null, exchange||'revolut']
+      'INSERT INTO standalone_trough_trackers (symbol,buy_usd,bounce_pct,entry_floor,exchange,arm_below,gate_hit) VALUES (?,?,?,?,?,?,0) ON DUPLICATE KEY UPDATE buy_usd=VALUES(buy_usd),bounce_pct=VALUES(bounce_pct),entry_floor=VALUES(entry_floor),exchange=VALUES(exchange),arm_below=VALUES(arm_below),gate_hit=0,trough_price=NULL,updated_at=NOW()',
+      [symbol, buyUsd, bouncePct||8, entryFloor||null, exchange||'revolut', Number(armBelow) > 0 ? Number(armBelow) : null]
     );
     const b = symbol.replace('-USD','');
     console.log('[trough-st] armed: ' + symbol + ' buy $' + buyUsd + ' bounce ' + (bouncePct||8) + '%%');
     await sendTelegram('<b>[TROUGH ARMED]</b> ' + b +
+      (Number(armBelow) > 0 ? '\nDORMANT until the price falls to $' + Number(armBelow) + ' - only then does it start watching for a bounce' : '') +
       '\nBuy $' + buyUsd + ' on ' + (bouncePct||8) + '%% bounce off trough' +
       (entryFloor ? '\nFloor: $' + entryFloor : '') +
       '\nExchange: ' + (exchange||'revolut')).catch(() => {});
@@ -7297,7 +7305,7 @@ async function runFastScan() {
     if (standaloneTroughTrackers.size > 0) {
       for (const stSym of [...standaloneTroughTrackers.keys()]) {
         try {
-          const st = standaloneTroughTrackers.get(stSym);
+          let st = standaloneTroughTrackers.get(stSym);
           if (!st) continue;
           const stB = stSym.replace('-USD','');
           const stEx = st.exchange || 'revolut';
@@ -7305,6 +7313,16 @@ async function runFastScan() {
             ? await getKrakenPriceForSymbol(stSym).catch(() => null)
             : (fsRevolutPrices[stSym] || null);
           if (!stP) continue;
+          // #394 retrace gate: DORMANT until the price reaches arm_below - no low tracked, no buy possible
+          if (st.armBelow && !st.gateHit) {
+            if (stP > st.armBelow) continue;
+            st = { ...st, gateHit: true };
+            standaloneTroughTrackers.set(stSym, st);
+            await db.execute('UPDATE standalone_trough_trackers SET gate_hit=1, updated_at=NOW() WHERE symbol=?', [stSym]).catch(() => {});
+            await sendTelegram('<b>[TROUGH GATE REACHED] ' + stB + '</b>\nPrice ' + fmtPriceShort(stP) + ' reached the retrace gate ' + fmtPriceShort(st.armBelow) +
+              '.\nNow tracking the low; buys $' + st.buyUsd + ' on a ' + (st.bouncePct || 8) + '% bounce off it.').catch(() => {});
+            console.log('[trough-st] ' + stB + ' retrace gate reached at ' + fmtPriceShort(stP));
+          }
           if (st.troughPrice === null || stP < st.troughPrice) {
             standaloneTroughTrackers.set(stSym, { ...st, troughPrice: stP });
             await db.execute('UPDATE standalone_trough_trackers SET trough_price=?,updated_at=NOW() WHERE symbol=?',[stP,stSym]).catch(()=>{});
@@ -17153,10 +17171,13 @@ let rows;
       sell_pct:      z.coerce.number().optional().describe('#93/#144 set_trailing/set_target: %% of position to sell; 100=full exit. Away Mode uses per-rung value if set, else global max_sell_pct (default 25)'),
       buy_usd:       z.coerce.number().optional().describe('set_trough: USD to auto-buy on bounce'),
       bounce_pct:    z.coerce.number().optional().describe('set_trough: %% bounce off trough (default 8)'),
+      arm_below_price: z.coerce.number().optional().describe('#394 set_trough: RETRACE GATE as an exact price - the tracker stays dormant until the price falls to this level, then starts hunting the bounce'),
+      retrace_pct:   z.coerce.number().optional().describe('#394 set_trough: RETRACE GATE as a percentage below reference_price (e.g. 30 = dormant until 30% below it). Needs reference_price'),
+      reference_price: z.coerce.number().optional().describe('#394 set_trough: the level retrace_pct is measured from (e.g. the peak, or your sale price)'),
       entry_floor:   z.coerce.number().optional().describe('set_trough: never buy below this price'),
       resolutions:   z.preprocess(v => { if (typeof v === 'string') { try { return JSON.parse(v); } catch(e) { return v; } } return v; }, z.array(z.object({ symbol: z.string(), choice: z.coerce.number() }))).optional().describe('#148 batch_resolve: [{symbol,choice}] to resolve pending alerts from PM thread'),
     },
-    async ({ action, symbol, direction, threshold_pct, anchor_price, trail_pct, current_price, target_price, description, auto_execute, sell_pct, buy_usd, bounce_pct, entry_floor, resolutions }) => {
+    async ({ action, symbol, direction, threshold_pct, anchor_price, trail_pct, current_price, target_price, description, auto_execute, sell_pct, buy_usd, bounce_pct, entry_floor, resolutions, arm_below_price, retrace_pct, reference_price }) => {
       const sym      = symbol ? (symbol.includes('-USD') ? symbol.toUpperCase() : `${symbol.toUpperCase()}-USD`) : 'UNKNOWN-USD';
       const coinBase = sym.replace('-USD', '');
       let result = {};
@@ -17243,10 +17264,22 @@ let rows;
       } else if (action === 'set_trough') {
         if (!buy_usd || buy_usd <= 0) throw new Error('set_trough requires buy_usd > 0');
         const stExch = KRAKEN_MONITORED_COINS.includes(coinBase) ? 'kraken' : 'revolut';
-        await armStandaloneTrough(sym, buy_usd, bounce_pct||8, entry_floor||null, stExch);
+        // #394 retrace gate: an exact price, or retrace_pct below a reference price
+        let stGate = null;
+        if (arm_below_price != null) { if (!(Number(arm_below_price) > 0)) throw new Error('arm_below_price must be > 0'); stGate = Number(arm_below_price); }
+        else if (retrace_pct != null) {
+          if (!(Number(reference_price) > 0)) throw new Error('retrace_pct needs reference_price - the level the retrace is measured from (e.g. the peak or the sale price)');
+          if (!(Number(retrace_pct) > 0 && Number(retrace_pct) < 100)) throw new Error('retrace_pct must be between 0 and 100');
+          stGate = Number(reference_price) * (1 - Number(retrace_pct) / 100);
+        }
+        const stNow = await getCurrentPrice(sym).catch(() => null);
+        await armStandaloneTrough(sym, buy_usd, bounce_pct||8, entry_floor||null, stExch, stGate);
         result = { ok: true, action: 'set_trough', symbol: sym, buy_usd, bounce_pct: bounce_pct||8,
           entry_floor: entry_floor||null, exchange: stExch,
-          message: 'Trough tracker armed -- buys $' + buy_usd + ' on ' + (bounce_pct||8) + '%% bounce' };
+          retrace_gate: stGate ? { arm_below: Number(stGate.toPrecision(6)), from: retrace_pct != null ? Number(retrace_pct) + '% below ' + reference_price : 'exact price',
+            price_now: stNow, distance_pct: stNow ? Number(((stGate / stNow - 1) * 100).toFixed(2)) : null, already_reached: !!(stNow && stNow <= stGate) } : null,
+          message: stGate ? ('Trough tracker DORMANT until the price falls to ' + Number(stGate.toPrecision(6)) + ', then buys $' + buy_usd + ' on a ' + (bounce_pct||8) + '% bounce off the low')
+                          : ('Trough tracker armed -- buys $' + buy_usd + ' on ' + (bounce_pct||8) + '%% bounce') };
       } else if (action === 'remove_trough') {
         await clearStandaloneTrough(sym);
         result = { ok: true, action: 'remove_trough', symbol: sym, message: 'Tracker cleared for ' + sym };
