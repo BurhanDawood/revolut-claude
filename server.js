@@ -4239,7 +4239,7 @@ async function updateTrailingStop(symbol, currentPrice) {
   // Check if stop triggered
   // #392 the BREACH test had the same acknowledgement filter as the scan loops (#391): an acknowledged coin's
   // AUTO-SELLING trail could be evaluated but never fire. Acknowledgement silences alerts only.
-  if (currentPrice <= ts.stopPrice && (!alertState.acknowledged.has(symbol) || ts.autoExecute) && !ignoredCoins.has(symbol)) {
+  if (currentPrice <= ts.stopPrice && ((!alertState.acknowledged.has(symbol) && !ignoredCoins.has(symbol)) || ts.autoExecute)) {   // #393
     // #21: flat-position guard — never fire a trailing stop (and never spin up sell analysis / auto-exec)
     // on a position that has already been fully exited. A stale stop tracking a zero-balance ghost is
     // dangerous on auto-exec-eligible coins. On breach, verify a live non-dust balance exists; if flat,
@@ -5384,6 +5384,7 @@ async function checkPumpArm(symbol, currentPrice) {
         if (floor24) await db.execute('UPDATE pump_armed_rules SET entry_floor = ? WHERE symbol = ? AND active = 1', [floor24, symbol]);
         await setTrailingStop(symbol, parseFloat(rule.trail_pct), currentPrice, floor24, true, rule.sell_pct || 100);
         await db.execute('UPDATE pump_armed_rules SET armed = 1, armed_since = NOW() WHERE symbol = ?', [symbol]);
+        await logArmEvent(symbol, currentPrice, rule, 'dnd');   // #393
         console.log(`[pump-arm] ${symbol} ARMED (DND) — 24h floor=$${floor24 ? floor24.toFixed(4) : 'none'}, trail ${rule.trail_pct}%`);
         return;
       }
@@ -5398,6 +5399,7 @@ async function checkPumpArm(symbol, currentPrice) {
       const loopEnabledArm = parseInt(rule.loop_enabled) === 1;
       await setTrailingStop(symbol, parseFloat(rule.trail_pct), currentPrice, entryFloor, loopEnabledArm, loopEnabledArm ? (rule.sell_pct || 50) : null);
       await db.execute('UPDATE pump_armed_rules SET armed = 1, armed_since = NOW() WHERE symbol = ?', [symbol]);
+      await logArmEvent(symbol, currentPrice, rule, 'loop');   // #393
       console.log(`[pump-arm] ${symbol} ARMED — pumped +${pumpPct.toFixed(1)}% to ${fmtPriceShort(currentPrice)}, trailing stop set ${rule.trail_pct}%`);
       await sendTelegram(
         `🎯 <b>PUMP-ARMED — ${symbol.replace('-USD','')}</b>\n\n` +
@@ -6957,6 +6959,61 @@ async function checkStopClearanceStates() {
   return { first_run: first, states: next, changes: changes.map(x => ({ coin: x.coin, was: x.was, now: x.now })) };
 }
 
+// ── #393 EXECUTION WATCHDOG (PM #52) ────────────────────────────────────────────────
+// Every control built so far is PREVENTIVE (it constrains a decision); none was DETECTIVE (checks that a decision
+// which should have executed actually did). HONEY 23 Sept: armed at 17:40, traded through its stop, reached $0.001348
+// by 17:54 UNSOLD - found by inspection. This check is CAUSE-AGNOSTIC: it does not care why the chain broke (a
+// notification flag, a swallowed error, a stopped loop, a hung venue call). For every ENABLED, ARMED loop, each scan:
+//   STUCK   - armed, but no trailing stop exists and no buy-back is pending (e.g. the auto-sell cooldown removed the
+//             trail, or a restart lost it): the loop can never sell and never re-arm
+//   PAST    - the live price has been AT OR BELOW the stop for longer than WATCHDOG_GRACE_MS and the trail is still
+//             there (a sale, block or EDGE outcome removes or re-anchors it): a breach nothing acted on
+// One Telegram per problem, one when it clears. Read-only - it never trades. Also records arming history (arm_events)
+// so a retrospective never depends on chat history again.
+const WATCHDOG_GRACE_MS = 3 * 60 * 1000;
+const _watchdog = new Map();   // symbol -> { kind, since, alerted }
+async function logArmEvent(symbol, price, rule, kind) {
+  try {
+    await db.execute(`CREATE TABLE IF NOT EXISTS arm_events (
+      id INT AUTO_INCREMENT PRIMARY KEY, symbol VARCHAR(20) NOT NULL, armed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      arm_price DECIMAL(24,12), arm_pump_pct DECIMAL(10,4), trail_pct DECIMAL(10,4), sell_pct DECIMAL(10,4), kind VARCHAR(10),
+      INDEX idx_arm_sym (symbol, armed_at))`);
+    await db.execute('INSERT INTO arm_events (symbol, arm_price, arm_pump_pct, trail_pct, sell_pct, kind) VALUES (?, ?, ?, ?, ?, ?)',
+      [symbol, price, rule.arm_pump_pct, rule.trail_pct, rule.sell_pct, kind]);
+  } catch (e) { console.error('[arm-log] failed:', e.message); }
+}
+async function runExecutionWatchdog(priceOf) {
+  let rows;
+  try { [rows] = await db.execute('SELECT symbol, armed, armed_since, sale_price, trail_pct, sell_pct FROM pump_armed_rules WHERE active = 1 AND loop_enabled = 1 AND armed = 1'); }
+  catch (e) { return; }
+  const seen = new Set(), now = Date.now();
+  for (const r of rows) {
+    const sym = String(r.symbol); seen.add(sym);
+    const ts = trailingStops.get(sym), price = priceOf(sym);
+    let kind = null, detail = '';
+    if (!ts && r.sale_price == null) {
+      kind = 'STUCK'; detail = 'armed since ' + (r.armed_since ? new Date(r.armed_since).toISOString().slice(11, 16) + ' UTC' : '?') + ', but it has NO trailing stop and no pending buy-back - it can never sell and never re-arm. Fix: reset_cycle.';
+    } else if (ts && price && price <= ts.stopPrice) {
+      const w = _watchdog.get(sym);
+      const since = w && w.kind === 'PAST' ? w.since : now;
+      if (now - since >= WATCHDOG_GRACE_MS) { kind = 'PAST'; detail = 'price ' + price + ' has been AT OR BELOW the stop ' + ts.stopPrice + ' for ' + Math.round((now - since) / 60000) + ' min and nothing has acted (no sale, block or EDGE result). Peak ' + ts.peakPrice + ', trail ' + ts.trailPct + '%, auto-sell ' + (ts.autoExecute ? 'ON' : 'OFF') + '.'; }
+      else { _watchdog.set(sym, { kind: 'PAST', since, alerted: false }); continue; }
+    }
+    const prev = _watchdog.get(sym);
+    if (kind) {
+      if (!prev || prev.kind !== kind || !prev.alerted) {
+        await sendTelegram('\ud83d\udea8 <b>EXECUTION WATCHDOG - ' + sym.replace('-USD', '') + ' (' + kind + ')</b>\n' + detail + '\nThe loop should have acted and has not. Please check it.').catch(() => {});
+        console.log('[watchdog] ' + sym + ' ' + kind + ': ' + detail);
+      }
+      _watchdog.set(sym, { kind, since: prev && prev.kind === kind ? prev.since : now, alerted: true });
+    } else if (prev) {
+      if (prev.alerted) await sendTelegram('\u2705 Execution watchdog: ' + sym.replace('-USD', '') + ' is healthy again.').catch(() => {});
+      _watchdog.delete(sym);
+    }
+  }
+  for (const [sym, w] of _watchdog) if (!seen.has(sym)) { if (w.alerted) await sendTelegram('\u2705 Execution watchdog: ' + sym.replace('-USD', '') + ' is no longer armed - resolved.').catch(() => {}); _watchdog.delete(sym); }
+}
+
 async function runFastScan() {
   try {
     // Part A: pump-arm detector -- dynamic over ALL active, unarmed pump_armed_rules (#215 fix;
@@ -7066,6 +7123,12 @@ async function runFastScan() {
     await runLadderShadowTick().catch(e => console.error('[ladder-shadow] tick failed:', e.message));
     await runLadderLiveTick().catch(e => console.error('[ladder-live] tick failed:', e.message));   // #359
     await runFillEnrichment().catch(e => console.error('[fill-enrich] tick failed:', e.message));   // #362
+    // #393 execution watchdog - its own ticker read, so it runs even when no trail exists (the STUCK case)
+    try {
+      const wdT = await revolutRequest('GET', '/tickers'); const wdList = Array.isArray(wdT) ? wdT : (wdT && wdT.data) || []; const wdMap = {};
+      for (const t of wdList) { if (!t.symbol) continue; const p = parseFloat(t.last_price || t.mid || t.ask || t.bid); if (p) wdMap[t.symbol.replace('/', '-')] = p; }
+      await runExecutionWatchdog((s) => wdMap[s] || null);
+    } catch (e) { console.error('[watchdog] tick failed:', e.message); }
 
     if (trailingStops.size === 0 && troughTrackers.size === 0 && standaloneTroughTrackers.size === 0) return; // #264: was `trailingStops.size===0` only, which returned BEFORE Part C(#130 trough)/Part D(#143 standalone) and the shared price map — starving both trough subsystems whenever no trailing stop was armed (IDEX rebuy stalled 5h). Bail only when ALL THREE are empty; Parts C/D keep their own size guards.
     const fsRevolutPrices = {};
@@ -7081,8 +7144,8 @@ async function runFastScan() {
 
     for (const symbol of trailingStops.keys()) {
       // #391 an acknowledgement silences ALERTS; it must never switch off an AUTO-SELLING trail (HONEY 23 Sept: a hit up-target re-acknowledged the coin every 5 min and blinded its armed loop)
-      if (ignoredCoins.has(symbol)) continue;
-      if (alertState.acknowledged.has(symbol) && !(trailingStops.get(symbol) || {}).autoExecute) continue;
+      // #393 (PM #52) 'ignore' mutes ALERTS; like acknowledgement (#391/#392) it must never blind an AUTO-SELLING trail
+      if ((ignoredCoins.has(symbol) || alertState.acknowledged.has(symbol)) && !(trailingStops.get(symbol) || {}).autoExecute) continue;
       // Price: Kraken-only coins fetch individually; Revolut coins from the pre-fetched map
       const price = KRAKEN_MONITORED_COINS.includes(symbol)
         ? await getKrakenPriceForSymbol(symbol).catch(() => null)
@@ -13950,8 +14013,7 @@ async function checkPortfolio() {
       const currentPrice = priceMap[symbol];
       if (!currentPrice) continue;
       // #391 an acknowledgement silences ALERTS; it must never switch off an AUTO-SELLING trail (HONEY 23 Sept: a hit up-target re-acknowledged the coin every 5 min and blinded its armed loop)
-      if (alertState.acknowledged.has(symbol) && !ts.autoExecute) continue;
-      if (ignoredCoins.has(symbol)) continue;
+      if ((alertState.acknowledged.has(symbol) || ignoredCoins.has(symbol)) && !ts.autoExecute) continue;   // #393
 
       // Dust check with exception: trailing stops fire even on dust if explicitly set by Claude
       // Since all entries in trailingStops were explicitly set, hasExplicitTrailingStop is always true —
@@ -13976,8 +14038,7 @@ async function checkPortfolio() {
     // Coins held on Kraken are not in the Revolut X priceMap, so checked separately
     for (const [symbol, ts] of trailingStops) {
       if (priceMap[symbol]) continue; // already handled above by Revolut X loop
-      if (alertState.acknowledged.has(symbol) && !ts.autoExecute) continue;   // #391
-      if (ignoredCoins.has(symbol)) continue;
+      if ((alertState.acknowledged.has(symbol) || ignoredCoins.has(symbol)) && !ts.autoExecute) continue;   // #391 #393
 
       const krakenPrice = await getKrakenPriceForSymbol(symbol).catch(() => null);
       if (!krakenPrice) continue;
@@ -14296,7 +14357,7 @@ async function checkPortfolio() {
         }
 
         // Trailing stop check for Kraken assets
-        if (trailingStops.has(symbol) && (!alertState.acknowledged.has(symbol) || (trailingStops.get(symbol) || {}).autoExecute) && !ignoredCoins.has(symbol)) {   // #391
+        if (trailingStops.has(symbol) && ((!alertState.acknowledged.has(symbol) && !ignoredCoins.has(symbol)) || (trailingStops.get(symbol) || {}).autoExecute)) {   // #393   // #391
           const result = await updateTrailingStop(symbol, asset.price);
           if (result && result.triggered) {
             await sendTelegram(
