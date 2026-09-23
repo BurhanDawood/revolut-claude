@@ -16788,7 +16788,7 @@ let rows;
       dnd_retrace_pct:  z.coerce.number().optional().describe('configure_dnd: #160 %% of move price must retrace before trough arms (default 50)'),
       dnd_bounce_pct:   z.coerce.number().optional().describe('configure_dnd: #160 %% bounce off trough to trigger rebuy (default 8)'),
       // #355 Only a real true/false: z.coerce.boolean('false') is TRUE, which would turn the reconciler ON when asked to switch it off.
-      candles_op:       z.enum(['start', 'status', 'stop', 'topup', 'check_new']).optional().describe('#370/#371 candles_backfill: start (or resume) / status / stop / topup (last 48 h for every tracked coin, runs nightly) / check_new (backfill coins that have no history yet, runs hourly)'),
+      candles_op:       z.enum(['start', 'status', 'stop', 'topup', 'check_new', 'probe']).optional().describe('#370/#371 candles_backfill: start (or resume) / status / stop / topup (last 48 h for every tracked coin, runs nightly) / check_new (backfill coins that have no history yet, runs hourly)'),
       candles_symbols:  zLoose(z.array(z.string())).optional().describe('#370 candles_backfill start: coins to fill, e.g. ["NEAR","ENA"]. Omit for held coins plus every coin with a saved strategy.'),
       candles_since:    z.string().optional().describe('#370 candles_backfill start: earliest date to reach back to, YYYY-MM-DD (default 2023-01-01; each coin stops at its own listing date)'),
       reconciler_on:    z.preprocess(v => v === 'true' ? true : (v === 'false' ? false : v), z.boolean()).optional().describe('#355 reconciler_switch: true = record card payments/deposits from Revolut transactions (runs once immediately, then every 30 min); false = dry run only'),
@@ -17551,6 +17551,30 @@ let rows;
           return { content: [{ type: 'text', text: JSON.stringify({ ok: true, stopping: !!_candlesJob, note: 'Progress is kept - start again to resume.' }) }] };
         }
         if (op === 'topup') { const t = await candlesTopUp(); return { content: [{ type: 'text', text: JSON.stringify(t, null, 2) }] }; }   // #371
+        if (op === 'probe') {
+          // #372 READ-ONLY, stores nothing: how far back does Revolut keep candles at each time scale? Hourly stops at
+          // ~1 year (#370: BTC and NEAR both from 2025-09-11). Daily or 4-hourly may reach further - e.g. the 2024-25 bull run.
+          const coin = (Array.isArray(candles_symbols) && candles_symbols[0] ? String(candles_symbols[0]) : 'BTC').toUpperCase().replace(/-USD$/, '');
+          const D = 86400000;
+          const probes = [
+            ['1d', 1440, '2024-05-01'], ['1d', 1440, '2024-09-01'], ['1d', 1440, '2025-01-01'], ['1d', 1440, '2025-05-01'],
+            ['4h', 240, '2025-01-01'],
+            ['1h', 60, '2025-06-01'], ['1h', 60, '2025-10-01']
+          ];
+          const out = [];
+          for (const [label, iv, start] of probes) {
+            const since = Date.parse(start + 'T00:00:00Z'), until = since + 100 * iv * 60000;   // 100 candles per request
+            const qs = new URLSearchParams({ interval: String(iv), since: String(since), until: String(until) });
+            let r; try { r = await revolutRequest('GET', '/candles/' + coin + '-USD?' + qs.toString(), null, null, { withStatus: true }); } catch (e) { r = { status: 0, ok: false, body: { message: e.message } }; }
+            const list = r.ok && r.body && Array.isArray(r.body.data) ? r.body.data : [];
+            const ts = list.map(k => Number(k.start)).filter(t => t > 0).sort((a, b) => a - b);
+            out.push({ interval: label, window_from: start, window_to: new Date(until).toISOString().slice(0, 10), http: r.status,
+              candles: list.length, first: ts.length ? new Date(ts[0]).toISOString().slice(0, 16) : null, last: ts.length ? new Date(ts[ts.length - 1]).toISOString().slice(0, 16) : null,
+              sample_close: list.length ? list[0].close : null, error: r.ok ? null : JSON.stringify(r.body).slice(0, 120) });
+            await new Promise(res => setTimeout(res, 700));
+          }
+          return { content: [{ type: 'text', text: JSON.stringify({ coin, read_only: true, probes: out }, null, 2) }] };
+        }
         if (op === 'check_new') { const t = await candlesAutoBackfillNew(); return { content: [{ type: 'text', text: JSON.stringify(t, null, 2) }] }; }   // #371
         if (_candlesJob) return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'already running', status: candlesSummary(st) }) }] };
         const coins = Array.isArray(candles_symbols) && candles_symbols.length ? candles_symbols.map(s => String(s).toUpperCase().replace(/-USD$/, '')) : await candlesTrackedCoins();
