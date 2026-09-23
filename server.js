@@ -147,7 +147,9 @@ async function revolutRequest(method, path, body = null, signPathOverride = null
   return JSON.parse(text);
 }
 
-async function placeRevolutOrder(symbol, side, orderType, baseSize, price = null, valueUsd = null, callerClientOrderId = null) {
+async function placeRevolutOrder(symbol, side, orderType, baseSize, price = null, valueUsd = null, callerClientOrderId = null, pipelinedQty = 0) {
+  // #388 pipelinedQty: record this order as already journaled up to that quantity, so the limit-fill poller
+  // (#47 B2b) does not journal a fill the caller records itself. Default 0 = unchanged for every existing caller.
   // #359: a caller may supply the id, so it can record 'about to place order X' BEFORE placing it (crash recovery).
   const clientOrderId = callerClientOrderId || randomUUID();
 
@@ -181,8 +183,8 @@ async function placeRevolutOrder(symbol, side, orderType, baseSize, price = null
     const oid = od.venue_order_id || od.id || od.order_id || clientOrderId;
     const initStatus = od.state || od.status || (orderType === 'limit' ? 'pending_new' : 'filled');
     await db.execute(
-      'INSERT INTO pending_orders (order_id, client_order_id, symbol, side, order_type, quantity, limit_price, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE status = VALUES(status)',
-      [String(oid), clientOrderId, revolutSymbol, side.toUpperCase(), orderType, (baseSize != null ? baseSize : null), (price != null ? price : null), initStatus]
+      'INSERT INTO pending_orders (order_id, client_order_id, symbol, side, order_type, quantity, limit_price, status, last_pipeline_qty) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE status = VALUES(status)',
+      [String(oid), clientOrderId, revolutSymbol, side.toUpperCase(), orderType, (baseSize != null ? baseSize : null), (price != null ? price : null), initStatus, Number(pipelinedQty) || 0]
     );
     if (orderType === 'limit') console.log('[orders] Recorded resting LIMIT order ' + oid + ' ' + side + ' ' + revolutSymbol + ' @ ' + price + ' (status ' + initStatus + ')');
   } catch (e) { console.error('[orders] pending_orders capture failed:', e.message); }
@@ -12058,7 +12060,8 @@ async function floorCappedLimitSell(symbol, qty, floor, refPrice, clientOrderId,
     const f = Math.pow(10, dec); lim = Math.ceil(Number(floor) * f - 1e-9) / f; if (lim < Number(floor)) lim += 1 / f;
   }
   const limStr = lim.toFixed(dec);
-  const order = await placeRevolutOrder(symbol, 'sell', 'limit', qty, limStr, null, clientOrderId);
+  // #388 claimed in FULL while this function handles it, so the poller cannot journal the same fill a second time
+  const order = await placeRevolutOrder(symbol, 'sell', 'limit', qty, limStr, null, clientOrderId, qty);
   const od = (order && order.data) || order || {};
   const oid = od.venue_order_id || od.id || od.order_id;
   if (!oid) throw new Error('limit order placed but no venue order id returned');
@@ -12079,7 +12082,8 @@ async function floorCappedLimitSell(symbol, qty, floor, refPrice, clientOrderId,
   }
   const filled = st && st.filled_quantity != null ? Number(st.filled_quantity) : 0;
   const avg = st && st.average_fill_price != null && Number(st.average_fill_price) > 0 ? Number(st.average_fill_price) : null;
-  await db.execute('UPDATE pending_orders SET status = ? WHERE order_id = ?', [s || 'unknown', String(oid)]).catch(() => {});
+  // #388 claim exactly what the caller records; if the cancel failed and more fills later, the poller journals ONLY that
+  await db.execute('UPDATE pending_orders SET status = ?, filled_quantity = ?, last_pipeline_qty = ? WHERE order_id = ?', [s || 'unknown', filled, filled, String(oid)]).catch(() => {});
   return { order, order_id: String(oid), limit_price: Number(limStr), requested_qty: qty, filled_qty: filled, avg_price: avg, state: s,
     cancelled, cancel_error: cancelError, remainder_resting: !cancelled && !done(s) && !/cancel|reject|expire/.test(s) };
 }
@@ -12151,6 +12155,12 @@ async function autoExecuteSell(symbol, maxPct, analysis, confidence, opts = {}) 
     if (aeEdge && aeEdge.edge) {
       const wanted = sellQty;
       const lim = await floorCappedLimitSell(symbol, sellQty, aeEdge.floor, currentPrice, opts.clientOrderId || null);
+      if (lim.remainder_resting) {   // #388 (PM #49): loop state can no longer be trusted - disarm, let Bryan re-arm
+        await db.execute('UPDATE pump_armed_rules SET loop_enabled = 0, armed = 0 WHERE symbol = ? AND active = 1', [symbol]).catch(() => {});
+        await sendTelegram('\u26a0\ufe0f <b>' + coinBase + ' loop SWITCHED OFF</b>: a floor-capped sell order could not be cancelled and may still be resting at ' + lim.limit_price +
+          ' (it can only ever fill at or above the floor). If it fills later, the fill is still recorded - but the loop would be managing a position that is no longer the size it thinks, so it is disarmed. Check Revolut X, cancel the order there if you wish, then re-enable the loop.').catch(() => {});
+        if (!(lim.filled_qty > 0)) return { executed: false, reason: 'edge_limit_resting', floor: aeEdge.floor, price: currentPrice, limit: lim };
+      }
       if (!(lim.filled_qty > 0)) {
         await sendTelegram('\ud83d\udee1\ufe0f <b>' + coinBase + ' sale held at the floor</b>\nThe price was only ' + aeEdge.clearance_pct + '% above the floor (needs ' + aeEdge.required_pct +
           '% to absorb slippage), so it was offered as a LIMIT at ' + lim.limit_price + ' instead of a market order. Nothing filled there - nothing was sold, below cost or otherwise.' +
