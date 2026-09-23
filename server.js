@@ -6816,7 +6816,7 @@ async function runLadderLiveTick(nowMs) {
           const res = await autoExecuteSell(sym, null, 'Pump-loop ladder, sell leg ' + (act.tier + 1), 'High',
             { sellQty: intentObj.qty, skipCascade: true, clientOrderId, source: 'ladder', silent: true });
           if (res && res.executed) placed = { qty: res.qty, price: res.price, journal_id: res.journal_id };   // #363
-          else { err = (res && (res.reason || res.message)) || 'not executed'; floorBlocked = !!(res && res.reason === 'floor_blocked'); }
+          else { err = (res && (res.reason || res.message)) || 'not executed'; floorBlocked = !!(res && (res.reason === 'floor_blocked' || res.reason === 'edge_limit_unfilled')); }   // #387
         } else {
           const buyRes = await placeRevolutOrder(sym, 'buy', 'market', null, null, intentObj.usd.toFixed(2), clientOrderId);
           placed = { usd: intentObj.usd, price: p, qty: intentObj.usd / p, order_id: (buyRes && buyRes.data ? (buyRes.data.venue_order_id || buyRes.data.id) : null) || clientOrderId };
@@ -12008,10 +12008,86 @@ function stopClearanceCheck(price, armPct, trailPct, floor, slip) {
                price_to_pass: Number(passP.toPrecision(6)), recovery_to_pass_pct: p < passP ? Number(((passP / p - 1) * 100).toFixed(2)) : 0 }; })() };
 }
 
+// ── #387 FLOOR-CAPPED SELL WHEN A LOOP IS IN EDGE (PM #48) ─────────────────────────
+// Every guard so far constrains the DECISION to sell; none constrains the FILL. A market order takes whatever the
+// book gives, so when the price is close to the floor a sale that PASSED the floor check can still fill below it.
+// When the scan price clears the floor by less than 3 x the coin's p90 sell slippage (EDGE), the sale is placed as
+// a LIMIT at the floor instead: it trades immediately against any bid at or above the floor and can NEVER fill
+// below it. Revolut limit orders are always good-till-cancelled (time_in_force cannot be set), so after a short
+// wait any unfilled remainder is CANCELLED and only the quantity actually filled, at the price actually paid, is
+// recorded. Nothing filled = nothing sold; the loop stays armed. PASS loops keep market orders.
+const EDGE_LIMIT_WAIT_MS = 2000, EDGE_LIMIT_POLLS = 6;
+function priceDecimals(p) {
+  const s = Number(p).toString();
+  if (/e-/i.test(s)) { const [m, e] = s.toLowerCase().split('e-'); return Number(e) + ((m.split('.')[1] || '').length); }
+  return (s.split('.')[1] || '').length;
+}
+const _pairSteps = { at: 0, map: null };
+async function getPairQuoteStep(symbol) {   // #387 price increment per pair, cached for an hour
+  try {
+    if (!_pairSteps.map || Date.now() - _pairSteps.at > 3600000) {
+      const r = await revolutRequest('GET', '/configuration/pairs', null, null, { withStatus: true });
+      if (r && r.ok && r.body && typeof r.body === 'object') { _pairSteps.map = r.body.data && typeof r.body.data === 'object' && !Array.isArray(r.body.data) ? r.body.data : r.body; _pairSteps.at = Date.now(); }
+    }
+    const key = String(symbol).toUpperCase().replace('-', '/'), e = _pairSteps.map && (_pairSteps.map[key] || _pairSteps.map[key.replace('/', '-')]);
+    const q = e && e.quote_step != null ? Number(e.quote_step) : null;
+    return q > 0 ? q : null;
+  } catch (e) { return null; }
+}
+async function edgeSellCheck(symbol, coinBase, price) {
+  const d = await computeDerivedFloor(symbol, coinBase);
+  if (!(Number(d.floor) > 0) || !(Number(price) > 0)) return { edge: false, reason: 'no floor or price' };
+  const slip = await coinSellSlipP90(coinBase);
+  const clearance = (Number(price) / Number(d.floor) - 1) * 100, required = STOP_CLEARANCE_MULT * slip.p90;
+  return { edge: clearance < required, floor: Number(d.floor), clearance_pct: Number(clearance.toFixed(2)), required_pct: Number(required.toFixed(2)) };
+}
+async function floorCappedLimitSell(symbol, qty, floor, refPrice, clientOrderId, opt = {}) {
+  const wait = opt.waitMs != null ? opt.waitMs : EDGE_LIMIT_WAIT_MS, polls = opt.polls || EDGE_LIMIT_POLLS;
+  const sleep = opt.sleep || ((ms) => new Promise(r => setTimeout(r, ms)));
+  // The limit price is rounded UP to the pair's own price step (Revolut GET /configuration/pairs quote_step), so it is
+  // a valid price AND never below the floor. Fallback when the step is unknown: 5 significant figures (if Revolut then
+  // rejects the precision, the result is no sale - the safe direction).
+  const step = opt.quoteStep !== undefined ? opt.quoteStep : await getPairQuoteStep(symbol);
+  let lim, dec;
+  if (Number(step) > 0) {
+    dec = Math.min(12, priceDecimals(step));
+    lim = Math.ceil(Number(floor) / Number(step) - 1e-9) * Number(step);
+    if (lim < Number(floor)) lim += Number(step);
+  } else {
+    dec = Math.min(12, Math.max(2, 4 - Math.floor(Math.log10(Number(refPrice) || Number(floor)))));
+    const f = Math.pow(10, dec); lim = Math.ceil(Number(floor) * f - 1e-9) / f; if (lim < Number(floor)) lim += 1 / f;
+  }
+  const limStr = lim.toFixed(dec);
+  const order = await placeRevolutOrder(symbol, 'sell', 'limit', qty, limStr, null, clientOrderId);
+  const od = (order && order.data) || order || {};
+  const oid = od.venue_order_id || od.id || od.order_id;
+  if (!oid) throw new Error('limit order placed but no venue order id returned');
+  const read = async () => { const r = await revolutRequest('GET', '/orders/' + oid); return (r && r.data) || r || {}; };
+  const done = (s) => s === 'filled' || s === 'completed';
+  let st = {}, s = '';
+  for (let i = 0; i < polls; i++) {
+    await sleep(wait);
+    try { st = await read(); s = String(st.state || st.status || '').toLowerCase(); } catch (e) { /* keep trying */ }
+    if (done(s) || /cancel|reject|expire/.test(s)) break;
+  }
+  let cancelled = false, cancelError = null;
+  if (!done(s)) {
+    try { const c = await revolutRequest('DELETE', '/orders/' + oid, null, null, { withStatus: true }); cancelled = !!(c && c.ok); if (!cancelled) cancelError = 'HTTP ' + (c && c.status) + ' ' + JSON.stringify(c && c.body).slice(0, 120); }
+    catch (e) { cancelError = e.message; }
+    await sleep(Math.min(wait, 1000));
+    try { st = await read(); s = String(st.state || st.status || '').toLowerCase(); } catch (e) { /* keep last */ }
+  }
+  const filled = st && st.filled_quantity != null ? Number(st.filled_quantity) : 0;
+  const avg = st && st.average_fill_price != null && Number(st.average_fill_price) > 0 ? Number(st.average_fill_price) : null;
+  await db.execute('UPDATE pending_orders SET status = ? WHERE order_id = ?', [s || 'unknown', String(oid)]).catch(() => {});
+  return { order, order_id: String(oid), limit_price: Number(limStr), requested_qty: qty, filled_qty: filled, avg_price: avg, state: s,
+    cancelled, cancel_error: cancelError, remainder_resting: !cancelled && !done(s) && !/cancel|reject|expire/.test(s) };
+}
+
 async function autoExecuteSell(symbol, maxPct, analysis, confidence, opts = {}) {
   const coinBase = symbol.replace('-USD', '');
   try {
-    const currentPrice = await getCurrentPrice(symbol);
+    let currentPrice = await getCurrentPrice(symbol);   // #387 let: updated to the actual fill after an EDGE limit sale
     const balancesNow = await revolutRequest('GET', '/balances');
     const asset = balancesNow.find(b => b.currency === coinBase);
     const currentQty = parseFloat(asset?.available || 0);
@@ -12025,8 +12101,8 @@ async function autoExecuteSell(symbol, maxPct, analysis, confidence, opts = {}) 
     // coins back open orders / card authorisations and cannot be sold); skipCascade = no Stage-3 single-mode rebuy (the
     // ladder buys back itself - two engines must never chase one pullback); clientOrderId; source ('ladder' is
     // recognised by the trade detector); silent = no success message (the ladder sends its own).
-    const sellQty = (opts.sellQty != null) ? Math.min(Number(opts.sellQty), currentQty) : currentQty * (maxPct / 100);
-    const valueUSD = sellQty * currentPrice;
+    let sellQty = (opts.sellQty != null) ? Math.min(Number(opts.sellQty), currentQty) : currentQty * (maxPct / 100);   // #387 let
+    let valueUSD = sellQty * currentPrice;
 
     // Dust guard: skip if the sell is negligible
     if (sellQty <= 0 || !isFinite(sellQty) || valueUSD < 1) {
@@ -12065,7 +12141,30 @@ async function autoExecuteSell(symbol, maxPct, analysis, confidence, opts = {}) 
       [symbol, 'sell', `AI auto-execution [${confidence}]: ${analysis.substring(0, 150)}`, 'confident']
     ).catch(() => {});
 
-    const aeOrder = await placeRevolutOrder(symbol, 'sell', 'market', sellQty, null, null, opts.clientOrderId || null);
+    // #387 EDGE -> a LIMIT at the floor (can never fill below it); PASS -> market as before.
+    let aeOrder = null, aeEdge = null;
+    try { aeEdge = await edgeSellCheck(symbol, coinBase, currentPrice); }
+    catch (e) {   // fail SAFE, like the floor guard: an unverifiable sale is not placed
+      await sendTelegram('\ud83d\uded1 AUTO-SELL BLOCKED - ' + coinBase + ': the slippage-margin check errored (' + e.message + '), so a fill below the floor could not be ruled out. Failing safe - no sale, loop stays armed.').catch(() => {});
+      return { executed: false, reason: 'floor_error' };
+    }
+    if (aeEdge && aeEdge.edge) {
+      const wanted = sellQty;
+      const lim = await floorCappedLimitSell(symbol, sellQty, aeEdge.floor, currentPrice, opts.clientOrderId || null);
+      if (!(lim.filled_qty > 0)) {
+        await sendTelegram('\ud83d\udee1\ufe0f <b>' + coinBase + ' sale held at the floor</b>\nThe price was only ' + aeEdge.clearance_pct + '% above the floor (needs ' + aeEdge.required_pct +
+          '% to absorb slippage), so it was offered as a LIMIT at ' + lim.limit_price + ' instead of a market order. Nothing filled there - nothing was sold, below cost or otherwise.' +
+          (lim.remainder_resting ? '\n\u26a0\ufe0f The order could not be cancelled (' + (lim.cancel_error || 'unknown') + ') and may still be resting at ' + lim.limit_price + ' - it can only ever fill at or above the floor. Please check Revolut X.' : '\nThe loop stays armed.')).catch(() => {});
+        return { executed: false, reason: 'edge_limit_unfilled', floor: aeEdge.floor, price: currentPrice, limit: lim };
+      }
+      aeOrder = lim.order;
+      sellQty = lim.filled_qty; if (lim.avg_price) currentPrice = lim.avg_price; valueUSD = sellQty * currentPrice;
+      await sendTelegram('\ud83d\udee1\ufe0f <b>' + coinBase + ' sold with a floor-capped LIMIT</b> (EDGE: ' + aeEdge.clearance_pct + '% above the floor, needs ' + aeEdge.required_pct + '%).\n' +
+        'Filled ' + sellQty + (sellQty < wanted ? ' of ' + wanted + ' (the rest was cancelled and is still held)' : '') + ' at ' + currentPrice + ' - never below the floor ' + aeEdge.floor + '.' +
+        (lim.remainder_resting ? '\n\u26a0\ufe0f The unfilled remainder could not be cancelled and may still be resting at ' + lim.limit_price + ' (at or above the floor only). Please check Revolut X.' : '')).catch(() => {});
+    } else {
+      aeOrder = await placeRevolutOrder(symbol, 'sell', 'market', sellQty, null, null, opts.clientOrderId || null);
+    }
 
     const [aeRevIns] = await db.execute(
       `INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -12219,7 +12318,7 @@ async function handleTrailingStopAlert(symbol, currentPrice, ts, exchange = 'rev
         // NOTE: Revolut only for now -- autoExecuteKrakenSell still returns undefined, so Kraken
         // coins fall through to the original remove-the-trail behaviour (no regression).
         const ae93Blocked = ae93Result && ae93Result.executed === false
-          && ['floor_blocked', 'no_floor', 'floor_error'].indexOf(ae93Result.reason) !== -1;
+          && ['floor_blocked', 'no_floor', 'floor_error', 'edge_limit_unfilled'].indexOf(ae93Result.reason) !== -1;   // #387
         if (ae93Blocked) {
           // No trade occurred, so the execution cooldown must not be held against the next attempt.
           analysisRateLimit.delete(symbol + '_executed');
