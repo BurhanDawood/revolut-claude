@@ -12717,7 +12717,7 @@ async function checkAutoTradeRules(priceMap) {
             `Trigger: ${rule.direction} $${triggerPrice.toFixed(6)}\n` +
             `Current: $${currentPrice.toFixed(6)}\n` +
             `Distance: ${(priceDiff * 100).toFixed(2)}% away\n\n` +
-            `🤖 Will execute automatically when triggered`
+            `🔔 Alert-only: you will be told when it triggers`
           ).catch(() => {});
         }
         // Reset approach alert when price moves back out beyond 5%
@@ -12866,150 +12866,21 @@ async function checkAutoTradeRules(priceMap) {
           }
         }
 
-        if (await isAutoExecPaused()) continue;   // #F1 (until F2 makes this path alert-only)
-        console.log(`[auto] Executing ${rule.order_type} rule for ${rule.symbol} at $${currentPrice} via ${exchange} (trigger: ${rule.direction} $${rule.trigger_price}, vol: ${resolvedVolume})`);
+        // #F2 ALERT-ONLY. Order placement removed 23 Sept 2026: this executor had no master gate, no per-coin
+        // opt-in, no derived-floor check and no approval. Nothing live depended on it firing (loops buy back via the
+        // #130 trough tracker; cascadeRulesAfterTrade returns before inserting rows for any coin with a pump rule).
+        // Also removed with it: journal/P&L writes, cascades, re-arm, price_targets deletes, the automatic
+        // alertState.acknowledged.add (an F7 writer) and the USDT sweep.
         const coinBase = rule.symbol.replace('-USD', '');
-
-        try {
-          let result, orderId;
-          if (exchange === 'revolut') {
-            result = await placeRevolutOrder(rule.symbol, rule.order_type, 'market', resolvedVolume, null, null);
-            orderId = result?.id || 'unknown';
-          } else {
-            result = await executeKrakenTrade(rule.symbol, rule.order_type, 'market', resolvedVolume);
-            orderId = result?.txid?.[0] || 'unknown';
-          }
-
-          await db.execute('UPDATE auto_trade_rules SET last_triggered = NOW() WHERE id = ?', [rule.id]);
-
-          const [autoRuleIns] = await db.execute(
-            'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-            [coinBase, rule.order_type, currentPrice, resolvedVolume, currentPrice * resolvedVolume,
-             `Auto-executed: ${rule.rule_type} rule triggered at $${currentPrice}${rule.volume_type === 'pct' ? ` (${rule.volume}% of position)` : ''} via ${exchange}`, 'neutral', 'auto_rule']
-          );
-          if (rule.order_type === 'sell' && autoRuleIns && autoRuleIns.insertId) await recordRealisedPnl(autoRuleIns.insertId, rule.symbol, currentPrice, resolvedVolume).catch(() => {});
-
-          // Fetch USDT sweep config for notification
-          let sweepEnabled = false;
-          let sweepPct = 0;
-          try {
-            const [sweepRows] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'usdt_sweep_config'");
-            if (sweepRows.length) {
-              const cfg = JSON.parse(sweepRows[0].config_value);
-              sweepEnabled = cfg.enabled === true;
-              sweepPct = cfg.sweep_pct || 0;
-            }
-          } catch (e) { /* ignore */ }
-
-          const valueUsd = currentPrice * resolvedVolume;
-          const volLabel = rule.volume_type === 'pct' ? ` (${rule.volume}% of position)` : '';
-          const sweepLine = (rule.order_type === 'sell' && exchange === 'kraken')
-            ? `💰 USDT sweep: ${sweepEnabled ? `${sweepPct}% of proceeds ($${(valueUsd * sweepPct / 100).toFixed(2)})` : 'disabled'}\n`
-            : '';
-
-          // Clear approach alert now that rule has fired
-          ruleApproachAlerted.delete(rule.id);
-
-          // Fetch remaining cash for post-execution report
-          const remainingUSD = await getAvailableUSD(exchange).catch(() => null);
-          const exchangeLabel = exchange === 'revolut' ? 'Revolut X' : 'Kraken';
-          const cashLine = remainingUSD !== null
-            ? `\n💵 Remaining cash: $${remainingUSD.toFixed(2)}${remainingUSD < 20 ? '\n⚠️ Cash running low — consider topping up' : ''}`
-            : '';
-
-          // Clear ringfenced reservation if applicable
-          const isRingfenced = rule.order_type === 'buy' && rule.proceeds_reserved > 0;
-          if (isRingfenced) {
-            await db.execute('UPDATE auto_trade_rules SET proceeds_reserved = NULL WHERE id = ?', [rule.id]);
-          }
-
-          // One-line execution confirmation
-          const exchIcon  = exchange === 'revolut' ? '🔄' : '🦑';
-          const tradeIcon = rule.rule_type === 'stop_loss' ? '🛑' : rule.order_type === 'sell' ? '✅' : '🟢';
-          const actionTag = rule.rule_type === 'stop_loss'
-            ? `STOP LOSS`
-            : `AUTO ${rule.order_type.toUpperCase()}`;
-          const cashSuffix = remainingUSD !== null && remainingUSD < 20
-            ? ` ⚠️ $${remainingUSD.toFixed(0)} cash left`
-            : '';
-          await sendTelegram(formatSystemAlert(actionTag, coinBase,
-            `${tradeIcon} ${formatTradeQty(resolvedVolume)} ${coinBase} @ ${formatPrice(currentPrice)} = $${valueUsd.toFixed(2)} ${exchIcon}\n` +
-            `Rule: ${rule.rule_type}${volLabel}${cashSuffix ? '\n' + cashSuffix : ''}`
-          ));
-
-          // Part 3: Low cash warning — once per day per exchange after any trade
-          if (remainingUSD !== null && remainingUSD < 20) {
-            const today = new Date().toDateString();
-            const lastLowCashAlert = lowCashAlerted.get(exchange);
-            if (lastLowCashAlert !== today) {
-              lowCashAlerted.set(exchange, today);
-              await sendTelegram(formatSystemAlert('LOW CASH WARNING', exchangeLabel,
-                `Balance: $${remainingUSD.toFixed(2)}\n` +
-                `Buy-back rules may not execute.\n` +
-                `USDT sweep: ${sweepEnabled ? `ON ✅ (${sweepPct}%)` : 'OFF ❌'}`
-              )).catch(() => {});
-            }
-          }
-
-          // Cascade: generate next set of rules based on executed price
-          await cascadeRulesAfterTrade(rule, currentPrice);
-
-          // #95 Rinse-Repeat: if this was a pump-loop rebuy, re-arm for the next cycle (gated, inert by default)
-          await rearmPumpLoopAfterBuyback(rule, currentPrice);
-
-          // Real-time target cancellation: after a sell fires, wipe 'up' targets at or below executed price
-          if (rule.order_type === 'sell') {
-            try {
-              const [staleTargets] = await db.execute(
-                `SELECT * FROM price_targets WHERE symbol = ? AND direction = 'up' AND target_price <= ?`,
-                [rule.symbol, currentPrice]
-              );
-              for (const staleTarget of staleTargets) {
-                priceTargets.delete(rule.symbol);
-                alertState.acknowledged.add(rule.symbol);
-                targetReminderCount.delete(rule.symbol);
-                if (activeFixedAlerts.has(rule.symbol)) {
-                  clearInterval(activeFixedAlerts.get(rule.symbol));
-                  activeFixedAlerts.delete(rule.symbol);
-                }
-                await db.execute('DELETE FROM price_targets WHERE id = ?', [staleTarget.id]);
-                console.log(`[target] Real-time cancel: ${rule.symbol} target $${staleTarget.target_price} — auto rule already fired at $${currentPrice}`);
-              }
-            } catch (e) { console.error('[target] Real-time sell target cancel failed:', e.message); }
-          }
-
-          // Also cancel drop targets if a stop loss fired
-          if (rule.rule_type === 'stop_loss') {
-            try {
-              const [dropTargets] = await db.execute(
-                `SELECT * FROM price_targets WHERE symbol = ? AND direction = 'down' AND target_price >= ?`,
-                [rule.symbol, currentPrice]
-              );
-              for (const dropTarget of dropTargets) {
-                priceTargets.delete(rule.symbol);
-                targetReminderCount.delete(rule.symbol);
-                if (activeFixedAlerts.has(rule.symbol)) {
-                  clearInterval(activeFixedAlerts.get(rule.symbol));
-                  activeFixedAlerts.delete(rule.symbol);
-                }
-                await db.execute('DELETE FROM price_targets WHERE id = ?', [dropTarget.id]);
-                console.log(`[target] Stop loss fired — cancelled drop target for ${rule.symbol}`);
-              }
-            } catch (e) { console.error('[target] Stop loss drop target cancel failed:', e.message); }
-          }
-
-          // USDT sweep after qualifying sells (Kraken only — Revolut handles its own treasury)
-          if (rule.order_type === 'sell' && exchange === 'kraken') {
-            const proceeds = currentPrice * resolvedVolume;
-            const _swEp7 = entryPrices.get(rule.symbol) || 0;
-            const _swProfit7 = _swEp7 > 0 ? (currentPrice - _swEp7) * resolvedVolume : null; // #26 Bug1
-            await sweepToUSDT(proceeds, rule.symbol, _swProfit7).catch(() => {});
-          }
-
-        } catch (e) {
-          console.error(`[auto] Trade execution failed for ${rule.symbol}:`, e.message);
-          await sendTelegram(`❌ Auto trade failed for ${coinBase}: ${e.message}`);
-        }
+        await db.execute('UPDATE auto_trade_rules SET last_triggered = NOW() WHERE id = ?', [rule.id]).catch(() => {});
+        ruleApproachAlerted.delete(rule.id);
+        const valueUsd = currentPrice * resolvedVolume;
+        const volLabel = rule.volume_type === 'pct' ? ' (' + rule.volume + '% of position)' : '';
+        await sendTelegram(formatSystemAlert('AUTO RULE TRIGGERED - NOT EXECUTED', coinBase,
+          rule.order_type.toUpperCase() + ' ' + formatTradeQty(resolvedVolume) + ' ' + coinBase + ' @ ' + formatPrice(currentPrice) + ' = $' + valueUsd.toFixed(2) + '\n' +
+          'Rule ' + rule.id + ': ' + rule.rule_type + volLabel + ' (' + rule.direction + ' ' + formatPrice(parseFloat(rule.trigger_price)) + ')\n' +
+          'Auto-rules are alert-only. Place this by hand if you still want it.')).catch(() => {});
+        console.log('[auto] rule ' + rule.id + ' ' + rule.symbol + ' triggered - alert only');
       } catch (e) {
         console.error(`[auto] Rule processing error (id=${rule.id}):`, e.message);
       }
@@ -18532,10 +18403,10 @@ let rows;
 
   // ── Tool: set_auto_trade_rule ─────────────────────────────────────────────
   server.tool('set_auto_trade_rule',
-    'Set an automatic trade rule for Kraken or Revolut X — executes automatically when price condition is met. Use rule_type moon_bag to mark a portion as never-sell.',
+    'Set an auto rule for Kraken or Revolut X — ALERT-ONLY: notifies when the price condition is met; never places an order (#F2). Use rule_type moon_bag to mark a portion as never-sell.',
     {
       symbol:           z.string().describe('Trading pair e.g. SOL-USD'),
-      rule_type:        z.string().describe('Label: buy_dip, sell_pump, stop_loss, buy_retrace, moon_bag'),
+      rule_type:        z.string().describe('Label: buy_dip, sell_pump, buy_retrace, moon_bag (alert-only - no rule ever trades)'),
       trigger_price:    z.coerce.number().describe('Price that triggers the trade (use 0 for moon_bag markers)'),
       direction:        z.enum(['above', 'below']).describe('Trigger when price goes above or below trigger_price'),
       order_type:       z.enum(['buy', 'sell']).describe('Buy or sell when triggered'),
@@ -18558,14 +18429,14 @@ let rows;
         const volLabel = volType === 'pct' ? `${volume}% of position` : `${volume} tokens`;
         const moonNote = rule_type === 'moon_bag' ? '\n🌙 Moon bag — marker only, never auto-sold' : '';
         await sendTelegram(
-          `🤖 <b>AUTO TRADE RULE SET</b>\n\n` +
+          `🔔 <b>AUTO RULE SET - ALERT-ONLY</b>\nNotifies when the price condition is met; never places an order.\n\n` +
           `${order_type.toUpperCase()} ${volLabel} ${sym.replace('-USD', '')} when price goes ${direction} $${trigger_price}\n` +
           `Rule type: ${rule_type}\n` +
           `Exchange: ${exch.toUpperCase()}\n` +
           `Max cascades: ${maxCascades}\n` +
           `Max position: ${max_position_usd ? '$' + max_position_usd : 'unlimited'}${moonNote}`
         );
-        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, rule_id: result.insertId, symbol: sym, rule_type, trigger_price, direction, order_type, volume, volume_type: volType, exchange: exch, max_cascades: maxCascades }) }] };
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, execution: 'alert_only', rule_id: result.insertId, symbol: sym, rule_type, trigger_price, direction, order_type, volume, volume_type: volType, exchange: exch, max_cascades: maxCascades }) }] };
       } catch (e) {
         return { content: [{ type: 'text', text: JSON.stringify({ error: e.message }) }] };
       }
@@ -18580,7 +18451,7 @@ let rows;
       try {
         const [rules] = await db.execute('SELECT * FROM auto_trade_rules ORDER BY created_at DESC');
         const active = rules.filter(r => r.active);
-        return { content: [{ type: 'text', text: JSON.stringify({ rules, active_count: active.length, total: rules.length }, null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify({ execution: 'alert_only', rules, active_count: active.length, total: rules.length }, null, 2) }] };   // #F2
       } catch (e) {
         return { content: [{ type: 'text', text: JSON.stringify({ error: e.message }) }] };
       }
@@ -18604,7 +18475,7 @@ let rows;
       try {
         if (action === 'list') {
           const [rules] = await db.execute('SELECT * FROM auto_trade_rules ORDER BY created_at DESC');
-          return { content: [{ type: 'text', text: JSON.stringify({ rules, active: rules.filter(r => r.active) }, null, 2) }] };
+          return { content: [{ type: 'text', text: JSON.stringify({ execution: 'alert_only', rules, active: rules.filter(r => r.active) }, null, 2) }] };   // #F2
         }
         if (action === 'profile_list' || action === 'profile_validate' || action === 'profile_status') {
           // #379 versioned profiles + the validation record (round-trip / cash-parked split REQUIRED)
