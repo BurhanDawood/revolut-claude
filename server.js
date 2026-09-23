@@ -4228,6 +4228,14 @@ async function removeTrailingStop(symbol) {
   trailingStopReminderCount.delete(symbol); // #237/#238 ask-2
   await db.execute('DELETE FROM trailing_stops WHERE symbol = ?', [symbol]);
 }
+// #F4 put a trail back EXACTLY as it was (peak/stop preserved) - used when a sale did not happen and must not re-anchor
+async function restoreTrailingStop(symbol, ts) {
+  trailingStops.set(symbol, ts);
+  await db.execute(
+    'INSERT INTO trailing_stops (symbol, trail_pct, peak_price, stop_price, entry_price, auto_execute, sell_pct, exchange) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE trail_pct=VALUES(trail_pct), peak_price=VALUES(peak_price), stop_price=VALUES(stop_price), entry_price=VALUES(entry_price), auto_execute=VALUES(auto_execute), sell_pct=VALUES(sell_pct), exchange=VALUES(exchange), updated_at=CURRENT_TIMESTAMP',
+    [symbol, ts.trailPct, ts.peakPrice, ts.stopPrice, ts.entryPrice, ts.autoExecute ? 1 : 0, ts.sellPct != null ? ts.sellPct : 25, ts.exchange || 'revolut']
+  );
+}
 
 async function removeFixedTarget(symbol, targetPrice = null) {
   // #38 B3 — if targetPrice given, remove only that rung; else whole symbol
@@ -12466,6 +12474,16 @@ async function handleTrailingStopAlert(symbol, currentPrice, ts, exchange = 'rev
         }
         // Arm cooldown and execute directly
         analysisRateLimit.set(symbol + '_executed', Date.now());
+        // #F4 CLEAR FIRST. The trail is gone from memory AND the DB before any venue call, so a restart or a concurrent
+        // scanner cannot sell the remainder again. A blocked sale re-anchors below; a paused one is restored as-is.
+        const ae93Saved = { ...ts };
+        try { await removeTrailingStop(symbol); }
+        catch (e) {
+          trailingStops.set(symbol, ae93Saved);   // DB delete failed: keep the in-memory copy and do NOT sell
+          analysisRateLimit.delete(symbol + '_executed');
+          await sendTelegram('\ud83d\uded1 <b>' + coinBase + ' sale NOT placed</b>: could not clear its trailing stop first (' + (e.message || '').slice(0, 80) + '). Failing safe - trail kept, nothing sold. Will retry on the next scan.').catch(() => {});
+          return;
+        }
         const ae93Exchange = ts.exchange || exchange;
         const ae93SellPct = ts.sellPct || 25;
         console.log('[trailing] #93 ' + coinBase + ' auto_execute=true -- bypassing analysis (exchange: ' + ae93Exchange + ', sell_pct: ' + ae93SellPct + ')');
@@ -12494,7 +12512,7 @@ async function handleTrailingStopAlert(symbol, currentPrice, ts, exchange = 'rev
         // must run INSTEAD of removeTrailingStop, never after it.
         // NOTE: Revolut only for now -- autoExecuteKrakenSell still returns undefined, so Kraken
         // coins fall through to the original remove-the-trail behaviour (no regression).
-        if (ae93Result && ae93Result.reason === 'paused') { analysisRateLimit.delete(symbol + '_executed'); return; }   // #F1 hold: trail untouched
+        if (ae93Result && ae93Result.reason === 'paused') { analysisRateLimit.delete(symbol + '_executed'); await restoreTrailingStop(symbol, ae93Saved).catch(() => {}); return; }   // #F1 hold / #F4 restore as-is
         const ae93Blocked = ae93Result && ae93Result.executed === false
           && ['floor_blocked', 'no_floor', 'floor_error', 'edge_limit_unfilled'].indexOf(ae93Result.reason) !== -1;   // #387
         if (ae93Blocked) {
@@ -12513,8 +12531,7 @@ async function handleTrailingStopAlert(symbol, currentPrice, ts, exchange = 'rev
           }
           return;
         }
-        // Executed, dust, no position, or hard error: single-use, remove the trail as before.
-        await removeTrailingStop(symbol).catch(() => {});
+        // Executed, dust, no position, or hard error: single-use - the trail was already cleared before the order (#F4).
         return;
       }
     } catch (ae93ConfigErr) {
