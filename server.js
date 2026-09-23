@@ -11949,7 +11949,12 @@ function stopClearanceCheck(price, armPct, trailPct, floor, slip) {
   const required = STOP_CLEARANCE_MULT * slip.p90;
   return { checked: true, ok: clearance >= required, lowest_stop: Number(minStop.toPrecision(6)), floor: Number(Number(floor).toPrecision(6)),
     clearance_pct: Number(clearance.toFixed(2)), required_pct: Number(required.toFixed(2)), slippage_p90_pct: slip.p90, slippage_source: slip.source,
-    fireable_down_to_price: Number((Number(floor) * (1 + required / 100) / ((1 + Number(armPct) / 100) * (1 - Number(trailPct) / 100))).toPrecision(6)) };
+    fireable_down_to_price: Number((Number(floor) * (1 + required / 100) / ((1 + Number(armPct) / 100) * (1 - Number(trailPct) / 100))).toPrecision(6)),
+    // #385 (PM #46): for a loop below the line, the price it must RECOVER to - to act at all (stop = floor) and to pass
+    // safely (stop = floor + the slippage margin) - so 'FAIL' becomes a number to watch.
+    ...(() => { const k = (1 + Number(armPct) / 100) * (1 - Number(trailPct) / 100), act = Number(floor) / k, passP = Number(floor) * (1 + required / 100) / k, p = Number(price);
+      return { price_to_act: Number(act.toPrecision(6)), recovery_to_act_pct: p < act ? Number(((act / p - 1) * 100).toFixed(2)) : 0,
+               price_to_pass: Number(passP.toPrecision(6)), recovery_to_pass_pct: p < passP ? Number(((passP / p - 1) * 100).toFixed(2)) : 0 }; })() };
 }
 
 async function autoExecuteSell(symbol, maxPct, analysis, confidence, opts = {}) {
@@ -18477,7 +18482,10 @@ let rows;
               floor_rule: r6(rf), floor_sell_floors: r6(sfv), floor_effective: r6(eff), floor_source: src, floor_vs_cost: floorVsCost,
               // #384 (PM #45) standing health metric: can the lowest possible stop clear the floor by 3 x p90 slippage?
               stop_clearance: rule ? (() => { const sc = stopClearanceCheck(price, rule.arm_pump_pct, rule.trail_pct, eff, slipMap[c] || { p90: BOOK_SELL_SLIP_P90, source: 'fallback' });
-                return sc.checked ? { pass: sc.ok, lowest_stop: sc.lowest_stop, clearance_pct: sc.clearance_pct, required_pct: sc.required_pct, fireable_down_to_price: sc.fireable_down_to_price, slippage: sc.slippage_source }
+                return sc.checked ? { pass: sc.ok, lowest_stop: sc.lowest_stop, clearance_pct: sc.clearance_pct, required_pct: sc.required_pct, fireable_down_to_price: sc.fireable_down_to_price,
+                    ...(sc.ok ? { headroom_pct: Number(((1 - sc.fireable_down_to_price / Number(price)) * 100).toFixed(2)) }
+                              : { price_to_act: sc.price_to_act, recovery_to_act_pct: sc.recovery_to_act_pct, price_to_pass: sc.price_to_pass, recovery_to_pass_pct: sc.recovery_to_pass_pct }),
+                    slippage: sc.slippage_source }
                                   : { pass: null, reason: sc.reason }; })() : null,
               loop_enabled: rule ? Number(rule.loop_enabled) : null, armed: rule ? Number(rule.armed) : null,
               arm: rule ? `+${Number(rule.arm_pump_pct)}% in ${Number(rule.arm_window_min)}min, trail ${Number(rule.trail_pct)}%, sell ${Number(rule.sell_pct)}%` : null,
