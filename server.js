@@ -5480,7 +5480,7 @@ function shadowEvalLadder(state, bar, cfg, ctx) {
     if (outcome === 'completed') ctx.cyclesCompleted++; else ctx.cyclesAbandoned++;
     ctx.lastOutcome = { cycle: state.cycle_id, legs: state.legs_filled, buys_filled: state.buys_filled, outcome };
     (ctx.outcomes = ctx.outcomes || []).push(ctx.lastOutcome);
-    state.phase = 'idle'; state.baseline = px; state.baseline_at = t; state.reserved = 0; state.reserved_left = 0;
+    state.phase = 'idle'; state.baseline = px; state.baseline_at = t; state.reserved = 0; state.reserved_left = 0; state.lows = []; state.sold_qty = 0;   // #375 fresh lows: a finished cycle must not re-arm off its old low
     state.legs_filled = 0; state.rearm_target = null; state.trough = null; state.gate = null; state.buy1_price = null;
   };
   // #374 At the retention floor there is nothing left the ladder may sell. Re-arming then only parks the proceeds in a
@@ -5496,6 +5496,15 @@ function shadowEvalLadder(state, bar, cfg, ctx) {
   };
   const buy = (tier, trig, share) => {
     const price = op > trig ? op : trig;
+    // #375 (PM decision with Bryan, 23 Sept - alongside PM #24's ceiling): NEVER buy back above the cycle's average
+    // sale price, so a completed round trip always ends with MORE coins. The buy-back trigger is measured from the
+    // PEAK, and after a big run it fired above the sale (HBAR -11.1% vs hold instead of +13.3%). Wait instead - the
+    // trough keeps tracking, so a deeper low brings the trigger below the sale.
+    const avgSale = Number(state.sold_qty) > 0 ? Number(state.reserved) / Number(state.sold_qty) : null;
+    if (avgSale && price > avgSale) {
+      if (state.cap_noted !== state.cycle_id + ':' + tier) { rec('buy', tier, trig, price, null, null, false, 'above_sale_price'); state.cap_noted = state.cycle_id + ':' + tier; }
+      return 'wait';
+    }
     if (!coolOk()) { rec('buy', tier, trig, price, null, null, false, 'tier_cooldown'); return 'wait'; }
     // #357 Spend what is ACTUALLY available, capped at the reserved share. Reserved proceeds are GROSS; the cash a
     // sale really produced is NET of fees and slippage, so 'buy the rest' used to exceed it by a hair and be refused
@@ -5510,12 +5519,22 @@ function shadowEvalLadder(state, bar, cfg, ctx) {
   };
 
   if (state.phase === 'idle') {
-    if (state.baseline == null) { state.baseline = px; state.baseline_at = t; }
-    if (t - state.baseline_at > P.winMs) { state.baseline = px; state.baseline_at = t; }
-    if (atOrAbove(hi, state.baseline * (1 + P.arm / 100))) {
-      state.phase = 'armed'; state.cycle_id = 'c' + (++ctx.cycleSeq); state.cycle_base = state.baseline;
+    // #375 ARM FROM THE ROLLING LOW of the arm window. The old baseline was the price at the START of a window and
+    // RESET when the window elapsed, so a reset mid-run hid the first half of the move (XRP +250% Oct 2024 - Mar 2025:
+    // never armed). Lows are kept per bucket (window / 48, so at most ~50 points - small enough to persist every tick),
+    // and the pump is measured from EARLIER bars' lows: this bar's low is recorded after the check.
+    const bMs = Math.max(60000, Math.floor(P.winMs / 48));
+    if (!Array.isArray(state.lows)) state.lows = [];
+    state.lows = state.lows.filter(x => x[0] + bMs > t - P.winMs);
+    const rollLow = state.lows.length ? Math.min(...state.lows.map(x => x[1])) : null;
+    if (rollLow != null) { state.baseline = rollLow; state.baseline_at = t; }   // kept for status / messages
+    const pumped = rollLow != null && atOrAbove(hi, rollLow * (1 + P.arm / 100));
+    const bk = Math.floor(t / bMs) * bMs, lastB = state.lows[state.lows.length - 1];
+    if (lastB && lastB[0] === bk) lastB[1] = Math.min(lastB[1], lo); else state.lows.push([bk, lo]);
+    if (pumped) {
+      state.phase = 'armed'; state.cycle_id = 'c' + (++ctx.cycleSeq); state.cycle_base = rollLow;
       state.peak = hi; state.legs_filled = 0; state.buys_filled = 0; state.sells_filled = 0;
-      state.reserved = 0; state.reserved_left = 0; state.qty0 = state.qty;
+      state.reserved = 0; state.reserved_left = 0; state.sold_qty = 0; state.qty0 = state.qty; state.lows = [];
     }
     return { state, fills };
   }
@@ -5535,7 +5554,7 @@ function shadowEvalLadder(state, bar, cfg, ctx) {
     if (P.floor && price <= P.floor) return refuse('below_entry_floor');   // #366 same path as the retention floor
     if (usd < P.minUsd) { rec('sell', state.legs_filled, trig, price, qty, usd, false, 'below_min_tier_usd'); end('abandoned_dust'); return { state, fills }; }
     rec('sell', state.legs_filled, trig, price, qty, usd, true, null);
-    state.qty -= qty; state.reserved += usd; state.reserved_left += usd;
+    state.qty -= qty; state.reserved += usd; state.reserved_left += usd; state.sold_qty = Number(state.sold_qty || 0) + qty;   // #375
     state.legs_filled++; state.sells_filled++; state.sale_price = price; state.last_sale_at = t; state.last_fill_at = t;
     state.rearm_target = state.peak * (1 + P.confirm / 100);
     state.gate = state.peak - (state.peak - state.cycle_base) * (P.retrace / 100);
