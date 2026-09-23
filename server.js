@@ -6902,6 +6902,57 @@ async function checkRingfenceCoverage() {
   return now;
 }
 
+// ── #386 STOP-CLEARANCE MONITOR (PM #47) ───────────────────────────────────────────
+// The #383 guard checks clearance when a rule is WRITTEN, but clearance drifts with price (JTO: 8.4% when set, 2.7%
+// hours later with no config change). Every 30 minutes each ENABLED loop is put in one of three states:
+//   PASS - its lowest stop clears the floor by the full slippage margin
+//   EDGE - it can act, but a sale could fill inside the slippage band (0 <= clearance < required)
+//   DEAD - its lowest stop is below the floor: it cannot sell at today's price
+// A Telegram message goes out when a loop changes state, with what it can do now and the price to watch. JTO crossed
+// the line twice in one day on sub-1% moves, so a change only counts once it is clear of the line by a buffer
+// (CLEARANCE_BAND percentage points) - no flapping. The first run records states silently. Monitoring only.
+const CLEARANCE_BAND = 0.3;
+function clearanceState(sc, prev) {
+  if (!sc || !sc.checked) return prev || 'unknown';
+  const c = sc.clearance_pct, req = sc.required_pct;
+  const raw = c >= req ? 'PASS' : (c >= 0 ? 'EDGE' : 'DEAD');
+  if (!prev || prev === 'unknown' || raw === prev) return raw;
+  // hysteresis: only leave the previous state once clearly past the boundary between them
+  const bound = (a, b) => { const s = [a, b].sort().join('|'); return s === 'EDGE|PASS' ? req : (s === 'DEAD|EDGE' ? 0 : null); };
+  const b = bound(prev, raw);
+  if (b == null) return raw;   // PASS <-> DEAD in one step: a big move, no buffer needed
+  return Math.abs(c - b) >= CLEARANCE_BAND ? raw : prev;
+}
+async function checkStopClearanceStates() {
+  const [rules] = await db.execute('SELECT symbol, arm_pump_pct, trail_pct FROM pump_armed_rules WHERE active = 1 AND loop_enabled = 1');
+  let prev = {};
+  try { const [p] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'clearance_states'"); if (p.length) prev = JSON.parse(p[0].config_value) || {}; } catch (e) { prev = {}; }
+  const first = !Object.keys(prev).length, next = {}, changes = [];
+  for (const r of rules) {
+    const sym = String(r.symbol), coin = sym.replace('-USD', '');
+    let sc = null;
+    try {
+      const d = await computeDerivedFloor(sym, coin);
+      sc = stopClearanceCheck(await getCurrentPrice(sym).catch(() => null), r.arm_pump_pct, r.trail_pct, d.floor, await coinSellSlipP90(coin));
+    } catch (e) { sc = null; }
+    const was = prev[coin] ? prev[coin].state : null, now = clearanceState(sc, was);
+    next[coin] = { state: now, clearance_pct: sc && sc.checked ? sc.clearance_pct : null, at: new Date().toISOString() };
+    if (!first && was && now !== was && now !== 'unknown' && was !== 'unknown') changes.push({ coin, was, now, sc });
+  }
+  await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('clearance_states', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)", [JSON.stringify(next)]).catch(() => {});
+  if (changes.length) {
+    const say = { PASS: 'can sell safely above its floor', EDGE: 'can act, but a sale could fill inside the slippage band near the floor', DEAD: 'CANNOT sell at today\u2019s price - its lowest stop is below the floor' };
+    const lines = changes.map(x => {
+      const s = x.sc;
+      const watch = x.now === 'PASS' ? 'Can fall to ' + s.fireable_down_to_price + ' and still pass'
+        : (x.now === 'EDGE' ? 'Passes again above ' + s.price_to_pass : 'Can act again above ' + s.price_to_act + ' (+' + s.recovery_to_act_pct + '%), passes above ' + s.price_to_pass);
+      return (x.now === 'PASS' ? '\u2705 ' : '\u26a0\ufe0f ') + '<b>' + x.coin + '</b>: ' + x.was + ' \u2192 ' + x.now + ' (clearance ' + s.clearance_pct + '%, needs ' + s.required_pct + '%)\n   It ' + say[x.now] + '. ' + watch + '.';
+    });
+    await sendTelegram('\ud83d\udee1\ufe0f <b>Loop insurance status changed</b>\n\n' + lines.join('\n\n')).catch(() => {});
+  }
+  return { first_run: first, states: next, changes: changes.map(x => ({ coin: x.coin, was: x.was, now: x.now })) };
+}
+
 async function runFastScan() {
   try {
     // Part A: pump-arm detector -- dynamic over ALL active, unarmed pump_armed_rules (#215 fix;
@@ -14238,6 +14289,7 @@ cron.schedule('40 2 * * *', runNightlyLedgerResync, { timezone: 'Europe/London' 
 // #354 Reconciler every 30 min - ONLY while reconciler_writes_enabled is on (dry runs on a timer would be pointless).
 // #371 (#378) Keep candle history current automatically: new coins get their year of history within the hour;
 // every tracked coin gets its last 48 hours topped up nightly.
+cron.schedule('17,47 * * * *', () => { checkStopClearanceStates().catch(e => console.error('[clearance] check failed:', e.message)); });   // #386
 cron.schedule('12,42 * * * *', () => { checkRingfenceCoverage().catch(e => console.error('[ringfence] check failed:', e.message)); });   // #377
 cron.schedule('23 * * * *', () => { candlesAutoBackfillNew().catch(e => console.error('[candles] new-coin check failed:', e.message)); });
 cron.schedule('20 3 * * *', () => { candlesTopUp().catch(e => console.error('[candles] top-up failed:', e.message)); }, { timezone: 'Europe/London' });
