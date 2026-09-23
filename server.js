@@ -12067,9 +12067,9 @@ async function floorCappedLimitSell(symbol, qty, floor, refPrice, clientOrderId,
   if (!oid) throw new Error('limit order placed but no venue order id returned');
   const read = async () => { const r = await revolutRequest('GET', '/orders/' + oid); return (r && r.data) || r || {}; };
   const done = (s) => s === 'filled' || s === 'completed';
-  let st = {}, s = '';
+  let st = {}, s = '', checks = 0;
   for (let i = 0; i < polls; i++) {
-    await sleep(wait);
+    await sleep(wait); checks++;
     try { st = await read(); s = String(st.state || st.status || '').toLowerCase(); } catch (e) { /* keep trying */ }
     if (done(s) || /cancel|reject|expire/.test(s)) break;
   }
@@ -12084,7 +12084,7 @@ async function floorCappedLimitSell(symbol, qty, floor, refPrice, clientOrderId,
   const avg = st && st.average_fill_price != null && Number(st.average_fill_price) > 0 ? Number(st.average_fill_price) : null;
   // #388 claim exactly what the caller records; if the cancel failed and more fills later, the poller journals ONLY that
   await db.execute('UPDATE pending_orders SET status = ?, filled_quantity = ?, last_pipeline_qty = ? WHERE order_id = ?', [s || 'unknown', filled, filled, String(oid)]).catch(() => {});
-  return { order, order_id: String(oid), limit_price: Number(limStr), requested_qty: qty, filled_qty: filled, avg_price: avg, state: s,
+  return { step: Number(step) > 0 ? Number(step) : null, checks, order, order_id: String(oid), limit_price: Number(limStr), requested_qty: qty, filled_qty: filled, avg_price: avg, state: s,
     cancelled, cancel_error: cancelError, remainder_resting: !cancelled && !done(s) && !/cancel|reject|expire/.test(s) };
 }
 
@@ -12146,7 +12146,7 @@ async function autoExecuteSell(symbol, maxPct, analysis, confidence, opts = {}) 
     ).catch(() => {});
 
     // #387 EDGE -> a LIMIT at the floor (can never fill below it); PASS -> market as before.
-    let aeOrder = null, aeEdge = null;
+    let aeOrder = null, aeEdge = null, aeLoopOff = false, aeLim = null;
     try { aeEdge = await edgeSellCheck(symbol, coinBase, currentPrice); }
     catch (e) {   // fail SAFE, like the floor guard: an unverifiable sale is not placed
       await sendTelegram('\ud83d\uded1 AUTO-SELL BLOCKED - ' + coinBase + ': the slippage-margin check errored (' + e.message + '), so a fill below the floor could not be ruled out. Failing safe - no sale, loop stays armed.').catch(() => {});
@@ -12155,8 +12155,25 @@ async function autoExecuteSell(symbol, maxPct, analysis, confidence, opts = {}) 
     if (aeEdge && aeEdge.edge) {
       const wanted = sellQty;
       const lim = await floorCappedLimitSell(symbol, sellQty, aeEdge.floor, currentPrice, opts.clientOrderId || null);
+      aeLim = lim;
+      // #389 (PM #50) the first live EDGE sale is a REVIEWED event: every EDGE outcome reports exactly what it did.
+      try {
+        const [fr] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'edge_first_sale_at'");
+        const first = !fr.length;
+        if (first) await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('edge_first_sale_at', ?) ON DUPLICATE KEY UPDATE config_value = config_value", [JSON.stringify({ at: new Date().toISOString(), coin: coinBase, order_id: lim.order_id })]).catch(() => {});
+        await sendTelegram((first ? '\ud83d\udd0e <b>FIRST LIVE EDGE SALE - please review</b>\n' : '\ud83d\udd0e <b>EDGE sale report</b>\n') +
+          coinBase + ': price ' + currentPrice + ', floor ' + aeEdge.floor + ' (' + aeEdge.clearance_pct + '% above, needs ' + aeEdge.required_pct + '%)\n' +
+          'Limit ' + lim.limit_price + (lim.step ? ' (Revolut price step ' + lim.step + ')' : ' (price step unknown - 5 significant figures)') + ', order ' + lim.order_id + '\n' +
+          'Status checks: ' + lim.checks + ', final state: ' + (lim.state || 'unknown') + '\n' +
+          'Filled ' + lim.filled_qty + ' of ' + lim.requested_qty + (lim.avg_price ? ' at an average ' + lim.avg_price : '') + '\n' +
+          'Cancel: ' + (lim.cancelled ? 'done' : (lim.remainder_resting ? 'FAILED - ' + (lim.cancel_error || 'unknown') : 'not needed')) +
+          (first ? '\n\nThis is the first time this path has run live. Worth checking it against Revolut X: the fill, that nothing is left open, and the journal entry.' : '')).catch(() => {});
+      } catch (e) { /* the report must never block the sale */ }
       if (lim.remainder_resting) {   // #388 (PM #49): loop state can no longer be trusted - disarm, let Bryan re-arm
-        await db.execute('UPDATE pump_armed_rules SET loop_enabled = 0, armed = 0 WHERE symbol = ? AND active = 1', [symbol]).catch(() => {});
+        // #389 (PM #50) switched OFF and nothing left reserved: no buy-back will run, so no cash is spoken for.
+        aeLoopOff = true;
+        await db.execute('UPDATE pump_armed_rules SET loop_enabled = 0, armed = 0, sale_price = NULL, sale_proceeds_usd = NULL, retrace_gate = NULL, trough_low = NULL, trough_armed = 0 WHERE symbol = ? AND active = 1', [symbol]).catch(() => {});
+        troughTrackers.delete(symbol);
         await sendTelegram('\u26a0\ufe0f <b>' + coinBase + ' loop SWITCHED OFF</b>: a floor-capped sell order could not be cancelled and may still be resting at ' + lim.limit_price +
           ' (it can only ever fill at or above the floor). If it fills later, the fill is still recorded - but the loop would be managing a position that is no longer the size it thinks, so it is disarmed. Check Revolut X, cancel the order there if you wish, then re-enable the loop.').catch(() => {});
         if (!(lim.filled_qty > 0)) return { executed: false, reason: 'edge_limit_resting', floor: aeEdge.floor, price: currentPrice, limit: lim };
@@ -12171,7 +12188,7 @@ async function autoExecuteSell(symbol, maxPct, analysis, confidence, opts = {}) 
       sellQty = lim.filled_qty; if (lim.avg_price) currentPrice = lim.avg_price; valueUSD = sellQty * currentPrice;
       await sendTelegram('\ud83d\udee1\ufe0f <b>' + coinBase + ' sold with a floor-capped LIMIT</b> (EDGE: ' + aeEdge.clearance_pct + '% above the floor, needs ' + aeEdge.required_pct + '%).\n' +
         'Filled ' + sellQty + (sellQty < wanted ? ' of ' + wanted + ' (the rest was cancelled and is still held)' : '') + ' at ' + currentPrice + ' - never below the floor ' + aeEdge.floor + '.' +
-        (lim.remainder_resting ? '\n\u26a0\ufe0f The unfilled remainder could not be cancelled and may still be resting at ' + lim.limit_price + ' (at or above the floor only). Please check Revolut X.' : '')).catch(() => {});
+        (lim.remainder_resting ? '\n\u26a0\ufe0f The unfilled remainder could not be cancelled and may still be resting at ' + lim.limit_price + ' (at or above the floor only). Please check Revolut X. The loop is switched OFF: no buy-back is armed and the proceeds are simply cash - nothing is reserved.' : '')).catch(() => {});
     } else {
       aeOrder = await placeRevolutOrder(symbol, 'sell', 'market', sellQty, null, null, opts.clientOrderId || null);
     }
@@ -12212,7 +12229,7 @@ async function autoExecuteSell(symbol, maxPct, analysis, confidence, opts = {}) 
 
     // #95 Stage 3: pump-armed sell → spawn ONE buyback rung (no deeper averaging-down).
     // A buy only ever exists as the back-half of a completed sell. max_cascades:0 stops the rebuy from cascading deeper.
-    if (!opts.skipCascade) try {   // #359: the ladder does its own buy-back
+    if (!opts.skipCascade && !aeLoopOff) try {   // #359: the ladder does its own buy-back. #389: a loop switched OFF gets no buy-back
       const [parRows] = await db.execute('SELECT * FROM pump_armed_rules WHERE symbol = ? AND active = 1 LIMIT 1', [symbol]);
       if (parRows.length) {
         const syntheticRule = {
