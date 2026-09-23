@@ -5833,6 +5833,94 @@ function btComputeMetrics(fills, startQty, startUsd, endPrice, feePct, slipPct) 
   };
 }
 
+// ── #379 LADDER PROFILES + VALIDATION RECORD (spec #386/#387; pm #31 #33 #35 #36) ─────────
+// Named, VERSIONED parameter sets. A ladder (shadow or live) can be started from 'WIDE@1' instead of hand-typed
+// settings, and ONLY a profile whose status is 'validated' may trade real money. Validation is a recorded sweep in
+// which the ROUND-TRIP vs CASH-PARKED split is a REQUIRED field (computed by the sweep, so it cannot be omitted) -
+// every wrong conclusion in the 22-23 Sept analysis came from a headline number whose composition was not shown
+// (see the ALGO annotation on WIDE@2).
+// TIGHT is DERIVED per coin (pm #35 / PM Q2): arm = arm_mult x the coin's 14-day mean absolute daily move, trail =
+// trail_mult x the same, clamped. Two global free parameters instead of two per coin. Calibrated 23 Sept on
+// COTI (9.43% -> 24.9 / 10.1) and JTO (4.58% -> 12.1 / 4.9) against their hand-set 25/10 and 12/5. In a backtest the
+// volatility is measured as of the START of the window (no look-ahead); live it is measured now.
+let _profilesReady = false;
+const PROFILE_SEED = [
+  { name: 'WIDE', version: 1, kind: 'wide', status: 'validated', notes: 'Bull-run profile, DEFAULT ceiling 50% (pm #35). Validated on the 2024-25 bull run (dev #387).',
+    params: { arm_pump_pct: 150, arm_window_min: 20160, trail_pct: 35, sell_pct: 50, buy_pct: 70, retrace_pct: 50, bounce_pct: 10, further_drop_pct: 20, buyback_ceiling_pct: 50, abandon_hours: 336, retention_floor_pct: 50, max_legs: 2, rearm_confirm_pct: 1 } },
+  { name: 'WIDE', version: 2, kind: 'wide', status: 'validated', notes: 'LIQUIDITY variant of WIDE@1: ceiling 15%. pm #36: use ONLY for a named, dated cash need (log amount + date, revert when met); never because a cycle feels slow.',
+    params: { arm_pump_pct: 150, arm_window_min: 20160, trail_pct: 35, sell_pct: 50, buy_pct: 70, retrace_pct: 50, bounce_pct: 10, further_drop_pct: 20, buyback_ceiling_pct: 15, abandon_hours: 336, retention_floor_pct: 50, max_legs: 2, rearm_confirm_pct: 1 } },
+  { name: 'TIGHT', version: 1, kind: 'tight', status: 'draft', notes: 'Quiet-market profile, arm/trail DERIVED per coin from 14-day volatility (pm #35). DRAFT until a sweep validates it.',
+    params: { derive: { arm_mult: 2.65, trail_mult: 1.07, vol_days: 14, arm_min: 8, arm_max: 60, trail_min: 3, trail_max: 25 },
+      arm_window_min: 1440, sell_pct: 50, buy_pct: 70, retrace_pct: 50, bounce_pct: 5, further_drop_pct: 10, buyback_ceiling_pct: 15, abandon_hours: 48, retention_floor_pct: 50, max_legs: 2, rearm_confirm_pct: 1 } }
+];
+const VALIDATION_SEED = [
+  { name: 'WIDE', version: 1, window_start: '2024-10-01', window_end: '2025-03-31', source: 'daily', coins: 45, active: 9, win: 8, flat: 1, loss: 0, inert: 36,
+    round_trips: { n: 4, median_vs_hold: 6.92, median_retained: 97.2, coins: { ALGO: [21.98, 89.8], IDEX: [9.23, 109.2], DASH: [4.61, 104.6], ADA: [4.18, 85.1] } },
+    cash_parked: { n: 5, median_vs_hold: 13.33, median_retained: 50, coins: { CRO: [27.13, 50], XLM: [13.88, 50], HBAR: [13.33, 50], XRP: [2.49, 50], SPX: [-0.86, 50] } },
+    annotation: 'Evidence seeded from dev #382/#387 (sweep 23 Sept, 1% slippage, no cost floor - coins not held then). Cash-parked results are marked on 31 Mar 2025 AFTER the crash (window-close caveat): read retention, not the headline.', origin: 'seed: dev #387' },
+  { name: 'WIDE', version: 2, window_start: '2024-10-01', window_end: '2025-03-31', source: 'daily', coins: 45, active: 9, win: 8, flat: 1, loss: 0, inert: 36,
+    round_trips: { n: 3, median_vs_hold: 4.61, median_retained: 104.6, coins: { IDEX: [9.23, 109.2], DASH: [4.61, 104.6], ADA: [4.18, 85.1] } },
+    cash_parked: { n: 6, median_vs_hold: 13.61, median_retained: 50, coins: { ALGO: [60.12, 50], CRO: [27.13, 50], XLM: [13.88, 50], HBAR: [13.33, 50], XRP: [2.49, 50], SPX: [-0.86, 50] } },
+    annotation: 'ALGO - THE HIGHER NUMBER IS THE WORSE OUTCOME. Here ALGO shows +60.1% vs hold against +22.0% on WIDE@1. At 15% the ladder gave up when ALGO rose >15% above its sale, sat in cash at 50% retention, and was marked on 31 March AFTER the crash (window-close artefact). On WIDE@1 (50%) it waited out the pop, bought back cheaper and kept 90% of its coins - a genuine round trip. Ranking this table by the biggest figure gives the opposite of the correct conclusion; this is why the split is a required field.', origin: 'seed: dev #387' }
+];
+async function ensureProfileTables() {
+  if (_profilesReady) return;
+  await db.execute(`CREATE TABLE IF NOT EXISTS ladder_profiles (
+    name VARCHAR(32) NOT NULL, version INT NOT NULL, kind VARCHAR(12) NOT NULL, params TEXT NOT NULL,
+    status VARCHAR(12) NOT NULL DEFAULT 'draft', notes TEXT NULL, status_by VARCHAR(40) NULL, status_at TIMESTAMP NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (name, version))`);
+  await db.execute(`CREATE TABLE IF NOT EXISTS ladder_profile_validations (
+    id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(32) NOT NULL, version INT NOT NULL,
+    window_start VARCHAR(20) NULL, window_end VARCHAR(20) NULL, source VARCHAR(10) NULL,
+    coins INT NULL, active INT NULL, win INT NULL, flat INT NULL, loss INT NULL, inert INT NULL,
+    round_trips TEXT NOT NULL, cash_parked TEXT NOT NULL, annotation TEXT NULL, origin VARCHAR(60) NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, INDEX idx_lpv (name, version))`);
+  for (const p of PROFILE_SEED)
+    await db.execute('INSERT IGNORE INTO ladder_profiles (name, version, kind, params, status, notes, status_by, status_at) VALUES (?, ?, ?, ?, ?, ?, ?, ' + (p.status === 'validated' ? 'CURRENT_TIMESTAMP' : 'NULL') + ')',
+      [p.name, p.version, p.kind, JSON.stringify(p.params), p.status, p.notes, p.status === 'validated' ? 'seed: pm #35 / dev #387' : null]);
+  for (const v of VALIDATION_SEED) {
+    const [have] = await db.execute('SELECT COUNT(*) AS n FROM ladder_profile_validations WHERE name = ? AND version = ?', [v.name, v.version]);
+    if (!have[0] || Number(have[0].n) === 0)
+      await db.execute('INSERT INTO ladder_profile_validations (name, version, window_start, window_end, source, coins, active, win, flat, loss, inert, round_trips, cash_parked, annotation, origin) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        [v.name, v.version, v.window_start, v.window_end, v.source, v.coins, v.active, v.win, v.flat, v.loss, v.inert, JSON.stringify(v.round_trips), JSON.stringify(v.cash_parked), v.annotation, v.origin]);
+  }
+  _profilesReady = true;
+}
+async function getProfile(ref) {
+  await ensureProfileTables();
+  const m = String(ref || '').trim().toUpperCase().match(/^([A-Z0-9_-]+)(?:@(\d+))?$/);
+  if (!m) return null;
+  const [r] = m[2] ? await db.execute('SELECT * FROM ladder_profiles WHERE name = ? AND version = ?', [m[1], Number(m[2])])
+                   : await db.execute('SELECT * FROM ladder_profiles WHERE name = ? ORDER BY version DESC LIMIT 1', [m[1]]);
+  if (!r.length) return null;
+  const p = r[0]; let params = {}; try { params = JSON.parse(p.params); } catch (e) { params = {}; }
+  return { name: p.name, version: Number(p.version), kind: p.kind, status: p.status, notes: p.notes, params, ref: p.name + '@' + p.version };
+}
+// Mean absolute DAILY move over the last `days` London days, from Revolut daily candles; as of a date for backtests.
+async function coinVolatility(coin, days, asOf) {
+  const sym = String(coin).toUpperCase().replace(/-USD$/, '') + '-USD';
+  const [r] = asOf ? await db.execute('SELECT close_px FROM price_daily_ohlc WHERE symbol = ? AND day < DATE(?) ORDER BY day DESC LIMIT ?', [sym, asOf, String((days || 14) + 1)])
+                   : await db.execute('SELECT close_px FROM price_daily_ohlc WHERE symbol = ? ORDER BY day DESC LIMIT ?', [sym, String((days || 14) + 1)]);
+  const c = r.map(x => Number(x.close_px)).filter(x => x > 0).reverse();
+  if (c.length < 8) return null;
+  let s = 0; for (let i = 1; i < c.length; i++) s += Math.abs(c[i] / c[i - 1] - 1) * 100;
+  return s / (c.length - 1);
+}
+// The ladder settings a profile gives for one coin. TIGHT derives arm/trail from that coin's volatility.
+async function profileCfgFor(prof, coin, asOf) {
+  const out = Object.assign({}, prof.params); delete out.derive;
+  if (prof.kind === 'tight') {
+    const d = prof.params.derive || {};
+    const vol = await coinVolatility(coin, d.vol_days || 14, asOf);
+    if (vol == null) return null;
+    const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+    out.arm_pump_pct = Number(clamp(d.arm_mult * vol, d.arm_min || 8, d.arm_max || 60).toFixed(1));
+    out.trail_pct = Number(clamp(d.trail_mult * vol, d.trail_min || 3, d.trail_max || 25).toFixed(1));
+    out.derived_volatility_pct = Number(vol.toFixed(2));
+  }
+  return out;
+}
+
 // ── #374 SWEEP: one ladder profile across MANY coins ─────────────────────────────────
 // Profiles must be judged on dozens of coins, not three chosen by hand (PM #31 step 2): a setting that swings one
 // coin from -22.6% to +13.3% (HBAR, arm 50 vs 150) may simply fit that coin. Runs the same runLadderBacktest for each
@@ -5866,12 +5954,15 @@ async function runLadderSweep(opts) {
   const moved = (lo, hi) => good.filter(r => r.price_change_pct != null && r.price_change_pct >= lo && r.price_change_pct < hi);
   return {
     ok: true, sweep: true, read_only: true, source: src, window: { start: opts.start, end: opts.end },
-    profile: { arm_pump_pct: opts.arm_pump_pct, arm_window_min: opts.arm_window_min, trail_pct: opts.trail_pct, sell_pct: opts.sell_pct, retention_floor_pct: opts.retention_floor_pct,
+    profile: { ref: opts._profile ? opts._profile.ref : null, arm_pump_pct: opts._profile && opts._profile.kind === 'tight' ? 'derived per coin' : opts.arm_pump_pct, arm_window_min: opts.arm_window_min, trail_pct: opts.trail_pct, sell_pct: opts.sell_pct, retention_floor_pct: opts.retention_floor_pct,
       bounce_pct: opts.bounce_pct, further_drop_pct: opts.further_drop_pct, buyback_ceiling_pct: opts.buyback_ceiling_pct, abandon_hours: opts.abandon_hours, slippage_pct: opts.slippage_pct, entry_floor: opts.entry_floor },
     summary: { coins: rows.length, errors: rows.filter(r => r.error).length, win: count('win'), flat: count('flat'), loss: count('loss'), inert: count('inert'),
       median_vs_hold_active: med(active.map(r => r.vs_hold_pct)), mean_vs_hold_active: mean(active.map(r => r.vs_hold_pct)),
       median_vs_hold_all: med(good.map(r => r.vs_hold_pct)), median_retained_active: med(active.map(r => r.retained_pct)),
-      total_cycles: active.reduce((a, r) => a + (r.cycles || 0), 0), abandoned_no_buy: active.reduce((a, r) => a + (r.abandoned_no_buy || 0), 0) },
+      total_cycles: active.reduce((a, r) => a + (r.cycles || 0), 0), abandoned_no_buy: active.reduce((a, r) => a + (r.abandoned_no_buy || 0), 0),
+      // #379 REQUIRED split: a round trip bought back at least once; cash-parked sold and never bought back.
+      round_trips: (() => { const g = active.filter(r => (r.buys || 0) > 0); return { n: g.length, median_vs_hold: med(g.map(r => r.vs_hold_pct)), median_retained: med(g.map(r => r.retained_pct)), coins: Object.fromEntries(g.map(r => [r.coin, [r.vs_hold_pct, r.retained_pct]])) }; })(),
+      cash_parked: (() => { const g = active.filter(r => !((r.buys || 0) > 0)); return { n: g.length, median_vs_hold: med(g.map(r => r.vs_hold_pct)), median_retained: med(g.map(r => r.retained_pct)), coins: Object.fromEntries(g.map(r => [r.coin, [r.vs_hold_pct, r.retained_pct]])) }; })() },
     by_coin_price_move: { 'rose more than 50%': bucket(moved(50, Infinity)), 'between -20% and +50%': bucket(moved(-20, 50)), 'fell more than 20%': bucket(moved(-Infinity, -20)) },
     how_to_read: 'win/loss = more than 2% better/worse than holding; flat within 2%; inert = never sold. "active" excludes inert coins. Judge a profile on the distribution and on retention, not on the best coin.',
     coins: rows.sort((a, b) => (b.vs_hold_pct == null ? -1e9 : b.vs_hold_pct) - (a.vs_hold_pct == null ? -1e9 : a.vs_hold_pct))
@@ -5879,6 +5970,11 @@ async function runLadderSweep(opts) {
 }
 
 async function runLadderBacktest(opts) {
+  if (opts._profile) {   // #379 profile settings (TIGHT derived for THIS coin as of the window start)
+    const pc = await profileCfgFor(opts._profile, opts.symbol, opts.start);
+    if (!pc) return { ok: false, error: 'no volatility baseline for ' + opts.symbol + ' before ' + opts.start + ' (needs 8+ daily candles)' };
+    opts = Object.assign({}, opts, pc, { rule_mode: 'ladder' });
+  }
   const sym = (opts.symbol || '').toUpperCase().includes('-USD')
     ? opts.symbol.toUpperCase() : (opts.symbol || '').toUpperCase() + '-USD';
   const src = opts.source === 'intraday' ? 'intraday' : (opts.source === 'daily' ? 'daily' : 'hourly');   // #373
@@ -18021,19 +18117,61 @@ let rows;
   server.tool('manage_auto_rules',
     'Manage automatic trade rules — list, remove, disable or enable a rule by ID. reset_cycle (#278) clears STALE pump-loop runtime state for a symbol (armed, armed_since, ringfenced sale_proceeds_usd, trough fields, baseline, tier_state) while PRESERVING all config; it refuses on a live cycle (sale_price set) unless force=true.',
     {
-      action:  z.enum(['list', 'remove', 'disable', 'enable', 'pump_status', 'loop_enable', 'loop_disable', 'reset_cycle', 'loop_audit', 'ladder_shadow_start', 'ladder_shadow_stop', 'ladder_shadow_status', 'ladder_live_start', 'ladder_live_stop', 'ladder_live_status', 'ladder_live_switch']).describe('Action to perform. ladder_live_* (#359): REAL-MONEY ladder - start (symbol, cap_usd, ladder_cfg; takes the coin over from its single-mode loop), stop, status, switch (ladder_on true/false, ladder-wide). ladder_shadow_start/stop/status (#358): paper-trade the pump-loop ladder on the live price - symbol + ladder_cfg {arm_pump_pct, trail_pct, ...}; never trades. loop_audit (#353, read-only): every gate that decides whether each pump loop can really auto-sell, with both floors against the real cost.'),
+      action:  z.enum(['list', 'remove', 'disable', 'enable', 'pump_status', 'loop_enable', 'loop_disable', 'reset_cycle', 'loop_audit', 'ladder_shadow_start', 'ladder_shadow_stop', 'ladder_shadow_status', 'ladder_live_start', 'ladder_live_stop', 'ladder_live_status', 'ladder_live_switch', 'profile_list', 'profile_validate', 'profile_status']).describe('Action to perform. profile_list / profile_validate / profile_status (#379): versioned ladder profiles and their validation record (profile + ladder_cfg {start, end, source, slippage_pct, annotation} or {status, by, notes}). ladder_live_* (#359): REAL-MONEY ladder - start (symbol, cap_usd, ladder_cfg; takes the coin over from its single-mode loop), stop, status, switch (ladder_on true/false, ladder-wide). ladder_shadow_start/stop/status (#358): paper-trade the pump-loop ladder on the live price - symbol + ladder_cfg {arm_pump_pct, trail_pct, ...}; never trades. loop_audit (#353, read-only): every gate that decides whether each pump loop can really auto-sell, with both floors against the real cost.'),
       rule_id: z.coerce.number().optional().describe('Rule ID to remove, disable or enable'),
       symbol: z.string().optional().describe('Symbol e.g. BOBA-USD for loop_enable/loop_disable/reset_cycle'),
       force:  z.boolean().optional().describe('#278 reset_cycle only — override the live-cycle guard (sale_price set). Default false.'),
       cap_usd: z.coerce.number().optional().describe('#359 ladder_live_start: the most USD of the holding the ladder may manage (required)'),
       ladder_on: z.preprocess(v => v === 'true' ? true : (v === 'false' ? false : v), z.boolean()).optional().describe('#359 ladder_live_switch: true = the live ladder may trade, false = it may not (ladder-wide)'),
+      profile: z.string().optional().describe("#379 a stored ladder profile, e.g. 'WIDE@1' or 'TIGHT' (latest version). ladder_shadow_start / ladder_live_start take their settings from it (live requires status 'validated'); profile_validate / profile_status act on it."),
       ladder_cfg: z.preprocess(v => { if (typeof v === 'string') { try { return JSON.parse(v); } catch (e) { return v; } } return v; }, z.record(z.any())).optional().describe('#358 ladder_shadow_start: {arm_pump_pct, trail_pct} required; optional sell_pct, max_legs, retrace_pct, bounce_pct, buy_pct, further_drop_pct, buyback_ceiling_pct, abandon_hours, paper_slippage_pct'),
     },
-    async ({ action, rule_id, symbol, force, ladder_cfg, cap_usd, ladder_on }) => {
+    async ({ action, rule_id, symbol, force, ladder_cfg, cap_usd, ladder_on, profile }) => {
       try {
         if (action === 'list') {
           const [rules] = await db.execute('SELECT * FROM auto_trade_rules ORDER BY created_at DESC');
           return { content: [{ type: 'text', text: JSON.stringify({ rules, active: rules.filter(r => r.active) }, null, 2) }] };
+        }
+        if (action === 'profile_list' || action === 'profile_validate' || action === 'profile_status') {
+          // #379 versioned profiles + the validation record (round-trip / cash-parked split REQUIRED)
+          await ensureProfileTables();
+          const a = ladder_cfg && typeof ladder_cfg === 'object' ? ladder_cfg : {};
+          if (action === 'profile_list') {
+            const [ps] = await db.execute('SELECT * FROM ladder_profiles ORDER BY name, version');
+            const out = [];
+            for (const p of ps) {
+              const [vs] = await db.execute('SELECT * FROM ladder_profile_validations WHERE name = ? AND version = ? ORDER BY id DESC LIMIT 3', [p.name, p.version]);
+              out.push({ ref: p.name + '@' + p.version, kind: p.kind, status: p.status, status_by: p.status_by, notes: p.notes, params: JSON.parse(p.params),
+                validations: vs.map(v => ({ id: v.id, window: v.window_start + ' - ' + v.window_end, source: v.source, coins: v.coins, active: v.active, win: v.win, flat: v.flat, loss: v.loss, inert: v.inert,
+                  round_trips: JSON.parse(v.round_trips), cash_parked: JSON.parse(v.cash_parked), annotation: v.annotation, origin: v.origin, at: v.created_at })) });
+            }
+            return { content: [{ type: 'text', text: JSON.stringify({ profiles: out, note: 'Only a VALIDATED profile can trade real money. Read round_trips and cash_parked, not the win count.' }, null, 2) }] };
+          }
+          const prof = await getProfile(profile);
+          if (!prof) throw new Error('no such profile: ' + profile);
+          if (action === 'profile_validate') {
+            if (!a.start || !a.end) throw new Error('ladder_cfg needs start and end (YYYY-MM-DD) for the validation window');
+            const sw = await runLadderSweep({ _profile: prof, start: a.start, end: a.end, source: a.source || 'daily', slippage_pct: a.slippage_pct != null ? Number(a.slippage_pct) : 1,
+              entry_floor: a.entry_floor != null ? Number(a.entry_floor) : 1e-6, initial_qty: 1000, rule_mode: 'ladder', arm_pump_pct: 0 });
+            const s = sw.summary;
+            if (!s.round_trips || !s.cash_parked) throw new Error('sweep returned no round-trip / cash-parked split - not recorded');
+            const [ins] = await db.execute('INSERT INTO ladder_profile_validations (name, version, window_start, window_end, source, coins, active, win, flat, loss, inert, round_trips, cash_parked, annotation, origin) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+              [prof.name, prof.version, a.start, a.end, a.source || 'daily', s.coins, s.win + s.flat + s.loss, s.win, s.flat, s.loss, s.inert,
+               JSON.stringify(s.round_trips), JSON.stringify(s.cash_parked), a.annotation ? String(a.annotation).slice(0, 2000) : null, 'sweep ' + new Date().toISOString().slice(0, 10)]);
+            return { content: [{ type: 'text', text: JSON.stringify({ ok: true, recorded_as: ins && ins.insertId, profile: prof.ref, status: prof.status,
+              summary: { coins: s.coins, win: s.win, flat: s.flat, loss: s.loss, inert: s.inert, round_trips: s.round_trips, cash_parked: s.cash_parked },
+              note: 'Recorded. The profile status is unchanged - set it with profile_status once reviewed.' }, null, 2) }] };
+          }
+          // profile_status
+          const want = String(a.status || '').toLowerCase();
+          if (!['draft', 'validated', 'retired'].includes(want)) throw new Error("ladder_cfg.status must be 'draft', 'validated' or 'retired'");
+          if (want === 'validated') {
+            const [vs] = await db.execute('SELECT COUNT(*) AS n FROM ladder_profile_validations WHERE name = ? AND version = ? AND active > 0', [prof.name, prof.version]);
+            if (!vs[0] || Number(vs[0].n) === 0) throw new Error(prof.ref + ' has no validation record with any activity - run profile_validate first');
+          }
+          await db.execute('UPDATE ladder_profiles SET status = ?, status_by = ?, status_at = CURRENT_TIMESTAMP, notes = COALESCE(?, notes) WHERE name = ? AND version = ?',
+            [want, a.by ? String(a.by).slice(0, 40) : 'unspecified', a.notes ? String(a.notes).slice(0, 2000) : null, prof.name, prof.version]);
+          return { content: [{ type: 'text', text: JSON.stringify({ ok: true, profile: prof.ref, status: want }) }] };
         }
         if (action === 'ladder_live_start' || action === 'ladder_live_stop' || action === 'ladder_live_status' || action === 'ladder_live_switch') {
           // #359 REAL-MONEY ladder controls.
@@ -18050,8 +18188,17 @@ let rows;
           if (action === 'ladder_live_start') {
             if (!sym) throw new Error('symbol required');
             if (KRAKEN_MONITORED_COINS.includes(sym)) throw new Error('Kraken coins are not supported by the live ladder yet');
-            const c = ladder_cfg && typeof ladder_cfg === 'object' ? ladder_cfg : {};
-            if (!(Number(c.arm_pump_pct) > 0) || !(Number(c.trail_pct) > 0)) throw new Error('ladder_cfg needs arm_pump_pct and trail_pct');
+            let c = ladder_cfg && typeof ladder_cfg === 'object' ? ladder_cfg : {};
+            let liveProf = null;
+            if (profile) {   // #379 real money only from a VALIDATED profile
+              liveProf = await getProfile(profile);
+              if (!liveProf) throw new Error('no such profile: ' + profile);
+              if (liveProf.status !== 'validated') throw new Error(liveProf.ref + ' is ' + liveProf.status + ' - only a VALIDATED profile can trade real money');
+              const pc = await profileCfgFor(liveProf, sym.replace('-USD', ''));
+              if (!pc) throw new Error('no volatility baseline for ' + sym + ' - cannot derive ' + liveProf.ref);
+              c = pc;
+            }
+            if (!(Number(c.arm_pump_pct) > 0) || !(Number(c.trail_pct) > 0)) throw new Error('ladder_cfg needs arm_pump_pct and trail_pct (or pass profile)');
             if (!(Number(cap_usd) > 0)) throw new Error('cap_usd required: the most USD of the holding the ladder may manage');
             const coin = sym.replace('-USD', '');
             if (await isDndCoin(coin).catch(() => false)) throw new Error(coin + ' is in Do-Not-Disturb mode - one engine per coin');
@@ -18072,6 +18219,7 @@ let rows;
             troughTrackers.delete(sym); standaloneTroughTrackers.delete(sym);
             const cfg = {};
             for (const [k, v] of Object.entries(Object.assign({}, LADDER_DEFAULTS, c))) if (!/^paper_/.test(k) && v !== null && v !== '' && isFinite(Number(v))) cfg[k] = Number(v);
+            if (liveProf) cfg.profile = liveProf.ref;   // #379 which VALIDATED profile this live ladder runs
             const managed = Math.min(qty, Number(cap_usd) / price);
             await db.execute('INSERT INTO ladder_live (symbol, cfg, state, intent, cap_usd, start_price, start_qty, active) VALUES (?, ?, NULL, NULL, ?, ?, ?, 1) ON DUPLICATE KEY UPDATE cfg = VALUES(cfg), state = NULL, intent = NULL, cap_usd = VALUES(cap_usd), start_price = VALUES(start_price), start_qty = VALUES(start_qty), active = 1, started_at = CURRENT_TIMESTAMP',
               [sym, JSON.stringify(cfg), Number(cap_usd), price, managed]);
@@ -18110,10 +18258,19 @@ let rows;
           const sym = symbol ? (symbol.toUpperCase().includes('-USD') ? symbol.toUpperCase() : symbol.toUpperCase() + '-USD') : null;
           if (action === 'ladder_shadow_start') {
             if (!sym) throw new Error('symbol required');
-            const c = ladder_cfg && typeof ladder_cfg === 'object' ? ladder_cfg : {};
-            if (!(Number(c.arm_pump_pct) > 0) || !(Number(c.trail_pct) > 0)) throw new Error('ladder_cfg needs arm_pump_pct and trail_pct (the per-coin settings from the backtest)');
+            let c = ladder_cfg && typeof ladder_cfg === 'object' ? ladder_cfg : {};
+            let shProf = null;
+            if (profile) {   // #379 paper only, so any status may be shadowed
+              shProf = await getProfile(profile);
+              if (!shProf) throw new Error('no such profile: ' + profile);
+              const pc = await profileCfgFor(shProf, sym.replace('-USD', ''));
+              if (!pc) throw new Error('no volatility baseline for ' + sym + ' - cannot derive ' + shProf.ref);
+              c = Object.assign({}, pc, { paper_slippage_pct: (ladder_cfg && ladder_cfg.paper_slippage_pct) || undefined });
+            }
+            if (!(Number(c.arm_pump_pct) > 0) || !(Number(c.trail_pct) > 0)) throw new Error('ladder_cfg needs arm_pump_pct and trail_pct (or pass profile)');
             const cfg = {};
             for (const [k, v] of Object.entries(Object.assign({}, LADDER_DEFAULTS, c))) if (v !== null && v !== '' && isFinite(Number(v))) cfg[k] = Number(v);
+            if (shProf) cfg.profile = shProf.ref;   // #379 which profile this shadow runs
             const coin = sym.replace('-USD', '');
             const bal = await revolutRequest('GET', '/balances');
             const brows = Array.isArray(bal) ? bal : (bal && (bal.data || bal.balances)) || [];
@@ -19115,11 +19272,15 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
       buyback_ceiling_pct: z.coerce.number().optional().describe('#356 ladder: abandon buy-back if price rises this %% above the sale with no legs left (default 15)'),
       abandon_hours:     z.coerce.number().optional().describe('#356 ladder: release reserved cash after this many hours with no qualifying bounce (default 48)'),
       retention_floor_pct: z.coerce.number().optional().describe('#364 ladder: the ladder may never sell you below this %% of the starting position (default 50). Bounds the rising-market case where it keeps pace in dollars but ends holding a fraction of the coins.'),
+      profile: z.string().optional().describe("#379 run with a stored profile instead of hand-set settings, e.g. 'WIDE@1' or 'TIGHT' (latest version). TIGHT derives arm/trail per coin from its volatility as of the window start. arm_pump_pct is then ignored (pass any number)."),
       max_legs:          z.coerce.number().optional().describe('#315 rearm only: cap on sell legs in one continuous move (default 5)'),
       rearm_from:        z.enum(['sale','peak']).optional().describe("#315 rearm only. 'sale' (default) re-arms at sale_price*(1+arm) - MEASURED ON COTI THIS NEVER FIRES: the sell happens on a trail breach, so the buy tier at -10% from the sale price is ~3x nearer than a +30% re-arm, the buy always wins the race, and the result is identical to 'single'. 'peak' re-arms on regaining the peak just retraced from, which is close enough to compete."),
       rearm_confirm_pct: z.coerce.number().optional().describe("#315 rearm_from='peak' only: percent above the prior peak needed to confirm the run continues (default 1)"),
     },
-    async ({ symbol, start, end, source, initial_qty, initial_usd, arm_pump_pct, arm_window_min, sell_tiers, buy_tiers, tier_cooldown_min, min_tier_usd, entry_floor, slippage_pct, fee_pct, rule_mode, max_legs, rearm_from, rearm_confirm_pct, trail_pct, sell_pct, retrace_pct, bounce_pct, buy_pct, further_drop_pct, buyback_ceiling_pct, abandon_hours, retention_floor_pct }) => {
+    async ({ symbol, start, end, source, initial_qty, initial_usd, arm_pump_pct, arm_window_min, sell_tiers, buy_tiers, tier_cooldown_min, min_tier_usd, entry_floor, slippage_pct, fee_pct, rule_mode, max_legs, rearm_from, rearm_confirm_pct, trail_pct, sell_pct, retrace_pct, bounce_pct, buy_pct, further_drop_pct, buyback_ceiling_pct, abandon_hours, retention_floor_pct, profile }) => {
+      // #379 a stored profile replaces the hand-set ladder settings (slippage / floor / window / source still apply)
+      let _prof = null;
+      if (profile) { _prof = await getProfile(profile); if (!_prof) return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'no such profile: ' + profile }) }] }; }
       try {
         if (rule_mode !== 'ladder' && (!Array.isArray(sell_tiers) || !Array.isArray(buy_tiers) || !sell_tiers.length || !buy_tiers.length)) {   // #356: ladder does not use tiers
           return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'sell_tiers and buy_tiers must both be non-empty arrays of [pct, pct] pairs' }) }] };
@@ -19128,12 +19289,12 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
         const sweepAll = String(symbol || '').trim().toUpperCase() === 'ALL';
         const sweepList = !sweepAll && String(symbol || '').includes(',') ? String(symbol).split(',').map(s => s.trim().toUpperCase()).filter(Boolean).map(s => s.endsWith('-USD') ? s : s + '-USD') : null;
         if (sweepAll || sweepList) {
-          const sw = await runLadderSweep({ symbols: sweepList, start, end, source, initial_qty, initial_usd, arm_pump_pct, arm_window_min,
+          const sw = await runLadderSweep({ _profile: _prof, symbols: sweepList, start, end, source, initial_qty, initial_usd, arm_pump_pct, arm_window_min,
             sell_tiers, buy_tiers, tier_cooldown_min, min_tier_usd, entry_floor, slippage_pct, fee_pct, rule_mode, max_legs, rearm_from, rearm_confirm_pct,
             trail_pct, sell_pct, retrace_pct, bounce_pct, buy_pct, further_drop_pct, buyback_ceiling_pct, abandon_hours, retention_floor_pct });
           return { content: [{ type: 'text', text: JSON.stringify(sw, null, 2) }] };
         }
-        const res = await runLadderBacktest({
+        const res = await runLadderBacktest({ _profile: _prof,
           symbol, start, end, source, initial_qty, initial_usd, arm_pump_pct, arm_window_min,
           sell_tiers, buy_tiers, tier_cooldown_min, min_tier_usd, entry_floor, slippage_pct, fee_pct,
           rule_mode, max_legs, rearm_from, rearm_confirm_pct,
