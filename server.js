@@ -4237,7 +4237,9 @@ async function updateTrailingStop(symbol, currentPrice) {
   }
 
   // Check if stop triggered
-  if (currentPrice <= ts.stopPrice && !alertState.acknowledged.has(symbol) && !ignoredCoins.has(symbol)) {
+  // #392 the BREACH test had the same acknowledgement filter as the scan loops (#391): an acknowledged coin's
+  // AUTO-SELLING trail could be evaluated but never fire. Acknowledgement silences alerts only.
+  if (currentPrice <= ts.stopPrice && (!alertState.acknowledged.has(symbol) || ts.autoExecute) && !ignoredCoins.has(symbol)) {
     // #21: flat-position guard — never fire a trailing stop (and never spin up sell analysis / auto-exec)
     // on a position that has already been fully exited. A stale stop tracking a zero-balance ghost is
     // dangerous on auto-exec-eligible coins. On breach, verify a live non-dust balance exists; if flat,
