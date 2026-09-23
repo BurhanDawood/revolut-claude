@@ -5915,7 +5915,9 @@ async function runLadderBacktest(opts) {
     trail_pct: opts.trail_pct, sell_pct: opts.sell_pct, retrace_pct: opts.retrace_pct, bounce_pct: opts.bounce_pct,
     buy_pct: opts.buy_pct, further_drop_pct: opts.further_drop_pct, buyback_ceiling_pct: opts.buyback_ceiling_pct, abandon_hours: opts.abandon_hours,
     // #364 retention floor as an absolute quantity, from the starting position
-    retention_floor_pct: opts.retention_floor_pct != null ? Number(opts.retention_floor_pct) : 50,
+    // #376 (#379): the retention floor is enforced ONLY by the ladder evaluator. The config echo used to show it for every
+    // mode, which made it look applied to single/rearm runs (PM's HIGH backtests sold 100% with 'retention 50' displayed).
+    retention_floor_pct: opts.rule_mode === 'ladder' ? (opts.retention_floor_pct != null ? Number(opts.retention_floor_pct) : 50) : 'not applied in this mode (ladder only - in single/rearm, sell_pct is the retention control)',
     max_legs: opts.max_legs != null ? Number(opts.max_legs) : (opts.rule_mode === 'ladder' ? 2 : 5),
     rearm_from: (opts.rearm_from === 'peak' || opts.rule_mode === 'ladder') ? 'peak' : 'sale',   // #357 ladder always re-arms from the peak
     rearm_confirm_pct: opts.rearm_confirm_pct != null ? Number(opts.rearm_confirm_pct) : 1
@@ -5992,12 +5994,10 @@ async function ensureLadderShadowTables() {
   _ladderShadowReady = true;
 }
 function ladderEffectiveFloor(coin, aeCfg, rule) {
-  const sf = (aeCfg && aeCfg.sell_floors) || {};
-  if (sf[coin] != null && Number(sf[coin]) > 0) return { floor: Number(sf[coin]), source: 'sell_floors' };
-  if (rule && rule.entry_floor != null && Number(rule.entry_floor) > 0) return { floor: Number(rule.entry_floor), source: 'rule floor' };
-  const ep = entryPrices.get(coin + '-USD');
-  if (ep != null && Number(ep) > 0) return { floor: Number(ep), source: 'entry price' };
-  return { floor: null, source: 'none' };
+  // #377 the same DERIVED rule as the live sell paths: highest of real cost + 0.5% and any stored override.
+  const sf = ((aeCfg && aeCfg.sell_floors) || {})[coin];
+  const d = derivedFloorFrom(entryPrices.get(coin + '-USD'), sf, rule && rule.entry_floor);
+  return { floor: d.floor, source: d.source + (d.raised ? ' (override was below cost - lifted)' : '') };
 }
 const LADDER_DEFAULTS = { arm_window_min: 1440, sell_pct: 50, max_legs: 2, rearm_confirm_pct: 1, retrace_pct: 50, bounce_pct: 5, retention_floor_pct: 50,
   buy_pct: 70, further_drop_pct: 10, buyback_ceiling_pct: 15, abandon_hours: 48, tier_cooldown_min: 15, min_tier_usd: 2,
@@ -6667,6 +6667,42 @@ async function runLadderLiveTick(nowMs) {
     }
     return { rows: rows.length, enabled, report };
   } finally { _ladderLiveBusy = false; }
+}
+
+// ── #377 RING-FENCE COVERAGE (PM #35 ask) ───────────────────────────────────────────
+// Six loops now exit 100% on a trail breach (pm #34), so the buy-back is what everything depends on - and the
+// historical reason buy-backs fail is that the ring-fenced proceeds were already spent (#278: $217.81 ring-fenced
+// against $0.00; Bryan runs ~$0 cash and pays by card from the book). Every 30 minutes this compares the cash set
+// aside for pending buy-backs (single-mode sale_proceeds_usd on live cycles + the live ladder's reserved_left)
+// with the USD + USDT actually available, and says so ONCE when it stops being covered, and once when it is covered
+// again. Monitoring only - it changes nothing about trading.
+async function checkRingfenceCoverage() {
+  let need = 0; const parts = [];
+  const [rows] = await db.execute('SELECT symbol, sale_proceeds_usd FROM pump_armed_rules WHERE active = 1 AND sale_price IS NOT NULL AND sale_proceeds_usd > 0');
+  for (const r of rows) { const v = Number(r.sale_proceeds_usd); if (v > 0) { need += v; parts.push(String(r.symbol).replace('-USD', '') + ' $' + v.toFixed(2)); } }
+  try {
+    const [ll] = await db.execute('SELECT symbol, state FROM ladder_live WHERE active = 1');
+    for (const x of ll) { let st = null; try { st = JSON.parse(x.state); } catch (e) { st = null; } const v = st && Number(st.reserved_left) > 0 ? Number(st.reserved_left) : 0; if (v > 0) { need += v; parts.push(String(x.symbol).replace('-USD', '') + ' (ladder) $' + v.toFixed(2)); } }
+  } catch (e) { /* no ladder table yet */ }
+  let have;
+  try {
+    const b = await revolutRequest('GET', '/balances'); const list = Array.isArray(b) ? b : (b && (b.data || b.balances)) || [];
+    if (!list.length) return { skipped: 'balances unreadable' };
+    const av = (c) => { const x = list.find(r => String(r.currency || '').toUpperCase() === c); return x ? parseFloat(x.available) || 0 : 0; };
+    have = av('USD') + av('USDT');
+  } catch (e) { return { skipped: 'balances: ' + e.message }; }
+  let prev = null;
+  try { const [p] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'ringfence_alert'"); if (p.length) prev = JSON.parse(p[0].config_value); } catch (e) { prev = null; }
+  const short = need > 0.01 && have + 0.01 < need * 0.99;
+  const now = { short, need: Number(need.toFixed(2)), have: Number(have.toFixed(2)), parts, at: new Date().toISOString() };
+  if (short && (!prev || !prev.short || Math.abs(Number(prev.need) - need) > need * 0.05)) {
+    await sendTelegram('\u26a0\ufe0f <b>Buy-back cash is not there</b>\n\n$' + need.toFixed(2) + ' is set aside for pending buy-backs (' + parts.join(', ') + '), but only $' + have.toFixed(2) +
+      ' is available in USD/USDT.\nIf a buy-back triggers now it can only use what is there - after a full exit, that is the difference between getting back in and not.').catch(() => {});
+  } else if (!short && prev && prev.short) {
+    await sendTelegram('\u2705 Buy-back cash is covered again ($' + have.toFixed(2) + ' available for $' + need.toFixed(2) + ' set aside).').catch(() => {});
+  }
+  await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('ringfence_alert', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)", [JSON.stringify(now)]).catch(() => {});
+  return now;
 }
 
 async function runFastScan() {
@@ -11665,6 +11701,32 @@ ${journalContext}`;
   }
 }
 
+// ── #377 DERIVED SELL FLOOR (PM #35 design) ───────────────────────────────────────
+// The floor used to be a STORED number chosen by priority (sell_floors > rule entry_floor > entry price, first found
+// wins). Adding to a position raises the real cost, but a stored override does not move - so it silently fell BELOW
+// cost (JTO 23 Sept: floor 0.447664 vs new cost 0.480548 - the one loop that could fire could have sold at a loss;
+// eight more dormant coins were the same). Now the floor is DERIVED: the HIGHEST of real cost + 0.5% (Bryan's
+// rule, 22 Sept) and any stored override. An override can raise a floor above cost; it can never lower it below.
+// No cost known -> the overrides alone; nothing at all -> null, and every caller fails safe (blocks the sale).
+const FLOOR_BUFFER_PCT = 0.5;
+function derivedFloorFrom(cost, sellFloorsVal, ruleFloorVal) {
+  const c = Number(cost) > 0 ? Number(cost) : null, sf = Number(sellFloorsVal) > 0 ? Number(sellFloorsVal) : null, rf = Number(ruleFloorVal) > 0 ? Number(ruleFloorVal) : null;
+  const base = c != null ? c * (1 + FLOOR_BUFFER_PCT / 100) : null;
+  const cands = [[base, 'cost + ' + FLOOR_BUFFER_PCT + '%'], [sf, 'sell_floors override'], [rf, 'rule floor override']].filter(x => x[0] != null);
+  if (!cands.length) return { floor: null, source: 'none', cost: c, raised: false };
+  cands.sort((a, b) => b[0] - a[0]);
+  const ovMax = Math.max(sf || 0, rf || 0);
+  return { floor: cands[0][0], source: cands[0][1], cost: c, cost_floor: base, sell_floors: sf, rule_floor: rf,
+    raised: base != null && ovMax > 0 && ovMax < base };   // a stored override sat BELOW cost and was lifted
+}
+async function computeDerivedFloor(symbol, coinBase) {
+  let sf = null, rf = null, cost = null;
+  try { const [a] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'ai_auto_execute'"); const cfg = a.length ? JSON.parse(a[0].config_value) : {}; sf = (cfg.sell_floors || {})[coinBase]; } catch (e) { /* none */ }
+  try { const [r] = await db.execute('SELECT entry_floor FROM pump_armed_rules WHERE symbol = ? AND active = 1 LIMIT 1', [symbol]); if (r.length) rf = r[0].entry_floor; } catch (e) { /* none */ }
+  try { const [e] = await db.execute('SELECT entry_price FROM entry_prices WHERE symbol = ? OR symbol = ? LIMIT 1', [symbol, coinBase + '-USD']); if (e.length) cost = e[0].entry_price; } catch (e) { /* none */ }
+  return derivedFloorFrom(cost, sf, rf);
+}
+
 async function autoExecuteSell(symbol, maxPct, analysis, confidence, opts = {}) {
   const coinBase = symbol.replace('-USD', '');
   try {
@@ -11694,22 +11756,10 @@ async function autoExecuteSell(symbol, maxPct, analysis, confidence, opts = {}) 
     // #95+#125+#45: HARD ENTRY-FLOOR GUARD — never auto-sell below entry or sell_floors config.
     // Source priority: sell_floors config > pump_armed_rules.entry_floor > entry_prices.entry_price.
     try {
-      // #45: sell_floors from ai_auto_execute config (highest priority)
-      let entryFloor = null;
-      try {
-        const [aeFloorRows] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'ai_auto_execute'");
-        const aeCfg = aeFloorRows.length ? JSON.parse(aeFloorRows[0].config_value) : {};
-        const cfgFloor = (aeCfg.sell_floors || {})[coinBase];
-        if (cfgFloor && parseFloat(cfgFloor) > 0) { entryFloor = parseFloat(cfgFloor); console.log('[auto-exec] #45 sell_floors floor ' + coinBase + ': $' + entryFloor); }
-      } catch (e) { /* ignore */ }
-      if (entryFloor === null) {
-        const [floorRows] = await db.execute('SELECT entry_floor FROM pump_armed_rules WHERE symbol = ? AND active = 1 LIMIT 1', [symbol]);
-        entryFloor = floorRows.length && floorRows[0].entry_floor != null ? parseFloat(floorRows[0].entry_floor) : null;
-      }
-      if (entryFloor === null) {
-        const [epRow] = await db.execute('SELECT entry_price FROM entry_prices WHERE symbol = ? OR symbol = ? LIMIT 1', [symbol, coinBase + '-USD']);
-        if (epRow.length && epRow[0].entry_price != null && parseFloat(epRow[0].entry_price) > 0) entryFloor = parseFloat(epRow[0].entry_price);
-      }
+      // #377 DERIVED floor: the highest of real cost + 0.5% and any stored override - never below cost by construction.
+      const dfl = await computeDerivedFloor(symbol, coinBase);
+      let entryFloor = dfl.floor;
+      if (entryFloor !== null) console.log('[auto-exec] #377 floor ' + coinBase + ': $' + entryFloor + ' (' + dfl.source + (dfl.raised ? ', stored override was below cost and was lifted' : '') + ')');
       if (entryFloor === null) {
         await sendTelegram('AUTO-SELL BLOCKED - ' + coinBase + ': no entry floor established (no sell_floors, no pump entry_floor, no entry_price). Never-sell-below-entry cannot be verified - failing safe, position untouched.').catch(() => {});
         console.log('[auto-exec] FLOOR GUARD blocked ' + coinBase + ' sell: entryFloor null - fail-safe hash187');
@@ -11997,22 +12047,10 @@ async function autoExecuteKrakenSell(symbol, maxPct, analysis, confidence) {
     // #95+#125+#45: HARD ENTRY-FLOOR GUARD (Kraken path) — never auto-sell below entry or sell_floors config.
     // Source priority: sell_floors config > pump_armed_rules.entry_floor > entry_prices.entry_price.
     try {
-      // #45: sell_floors from ai_auto_execute config (highest priority)
-      let entryFloor = null;
-      try {
-        const [aeFloorRows] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'ai_auto_execute'");
-        const aeCfg = aeFloorRows.length ? JSON.parse(aeFloorRows[0].config_value) : {};
-        const cfgFloor = (aeCfg.sell_floors || {})[coinBase];
-        if (cfgFloor && parseFloat(cfgFloor) > 0) { entryFloor = parseFloat(cfgFloor); console.log('[auto-exec] #45 sell_floors floor ' + coinBase + ' (Kraken): $' + entryFloor); }
-      } catch (e) { /* ignore */ }
-      if (entryFloor === null) {
-        const [floorRows] = await db.execute('SELECT entry_floor FROM pump_armed_rules WHERE symbol = ? AND active = 1 LIMIT 1', [symbol]);
-        entryFloor = floorRows.length && floorRows[0].entry_floor != null ? parseFloat(floorRows[0].entry_floor) : null;
-      }
-      if (entryFloor === null) {
-        const [epRow] = await db.execute('SELECT entry_price FROM entry_prices WHERE symbol = ? OR symbol = ? LIMIT 1', [symbol, coinBase + '-USD']);
-        if (epRow.length && epRow[0].entry_price != null && parseFloat(epRow[0].entry_price) > 0) entryFloor = parseFloat(epRow[0].entry_price);
-      }
+      // #377 DERIVED floor (Kraken path) - same function as the Revolut path, so the two cannot drift apart.
+      const dfl = await computeDerivedFloor(symbol, coinBase);
+      let entryFloor = dfl.floor;
+      if (entryFloor !== null) console.log('[auto-exec] #377 floor ' + coinBase + ' (Kraken): $' + entryFloor + ' (' + dfl.source + (dfl.raised ? ', stored override was below cost and was lifted' : '') + ')');
       if (entryFloor === null) {
         await sendTelegram('AUTO-SELL BLOCKED - ' + coinBase + ' (Kraken): no entry floor established (no sell_floors, no pump entry_floor, no entry_price). Never-sell-below-entry cannot be verified - failing safe, position untouched.').catch(() => {});
         console.log('[auto-exec] FLOOR GUARD blocked Kraken ' + coinBase + ' sell: entryFloor null - fail-safe hash187');
@@ -13970,6 +14008,7 @@ cron.schedule('40 2 * * *', runNightlyLedgerResync, { timezone: 'Europe/London' 
 // #354 Reconciler every 30 min - ONLY while reconciler_writes_enabled is on (dry runs on a timer would be pointless).
 // #371 (#378) Keep candle history current automatically: new coins get their year of history within the hour;
 // every tracked coin gets its last 48 hours topped up nightly.
+cron.schedule('12,42 * * * *', () => { checkRingfenceCoverage().catch(e => console.error('[ringfence] check failed:', e.message)); });   // #377
 cron.schedule('23 * * * *', () => { candlesAutoBackfillNew().catch(e => console.error('[candles] new-coin check failed:', e.message)); });
 cron.schedule('20 3 * * *', () => { candlesTopUp().catch(e => console.error('[candles] top-up failed:', e.message)); }, { timezone: 'Europe/London' });
 cron.schedule('7,37 * * * *', async () => {
@@ -18123,8 +18162,10 @@ let rows;
             const cost = entryPrices.has(c + '-USD') ? Number(entryPrices.get(c + '-USD')) : null;
             const sfv = sf[c] != null && Number(sf[c]) > 0 ? Number(sf[c]) : null;
             const rf = rule && rule.entry_floor != null && Number(rule.entry_floor) > 0 ? Number(rule.entry_floor) : null;
-            const eff = sfv != null ? sfv : (rf != null ? rf : (cost != null && cost > 0 ? cost : null));
-            const src = sfv != null ? 'sell_floors' : (rf != null ? 'rule' : (eff != null ? 'entry_price' : 'none'));
+            // #377 the SAME derived floor the sell paths now use: highest of real cost + 0.5% and any stored override
+            const dd = derivedFloorFrom(cost, sfv, rf);
+            const eff = dd.floor;
+            const src = dd.source + (dd.raised ? ' (a stored override sat below cost and is lifted)' : '');
             const price = px[c + '-USD'] ?? null, qty = held[c] ?? 0, usd = price != null ? qty * price : null;
             const blocks = [];
             if (!rule) blocks.push('no active pump rule');
