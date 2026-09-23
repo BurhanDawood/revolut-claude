@@ -5483,8 +5483,12 @@ function shadowEvalLadder(state, bar, cfg, ctx) {
     state.phase = 'idle'; state.baseline = px; state.baseline_at = t; state.reserved = 0; state.reserved_left = 0;
     state.legs_filled = 0; state.rearm_target = null; state.trough = null; state.gate = null; state.buy1_price = null;
   };
+  // #374 At the retention floor there is nothing left the ladder may sell. Re-arming then only parks the proceeds in a
+  // trail that can never fire (HBAR Oct 2024 - Mar 2025: it re-armed on each new high and never bought back through a
+  // 57% fall). So: no re-arm when nothing is sellable, and the buy-back ceiling applies as if the legs were used up.
+  const canSellMore = () => !(minQty > 0) || (state.qty - minQty) > state.qty * 1e-9;
   const rearmIf = () => {
-    if (state.legs_filled < P.maxLegs && state.rearm_target && atOrAbove(hi, state.rearm_target)) {
+    if (canSellMore() && state.legs_filled < P.maxLegs && state.rearm_target && atOrAbove(hi, state.rearm_target)) {
       state.phase = 'armed'; state.peak = hi; state.rearm_target = null; state.trough = null;
       return true;
     }
@@ -5541,7 +5545,7 @@ function shadowEvalLadder(state, bar, cfg, ctx) {
 
   if (state.phase === 'watch' || state.phase === 'trough1') {
     if (rearmIf()) return { state, fills };
-    if (state.legs_filled >= P.maxLegs && atOrAbove(hi, state.sale_price * (1 + P.ceiling / 100))) { end('abandoned_ceiling'); return { state, fills }; }
+    if ((state.legs_filled >= P.maxLegs || !canSellMore()) && atOrAbove(hi, state.sale_price * (1 + P.ceiling / 100))) { end('abandoned_ceiling'); return { state, fills }; }
     if (t - state.last_sale_at > P.abandonMs) { end('abandoned_timeout'); return { state, fills }; }
     if (state.phase === 'watch') {
       if (atOrBelow(lo, state.gate)) { state.phase = 'trough1'; state.trough = lo; }
@@ -5807,6 +5811,51 @@ function btComputeMetrics(fills, startQty, startUsd, endPrice, feePct, slipPct) 
     fees_paid_usd: Number(feesPaid.toFixed(4)),
     slippage_cost_usd: Number(slipCost.toFixed(4)),
     cost_drag_pct_of_hold: hold > 0 ? Number(((feesPaid + slipCost) / hold * 100).toFixed(2)) : null
+  };
+}
+
+// ── #374 SWEEP: one ladder profile across MANY coins ─────────────────────────────────
+// Profiles must be judged on dozens of coins, not three chosen by hand (PM #31 step 2): a setting that swings one
+// coin from -22.6% to +13.3% (HBAR, arm 50 vs 150) may simply fit that coin. Runs the same runLadderBacktest for each
+// coin and reports the distribution - win / flat / loss / inert counts, medians, retention - split by what each
+// coin's own price did in the window. READ-ONLY.
+async function runLadderSweep(opts) {
+  const src = opts.source === 'daily' ? 'daily' : 'hourly';
+  let coins = opts.symbols;
+  if (!coins || !coins.length) {
+    const table = src === 'daily' ? 'price_daily_ohlc' : 'price_intraday_hourly', col = src === 'daily' ? 'day' : 'hour_bucket';
+    const [r] = await db.execute('SELECT symbol, COUNT(*) AS n FROM ' + table + ' WHERE ' + col + ' >= ? AND ' + col + ' <= ? GROUP BY symbol HAVING n >= 24 ORDER BY symbol', [opts.start, opts.end]);
+    coins = r.map(x => x.symbol);
+  }
+  const rows = [];
+  for (const c of coins) {
+    let one; try { one = await runLadderBacktest(Object.assign({}, opts, { symbol: c, initial_qty: opts.initial_qty || 1000 })); } catch (e) { one = { ok: false, error: e.message }; }
+    const coin = String(c).toUpperCase().replace(/-USD$/, '');
+    if (!one || !one.ok) { rows.push({ coin, error: one && one.error }); continue; }
+    const m = one.metrics, vs = Number(m.vs_hold_pct);
+    const kind = !(m.sells_filled > 0) ? 'inert' : (vs > 2 ? 'win' : (vs < -2 ? 'loss' : 'flat'));
+    rows.push({ coin, price_change_pct: one.price ? one.price.change_pct : null, vs_hold_pct: vs, retained_pct: m.end_qty_pct_of_start,
+      sells: m.sells_filled, buys: m.buys_filled, cycles: m.cycles_completed, abandoned_no_buy: m.cycles_abandoned_no_buy, blocked: m.fills_blocked, kind });
+  }
+  const good = rows.filter(r => r.kind), active = good.filter(r => r.kind !== 'inert');
+  const med = (a) => { if (!a.length) return null; const s = a.slice().sort((x, y) => x - y), k = Math.floor(s.length / 2); return Number((s.length % 2 ? s[k] : (s[k - 1] + s[k]) / 2).toFixed(2)); };
+  const mean = (a) => a.length ? Number((a.reduce((x, y) => x + y, 0) / a.length).toFixed(2)) : null;
+  const count = (k) => good.filter(r => r.kind === k).length;
+  const bucket = (list) => ({ coins: list.length, active: list.filter(r => r.kind !== 'inert').length, win: list.filter(r => r.kind === 'win').length, flat: list.filter(r => r.kind === 'flat').length,
+    loss: list.filter(r => r.kind === 'loss').length, inert: list.filter(r => r.kind === 'inert').length,
+    median_vs_hold_active: med(list.filter(r => r.kind !== 'inert').map(r => r.vs_hold_pct)), median_retained_active: med(list.filter(r => r.kind !== 'inert').map(r => r.retained_pct)) });
+  const moved = (lo, hi) => good.filter(r => r.price_change_pct != null && r.price_change_pct >= lo && r.price_change_pct < hi);
+  return {
+    ok: true, sweep: true, read_only: true, source: src, window: { start: opts.start, end: opts.end },
+    profile: { arm_pump_pct: opts.arm_pump_pct, arm_window_min: opts.arm_window_min, trail_pct: opts.trail_pct, sell_pct: opts.sell_pct, retention_floor_pct: opts.retention_floor_pct,
+      bounce_pct: opts.bounce_pct, further_drop_pct: opts.further_drop_pct, buyback_ceiling_pct: opts.buyback_ceiling_pct, abandon_hours: opts.abandon_hours, slippage_pct: opts.slippage_pct, entry_floor: opts.entry_floor },
+    summary: { coins: rows.length, errors: rows.filter(r => r.error).length, win: count('win'), flat: count('flat'), loss: count('loss'), inert: count('inert'),
+      median_vs_hold_active: med(active.map(r => r.vs_hold_pct)), mean_vs_hold_active: mean(active.map(r => r.vs_hold_pct)),
+      median_vs_hold_all: med(good.map(r => r.vs_hold_pct)), median_retained_active: med(active.map(r => r.retained_pct)),
+      total_cycles: active.reduce((a, r) => a + (r.cycles || 0), 0), abandoned_no_buy: active.reduce((a, r) => a + (r.abandoned_no_buy || 0), 0) },
+    by_coin_price_move: { 'rose more than 50%': bucket(moved(50, Infinity)), 'between -20% and +50%': bucket(moved(-20, 50)), 'fell more than 20%': bucket(moved(-Infinity, -20)) },
+    how_to_read: 'win/loss = more than 2% better/worse than holding; flat within 2%; inert = never sold. "active" excludes inert coins. Judge a profile on the distribution and on retention, not on the best coin.',
+    coins: rows.sort((a, b) => (b.vs_hold_pct == null ? -1e9 : b.vs_hold_pct) - (a.vs_hold_pct == null ? -1e9 : a.vs_hold_pct))
   };
 }
 
@@ -18997,6 +19046,15 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
       try {
         if (rule_mode !== 'ladder' && (!Array.isArray(sell_tiers) || !Array.isArray(buy_tiers) || !sell_tiers.length || !buy_tiers.length)) {   // #356: ladder does not use tiers
           return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'sell_tiers and buy_tiers must both be non-empty arrays of [pct, pct] pairs' }) }] };
+        }
+        // #374 symbol 'ALL' (every coin with enough history) or a comma list runs a SWEEP of this one profile.
+        const sweepAll = String(symbol || '').trim().toUpperCase() === 'ALL';
+        const sweepList = !sweepAll && String(symbol || '').includes(',') ? String(symbol).split(',').map(s => s.trim().toUpperCase()).filter(Boolean).map(s => s.endsWith('-USD') ? s : s + '-USD') : null;
+        if (sweepAll || sweepList) {
+          const sw = await runLadderSweep({ symbols: sweepList, start, end, source, initial_qty, initial_usd, arm_pump_pct, arm_window_min,
+            sell_tiers, buy_tiers, tier_cooldown_min, min_tier_usd, entry_floor, slippage_pct, fee_pct, rule_mode, max_legs, rearm_from, rearm_confirm_pct,
+            trail_pct, sell_pct, retrace_pct, bounce_pct, buy_pct, further_drop_pct, buyback_ceiling_pct, abandon_hours, retention_floor_pct });
+          return { content: [{ type: 'text', text: JSON.stringify(sw, null, 2) }] };
         }
         const res = await runLadderBacktest({
           symbol, start, end, source, initial_qty, initial_usd, arm_pump_pct, arm_window_min,
