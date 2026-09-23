@@ -4355,7 +4355,7 @@ async function clearTroughTracker(symbol) {
   troughTrackers.delete(symbol);
   try {
     await db.execute(
-      'UPDATE pump_armed_rules SET sale_price=NULL, reference_base=NULL, retrace_gate=NULL, trough_low=NULL, trough_armed=0 WHERE symbol=? AND active=1',
+      'UPDATE pump_armed_rules SET sale_price=NULL, sale_proceeds_usd=NULL, reference_base=NULL, retrace_gate=NULL, trough_low=NULL, trough_armed=0 WHERE symbol=? AND active=1',   // #390 no fossil reservation
       [symbol]
     );
     console.log('[trough] ' + symbol + ' tracker cleared');
@@ -12235,7 +12235,11 @@ async function autoExecuteSell(symbol, maxPct, analysis, confidence, opts = {}) 
     // A buy only ever exists as the back-half of a completed sell. max_cascades:0 stops the rebuy from cascading deeper.
     if (!opts.skipCascade && !aeLoopOff) try {   // #359: the ladder does its own buy-back. #389: a loop switched OFF gets no buy-back
       const [parRows] = await db.execute('SELECT * FROM pump_armed_rules WHERE symbol = ? AND active = 1 LIMIT 1', [symbol]);
-      if (parRows.length) {
+      // #390 (PM #51): 'active' means the rule ROW exists; 'loop_enabled' means the loop may ACT. A buy-back and its
+      // ring-fence belong only to a loop that may act (or an away-mode coin, which is automatic by design).
+      const _mayAct = parRows.length && (parseInt(parRows[0].loop_enabled) === 1 || await isDndCoin(coinBase).catch(() => false));
+      if (parRows.length && !_mayAct) console.log('[auto-exec] #390 ' + coinBase + ' loop is switched OFF - no buy-back armed, no proceeds reserved');
+      if (_mayAct) {
         const syntheticRule = {
           id: null,
           symbol,
@@ -12507,7 +12511,11 @@ async function autoExecuteKrakenSell(symbol, maxPct, analysis, confidence) {
     // #95 Stage 3: pump-armed Kraken sell → spawn ONE buyback rung (no deeper averaging-down). max_cascades:0.
     try {
       const [parRows] = await db.execute('SELECT * FROM pump_armed_rules WHERE symbol = ? AND active = 1 LIMIT 1', [symbol]);
-      if (parRows.length) {
+      // #390 (PM #51): 'active' means the rule ROW exists; 'loop_enabled' means the loop may ACT. A buy-back and its
+      // ring-fence belong only to a loop that may act (or an away-mode coin, which is automatic by design).
+      const _mayAct = parRows.length && (parseInt(parRows[0].loop_enabled) === 1 || await isDndCoin(coinBase).catch(() => false));
+      if (parRows.length && !_mayAct) console.log('[auto-exec] #390 ' + coinBase + ' loop is switched OFF - no buy-back armed, no proceeds reserved');
+      if (_mayAct) {
         const syntheticRule = {
           id: null,
           symbol,
@@ -18749,9 +18757,17 @@ let rows;
         if (action === 'loop_disable') {
           if (!symbol) throw new Error('symbol required for loop_disable');
           const sym = symbol.includes('-') ? symbol.toUpperCase() : symbol.toUpperCase()+'-USD';
-          await db.execute('UPDATE pump_armed_rules SET loop_enabled = 0 WHERE symbol = ?', [sym]);
+          // #390 (PM #51) switching a loop OFF must actually stop it. Before, only the flag changed: an ARMED loop kept its
+          // auto-selling trail, and a pending buy-back kept its reserved cash. Now: if armed, its trail is removed and it is
+          // disarmed; any pending buy-back is cancelled and its reservation released. Re-enabling starts clean.
+          const [before] = await db.execute('SELECT armed, sale_price, sale_proceeds_usd FROM pump_armed_rules WHERE symbol = ? AND active = 1 LIMIT 1', [sym]);
+          const wasArmed = before.length && parseInt(before[0].armed) === 1, hadBuyback = before.length && before[0].sale_price != null;
+          if (wasArmed) await removeTrailingStop(sym).catch(() => {});
+          troughTrackers.delete(sym);
+          await db.execute('UPDATE pump_armed_rules SET loop_enabled = 0, armed = 0, armed_since = NULL, sale_price = NULL, sale_proceeds_usd = NULL, reference_base = NULL, retrace_gate = NULL, trough_low = NULL, trough_armed = 0 WHERE symbol = ?', [sym]);
           const [after] = await db.execute('SELECT * FROM pump_armed_rules WHERE symbol = ? LIMIT 1', [sym]);
-          await sendTelegram('LOOP DISABLED -- '+sym+' rinse-repeat OFF.').catch(()=>{});
+          await sendTelegram('LOOP DISABLED -- ' + sym + ' rinse-repeat OFF.' + (wasArmed ? ' It was ARMED: its trail is removed, so it will not sell.' : '') +
+            (hadBuyback ? ' A pending buy-back was cancelled and its reserved cash released.' : '')).catch(() => {});
           return { content: [{ type: 'text', text: JSON.stringify({ ok: true, loop_enabled: 0, row: after[0] || null }, null, 2) }] };
         }
         if (action === 'remove' && rule_id) {
