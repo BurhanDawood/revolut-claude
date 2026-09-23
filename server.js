@@ -18447,6 +18447,8 @@ let rows;
           } catch (e) { /* reported below */ }
           const coins = [...new Set([...rules.map(r => r.symbol.replace('-USD', '')), ...Object.keys(sf).map(k => k.toUpperCase())])].sort();
           const r6 = (v) => v == null ? null : Number(Number(v).toPrecision(6));
+          const slipMap = {};   // #384 each loop's p90 sell slippage, for the stop-clearance column
+          for (const r of rules) { const cc = r.symbol.replace('-USD', ''); slipMap[cc] = await coinSellSlipP90(cc).catch(() => ({ p90: BOOK_SELL_SLIP_P90, source: 'fallback' })); }
           const loops = coins.map(c => {
             const rule = rules.find(r => r.symbol === c + '-USD') || null;
             const cost = entryPrices.has(c + '-USD') ? Number(entryPrices.get(c + '-USD')) : null;
@@ -18473,6 +18475,10 @@ let rows;
             return {
               coin: c, held_usd: usd != null ? Number(usd.toFixed(2)) : null, price: r6(price), real_cost: r6(cost),
               floor_rule: r6(rf), floor_sell_floors: r6(sfv), floor_effective: r6(eff), floor_source: src, floor_vs_cost: floorVsCost,
+              // #384 (PM #45) standing health metric: can the lowest possible stop clear the floor by 3 x p90 slippage?
+              stop_clearance: rule ? (() => { const sc = stopClearanceCheck(price, rule.arm_pump_pct, rule.trail_pct, eff, slipMap[c] || { p90: BOOK_SELL_SLIP_P90, source: 'fallback' });
+                return sc.checked ? { pass: sc.ok, lowest_stop: sc.lowest_stop, clearance_pct: sc.clearance_pct, required_pct: sc.required_pct, fireable_down_to_price: sc.fireable_down_to_price, slippage: sc.slippage_source }
+                                  : { pass: null, reason: sc.reason }; })() : null,
               loop_enabled: rule ? Number(rule.loop_enabled) : null, armed: rule ? Number(rule.armed) : null,
               arm: rule ? `+${Number(rule.arm_pump_pct)}% in ${Number(rule.arm_window_min)}min, trail ${Number(rule.trail_pct)}%, sell ${Number(rule.sell_pct)}%` : null,
               blocked_by: blocks,
@@ -18931,20 +18937,34 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
         // not armed. An INACTIVE or missing rule is a fresh set-up (defaults, re-activated) - unchanged from before.
         const [exRows] = await db.execute('SELECT * FROM pump_armed_rules WHERE symbol = ? LIMIT 1', [sym]);
         const ex = exRows.length && Number(exRows[0].active) === 1 ? exRows[0] : null;
-        // #383 stop-to-floor clearance - checked BEFORE anything is written
+        // #383 stop-to-floor clearance - checked BEFORE anything is written.
+        // #384 (PM #45) refuse only an edit that makes an ENABLED loop LESS safe. A loop far below its floor is unfireable
+        // today for reasons unrelated to config; routine maintenance on it (a trail tweak) must not be forced into an
+        // absurd arm. So an edit leaving clearance NO WORSE than the stored config is allowed with a warning.
         let _stopCheck = null;
         try {
           const coinB = sym.replace('-USD', '');
           const newEF = entry_floor != null ? entry_floor : (ex ? ex.entry_floor : null);
           const d0 = await computeDerivedFloor(sym, coinB);
           const fl = derivedFloorFrom(d0.cost, d0.sell_floors, newEF).floor;
-          _stopCheck = stopClearanceCheck(await getCurrentPrice(sym).catch(() => null), arm_pump_pct, trail_pct, fl, await coinSellSlipP90(coinB));
+          const pxNow = await getCurrentPrice(sym).catch(() => null), slipNow = await coinSellSlipP90(coinB);
+          _stopCheck = stopClearanceCheck(pxNow, arm_pump_pct, trail_pct, fl, slipNow);
           if (_stopCheck.checked && !_stopCheck.ok) {
             const enabled = ex && Number(ex.loop_enabled) === 1;
             const msg = 'Lowest possible stop ' + _stopCheck.lowest_stop + ' clears the floor ' + _stopCheck.floor + ' by only ' + _stopCheck.clearance_pct +
               '% - needs ' + _stopCheck.required_pct + '% (3 x p90 sell slippage ' + _stopCheck.slippage_p90_pct + '%). A sale could pass the floor check and still FILL below the floor. Raise the arm or tighten the trail.';
-            if (enabled) return { content: [{ type: 'text', text: JSON.stringify({ ok: false, refused: true, reason: 'stop too close to the floor for an ENABLED loop - nothing was written', stop_check: _stopCheck, detail: msg }) }] };
-            _stopCheck.warning = 'loop is not enabled, so it cannot fire - written anyway. ' + msg;
+            if (enabled) {
+              const oldFl = derivedFloorFrom(d0.cost, d0.sell_floors, ex.entry_floor).floor;
+              const was = stopClearanceCheck(pxNow, ex.arm_pump_pct, ex.trail_pct, oldFl, slipNow);
+              if (was.checked && _stopCheck.clearance_pct >= was.clearance_pct - 1e-9) {
+                _stopCheck.warning = 'MAINTENANCE EDIT PERMITTED: clearance ' + was.clearance_pct + '% -> ' + _stopCheck.clearance_pct + '% (no worse than the stored config), but still below the required ' + _stopCheck.required_pct + '%. ' + msg;
+                _stopCheck.stored_clearance_pct = was.clearance_pct;
+              } else {
+                return { content: [{ type: 'text', text: JSON.stringify({ ok: false, refused: true, reason: 'this edit makes an ENABLED loop LESS safe (clearance ' + (was.checked ? was.clearance_pct + '% -> ' : '') + _stopCheck.clearance_pct + '%) - nothing was written', stop_check: _stopCheck, stored_clearance_pct: was.checked ? was.clearance_pct : null, detail: msg }) }] };
+              }
+            } else {
+              _stopCheck.warning = 'loop is not enabled, so it cannot fire - written anyway. ' + msg;
+            }
           }
         } catch (e) { _stopCheck = { checked: false, reason: 'check failed: ' + e.message }; }
         const changed = [];
