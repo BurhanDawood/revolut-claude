@@ -7087,7 +7087,20 @@ async function runExecutionWatchdog(priceOf) {
       _watchdog.delete(sym);
     }
   }
-  for (const [sym, w] of _watchdog) if (!seen.has(sym)) { if (w.alerted) await sendTelegram('\u2705 Execution watchdog: ' + sym.replace('-USD', '') + ' is no longer armed - resolved.').catch(() => {}); _watchdog.delete(sym); }
+  // #F6 ORPHAN: an auto-selling trail on a loop that says it is NOT armed (e.g. reset_cycle before this fix). It would still sell.
+  let armedOff = [];
+  try { [armedOff] = await db.execute('SELECT symbol FROM pump_armed_rules WHERE active = 1 AND armed = 0'); } catch (e) { armedOff = []; }
+  for (const r of armedOff) {
+    const sym = String(r.symbol), ts = trailingStops.get(sym);
+    if (!ts || !ts.autoExecute) continue;
+    seen.add(sym);
+    const prev = _watchdog.get(sym);
+    if (!prev || prev.kind !== 'ORPHAN' || !prev.alerted) {
+      await sendTelegram('\ud83d\udea8 <b>EXECUTION WATCHDOG - ' + sym.replace('-USD', '') + ' (ORPHAN)</b>\nThe loop says armed = 0 but an AUTO-SELLING trail is live (stop ' + fmtPriceShort(ts.stopPrice) + '). It WILL sell on a breach. Fix: manage_alerts remove_trailing, or loop_enable + reset_cycle to start clean.').catch(() => {});
+    }
+    _watchdog.set(sym, { kind: 'ORPHAN', since: prev && prev.kind === 'ORPHAN' ? prev.since : now, alerted: true });
+  }
+  for (const [sym, w] of _watchdog) if (!seen.has(sym)) { if (w.alerted) await sendTelegram('\u2705 Execution watchdog: ' + sym.replace('-USD', '') + (w.kind === 'ORPHAN' ? ' - the orphan trail is gone - resolved.' : ' is no longer armed - resolved.')).catch(() => {}); _watchdog.delete(sym); }
 }
 
 async function runFastScan() {
@@ -18799,14 +18812,19 @@ let rows;
             baseline_price: b.baseline_price, baseline_at: b.baseline_at, tier_state: b.tier_state
           };
           troughTrackers.delete(sym); // drop any in-memory tracker too
+          const hadTrail = trailingStops.get(sym) || null;   // #F6 a reset loop owns no trail - the next pump re-arms one
+          await removeTrailingStop(sym).catch(() => {});
           await db.execute(
             'UPDATE pump_armed_rules SET armed=0, armed_since=NULL, sale_price=NULL, sale_proceeds_usd=NULL, reference_base=NULL, retrace_gate=NULL, trough_low=NULL, trough_armed=0, baseline_price=NULL, baseline_at=NULL, tier_state=NULL WHERE symbol = ?',
             [sym]
           );
           const [after] = await db.execute('SELECT * FROM pump_armed_rules WHERE symbol = ? LIMIT 1', [sym]);
           console.log('[reset_cycle] '+sym+' runtime state cleared (config preserved)');
-          await sendTelegram('CYCLE RESET -- '+sym+' runtime state cleared (armed, ringfenced USD, trough, baseline). All config preserved.').catch(()=>{});
-          return { content: [{ type: 'text', text: JSON.stringify({ ok: true, symbol: sym, cleared_from: clearedFrom, row: after[0] }, null, 2) }] };
+          await sendTelegram('CYCLE RESET -- '+sym+' runtime state cleared (armed, ringfenced USD, trough, baseline). All config preserved.' +
+            (hadTrail ? ' Its trailing stop (stop ' + fmtPriceShort(hadTrail.stopPrice) + (hadTrail.autoExecute ? ', AUTO-SELL' : '') + ') was removed.' : '')).catch(()=>{});
+          return { content: [{ type: 'text', text: JSON.stringify({ ok: true, symbol: sym, cleared_from: clearedFrom,
+            trail_removed: hadTrail ? { peak: hadTrail.peakPrice, stop: hadTrail.stopPrice, auto_execute: !!hadTrail.autoExecute } : null,   // #F6
+            row: after[0] }, null, 2) }] };
         }
         if (action === 'loop_disable') {
           if (!symbol) throw new Error('symbol required for loop_disable');
