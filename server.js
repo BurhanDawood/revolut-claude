@@ -4205,11 +4205,14 @@ async function resumeAlerts(symbol) {
 
 // ── Trailing Stop Functions ───────────────────────────────────────────────────
 
-async function setTrailingStop(symbol, trailPct, currentPrice, entryPrice = null, autoExecute = false, sellPct = null, exchange = null) {
+async function setTrailingStop(symbol, trailPct, currentPrice, entryPrice = null, autoExecute = null, sellPct = null, exchange = null) {
   const stopPrice = currentPrice * (1 - trailPct / 100);
-  // #93: preserve existing fields if not overridden
+  // #93 preserve existing fields when NOT specified; #F3 THREE-VALUED autoExecute: null/undefined = preserve,
+  // true = on, false = explicitly OFF (honoured - it used to be impossible to lower, so a notify-only caller could
+  // inherit auto-sell). The default is null so every caller that passes nothing keeps its re-anchor semantics.
   const existing = trailingStops.get(symbol) || {};
-  const finalAutoExecute = autoExecute || existing.autoExecute || false;
+  const finalAutoExecute = (autoExecute === true || autoExecute === false) ? autoExecute : (existing.autoExecute || false);
+  const preserved = { autoExecute: !(autoExecute === true || autoExecute === false) && existing.autoExecute !== undefined, sellPct: sellPct == null && existing.sellPct != null };
   const finalSellPct     = sellPct != null ? sellPct : (existing.sellPct != null ? existing.sellPct : 25);
   const finalExchange    = exchange || existing.exchange || 'revolut';
   const ts = { trailPct, peakPrice: currentPrice, stopPrice, entryPrice, autoExecute: finalAutoExecute, sellPct: finalSellPct, exchange: finalExchange };
@@ -4219,7 +4222,7 @@ async function setTrailingStop(symbol, trailPct, currentPrice, entryPrice = null
     [symbol, trailPct, currentPrice, stopPrice, entryPrice, finalAutoExecute ? 1 : 0, finalSellPct, finalExchange]
   );
   alertState.acknowledged.delete(symbol); // Setting new trail re-enables coin
-  return { trailPct, peakPrice: currentPrice, stopPrice, autoExecute: finalAutoExecute, sellPct: finalSellPct, exchange: finalExchange };
+  return { trailPct, peakPrice: currentPrice, stopPrice, autoExecute: finalAutoExecute, sellPct: finalSellPct, exchange: finalExchange, preserved };
 }
 
 async function removeTrailingStop(symbol) {
@@ -17199,9 +17202,10 @@ let rows;
         const entryPrice = entryPrices.get(sym) || null;
         // #93: derive exchange (Kraken-monitored coin or default Revolut). Pass auto_execute + sell_pct (Zod-coerced).
         const tsExchange = KRAKEN_MONITORED_COINS.includes(sym) ? 'kraken' : 'revolut';
-        const r = await setTrailingStop(sym, trail_pct, resolvedPrice, entryPrice, auto_execute === true, sell_pct != null ? sell_pct : null, tsExchange);
-        const msgSuffix = r.autoExecute ? ` — AUTO-EXEC ON: will sell ${r.sellPct}% on breach (${r.exchange})` : ` — notify-only`;
-        result = { ok: true, action: 'set_trailing', symbol: sym, trail_pct, peak_price: r.peakPrice, stop_price: r.stopPrice, current_price: resolvedPrice, auto_execute: r.autoExecute, sell_pct: r.sellPct, exchange: r.exchange, message: `Trailing stop set — alerts if ${sym} drops ${trail_pct}% from any peak` + msgSuffix };
+        // #F3 omitted auto_execute = keep the existing trail's setting; false = switch auto-sell OFF; true = ON
+        const r = await setTrailingStop(sym, trail_pct, resolvedPrice, entryPrice, (auto_execute === true || auto_execute === false) ? auto_execute : null, sell_pct != null ? sell_pct : null, tsExchange);
+        const msgSuffix = r.autoExecute ? ` — AUTO-EXEC ON: will sell ${r.sellPct}% on breach (${r.exchange})` + (r.preserved && r.preserved.autoExecute ? ' (kept from the existing trail; pass auto_execute:false to switch it off)' : '') : ` — notify-only`;
+        result = { ok: true, action: 'set_trailing', symbol: sym, trail_pct, peak_price: r.peakPrice, stop_price: r.stopPrice, current_price: resolvedPrice, auto_execute: r.autoExecute, auto_execute_preserved: !!(r.preserved && r.preserved.autoExecute), sell_pct: r.sellPct, exchange: r.exchange, message: `Trailing stop set — alerts if ${sym} drops ${trail_pct}% from any peak` + msgSuffix };
 
       } else if (action === 'acknowledge') {
         await acknowledgeAlert(sym);
