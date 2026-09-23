@@ -7075,7 +7075,11 @@ async function runExecutionWatchdog(priceOf) {
     } else if (ts && price && price <= ts.stopPrice) {
       const w = _watchdog.get(sym);
       const since = w && w.kind === 'PAST' ? w.since : now;
-      if (now - since >= WATCHDOG_GRACE_MS) { kind = 'PAST'; detail = 'price ' + price + ' has been AT OR BELOW the stop ' + ts.stopPrice + ' for ' + Math.round((now - since) / 60000) + ' min and nothing has acted (no sale, block or EDGE result). Peak ' + ts.peakPrice + ', trail ' + ts.trailPct + '%, auto-sell ' + (ts.autoExecute ? 'ON' : 'OFF') + '.'; }
+      if (now - since >= WATCHDOG_GRACE_MS) { kind = 'PAST'; detail = 'price ' + price + ' has been AT OR BELOW the stop ' + ts.stopPrice + ' for ' + Math.round((now - since) / 60000) + ' min and nothing has acted (no sale, block or EDGE result). Peak ' + ts.peakPrice + ', trail ' + ts.trailPct + '%, auto-sell ' + (ts.autoExecute ? 'ON' : 'OFF') + '.';
+        // #F5 say WHY when the auto-sell cooldown is what is holding it
+        const cdAt = analysisRateLimit.get(sym + '_executed');
+        if (cdAt) { let cdMin = 60; try { const [c] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'ai_auto_execute'"); if (c.length) cdMin = JSON.parse(c[0].config_value).cooldown_minutes || 60; } catch (e) {}
+          const left = Math.ceil((cdMin * 60000 - (now - cdAt)) / 60000); if (left > 0) detail += ' (held by auto-exec cooldown, ' + left + ' min left)'; } }
       else { _watchdog.set(sym, { kind: 'PAST', since, alerted: false }); continue; }
     }
     const prev = _watchdog.get(sym);
@@ -12483,9 +12487,12 @@ async function handleTrailingStopAlert(symbol, currentPrice, ts, exchange = 'rev
         const lastExec93 = analysisRateLimit.get(symbol + '_executed');
         const cooldown93Ms = ((ae93Cfg.cooldown_minutes || 60)) * 60 * 1000;
         if (lastExec93 && Date.now() - lastExec93 < cooldown93Ms) {
-          console.log('[trailing] #93 ' + coinBase + ' auto-exec cooldown active -- skipping');
-          await sendTelegram('<b>[#93 AUTO-TRAIL]</b> ' + coinBase + ' cooldown active (' + Math.round((Date.now()-lastExec93)/60000) + 'min). Trail cleared.').catch(() => {});
-          await removeTrailingStop(symbol).catch(() => {});
+          // #F5 HOLD, never remove: a throttle must not strip a protective stop (it used to delete the trail and leave the
+          // loop armed with nothing - the watchdog's STUCK state). Re-checked every scan; sells when the window ends.
+          const leftMin = Math.ceil((cooldown93Ms - (Date.now() - lastExec93)) / 60000);
+          const cdKey = 'cd:' + symbol + ':' + lastExec93;
+          if (!_pauseHeld.has(cdKey)) { _pauseHeld.set(cdKey, true); await sendTelegram('\u23f3 <b>' + coinBase + ' breach held - auto-exec cooldown</b>\n' + leftMin + ' min left since the last auto-sale. Trail kept as-is; it sells when the cooldown ends if still breached.').catch(() => {}); }
+          console.log('[trailing] #93 ' + coinBase + ' auto-exec cooldown active (' + leftMin + ' min left) - holding, trail kept');
           return;
         }
         // Arm cooldown and execute directly
