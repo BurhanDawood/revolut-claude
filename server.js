@@ -7078,7 +7078,9 @@ async function runFastScan() {
     } catch (e) { console.warn('[fast-scan] Revolut ticker fetch failed:', e.message); }
 
     for (const symbol of trailingStops.keys()) {
-      if (alertState.acknowledged.has(symbol) || ignoredCoins.has(symbol)) continue;
+      // #391 an acknowledgement silences ALERTS; it must never switch off an AUTO-SELLING trail (HONEY 23 Sept: a hit up-target re-acknowledged the coin every 5 min and blinded its armed loop)
+      if (ignoredCoins.has(symbol)) continue;
+      if (alertState.acknowledged.has(symbol) && !(trailingStops.get(symbol) || {}).autoExecute) continue;
       // Price: Kraken-only coins fetch individually; Revolut coins from the pre-fetched map
       const price = KRAKEN_MONITORED_COINS.includes(symbol)
         ? await getKrakenPriceForSymbol(symbol).catch(() => null)
@@ -13937,7 +13939,8 @@ async function checkPortfolio() {
     for (const [symbol, ts] of trailingStops) {
       const currentPrice = priceMap[symbol];
       if (!currentPrice) continue;
-      if (alertState.acknowledged.has(symbol)) continue;
+      // #391 an acknowledgement silences ALERTS; it must never switch off an AUTO-SELLING trail (HONEY 23 Sept: a hit up-target re-acknowledged the coin every 5 min and blinded its armed loop)
+      if (alertState.acknowledged.has(symbol) && !ts.autoExecute) continue;
       if (ignoredCoins.has(symbol)) continue;
 
       // Dust check with exception: trailing stops fire even on dust if explicitly set by Claude
@@ -13963,7 +13966,7 @@ async function checkPortfolio() {
     // Coins held on Kraken are not in the Revolut X priceMap, so checked separately
     for (const [symbol, ts] of trailingStops) {
       if (priceMap[symbol]) continue; // already handled above by Revolut X loop
-      if (alertState.acknowledged.has(symbol)) continue;
+      if (alertState.acknowledged.has(symbol) && !ts.autoExecute) continue;   // #391
       if (ignoredCoins.has(symbol)) continue;
 
       const krakenPrice = await getKrakenPriceForSymbol(symbol).catch(() => null);
@@ -14283,7 +14286,7 @@ async function checkPortfolio() {
         }
 
         // Trailing stop check for Kraken assets
-        if (trailingStops.has(symbol) && !alertState.acknowledged.has(symbol) && !ignoredCoins.has(symbol)) {
+        if (trailingStops.has(symbol) && (!alertState.acknowledged.has(symbol) || (trailingStops.get(symbol) || {}).autoExecute) && !ignoredCoins.has(symbol)) {   // #391
           const result = await updateTrailingStop(symbol, asset.price);
           if (result && result.triggered) {
             await sendTelegram(
