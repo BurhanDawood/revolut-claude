@@ -5884,6 +5884,9 @@ async function ensureProfileTables() {
       await db.execute('INSERT INTO ladder_profile_validations (name, version, window_start, window_end, source, coins, active, win, flat, loss, inert, round_trips, cash_parked, annotation, origin) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
         [v.name, v.version, v.window_start, v.window_end, v.source, v.coins, v.active, v.win, v.flat, v.loss, v.inert, JSON.stringify(v.round_trips), JSON.stringify(v.cash_parked), v.annotation, v.origin]);
   }
+  await safeAddColumn('ladder_profile_validations', 'churned', 'TEXT NULL').catch(() => {});   // #380
+  await safeAddColumn('ladder_profile_validations', 'edge', 'TEXT NULL').catch(() => {});
+  await safeAddColumn('ladder_profile_validations', 'method', 'VARCHAR(8) NULL').catch(() => {});
   _profilesReady = true;
 }
 async function getProfile(ref) {
@@ -5941,7 +5944,10 @@ async function runLadderSweep(opts) {
     if (!one || !one.ok) { rows.push({ coin, error: one && one.error }); continue; }
     const m = one.metrics, vs = Number(m.vs_hold_pct);
     const kind = !(m.sells_filled > 0) ? 'inert' : (vs > 2 ? 'win' : (vs < -2 ? 'loss' : 'flat'));
-    rows.push({ coin, price_change_pct: one.price ? one.price.change_pct : null, vs_hold_pct: vs, retained_pct: m.end_qty_pct_of_start,
+    // #380 an honest class: a ROUND TRIP must actually get its coins back (>= 75% retained); bought back and then sold
+    // down again is CHURNED; sold and never bought back is CASH-PARKED; never sold is INERT.
+    const cls = !(m.sells_filled > 0) ? 'inert' : (!(m.buys_filled > 0) ? 'cash_parked' : (Number(m.end_qty_pct_of_start) >= 75 ? 'round_trip' : 'churned'));
+    rows.push({ coin, price_change_pct: one.price ? one.price.change_pct : null, vs_hold_pct: vs, vs_half_cash_pct: m.vs_half_cash_pct, cls, retained_pct: m.end_qty_pct_of_start,
       sells: m.sells_filled, buys: m.buys_filled, cycles: m.cycles_completed, abandoned_no_buy: m.cycles_abandoned_no_buy, blocked: m.fills_blocked, kind });
   }
   const good = rows.filter(r => r.kind), active = good.filter(r => r.kind !== 'inert');
@@ -5960,11 +5966,16 @@ async function runLadderSweep(opts) {
       median_vs_hold_active: med(active.map(r => r.vs_hold_pct)), mean_vs_hold_active: mean(active.map(r => r.vs_hold_pct)),
       median_vs_hold_all: med(good.map(r => r.vs_hold_pct)), median_retained_active: med(active.map(r => r.retained_pct)),
       total_cycles: active.reduce((a, r) => a + (r.cycles || 0), 0), abandoned_no_buy: active.reduce((a, r) => a + (r.abandoned_no_buy || 0), 0),
-      // #379 REQUIRED split: a round trip bought back at least once; cash-parked sold and never bought back.
-      round_trips: (() => { const g = active.filter(r => (r.buys || 0) > 0); return { n: g.length, median_vs_hold: med(g.map(r => r.vs_hold_pct)), median_retained: med(g.map(r => r.retained_pct)), coins: Object.fromEntries(g.map(r => [r.coin, [r.vs_hold_pct, r.retained_pct]])) }; })(),
-      cash_parked: (() => { const g = active.filter(r => !((r.buys || 0) > 0)); return { n: g.length, median_vs_hold: med(g.map(r => r.vs_hold_pct)), median_retained: med(g.map(r => r.retained_pct)), coins: Object.fromEntries(g.map(r => [r.coin, [r.vs_hold_pct, r.retained_pct]])) }; })() },
+      // #379/#380 REQUIRED split, method v2. coins: [vs_hold %, retained %, vs_half_cash %]. Read vs_half_cash - it is
+      // the trading edge with the cash effect removed.
+      ...(() => { const grp = (k) => { const g = active.filter(r => r.cls === k); return { n: g.length, median_vs_hold: med(g.map(r => r.vs_hold_pct)),
+          median_vs_half_cash: med(g.map(r => r.vs_half_cash_pct).filter(v => v != null)), median_retained: med(g.map(r => r.retained_pct)),
+          coins: Object.fromEntries(g.map(r => [r.coin, [r.vs_hold_pct, r.retained_pct, r.vs_half_cash_pct]])) }; };
+        const e = active.map(r => r.vs_half_cash_pct).filter(v => v != null);
+        return { round_trips: grp('round_trip'), churned: grp('churned'), cash_parked: grp('cash_parked'), method: 'v2',
+          edge: { vs: 'static half-cash', win: e.filter(v => v > 2).length, flat: e.filter(v => v >= -2 && v <= 2).length, loss: e.filter(v => v < -2).length, median_vs_half_cash_active: med(e) } }; })() },
     by_coin_price_move: { 'rose more than 50%': bucket(moved(50, Infinity)), 'between -20% and +50%': bucket(moved(-20, 50)), 'fell more than 20%': bucket(moved(-Infinity, -20)) },
-    how_to_read: 'win/loss = more than 2% better/worse than holding; flat within 2%; inert = never sold. "active" excludes inert coins. Judge a profile on the distribution and on retention, not on the best coin.',
+    how_to_read: 'READ summary.edge and vs_half_cash FIRST: the result against selling half on day one and holding cash - the trading edge with the cash effect removed (#380). win/flat/loss in the summary are vs HOLD and are meaningless in a strongly trending window. Classes: round trip = bought back AND kept >= 75% of the coins; churned = bought back then sold down again; cash-parked = sold, never bought back; inert = never sold. Judge a profile on the distribution and on retention, not on the best coin.',
     coins: rows.sort((a, b) => (b.vs_hold_pct == null ? -1e9 : b.vs_hold_pct) - (a.vs_hold_pct == null ? -1e9 : a.vs_hold_pct))
   };
 }
@@ -6039,6 +6050,15 @@ async function runLadderBacktest(opts) {
     fills.push(...out.fills);
   }
   const m = btComputeMetrics(fills, startQty, startUsd, bars[bars.length - 1].c, feePct, slipPct);
+  // #380 FAIR BENCHMARK. vs_hold is meaningless in a strongly trending window: in a crash year ANY strategy that
+  // moved half to cash early 'beats hold' enormously (TIGHT@1 validation: median +100%, IDEX +1421%). The honest
+  // comparison is a static half-cash position - sell 50% on the first bar (paying that leg's fee and slippage), then
+  // hold. vs_half_cash_pct is the result against THAT, which isolates trading edge from the cash effect in rising AND
+  // falling markets.
+  { const p0 = bars[0].c, pN = bars[bars.length - 1].c;
+    const half = startQty * 0.5 * pN + startQty * 0.5 * p0 * (1 - slipPct / 100) * (1 - feePct / 100) + startUsd;
+    m.static_half_cash_value = Number(half.toFixed(4));
+    m.vs_half_cash_pct = half > 0 ? Number(((m.terminal_value / half - 1) * 100).toFixed(2)) : null; }
   if (cfg.rule_mode === 'ladder') m.cycle_outcomes = ctx.outcomes || [];   // #356 how each cycle ended
   return {
     ok: true, symbol: sym, source: src,
@@ -18143,7 +18163,8 @@ let rows;
               const [vs] = await db.execute('SELECT * FROM ladder_profile_validations WHERE name = ? AND version = ? ORDER BY id DESC LIMIT 3', [p.name, p.version]);
               out.push({ ref: p.name + '@' + p.version, kind: p.kind, status: p.status, status_by: p.status_by, notes: p.notes, params: JSON.parse(p.params),
                 validations: vs.map(v => ({ id: v.id, window: v.window_start + ' - ' + v.window_end, source: v.source, coins: v.coins, active: v.active, win: v.win, flat: v.flat, loss: v.loss, inert: v.inert,
-                  round_trips: JSON.parse(v.round_trips), cash_parked: JSON.parse(v.cash_parked), annotation: v.annotation, origin: v.origin, at: v.created_at })) });
+                  method: v.method || 'v1 (vs hold only - superseded by #380)', edge_vs_half_cash: v.edge ? JSON.parse(v.edge) : null,
+                  round_trips: JSON.parse(v.round_trips), churned: v.churned ? JSON.parse(v.churned) : null, cash_parked: JSON.parse(v.cash_parked), annotation: v.annotation, origin: v.origin, at: v.created_at })) });
             }
             return { content: [{ type: 'text', text: JSON.stringify({ profiles: out, note: 'Only a VALIDATED profile can trade real money. Read round_trips and cash_parked, not the win count.' }, null, 2) }] };
           }
@@ -18154,20 +18175,21 @@ let rows;
             const sw = await runLadderSweep({ _profile: prof, start: a.start, end: a.end, source: a.source || 'daily', slippage_pct: a.slippage_pct != null ? Number(a.slippage_pct) : 1,
               entry_floor: a.entry_floor != null ? Number(a.entry_floor) : 1e-6, initial_qty: 1000, rule_mode: 'ladder', arm_pump_pct: 0 });
             const s = sw.summary;
-            if (!s.round_trips || !s.cash_parked) throw new Error('sweep returned no round-trip / cash-parked split - not recorded');
-            const [ins] = await db.execute('INSERT INTO ladder_profile_validations (name, version, window_start, window_end, source, coins, active, win, flat, loss, inert, round_trips, cash_parked, annotation, origin) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+            if (!s.round_trips || !s.cash_parked || !s.churned || !s.edge) throw new Error('sweep returned no complete split (round trips / churned / cash-parked / edge) - not recorded');
+            const [ins] = await db.execute('INSERT INTO ladder_profile_validations (name, version, window_start, window_end, source, coins, active, win, flat, loss, inert, round_trips, cash_parked, churned, edge, method, annotation, origin) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
               [prof.name, prof.version, a.start, a.end, a.source || 'daily', s.coins, s.win + s.flat + s.loss, s.win, s.flat, s.loss, s.inert,
-               JSON.stringify(s.round_trips), JSON.stringify(s.cash_parked), a.annotation ? String(a.annotation).slice(0, 2000) : null, 'sweep ' + new Date().toISOString().slice(0, 10)]);
+               JSON.stringify(s.round_trips), JSON.stringify(s.cash_parked), JSON.stringify(s.churned), JSON.stringify(s.edge), 'v2', a.annotation ? String(a.annotation).slice(0, 2000) : null, 'sweep ' + new Date().toISOString().slice(0, 10)]);
             return { content: [{ type: 'text', text: JSON.stringify({ ok: true, recorded_as: ins && ins.insertId, profile: prof.ref, status: prof.status,
-              summary: { coins: s.coins, win: s.win, flat: s.flat, loss: s.loss, inert: s.inert, round_trips: s.round_trips, cash_parked: s.cash_parked },
+              summary: { coins: s.coins, edge_vs_half_cash: s.edge, round_trips: s.round_trips, churned: s.churned, cash_parked: s.cash_parked, inert: s.inert, vs_hold_counts_do_not_use_alone: { win: s.win, flat: s.flat, loss: s.loss } },
               note: 'Recorded. The profile status is unchanged - set it with profile_status once reviewed.' }, null, 2) }] };
           }
           // profile_status
           const want = String(a.status || '').toLowerCase();
           if (!['draft', 'validated', 'retired'].includes(want)) throw new Error("ladder_cfg.status must be 'draft', 'validated' or 'retired'");
           if (want === 'validated') {
-            const [vs] = await db.execute('SELECT COUNT(*) AS n FROM ladder_profile_validations WHERE name = ? AND version = ? AND active > 0', [prof.name, prof.version]);
-            if (!vs[0] || Number(vs[0].n) === 0) throw new Error(prof.ref + ' has no validation record with any activity - run profile_validate first');
+            // #380 only a METHOD v2 record (fair benchmark + honest classes) can validate a profile
+            const [vs] = await db.execute("SELECT COUNT(*) AS n FROM ladder_profile_validations WHERE name = ? AND version = ? AND active > 0 AND method = 'v2'", [prof.name, prof.version]);
+            if (!vs[0] || Number(vs[0].n) === 0) throw new Error(prof.ref + ' has no method-v2 validation record with any activity (fair benchmark + honest classes, #380) - run profile_validate first');
           }
           await db.execute('UPDATE ladder_profiles SET status = ?, status_by = ?, status_at = CURRENT_TIMESTAMP, notes = COALESCE(?, notes) WHERE name = ? AND version = ?',
             [want, a.by ? String(a.by).slice(0, 40) : 'unspecified', a.notes ? String(a.notes).slice(0, 2000) : null, prof.name, prof.version]);
