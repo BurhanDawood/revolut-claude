@@ -376,6 +376,27 @@ async function tryAwayAutoSellUpTarget(symbol, coinBase, currentPrice, changePct
 
 // #125 Phase 2c — Away Mode analyse-and-buy on down-target. Triple-gated: master enabled AND isAwayActionable AND LLM High-confidence BUY.
 // Below-entry buys ARE allowed (deliberate buybacks) — does NOT apply the cascade below-95%-entry guard. Returns true if handled (caller skips menu).
+// ── #F1 (Fable spec, Bryan decision) /pause IS A TRUE EMERGENCY STOP ─────────────────────
+// One authority: ai_auto_execute.enabled, read FRESH from the DB at fire time by every autonomous order path.
+// Paused = HOLD, never abandon: trails stay armed, trackers keep their reservation; a breach/bounce is reported
+// once per pause and not acted on. Fails CLOSED: unreadable config = paused.
+async function isAutoExecPaused() {
+  try {
+    const [r] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'ai_auto_execute'");
+    if (!r.length) return true;
+    return JSON.parse(r[0].config_value).enabled !== true;
+  } catch (e) { return true; }
+}
+async function pausedSince() {
+  try { const [r] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'ai_auto_execute'"); return r.length ? (JSON.parse(r[0].config_value).updated_at || 'unknown') : 'unknown'; } catch (e) { return 'unknown'; }
+}
+const _pauseHeld = new Map();   // 'kind:symbol' -> pause updated_at already reported. In-memory: a restart re-reports once, deliberately.
+async function notifyHeldOnce(kind, symbol, text) {
+  const since = await pausedSince(), k = kind + ':' + symbol;
+  if (_pauseHeld.get(k) === since) return;
+  _pauseHeld.set(k, since);
+  await sendTelegram(text).catch(() => {});
+}
 // DND mode helpers (#32)
 async function getDndMode() {
   try {
@@ -686,7 +707,7 @@ const lastBalances = {};
 const customThresholds = {};
 const priceTargets = new Map(); // symbol -> { anchorPrice, thresholdPct, targetPrice, entryPrice }
 const entryPrices = new Map(); // symbol -> number (DB-backed, persists across restarts)
-let monitoringPaused = false;
+// #F1 monitoringPaused retired - the one pause is ai_auto_execute.enabled (the emergency stop)
 let briefingInProgress = false;
 let lastMacroNewsCallTime = 0; // separate rate-limit for macro news Claude calls (1 hour)
 let learningModelCache = ''; // updated by updateLearningModel()
@@ -2271,7 +2292,7 @@ seedLegacyTranches().catch(e => console.error('[tranches] Startup seed failed:',
         "SELECT config_value FROM system_config WHERE config_key = 'ai_auto_execute'"
       ))[0][0]?.config_value || '{}');
       console.log(
-        `[auto-exec] Status on startup: ${reloaded.enabled ? 'ENABLED ✅' : 'DISABLED ❌'} | ` +
+        `[auto-exec] Status on startup: ${reloaded.enabled ? 'ENABLED ✅' : 'PAUSED (emergency stop active - loops will hold, not sell) ⏸️'} | ` +
         `Max sell: ${reloaded.max_sell_pct}% | ` +
         `Confidence: ${reloaded.require_confidence} | ` +
         `Cooldown: ${reloaded.cooldown_minutes}min`
@@ -6745,6 +6766,7 @@ async function runLadderLiveTick(nowMs) {
     } catch (e) { return { error: 'tickers: ' + e.message }; }
     let aeCfg = {};
     try { const [a] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'ai_auto_execute'"); if (a.length) aeCfg = JSON.parse(a[0].config_value); } catch (e) { aeCfg = {}; }
+    if (aeCfg.enabled !== true) return { rows: rows.length, enabled, paused: true };   // #F1 the ladder honours the emergency stop
     const now = nowMs || Date.now();
     const fmt = (v) => v == null ? '-' : '$' + Number(v).toPrecision(5);
     const hold = (c) => { const x = bal.find(b => String(b.currency || '').toUpperCase() === c); return { total: x ? (parseFloat(x.available) || 0) + (parseFloat(x.reserved) || 0) : 0, avail: x ? parseFloat(x.available) || 0 : 0 }; };
@@ -7029,6 +7051,7 @@ async function runExecutionWatchdog(priceOf) {
   let rows;
   try { [rows] = await db.execute('SELECT symbol, armed, armed_since, sale_price, trail_pct, sell_pct FROM pump_armed_rules WHERE active = 1 AND loop_enabled = 1 AND armed = 1'); }
   catch (e) { return; }
+  const paused = await isAutoExecPaused();   // #F1
   const seen = new Set(), now = Date.now();
   for (const r of rows) {
     const sym = String(r.symbol); seen.add(sym);
@@ -7036,6 +7059,8 @@ async function runExecutionWatchdog(priceOf) {
     let kind = null, detail = '';
     if (!ts && r.sale_price == null) {
       kind = 'STUCK'; detail = 'armed since ' + (r.armed_since ? new Date(r.armed_since).toISOString().slice(11, 16) + ' UTC' : '?') + ', but it has NO trailing stop and no pending buy-back - it can never sell and never re-arm. Fix: reset_cycle.';
+    } else if (ts && price && price <= ts.stopPrice && paused) {   // #F1 held by the emergency stop - correct, not a failure
+      kind = 'HELD'; detail = 'price ' + price + ' is at/below the stop ' + ts.stopPrice + ' - held by /pause (correctly not selling). It will sell on the first scan after /resume confirm.';
     } else if (ts && price && price <= ts.stopPrice) {
       const w = _watchdog.get(sym);
       const since = w && w.kind === 'PAST' ? w.since : now;
@@ -7045,7 +7070,7 @@ async function runExecutionWatchdog(priceOf) {
     const prev = _watchdog.get(sym);
     if (kind) {
       if (!prev || prev.kind !== kind || !prev.alerted) {
-        await sendTelegram('\ud83d\udea8 <b>EXECUTION WATCHDOG - ' + sym.replace('-USD', '') + ' (' + kind + ')</b>\n' + detail + '\nThe loop should have acted and has not. Please check it.').catch(() => {});
+        await sendTelegram('\ud83d\udea8 <b>EXECUTION WATCHDOG - ' + sym.replace('-USD', '') + ' (' + kind + ')</b>\n' + detail + (kind === 'HELD' ? '' : '\nThe loop should have acted and has not. Please check it.')).catch(() => {});
         console.log('[watchdog] ' + sym + ' ' + kind + ': ' + detail);
       }
       _watchdog.set(sym, { kind, since: prev && prev.kind === kind ? prev.since : now, alerted: true });
@@ -7237,14 +7262,9 @@ async function runFastScan() {
             const [cfgR] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'ai_auto_execute'");
             if (cfgR.length) masterOn = JSON.parse(cfgR[0].config_value).enabled === true;
           } catch (e) { masterOn = false; }
-          if (!masterOn) {
-            await sendTelegram(
-              '<b>[#130 TROUGH BUY signal] ' + ttBase + '</b>\n\n' +
-              'Bounce confirmed @ $' + ttPrice + ' (trough $' + ttResult.trough.toFixed(8) + ', rebuy $' + buyUsd.toFixed(2) + ').\n' +
-              'Master auto-exec OFF -- not buying. Tracker cleared, manual rebuy if desired.'
-            ).catch(() => {});
-            console.log('[trough] ' + ttBase + ' GATE 1 fail: master auto-exec OFF');
-            await clearTroughTracker(ttSymbol);
+          if (!masterOn) {   // #F1 paused = HOLD: tracker and reservation kept, reported once per pause
+            await notifyHeldOnce('trough', ttSymbol, '<b>[#130 TROUGH BUY held - auto-exec PAUSED] ' + ttBase + '</b>\nBounce confirmed @ $' + ttPrice + ' (trough $' + ttResult.trough.toFixed(8) + ', rebuy $' + buyUsd.toFixed(2) + '). NOT bought; tracker and reservation kept. On /resume confirm the low restarts from the then-current price, so a fresh ' + t.bouncePct + '% bounce is needed.');
+            console.log('[trough] ' + ttBase + ' GATE 1 hold: auto-exec paused');
             continue;
           }
 
@@ -7373,9 +7393,8 @@ async function runFastScan() {
                 if (stCfgR.length) stMasterOn = JSON.parse(stCfgR[0].config_value).enabled === true;
               } catch (e) { stMasterOn = false; }
               if (!stMasterOn) {
-                console.log('[trough-st] bounce ' + stB + ' master OFF');
-                await sendTelegram('<b>[TROUGH BOUNCE] ' + stB + '</b>\nBounce ' + fmtPriceShort(st.troughPrice) + '->' + fmtPriceShort(stP) + ' but master auto-exec OFF. Manual buy?').catch(()=>{});
-                await clearStandaloneTrough(stSym); continue;
+                console.log('[trough-st] bounce ' + stB + ' held - auto-exec paused (#F1)');
+                await notifyHeldOnce('trough-st', stSym, '<b>[TROUGH BOUNCE held - auto-exec PAUSED] ' + stB + '</b>\nBounce ' + fmtPriceShort(st.troughPrice) + '->' + fmtPriceShort(stP) + '. NOT bought; tracker kept. Low restarts on resume.'); continue;
               }
               if (st.entryFloor && st.troughPrice < st.entryFloor) {
                 await sendTelegram('<b>[TROUGH FLOOR BREACH] ' + stB + '</b>\nTrough ' + fmtPriceShort(st.troughPrice) + ' below floor ' + fmtPriceShort(st.entryFloor) + '. No auto-buy.').catch(()=>{});
@@ -12211,6 +12230,7 @@ async function floorCappedLimitSell(symbol, qty, floor, refPrice, clientOrderId,
 async function autoExecuteSell(symbol, maxPct, analysis, confidence, opts = {}) {
   const coinBase = symbol.replace('-USD', '');
   try {
+    if (await isAutoExecPaused()) { console.log('[auto-exec] #F1 ' + coinBase + ' sell refused - auto-exec paused'); return { executed: false, reason: 'paused' }; }
     let currentPrice = await getCurrentPrice(symbol);   // #387 let: updated to the actual fill after an EDGE limit sale
     const balancesNow = await revolutRequest('GET', '/balances');
     const asset = balancesNow.find(b => b.currency === coinBase);
@@ -12410,6 +12430,12 @@ async function handleTrailingStopAlert(symbol, currentPrice, ts, exchange = 'rev
     try {
       const [ae93Rows] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'ai_auto_execute'");
       const ae93Cfg = ae93Rows.length ? JSON.parse(ae93Rows[0].config_value) : {};
+      // #F1 EMERGENCY STOP: paused = hold. No sale, no cooldown, no re-anchor, no removal. Reported once per pause.
+      if (ae93Cfg.enabled !== true) {
+        await notifyHeldOnce('trail', symbol, '\u23f8\ufe0f <b>HELD (auto-exec PAUSED) - ' + coinBase + '</b>\nTrail breached at ' + fmtPriceShort(currentPrice) + ' (stop ' + fmtPriceShort(ts.stopPrice) + '). NOT sold. The trail stays armed and keeps trailing. /resume confirm to let it act.');
+        console.log('[trailing] #F1 ' + coinBase + ' breach held - auto-exec paused');
+        return;
+      }
       const hodl93 = ae93Cfg.hodl_symbols || [];
       // #306: manual_only_symbols was honoured ONLY on the AI-analysis path (shouldAutoExecute),
       // so a coin flagged manual_only but absent from hodl_symbols could still be auto-sold HERE —
@@ -12468,6 +12494,7 @@ async function handleTrailingStopAlert(symbol, currentPrice, ts, exchange = 'rev
         // must run INSTEAD of removeTrailingStop, never after it.
         // NOTE: Revolut only for now -- autoExecuteKrakenSell still returns undefined, so Kraken
         // coins fall through to the original remove-the-trail behaviour (no regression).
+        if (ae93Result && ae93Result.reason === 'paused') { analysisRateLimit.delete(symbol + '_executed'); return; }   // #F1 hold: trail untouched
         const ae93Blocked = ae93Result && ae93Result.executed === false
           && ['floor_blocked', 'no_floor', 'floor_error', 'edge_limit_unfilled'].indexOf(ae93Result.reason) !== -1;   // #387
         if (ae93Blocked) {
@@ -12554,6 +12581,7 @@ async function handleTrailingStopAlert(symbol, currentPrice, ts, exchange = 'rev
 async function autoExecuteKrakenSell(symbol, maxPct, analysis, confidence) {
   const coinBase = symbol.replace('-USD', '');
   try {
+    if (await isAutoExecPaused()) { console.log('[auto-exec] #F1 ' + coinBase + ' Kraken sell refused - auto-exec paused'); return { executed: false, reason: 'paused' }; }
     const currentPrice = await getKrakenPriceForSymbol(symbol);
     if (!currentPrice) throw new Error('Could not fetch Kraken price');
 
@@ -12838,6 +12866,7 @@ async function checkAutoTradeRules(priceMap) {
           }
         }
 
+        if (await isAutoExecPaused()) continue;   // #F1 (until F2 makes this path alert-only)
         console.log(`[auto] Executing ${rule.order_type} rule for ${rule.symbol} at $${currentPrice} via ${exchange} (trigger: ${rule.direction} $${rule.trigger_price}, vol: ${resolvedVolume})`);
         const coinBase = rule.symbol.replace('-USD', '');
 
@@ -12991,10 +13020,6 @@ async function checkAutoTradeRules(priceMap) {
 }
 
 async function checkPortfolio() {
-  if (monitoringPaused) {
-    console.log('Monitoring paused, skipping check.');
-    return;
-  }
   try {
     portfolioCheckCount++;
     console.log('Checking portfolio...');
@@ -14932,7 +14957,7 @@ app.get('/api/health', (req, res) => {
 });
 
 // GET /api/status — monitoring status, active alerts, baseline prices
-app.get('/api/status', (req, res) => {
+app.get('/api/status', async (req, res) => {   // #F1 async: reports the real pause
   // #112 Fix #3 / #75: emit a real ARRAY of configured alerts (with direction) so the dashboard can render up/down arrows.
   const alerts = [];
   for (const [sym, arr] of priceTargets.entries()) {
@@ -14946,7 +14971,7 @@ app.get('/api/status', (req, res) => {
     alerts.push({ symbol: sym, type: 'trailing', direction: 'down', trail_pct: (ts.trailPct != null ? ts.trailPct : null), stop: (ts.stopPrice != null ? ts.stopPrice : null), firing: alertState.active.has(sym) });
   }
   res.json({
-    paused: monitoringPaused,
+    paused: await isAutoExecPaused(),   // #F1 the emergency stop, not the retired monitoringPaused
     activeAlerts: alerts,
     acknowledged: [...alertState.acknowledged],
     basePrices,
@@ -15219,17 +15244,20 @@ app.post('/api/acknowledge/:symbol', async (req, res) => {
 });
 
 // POST /api/pause — pause all monitoring
-app.post('/api/pause', async (req, res) => {
-  monitoringPaused = true;
-  await sendTelegram('⏸️ Portfolio monitoring paused via dashboard.');
-  res.json({ ok: true, paused: true });
+app.post('/api/pause', async (req, res) => {   // #F1 the dashboard pause is the same emergency stop as /pause
+  try {
+    let cfg = {}; try { const [r] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'ai_auto_execute'"); cfg = r.length ? JSON.parse(r[0].config_value) : {}; } catch (e) { cfg = {}; }
+    cfg.enabled = false; cfg.updated_at = new Date().toISOString();
+    await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('ai_auto_execute', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)", [JSON.stringify(cfg)]);
+    await sendTelegram('\u23f8\ufe0f <b>AUTO-EXEC PAUSED via dashboard - emergency stop</b> (see /status)').catch(() => {});
+    res.json({ ok: true, paused: true });
+  } catch (e) { res.status(500).json({ ok: false, error: 'Pause FAILED: ' + e.message }); }
 });
 
 // POST /api/resume — resume monitoring
-app.post('/api/resume', async (req, res) => {
-  monitoringPaused = false;
-  await sendTelegram('▶️ Portfolio monitoring resumed via dashboard.');
-  res.json({ ok: true, paused: false });
+app.post('/api/resume', async (req, res) => {   // #F1 single unlock path: Telegram only
+  await sendTelegram('Resume from Telegram: /resume then /resume confirm').catch(() => {});
+  res.json({ ok: false, message: 'Resume from Telegram: /resume then /resume confirm' });
 });
 
 // POST /api/threshold/:symbol — set per-coin alert threshold
@@ -21072,7 +21100,8 @@ app.post('/telegram-webhook', async (req, res) => {
         await sendReply('<b>STATUS</b>\nAuto-exec: ' + (en ? '\u2705 ENABLED' : '\u23f8\ufe0f PAUSED') +
           '\nAvailable USD: <b>' + usdTxt + '</b>' + pnlTxt + armedTxt +
           '\nmanual_only: ' + ((aeCfg.manual_only_symbols || []).join(', ') || 'none') +
-          '\nmax_sell_pct: ' + (aeCfg.max_sell_pct != null ? aeCfg.max_sell_pct : 'unset'));
+          '\nmax_sell_pct: ' + (aeCfg.max_sell_pct != null ? aeCfg.max_sell_pct : 'unset') +
+          (en ? '' : '\nHeld while paused: ' + ([..._pauseHeld.keys()].map(k => k.split(':')[1].replace('-USD', '')).join(', ') || 'none')));   // #F1
         return res.status(200).json({ ok: true });
       }
 
@@ -21088,7 +21117,7 @@ app.post('/telegram-webhook', async (req, res) => {
             "INSERT INTO system_config (config_key, config_value) VALUES ('ai_auto_execute', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)",
             [JSON.stringify(aeCfg)]);
           console.log('[telegram] #316 /pause -> ai_auto_execute.enabled = false');
-          await sendReply('\u23f8\ufe0f <b>AUTO-EXEC PAUSED</b>\nEvery autonomous loop is now halted at the next cycle.\nAnything already in flight will finish its current cycle — that is deliberate, so a filled trade is never orphaned from its record.\nSend <code>/resume</code> to re-enable.');
+          await sendReply('\u23f8\ufe0f <b>AUTO-EXEC PAUSED - EMERGENCY STOP</b>\nHalted: loop sells, buy-backs, standalone trough buys, ladder, auto-rules.\nTrails stay armed and keep trailing; a breach is HELD and reported once, not sold. Trough trackers keep their reservation; their low restarts on resume.\nSurvives redeploy. Anything already mid-order finishes so its record is not orphaned.\n<code>/resume</code> then <code>/resume confirm</code> to re-enable.');
         } catch (e) {
           await sendReply('\u26a0\ufe0f Pause FAILED: ' + e.message + '\nAuto-exec state is UNCHANGED. Check the dashboard.');
         }
@@ -21113,7 +21142,36 @@ app.post('/telegram-webhook', async (req, res) => {
             "INSERT INTO system_config (config_key, config_value) VALUES ('ai_auto_execute', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)",
             [JSON.stringify(aeCfg)]);
           console.log('[telegram] #316 /resume confirm -> ai_auto_execute.enabled = true');
-          await sendReply('\u2705 <b>AUTO-EXEC RE-ENABLED</b>\nAutonomous loops resume at the next cycle.');
+          // #F1 (a) restart every tracking trough low from the current price - a low from before the pause is stale
+          const rsT = await revolutRequest('GET', '/tickers').catch(() => []);
+          const rsL = Array.isArray(rsT) ? rsT : (rsT && rsT.data) || []; const rsPx = {};
+          for (const t of rsL) { if (!t.symbol) continue; const p = parseFloat(t.last_price || t.mid || t.ask || t.bid); if (p) rsPx[t.symbol.replace('/', '-')] = p; }
+          const priceOfRs = async (s) => KRAKEN_MONITORED_COINS.includes(s) ? await getKrakenPriceForSymbol(s).catch(() => null) : (rsPx[s] || null);
+          const resetLines = [];
+          for (const [sym, t] of troughTrackers) {
+            if (!t.troughArmed) continue;
+            const p = await priceOfRs(sym); if (!p) continue;
+            t.troughLow = p; troughTrackers.set(sym, t);
+            await db.execute('UPDATE pump_armed_rules SET trough_low = ? WHERE symbol = ? AND active = 1', [p, sym]).catch(() => {});
+            resetLines.push(sym.replace('-USD', '') + ' low -> ' + fmtPriceShort(p) + ' (needs +' + t.bouncePct + '%)');
+          }
+          for (const [sym, st] of standaloneTroughTrackers) {
+            if (st.troughPrice === null || (st.armBelow && !st.gateHit)) continue;
+            const p = await priceOfRs(sym); if (!p) continue;
+            standaloneTroughTrackers.set(sym, { ...st, troughPrice: p });
+            await db.execute('UPDATE standalone_trough_trackers SET trough_price = ?, updated_at = NOW() WHERE symbol = ?', [p, sym]).catch(() => {});
+            resetLines.push(sym.replace('-USD', '') + ' (standalone) low -> ' + fmtPriceShort(p) + ' (needs +' + (st.bouncePct || 8) + '%)');
+          }
+          // #F1 (b) everything that will act on the next scan: trails at/below their stop
+          const willAct = [];
+          for (const [sym, ts] of trailingStops) {
+            const p = await priceOfRs(sym); if (!p || p > ts.stopPrice) continue;
+            willAct.push(sym.replace('-USD', '') + ' ' + fmtPriceShort(p) + ' <= stop ' + fmtPriceShort(ts.stopPrice) + (ts.autoExecute ? ' - WILL SELL ' + ts.sellPct + '%' : ' - alert only'));
+          }
+          _pauseHeld.clear();
+          for (const [k, w] of _watchdog) if (w.kind === 'HELD') _watchdog.set(k, { kind: 'PAST', since: Date.now(), alerted: false });   // PAST grace restarts from resume
+          await sendReply('\u2705 <b>AUTO-EXEC RE-ENABLED</b>\nWill act on the next scan:\n' + (willAct.length ? willAct.join('\n') : 'none - no trail is at its stop') +
+            '\nTrough lows restarted (fresh bounce needed):\n' + (resetLines.length ? resetLines.join('\n') : 'none'));
         } catch (e) {
           await sendReply('\u26a0\ufe0f Resume FAILED: ' + e.message + '\nAuto-exec remains PAUSED.');
         }
@@ -22131,19 +22189,7 @@ app.post('/telegram-webhook', async (req, res) => {
       }
     }
 
-    // --- Command: pause ---
-    if (commandText === 'pause') {
-      monitoringPaused = true;
-      await sendReply('⏸ Monitoring paused');
-      return res.status(200).json({ ok: true });
-    }
-
-    // --- Command: resume ---
-    if (commandText === 'resume') {
-      monitoringPaused = false;
-      await sendReply('▶️ Monitoring resumed');
-      return res.status(200).json({ ok: true });
-    }
+    // #F1 the old monitoringPaused 'pause'/'resume' text commands were unreachable (#316 handles them first) - removed
 
     // --- Command: status ---
     // Command: dnd COIN1 COIN2 (#32)
@@ -22204,7 +22250,7 @@ app.post('/telegram-webhook', async (req, res) => {
       );
       const statusMsg =
         `<b>Monitor Status</b>\n` +
-        `Paused: ${monitoringPaused ? 'Yes' : 'No'}\n` +
+        `Paused: ${(await isAutoExecPaused()) ? 'Yes (emergency stop)' : 'No'}\n` +   // #F1
         `Pump alerts: ${alertedSymbols.length ? alertedSymbols.join(', ') : 'none'}\n` +
         `Drop alerts: ${dropSymbols.length ? dropSymbols.join(', ') : 'none'}\n` +
         `Fixed alerts: ${fixedSymbols.length ? fixedSymbols.join(', ') : 'none'}\n` +
