@@ -6183,11 +6183,101 @@ async function candlesBackfillWorker(st, opt = {}) {
   await candlesSave(st);
   return st;
 }
+// #371 (#378) One way to START a backfill, shared by the manual action and the automatic new-coin check, so the two
+// can never drift apart. Returns the coins it will actually fetch. Resumes: finished coins and each unfinished
+// coin's progress are kept; new coins are added.
+async function startCandlesBackfill(coins, sinceStr, reason) {
+  if (_candlesJob) return { ok: false, error: 'already running' };
+  const sinceMs = Date.parse((sinceStr || '2023-01-01') + 'T00:00:00Z');
+  if (!(sinceMs > 0)) throw new Error('candles_since must be YYYY-MM-DD');
+  let st = await candlesState();
+  if (!st || st.since_ms !== sinceMs) st = { since_ms: sinceMs, coins: {}, order: [] };
+  for (const c of coins) { if (!st.coins[c]) st.coins[c] = { status: 'queued' }; if (!st.order.includes(c)) st.order.push(c); }
+  st.running = true; st.started_at = new Date().toISOString(); delete st.finished_at; st.reason = reason || 'manual';
+  await candlesSave(st);
+  _candlesJob = { stop: false };
+  const todo = st.order.filter(c => !['done', 'not_on_revolut_x'].includes(st.coins[c].status));
+  candlesBackfillWorker(st).then(async (fin) => {
+    _candlesJob = null;
+    const shown = (reason && reason !== 'manual') ? todo : fin.order;   // automatic runs only report the coins they fetched
+    const lines = shown.map(c => { const x = fin.coins[c] || {}; return c + ': ' + (x.status === 'done' ? 'history from ' + (x.history_from || '?') + ' (' + (x.inserted || 0) + ' new hours)' : x.status + (x.note ? ' - ' + x.note.slice(0, 60) : '')); });
+    await sendTelegram('\ud83d\udd6f\ufe0f <b>' + (reason && reason !== 'manual' ? 'Price history ready for new coin' + (shown.length > 1 ? 's' : '') : 'Candle history backfill finished') + '</b>\n\n' + lines.join('\n')).catch(() => {});
+  }).catch(async (e) => { _candlesJob = null; st.running = false; st.error = e.message; await candlesSave(st); console.error('[candles] job failed:', e.message); });
+  return { ok: true, started: true, coins: st.order.length, to_fetch: todo };
+}
+// The coins worth having history for: held now, or with a saved strategy (watchlist included).
+async function candlesTrackedCoins() {
+  const set = new Set();
+  try {
+    const b = await revolutRequest('GET', '/balances'); const rows = Array.isArray(b) ? b : (b && (b.data || b.balances)) || [];
+    for (const x of rows) { const c = String(x.currency || '').toUpperCase(); if (!/^(USD|USDT|USDC|GBP|EUR)$/.test(c) && ((parseFloat(x.available) || 0) + (parseFloat(x.reserved) || 0)) > 0) set.add(c); }
+  } catch (e) {}
+  try { const [cs] = await db.execute('SELECT symbol FROM coin_strategy'); for (const x of cs) set.add(String(x.symbol || '').toUpperCase().replace(/-USD$/, '')); } catch (e) {}
+  return [...set].filter(c => c && !/^(USD|USDT|USDC|GBP|EUR)$/.test(c)).sort();
+}
+// HOURLY: a tracked coin with NO venue history, not already known to be missing from Revolut X, gets its year of
+// candles fetched in the background - a new position has a real baseline within the hour instead of after 14 days.
+async function candlesAutoBackfillNew() {
+  if (_candlesJob) return { skipped: 'a backfill is already running' };
+  const coins = await candlesTrackedCoins();
+  if (!coins.length) return { new_coins: [] };
+  const st = await candlesState();
+  const known = st && st.coins ? st.coins : {};
+  const [have] = await db.execute("SELECT DISTINCT symbol FROM price_intraday_hourly WHERE source = 'venue'");
+  const withHistory = new Set(have.map(x => String(x.symbol || '').toUpperCase().replace(/-USD$/, '')));
+  // skip: already has venue history, or a previous attempt settled it (not listed on Revolut X / done)
+  const need = coins.filter(c => !withHistory.has(c) && !(known[c] && ['done', 'not_on_revolut_x'].includes(known[c].status)));
+  if (!need.length) return { new_coins: [] };
+  console.log('[candles] new coin(s) without history - backfilling: ' + need.join(', '));
+  const r = await startCandlesBackfill(need, null, 'new coin');
+  return { new_coins: need, started: r };
+}
+// NIGHTLY: the last 48 hours for every tracked coin AND every coin that already has venue history - so watchlist
+// names the live 2-minute capture does not follow (e.g. NEAR) stay current. One request per coin, INSERT IGNORE,
+// status-aware like the backfill. Never runs alongside a backfill.
+async function candlesTopUp(opt = {}) {
+  if (_candlesJob) return { skipped: 'a backfill is running' };
+  const H = 3600000, gapMs = opt.gapMs != null ? opt.gapMs : 700, sleep = opt.sleep || ((ms) => new Promise(r => setTimeout(r, ms)));
+  const st = await candlesState();
+  const skip = new Set(Object.entries((st && st.coins) || {}).filter(([, c]) => c.status === 'not_on_revolut_x').map(([k]) => k));
+  const set = new Set(await candlesTrackedCoins());
+  try { const [have] = await db.execute("SELECT DISTINCT symbol FROM price_intraday_hourly WHERE source = 'venue'"); for (const x of have) set.add(String(x.symbol || '').toUpperCase().replace(/-USD$/, '')); } catch (e) {}
+  const coins = [...set].filter(c => !skip.has(c)).sort();
+  const until = Math.floor(Date.now() / H) * H, since = until - 48 * H;
+  const out = { at: new Date().toISOString(), coins: coins.length, new_rows: 0, errors: [], not_listed: [] };
+  for (const coin of coins) {
+    const qs = new URLSearchParams({ interval: '60', since: String(since), until: String(until) });
+    let r = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try { r = await revolutRequest('GET', '/candles/' + coin + '-USD?' + qs.toString(), null, null, { withStatus: true }); }
+      catch (e) { r = { status: 0, ok: false, body: { message: e.message } }; }
+      if (r.status === 429) { await sleep(opt.rateWaitMs || 30000); continue; }
+      break;
+    }
+    if (r.status === 400 || r.status === 404) out.not_listed.push(coin);
+    else if (!r.ok) out.errors.push(coin + ' (HTTP ' + r.status + ')');
+    else {
+      const list = (r.body && Array.isArray(r.body.data)) ? r.body.data : [];
+      const rows = [];
+      for (const k of list) { const t = Number(k.start), o = parseFloat(k.open), h = parseFloat(k.high), l = parseFloat(k.low), c = parseFloat(k.close);
+        if (t > 0 && o > 0 && h > 0 && l > 0 && c > 0) rows.push([coin + '-USD', new Date(Math.floor(t / H) * H).toISOString().slice(0, 19).replace('T', ' '), o, h, l, c]); }
+      if (rows.length) {
+        const [ins] = await db.execute('INSERT IGNORE INTO price_intraday_hourly (symbol, hour_bucket, open_px, high_px, low_px, close_px, sample_count, source) VALUES ' + rows.map(() => "(?, ?, ?, ?, ?, ?, 0, 'venue')").join(', '), rows.flat());
+        out.new_rows += (ins && ins.affectedRows) || 0;
+      }
+    }
+    await sleep(gapMs);
+  }
+  await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('candles_topup_last', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)", [JSON.stringify(out)]).catch(() => {});
+  console.log('[candles] nightly top-up: ' + out.coins + ' coins, ' + out.new_rows + ' new hours' + (out.errors.length ? ', errors: ' + out.errors.join(', ') : ''));
+  if (out.errors.length) await sendTelegram('\u26a0\ufe0f <b>Nightly price-history top-up</b>: ' + out.errors.length + ' coin(s) failed - ' + out.errors.slice(0, 8).join(', ') + '. Their history will be filled on the next run.').catch(() => {});
+  return out;
+}
 function candlesSummary(st) {
   if (!st) return { note: 'no backfill has been run' };
   const coins = {};
   for (const k of st.order || []) { const c = st.coins[k] || {}; coins[k] = { status: c.status, history_from: c.history_from || null, candles: c.candles || 0, new_rows: c.inserted || 0, requests: c.requests || 0, note: c.note || null }; }
-  return { running: !!(st.running && _candlesJob), interrupted: !!(st.running && !_candlesJob), started_at: st.started_at, finished_at: st.finished_at || null, since: new Date(Number(st.since_ms)).toISOString().slice(0, 10), coins };
+  return { running: !!(st.running && _candlesJob), interrupted: !!(st.running && !_candlesJob), reason: st.reason || 'manual', started_at: st.started_at, finished_at: st.finished_at || null, since: new Date(Number(st.since_ms)).toISOString().slice(0, 10), coins };
 }
 
 // ── #359 LIVE LADDER EXECUTOR ──────────────────────────────────────────────────────
@@ -13766,6 +13856,10 @@ cron.schedule('55 2 * * *', backupServerJsToDrive, { timezone: 'Europe/London' }
 cron.schedule('30 3 * * *', backupDatabaseToDrive, { timezone: 'Europe/London' }); // #12 nightly DB backup
 cron.schedule('40 2 * * *', runNightlyLedgerResync, { timezone: 'Europe/London' }); // #346 ledger + entry prices from venue transactions
 // #354 Reconciler every 30 min - ONLY while reconciler_writes_enabled is on (dry runs on a timer would be pointless).
+// #371 (#378) Keep candle history current automatically: new coins get their year of history within the hour;
+// every tracked coin gets its last 48 hours topped up nightly.
+cron.schedule('23 * * * *', () => { candlesAutoBackfillNew().catch(e => console.error('[candles] new-coin check failed:', e.message)); });
+cron.schedule('20 3 * * *', () => { candlesTopUp().catch(e => console.error('[candles] top-up failed:', e.message)); }, { timezone: 'Europe/London' });
 cron.schedule('7,37 * * * *', async () => {
   try {
     const [r] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'reconciler_writes_enabled'");
@@ -16694,7 +16788,7 @@ let rows;
       dnd_retrace_pct:  z.coerce.number().optional().describe('configure_dnd: #160 %% of move price must retrace before trough arms (default 50)'),
       dnd_bounce_pct:   z.coerce.number().optional().describe('configure_dnd: #160 %% bounce off trough to trigger rebuy (default 8)'),
       // #355 Only a real true/false: z.coerce.boolean('false') is TRUE, which would turn the reconciler ON when asked to switch it off.
-      candles_op:       z.enum(['start', 'status', 'stop']).optional().describe('#370 candles_backfill: start (or resume) / status / stop'),
+      candles_op:       z.enum(['start', 'status', 'stop', 'topup', 'check_new']).optional().describe('#370/#371 candles_backfill: start (or resume) / status / stop / topup (last 48 h for every tracked coin, runs nightly) / check_new (backfill coins that have no history yet, runs hourly)'),
       candles_symbols:  zLoose(z.array(z.string())).optional().describe('#370 candles_backfill start: coins to fill, e.g. ["NEAR","ENA"]. Omit for held coins plus every coin with a saved strategy.'),
       candles_since:    z.string().optional().describe('#370 candles_backfill start: earliest date to reach back to, YYYY-MM-DD (default 2023-01-01; each coin stops at its own listing date)'),
       reconciler_on:    z.preprocess(v => v === 'true' ? true : (v === 'false' ? false : v), z.boolean()).optional().describe('#355 reconciler_switch: true = record card payments/deposits from Revolut transactions (runs once immediately, then every 30 min); false = dry run only'),
@@ -17456,33 +17550,13 @@ let rows;
           if (_candlesJob) _candlesJob.stop = true;
           return { content: [{ type: 'text', text: JSON.stringify({ ok: true, stopping: !!_candlesJob, note: 'Progress is kept - start again to resume.' }) }] };
         }
+        if (op === 'topup') { const t = await candlesTopUp(); return { content: [{ type: 'text', text: JSON.stringify(t, null, 2) }] }; }   // #371
+        if (op === 'check_new') { const t = await candlesAutoBackfillNew(); return { content: [{ type: 'text', text: JSON.stringify(t, null, 2) }] }; }   // #371
         if (_candlesJob) return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'already running', status: candlesSummary(st) }) }] };
-        let coins = Array.isArray(candles_symbols) && candles_symbols.length ? candles_symbols.map(s => String(s).toUpperCase().replace(/-USD$/, '')) : null;
-        if (!coins) {
-          const set = new Set();
-          try {
-            const b = await revolutRequest('GET', '/balances'); const rows = Array.isArray(b) ? b : (b && (b.data || b.balances)) || [];
-            for (const x of rows) { const c = String(x.currency || '').toUpperCase(); if (!/^(USD|USDT|USDC|GBP|EUR)$/.test(c) && ((parseFloat(x.available) || 0) + (parseFloat(x.reserved) || 0)) > 0) set.add(c); }
-          } catch (e) {}
-          try { const [cs] = await db.execute('SELECT symbol FROM coin_strategy'); for (const x of cs) set.add(String(x.symbol || '').toUpperCase().replace(/-USD$/, '')); } catch (e) {}
-          coins = [...set].filter(c => c && !/^(USD|USDT|USDC|GBP|EUR)$/.test(c)).sort();
-        }
-        const sinceMs = Date.parse((candles_since || '2023-01-01') + 'T00:00:00Z');
-        if (!(sinceMs > 0)) throw new Error('candles_since must be YYYY-MM-DD');
-        // Resume: keep finished coins and each unfinished coin's progress; add any new coins.
-        if (!st || st.since_ms !== sinceMs) st = { since_ms: sinceMs, coins: {}, order: [] };
-        for (const c of coins) { if (!st.coins[c]) st.coins[c] = { status: 'queued' }; if (!st.order.includes(c)) st.order.push(c); }
-        st.running = true; st.started_at = new Date().toISOString(); delete st.finished_at;
-        await candlesSave(st);
-        _candlesJob = { stop: false };
-        const todo = st.order.filter(c => !['done', 'not_on_revolut_x'].includes(st.coins[c].status));
-        candlesBackfillWorker(st).then(async (fin) => {
-          _candlesJob = null;
-          const lines = fin.order.map(c => { const x = fin.coins[c]; return c + ': ' + (x.status === 'done' ? 'from ' + (x.history_from || '?') + ' (' + (x.inserted || 0) + ' new hours)' : x.status + (x.note ? ' - ' + x.note.slice(0, 60) : '')); });
-          await sendTelegram('\ud83d\udd6f\ufe0f <b>Candle history backfill finished</b>\n\n' + lines.join('\n')).catch(() => {});
-        }).catch(async (e) => { _candlesJob = null; st.running = false; st.error = e.message; await candlesSave(st); console.error('[candles] job failed:', e.message); });
-        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, started: true, coins: st.order.length, to_fetch: todo, since: candles_since || '2023-01-01',
-          note: 'Runs in the background (~100 hours of history per request, paced). Check with candles_op status; a Telegram message arrives when it finishes.' }) }] };
+        const coins = Array.isArray(candles_symbols) && candles_symbols.length ? candles_symbols.map(s => String(s).toUpperCase().replace(/-USD$/, '')) : await candlesTrackedCoins();
+        const r = await startCandlesBackfill(coins, candles_since, 'manual');   // #371: the same path the automatic check uses
+        return { content: [{ type: 'text', text: JSON.stringify(Object.assign(r, { since: candles_since || '2023-01-01',
+          note: 'Runs in the background (~100 hours of history per request, paced). Check with candles_op status; a Telegram message arrives when it finishes.' })) }] };
       } else if (action === 'reconciler_switch') {
         // #355 The reconciler's on/off switch - reconciler_writes_enabled had no setter at all. OFF = dry run only.
         // Turning it ON runs it once straight away and reports what it did; the #354 30-minute schedule then takes over.
