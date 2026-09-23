@@ -2676,6 +2676,26 @@ async function ensurePendingCapTable() {
 // tap after a restart can never act twice or act on the wrong row.
 //   np = 'Not a payment' / 'Not a withdrawal' (id = trading_journal row)
 //   cc = capital change Confirm (1) / Cancel (2) (id = pending_capital_changes row)
+// ── #395 WAS THE MISSING CASH SPENT ON COINS? ASK THE VENUE ─────────────────────────
+// The payment detectors decided 'trade-funding or payment?' from the JOURNAL alone. Buys the journal missed (placed
+// by hand, e.g. during a restart - 23 Sept: $201.66 of HONEY proceeds spent on DASH/JTO/COTI/IDEX/AST) then look
+// exactly like a hidden card payment. Revolut's own order history is the ground truth: the USD value of BUY orders
+// that FILLED in the window. (Same call pattern as the #330 history reader: epoch-ms dates, '?' not signed.)
+async function venueBuysUsdInWindow(windowMs) {
+  const end = Date.now(), start = end - windowMs;
+  const qs = new URLSearchParams({ start_date: String(start), end_date: String(end), limit: '200' });
+  const page = await revolutRequest('GET', '/orders/historical?' + qs.toString());
+  if (page && page.message && !page.orders && !Array.isArray(page)) throw new Error('API: ' + page.message);
+  const rows = Array.isArray(page) ? page : (page && (page.data || page.orders || page.items)) || [];
+  let usd = 0, n = 0; const coins = new Set();
+  for (const o of rows) {
+    if (String(o.side || '').toLowerCase() !== 'buy') continue;
+    const q = Number(o.filled_quantity), p = Number(o.average_fill_price);
+    if (q > 0 && p > 0) { usd += q * p; n++; coins.add(String(o.symbol || '').split(/[\/-]/)[0]); }
+  }
+  return { usd: Number(usd.toFixed(2)), n, coins: [...coins] };
+}
+
 async function handleMoneyButton(typeCode, idStr, choice, reply) {
   const id = parseInt(idStr, 10);
   if (!Number.isFinite(id) || id <= 0) { await reply('\u26a0\ufe0f That button has no valid reference.'); return; }
@@ -2693,6 +2713,21 @@ async function handleMoneyButton(typeCode, idStr, choice, reply) {
     await db.execute('DELETE FROM coin_cash_flows WHERE journal_id = ?', [id]).catch(() => {});
     const amt = parseFloat(row.quantity) || 0;
     const before = totalInvestedCapital;
+    // #395 if this payment's capital deduction is still HELD (a drop > $200 waits for Confirm), it was never applied:
+    // cancel the hold instead of adding the money back. Before, 'Not a payment' ALWAYS added it back, so on a held
+    // payment capital ended too high - and the still-live Confirm could then subtract it again (23 Sept, HONEY cash).
+    try {
+      await ensurePendingCapTable();
+      const [hold] = await db.execute("SELECT id FROM pending_capital_changes WHERE status = 'pending' AND ABS(delta + ?) < 0.01 AND created_at BETWEEN DATE_SUB(?, INTERVAL 30 MINUTE) AND DATE_ADD(?, INTERVAL 30 MINUTE) ORDER BY id DESC LIMIT 1",
+        [amt, row.created_at, row.created_at]);
+      if (hold && hold.length) {
+        const [c] = await db.execute("UPDATE pending_capital_changes SET status = 'cancelled', resolved_at = NOW() WHERE id = ? AND status = 'pending'", [hold[0].id]);
+        if (c && c.affectedRows === 1) {
+          await reply('\u2705 Reversed - not a ' + kind + ' ($' + amt.toFixed(2) + '). Its capital change was still on hold, so the hold is cancelled.\nCapital unchanged at $' + totalInvestedCapital.toFixed(2) + '.');
+          return;
+        }
+      }
+    } catch (e) { console.error('[money-btn] #395 hold check failed:', e.message); }
     try {
       await updateInvestedCapital(before + amt, 'Button reversal of j' + id + ': +$' + amt.toFixed(2));
     } catch (e) {
@@ -13170,7 +13205,8 @@ async function checkPortfolio() {
                LIMIT 1`
             ).catch(() => [[]]);
 
-            if (recentTrade.length > 0) {
+            let vB = null; try { vB = await venueBuysUsdInWindow(30 * 60 * 1000); } catch (e) { vB = null; }   // #395
+            if (recentTrade.length > 0 || (vB && vB.usd >= decrease * 0.9)) {
               console.log(`[usdt] USDT decrease $${decrease.toFixed(2)} — recent trade detected, treating as trade-funding (no capital change)`);
               await db.execute(
                 `INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source)
@@ -13247,7 +13283,15 @@ async function checkPortfolio() {
             const [recentTrade159] = await db.execute(
               `SELECT id FROM trading_journal WHERE action IN ('buy','add') AND source IN ('claude_mcp','auto_detected','manual') AND created_at > DATE_SUB(NOW(), INTERVAL 10 MINUTE) LIMIT 1`
             ).catch(() => [[]]);
-            if (recentTrade159.length === 0) {
+            // #395 the journal can miss buys (manual, during a restart) - ask Revolut which buys actually filled
+            let v159 = null; try { v159 = await venueBuysUsdInWindow(30 * 60 * 1000); } catch (e) { console.warn('[usdt] #395 venue check failed:', e.message); }
+            const funded159 = !!(v159 && v159.usd >= hidden159 * 0.9);
+            if (funded159) {
+              console.log('[usdt] #395 USD -$' + hidden159.toFixed(2) + ' matched by $' + v159.usd + ' of filled buys on Revolut X (' + v159.coins.join(', ') + ') - trade-funding, not a payment');
+              await sendTelegram('\u2139\ufe0f $' + hidden159.toFixed(2) + ' of USD was spent on coin buys (' + v159.n + ' filled order(s) on Revolut X: ' + v159.coins.join(', ') + ') - not a payment. Capital unchanged.' +
+                (recentTrade159.length === 0 ? '\nThese buys are not in the journal yet (placed by hand) - the nightly re-sync records them and updates cost prices.' : '')).catch(() => {});
+            }
+            if (recentTrade159.length === 0 && !funded159) {
               const [dupe159] = await db.execute(
                 `SELECT id FROM trading_journal WHERE symbol='USDT' AND action='payment' AND ABS(quantity - ?) < 0.05 AND created_at > DATE_SUB(NOW(), INTERVAL 15 MINUTE) LIMIT 1`,
                 [hidden159]
@@ -13267,7 +13311,7 @@ async function checkPortfolio() {
                 const applied159 = Math.abs(totalInvestedCapital - newCap159) < 0.005;
                 await sendTelegram(
                   `\ud83d\udcb3 PAYMENT $${hidden159.toFixed(2)} USDT\n` +
-                  `(#159: masked by USD\u2192USDT conversion in same window)\n` +
+                  (usdtIn159 > 0 ? `(#159: masked by USD\u2192USDT conversion in same window)\n` : `(USD left the account with no matching USDT, and no coin buys found on Revolut X)\n`) +
                   (applied159
                     ? `Capital: $${prevCap159.toFixed(2)} \u2192 $${totalInvestedCapital.toFixed(2)}\n\n`
                     : `Capital change HELD for your confirmation - see the capital alert.\n\n`) +
