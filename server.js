@@ -11924,6 +11924,34 @@ async function computeDerivedFloor(symbol, coinBase) {
   return derivedFloorFrom(cost, sf, rf);
 }
 
+// ── #383 STOP-TO-FLOOR CLEARANCE (PM #44) ──────────────────────────────────────────
+// pm #40 set JTO to arm +30% / trail 25%: the LOWEST possible stop is baseline x 1.30 x 0.75 = 0.975 x baseline, which
+// sat 0.64% above the floor - inside the system's own measured sell slippage (auto orders median 1.29%), so a sale
+// that PASSED the floor check could have filled BELOW the floor and below cost. Dev did not check it; nothing did.
+// Now, whenever a pump rule is written, the lowest possible stop (current price x (1 + arm) x (1 - trail)) is compared
+// with the derived floor, and the gap must be at least 3 x that coin's p90 sell slippage (its own enriched sells
+// when there are 10+, else the book-wide sell p90 of 1.0% measured in #360). An ENABLED loop that fails is REFUSED
+// with nothing written; a disabled one is written with a warning (it cannot fire).
+const STOP_CLEARANCE_MULT = 3, BOOK_SELL_SLIP_P90 = 1.0;
+async function coinSellSlipP90(coin) {
+  try {
+    const [r] = await db.execute("SELECT slip_pct FROM trading_journal WHERE (symbol = ? OR symbol = ?) AND action = 'sell' AND slip_pct IS NOT NULL ORDER BY id DESC LIMIT 50", [coin, coin + '-USD']);
+    const v = r.map(x => Number(x.slip_pct)).filter(x => isFinite(x)).sort((a, b) => a - b);
+    if (v.length >= 10) return { p90: Math.max(0, v[Math.min(v.length - 1, Math.floor(v.length * 0.9))]), n: v.length, source: coin + "'s own enriched sells" };
+  } catch (e) { /* fall through */ }
+  return { p90: BOOK_SELL_SLIP_P90, n: null, source: 'book-wide sell p90 (#360) - fewer than 10 enriched sells for this coin' };
+}
+function stopClearanceCheck(price, armPct, trailPct, floor, slip) {
+  if (!(Number(price) > 0)) return { checked: false, reason: 'no current price' };
+  if (!(Number(floor) > 0)) return { checked: false, reason: 'no floor (sales are blocked anyway)' };
+  const minStop = Number(price) * (1 + Number(armPct) / 100) * (1 - Number(trailPct) / 100);
+  const clearance = (minStop / Number(floor) - 1) * 100;
+  const required = STOP_CLEARANCE_MULT * slip.p90;
+  return { checked: true, ok: clearance >= required, lowest_stop: Number(minStop.toPrecision(6)), floor: Number(Number(floor).toPrecision(6)),
+    clearance_pct: Number(clearance.toFixed(2)), required_pct: Number(required.toFixed(2)), slippage_p90_pct: slip.p90, slippage_source: slip.source,
+    fireable_down_to_price: Number((Number(floor) * (1 + required / 100) / ((1 + Number(armPct) / 100) * (1 - Number(trailPct) / 100))).toPrecision(6)) };
+}
+
 async function autoExecuteSell(symbol, maxPct, analysis, confidence, opts = {}) {
   const coinBase = symbol.replace('-USD', '');
   try {
@@ -18903,6 +18931,22 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
         // not armed. An INACTIVE or missing rule is a fresh set-up (defaults, re-activated) - unchanged from before.
         const [exRows] = await db.execute('SELECT * FROM pump_armed_rules WHERE symbol = ? LIMIT 1', [sym]);
         const ex = exRows.length && Number(exRows[0].active) === 1 ? exRows[0] : null;
+        // #383 stop-to-floor clearance - checked BEFORE anything is written
+        let _stopCheck = null;
+        try {
+          const coinB = sym.replace('-USD', '');
+          const newEF = entry_floor != null ? entry_floor : (ex ? ex.entry_floor : null);
+          const d0 = await computeDerivedFloor(sym, coinB);
+          const fl = derivedFloorFrom(d0.cost, d0.sell_floors, newEF).floor;
+          _stopCheck = stopClearanceCheck(await getCurrentPrice(sym).catch(() => null), arm_pump_pct, trail_pct, fl, await coinSellSlipP90(coinB));
+          if (_stopCheck.checked && !_stopCheck.ok) {
+            const enabled = ex && Number(ex.loop_enabled) === 1;
+            const msg = 'Lowest possible stop ' + _stopCheck.lowest_stop + ' clears the floor ' + _stopCheck.floor + ' by only ' + _stopCheck.clearance_pct +
+              '% - needs ' + _stopCheck.required_pct + '% (3 x p90 sell slippage ' + _stopCheck.slippage_p90_pct + '%). A sale could pass the floor check and still FILL below the floor. Raise the arm or tighten the trail.';
+            if (enabled) return { content: [{ type: 'text', text: JSON.stringify({ ok: false, refused: true, reason: 'stop too close to the floor for an ENABLED loop - nothing was written', stop_check: _stopCheck, detail: msg }) }] };
+            _stopCheck.warning = 'loop is not enabled, so it cannot fire - written anyway. ' + msg;
+          }
+        } catch (e) { _stopCheck = { checked: false, reason: 'check failed: ' + e.message }; }
         const changed = [];
         if (ex) {
           const same = (x, y) => (x == null && y == null) || (x != null && y != null && (Number(x) === Number(y) || String(x) === String(y)));
@@ -18942,7 +18986,7 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
           `${Number(fin.armed) === 1 ? '\nArmed state kept - this change did not disarm the loop.' : ''}` +
           `${tierInfo ? `\nMode: TIERED — sell ${stJson}, buy ${btJson} (cumulative sell ${tierInfo.cumulative_sell_pct}%, cap ${tierInfo.max_sell_pct}%)` : ''}` + conflictWarning
         ).catch(() => {});
-        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, mode: ex ? 'updated' : 'created', changed, rule: {
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, stop_check: _stopCheck, mode: ex ? 'updated' : 'created', changed, rule: {
           symbol: sym, arm_pump_pct: num(fin.arm_pump_pct), arm_window_min: num(fin.arm_window_min), trail_pct: num(fin.trail_pct), sell_pct: num(fin.sell_pct),
           entry_floor: num(fin.entry_floor), rebuy_pct: num(fin.rebuy_pct), retrace_pct: num(fin.retrace_pct), bounce_pct: num(fin.bounce_pct),
           buyback_floor_pct: num(fin.buyback_floor_pct), rule_mode: fin.rule_mode, tier_cooldown_min: num(fin.tier_cooldown_min), min_tier_usd: num(fin.min_tier_usd),
