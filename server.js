@@ -868,6 +868,19 @@ await db.execute(`CREATE TABLE IF NOT EXISTS price_intraday_hourly (
   UNIQUE KEY uq_hourly_symbol_hour (symbol, hour_bucket),
   INDEX idx_hourly_symbol_time (symbol, hour_bucket)
 )`);
+// #373 DAILY candles from Revolut. Hourly/4h candles are kept ~1 year; daily go back 2.5+ years (probe #372: BTC daily
+// from May 2024) - so the 2024-25 bull run is available at daily resolution. Keyed by the LONDON date, because
+// Revolut's daily candles start at London midnight (23:00 UTC in summer, 00:00 in winter).
+await db.execute(`CREATE TABLE IF NOT EXISTS price_daily_ohlc (
+  symbol VARCHAR(50) NOT NULL,
+  day DATE NOT NULL,
+  open_px DECIMAL(20,10) NOT NULL,
+  high_px DECIMAL(20,10) NOT NULL,
+  low_px DECIMAL(20,10) NOT NULL,
+  close_px DECIMAL(20,10) NOT NULL,
+  source VARCHAR(8) NOT NULL DEFAULT 'venue',
+  PRIMARY KEY (symbol, day)
+)`);
 await db.execute(`CREATE TABLE IF NOT EXISTS shadow_tier_fills (
   id INT AUTO_INCREMENT PRIMARY KEY,
   symbol VARCHAR(50) NOT NULL,
@@ -5800,11 +5813,15 @@ function btComputeMetrics(fills, startQty, startUsd, endPrice, feePct, slipPct) 
 async function runLadderBacktest(opts) {
   const sym = (opts.symbol || '').toUpperCase().includes('-USD')
     ? opts.symbol.toUpperCase() : (opts.symbol || '').toUpperCase() + '-USD';
-  const src = opts.source === 'intraday' ? 'intraday' : 'hourly';
+  const src = opts.source === 'intraday' ? 'intraday' : (opts.source === 'daily' ? 'daily' : 'hourly');   // #373
   const feePct = opts.fee_pct != null ? Number(opts.fee_pct) : 0.09;
   const slipPct = opts.slippage_pct != null ? Number(opts.slippage_pct) : 0;
   let bars = [];
-  if (src === 'hourly') {
+  if (src === 'daily') {
+    // #373 daily OHLC from Revolut (2.5+ years). Bars are stamped at 00:00 UTC of the London date.
+    const [r] = await db.execute('SELECT day AS t, open_px AS o, high_px AS h, low_px AS l, close_px AS c FROM price_daily_ohlc WHERE symbol = ? AND day >= DATE(?) AND day <= DATE(?) ORDER BY day ASC', [sym, opts.start, opts.end]);
+    bars = r.map(x => ({ t: Date.parse(String(x.t instanceof Date ? x.t.toISOString().slice(0, 10) : String(x.t).slice(0, 10)) + 'T00:00:00Z'), o: parseFloat(x.o), h: parseFloat(x.h), l: parseFloat(x.l), c: parseFloat(x.c) }));
+  } else if (src === 'hourly') {
     const [r] = await db.execute(
       'SELECT hour_bucket AS t, open_px AS o, high_px AS h, low_px AS l, close_px AS c FROM price_intraday_hourly WHERE symbol = ? AND hour_bucket >= ? AND hour_bucket <= ? ORDER BY hour_bucket ASC',
       [sym, opts.start, opts.end]);
@@ -6111,16 +6128,19 @@ async function runFillEnrichment() {
 // progress persisted so a restart can resume where it stopped. Read-only against the venue.
 let _candlesJob = null;
 const CANDLES_STATE_KEY = 'candles_backfill';
-async function candlesState() {
-  try { const [r] = await db.execute('SELECT config_value FROM system_config WHERE config_key = ?', [CANDLES_STATE_KEY]); return r.length ? JSON.parse(r[0].config_value) : null; }
+const CANDLES_DAILY_KEY = 'candles_backfill_daily';   // #373 separate progress for the daily job
+async function candlesState(key) {
+  try { const [r] = await db.execute('SELECT config_value FROM system_config WHERE config_key = ?', [key || CANDLES_STATE_KEY]); return r.length ? JSON.parse(r[0].config_value) : null; }
   catch (e) { return null; }
 }
 async function candlesSave(st) {
   st.updated_at = new Date().toISOString();
-  await db.execute('INSERT INTO system_config (config_key, config_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)', [CANDLES_STATE_KEY, JSON.stringify(st)]).catch(() => {});
+  await db.execute('INSERT INTO system_config (config_key, config_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)', [st.key || CANDLES_STATE_KEY, JSON.stringify(st)]).catch(() => {});
 }
 async function candlesBackfillWorker(st, opt = {}) {
   const H = 3600000, gapMs = opt.gapMs != null ? opt.gapMs : 700, sleep = opt.sleep || ((ms) => new Promise(r => setTimeout(r, ms)));
+  const ivMin = Number(st.interval_min || 60), STEP = 100 * ivMin * 60000, DAILY = ivMin >= 1440;   // #373
+  const londonDay = (t) => new Date(t).toLocaleDateString('en-CA', { timeZone: 'Europe/London' });
   const sinceFloor = Number(st.since_ms);
   for (const coin of st.order) {
     const c = st.coins[coin];
@@ -6131,8 +6151,8 @@ async function candlesBackfillWorker(st, opt = {}) {
     let empties = 0, errors = 0;
     while (until > sinceFloor) {
       if (_candlesJob && _candlesJob.stop) { c.status = 'stopped'; break; }
-      const since = Math.max(sinceFloor, until - 100 * H);
-      const qs = new URLSearchParams({ interval: '60', since: String(since), until: String(until) });
+      const since = Math.max(sinceFloor, until - STEP);
+      const qs = new URLSearchParams({ interval: String(ivMin), since: String(since), until: String(until) });
       let r;
       try { r = await revolutRequest('GET', '/candles/' + coin + '-USD?' + qs.toString(), null, null, { withStatus: true }); }
       catch (e) { r = { status: 0, ok: false, body: { message: e.message } }; }
@@ -6158,13 +6178,14 @@ async function candlesBackfillWorker(st, opt = {}) {
         for (const k of list) {
           const t = Number(k.start); const o = parseFloat(k.open), h = parseFloat(k.high), l = parseFloat(k.low), cl = parseFloat(k.close);
           if (!(t > 0) || !(o > 0) || !(h > 0) || !(l > 0) || !(cl > 0)) continue;
-          const hb = new Date(Math.floor(t / H) * H).toISOString().slice(0, 19).replace('T', ' ');
+          const hb = DAILY ? londonDay(t) : new Date(Math.floor(t / H) * H).toISOString().slice(0, 19).replace('T', ' ');
           rows.push([coin + '-USD', hb, o, h, l, cl]);
           if (!c.earliest_ms || t < c.earliest_ms) c.earliest_ms = t;
         }
         if (rows.length) {
-          const ph = rows.map(() => "(?, ?, ?, ?, ?, ?, 0, 'venue')").join(', ');
-          const [ins] = await db.execute('INSERT IGNORE INTO price_intraday_hourly (symbol, hour_bucket, open_px, high_px, low_px, close_px, sample_count, source) VALUES ' + ph, rows.flat());
+          const [ins] = DAILY
+            ? await db.execute('INSERT IGNORE INTO price_daily_ohlc (symbol, day, open_px, high_px, low_px, close_px, source) VALUES ' + rows.map(() => "(?, ?, ?, ?, ?, ?, 'venue')").join(', '), rows.flat())
+            : await db.execute('INSERT IGNORE INTO price_intraday_hourly (symbol, hour_bucket, open_px, high_px, low_px, close_px, sample_count, source) VALUES ' + rows.map(() => "(?, ?, ?, ?, ?, ?, 0, 'venue')").join(', '), rows.flat());
           c.candles = (c.candles || 0) + rows.length;
           c.inserted = (c.inserted || 0) + (ins && ins.affectedRows != null ? ins.affectedRows : 0);
         }
@@ -6186,12 +6207,15 @@ async function candlesBackfillWorker(st, opt = {}) {
 // #371 (#378) One way to START a backfill, shared by the manual action and the automatic new-coin check, so the two
 // can never drift apart. Returns the coins it will actually fetch. Resumes: finished coins and each unfinished
 // coin's progress are kept; new coins are added.
-async function startCandlesBackfill(coins, sinceStr, reason) {
+async function startCandlesBackfill(coins, sinceStr, reason, interval) {
   if (_candlesJob) return { ok: false, error: 'already running' };
-  const sinceMs = Date.parse((sinceStr || '2023-01-01') + 'T00:00:00Z');
+  const daily = interval === '1d';   // #373
+  const sinceMs = Date.parse((sinceStr || (daily ? '2020-01-01' : '2023-01-01')) + 'T00:00:00Z');
   if (!(sinceMs > 0)) throw new Error('candles_since must be YYYY-MM-DD');
-  let st = await candlesState();
+  const key = daily ? CANDLES_DAILY_KEY : CANDLES_STATE_KEY;
+  let st = await candlesState(key);
   if (!st || st.since_ms !== sinceMs) st = { since_ms: sinceMs, coins: {}, order: [] };
+  st.key = key; st.interval_min = daily ? 1440 : 60;
   for (const c of coins) { if (!st.coins[c]) st.coins[c] = { status: 'queued' }; if (!st.order.includes(c)) st.order.push(c); }
   st.running = true; st.started_at = new Date().toISOString(); delete st.finished_at; st.reason = reason || 'manual';
   await candlesSave(st);
@@ -6201,7 +6225,9 @@ async function startCandlesBackfill(coins, sinceStr, reason) {
     _candlesJob = null;
     const shown = (reason && reason !== 'manual') ? todo : fin.order;   // automatic runs only report the coins they fetched
     const lines = shown.map(c => { const x = fin.coins[c] || {}; return c + ': ' + (x.status === 'done' ? 'history from ' + (x.history_from || '?') + ' (' + (x.inserted || 0) + ' new hours)' : x.status + (x.note ? ' - ' + x.note.slice(0, 60) : '')); });
-    await sendTelegram('\ud83d\udd6f\ufe0f <b>' + (reason && reason !== 'manual' ? 'Price history ready for new coin' + (shown.length > 1 ? 's' : '') : 'Candle history backfill finished') + '</b>\n\n' + lines.join('\n')).catch(() => {});
+    await sendTelegram('\ud83d\udd6f\ufe0f <b>' + (reason && reason !== 'manual' ? 'Price history ready for new coin' + (shown.length > 1 ? 's' : '') : 'Candle history backfill finished') + (daily ? ' (daily)' : '') + '</b>\n\n' + lines.join('\n')).catch(() => {});
+    // #373 a new coin's hourly history is followed by its daily history
+    if (reason === 'new coin' && !daily && todo.length) await startCandlesBackfill(todo, null, 'new coin', '1d').catch(() => {});
   }).catch(async (e) => { _candlesJob = null; st.running = false; st.error = e.message; await candlesSave(st); console.error('[candles] job failed:', e.message); });
   return { ok: true, started: true, coins: st.order.length, to_fetch: todo };
 }
@@ -6227,7 +6253,15 @@ async function candlesAutoBackfillNew() {
   const withHistory = new Set(have.map(x => String(x.symbol || '').toUpperCase().replace(/-USD$/, '')));
   // skip: already has venue history, or a previous attempt settled it (not listed on Revolut X / done)
   const need = coins.filter(c => !withHistory.has(c) && !(known[c] && ['done', 'not_on_revolut_x'].includes(known[c].status)));
-  if (!need.length) return { new_coins: [] };
+  if (!need.length) {
+    // #373 hourly is complete - is any coin missing its DAILY history?
+    const dst = await candlesState(CANDLES_DAILY_KEY); const dknown = dst && dst.coins ? dst.coins : {};
+    const [dh] = await db.execute('SELECT DISTINCT symbol FROM price_daily_ohlc');
+    const withDaily = new Set(dh.map(x => String(x.symbol || '').toUpperCase().replace(/-USD$/, '')));
+    const needDaily = coins.filter(c => !withDaily.has(c) && !(known[c] && known[c].status === 'not_on_revolut_x') && !(dknown[c] && ['done', 'not_on_revolut_x'].includes(dknown[c].status)));
+    if (!needDaily.length) return { new_coins: [] };
+    return { new_coins_daily: needDaily, started: await startCandlesBackfill(needDaily, null, 'new coin', '1d') };
+  }
   console.log('[candles] new coin(s) without history - backfilling: ' + need.join(', '));
   const r = await startCandlesBackfill(need, null, 'new coin');
   return { new_coins: need, started: r };
@@ -6244,7 +6278,7 @@ async function candlesTopUp(opt = {}) {
   try { const [have] = await db.execute("SELECT DISTINCT symbol FROM price_intraday_hourly WHERE source = 'venue'"); for (const x of have) set.add(String(x.symbol || '').toUpperCase().replace(/-USD$/, '')); } catch (e) {}
   const coins = [...set].filter(c => !skip.has(c)).sort();
   const until = Math.floor(Date.now() / H) * H, since = until - 48 * H;
-  const out = { at: new Date().toISOString(), coins: coins.length, new_rows: 0, errors: [], not_listed: [] };
+  const out = { at: new Date().toISOString(), coins: coins.length, new_rows: 0, new_daily_rows: 0, errors: [], not_listed: [] };
   for (const coin of coins) {
     const qs = new URLSearchParams({ interval: '60', since: String(since), until: String(until) });
     let r = null;
@@ -6265,6 +6299,16 @@ async function candlesTopUp(opt = {}) {
         const [ins] = await db.execute('INSERT IGNORE INTO price_intraday_hourly (symbol, hour_bucket, open_px, high_px, low_px, close_px, sample_count, source) VALUES ' + rows.map(() => "(?, ?, ?, ?, ?, ?, 0, 'venue')").join(', '), rows.flat());
         out.new_rows += (ins && ins.affectedRows) || 0;
       }
+      // #373 the last 4 days at daily resolution (closed days only get inserted once; INSERT IGNORE)
+      const dqs = new URLSearchParams({ interval: '1440', since: String(until - 4 * 24 * H), until: String(until) });
+      let d = null; try { d = await revolutRequest('GET', '/candles/' + coin + '-USD?' + dqs.toString(), null, null, { withStatus: true }); } catch (e) { d = null; }
+      if (d && d.ok && d.body && Array.isArray(d.body.data)) {
+        const drows = [];
+        for (const k of d.body.data) { const t = Number(k.start), o = parseFloat(k.open), h = parseFloat(k.high), l = parseFloat(k.low), c = parseFloat(k.close);
+          if (t > 0 && o > 0 && h > 0 && l > 0 && c > 0 && t + 24 * H <= Date.now()) drows.push([coin + '-USD', new Date(t).toLocaleDateString('en-CA', { timeZone: 'Europe/London' }), o, h, l, c]); }   // closed days only
+        if (drows.length) { const [di] = await db.execute('INSERT IGNORE INTO price_daily_ohlc (symbol, day, open_px, high_px, low_px, close_px, source) VALUES ' + drows.map(() => "(?, ?, ?, ?, ?, ?, 'venue')").join(', '), drows.flat()); out.new_daily_rows += (di && di.affectedRows) || 0; }
+      } else if (d && !d.ok && d.status !== 400 && d.status !== 404) out.errors.push(coin + ' daily (HTTP ' + d.status + ')');
+      await sleep(gapMs);
     }
     await sleep(gapMs);
   }
@@ -16788,12 +16832,13 @@ let rows;
       dnd_retrace_pct:  z.coerce.number().optional().describe('configure_dnd: #160 %% of move price must retrace before trough arms (default 50)'),
       dnd_bounce_pct:   z.coerce.number().optional().describe('configure_dnd: #160 %% bounce off trough to trigger rebuy (default 8)'),
       // #355 Only a real true/false: z.coerce.boolean('false') is TRUE, which would turn the reconciler ON when asked to switch it off.
+      candles_interval: z.enum(['1h', '1d']).optional().describe('#373 candles_backfill start/status: 1h (default, ~1 year kept by Revolut) or 1d (daily, 2.5+ years - reaches the 2024-25 bull run)'),
       candles_op:       z.enum(['start', 'status', 'stop', 'topup', 'check_new', 'probe']).optional().describe('#370/#371 candles_backfill: start (or resume) / status / stop / topup (last 48 h for every tracked coin, runs nightly) / check_new (backfill coins that have no history yet, runs hourly)'),
       candles_symbols:  zLoose(z.array(z.string())).optional().describe('#370 candles_backfill start: coins to fill, e.g. ["NEAR","ENA"]. Omit for held coins plus every coin with a saved strategy.'),
       candles_since:    z.string().optional().describe('#370 candles_backfill start: earliest date to reach back to, YYYY-MM-DD (default 2023-01-01; each coin stops at its own listing date)'),
       reconciler_on:    z.preprocess(v => v === 'true' ? true : (v === 'false' ? false : v), z.boolean()).optional().describe('#355 reconciler_switch: true = record card payments/deposits from Revolut transactions (runs once immediately, then every 30 min); false = dry run only'),
     },
-    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, away_buy_usd, away_sell_pct, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam, manual_only_symbols: manualOnlyParam, title, detail, category, status: devStatus, source: devSource, related_symbol: relSymbol, dev_log_id, active_workstream, progress, open_threads, next_action, recent_decision, recent_decisions, cs_status, cs_role, cs_theme, cs_strategy_md, pm_decision, pm_principle_tag, pm_conviction, pm_captured_by, pm_supersedes_id, dev_decision, dev_principle_tag, dev_cross_thread, dev_alternatives, dev_related_log, dev_supersedes_id, journal_id, tax_lot_id, away_action, away_coins, sell_floors, per_coin_enabled, catalyst_id, catalyst, catalyst_date, catalyst_type, expected_impact, priced_in_risk, catalyst_confidence, catalyst_source, catalyst_status, abn_alert_floor_pct, abn_broad_floor_pct, abn_broad_threshold, abn_cooldown_min, dnd_action, dnd_coins, dnd_arm_pct, dnd_trail_pct, dnd_sell_pct, dnd_retrace_pct, dnd_bounce_pct, conviction, bull_case, bear_case, invalidation_triggers, supporting_refs, tn_enabled, tn_min_severity, tn_cooldown_min, cat_kind, cat_key, cat_name, cat_active, cat_description, cat_detection_signals, cat_detection_criteria, cat_data_available, cat_data_gap, cat_dev_ref, cat_status, cat_what_it_does, cat_when_it_wins, cat_when_it_loses, cat_parameters, cat_conflicts, cat_evidence, cat_notes, ledger_confirm, ledger_run_id, reconciler_on, candles_op, candles_symbols, candles_since }) => {
+    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, away_buy_usd, away_sell_pct, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam, manual_only_symbols: manualOnlyParam, title, detail, category, status: devStatus, source: devSource, related_symbol: relSymbol, dev_log_id, active_workstream, progress, open_threads, next_action, recent_decision, recent_decisions, cs_status, cs_role, cs_theme, cs_strategy_md, pm_decision, pm_principle_tag, pm_conviction, pm_captured_by, pm_supersedes_id, dev_decision, dev_principle_tag, dev_cross_thread, dev_alternatives, dev_related_log, dev_supersedes_id, journal_id, tax_lot_id, away_action, away_coins, sell_floors, per_coin_enabled, catalyst_id, catalyst, catalyst_date, catalyst_type, expected_impact, priced_in_risk, catalyst_confidence, catalyst_source, catalyst_status, abn_alert_floor_pct, abn_broad_floor_pct, abn_broad_threshold, abn_cooldown_min, dnd_action, dnd_coins, dnd_arm_pct, dnd_trail_pct, dnd_sell_pct, dnd_retrace_pct, dnd_bounce_pct, conviction, bull_case, bear_case, invalidation_triggers, supporting_refs, tn_enabled, tn_min_severity, tn_cooldown_min, cat_kind, cat_key, cat_name, cat_active, cat_description, cat_detection_signals, cat_detection_criteria, cat_data_available, cat_data_gap, cat_dev_ref, cat_status, cat_what_it_does, cat_when_it_wins, cat_when_it_loses, cat_parameters, cat_conflicts, cat_evidence, cat_notes, ledger_confirm, ledger_run_id, reconciler_on, candles_op, candles_symbols, candles_since, candles_interval }) => {
       // Make hodl_symbols accessible in configure_auto_execute via params object
       const params = { hodl_symbols: hodlSymbolsParam, manual_only_symbols: manualOnlyParam };
 
@@ -17544,7 +17589,7 @@ let rows;
       } else if (action === 'candles_backfill') {
         // #370 Revolut candle history into price_intraday_hourly. Background job; read-only against the venue.
         const op = candles_op || 'status';
-        let st = await candlesState();
+        let st = await candlesState(candles_interval === '1d' ? CANDLES_DAILY_KEY : CANDLES_STATE_KEY);   // #373
         if (op === 'status') return { content: [{ type: 'text', text: JSON.stringify(candlesSummary(st), null, 2) }] };
         if (op === 'stop') {
           if (_candlesJob) _candlesJob.stop = true;
@@ -17578,7 +17623,7 @@ let rows;
         if (op === 'check_new') { const t = await candlesAutoBackfillNew(); return { content: [{ type: 'text', text: JSON.stringify(t, null, 2) }] }; }   // #371
         if (_candlesJob) return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'already running', status: candlesSummary(st) }) }] };
         const coins = Array.isArray(candles_symbols) && candles_symbols.length ? candles_symbols.map(s => String(s).toUpperCase().replace(/-USD$/, '')) : await candlesTrackedCoins();
-        const r = await startCandlesBackfill(coins, candles_since, 'manual');   // #371: the same path the automatic check uses
+        const r = await startCandlesBackfill(coins, candles_since, 'manual', candles_interval || '1h');   // #371/#373
         return { content: [{ type: 'text', text: JSON.stringify(Object.assign(r, { since: candles_since || '2023-01-01',
           note: 'Runs in the background (~100 hours of history per request, paced). Check with candles_op status; a Telegram message arrives when it finishes.' })) }] };
       } else if (action === 'reconciler_switch') {
@@ -18922,7 +18967,7 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
       symbol:            z.string().describe('Coin symbol, e.g. IDEX or IDEX-USD'),
       start:             z.string().describe('Window start, UTC, e.g. 2026-08-20 or 2026-08-20T00:00:00Z'),
       end:               z.string().describe('Window end, UTC, inclusive'),
-      source:            z.enum(['hourly','intraday']).optional().describe("hourly = OHLC rollup, retained indefinitely (default). intraday = 2-min captures, ~30d retention, finer trigger detection"),
+      source:            z.enum(['hourly','intraday','daily']).optional().describe("hourly = OHLC rollup + Revolut candles (~1 year, default). intraday = 2-min captures, ~30d. daily = Revolut daily candles, 2.5+ years incl. the 2024-25 bull run (#373) - use for wide profiles (multi-day arm windows); too coarse for tight trails"),
       initial_qty:       z.coerce.number().describe('Starting position size in tokens'),
       initial_usd:       z.coerce.number().optional().describe('Starting USD. Default 0. Simulated sale proceeds are credited during replay, so the ladder can self-fund even from 0'),
       arm_pump_pct:      z.coerce.number().describe('Pump %% that arms a cycle, e.g. 20'),
