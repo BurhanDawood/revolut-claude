@@ -6677,13 +6677,18 @@ async function runLadderLiveTick(nowMs) {
 // with the USD + USDT actually available, and says so ONCE when it stops being covered, and once when it is covered
 // again. Monitoring only - it changes nothing about trading.
 async function checkRingfenceCoverage() {
-  let need = 0; const parts = [];
-  const [rows] = await db.execute('SELECT symbol, sale_proceeds_usd FROM pump_armed_rules WHERE active = 1 AND sale_price IS NOT NULL AND sale_proceeds_usd > 0');
-  for (const r of rows) { const v = Number(r.sale_proceeds_usd); if (v > 0) { need += v; parts.push(String(r.symbol).replace('-USD', '') + ' $' + v.toFixed(2)); } }
+  // #378 (PM #36) ACTIONABLE: each pending buy-back is listed with what it sold at and the level the price must reach
+  // before the buy-back can start, and the available cash is allocated smallest-first so the message says exactly
+  // WHICH cycles are uncovered and by how much - a decision Bryan can make from the notification.
+  const cycles = [];
+  const [rows] = await db.execute('SELECT symbol, sale_proceeds_usd, sale_price, retrace_gate FROM pump_armed_rules WHERE active = 1 AND sale_price IS NOT NULL AND sale_proceeds_usd > 0');
+  for (const r of rows) { const v = Number(r.sale_proceeds_usd); if (v > 0) cycles.push({ coin: String(r.symbol).replace('-USD', ''), usd: v, sold_at: r.sale_price != null ? Number(r.sale_price) : null, starts_at: r.retrace_gate != null ? Number(r.retrace_gate) : null, kind: 'loop' }); }
   try {
     const [ll] = await db.execute('SELECT symbol, state FROM ladder_live WHERE active = 1');
-    for (const x of ll) { let st = null; try { st = JSON.parse(x.state); } catch (e) { st = null; } const v = st && Number(st.reserved_left) > 0 ? Number(st.reserved_left) : 0; if (v > 0) { need += v; parts.push(String(x.symbol).replace('-USD', '') + ' (ladder) $' + v.toFixed(2)); } }
+    for (const x of ll) { let st = null; try { st = JSON.parse(x.state); } catch (e) { st = null; } const v = st && Number(st.reserved_left) > 0 ? Number(st.reserved_left) : 0;
+      if (v > 0) cycles.push({ coin: String(x.symbol).replace('-USD', ''), usd: v, sold_at: st.sale_price != null ? Number(st.sale_price) : null, starts_at: st.gate != null ? Number(st.gate) : null, kind: 'ladder' }); }
   } catch (e) { /* no ladder table yet */ }
+  const need = cycles.reduce((a, c) => a + c.usd, 0);
   let have;
   try {
     const b = await revolutRequest('GET', '/balances'); const list = Array.isArray(b) ? b : (b && (b.data || b.balances)) || [];
@@ -6691,13 +6696,25 @@ async function checkRingfenceCoverage() {
     const av = (c) => { const x = list.find(r => String(r.currency || '').toUpperCase() === c); return x ? parseFloat(x.available) || 0 : 0; };
     have = av('USD') + av('USDT');
   } catch (e) { return { skipped: 'balances: ' + e.message }; }
+  // allocate the cash smallest-first: that covers as many cycles as possible and names the rest
+  let left = have; const sorted = cycles.slice().sort((x, y) => x.usd - y.usd);
+  for (const c of sorted) { c.covered = left + 0.01 >= c.usd; if (c.covered) left -= c.usd; }
   let prev = null;
   try { const [p] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'ringfence_alert'"); if (p.length) prev = JSON.parse(p[0].config_value); } catch (e) { prev = null; }
   const short = need > 0.01 && have + 0.01 < need * 0.99;
-  const now = { short, need: Number(need.toFixed(2)), have: Number(have.toFixed(2)), parts, at: new Date().toISOString() };
+  const fmt = (v) => v == null ? '?' : '$' + Number(v).toPrecision(4);
+  const now = { short, need: Number(need.toFixed(2)), have: Number(have.toFixed(2)), shortfall: Number(Math.max(0, need - have).toFixed(2)),
+    uncovered: sorted.filter(c => !c.covered).map(c => c.coin), cycles: sorted, at: new Date().toISOString() };
   if (short && (!prev || !prev.short || Math.abs(Number(prev.need) - need) > need * 0.05)) {
-    await sendTelegram('\u26a0\ufe0f <b>Buy-back cash is not there</b>\n\n$' + need.toFixed(2) + ' is set aside for pending buy-backs (' + parts.join(', ') + '), but only $' + have.toFixed(2) +
-      ' is available in USD/USDT.\nIf a buy-back triggers now it can only use what is there - after a full exit, that is the difference between getting back in and not.').catch(() => {});
+    const line = (c) => '\u2022 ' + c.coin + (c.kind === 'ladder' ? ' (ladder)' : '') + ': $' + c.usd.toFixed(2) + ' set aside - sold at ' + fmt(c.sold_at) +
+      (c.starts_at != null ? '; buy-back starts once the price falls to ' + fmt(c.starts_at) : '');
+    const unc = sorted.filter(c => !c.covered), cov = sorted.filter(c => c.covered);
+    await sendTelegram('\u26a0\ufe0f <b>Buy-back cash is not there - short by $' + (need - have).toFixed(2) + '</b>\n\n' +
+      '$' + need.toFixed(2) + ' is set aside for pending buy-backs; $' + have.toFixed(2) + ' is available in USD/USDT.\n\n' +
+      '<b>Not covered:</b>\n' + unc.map(line).join('\n') +
+      (cov.length ? '\n\n<b>Covered:</b>\n' + cov.map(line).join('\n') : '') +
+      '\n\nAfter a full exit, an uncovered buy-back is the difference between getting back in and not. Adding $' + (need - have).toFixed(2) +
+      ' in USD or USDT covers everything; otherwise the buy-back can only use what is there.').catch(() => {});
   } else if (!short && prev && prev.short) {
     await sendTelegram('\u2705 Buy-back cash is covered again ($' + have.toFixed(2) + ' available for $' + need.toFixed(2) + ' set aside).').catch(() => {});
   }
@@ -18192,7 +18209,7 @@ let rows;
           return { content: [{ type: 'text', text: JSON.stringify({
             read_only: true, balances_read: balancesOk, prices_read: Object.keys(px).length > 0,
             master_auto_execute: ae.enabled === true,
-            note: 'The pump-loop sell path does NOT check master_auto_execute - turning it off does not stop these loops. Floor priority: sell_floors > rule floor > entry price.',
+            note: 'The pump-loop sell path does NOT check master_auto_execute - turning it off does not stop these loops. Floor (#377): the HIGHEST of real cost + 0.5% and any stored override - an override can raise it, never lower it; no cost and no override = sale blocked.',
             dnd_coins: dndCoins, loops
           }, null, 2) }] };
         }
