@@ -16205,16 +16205,17 @@ let rows;
   server.tool('get_trading_data',
     'Get trading journal entries, active alerts, trader context/profile, rebalancing history, and dev_bridge messages',
     {
-      include: zLoose(z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'dev_bridge', 'coin_strategy', 'reconciliation', 'ledger', 'tax_lots', 'catalysts', 'thesis', 'nudges', 'dev_health', 'dev_recommendations', 'volatility_baseline', 'shadow_fills', 'abnormal_events', 'strategy_catalogue', 'exchange_orders', 'transactions', 'reconcile_transactions', 'ledger_rebuild', 'slippage_audit', 'regime_frequency', 'all']))).optional()
+      include: zLoose(z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'dev_bridge', 'coin_strategy', 'reconciliation', 'ledger', 'tax_lots', 'catalysts', 'thesis', 'nudges', 'dev_health', 'dev_recommendations', 'volatility_baseline', 'shadow_fills', 'abnormal_events', 'strategy_catalogue', 'exchange_orders', 'transactions', 'reconcile_transactions', 'ledger_rebuild', 'slippage_audit', 'regime_frequency', 'order_journal_gap', 'all']))).optional()
         .describe('What data to fetch — defaults to all. dev_bridge, coin_strategy and reconciliation are never included in all; request them explicitly'),
       symbol:           z.string().optional().describe('Filter journal by coin e.g. NEAR'),
       limit:            z.coerce.number().optional().describe('Max journal entries to return, default 10'),
+      days:             z.coerce.number().optional().describe('#D1 order_journal_gap window in days (default 30, max 90)'),
       bridge_id:        z.coerce.number().optional().describe('Fetch a specific dev_bridge row by id'),
       ref_devlog_id:    z.coerce.number().optional().describe('Filter dev_bridge by referenced dev_log id'),
       include_consumed: zLoose(z.boolean()).optional().describe('Include consumed dev_bridge rows (default false)'),
       mark_consumed:    zLoose(z.boolean()).optional().describe('Mark returned dev_bridge rows consumed (default false)'),
     },
-    async ({ include, symbol, limit, bridge_id, ref_devlog_id, include_consumed, mark_consumed } = {}) => {
+    async ({ include, symbol, limit, bridge_id, ref_devlog_id, include_consumed, mark_consumed, days } = {}) => {
       const fetch = include || ['all'];
       const fetchAll = fetch.includes('all');
       const limitInt = parseInt(limit) || 10;
@@ -16963,6 +16964,76 @@ let rows;
           sa.how_to_read = 'slip_pct is positive when the fill was WORSE than the price the system booked (sold lower / bought higher). A ladder sell leg fires during a retrace, so "sell / falling" is the bucket to price a leg from - not "overall". Buckets with thin_sample true have fewer than 5 trades: treat as anecdote. Limit orders are excluded (they choose their own price); price_intraday only reaches back ~30 days, so older orders show condition "unknown".';
         } catch (e) { sa.error = e.message; }
         result.slippage_audit = sa;   // #361: the surrounding function's accumulator is `result` (was `out` - runtime error)
+      }
+
+      // #D1 order_journal_gap (Fable spec, READ-ONLY): classify every filled venue order in the window as matched to the
+      // journal (by venue_order_id / via pending_orders / fuzzy) or unmatched, and split the unmatched into conversion /
+      // system_unrecorded (the system placed it - pending_orders row - and never journaled it: EVERY row listed) /
+      // manual_unrecorded (app-side trade the detector missed); split at the #345 cutover and per day after it.
+      // Reuses fetchExchangeOrders (one order-list path). Writes NOTHING.
+      if (fetch.includes('order_journal_gap')) {
+        const G = { generated_at: new Date().toISOString() };
+        try {
+          const CUTOVER = 1789983388334;   // 2026-09-21 08:56:28 UTC (#345 rebuild / reconciler cutover)
+          const gDays = Math.min(Math.max(parseInt(days) || 30, 1), 90);
+          const gSym = symbol ? (symbol.toUpperCase().includes('-USD') ? symbol.toUpperCase() : symbol.toUpperCase() + '-USD') : null;
+          const base = (x) => String(x || '').toUpperCase().replace('/', '-').replace(/-(USD|USDT|USDC|EUR|GBP)$/, '');
+          const ms = (x) => { if (x == null) return null; const n = Number(x); if (Number.isFinite(n) && n > 1e11) return n; const t = Date.parse(x); return Number.isFinite(t) ? t : null; };
+          const ex = await fetchExchangeOrders(gDays, gSym);
+          G.window = { from: new Date(Date.now() - gDays * 86400000).toISOString(), to: new Date().toISOString(), days: gDays, cutover: new Date(CUTOVER).toISOString() };
+          if (ex.errors && ex.errors.length) G.fetch_errors = ex.errors;
+          const universe = ex.orders.filter(o => Number(o.filled_quantity) > 0);
+          G.universe = universe.length;
+          const ids = universe.map(o => String(o.id || '')).filter(Boolean);
+          // journal rows and pending rows for the window (+1 day either side for the 60-min fuzzy window)
+          const since = new Date(Date.now() - (gDays + 1) * 86400000);
+          const [jr] = await db.execute('SELECT id, symbol, action, quantity, created_at, venue_order_id FROM trading_journal WHERE created_at >= ?', [since]);
+          const jByVoid = new Map(); for (const j of jr) if (j.venue_order_id) jByVoid.set(String(j.venue_order_id), j);
+          const jIds = new Set(jr.map(j => Number(j.id)));
+          let pend = [];
+          if (ids.length) { const ph = ids.map(() => '?').join(','); [pend] = await db.execute('SELECT order_id, symbol, side, order_type, status, quantity, linked_journal_id FROM pending_orders WHERE order_id IN (' + ph + ')', ids); }
+          const pById = new Map(pend.map(p => [String(p.order_id), p]));
+          const sideOfAction = (a) => { a = String(a || '').toLowerCase(); return (a === 'sell' || a === 'reduce') ? 'sell' : ((a === 'buy' || a === 'add') ? 'buy' : null); };
+          const fuzzyJ = (o, fq, t) => jr.find(j => base(j.symbol) === base(o.symbol) && sideOfAction(j.action) === String(o.side || '').toLowerCase() &&
+            fq > 0 && Math.abs(Number(j.quantity) - fq) / fq <= 0.01 && t != null && Math.abs(new Date(j.created_at).getTime() - t) <= 60 * 60000);
+          const CONV = new Set(['USDT', 'USDC', 'USD', 'GBP', 'EUR']);
+          const matched = { venue_order_id: 0, pending_orders: 0, fuzzy: 0 };
+          const un = []; const sysRows = [];
+          for (const o of universe) {
+            const id = String(o.id || ''), fq = Number(o.filled_quantity), t = ms(o.updated_date) || ms(o.created_date);
+            if (id && jByVoid.has(id)) { matched.venue_order_id++; continue; }
+            const p = pById.get(id);
+            if (p && ((p.linked_journal_id && jIds.has(Number(p.linked_journal_id))) || fuzzyJ(o, fq, t))) { matched.pending_orders++; continue; }
+            if (!p && fuzzyJ(o, fq, t)) { matched.fuzzy++; continue; }
+            const b = base(o.symbol);
+            const cls = CONV.has(b) ? 'conversion' : (p ? 'system_unrecorded' : 'manual_unrecorded');
+            const row = { id, symbol: o.symbol, side: o.side, filled_quantity: fq, average_fill_price: o.average_fill_price, updated_date: t ? new Date(t).toISOString() : null, cls, period: t != null && t >= CUTOVER ? 'after' : 'before', usd: o.average_fill_price ? Number((fq * o.average_fill_price).toFixed(2)) : null };
+            un.push(row);
+            if (cls === 'system_unrecorded') sysRows.push({ id, symbol: o.symbol, side: o.side, filled_quantity: fq, average_fill_price: o.average_fill_price, updated_date: row.updated_date,
+              pending_status: p.status, pending_order_type: p.order_type, pending_source: 'unknown (not recorded by pending_orders)' });
+          }
+          G.matched = matched;
+          const cnt = (f) => un.filter(f).length;
+          const byClassPeriod = {}; for (const c of ['system_unrecorded', 'manual_unrecorded', 'conversion']) byClassPeriod[c] = { before: cnt(r => r.cls === c && r.period === 'before'), after: cnt(r => r.cls === c && r.period === 'after') };
+          const perDay = {}; for (const r of un) if (r.period === 'after' && r.updated_date) { const d = r.updated_date.slice(0, 10); perDay[d] = (perDay[d] || 0) + 1; }
+          const bySym = {};
+          for (const r of un) { const k = r.symbol || 'UNKNOWN'; const s = bySym[k] || (bySym[k] = { total: 0, system_unrecorded: 0, manual_unrecorded: 0, conversion: 0, buys: 0, sells: 0, usd: 0 });
+            s.total++; s[r.cls]++; if (String(r.side).toLowerCase() === 'buy') s.buys++; else s.sells++; s.usd = Number((s.usd + (r.usd || 0)).toFixed(2)); }
+          const watch = {}; for (const c of ['FET', 'COTI', 'IDEX', 'HIGH', 'CC', 'JTO']) watch[c] = bySym[c + '-USD'] || { total: 0, system_unrecorded: 0, manual_unrecorded: 0, conversion: 0, buys: 0, sells: 0, usd: 0 };
+          G.unmatched = {
+            total: un.length,
+            by_class: { conversion: cnt(r => r.cls === 'conversion'), system_unrecorded: cnt(r => r.cls === 'system_unrecorded'), manual_unrecorded: cnt(r => r.cls === 'manual_unrecorded') },
+            by_period: { before_cutover: cnt(r => r.period === 'before'), after_cutover: cnt(r => r.period === 'after') },
+            by_class_and_period: byClassPeriod, after_cutover_per_day: perDay, by_symbol: bySym, pm_watchlist: watch,
+            system_unrecorded_rows: sysRows   // ALL of them - this class is read row by row
+          };
+          G.sample_manual_unrecorded = un.filter(r => r.cls === 'manual_unrecorded').sort((a, b) => String(b.updated_date).localeCompare(String(a.updated_date))).slice(0, 25);
+          G.notes = ['fuzzy matches are coincidence, not key (same coin + side, qty within 1%, within 60 min)',
+            'pending_orders does not record which path created an order, so pending_source is unknown',
+            'symbols compared by base coin (the journal stores JTO, JTO-USD and JTO/USD forms)',
+            'read-only: this include writes nothing'];
+        } catch (e) { G.error = e.message; }
+        result.order_journal_gap = G;
       }
 
       if (fetch.includes('exchange_orders')) {
