@@ -7091,12 +7091,28 @@ async function runLadderLiveTick(nowMs) {
 // Trade-off recorded: an abandon forgoes a rebuy with ~8% measured fill probability (pm #20). Ladder cycles: out of scope.
 async function evaluateAbandons() {
   let rows = [];
-  try { [rows] = await db.execute('SELECT symbol, sale_at, uncovered_since, sale_proceeds_usd, COALESCE(abandon_hours, 336) AS ah, COALESCE(uncovered_abandon_hours, 48) AS uh FROM pump_armed_rules WHERE active = 1 AND sale_price IS NOT NULL'); }
+  try { [rows] = await db.execute('SELECT symbol, sale_at, uncovered_since, sale_proceeds_usd, COALESCE(abandon_hours, 336) AS ah, COALESCE(uncovered_abandon_hours, 48) AS uh, sale_price, ceiling_pct, ceiling_override FROM pump_armed_rules WHERE active = 1 AND sale_price IS NOT NULL'); }
   catch (e) { return; }
   const now = Date.now();
+  // #A3 prices once per run for the ceiling test. Unreadable tickers -> no ceiling abandons this run (time/cash clocks still run).
+  const px = {};
+  if (rows.length) {
+    try {
+      const t = await revolutRequest('GET', '/tickers'); const list = Array.isArray(t) ? t : (t && t.data) || [];
+      for (const k of list) { if (!k.symbol) continue; const p = parseFloat(k.last_price || k.mid || k.ask || k.bid); if (p) px[k.symbol.replace('/', '-')] = p; }
+    } catch (e) { console.error('[abandon] #A3 tickers unreadable - ceiling test skipped this run:', e.message); }
+  }
   for (const r of rows) {
     try {
       const sym = String(r.symbol);
+      // #A3 THIRD TRIGGER (Bryan B14): the ceiling is a GIVE-UP rule. Price above sale x (1 + effective ceiling) = the pump
+      // continued; give the buy-back up so the loop can re-arm on this move. Runs first; exactly one abandon per cycle.
+      const price = px[sym] || null, sale = Number(r.sale_price) > 0 ? Number(r.sale_price) : null;
+      const ceil = effectiveCeilingPct(r, now);
+      if (price && sale && price > sale * (1 + ceil.pct / 100)) {
+        await abandonCycle(sym, 'price ' + ceil.pct + '% above the sale - the pump continued', 'Sold at ' + fmtPriceShort(sale) + ', now ' + fmtPriceShort(price) + ' (+' + ((price / sale - 1) * 100).toFixed(1) + '%; ceiling ' + ceil.pct + '%, ' + ceil.source + '). The buy-back is given up so the loop can re-arm on this move.');
+        continue;
+      }
       const ageH = r.sale_at ? (now - new Date(r.sale_at).getTime()) / 3600000 : null;
       const uncH = r.uncovered_since ? (now - new Date(r.uncovered_since).getTime()) / 3600000 : null;
       if (ageH !== null && ageH > Number(r.ah)) {
@@ -12330,7 +12346,8 @@ const CEILING_DEFAULT_PCT = 50;
 function effectiveCeilingPct(row, nowMs) {
   const base = Number(row && row.ceiling_pct) > 0 ? Number(row.ceiling_pct) : CEILING_DEFAULT_PCT;
   let ov = row && row.ceiling_override; if (typeof ov === 'string') { try { ov = JSON.parse(ov); } catch (e) { ov = null; } }
-  if (ov && Number(ov.value) > 0 && ov.expires_at && new Date(ov.expires_at).getTime() > (nowMs || Date.now())) return { pct: Number(ov.value), source: 'override until ' + ov.expires_at };
+  if (ov && Number(ov.value) > 0 && ov.expires_at && new Date(ov.expires_at).getTime() > (nowMs || Date.now()))   // #A3 an override can only TIGHTEN (never loosen a stored 15 to 49)
+    return { pct: Math.min(base, Number(ov.value)), source: Number(ov.value) < base ? 'override until ' + ov.expires_at : (base === CEILING_DEFAULT_PCT ? 'default' : 'stored') };
   return { pct: base, source: base === CEILING_DEFAULT_PCT ? 'default' : 'stored' };
 }
 // #P0 write-time rule for a ceiling_override (set_pump_armed_rule, #282 validator discipline): all four fields, value in
@@ -19669,7 +19686,7 @@ let rows;
                                   : { pass: null, reason: sc.reason }; })() : null,
               loop_enabled: rule ? Number(rule.loop_enabled) : null, armed: rule ? Number(rule.armed) : null,
               arm: rule ? `+${Number(rule.arm_pump_pct)}% in ${Number(rule.arm_window_min)}min, trail ${Number(rule.trail_pct)}%, sell ${Number(rule.sell_pct)}%` : null,
-              ceiling: rule ? (() => { const c = effectiveCeilingPct(rule); return c.pct + '% (' + c.source + ')'; })() : null,   // #P0 buy-back ceiling
+              ceiling: rule ? (() => { const c = effectiveCeilingPct(rule); const sp = Number(rule.sale_price); return c.pct + '% (' + c.source + ')' + (sp > 0 ? ' - gives up above ' + fmtPriceShort(sp * (1 + c.pct / 100)) : ' - no live cycle'); })() : null,   // #P0 buy-back ceiling; #A3 the give-up price
               blocked_by: blocks,
               verdict: !canSell ? 'CANNOT auto-sell' : (price != null && eff != null && price <= eff ? `can auto-sell only above ${r6(eff)} (price is at/below the floor)` : 'CAN auto-sell on a trail breach')
             };
