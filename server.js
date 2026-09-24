@@ -1791,6 +1791,8 @@ await safeAddColumn('entry_prices', 'created_at',           'TIMESTAMP DEFAULT C
     UNIQUE KEY uq_item (source_id, item_id),
     INDEX idx_pub (published_at)
   )`).catch(()=>{});
+  // #419 on-demand verbatim transcript (manage_sources transcribe). Duplicate-column error on later boots is expected.
+  await db.execute('ALTER TABLE feed_items ADD COLUMN full_transcript MEDIUMTEXT NULL').catch(()=>{});
 
 // Backfill: preserve current entry prices as original for all existing positions
 await db.execute(`
@@ -15510,25 +15512,90 @@ async function youtubeItemContent(u, det) {
 }
 let videoScanInProgress = false, lastVideoScan = null;   // lastVideoScan: { at, errors[] } - read by the morning brief
 // #417 daily scan: every active YouTube source, one at a time. Loud: source-level errors are kept for the brief.
-async function scanYoutubeSources() {
+// #419 also on demand: Telegram /videos (notify: true -> a per-video summary when done) and the PM's scan_videos
+// (background, polled with scan_status). opts.sourceId limits it to one channel. Progress lives in lastVideoScan.
+async function scanYoutubeSources(opts = {}) {
   if (videoScanInProgress) { console.log('[feeds] #417 video scan already running - skipped'); return null; }
   videoScanInProgress = true;
   const errors = [];
+  let startedDb = null;
+  try { const [[r]] = await db.execute('SELECT NOW() AS t'); startedDb = r.t; } catch (e) { startedDb = null; }
+  lastVideoScan = { at: Date.now(), started: Date.now(), running: true, errors, sources_total: 0, sources_done: 0, trigger: opts.trigger || 'cron', startedDb };
   try {
     if (!process.env.YOUTUBE_API_KEY) errors.push('YOUTUBE_API_KEY is not set - no channel can be read');
     else {
-      const [srcs] = await db.execute("SELECT id FROM source_feeds WHERE active = 1 AND type = 'youtube' ORDER BY id");
+      const [srcs] = opts.sourceId
+        ? await db.execute("SELECT id FROM source_feeds WHERE active = 1 AND type = 'youtube' AND id = ?", [opts.sourceId])
+        : await db.execute("SELECT id FROM source_feeds WHERE active = 1 AND type = 'youtube' ORDER BY id");
+      if (opts.sourceId && !srcs.length) errors.push('source ' + opts.sourceId + ' is not an active YouTube source');
+      lastVideoScan.sources_total = srcs.length;
       for (const s of srcs) {
         try { const r = await fetchAllSources(s.id); for (const e of (r.errors || [])) errors.push(e.source + ': ' + e.error); }
         catch (e) { errors.push('source ' + s.id + ': ' + e.message); }
+        lastVideoScan.sources_done++;
       }
     }
   } finally {
-    lastVideoScan = { at: Date.now(), errors };
+    lastVideoScan.at = Date.now(); lastVideoScan.running = false;
     videoScanInProgress = false;
   }
   console.log('[feeds] #417 video scan done' + (errors.length ? ' - errors: ' + errors.join(' | ') : ''));
+  if (opts.notify) { try { await sendTelegram(await videoScanSummary(startedDb, errors)); } catch (e) { console.error('[feeds] #419 scan summary failed:', e.message); } }
   return lastVideoScan;
+}
+// #419 videos stored since `since` (a DB timestamp) -> [{ id, name, title, url, watched, reason, summary }]
+async function videosSince(since) {
+  const [rows] = since
+    ? await db.execute("SELECT fi.id, sf.name, fi.title, fi.url, fi.transcript FROM feed_items fi JOIN source_feeds sf ON sf.id = fi.source_id WHERE sf.type = 'youtube' AND fi.created_at >= ? ORDER BY sf.id, fi.published_at DESC", [since])
+    : [[]];
+  return rows.map(v => {
+    const t = String(v.transcript || ''), watched = t.startsWith('[Gemini video notes]');
+    const reason = watched ? null : ((/^\[Not watched: ([^\]]*)\]/.exec(t) || [])[1] || 'title only');
+    const summary = watched ? ((/SUMMARY:\s*([^\n]+)/i.exec(t) || [])[1] || t.replace('[Gemini video notes]', '').trim().split('\n')[0] || '').trim() : '';
+    return { id: v.id, name: v.name, title: v.title, url: v.url, watched, reason, summary };
+  });
+}
+// Telegram summary of one scan (escaped; capped under Telegram's 4096 limit)
+async function videoScanSummary(since, errors) {
+  const vids = await videosSince(since);
+  const w = vids.filter(v => v.watched), nw = vids.filter(v => !v.watched);
+  let m = '🎥 <b>Video scan done</b> - ' + w.length + ' watched' + (nw.length ? ', ' + nw.length + ' not watched' : '') + (vids.length ? '' : ' (no new videos in the last 48 h)');
+  for (const v of w) m += '\n\n• <b>' + escTg(v.name) + '</b> - ' + escTg(v.title) + (v.summary ? '\n' + escTg(v.summary.slice(0, 280)) : '');
+  if (nw.length) m += '\n\n<b>Not watched:</b>' + nw.map(v => '\n• ' + escTg(v.name) + ' - ' + escTg(v.title) + ' (' + escTg(v.reason) + ')').join('');
+  if (errors && errors.length) m += '\n\n⚠️ <b>Errors:</b> ' + escTg(errors.join(' | ').slice(0, 500));
+  m += '\n\nAsk Claude PM for detail - it can read the full notes or a full transcript.';
+  if (m.length > 3900) m = m.slice(0, 3850) + '\n[...]';
+  return m;
+}
+// #419 on-demand VERBATIM transcript of one public video (PM's transcribe). Only the public URL goes to Gemini.
+async function geminiVideoTranscript(videoId) {
+  const key = process.env.GEMINI_API_KEY;
+  if (!key) throw new Error('GEMINI_API_KEY is not set on Railway');
+  const model = String(process.env.GEMINI_VIDEO_MODEL || process.env.GEMINI_MODEL || 'gemini-3.8-flash').trim().replace(/^models\//, '');
+  const body = { contents: [{ role: 'user', parts: [{ file_data: { file_uri: 'https://www.youtube.com/watch?v=' + videoId } }, { text: 'Transcribe the spoken audio of this video verbatim as plain text, in order, from start to finish. Output only the transcript - no summary, no commentary, no timestamps. Start a new paragraph when the speaker or topic changes.' }] }],
+    generationConfig: { temperature: 0, maxOutputTokens: 32768 } };
+  const ctl = new AbortController(); const to = setTimeout(() => ctl.abort(), 300000);
+  let r, raw;
+  try {
+    r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent', {
+      method: 'POST', signal: ctl.signal, headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key }, body: JSON.stringify(body)
+    });
+    raw = await r.text();
+  } catch (e) {
+    throw new Error(e && e.name === 'AbortError' ? 'Gemini timed out after 300 s' : 'Gemini request failed: ' + (e && e.message));
+  } finally { clearTimeout(to); }
+  let j = null; try { j = JSON.parse(raw); } catch (e) { j = null; }
+  if (!r.ok) throw new Error('Gemini HTTP ' + r.status + (r.status === 429 ? ' (rate limit or quota)' : '') + ': ' + String((j && j.error && j.error.message) || raw || '').slice(0, 160));
+  const cand = j && Array.isArray(j.candidates) ? j.candidates[0] : null;
+  const parts = cand && cand.content && Array.isArray(cand.content.parts) ? cand.content.parts : [];
+  const text = parts.filter(p => p && typeof p.text === 'string' && !p.thought).map(p => p.text).join('').trim();
+  if (text.length < 100) throw new Error('Gemini returned ' + (text ? 'only ' + text.length + ' chars' : 'no text') + (cand && cand.finishReason ? ' (finishReason ' + cand.finishReason + ')' : ''));
+  return { text, truncated: !!(cand && cand.finishReason === 'MAX_TOKENS') };
+}
+function youtubeIdFromUrl(u) {
+  const s = String(u || '').trim();
+  const m = /(?:v=|youtu\.be\/|\/shorts\/|\/live\/|\/embed\/)([A-Za-z0-9_-]{11})/.exec(s) || /^([A-Za-z0-9_-]{11})$/.exec(s);
+  return m ? m[1] : null;
 }
 // #417 one plain Gemini text call (the feed analysis). Throws with a readable reason on any failure.
 let lastFeedAnalysisError = null;
@@ -21001,7 +21068,7 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
   server.tool('manage_sources',
     'Content intelligence feed: manage YouTube channels and RSS news sources and fetch and read their analysed items. Monitors crypto analyst videos and news articles, pulls transcripts, and analyses each against saved coin strategies for thesis impact. Actions: add (add a YouTube or RSS source with coin tags), list (list all sources), remove (deactivate a source), fetch_now (fetch and analyse latest videos/articles now), get_items (read analysed content items, filter by coin). Use for morning brief content review, checking what analysts and news say about held coins, source feed management, and in-chat research.',
     {
-      action:      z.enum(['add','list','remove','fetch_now','get_items']).describe('add: add source; list: list all; remove: deactivate; fetch_now: fetch new items now; get_items: retrieve analysed items'),
+      action:      z.enum(['add','list','remove','fetch_now','get_items','scan_videos','scan_status','get_notes','transcribe']).describe('add: add source; list: list all; remove: deactivate; fetch_now: fetch new items now (waits - slow for YouTube, prefer scan_videos); get_items: retrieve analysed items; scan_videos (#419): Gemini watches new videos from every YouTube source (or source_id) IN THE BACKGROUND - returns at once, poll scan_status; scan_status: progress + the videos stored by the last scan with a one-line summary each; get_notes: Gemini\'s full notes + the analysis for item_id; transcribe: Gemini\'s VERBATIM transcript of item_id or video_url (slow, up to ~5 min; stored on the item)'),
       source_id:   z.coerce.number().optional().describe('source id for remove/fetch_now/get_items'),
       name:        z.string().optional().describe('add: display name e.g. CoinBureau'),
       type:        z.enum(['youtube','rss']).optional().describe('add: source type'),
@@ -21010,8 +21077,11 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
       coin_filter: z.string().optional().describe('get_items: filter by coin tag e.g. NEAR'),
       limit:       z.coerce.number().optional().describe('get_items: max items (default 10)'),
       since_days:  z.coerce.number().optional().describe('get_items: only items from last N days (default 7)'),
+      item_id:     z.coerce.number().optional().describe('get_notes / transcribe: feed item id (from get_items or scan_status)'),
+      video_url:   z.string().optional().describe('transcribe: any public YouTube URL or 11-char video id, when there is no item_id'),
+      include_notes: z.preprocess(v => (v === 'true' ? true : v === 'false' ? false : v), z.boolean()).optional().describe('get_items: also return each item\'s notes/text (capped at 4000 chars)'),
     },
-    async ({ action, source_id, name, type, url, coin_tags, coin_filter, limit, since_days }) => {
+    async ({ action, source_id, name, type, url, coin_tags, coin_filter, limit, since_days, item_id, video_url, include_notes }) => {
       let result = {};
       if (action === 'add') {
         let channelId = null;
@@ -21026,14 +21096,39 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
         await db.execute('UPDATE source_feeds SET active=0 WHERE id=?', [source_id]);
         result = { ok: true, action: 'remove', source_id };
       } else if (action === 'fetch_now') {
-        const fr = await fetchAllSources(source_id || null);
-        result = { ok: true, action: 'fetch_now', ...fr };
+        if (videoScanInProgress) { result = { ok: false, action: 'fetch_now', error: 'a video scan is running - wait for it (scan_status) so no video is watched twice' }; }
+        else { const fr = await fetchAllSources(source_id || null); result = { ok: true, action: 'fetch_now', ...fr }; }
+      } else if (action === 'scan_videos') {   // #419 background: returns at once
+        if (videoScanInProgress) result = { ok: false, action: 'scan_videos', error: 'a scan is already running', progress: lastVideoScan };
+        else { scanYoutubeSources({ sourceId: source_id || null, trigger: 'pm' }).catch(e => console.error('[feeds] #419 PM scan failed:', e.message)); result = { ok: true, action: 'scan_videos', started: true, scope: source_id ? 'source ' + source_id : 'all active YouTube sources', next: 'poll scan_status every minute or two; each watched video takes ~10-60 s' }; }
+      } else if (action === 'scan_status') {
+        const s = lastVideoScan;
+        const vids = s && s.startedDb ? await videosSince(s.startedDb) : [];
+        result = { ok: true, action: 'scan_status', running: videoScanInProgress, last_scan: s ? { trigger: s.trigger, started: new Date(s.started || s.at).toISOString(), finished: s.running ? null : new Date(s.at).toISOString(), sources_done: s.sources_done, sources_total: s.sources_total, errors: s.errors } : null,
+          note: s ? undefined : 'no scan since the last restart', videos: vids };
+      } else if (action === 'get_notes') {
+        const [rows] = await db.execute('SELECT fi.id, sf.name source_name, fi.title, fi.url, fi.published_at, fi.transcript AS notes, fi.analysis, fi.thesis_status, (fi.full_transcript IS NOT NULL) AS has_full_transcript FROM feed_items fi JOIN source_feeds sf ON sf.id = fi.source_id WHERE fi.id = ?', [item_id || 0]);
+        result = rows.length ? { ok: true, action: 'get_notes', item: rows[0] } : { ok: false, action: 'get_notes', error: 'no feed item ' + item_id };
+      } else if (action === 'transcribe') {
+        let vid = null, row = null;
+        if (item_id) { const [rows] = await db.execute('SELECT id, title, url, full_transcript FROM feed_items WHERE id = ?', [item_id]); row = rows[0] || null; vid = row ? youtubeIdFromUrl(row.url) : null; }
+        else vid = youtubeIdFromUrl(video_url);
+        if (!vid) result = { ok: false, action: 'transcribe', error: item_id ? (row ? 'item ' + item_id + ' is not a YouTube video' : 'no feed item ' + item_id) : 'give item_id or a YouTube video_url' };
+        else if (row && row.full_transcript) result = { ok: true, action: 'transcribe', item_id: row.id, title: row.title, cached: true, chars: row.full_transcript.length, transcript: row.full_transcript.slice(0, 60000), clipped: row.full_transcript.length > 60000 };
+        else {
+          try {
+            const t = await geminiVideoTranscript(vid);
+            if (row) await db.execute('UPDATE feed_items SET full_transcript = ? WHERE id = ?', [t.text, row.id]);
+            result = { ok: true, action: 'transcribe', item_id: row ? row.id : null, video_id: vid, title: row ? row.title : null, cached: false, chars: t.text.length, model_stopped_early: t.truncated, transcript: t.text.slice(0, 60000), clipped: t.text.length > 60000 };
+          } catch (e) { result = { ok: false, action: 'transcribe', video_id: vid, error: e.message }; }
+        }
       } else if (action === 'get_items') {
         const days = since_days || 7; const lim = limit || 10;
         const daysInt = Math.max(1, parseInt(days) || 7);
         const limInt = Math.max(1, parseInt(lim) || 10);
-        let q = `SELECT fi.id, sf.name source_name, fi.title, fi.published_at, fi.url, fi.thesis_status, fi.analysis, fi.coin_tags FROM feed_items fi JOIN source_feeds sf ON fi.source_id=sf.id WHERE fi.published_at > DATE_SUB(NOW(), INTERVAL ${daysInt} DAY)`;
+        let q = `SELECT fi.id, sf.name source_name, fi.title, fi.published_at, fi.url, fi.thesis_status, fi.analysis, fi.coin_tags${include_notes ? ', LEFT(fi.transcript, 4000) AS notes' : ''} FROM feed_items fi JOIN source_feeds sf ON fi.source_id=sf.id WHERE fi.published_at > DATE_SUB(NOW(), INTERVAL ${daysInt} DAY)`;
         const p = [];
+        if (source_id) { q += ' AND fi.source_id = ?'; p.push(source_id); }   // #419 the filter was accepted but never applied
         if (coin_filter) { q += ' AND JSON_CONTAINS(fi.coin_tags, JSON_QUOTE(?))'; p.push(coin_filter.toUpperCase()); }
         q += ` ORDER BY fi.published_at DESC LIMIT ${limInt}`;
         const [items] = await db.execute(q, p);
@@ -22241,6 +22336,13 @@ app.post('/telegram-webhook', async (req, res) => {
     // NOTE: this creates ZERO new autonomous execution paths — /status reads,
     // /pause and /resume only toggle a flag the existing double-gate already reads.
     // #416 /brief - send the morning brief now (the same function as the 09:15 cron). Reads prices and news; never trades.
+    // #419 /videos - Gemini watches new videos from every YouTube source now; a summary arrives when done. Never trades.
+    if (commandText === 'videos') {
+      if (videoScanInProgress) { await sendReply('A video scan is already running (' + ((lastVideoScan && lastVideoScan.sources_done) || 0) + ' of ' + ((lastVideoScan && lastVideoScan.sources_total) || '?') + ' channels done). The summary will arrive when it finishes.'); return res.status(200).json({ ok: true }); }
+      await sendReply('🎥 Scanning the YouTube channels - Gemini watches each new video (up to 3 per channel, under an hour long). A summary arrives when it is done, usually within 10 minutes.');
+      scanYoutubeSources({ notify: true, trigger: 'telegram' }).catch(async (e) => { console.error('[feeds] /videos failed:', e.message); await sendTelegram('❌ Video scan failed: ' + escTg(e.message)); });
+      return res.status(200).json({ ok: true });
+    }
     if (commandText === 'brief') {
       if (briefingInProgress) { await sendReply('A brief is already being built - it will arrive shortly.'); return res.status(200).json({ ok: true }); }
       await sendReply('🌅 Building the morning brief - about a minute.');
