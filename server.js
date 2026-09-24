@@ -16974,7 +16974,7 @@ let rows;
       if (fetch.includes('order_journal_gap')) {
         const G = { generated_at: new Date().toISOString() };
         try {
-          const CUTOVER = 1789983388334;   // 2026-09-21 08:56:28 UTC (#345 rebuild / reconciler cutover)
+          const CUTOVER = 1789983388334;   // 2026-09-21 09:36:28 UTC (#345 rebuild / reconciler cutover; the spec's 08:56:28 was a conversion slip)
           const gDays = Math.min(Math.max(parseInt(days) || 30, 1), 90);
           const gSym = symbol ? (symbol.toUpperCase().includes('-USD') ? symbol.toUpperCase() : symbol.toUpperCase() + '-USD') : null;
           const base = (x) => String(x || '').toUpperCase().replace('/', '-').replace(/-(USD|USDT|USDC|EUR|GBP)$/, '');
@@ -16998,17 +16998,17 @@ let rows;
             fq > 0 && Math.abs(Number(j.quantity) - fq) / fq <= 0.01 && t != null && Math.abs(new Date(j.created_at).getTime() - t) <= 60 * 60000);
           const CONV = new Set(['USDT', 'USDC', 'USD', 'GBP', 'EUR']);
           const matched = { venue_order_id: 0, pending_orders: 0, fuzzy: 0 };
-          const un = []; const sysRows = [];
+          const un = []; const sysRows = []; const allK = [];   // #D1 rev 2: every order with its bucket
           for (const o of universe) {
             const id = String(o.id || ''), fq = Number(o.filled_quantity), t = ms(o.updated_date) || ms(o.created_date);
-            if (id && jByVoid.has(id)) { matched.venue_order_id++; continue; }
+            if (id && jByVoid.has(id)) { matched.venue_order_id++; allK.push({ o, fq, t, bucket: 'matched_system' }); continue; }
             const p = pById.get(id);
-            if (p && ((p.linked_journal_id && jIds.has(Number(p.linked_journal_id))) || fuzzyJ(o, fq, t))) { matched.pending_orders++; continue; }
-            if (!p && fuzzyJ(o, fq, t)) { matched.fuzzy++; continue; }
+            if (p && ((p.linked_journal_id && jIds.has(Number(p.linked_journal_id))) || fuzzyJ(o, fq, t))) { matched.pending_orders++; allK.push({ o, fq, t, bucket: 'matched_system' }); continue; }
+            if (!p && fuzzyJ(o, fq, t)) { matched.fuzzy++; allK.push({ o, fq, t, bucket: 'matched_manual_fuzzy' }); continue; }
             const b = base(o.symbol);
             const cls = CONV.has(b) ? 'conversion' : (p ? 'system_unrecorded' : 'manual_unrecorded');
             const row = { id, symbol: o.symbol, side: o.side, filled_quantity: fq, average_fill_price: o.average_fill_price, updated_date: t ? new Date(t).toISOString() : null, cls, period: t != null && t >= CUTOVER ? 'after' : 'before', usd: o.average_fill_price ? Number((fq * o.average_fill_price).toFixed(2)) : null };
-            un.push(row);
+            un.push(row); allK.push({ o, fq, t, bucket: cls });
             if (cls === 'system_unrecorded') sysRows.push({ id, symbol: o.symbol, side: o.side, filled_quantity: fq, average_fill_price: o.average_fill_price, updated_date: row.updated_date,
               pending_status: p.status, pending_order_type: p.order_type, pending_source: 'unknown (not recorded by pending_orders)' });
           }
@@ -17027,11 +17027,55 @@ let rows;
             by_class_and_period: byClassPeriod, after_cutover_per_day: perDay, by_symbol: bySym, pm_watchlist: watch,
             system_unrecorded_rows: sysRows   // ALL of them - this class is read row by row
           };
+          // #D1 rev 2 TAX-LOT EFFECT on EVERY order. sell: recorded if the lots disposed at one timestamp within +-60 min
+          // sum to filled_quantity within 1% (HIFO can close several lots per sale); buy: recorded if an open/partial lot
+          // was acquired within +-60 min with quantity within 1%. Tests the hypothesis that tax_lots is written only from
+          // autoLogTrade (+ /api/tax/backfill), so system-placed orders read "missing".
+          try {
+            const [dis] = await db.execute('SELECT symbol, disposed_at, disposed_quantity FROM tax_lots WHERE disposed_at IS NOT NULL AND disposed_at >= ?', [since]);
+            const [acq] = await db.execute("SELECT symbol, acquired_at, quantity FROM tax_lots WHERE acquired_at >= ? AND lot_status IN ('open', 'partial')", [since]);
+            const groups = new Map();   // base|disposed_at -> summed qty
+            for (const r of dis) { const k = base(r.symbol) + '|' + new Date(r.disposed_at).getTime(); groups.set(k, (groups.get(k) || 0) + Number(r.disposed_quantity || 0)); }
+            const within = (a, b) => b > 0 && Math.abs(a - b) / b <= 0.01;
+            const effectOf = (o, fq, t) => {
+              if (t == null || !(fq > 0)) return 'missing';
+              const b = base(o.symbol), side = String(o.side || '').toLowerCase();
+              if (side === 'sell') { for (const [k, q] of groups) { const [gb, gt] = k.split('|'); if (gb === b && Math.abs(Number(gt) - t) <= 60 * 60000 && within(q, fq)) return 'recorded'; } return 'missing'; }
+              return acq.some(r => base(r.symbol) === b && Math.abs(new Date(r.acquired_at).getTime() - t) <= 60 * 60000 && within(Number(r.quantity), fq)) ? 'recorded' : 'missing';
+            };
+            const eff = { matched_system: { recorded: 0, missing: 0 }, matched_manual_fuzzy: { recorded: 0, missing: 0 }, system_unrecorded: { recorded: 0, missing: 0 }, manual_unrecorded: { recorded: 0, missing: 0 }, conversion: 'n/a' };
+            const effBySide = {};
+            for (const k of allK) {
+              if (k.bucket === 'conversion') continue;
+              const e = effectOf(k.o, k.fq, k.t); eff[k.bucket][e]++;
+              const sd = String(k.o.side || '').toLowerCase() || '?'; const key = k.bucket + ':' + sd;
+              effBySide[key] = effBySide[key] || { recorded: 0, missing: 0 }; effBySide[key][e]++;
+            }
+            G.unmatched.tax_lot_effect = eff;
+            G.unmatched.tax_lot_effect_by_side = effBySide;
+            // open lots vs the live balance, per base coin (the view exchange_orders already makes, in the same output)
+            const [ol] = await db.execute("SELECT symbol, SUM(quantity) AS q FROM tax_lots WHERE lot_status = 'open' GROUP BY symbol");
+            const lotsQ = {}; for (const r of ol) lotsQ[base(r.symbol)] = (lotsQ[base(r.symbol)] || 0) + Number(r.q || 0);
+            const held = {};
+            try { const bal = await revolutRequest('GET', '/balances'); const rows = Array.isArray(bal) ? bal : (bal && (bal.data || bal.balances)) || [];
+              for (const b of rows) { const cur = base(b.currency || b.symbol || b.asset); const q = Number(b.balance != null ? b.balance : (Number(b.available || 0) + Number(b.reserved || 0))); if (cur && q) held[cur] = (held[cur] || 0) + q; } }
+            catch (be) { G.balance_fetch_error = be.message; }
+            const tvb = {};
+            for (const c of new Set([...Object.keys(lotsQ), ...Object.keys(held)])) {
+              if (CONV.has(c)) continue;
+              const lq = lotsQ[c] || 0, bq = held[c] || 0; if (!lq && !bq) continue;
+              if (gSym && c !== base(gSym)) continue;
+              tvb[c] = { open_lots_qty: Number(lq.toFixed(8)), balance: Number(bq.toFixed(8)), ratio: bq > 0 ? Number((lq / bq).toFixed(2)) : null };
+            }
+            G.unmatched.tax_lots_vs_balance = tvb;
+          } catch (te) { G.tax_lot_effect_error = te.message; }
           G.sample_manual_unrecorded = un.filter(r => r.cls === 'manual_unrecorded').sort((a, b) => String(b.updated_date).localeCompare(String(a.updated_date))).slice(0, 25);
           G.notes = ['fuzzy matches are coincidence, not key (same coin + side, qty within 1%, within 60 min)',
             'pending_orders does not record which path created an order, so pending_source is unknown',
             'symbols compared by base coin (the journal stores JTO, JTO-USD and JTO/USD forms)',
-            'read-only: this include writes nothing'];
+            'read-only: this include writes nothing',
+            'tax_lot_effect (rev 2): a buy whose lot has since been fully SOLD no longer reads open/partial, so it counts as missing although it was recorded - read buy "missing" as an upper bound',
+            'matched_system = matched by venue_order_id or via pending_orders; matched_manual_fuzzy = matched by coincidence'];
         } catch (e) { G.error = e.message; }
         result.order_journal_gap = G;
       }
