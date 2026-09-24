@@ -1426,6 +1426,15 @@ await safeAddColumn('pump_armed_rules', 'buy_tiers',         'JSON NULL'); // [[
 await safeAddColumn('pump_armed_rules', 'tier_state',        'JSON NULL'); // engine-owned runtime state; never written by config
 await safeAddColumn('pump_armed_rules', 'tier_cooldown_min', 'INT DEFAULT 15'); // intra-cycle tier fills; global cooldown_minutes still governs re-arming
 await safeAddColumn('pump_armed_rules', 'min_tier_usd',      'DECIMAL(10,2) DEFAULT 2.0'); // dust guard
+// #A2 abandon clocks: 14 d since the sale, or 48 h of the buy-back cash missing (NULL = the default)
+await safeAddColumn('pump_armed_rules', 'sale_at',                 'DATETIME NULL');
+await safeAddColumn('pump_armed_rules', 'uncovered_since',         'DATETIME NULL');
+await safeAddColumn('pump_armed_rules', 'abandon_hours',           'INT NULL');   // NULL = 336 (14 d, transferred from WIDE@1/@2 - not validated for single mode)
+await safeAddColumn('pump_armed_rules', 'uncovered_abandon_hours', 'INT NULL');   // NULL = 48
+try {   // #A2 cycles already live at deploy start their 14-day clock NOW, never retroactively
+  const [bf] = await db.execute('UPDATE pump_armed_rules SET sale_at = NOW() WHERE sale_price IS NOT NULL AND sale_at IS NULL');
+  console.log('[boot] #A2 abandon clocks ready - sale_at backfilled for ' + (bf && bf.affectedRows || 0) + ' live cycle(s)');
+} catch (e) { console.error('[boot] #A2 sale_at backfill failed:', e.message); }
 await db.execute("UPDATE pump_armed_rules SET rebuy_pct = 20.0 WHERE symbol = 'BOBA-USD'"); // #131 BOBA default
 await safeAddColumn('auto_trade_rules', 'proceeds_reserved', 'DECIMAL(12,2) NULL');
 await safeAddColumn('trading_journal',  'source',          "VARCHAR(20) DEFAULT 'auto_detected'");
@@ -4369,7 +4378,7 @@ async function armReboundTracker(symbol, salePrice, referenceBase, params, saleP
       saleProceedsUsd: proceedsUsd
     });
     await db.execute(
-      'UPDATE pump_armed_rules SET sale_price=?, reference_base=?, retrace_gate=?, trough_low=NULL, trough_armed=0, sale_proceeds_usd=? WHERE symbol=? AND active=1',
+      'UPDATE pump_armed_rules SET sale_price=?, reference_base=?, retrace_gate=?, trough_low=NULL, trough_armed=0, sale_proceeds_usd=?, sale_at=NOW(), uncovered_since=NULL WHERE symbol=? AND active=1',   // #A2 start the clocks
       [salePrice, referenceBase, retraceGate, proceedsUsd, symbol]
     );
     const coinBaseTrk = symbol.replace('-USD', '');
@@ -6970,13 +6979,38 @@ async function runLadderLiveTick(nowMs) {
 // aside for pending buy-backs (single-mode sale_proceeds_usd on live cycles + the live ladder's reserved_left)
 // with the USD + USDT actually available, and says so ONCE when it stops being covered, and once when it is covered
 // again. Monitoring only - it changes nothing about trading.
+// ── #A2 ABANDON A PENDING BUY-BACK ON TIME (14 d) OR ON CASH MISSING (48 h) ─────────────────────────
+// Single-mode loops had no abandon: a tracker waited forever. #278's fossils ($217.81 ring-fenced against $0) came from
+// waiting for cash already spent - with ~$0 cash that is the normal state - so the coverage clock clears one in two
+// days, the time clock in fourteen. Abandon = abandonCycle (#A1): release + reopen + one truthful Telegram.
+// Trade-off recorded: an abandon forgoes a rebuy with ~8% measured fill probability (pm #20). Ladder cycles: out of scope.
+async function evaluateAbandons() {
+  let rows = [];
+  try { [rows] = await db.execute('SELECT symbol, sale_at, uncovered_since, sale_proceeds_usd, COALESCE(abandon_hours, 336) AS ah, COALESCE(uncovered_abandon_hours, 48) AS uh FROM pump_armed_rules WHERE active = 1 AND sale_price IS NOT NULL'); }
+  catch (e) { return; }
+  const now = Date.now();
+  for (const r of rows) {
+    try {
+      const sym = String(r.symbol);
+      const ageH = r.sale_at ? (now - new Date(r.sale_at).getTime()) / 3600000 : null;
+      const uncH = r.uncovered_since ? (now - new Date(r.uncovered_since).getTime()) / 3600000 : null;
+      if (ageH !== null && ageH > Number(r.ah)) {
+        await abandonCycle(sym, 'no bounce within ' + Number(r.ah) + ' h of the sale', 'Sold ' + ageH.toFixed(0) + ' h ago; the buy-back never fired.');
+      } else if (uncH !== null && uncH > Number(r.uh)) {
+        await abandonCycle(sym, 'buy-back cash missing for ' + Number(r.uh) + ' h', '$' + Number(r.sale_proceeds_usd || 0).toFixed(2) + ' was set aside but has not been available for ' + uncH.toFixed(0) + ' h.');
+      }
+    } catch (e) { console.error('[abandon] ' + r.symbol + ':', e.message); }
+  }
+}
+
 async function checkRingfenceCoverage() {
   // #378 (PM #36) ACTIONABLE: each pending buy-back is listed with what it sold at and the level the price must reach
   // before the buy-back can start, and the available cash is allocated smallest-first so the message says exactly
   // WHICH cycles are uncovered and by how much - a decision Bryan can make from the notification.
   const cycles = [];
-  const [rows] = await db.execute('SELECT symbol, sale_proceeds_usd, sale_price, retrace_gate FROM pump_armed_rules WHERE active = 1 AND sale_price IS NOT NULL AND sale_proceeds_usd > 0');
-  for (const r of rows) { const v = Number(r.sale_proceeds_usd); if (v > 0) cycles.push({ coin: String(r.symbol).replace('-USD', ''), usd: v, sold_at: r.sale_price != null ? Number(r.sale_price) : null, starts_at: r.retrace_gate != null ? Number(r.retrace_gate) : null, kind: 'loop' }); }
+  const [rows] = await db.execute('SELECT symbol, sale_proceeds_usd, sale_price, retrace_gate, uncovered_since, COALESCE(uncovered_abandon_hours, 48) AS uh FROM pump_armed_rules WHERE active = 1 AND sale_price IS NOT NULL AND sale_proceeds_usd > 0');
+  for (const r of rows) { const v = Number(r.sale_proceeds_usd); if (v > 0) cycles.push({ symbol: String(r.symbol), coin: String(r.symbol).replace('-USD', ''), usd: v, sold_at: r.sale_price != null ? Number(r.sale_price) : null, starts_at: r.retrace_gate != null ? Number(r.retrace_gate) : null, kind: 'loop',
+    uncovered_since: r.uncovered_since ? new Date(r.uncovered_since).getTime() : null, uh: Number(r.uh) || 48 }); }
   try {
     const [ll] = await db.execute('SELECT symbol, state FROM ladder_live WHERE active = 1');
     for (const x of ll) { let st = null; try { st = JSON.parse(x.state); } catch (e) { st = null; } const v = st && Number(st.reserved_left) > 0 ? Number(st.reserved_left) : 0;
@@ -6990,9 +7024,18 @@ async function checkRingfenceCoverage() {
     const av = (c) => { const x = list.find(r => String(r.currency || '').toUpperCase() === c); return x ? parseFloat(x.available) || 0 : 0; };
     have = av('USD') + av('USDT');
   } catch (e) { return { skipped: 'balances: ' + e.message }; }
-  // allocate the cash smallest-first: that covers as many cycles as possible and names the rest
-  let left = have; const sorted = cycles.slice().sort((x, y) => x.usd - y.usd);
+  // #A2 allocate the cash LARGEST-first (Bryan decision 6): fill odds are ~8% whatever the size while a filled rebuy's
+  // edge scales with it, so the larger options are kept. The alert and the abandon clock read the SAME allocation.
+  let left = have; const sorted = cycles.slice().sort((x, y) => y.usd - x.usd);
   for (const c of sorted) { c.covered = left + 0.01 >= c.usd; if (c.covered) left -= c.usd; }
+  // #A2 the cash-missing clock: set on the first uncovered read, CLEARED when coverage returns (restarts, never resumes)
+  for (const c of sorted) {
+    if (c.kind !== 'loop') continue;
+    try {
+      if (!c.covered) { await db.execute('UPDATE pump_armed_rules SET uncovered_since = COALESCE(uncovered_since, NOW()) WHERE symbol = ? AND active = 1 AND sale_price IS NOT NULL', [c.symbol]); if (!c.uncovered_since) c.uncovered_since = Date.now(); }
+      else { await db.execute('UPDATE pump_armed_rules SET uncovered_since = NULL WHERE symbol = ? AND active = 1', [c.symbol]); c.uncovered_since = null; }
+    } catch (e) { console.error('[ringfence] #A2 clock write failed for ' + c.symbol + ':', e.message); }
+  }
   let prev = null;
   try { const [p] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'ringfence_alert'"); if (p.length) prev = JSON.parse(p[0].config_value); } catch (e) { prev = null; }
   const short = need > 0.01 && have + 0.01 < need * 0.99;
@@ -7001,7 +7044,8 @@ async function checkRingfenceCoverage() {
     uncovered: sorted.filter(c => !c.covered).map(c => c.coin), cycles: sorted, at: new Date().toISOString() };
   if (short && (!prev || !prev.short || Math.abs(Number(prev.need) - need) > need * 0.05)) {
     const line = (c) => '\u2022 ' + c.coin + (c.kind === 'ladder' ? ' (ladder)' : '') + ': $' + c.usd.toFixed(2) + ' set aside - sold at ' + fmt(c.sold_at) +
-      (c.starts_at != null ? '; buy-back starts once the price falls to ' + fmt(c.starts_at) : '');
+      (c.starts_at != null ? '; buy-back starts once the price falls to ' + fmt(c.starts_at) : '') +
+      (!c.covered && c.kind === 'loop' && c.uncovered_since ? ' (uncovered for ' + Math.floor((Date.now() - c.uncovered_since) / 3600000) + 'h / abandons at ' + c.uh + 'h)' : '');   // #A2
     const unc = sorted.filter(c => !c.covered), cov = sorted.filter(c => c.covered);
     await sendTelegram('\u26a0\ufe0f <b>Buy-back cash is not there - short by $' + (need - have).toFixed(2) + '</b>\n\n' +
       '$' + need.toFixed(2) + ' is set aside for pending buy-backs; $' + have.toFixed(2) + ' is available in USD/USDT.\n\n' +
@@ -14496,7 +14540,11 @@ cron.schedule('40 2 * * *', runNightlyLedgerResync, { timezone: 'Europe/London' 
 // #371 (#378) Keep candle history current automatically: new coins get their year of history within the hour;
 // every tracked coin gets its last 48 hours topped up nightly.
 cron.schedule('17,47 * * * *', () => { checkStopClearanceStates().catch(e => console.error('[clearance] check failed:', e.message)); });   // #386
-cron.schedule('12,42 * * * *', () => { checkRingfenceCoverage().catch(e => console.error('[ringfence] check failed:', e.message)); });   // #377
+cron.schedule('12,42 * * * *', async () => {   // #377 ring-fence monitor, then #A2 abandons on the same allocation
+  await checkRingfenceCoverage().catch(e => console.error('[ringfence] check failed:', e.message));
+  await evaluateAbandons().catch(e => console.error('[abandon] evaluate failed:', e.message));
+});
+setTimeout(() => { evaluateAbandons().catch(e => console.error('[abandon] boot evaluate failed:', e.message)); }, 3 * 60 * 1000);   // #A2 once at boot +3 min
 cron.schedule('23 * * * *', () => { candlesAutoBackfillNew().catch(e => console.error('[candles] new-coin check failed:', e.message)); });
 cron.schedule('20 3 * * *', () => { candlesTopUp().catch(e => console.error('[candles] top-up failed:', e.message)); }, { timezone: 'Europe/London' });
 cron.schedule('7,37 * * * *', async () => {
@@ -18758,6 +18806,15 @@ let rows;
               coin: c, held_usd: usd != null ? Number(usd.toFixed(2)) : null, price: r6(price), real_cost: r6(cost),
               floor_rule: r6(rf), floor_sell_floors: r6(sfv), floor_effective: r6(eff), floor_source: src, floor_vs_cost: floorVsCost,
               // #384 (PM #45) standing health metric: can the lowest possible stop clear the floor by 3 x p90 slippage?
+              abandon: rule ? (() => {   // #A2
+                const ah = rule.abandon_hours != null ? Number(rule.abandon_hours) : 336, uh = rule.uncovered_abandon_hours != null ? Number(rule.uncovered_abandon_hours) : 48;
+                const o = { abandon_hours: ah, uncovered_abandon_hours: uh };
+                if (rule.sale_price != null) {
+                  const ageH = rule.sale_at ? (Date.now() - new Date(rule.sale_at).getTime()) / 3600000 : null, uncH = rule.uncovered_since ? (Date.now() - new Date(rule.uncovered_since).getTime()) / 3600000 : null;
+                  o.sale_at = rule.sale_at || null; o.uncovered_since = rule.uncovered_since || null;
+                  o.hours_to_abandon_time = ageH != null ? Number((ah - ageH).toFixed(1)) : null; o.hours_to_abandon_cash = uncH != null ? Number((uh - uncH).toFixed(1)) : null;
+                }
+                return o; })() : null,
               stop_clearance: rule ? (() => { const sc = stopClearanceCheck(price, rule.arm_pump_pct, rule.trail_pct, eff, slipMap[c] || { p90: BOOK_SELL_SLIP_P90, source: 'fallback' });
                 return sc.checked ? { pass: sc.ok, lowest_stop: sc.lowest_stop, clearance_pct: sc.clearance_pct, required_pct: sc.required_pct, fireable_down_to_price: sc.fireable_down_to_price,
                     ...(sc.ok ? { headroom_pct: Number(((1 - sc.fireable_down_to_price / Number(price)) * 100).toFixed(2)) }
@@ -19181,8 +19238,10 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
       buy_tiers:        z.array(z.array(z.coerce.number())).optional().describe('#282 [[drop_pct, buy_pct], ...] ascending by drop_pct; buy_pct is %% of REMAINING reserved cash'),
       tier_cooldown_min: z.coerce.number().optional().describe('#282 minutes between intra-cycle tier fills (default 15). Global cooldown_minutes still governs re-arming'),
       min_tier_usd:     z.coerce.number().optional().describe('#282 dust guard — skip and mark-filled any tier below this USD notional (default 2.0)'),
+      abandon_hours:    z.coerce.number().optional().describe('#A2 abandon a pending buy-back this many hours after the sale (default 336 = 14 d)'),
+      uncovered_abandon_hours: z.coerce.number().optional().describe('#A2 abandon when the buy-back cash has been missing this many hours (default 48)'),
     },
-    async ({ symbol, arm_pump_pct, trail_pct, sell_pct, entry_floor, arm_window_min, rebuy_pct, retrace_pct, bounce_pct, buyback_floor_pct, rule_mode, sell_tiers, buy_tiers, tier_cooldown_min, min_tier_usd }) => {
+    async ({ symbol, arm_pump_pct, trail_pct, sell_pct, entry_floor, arm_window_min, rebuy_pct, retrace_pct, bounce_pct, buyback_floor_pct, rule_mode, sell_tiers, buy_tiers, tier_cooldown_min, min_tier_usd, abandon_hours, uncovered_abandon_hours }) => {
       try {
         const sym = symbol.includes('-USD') ? symbol.toUpperCase() : `${symbol.toUpperCase()}-USD`;
 
@@ -19289,6 +19348,11 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
              buyback_floor_pct ?? null, rule_mode ?? null, stJson, btJson, tier_cooldown_min ?? null, min_tier_usd ?? null]
           );
         }
+        // #A2 written separately and only when supplied, so a partial call can never reset them (#281/#282 lesson)
+        if (abandon_hours != null || uncovered_abandon_hours != null) {
+          await db.execute('UPDATE pump_armed_rules SET abandon_hours = COALESCE(?, abandon_hours), uncovered_abandon_hours = COALESCE(?, uncovered_abandon_hours) WHERE symbol = ?',
+            [abandon_hours != null && Number(abandon_hours) > 0 ? Math.round(Number(abandon_hours)) : null, uncovered_abandon_hours != null && Number(uncovered_abandon_hours) > 0 ? Math.round(Number(uncovered_abandon_hours)) : null, sym]);
+        }
         const [finRows] = await db.execute('SELECT * FROM pump_armed_rules WHERE symbol = ? LIMIT 1', [sym]);
         const fin = finRows[0] || {};
         const num = (v) => v == null ? null : Number(v);
@@ -19308,6 +19372,7 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
           symbol: sym, arm_pump_pct: num(fin.arm_pump_pct), arm_window_min: num(fin.arm_window_min), trail_pct: num(fin.trail_pct), sell_pct: num(fin.sell_pct),
           entry_floor: num(fin.entry_floor), rebuy_pct: num(fin.rebuy_pct), retrace_pct: num(fin.retrace_pct), bounce_pct: num(fin.bounce_pct),
           buyback_floor_pct: num(fin.buyback_floor_pct), rule_mode: fin.rule_mode, tier_cooldown_min: num(fin.tier_cooldown_min), min_tier_usd: num(fin.min_tier_usd),
+          abandon_hours: fin.abandon_hours != null ? num(fin.abandon_hours) : 336, uncovered_abandon_hours: fin.uncovered_abandon_hours != null ? num(fin.uncovered_abandon_hours) : 48,   // #A2
           loop_enabled: num(fin.loop_enabled), armed: num(fin.armed), active: num(fin.active) }, tier_validation: tierInfo, conflict_warning: conflictWarning || null }) }] };
       } catch (e) {
         return { content: [{ type: 'text', text: JSON.stringify({ error: e.message }) }] };
@@ -21020,6 +21085,14 @@ app.post('/telegram-webhook', async (req, res) => {
         try {
           const [ar] = await db.execute('SELECT symbol FROM pump_armed_rules WHERE armed = 1 AND active = 1');
           armedTxt = ar.length ? '\nArmed loops: ' + ar.map(r => r.symbol.replace('-USD', '')).join(', ') : '\nArmed loops: none';
+        } catch (e) {}
+        try {   // #A2 pending buy-backs and their abandon clocks
+          const [lc] = await db.execute('SELECT symbol, sale_at, uncovered_since, COALESCE(abandon_hours, 336) AS ah, COALESCE(uncovered_abandon_hours, 48) AS uh FROM pump_armed_rules WHERE active = 1 AND sale_price IS NOT NULL');
+          for (const r of lc) {
+            const ageD = r.sale_at ? (Date.now() - new Date(r.sale_at).getTime()) / 86400000 : null, uncH = r.uncovered_since ? (Date.now() - new Date(r.uncovered_since).getTime()) / 3600000 : null;
+            armedTxt += '\n' + String(r.symbol).replace('-USD', '') + ' buy-back: ' + (ageD != null ? ageD.toFixed(1) + ' d old (abandons at ' + (Number(r.ah) / 24).toFixed(0) + ' d)' : 'age unknown') +
+              (uncH != null ? ', cash missing ' + uncH.toFixed(0) + ' h (abandons at ' + r.uh + ' h)' : ', cash covered');
+          }
         } catch (e) {}
         const en = aeCfg.enabled === true;
         await sendReply('<b>STATUS</b>\nAuto-exec: ' + (en ? '\u2705 ENABLED' : '\u23f8\ufe0f PAUSED') +
