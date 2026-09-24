@@ -9383,7 +9383,7 @@ async function sendMorningBriefing() {
       let overnightChange = null;
       try {
         const [histRows] = await db.execute(
-          'SELECT price FROM price_history WHERE symbol = ? ORDER BY recorded_at DESC LIMIT 1',
+          'SELECT price FROM price_history WHERE symbol = ? AND recorded_at > DATE_SUB(NOW(), INTERVAL 25 HOUR) ORDER BY recorded_at DESC LIMIT 1',   // #418 stale close -> no figure
           [symbol]
         );
         if (histRows.length > 0) {
@@ -9459,6 +9459,8 @@ async function sendMorningBriefing() {
     // ── Alerts to watch ─────────────────────────────────────────────────────
     const alertsToWatch = [];
     for (const h of holdings) {
+      // #418 held positions only: dust and muted coins were filling this list with moves against months-old baselines
+      if (h.valueUSD < 10 || alertState.acknowledged.has(h.symbol) || ignoredCoins.has(h.symbol) || ignoredCoins.has(h.coin)) continue;
       const threshold = customThresholds[h.symbol] !== undefined ? customThresholds[h.symbol] : PUMP_THRESHOLD;
       if (basePrices[h.symbol]) {
         const change = (h.price - basePrices[h.symbol]) / basePrices[h.symbol];
@@ -9545,8 +9547,10 @@ async function sendMorningBriefing() {
         if (!p) continue;
         let ch = '';
         try {
-          const [hr] = await db.execute('SELECT price FROM price_history WHERE symbol = ? ORDER BY recorded_at DESC LIMIT 1', [s]);
-          if (hr.length && Number(hr[0].price) > 0) { const c = (p / Number(hr[0].price) - 1) * 100; ch = ' (' + (c >= 0 ? '+' : '') + c.toFixed(1) + '% since midnight)'; }
+          // #418 BTC/ETH are not held, so price_history has no recent close for them (24 Sep: a stale row made BTC "+9.8%" when
+          // it was flat). Use the 2-min captures: the last price at or before 24 h ago, and only if it is within the hour before that.
+          const [hr] = await db.execute('SELECT price FROM price_intraday WHERE symbol = ? AND recorded_at <= DATE_SUB(NOW(), INTERVAL 24 HOUR) AND recorded_at > DATE_SUB(NOW(), INTERVAL 25 HOUR) ORDER BY recorded_at DESC LIMIT 1', [s]);
+          if (hr.length && Number(hr[0].price) > 0) { const c = (p / Number(hr[0].price) - 1) * 100; ch = ' (' + (c >= 0 ? '+' : '') + c.toFixed(1) + '% in 24 h)'; }
         } catch (e) { /* price only */ }
         marketTxt.push(s.replace('-USD', '') + ' ' + fmtPrc(p) + ch);
       }
