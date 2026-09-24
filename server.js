@@ -1961,6 +1961,13 @@ try {
   }
   if (ttRows.length) console.log('[trough] Loaded ' + ttRows.length + ' active trough tracker(s) from DB');
 } catch (e) { console.error('[trough] boot-load failed:', e.message); }
+// #A1 one-off: any loop sitting armed=1 with no live cycle and no trail is already stuck - report, never fix silently
+try {
+  const [stuck] = await db.execute('SELECT symbol FROM pump_armed_rules WHERE active = 1 AND armed = 1 AND sale_price IS NULL');
+  const names = stuck.map(r => String(r.symbol)).filter(s => !trailingStops.has(s));
+  console.log('[boot] #A1 stuck-armed check: ' + (names.length ? names.join(', ') : 'none'));
+  if (names.length) await sendTelegram('\u26a0\ufe0f <b>Stuck loops at boot:</b> ' + names.map(s => s.replace('-USD', '')).join(', ') + ' - armed=1, no cycle, no trail. Run reset_cycle for each.').catch(() => {});
+} catch (e) { console.error('[boot] #A1 stuck check failed:', e.message); }
 try {
   const [stRows] = await db.execute('SELECT symbol, buy_usd, bounce_pct, entry_floor, exchange, trough_price, arm_below, gate_hit FROM standalone_trough_trackers');   // #394
   for (const r of stRows) {
@@ -4430,6 +4437,23 @@ async function clearTroughTracker(symbol) {
     );
     console.log('[trough] ' + symbol + ' tracker cleared');
   } catch (e) { console.error('[trough] clearTroughTracker error:', e.message); }
+}
+
+// #A1 ABANDON = release the ring-fence AND reopen the loop. clearTroughTracker alone left armed=1, so an abandoned
+// cycle could never re-arm and the remaining position was uninsured until reset_cycle. Not for the success path -
+// rearmPumpLoopAfterBuyback owns armed=0 there, after the cycle-count and circuit-breaker checks.
+async function abandonCycle(symbol, reason, detail) {
+  const coinBase = symbol.replace('-USD', '');
+  let released = 0;
+  try { const [r] = await db.execute('SELECT sale_proceeds_usd FROM pump_armed_rules WHERE symbol = ? AND active = 1 LIMIT 1', [symbol]); released = r.length ? Number(r[0].sale_proceeds_usd) || 0 : 0; } catch (e) {}
+  await clearTroughTracker(symbol);
+  try {
+    await db.execute('UPDATE pump_armed_rules SET armed = 0, armed_since = NULL, baseline_price = NULL, baseline_at = NULL, tier_state = NULL WHERE symbol = ? AND active = 1', [symbol]);
+    console.log('[trough] ' + coinBase + ' cycle abandoned (' + reason + ') - loop reopened for the next pump');
+  } catch (e) { console.error('[trough] abandonCycle reopen error:', e.message); }
+  await sendTelegram('<b>[BUY-BACK ABANDONED - ' + coinBase + ']</b> ' + reason + '\n' + (detail || '') +
+    (released > 0 ? '\n$' + released.toFixed(2) + ' is no longer set aside.' : '') +
+    '\nThe loop is reopened: it will re-arm on the next qualifying pump and insure what you still hold.').catch(() => {});
 }
 
 async function armStandaloneTrough(symbol, buyUsd, bouncePct, entryFloor, exchange, armBelow = null) {
@@ -7275,11 +7299,7 @@ async function runFastScan() {
           // Pre-flight: need saleProceedsUsd to size the rebuy
           if (!t || !(t.saleProceedsUsd > 0)) {
             console.error('[trough] ' + ttBase + ' BUY signal but no saleProceedsUsd in tracker -- cannot execute');
-            await sendTelegram(
-              '<b>[#130 TROUGH BUY signal] ' + ttBase + '</b>\n\n' +
-              'Bounce confirmed but no rebuy size stored (legacy tracker?). Manual rebuy needed.'
-            ).catch(() => {});
-            await clearTroughTracker(ttSymbol);
+            await abandonCycle(ttSymbol, 'no rebuy size stored (legacy tracker)', 'Bounce confirmed @ $' + ttPrice + ' - manual rebuy if wanted.');   // #A1
             continue;
           }
           const buyUsd = t.saleProceedsUsd;
@@ -7303,24 +7323,16 @@ async function runFastScan() {
             if (lpR.length) loopEnabled = parseInt(lpR[0].loop_enabled) === 1;
           } catch (e) { loopEnabled = false; }
           if (!loopEnabled) {
-            await sendTelegram(
-              '<b>[#130 TROUGH BUY signal] ' + ttBase + '</b>\n\n' +
-              'Bounce confirmed @ $' + ttPrice + ' but loop_enabled=0 -- not buying. Tracker cleared.'
-            ).catch(() => {});
             console.log('[trough] ' + ttBase + ' GATE 2 fail: loop_enabled=0');
-            await clearTroughTracker(ttSymbol);
+            await abandonCycle(ttSymbol, 'loop disabled after its sale', 'Bounce confirmed @ $' + ttPrice + ' - not buying.');   // #A1
             continue;
           }
 
           // GATE 3: sufficient USD on revolut
           const availUsd = await getAvailableUSD('revolut');
           if (availUsd < buyUsd) {
-            await sendTelegram(
-              '<b>[#130 TROUGH BUY signal] ' + ttBase + '</b>\n\n' +
-              'Bounce confirmed but insufficient USD: have $' + availUsd.toFixed(2) + ', need $' + buyUsd.toFixed(2) + '. Tracker cleared -- manual rebuy.'
-            ).catch(() => {});
             console.log('[trough] ' + ttBase + ' GATE 3 fail: USD ' + availUsd + ' < ' + buyUsd);
-            await clearTroughTracker(ttSymbol);
+            await abandonCycle(ttSymbol, 'insufficient cash at the bounce', 'Have $' + availUsd.toFixed(2) + ', need $' + buyUsd.toFixed(2) + ' @ $' + ttPrice + ' - manual rebuy if wanted.');   // #A1
             continue;
           }
 
@@ -18765,7 +18777,7 @@ let rows;
           return { content: [{ type: 'text', text: JSON.stringify({
             read_only: true, balances_read: balancesOk, prices_read: Object.keys(px).length > 0,
             master_auto_execute: ae.enabled === true,
-            note: 'The pump-loop sell path does NOT check master_auto_execute - turning it off does not stop these loops. Floor (#377): the HIGHEST of real cost + 0.5% and any stored override - an override can raise it, never lower it; no cost and no override = sale blocked.',
+            note: '/pause (ai_auto_execute.enabled=false) HOLDS every loop sell and buy-back since #F1; loop_disable stops a single loop. Floor (#377): the HIGHEST of real cost + 0.5% and any stored override - an override can raise it, never lower it; no cost and no override = sale blocked.',
             dnd_coins: dndCoins, loops
           }, null, 2) }] };
         }
