@@ -16205,7 +16205,7 @@ let rows;
   server.tool('get_trading_data',
     'Get trading journal entries, active alerts, trader context/profile, rebalancing history, and dev_bridge messages',
     {
-      include: zLoose(z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'dev_bridge', 'coin_strategy', 'reconciliation', 'ledger', 'tax_lots', 'catalysts', 'thesis', 'nudges', 'dev_health', 'dev_recommendations', 'volatility_baseline', 'shadow_fills', 'abnormal_events', 'strategy_catalogue', 'exchange_orders', 'transactions', 'reconcile_transactions', 'ledger_rebuild', 'slippage_audit', 'regime_frequency', 'order_journal_gap', 'all']))).optional()
+      include: zLoose(z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'dev_bridge', 'coin_strategy', 'reconciliation', 'ledger', 'tax_lots', 'catalysts', 'thesis', 'nudges', 'dev_health', 'dev_recommendations', 'volatility_baseline', 'shadow_fills', 'abnormal_events', 'strategy_catalogue', 'exchange_orders', 'transactions', 'reconcile_transactions', 'ledger_rebuild', 'slippage_audit', 'regime_frequency', 'order_journal_gap', 'venue_probe', 'all']))).optional()
         .describe('What data to fetch — defaults to all. dev_bridge, coin_strategy and reconciliation are never included in all; request them explicitly'),
       symbol:           z.string().optional().describe('Filter journal by coin e.g. NEAR'),
       limit:            z.coerce.number().optional().describe('Max journal entries to return, default 10'),
@@ -16964,6 +16964,65 @@ let rows;
           sa.how_to_read = 'slip_pct is positive when the fill was WORSE than the price the system booked (sold lower / bought higher). A ladder sell leg fires during a retrace, so "sell / falling" is the bucket to price a leg from - not "overall". Buckets with thin_sample true have fewer than 5 trades: treat as anecdote. Limit orders are excluded (they choose their own price); price_intraday only reaches back ~30 days, so older orders show condition "unknown".';
         } catch (e) { sa.error = e.message; }
         result.slippage_audit = sa;   // #361: the surrounding function's accumulator is `result` (was `out` - runtime error)
+      }
+
+      // #P-V venue_probe (senior-review reads, READ-ONLY, writes nothing). Two questions that gate any tax-record rebuild:
+      //  (1) are total_fee / fee_currency populated on OLD filled orders (GET /orders/{id} ~12 / ~6 / ~1 months back)?
+      //  (2) does GET /transactions return records before the 370-day cap - how far back does the venue retain/paginate?
+      // Same request shapes as fetchExchangeOrders / fetchTransactions (epoch-ms dates, windows <= 30 days).
+      if (fetch.includes('venue_probe')) {
+        const VP = { generated_at: new Date().toISOString(), read_only: true };
+        const DAY = 86400000, now = Date.now();
+        const pageRows = (page) => Array.isArray(page) ? page : (page && (page.data || page.orders || page.items)) || [];
+        // (1) historical fees
+        VP.order_fees = [];
+        for (const back of [365, 180, 30]) {
+          const target = now - back * DAY, rec = { months_back: Math.round(back / 30), target: new Date(target).toISOString().slice(0, 10) };
+          try {
+            const qs = new URLSearchParams({ start_date: String(target - 3 * DAY), end_date: String(target + 3 * DAY), limit: '50' });
+            const page = await revolutRequest('GET', '/orders/historical?' + qs.toString());
+            if (page && page.message && !pageRows(page).length) { rec.list_error = 'API: ' + page.message; VP.order_fees.push(rec); continue; }
+            const filled = pageRows(page).filter(o => Number(o.filled_quantity) > 0);
+            rec.filled_orders_in_window = filled.length;
+            if (!filled.length) { rec.note = 'no filled order within 3 days of the target'; VP.order_fees.push(rec); continue; }
+            const o = filled[0], id = o.id || o.venue_order_id;
+            rec.order_id = id; rec.symbol = o.symbol; rec.side = o.side;
+            rec.list_row_fee_fields = { total_fee: o.total_fee !== undefined ? o.total_fee : '(absent)', fee_currency: o.fee_currency !== undefined ? o.fee_currency : '(absent)' };
+            const r = await revolutRequest('GET', '/orders/' + id);
+            const d = (r && r.data) || r || {};
+            rec.detail_keys = Object.keys(d);
+            rec.total_fee = d.total_fee !== undefined ? d.total_fee : '(absent)';
+            rec.fee_currency = d.fee_currency !== undefined ? d.fee_currency : '(absent)';
+            rec.populated = d.total_fee != null && d.total_fee !== '' && d.fee_currency != null && d.fee_currency !== '';
+            rec.raw_excerpt = JSON.stringify(d).slice(0, 600);
+          } catch (e) { rec.error = e.message; }
+          VP.order_fees.push(rec);
+        }
+        // (2) transactions retention: 30-day windows reaching back past the 370-day cap
+        VP.transactions_retention = [];
+        for (const iso of ['2025-08-15', '2025-06-01', '2025-01-01', '2024-06-01', '2024-01-01']) {
+          const start = Date.parse(iso + 'T00:00:00Z'), end = start + 30 * DAY, rec = { window_start: iso, window_end: new Date(end).toISOString().slice(0, 10) };
+          try {
+            let cursor = null, pages = 0, rows = [];
+            do {
+              const qs = new URLSearchParams({ start_date: String(start), end_date: String(end), limit: '100' });
+              if (cursor) qs.set('cursor', cursor);
+              const page = await revolutRequest('GET', '/transactions?' + qs.toString());
+              if (page && page.message && !pageRows(page).length) { rec.error = 'API: ' + page.message; break; }
+              rows = rows.concat(pageRows(page)); pages++;
+              cursor = (page && page.metadata && page.metadata.next_cursor) || null;
+            } while (cursor && pages < 5);
+            const ts = rows.map(t => { const v = t.created_date || t.processed_date || t.created_at; return typeof v === 'number' ? v : (Date.parse(v) || 0); }).filter(Boolean).sort((a, b) => a - b);
+            rec.records = rows.length; rec.pages = pages; rec.more_pages = !!cursor;
+            rec.earliest = ts.length ? new Date(ts[0]).toISOString() : null; rec.latest = ts.length ? new Date(ts[ts.length - 1]).toISOString() : null;
+          } catch (e) { rec.error = e.message; }
+          VP.transactions_retention.push(rec);
+        }
+        const withRec = VP.transactions_retention.filter(r => r.records > 0 && r.earliest);
+        VP.earliest_transaction_seen = withRec.length ? withRec.map(r => r.earliest).sort()[0] : null;
+        VP.notes = ['read-only: GETs only, nothing written', 'order windows are +-3 days around each target; the first filled order is sampled',
+          'transaction windows are 30 days (the venue range limit); up to 5 pages each'];
+        result.venue_probe = VP;
       }
 
       // #D1 order_journal_gap (Fable spec, READ-ONLY): classify every filled venue order in the window as matched to the
