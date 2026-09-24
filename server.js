@@ -585,7 +585,8 @@ async function tryAwayAnalyseBuyDownTarget(symbol, coinBase, currentPrice, chang
     // GATE PASS: check available USD then BUY
     const availUsd = await getAvailableUSD('revolut');
     if (availUsd < buyUsd) {
-      await sendTelegram(`AWAY \u2014 ${coinBase} High-confidence BUY but only $${availUsd.toFixed(2)} USD available (need $${buyUsd.toFixed(2)}). Left armed \u2014 your call when back.`).catch(() => {});
+      await offerDeferredBuy(symbol, 'away', buyUsd, currentPrice, { target_price: target.targetPrice, analysis_head: String(analysis || '').split('\n')[0].slice(0, 120) },
+        `AWAY \u2014 ${coinBase} High-confidence BUY but only $${availUsd.toFixed(2)} USD available (need $${buyUsd.toFixed(2)}). Left armed \u2014 your call when back.`, availUsd);   // #413 with a Buy now button
       console.log('[away-buy] ' + coinBase + ' insufficient USD: ' + availUsd + ' < ' + buyUsd);
       return true;
     }
@@ -1487,6 +1488,18 @@ await db.execute(`CREATE TABLE IF NOT EXISTS exec_decisions (
   order_id VARCHAR(64) NULL, journal_id INT NULL,
   INDEX (symbol, created_at), INDEX (mode, created_at), INDEX (ok, reason)
 )`).then(() => console.log('[boot] #P0 exec_decisions present')).catch(e => console.error('[migration] exec_decisions:', e.message));
+// #413 funded buys: an automatic buy refused for lack of cash, kept for 24 h so Bryan can fund it and confirm it by button.
+await db.execute(`CREATE TABLE IF NOT EXISTS deferred_buys (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  symbol VARCHAR(24) NOT NULL, path VARCHAR(16) NOT NULL,
+  usd DECIMAL(14,4) NOT NULL, signal_price DECIMAL(24,12) NOT NULL, ctx_json JSON NULL,
+  status VARCHAR(12) NOT NULL DEFAULT 'pending',
+  preview_price DECIMAL(24,12) NULL, preview_at DATETIME NULL,
+  last_ref_price DECIMAL(24,12) NULL, last_reminder_at DATETIME NULL, final_sent TINYINT(1) NOT NULL DEFAULT 0,
+  journal_id INT NULL, order_id VARCHAR(64) NULL, done_at DATETIME NULL, note VARCHAR(200) NULL,
+  INDEX (status), INDEX (symbol, path, status)
+)`).then(() => console.log('[boot] #413 deferred_buys present')).catch(e => console.error('[migration] deferred_buys:', e.message));
 await db.execute("UPDATE pump_armed_rules SET rebuy_pct = 20.0 WHERE symbol = 'BOBA-USD'"); // #131 BOBA default
 await safeAddColumn('auto_trade_rules', 'proceeds_reserved', 'DECIMAL(12,2) NULL');
 await safeAddColumn('trading_journal',  'source',          "VARCHAR(20) DEFAULT 'auto_detected'");
@@ -7447,6 +7460,7 @@ async function runFastScan() {
           if (availUsd < buyUsd) {
             console.log('[trough] ' + ttBase + ' GATE 3 fail: USD ' + availUsd + ' < ' + buyUsd);
             await abandonCycle(ttSymbol, 'insufficient cash at the bounce', 'Have $' + availUsd.toFixed(2) + ', need $' + buyUsd.toFixed(2) + ' @ $' + ttPrice + ' - manual rebuy if wanted.');   // #A1
+            await offerDeferredBuy(ttSymbol, 'trough', buyUsd, ttPrice, { trough: ttResult.trough, bounce_pct: t.bouncePct, sale_price: t.salePrice }, null, availUsd);   // #413
             continue;
           }
 
@@ -7562,7 +7576,8 @@ async function runFastScan() {
               }
               const stAvailUsd = await getAvailableUSD('revolut').catch(() => 0);
               if (stAvailUsd < st.buyUsd) {
-                await sendTelegram('<b>[TROUGH BLOCKED] ' + stB + '</b>\n$' + stAvailUsd.toFixed(2) + ' available, need $' + st.buyUsd + '. Cleared.').catch(()=>{});
+                await offerDeferredBuy(stSym, 'trough_st', st.buyUsd, stP, { trough: st.troughPrice, bounce_pct: st.bouncePct || 8 },
+                  '<b>[TROUGH BLOCKED] ' + stB + '</b>\n$' + stAvailUsd.toFixed(2) + ' available, need $' + st.buyUsd + '. Cleared.', stAvailUsd);   // #413 with a Buy now button
                 await clearStandaloneTrough(stSym); continue;
               }
               await clearStandaloneTrough(stSym);
@@ -12587,6 +12602,144 @@ async function recordManualDecision(symbol, side, exchange, price, qty, reason, 
   } catch (e) { console.error('[P0] manual decision row failed:', e.message); return null; }
 }
 
+// ── #413 FUNDED BUYS ─────────────────────────────────────────────────────────────────────
+// When a pump-loop buy-back, a standalone trough or an Away buy is refused for lack of USD, the alert carries a Buy now
+// button backed by a deferred_buys row (stateless money-button design, #336: the row is CLAIMED atomically, so a double
+// tap, a stale button or a restart can never buy twice). Tap 1 shows the live price against the original signal and the
+// cash available; tap 2 (within 10 min, price not up >2% since that review) places the SAME USD amount at market,
+// journals it as Bryan's trade (manual_approved) and does what the automatic buy would have done afterwards. One live
+// offer per coin and path (a newer one supersedes); 24 h life; reminders on 5% moves (max one an hour) and 2 h before
+// expiry. Nothing here buys without a tap.
+const DEFERRED_BUY_TTL_MS = 24 * 3600000;
+const DEFERRED_PATH_LABEL = { trough: 'Pump-loop buy-back', trough_st: 'Standalone trough buy', away: 'Away-mode buy' };
+const deferredKeyboard = (id, usd) => ({ inline_keyboard: [[
+  { text: 'Buy now $' + Number(usd).toFixed(2), callback_data: 'a:' + id + ':1:db' },
+  { text: 'Cancel', callback_data: 'a:' + id + ':3:db' } ]] });
+const deferredPct = (p, ref) => ((p / ref) - 1) * 100;
+const deferredMoved = (p, ref) => { const d = deferredPct(p, ref); return Math.abs(d) < 0.05 ? 'unchanged' : (d > 0 ? 'risen back up ' + d.toFixed(1) + '%' : 'fallen further ' + Math.abs(d).toFixed(1) + '%'); };
+
+// Record the refused buy and send the alert WITH the button. headline = the path's own refusal text (sent plain if no
+// offer can be made). Never throws; returns the offer id or null.
+async function offerDeferredBuy(symbol, path, usd, signalPrice, ctx, headline, cashNow) {
+  let sent = false;
+  try {
+    if (!(Number(usd) > 0) || !(Number(signalPrice) > 0) || KRAKEN_MONITORED_COINS.includes(symbol)) throw new Error('not offerable');
+    await db.execute("UPDATE deferred_buys SET status = 'superseded', done_at = NOW() WHERE symbol = ? AND path = ? AND status = 'pending'", [symbol, path]);
+    const [ins] = await db.execute('INSERT INTO deferred_buys (symbol, path, usd, signal_price, ctx_json, last_ref_price, last_reminder_at) VALUES (?, ?, ?, ?, ?, ?, NOW())',
+      [symbol, path, Number(usd), Number(signalPrice), JSON.stringify(ctx || {}), Number(signalPrice)]);
+    const id = ins && ins.insertId;
+    if (!id) throw new Error('no id');
+    const coin = symbol.replace('-USD', '');
+    const short = cashNow != null && Number.isFinite(Number(cashNow)) ? Math.max(0, Number(usd) - Number(cashNow)) : null;
+    await sendTelegram((headline ? headline + '\n\n' : '') +
+      '💳 <b>FUND IT YOURSELF? - ' + coin + '</b>\n' + (DEFERRED_PATH_LABEL[path] || path) + ' of $' + Number(usd).toFixed(2) + ' at ~' + fmtPriceShort(Number(signalPrice)) +
+      ' was refused: not enough USD' + (short != null ? ' (short $' + short.toFixed(2) + ')' : '') + '.\n' +
+      'Add USD in Revolut X, then tap <b>Buy now</b>: you see the live price first and confirm with a second tap. Valid 24 h; reminders when the price moves 5%.',
+      deferredKeyboard(id, usd));
+    sent = true;
+    return id;
+  } catch (e) {
+    if (e.message !== 'not offerable') console.error('[funded-buy] offer failed for ' + symbol + ':', e.message);
+    if (!sent && headline) await sendTelegram(headline).catch(() => {});
+    return null;
+  }
+}
+
+async function handleDeferredBuyButton(idStr, choice, reply) {
+  const id = parseInt(idStr, 10);
+  if (!Number.isFinite(id) || id <= 0) { await reply('⚠️ That button has no valid reference.'); return; }
+  const [rows] = await db.execute('SELECT *, TIMESTAMPDIFF(SECOND, created_at, NOW()) AS age_s, TIMESTAMPDIFF(SECOND, preview_at, NOW()) AS preview_age_s FROM deferred_buys WHERE id = ?', [id]);
+  const r = rows && rows[0];
+  if (!r) { await reply('That buy offer no longer exists.'); return; }
+  const coin = String(r.symbol).replace('-USD', ''), usd = Number(r.usd), sig = Number(r.signal_price);
+  if (r.status !== 'pending') { await reply('Already handled - this ' + coin + ' offer is ' + r.status + '. Nothing more will happen.'); return; }
+  if (Number(r.age_s) * 1000 > DEFERRED_BUY_TTL_MS) {
+    await db.execute("UPDATE deferred_buys SET status = 'expired', done_at = NOW() WHERE id = ? AND status = 'pending'", [id]);
+    await reply('That ' + coin + ' offer has expired (24 h). Nothing was bought.'); return;
+  }
+  if (choice === 3) {
+    const [u] = await db.execute("UPDATE deferred_buys SET status = 'cancelled', done_at = NOW() WHERE id = ? AND status = 'pending'", [id]);
+    await reply(u && u.affectedRows === 1 ? 'Cancelled - the ' + coin + ' buy will not be offered again.' : 'Already handled.'); return;
+  }
+  if (choice !== 1 && choice !== 2) { await reply('Unrecognised button.'); return; }
+  const price = await getCurrentPrice(r.symbol).catch(() => null);
+  if (!(price > 0)) { await reply('⚠️ Could not read the ' + coin + ' price right now - nothing bought. Try again in a minute.'); return; }
+  const cash = await getAvailableUSD('revolut').catch(() => null);
+  if (cash == null || !Number.isFinite(Number(cash))) { await reply('⚠️ Could not read your USD balance right now - nothing bought. Try again in a minute.'); return; }
+  const preview = async (note) => {
+    await db.execute("UPDATE deferred_buys SET preview_price = ?, preview_at = NOW() WHERE id = ? AND status = 'pending'", [price, id]);
+    const enough = cash >= usd;
+    await sendTelegram((note ? note + '\n\n' : '') + '🔎 <b>REVIEW BUY - ' + coin + '</b>\n' +
+      (DEFERRED_PATH_LABEL[r.path] || r.path) + ' signalled at ' + fmtPriceShort(sig) + '.\n' +
+      'Now ' + fmtPriceShort(price) + ': ' + deferredMoved(price, sig) + ' since the signal.\n' +
+      'Amount $' + usd.toFixed(2) + ' at market (~' + formatTradeQty(usd / price) + ' ' + coin + ').\n' +
+      'USD available $' + Number(cash).toFixed(2) + (enough ? '.\nTap <b>Confirm</b> within 10 minutes to buy.' : ' - still short $' + (usd - cash).toFixed(2) + '. Top up, then tap Check again.'),
+      { inline_keyboard: [[ enough ? { text: 'Confirm buy $' + usd.toFixed(2), callback_data: 'a:' + id + ':2:db' } : { text: 'Check again', callback_data: 'a:' + id + ':1:db' },
+                            { text: 'Cancel', callback_data: 'a:' + id + ':3:db' } ]] });
+  };
+  if (choice === 1) { await preview(); return; }
+  // CONFIRM (choice 2): only straight after a review, at a price no more than 2% above it, with the cash there.
+  if (!r.preview_at || !(Number(r.preview_age_s) >= 0 && Number(r.preview_age_s) <= 600)) { await preview('That review is more than 10 minutes old - here is a fresh one.'); return; }
+  if (price > Number(r.preview_price) * 1.02) { await preview('The price rose more than 2% since your review - check it again.'); return; }
+  if (cash < usd) { await preview('Not enough USD yet.'); return; }
+  let ctx = {}; try { ctx = typeof r.ctx_json === 'string' ? JSON.parse(r.ctx_json) : (r.ctx_json || {}); } catch (e) { ctx = {}; }
+  let am = null;
+  if (r.path === 'away') {   // the same session cap as the automatic buy, and the rung must still be there
+    const [amR] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'away_mode'");
+    am = amR.length ? JSON.parse(amR[0].config_value) : {};
+    const bought = parseFloat(am.session_bought_usd ?? 0), cap = parseFloat(am.max_session_buy_usd ?? 200);
+    if (bought + usd > cap) { await reply('Away session buy cap reached ($' + bought.toFixed(2) + '/$' + cap.toFixed(2) + ') - nothing bought. Raise the cap or buy by hand.'); return; }
+    if (ctx.target_price != null) {
+      const [tg] = await db.execute('SELECT 1 FROM price_targets WHERE symbol = ? AND target_price = ? LIMIT 1', [r.symbol, ctx.target_price]);
+      if (!tg.length) {
+        await db.execute("UPDATE deferred_buys SET status = 'superseded', done_at = NOW(), note = 'rung gone' WHERE id = ? AND status = 'pending'", [id]);
+        await reply('The ' + coin + ' Away buy rung is gone (already bought, or removed) - nothing bought.'); return;
+      }
+    }
+  }
+  // CLAIM: only one tap can get past this line.
+  const [cl] = await db.execute("UPDATE deferred_buys SET status = 'executing' WHERE id = ? AND status = 'pending'", [id]);
+  if (!cl || cl.affectedRows !== 1) { await reply('Already handled.'); return; }
+  let resp;
+  try { resp = await placeRevolutOrder(r.symbol, 'buy', 'market', null, null, Number(usd.toFixed(2))); }
+  catch (e) {
+    await db.execute("UPDATE deferred_buys SET status = 'failed', note = ?, done_at = NOW() WHERE id = ?", [String(e.message || e).slice(0, 200), id]).catch(() => {});
+    await reply('⚠️ Revolut X REFUSED the ' + coin + ' buy: ' + String(e.message || '').slice(0, 150) + '. Nothing bought; this offer is closed.'); return;
+  }
+  const qty = usd / price;
+  const orderId = (resp && resp.data ? (resp.data.venue_order_id || resp.data.id) : null) || (resp && resp.client_order_id) || null;
+  let journalId = null;
+  try {
+    const [j] = await db.execute('INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      [coin, 'buy', price, qty, usd, 'Funded buy #413: ' + (DEFERRED_PATH_LABEL[r.path] || r.path) + ' refused for lack of cash at ' + fmtPriceShort(sig) + '; topped up and confirmed by Bryan at ~' + fmtPriceShort(price), 'confident', 'manual']);
+    journalId = j && j.insertId;
+  } catch (e) { console.error('[funded-buy] journal failed:', e.message); }
+  await stampVenueOrderId(journalId, resp);
+  await queueFillEnrichment(journalId, orderId, r.symbol, 'buy', price, qty, 'funded_buy');
+  await recordManualDecision(r.symbol, 'buy', 'revolut', price, qty, 'manual_approved', { usd, order_id: orderId });
+  const notes = [];
+  if (r.path === 'trough') {   // the loop's cycle bookkeeping - only if the loop has not moved on (armed, or a new sale) since
+    try {
+      const [pr] = await db.execute('SELECT armed, sale_price FROM pump_armed_rules WHERE symbol = ? AND active = 1 LIMIT 1', [r.symbol]);
+      if (pr.length && Number(pr[0].armed) === 0 && pr[0].sale_price == null) await rearmPumpLoopAfterBuyback({ symbol: r.symbol, order_type: 'buy', source: 'cascade', volume: qty, proceeds_reserved: usd }, price);
+      else if (pr.length) notes.push('The ' + coin + ' loop has moved on since (armed or a new sale), so its cycle count was left alone.');
+    } catch (e) { notes.push('Loop bookkeeping failed: ' + e.message); }
+  } else if (r.path === 'away') {
+    try {
+      am.session_bought_usd = parseFloat(am.session_bought_usd ?? 0) + usd;
+      await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('away_mode', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)", [JSON.stringify(am)]);
+      if (ctx.target_price != null) {
+        await db.execute('DELETE FROM price_targets WHERE symbol = ? AND target_price = ?', [r.symbol, ctx.target_price]);
+        if (priceTargets.has(r.symbol)) priceTargets.set(r.symbol, (priceTargets.get(r.symbol) || []).filter(t => t.targetPrice !== ctx.target_price));
+        notes.push('Away buy rung ' + fmtPriceShort(Number(ctx.target_price)) + ' removed (done). Session bought $' + am.session_bought_usd.toFixed(2) + '.');
+      }
+    } catch (e) { notes.push('Away bookkeeping failed: ' + e.message); }
+  }
+  await db.execute("UPDATE deferred_buys SET status = 'done', journal_id = ?, order_id = ?, done_at = NOW(), note = ? WHERE id = ?",
+    [journalId, orderId ? String(orderId).slice(0, 64) : null, notes.join(' ').slice(0, 200) || null, id]).catch(() => {});
+  await reply('✅ <b>BOUGHT ' + coin + '</b> $' + usd.toFixed(2) + ' at ~' + fmtPriceShort(price) + ' (' + deferredMoved(price, sig) + ' vs the signal at ' + fmtPriceShort(sig) + ').' + (notes.length ? '\n' + notes.join('\n') : ''));
+}
+
 // ── #383 STOP-TO-FLOOR CLEARANCE (PM #44) ──────────────────────────────────────────
 // pm #40 set JTO to arm +30% / trail 25%: the LOWEST possible stop is baseline x 1.30 x 0.75 = 0.975 x baseline, which
 // sat 0.64% above the floor - inside the system's own measured sell slippage (auto orders median 1.29%), so a sale
@@ -15135,6 +15288,34 @@ cron.schedule('20 2 * * *', async () => {
     const [r] = await db.execute('DELETE FROM exec_decisions WHERE created_at < DATE_SUB(NOW(), INTERVAL 180 DAY)');
     if (r.affectedRows > 0) console.log(`[P0] Pruned ${r.affectedRows} exec_decisions row(s) older than 180d`);
   } catch (e) { console.error('[P0] exec_decisions prune error:', e.message); }
+}, { timezone: 'Europe/London' });
+
+// #413 funded-buy reminders, every 5 min: on a 5%+ move from the last price shown (max one an hour), a last call 2 h
+// before expiry, and an 'expired' note at 24 h. Only its own bookkeeping is written; it never buys.
+cron.schedule('*/5 * * * *', async () => {
+  try {
+    const [rows] = await db.execute("SELECT *, TIMESTAMPDIFF(SECOND, created_at, NOW()) AS age_s, TIMESTAMPDIFF(SECOND, last_reminder_at, NOW()) AS since_s FROM deferred_buys WHERE status = 'pending'");
+    for (const r of rows) {
+      const coin = String(r.symbol).replace('-USD', ''), usd = Number(r.usd), sig = Number(r.signal_price), ageMs = Number(r.age_s) * 1000;
+      if (ageMs > DEFERRED_BUY_TTL_MS) {
+        const [u] = await db.execute("UPDATE deferred_buys SET status = 'expired', done_at = NOW() WHERE id = ? AND status = 'pending'", [r.id]);
+        if (u && u.affectedRows === 1) await sendTelegram('⌛ ' + coin + ' funded-buy offer expired after 24 h. Nothing was bought.').catch(() => {});
+        continue;
+      }
+      const price = await getCurrentPrice(r.symbol).catch(() => null);
+      if (!(price > 0)) continue;
+      const ref = Number(r.last_ref_price) > 0 ? Number(r.last_ref_price) : sig;
+      const moved = Math.abs(deferredPct(price, ref)) >= 5 && !(Number(r.since_s) < 3600);
+      const last = Number(r.final_sent) !== 1 && ageMs >= DEFERRED_BUY_TTL_MS - 2 * 3600000;
+      if (!moved && !last) continue;
+      await db.execute("UPDATE deferred_buys SET last_ref_price = ?, last_reminder_at = NOW(), final_sent = ? WHERE id = ? AND status = 'pending'", [price, last ? 1 : (Number(r.final_sent) || 0), r.id]);
+      const leftMin = Math.max(0, Math.round((DEFERRED_BUY_TTL_MS - ageMs) / 60000));
+      await sendTelegram('⏰ <b>' + (last ? 'LAST CALL' : 'REMINDER') + ' - ' + coin + ' buy you can fund</b>\n' +
+        (DEFERRED_PATH_LABEL[r.path] || r.path) + ' of $' + usd.toFixed(2) + ' signalled at ' + fmtPriceShort(sig) + '.\n' +
+        'Now ' + fmtPriceShort(price) + ': ' + deferredMoved(price, sig) + ' since the signal.\n' +
+        'Expires in ' + (leftMin >= 60 ? (leftMin / 60).toFixed(1) + ' h' : leftMin + ' min') + '.', deferredKeyboard(r.id, usd)).catch(() => {});
+    }
+  } catch (e) { console.error('[funded-buy] reminder scan error:', e.message); }
 }, { timezone: 'Europe/London' });
 
 // Daily cleanup — 2 AM: delete expired unmatched trade intentions
@@ -21500,10 +21681,11 @@ app.post('/telegram-webhook', async (req, res) => {
       // New Trade Detected buttons use 'tj'; numeric 'td' keeps already-sent ones working.
       const cbIsTradeJournal = cbMoneyType === 'tj' || (cbMoneyType === 'td' && /^\d+$/.test(cbCoin));
       if (cbMoneyType === 'np' || cbMoneyType === 'cc' || cbIsTradeJournal || cbMoneyType === 'ta' || cbMoneyType === 'mu' ||
-          cbMoneyType === 'sd' || cbMoneyType === 'sp' || cbMoneyType === 'rp') {
+          cbMoneyType === 'sd' || cbMoneyType === 'sp' || cbMoneyType === 'rp' || cbMoneyType === 'db') {
         await ackCb('Working...');
         try {
           if (cbMoneyType === 'ta') await handleTradeApprovalButton(cbCoin, cbChoice, cbReply);
+          else if (cbMoneyType === 'db') await handleDeferredBuyButton(cbCoin, cbChoice, cbReply);   // #413 funded buy
           else if (cbMoneyType === 'sd' || cbMoneyType === 'sp') await handleSwingButton(cbCoin, cbChoice, cbMoneyType, cbReply);
           else if (cbMoneyType === 'rp') await handleRebalanceConfirmButton(cbCoin, cbChoice, cbReply);
           else if (cbMoneyType === 'mu') await handleMuteButton(cbCoin, cbReply);
