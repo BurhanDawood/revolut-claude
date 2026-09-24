@@ -15461,7 +15461,8 @@ async function youtubeVideoDetails(ids) {
   const r = await fetch('https://www.googleapis.com/youtube/v3/videos?part=contentDetails,snippet&id=' + ids.map(encodeURIComponent).join(',') + '&key=' + process.env.YOUTUBE_API_KEY);
   const j = await r.json().catch(() => null);
   if (!r.ok || !j) throw new Error('YouTube videos API HTTP ' + r.status + (j && j.error && j.error.message ? ': ' + j.error.message : ''));
-  for (const v of (j.items || [])) out[v.id] = { secs: parseIsoDurationSecs(v.contentDetails && v.contentDetails.duration), live: (v.snippet && v.snippet.liveBroadcastContent) || 'none' };
+  for (const v of (j.items || [])) out[v.id] = { secs: parseIsoDurationSecs(v.contentDetails && v.contentDetails.duration), live: (v.snippet && v.snippet.liveBroadcastContent) || 'none',
+    title: (v.snippet && v.snippet.title) || null, channel: (v.snippet && v.snippet.channelTitle) || null, published: (v.snippet && v.snippet.publishedAt) || null };   // #420 for watched links
   return out;
 }
 async function geminiVideoNotes(videoId) {
@@ -15591,6 +15592,76 @@ async function geminiVideoTranscript(videoId) {
   const text = parts.filter(p => p && typeof p.text === 'string' && !p.thought).map(p => p.text).join('').trim();
   if (text.length < 100) throw new Error('Gemini returned ' + (text ? 'only ' + text.length + ' chars' : 'no text') + (cand && cand.finishReason ? ' (finishReason ' + cand.finishReason + ')' : ''));
   return { text, truncated: !!(cand && cand.finishReason === 'MAX_TOKENS') };
+}
+// #420 WATCH ANY LINK (Bryan 24 Sep): Gemini watches a public YouTube video Bryan chooses - from the PM (manage_sources
+// watch) or by pasting the link to the Telegram bot. Same notes as the channel scan; the analysis uses the plans of the coins
+// the NOTES mention (not a fixed tag list). Saved as a feed item: on the existing row if the video is already in the feed,
+// else under the source "Bryan's links" (active = 0, so the channel scans never touch it). Already watched -> cached.
+const LINKS_SOURCE_NAME = "Bryan's links";
+const COIN_NAMES = { BITCOIN: 'BTC', ETHEREUM: 'ETH', ETHER: 'ETH', SOLANA: 'SOL', RIPPLE: 'XRP', CANTON: 'CC', HYPERLIQUID: 'HYPE', CHAINLINK: 'LINK', JITO: 'JTO', BITTENSOR: 'TAO', AVALANCHE: 'AVAX', CARDANO: 'ADA', POLYGON: 'POL', UNISWAP: 'UNI', ETHENA: 'ENA', ARBITRUM: 'ARB', TONCOIN: 'TON', HEDERA: 'HBAR', STELLAR: 'XLM', INJECTIVE: 'INJ' };
+// coins with a saved plan that the notes mention (ticker as a whole word, or a common name), BTC first; at most 8
+async function coinsInNotes(notes) {
+  const t = String(notes || '');
+  const [rows] = await db.execute("SELECT symbol FROM coin_strategy WHERE strategy_md IS NOT NULL AND strategy_md <> ''");
+  const withPlan = new Set(rows.map(r => String(r.symbol).toUpperCase()));
+  const found = new Set();
+  for (const s of withPlan) { if (/^[A-Z0-9]{2,10}$/.test(s) && new RegExp('(^|[^A-Za-z0-9$])\\$?' + s + '(?![A-Za-z0-9])').test(t)) found.add(s); }
+  for (const [name, sym] of Object.entries(COIN_NAMES)) { if (withPlan.has(sym) && new RegExp('\\b' + name + '\\b', 'i').test(t)) found.add(sym); }
+  const out = [...found].sort((a, b) => (a === 'BTC' ? -1 : b === 'BTC' ? 1 : 0));
+  return out.slice(0, 8);
+}
+async function linksSourceId() {
+  const [r] = await db.execute('SELECT id FROM source_feeds WHERE name = ? AND type = ? ORDER BY id LIMIT 1', [LINKS_SOURCE_NAME, 'youtube']);
+  if (r.length) return r[0].id;
+  const [ins] = await db.execute('INSERT INTO source_feeds (name, type, url, channel_id, coin_tags, active) VALUES (?,?,?,?,?,0)', [LINKS_SOURCE_NAME, 'youtube', 'manual links (Telegram / PM)', null, '[]']);
+  return ins.insertId;
+}
+async function watchVideoLink(link, opts = {}) {
+  const vid = youtubeIdFromUrl(link);
+  if (!vid) throw new Error('not a YouTube video link: ' + String(link || '').slice(0, 80));
+  const url = 'https://www.youtube.com/watch?v=' + vid;
+  const [ex] = await db.execute('SELECT fi.id, fi.source_id, fi.title, fi.transcript, fi.analysis, sf.name source_name FROM feed_items fi JOIN source_feeds sf ON sf.id = fi.source_id WHERE fi.item_id = ? OR fi.url LIKE ? ORDER BY fi.id LIMIT 1', [vid, '%' + vid + '%']);
+  const row = ex[0] || null;
+  if (row && String(row.transcript || '').startsWith('[Gemini video notes]') && !opts.refresh) {
+    let a = null; try { a = row.analysis ? JSON.parse(row.analysis) : null; } catch (e) { a = null; }
+    return { cached: true, item_id: row.id, title: row.title, channel: row.source_name, notes: String(row.transcript).replace('[Gemini video notes]\n', ''), analysis: a };
+  }
+  let det = null;
+  if (process.env.YOUTUBE_API_KEY) { try { det = (await youtubeVideoDetails([vid]))[vid] || null; } catch (e) { console.error('[feeds] #420 details failed for ' + vid + ': ' + e.message); } }
+  if (det && (det.live === 'live' || det.live === 'upcoming')) throw new Error(det.live === 'live' ? 'the stream is still live - send it again after it ends' : 'this is an upcoming premiere - send it again after it airs');
+  const maxMin = Number(process.env.LINK_MAX_MIN) > 0 ? Number(process.env.LINK_MAX_MIN) : 180;
+  if (det && det.secs != null && det.secs > maxMin * 60) throw new Error(fmtMins(det.secs) + ' long - over the ' + maxMin + '-min limit for links (LINK_MAX_MIN)');
+  const notes = await geminiVideoNotes(vid);
+  const title = (det && det.title) || (row && row.title) || 'YouTube video ' + vid;
+  const channel = (det && det.channel) || (row && row.source_name) || null;
+  const coins = await coinsInNotes(notes);
+  const text = '[Gemini video notes]\n' + notes;
+  let itemId;
+  if (row) { await db.execute('UPDATE feed_items SET transcript = ?, coin_tags = ? WHERE id = ?', [text, JSON.stringify(coins), row.id]); itemId = row.id; }
+  else {
+    const sid = await linksSourceId();
+    const pub = det && det.published ? new Date(det.published) : new Date();
+    const [ins] = await db.execute('INSERT IGNORE INTO feed_items (source_id,item_id,title,published_at,url,transcript,coin_tags,thesis_status) VALUES (?,?,?,?,?,?,?,?)', [sid, vid, (channel ? channel + ': ' : '') + title, pub, url, text, JSON.stringify(coins), 'pending']);
+    itemId = ins.insertId || null;
+  }
+  lastFeedAnalysisError = null;
+  const analysis = await analyseSourceFeedItem({ title, transcript: text }, { name: channel || LINKS_SOURCE_NAME, coin_tags: coins.length ? coins : ['BTC'] });
+  if (itemId) {
+    if (analysis) await db.execute('UPDATE feed_items SET analysis = ?, thesis_status = ? WHERE id = ?', [JSON.stringify(analysis), analysis.thesis_status, itemId]);
+    else await db.execute('UPDATE feed_items SET analysis = ?, thesis_status = ? WHERE id = ?', [JSON.stringify({ skipped: 'analysis unavailable' + (lastFeedAnalysisError ? ': ' + String(lastFeedAnalysisError).slice(0, 200) : '') }), 'neutral', itemId]);
+  }
+  console.log('[feeds] #420 watched link ' + vid + ' -> item ' + itemId + ', coins ' + (coins.join(',') || 'none'));
+  return { cached: false, item_id: itemId, title, channel, minutes: det && det.secs != null ? Math.round(det.secs / 60) : null, coins, notes, analysis, analysis_error: analysis ? null : lastFeedAnalysisError };
+}
+// Telegram message for one watched link (escaped, capped)
+function formatWatchResult(r) {
+  let m = '🎥 <b>' + escTg(r.title || 'Video') + '</b>' + (r.channel ? '\n' + escTg(r.channel) : '') + (r.minutes ? ' - ' + r.minutes + ' min' : '') + (r.cached ? ' (watched earlier)' : '');
+  m += '\n\n' + escTg(String(r.notes || '').slice(0, 2600));
+  const a = r.analysis;
+  if (a && a.thesis_status) m += '\n\n<b>Against your plans (' + escTg(a.thesis_status) + '):</b> ' + escTg(String(a.implication || '').slice(0, 400));
+  else if (r.analysis_error) m += '\n\n⚠️ Plan check failed: ' + escTg(String(r.analysis_error).slice(0, 200));
+  m += '\n\nSaved as feed item ' + (r.item_id || '?') + ' - ask Claude PM for detail or a full transcript.';
+  return m.length > 3900 ? m.slice(0, 3850) + '\n[...]' : m;
 }
 function youtubeIdFromUrl(u) {
   const s = String(u || '').trim();
@@ -21068,7 +21139,7 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
   server.tool('manage_sources',
     'Content intelligence feed: manage YouTube channels and RSS news sources and fetch and read their analysed items. Monitors crypto analyst videos and news articles, pulls transcripts, and analyses each against saved coin strategies for thesis impact. Actions: add (add a YouTube or RSS source with coin tags), list (list all sources), remove (deactivate a source), fetch_now (fetch and analyse latest videos/articles now), get_items (read analysed content items, filter by coin). Use for morning brief content review, checking what analysts and news say about held coins, source feed management, and in-chat research.',
     {
-      action:      z.enum(['add','list','remove','fetch_now','get_items','scan_videos','scan_status','get_notes','transcribe']).describe('add: add source; list: list all; remove: deactivate; fetch_now: fetch new items now (waits - slow for YouTube, prefer scan_videos); get_items: retrieve analysed items; scan_videos (#419): Gemini watches new videos from every YouTube source (or source_id) IN THE BACKGROUND - returns at once, poll scan_status; scan_status: progress + the videos stored by the last scan with a one-line summary each; get_notes: Gemini\'s full notes + the analysis for item_id; transcribe: Gemini\'s VERBATIM transcript of item_id or video_url (slow, up to ~5 min; stored on the item)'),
+      action:      z.enum(['add','list','remove','fetch_now','get_items','scan_videos','scan_status','get_notes','transcribe','watch']).describe('add: add source; list: list all; remove: deactivate; fetch_now: fetch new items now (waits - slow for YouTube, prefer scan_videos); get_items: retrieve analysed items; scan_videos (#419): Gemini watches new videos from every YouTube source (or source_id) IN THE BACKGROUND - returns at once, poll scan_status; scan_status: progress + the videos stored by the last scan with a one-line summary each; get_notes: Gemini\'s full notes + the analysis for item_id; transcribe: Gemini\'s VERBATIM transcript of item_id or video_url (slow, up to ~5 min; stored on the item); watch (#420): Gemini watches ANY public YouTube video_url (or item_id) - notes + analysis against the plans of the coins it mentions, saved as a feed item (under "Bryan\'s links" if new); ~30-90 s; already watched -> cached (refresh: true to re-watch)'),
       source_id:   z.coerce.number().optional().describe('source id for remove/fetch_now/get_items'),
       name:        z.string().optional().describe('add: display name e.g. CoinBureau'),
       type:        z.enum(['youtube','rss']).optional().describe('add: source type'),
@@ -21080,8 +21151,9 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
       item_id:     z.coerce.number().optional().describe('get_notes / transcribe: feed item id (from get_items or scan_status)'),
       video_url:   z.string().optional().describe('transcribe: any public YouTube URL or 11-char video id, when there is no item_id'),
       include_notes: z.preprocess(v => (v === 'true' ? true : v === 'false' ? false : v), z.boolean()).optional().describe('get_items: also return each item\'s notes/text (capped at 4000 chars)'),
+      refresh:     z.preprocess(v => (v === 'true' ? true : v === 'false' ? false : v), z.boolean()).optional().describe('watch: re-watch even if already watched'),
     },
-    async ({ action, source_id, name, type, url, coin_tags, coin_filter, limit, since_days, item_id, video_url, include_notes }) => {
+    async ({ action, source_id, name, type, url, coin_tags, coin_filter, limit, since_days, item_id, video_url, include_notes, refresh }) => {
       let result = {};
       if (action === 'add') {
         let channelId = null;
@@ -21109,6 +21181,11 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
       } else if (action === 'get_notes') {
         const [rows] = await db.execute('SELECT fi.id, sf.name source_name, fi.title, fi.url, fi.published_at, fi.transcript AS notes, fi.analysis, fi.thesis_status, (fi.full_transcript IS NOT NULL) AS has_full_transcript FROM feed_items fi JOIN source_feeds sf ON sf.id = fi.source_id WHERE fi.id = ?', [item_id || 0]);
         result = rows.length ? { ok: true, action: 'get_notes', item: rows[0] } : { ok: false, action: 'get_notes', error: 'no feed item ' + item_id };
+      } else if (action === 'watch') {   // #420
+        let link = video_url;
+        if (!link && item_id) { const [rows] = await db.execute('SELECT url FROM feed_items WHERE id = ?', [item_id]); link = rows[0] ? rows[0].url : null; }
+        if (!link) result = { ok: false, action: 'watch', error: 'give video_url (any public YouTube link) or item_id' };
+        else { try { result = { ok: true, action: 'watch', ...(await watchVideoLink(link, { refresh: !!refresh })) }; } catch (e) { result = { ok: false, action: 'watch', error: e.message }; } }
       } else if (action === 'transcribe') {
         let vid = null, row = null;
         if (item_id) { const [rows] = await db.execute('SELECT id, title, url, full_transcript FROM feed_items WHERE id = ?', [item_id]); row = rows[0] || null; vid = row ? youtubeIdFromUrl(row.url) : null; }
@@ -22336,6 +22413,15 @@ app.post('/telegram-webhook', async (req, res) => {
     // NOTE: this creates ZERO new autonomous execution paths — /status reads,
     // /pause and /resume only toggle a flag the existing double-gate already reads.
     // #416 /brief - send the morning brief now (the same function as the 09:15 cron). Reads prices and news; never trades.
+    // #420 a YouTube link on its own (or "/watch <link>") -> Gemini watches it; the result arrives when done. Never trades.
+    // Matched on rawText: video ids are case-sensitive and commandText is lower-cased.
+    const ytLink = /^(?:\/watch\s+)?(\S*(?:youtube\.com|youtu\.be)\/\S+)$/i.exec(rawText);
+    if (ytLink) {
+      await sendReply('🎥 Watching it with Gemini - usually under 2 minutes.');
+      watchVideoLink(ytLink[1]).then(r => sendTelegram(formatWatchResult(r)))
+        .catch(async (e) => { console.error('[feeds] #420 watch failed:', e.message); await sendTelegram('❌ Could not watch that video: ' + escTg(e.message)); });
+      return res.status(200).json({ ok: true });
+    }
     // #419 /videos - Gemini watches new videos from every YouTube source now; a summary arrives when done. Never trades.
     if (commandText === 'videos') {
       if (videoScanInProgress) { await sendReply('A video scan is already running (' + ((lastVideoScan && lastVideoScan.sources_done) || 0) + ' of ' + ((lastVideoScan && lastVideoScan.sources_total) || '?') + ' channels done). The summary will arrive when it finishes.'); return res.status(200).json({ ok: true }); }
