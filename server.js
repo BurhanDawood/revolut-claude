@@ -397,6 +397,35 @@ async function notifyHeldOnce(kind, symbol, text) {
   _pauseHeld.set(k, since);
   await sendTelegram(text).catch(() => {});
 }
+// ── #H1 ENABLE-TIME WARNINGS ─────────────────────────────────────────────────────
+// "Enabled but silently inert" is #397 / #390 / A1 in a new hat. Every site that switches an autonomous path on asks
+// this ONE helper, so they all say the same thing. Warnings, never refusals: the write still happens; Bryan owns the
+// config and the system's job is to say plainly what it will do.
+//   manual_only_symbols -> no autonomous sell OR buy (pm #49: two-sided)
+//   hodl_symbols        -> no autonomous SELL, unless the coin is in DND (opts.dnd)
+//   opts.trigger        -> a SELL path whose trigger is not in allowed_triggers will not fire once enforced
+async function enableTimeWarnings(coin, opts = {}) {
+  const side = opts.side || 'both';   // 'sell' | 'buy' | 'both'
+  const c = String(coin || '').toUpperCase().replace('-USD', '');
+  const out = [];
+  let cfg;
+  try { const [r] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'ai_auto_execute'"); cfg = r.length ? JSON.parse(r[0].config_value) : {}; }
+  catch (e) { return out; }
+  const up = (a) => (Array.isArray(a) ? a : []).map(x => String(x).toUpperCase().replace('-USD', ''));
+  if (up(cfg.manual_only_symbols).includes(c))
+    out.push('\u26a0\ufe0f ' + c + ' is in manual_only_symbols - this is enabled but will not sell or buy autonomously until the coin is removed from the list.');
+  else if (side !== 'buy' && !opts.dnd && up(cfg.hodl_symbols).includes(c))
+    out.push('\u26a0\ufe0f ' + c + ' is in hodl_symbols - this is enabled but will not SELL autonomously (buys unaffected) until the coin is removed from the list.');
+  if (opts.trigger && side !== 'buy' && !(cfg.allowed_triggers || []).includes(opts.trigger))
+    out.push('\u26a0\ufe0f \'' + opts.trigger + '\' is not in allowed_triggers - ' + c + '\u2019s autonomous SALES on this path will not fire once enforced. Add it deliberately with configure_auto_execute if that is what you want.');
+  return out;
+}
+async function emitEnableWarnings(coin, opts, where) {
+  const w = await enableTimeWarnings(coin, opts).catch(() => []);
+  if (w.length) await sendTelegram(w.join('\n') + (where ? '\n(' + where + ')' : '')).catch(() => {});
+  return w;
+}
+
 // DND mode helpers (#32)
 async function getDndMode() {
   try {
@@ -2229,7 +2258,7 @@ try {
       'INSERT INTO system_config (config_key, config_value) VALUES (?, ?)',
       ['ai_auto_execute', JSON.stringify({
         enabled: false, max_sell_pct: 25,
-        allowed_triggers: ['trailing_stop', 'fixed_target', 'pump_alert'],
+        allowed_triggers: ['trailing_stop'],   // #H1 fail-closed: losing the row must mean LESS autonomy, not more (PM policy 24 Sep)
         require_confidence: 'High', cooldown_minutes: 60,
         hodl_symbols: defaultHodl,
         manual_only_symbols: defaultManualOnly
@@ -17268,7 +17297,8 @@ let rows;
         // #F3 omitted auto_execute = keep the existing trail's setting; false = switch auto-sell OFF; true = ON
         const r = await setTrailingStop(sym, trail_pct, resolvedPrice, entryPrice, (auto_execute === true || auto_execute === false) ? auto_execute : null, sell_pct != null ? sell_pct : null, tsExchange);
         const msgSuffix = r.autoExecute ? ` — AUTO-EXEC ON: will sell ${r.sellPct}% on breach (${r.exchange})` + (r.preserved && r.preserved.autoExecute ? ' (kept from the existing trail; pass auto_execute:false to switch it off)' : '') : ` — notify-only`;
-        result = { ok: true, action: 'set_trailing', symbol: sym, trail_pct, peak_price: r.peakPrice, stop_price: r.stopPrice, current_price: resolvedPrice, auto_execute: r.autoExecute, auto_execute_preserved: !!(r.preserved && r.preserved.autoExecute), sell_pct: r.sellPct, exchange: r.exchange, message: `Trailing stop set — alerts if ${sym} drops ${trail_pct}% from any peak` + msgSuffix };
+        const stWarn = r.autoExecute ? await emitEnableWarnings(sym, { side: 'sell', trigger: 'trailing_stop' }, 'set_trailing') : [];   // #H1
+        result = { ok: true, warnings: stWarn, action: 'set_trailing', symbol: sym, trail_pct, peak_price: r.peakPrice, stop_price: r.stopPrice, current_price: resolvedPrice, auto_execute: r.autoExecute, auto_execute_preserved: !!(r.preserved && r.preserved.autoExecute), sell_pct: r.sellPct, exchange: r.exchange, message: `Trailing stop set — alerts if ${sym} drops ${trail_pct}% from any peak` + msgSuffix };
 
       } else if (action === 'acknowledge') {
         await acknowledgeAlert(sym);
@@ -17314,7 +17344,8 @@ let rows;
         }
         const stNow = await getCurrentPrice(sym).catch(() => null);
         await armStandaloneTrough(sym, buy_usd, bounce_pct||8, entry_floor||null, stExch, stGate);
-        result = { ok: true, action: 'set_trough', symbol: sym, buy_usd, bounce_pct: bounce_pct||8,
+        const tgWarn = await emitEnableWarnings(sym, { side: 'buy' }, 'set_trough');   // #H1
+        result = { ok: true, warnings: tgWarn, action: 'set_trough', symbol: sym, buy_usd, bounce_pct: bounce_pct||8,
           entry_floor: entry_floor||null, exchange: stExch,
           retrace_gate: stGate ? { arm_below: Number(stGate.toPrecision(6)), from: retrace_pct != null ? Number(retrace_pct) + '% below ' + reference_price : 'exact price',
             price_now: stNow, distance_pct: stNow ? Number(((stGate / stNow - 1) * 100).toFixed(2)) : null, already_reached: !!(stNow && stNow <= stGate) } : null,
@@ -17410,7 +17441,7 @@ let rows;
       per_coin_enabled:       z.preprocess(v => { if (typeof v === 'string') { try { return JSON.parse(v); } catch(e) { return v; } } return v; }, z.record(z.boolean())).optional().describe('#24 explicit per-coin auto-exec opt-in map e.g. {"BOBA":true} -- only coins listed here can shouldAutoExecute'),
       away_action:            z.enum(['set_eligible','activate','deactivate','status','set_away_buy','set_away_sell']).optional().describe('configure_away_mode: which away-mode operation'),
       away_coins:             zLoose(z.array(z.string())).optional().describe('configure_away_mode: coin list for set_eligible / activate'),
-      allowed_triggers:       zLoose(z.array(z.string())).optional().describe('Alert types that can trigger auto-exec: trailing_stop, fixed_target, pump_alert'),
+      allowed_triggers:       zLoose(z.array(z.string())).optional().describe('Alert types that may auto-execute a SALE. Policy (24 Sep): trailing_stop only. Widening this widens the autonomous surface across every path once the fire-time predicate enforces it.'),
       require_confidence:     z.enum(['High', 'Medium', 'Low']).optional().describe('Minimum Claude confidence level to auto-execute'),
       cooldown_minutes:       z.coerce.number().optional().describe('Minutes to wait between auto-executions for same coin'),
       hodl_symbols:           zLoose(z.array(z.string())).optional().describe('Coins where AI analyses only and never auto-executes — Bryan decides. e.g. ["ENA","INJ","ALGO"]'),
@@ -17705,7 +17736,16 @@ let rows;
           [JSON.stringify(am)]
         );
         console.log('[away] configure_away_mode:', awayAction, '->', JSON.stringify(am));
-        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, away_mode: am, message: reply }) }] };
+        const awWarn = [];   // #H1
+        if (awayAction === 'activate' || awayAction === 'set_eligible') {
+          const awList = awayAction === 'activate' ? (am.coins || []) : (am.eligible || []);
+          if (awayAction === 'activate') {
+            try { const [ar] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'ai_auto_execute'"); const ac = ar.length ? JSON.parse(ar[0].config_value) : {};
+              if (!(ac.allowed_triggers || []).includes('fixed_target')) { const t = '\u26a0\ufe0f Away Mode is ON but \'fixed_target\' is not in allowed_triggers - Away up-target SALES will not fire (buys are unaffected). Add it deliberately with configure_auto_execute if that is what you want.'; awWarn.push(t); await sendTelegram(t).catch(() => {}); } } catch (e) {}
+          }
+          for (const c of awList) awWarn.push(...await emitEnableWarnings(c, { side: 'both' }, 'Away ' + awayAction));
+        }
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, away_mode: am, message: reply + (awWarn.length ? '\n' + awWarn.join('\n') : ''), warnings: awWarn }) }] };
       } else if (action === 'configure_auto_execute') {
         // Preserve hodl_symbols from existing config if not provided in this call
         const [existingCfgRows] = await db.execute(
@@ -17731,7 +17771,7 @@ let rows;
           ...existingCfg, // #281 merge-not-replace: preserve every key this handler does not explicitly manage (e.g. manual_only_symbols) — explicit fields below still override
           enabled: enabled ?? existingCfg.enabled ?? false,
           max_sell_pct: max_sell_pct || existingCfg.max_sell_pct || 25,
-          allowed_triggers: allowed_triggers || existingCfg.allowed_triggers || ['trailing_stop', 'fixed_target', 'pump_alert'],
+          allowed_triggers: allowed_triggers || existingCfg.allowed_triggers || ['trailing_stop'],   // #H1 fail-closed default
           require_confidence: require_confidence || existingCfg.require_confidence || 'High',
           cooldown_minutes: cooldown_minutes || existingCfg.cooldown_minutes || 60,
           hodl_symbols: params?.hodl_symbols ?? existingCfg.hodl_symbols ?? defaultHodl,
@@ -17757,7 +17797,24 @@ let rows;
           `Triggers: ${config.allowed_triggers.join(', ')}\n` +
           `HODL (analysis-only): ${(config.hodl_symbols || []).join(', ')}`
         );
-        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, config, saved_to: 'system_config' }) }] };
+        // #H1 say plainly what this config will do
+        const caWarn = [];
+        try {
+          const [le] = await db.execute('SELECT symbol FROM pump_armed_rules WHERE active = 1 AND loop_enabled = 1');
+          const loops = le.map(x => String(x.symbol).replace('-USD', ''));
+          const upc = (a) => (Array.isArray(a) ? a : []).map(x => String(x).toUpperCase().replace('-USD', ''));
+          if (per_coin_enabled && typeof per_coin_enabled === 'object') {
+            const on = Object.keys(per_coin_enabled).filter(k => per_coin_enabled[k] === true).map(k => k.toUpperCase());
+            if (on.length && !(config.allowed_triggers || []).includes('pump_alert')) caWarn.push('\u26a0\ufe0f per_coin_enabled set for ' + on.join(', ') + ' but \'pump_alert\' is not in allowed_triggers - the AI-analysis path cannot auto-SELL these coins.');
+            for (const c of on) caWarn.push(...await enableTimeWarnings(c, { side: 'sell' }));
+          }
+          if (allowed_triggers && !(config.allowed_triggers || []).includes('trailing_stop') && loops.length)
+            caWarn.push('\u26a0\ufe0f \'trailing_stop\' removed from allowed_triggers - under enforcement these loops will not sell: ' + loops.join(', ') + '.');
+          if (params?.manual_only_symbols !== undefined) { const hit = loops.filter(c => upc(config.manual_only_symbols).includes(c)); if (hit.length) caWarn.push('\u26a0\ufe0f manual_only_symbols now silences these enabled loops (no autonomous sell or buy): ' + hit.join(', ') + '.'); }
+          if (params?.hodl_symbols !== undefined) { const hit = loops.filter(c => upc(config.hodl_symbols).includes(c)); if (hit.length) caWarn.push('\u26a0\ufe0f hodl_symbols now stops these enabled loops SELLING (unless in DND): ' + hit.join(', ') + '.'); }
+        } catch (e) { console.error('[auto-exec] #H1 warnings failed:', e.message); }
+        if (caWarn.length) await sendTelegram(caWarn.join('\n')).catch(() => {});
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, config, saved_to: 'system_config', warnings: caWarn }) }] };
 
       } else if (action === 'sync_entry_prices') {
         const results = [];
@@ -18052,7 +18109,8 @@ let rows;
             }
           } catch (e) { console.error('[dnd] #153 master check error:', e.message); }
           await sendTelegram(`\ud83c\udf19 DND activated from PM: ${coins.join(', ')} (${D.arm}% arm, ${D.trail}% trail, loop on).`).catch(() => {});
-          return { content: [{ type: 'text', text: JSON.stringify({ ok: true, activated: coins, params: D }) }] };
+          const dndWarn = []; for (const c of coins) dndWarn.push(...await emitEnableWarnings(c, { side: 'both', dnd: true }, 'DND activate'));   // #H1
+          return { content: [{ type: 'text', text: JSON.stringify({ ok: true, activated: coins, params: D, warnings: dndWarn }) }] };
         }
         if (sub === 'deactivate') {
           dndSt.enabled = false;
@@ -18673,7 +18731,8 @@ let rows;
               '\nIt will never sell you below ' + (cfg.retention_floor_pct || 50) + '% of that (' + (managed * ((cfg.retention_floor_pct || 50) / 100)).toPrecision(6) + ' ' + coin + ').' +
               '\nThe old single-mode loop for ' + coin + ' is now OFF.' +
               '\n\nLadder-wide switch: ' + (switchOn ? 'ON - it can trade now.' : 'OFF - nothing will trade until it is switched on.')).catch(() => {});
-            return { content: [{ type: 'text', text: JSON.stringify({ ok: true, symbol: sym, cap_usd: Number(cap_usd), managed_qty: managed, start_price: price, cfg, ladder_live_enabled: switchOn }) }] };
+            const llWarn = await emitEnableWarnings(sym, { side: 'both', trigger: 'trailing_stop' }, 'ladder_live_start');   // #H1
+            return { content: [{ type: 'text', text: JSON.stringify({ ok: true, warnings: llWarn, symbol: sym, cap_usd: Number(cap_usd), managed_qty: managed, start_price: price, cfg, ladder_live_enabled: switchOn }) }] };
           }
           if (action === 'ladder_live_stop') {
             if (!sym) throw new Error('symbol required');
@@ -18830,6 +18889,7 @@ let rows;
           return { content: [{ type: 'text', text: JSON.stringify({
             read_only: true, balances_read: balancesOk, prices_read: Object.keys(px).length > 0,
             master_auto_execute: ae.enabled === true,
+            triggers: (ae.allowed_triggers || []).join(', ') || 'none',   // #H1 the live policy, where the loops are
             note: '/pause (ai_auto_execute.enabled=false) HOLDS every loop sell and buy-back since #F1; loop_disable stops a single loop. Floor (#377): the HIGHEST of real cost + 0.5% and any stored override - an override can raise it, never lower it; no cost and no override = sale blocked.',
             dnd_coins: dndCoins, loops
           }, null, 2) }] };
@@ -18862,7 +18922,8 @@ let rows;
           await db.execute('UPDATE pump_armed_rules SET loop_enabled = 1 WHERE symbol = ?', [sym]);
           const [after] = await db.execute('SELECT * FROM pump_armed_rules WHERE symbol = ? LIMIT 1', [sym]);
           await sendTelegram('LOOP ENABLED -- '+sym+' rinse-repeat ON. Floor $'+parseFloat(r.entry_floor).toFixed(6)+', sell '+r.sell_pct+'%, max '+r.max_cycles+' cycles. Master must also be ON to fire.'+conflictWarning).catch(()=>{});
-          return { content: [{ type: 'text', text: JSON.stringify({ ok: true, loop_enabled: 1, row: after[0], conflict_warning: conflictWarning || null }, null, 2) }] };
+          const leWarn = await emitEnableWarnings(sym, { side: 'both', trigger: 'trailing_stop' }, 'loop_enable');   // #H1
+          return { content: [{ type: 'text', text: JSON.stringify({ ok: true, loop_enabled: 1, row: after[0], conflict_warning: conflictWarning || null, warnings: leWarn }, null, 2) }] };
         }
         if (action === 'reset_cycle') {
           // #278 — clear stale pump-loop RUNTIME state while preserving all config.
@@ -19355,6 +19416,7 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
         }
         const [finRows] = await db.execute('SELECT * FROM pump_armed_rules WHERE symbol = ? LIMIT 1', [sym]);
         const fin = finRows[0] || {};
+        const spWarn = Number(fin.loop_enabled) === 1 ? await emitEnableWarnings(sym, { side: 'both', trigger: 'trailing_stop' }, 'set_pump_armed_rule') : [];   // #H1
         const num = (v) => v == null ? null : Number(v);
         await sendTelegram(
           `🎯 <b>PUMP-ARM RULE ${ex ? 'UPDATED' : 'SET'} — ${sym.replace('-USD','')}</b>\n\n` +
@@ -19368,7 +19430,7 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
           `${Number(fin.armed) === 1 ? '\nArmed state kept - this change did not disarm the loop.' : ''}` +
           `${tierInfo ? `\nMode: TIERED — sell ${stJson}, buy ${btJson} (cumulative sell ${tierInfo.cumulative_sell_pct}%, cap ${tierInfo.max_sell_pct}%)` : ''}` + conflictWarning
         ).catch(() => {});
-        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, stop_check: _stopCheck, mode: ex ? 'updated' : 'created', changed, rule: {
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, warnings: spWarn, stop_check: _stopCheck, mode: ex ? 'updated' : 'created', changed, rule: {
           symbol: sym, arm_pump_pct: num(fin.arm_pump_pct), arm_window_min: num(fin.arm_window_min), trail_pct: num(fin.trail_pct), sell_pct: num(fin.sell_pct),
           entry_floor: num(fin.entry_floor), rebuy_pct: num(fin.rebuy_pct), retrace_pct: num(fin.retrace_pct), bounce_pct: num(fin.bounce_pct),
           buyback_floor_pct: num(fin.buyback_floor_pct), rule_mode: fin.rule_mode, tier_cooldown_min: num(fin.tier_cooldown_min), min_tier_usd: num(fin.min_tier_usd),
@@ -21099,6 +21161,7 @@ app.post('/telegram-webhook', async (req, res) => {
           '\nAvailable USD: <b>' + usdTxt + '</b>' + pnlTxt + armedTxt +
           '\nmanual_only: ' + ((aeCfg.manual_only_symbols || []).join(', ') || 'none') +
           '\nmax_sell_pct: ' + (aeCfg.max_sell_pct != null ? aeCfg.max_sell_pct : 'unset') +
+          '\ntriggers: ' + ((aeCfg.allowed_triggers || []).join(', ') || 'none') +   // #H1
           (en ? '' : '\nHeld while paused: ' + ([..._pauseHeld.keys()].map(k => k.split(':')[1].replace('-USD', '')).join(', ') || 'none')));   // #F1
         return res.status(200).json({ ok: true });
       }
@@ -22228,6 +22291,7 @@ app.post('/telegram-webhook', async (req, res) => {
       }
       await setDndMode({ enabled: true, activated_at: new Date().toISOString(), coins });
       await sendReply(`\ud83c\udf19 DND ON for ${coins.join(', ')}. Pump loop auto-executes silently (30% arm, 8% trail, loop). Say <b>dnd off</b> to cancel.`);
+      for (const c of coins) await emitEnableWarnings(c, { side: 'both', dnd: true }, 'dnd');   // #H1
       return res.status(200).json({ ok: true });
     }
     // Command: dnd off (#32)
