@@ -9289,6 +9289,8 @@ Portfolio (Revolut X): ${ctx.total}. Top holdings (change since midnight, P&L vs
 Market: ${ctx.market}
 Alerts close to firing: ${ctx.alerts}
 Abnormal moves of 3% or more in one check, last 24 h (held coins): ${ctx.moves}
+Analyst videos, last 24 h (channel: title - notes; [Not watched] means only the title/description was available):
+${ctx.videos || '(none)'}
 Headlines from the last 24 h (source, age: title):
 ${headlines || '(no feed headlines - use Google Search)'}
 
@@ -9303,6 +9305,9 @@ FORMAT (exactly this layout)
 - [the headline that matters most for Bryan's holdings or the market - one line, name the source]
 - [second]
 - [third]
+
+🎥 ANALYST VIDEOS:
+- [up to three lines: which analyst said what about Bryan's coins or the market, from the video notes above; write "No new analyst videos." if there are none]
 
 👀 WATCH TODAY:
 1. [a level, event or coin to watch, from the data above]
@@ -9553,13 +9558,25 @@ async function sendMorningBriefing() {
           if (mv.length) movesTxt = mv.map(m => String(m.symbol).replace('-USD', '') + ' ' + Number(m.ups) + ' up / ' + Number(m.downs) + ' down, largest ' + Number(m.mx).toFixed(1) + '%').join('; ');
         }
       } catch (e) { movesTxt = 'unavailable'; }
+      // #417 analyst videos from the 07:30 scan. Only Gemini's own notes go into this prompt - never the plan-based analysis.
+      let videosTxt = '', videoStatus = '';
+      try {
+        const [vr] = await db.execute("SELECT sf.name, fi.title, fi.transcript FROM feed_items fi JOIN source_feeds sf ON sf.id = fi.source_id WHERE sf.type = 'youtube' AND fi.created_at > DATE_SUB(NOW(), INTERVAL 26 HOUR) ORDER BY fi.published_at DESC LIMIT 15");
+        const watched = vr.filter(v => String(v.transcript || '').startsWith('[Gemini video notes]'));
+        const notW = vr.filter(v => !String(v.transcript || '').startsWith('[Gemini video notes]'));
+        videosTxt = vr.map(v => '- ' + v.name + ': ' + v.title + ' - ' + String(v.transcript || '').replace(/\s+/g, ' ').slice(0, 1200)).join('\n');
+        const reasons = [...new Set(notW.map(v => (/^\[Not watched: ([^\]]*)\]/.exec(String(v.transcript || '')) || [])[1] || 'title only (older scan)'))];
+        videoStatus = '\n\n\ud83c\udfa5 Videos (last 24 h): ' + watched.length + ' watched' + (notW.length ? ', ' + notW.length + ' not watched (' + escTg(reasons.join('; ').slice(0, 300)) + ')' : '');
+      } catch (e) { videoStatus = '\n\n\ud83c\udfa5 Videos: could not be read - ' + escTg(e.message); }
+      if (lastVideoScan && Date.now() - lastVideoScan.at < 26 * 3600000 && lastVideoScan.errors.length) videoStatus += '\n\u26a0\ufe0f Video scan errors: ' + escTg(lastVideoScan.errors.join(' | ').slice(0, 400));
+      else if (!lastVideoScan) videoStatus += ' - no video scan since the last restart';
       const gb = await geminiMarketBrief({
-        dateStr, total: fmtAmt(totalUSD), holdings: portfolioContext || 'none',
+        dateStr, total: fmtAmt(totalUSD), holdings: portfolioContext || 'none', videos: videosTxt,
         market: marketTxt.join(', ') || 'no BTC/ETH price available',
         alerts: alertsToWatch.length ? alertsToWatch.join('; ') : 'none', moves: movesTxt
       });
       console.log('[brief] #416 Gemini ok: model ' + gb.model + ', ' + gb.headlines + ' headlines, search ' + (gb.search ? 'on' : 'off') + (gb.feedsFailed.length ? ', feeds down: ' + gb.feedsFailed.join(', ') : ''));
-      msg2 = formatBriefForTelegram(gb.text) + (gb.feedsFailed.length ? '\n\n(News feeds unreachable today: ' + escTg(gb.feedsFailed.join(', ')) + ')' : '') + BRIEF_PM_NUDGE;
+      msg2 = formatBriefForTelegram(gb.text) + (gb.feedsFailed.length ? '\n\n(News feeds unreachable today: ' + escTg(gb.feedsFailed.join(', ')) + ')' : '') + videoStatus + BRIEF_PM_NUDGE;
     } catch (ge) {
       console.error('[brief] #416 market section DEGRADED:', ge && ge.message);
       const wh = holdings.filter(h => h.overnightChange !== null);
@@ -15401,12 +15418,140 @@ async function analyseSourceFeedItem(item, source) {
     const [[row]] = await db.execute('SELECT strategy_md FROM coin_strategy WHERE symbol=?',[coin]).catch(()=>[[]]);
     if (row?.strategy_md) plans.push('=== '+coin+' PLAN ===\n'+row.strategy_md);
   }
-  const prompt = `Analyse this content from "${source.name}" against the trader's saved coin plans.\n\nCOIN PLANS:\n${plans.join('\n\n')||'No saved plans.'}\n\nCONTENT:\nTitle: ${item.title}\n\n${item.transcript.slice(0,6000)}\n\nRespond JSON only (no markdown): {"thesis_status":"intact|drifting|broken|neutral","takeaways":["bullet1","bullet2","bullet3"],"implication":"one sentence"}`;
+  const prompt = `Analyse this content from "${source.name}" against the trader's saved coin plans.\n\nCOIN PLANS:\n${plans.join('\n\n')||'No saved plans.'}\n\nCONTENT:\nTitle: ${item.title}\n\n${item.transcript.slice(0,9000)}\n\nRespond JSON only (no markdown): {"thesis_status":"intact|drifting|broken|neutral","takeaways":["bullet1","bullet2","bullet3"],"implication":"one sentence"}`;
+  try {   // #417 Gemini, not Claude Haiku (Bryan chose B, 24 Sep: free). thesis_status is checked - the column is an ENUM.
+    const text = await geminiGenerateText(prompt, { json: true, maxOutputTokens: 4096, timeoutMs: 60000 });
+    const a = JSON.parse(text.replace(/```json|```/g,'').trim());
+    if (!a || typeof a !== 'object') throw new Error('analysis was not a JSON object');
+    if (!['intact','drifting','broken','neutral'].includes(a.thesis_status)) a.thesis_status = 'neutral';
+    return a;
+  } catch(e) { lastFeedAnalysisError = e.message; console.error('[feeds] analysis err:',e.message); return null; }
+}
+// #417 (fix for #202, direction #203, saved spec gemini_transcript_build_spec): YouTube blocks Railway's IP with a
+// google.com/sorry 429 wall, so page-scraped transcripts are dead. Gemini takes the PUBLIC video URL and Google fetches
+// the video on its own servers - Railway never touches youtube.com. The video call carries ONLY the public URL + a
+// note-taking prompt. The plan-based analysis (analyseSourceFeedItem) is a separate call, also Gemini since #417 - Bryan's
+// choice B, 24 Sep: free, and Gemini's terms give UK users paid-tier data handling (no training on the content).
+// Notes, not a verbatim transcript: the analysis reads a bounded slice, and dense notes carry the whole video into it.
+// Limits: public videos only; free tier 8 h of YouTube video a day -> skip live/upcoming streams and anything over
+// VIDEO_MAX_MIN (default 60), at most VIDEO_MAX_PER_CHANNEL (3) per channel per scan, one video at a time.
+const VIDEO_NOTES_PROMPT = `You are taking notes on a crypto analyst's YouTube video for a trader who will not watch it.
+Write factual notes on what is SAID in the video. Plain text, no markdown, at most about 900 words:
+1. SUMMARY: one line - the video's main message.
+2. COINS: every coin or token discussed - what was said, any price levels, targets, supports or invalidation levels, the stance (bullish / bearish / neutral) and the timeframe.
+3. MARKET: views on BTC, the overall market, macro, rates, ETF flows, regulation.
+4. METHODS: any repeatable trading method or rule the presenter describes (entry, exit, sizing criteria), stated precisely.
+5. SPONSOR: note any sponsored segment or promotion in one line.
+Do not add your own opinions. Do not invent numbers. If something is unclear, say it is unclear.`;
+function parseIsoDurationSecs(s) {
+  const m = /^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?$/.exec(String(s || ''));
+  if (!m) return null;
+  return ((+m[1] || 0) * 86400) + ((+m[2] || 0) * 3600) + ((+m[3] || 0) * 60) + (+m[4] || 0);
+}
+// id -> { secs, live } from the YouTube Data API (key-based, not the blocked watch page). Throws on failure.
+async function youtubeVideoDetails(ids) {
+  const out = {};
+  if (!ids.length) return out;
+  const r = await fetch('https://www.googleapis.com/youtube/v3/videos?part=contentDetails,snippet&id=' + ids.map(encodeURIComponent).join(',') + '&key=' + process.env.YOUTUBE_API_KEY);
+  const j = await r.json().catch(() => null);
+  if (!r.ok || !j) throw new Error('YouTube videos API HTTP ' + r.status + (j && j.error && j.error.message ? ': ' + j.error.message : ''));
+  for (const v of (j.items || [])) out[v.id] = { secs: parseIsoDurationSecs(v.contentDetails && v.contentDetails.duration), live: (v.snippet && v.snippet.liveBroadcastContent) || 'none' };
+  return out;
+}
+async function geminiVideoNotes(videoId) {
+  const key = process.env.GEMINI_API_KEY;
+  if (!key) throw new Error('GEMINI_API_KEY is not set on Railway');
+  const model = String(process.env.GEMINI_VIDEO_MODEL || process.env.GEMINI_MODEL || 'gemini-3.8-flash').trim().replace(/^models\//, '');
+  const body = { contents: [{ role: 'user', parts: [{ file_data: { file_uri: 'https://www.youtube.com/watch?v=' + videoId } }, { text: VIDEO_NOTES_PROMPT }] }],
+    generationConfig: { temperature: 0.2, maxOutputTokens: 8192 } };
+  const ctl = new AbortController(); const to = setTimeout(() => ctl.abort(), 180000);
+  let r, raw;
   try {
-    const resp = await anthropic.messages.create({ model:'claude-haiku-4-5-20251001', max_tokens:400, messages:[{role:'user',content:prompt}] });
-    const text = resp.content?.[0]?.text||'';
-    return JSON.parse(text.replace(/```json|```/g,'').trim());
-  } catch(e) { console.error('[feeds] analysis err:',e.message); return null; }
+    r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent', {
+      method: 'POST', signal: ctl.signal, headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key }, body: JSON.stringify(body)
+    });
+    raw = await r.text();
+  } catch (e) {
+    throw new Error(e && e.name === 'AbortError' ? 'Gemini timed out after 180 s' : 'Gemini request failed: ' + (e && e.message));
+  } finally { clearTimeout(to); }
+  let j = null; try { j = JSON.parse(raw); } catch (e) { j = null; }
+  if (!r.ok) throw new Error('Gemini HTTP ' + r.status + (r.status === 429 ? ' (rate limit or quota)' : '') + ': ' + String((j && j.error && j.error.message) || raw || '').slice(0, 160));
+  const cand = j && Array.isArray(j.candidates) ? j.candidates[0] : null;
+  const parts = cand && cand.content && Array.isArray(cand.content.parts) ? cand.content.parts : [];
+  const text = parts.filter(p => p && typeof p.text === 'string' && !p.thought).map(p => p.text).join('').trim();
+  if (text.length < 100) throw new Error('Gemini returned ' + (text ? 'only ' + text.length + ' chars' : 'no text') + (cand && cand.finishReason ? ' (finishReason ' + cand.finishReason + ')' : ''));
+  const u = j.usageMetadata || {};
+  console.log('[feeds] #417 Gemini watched ' + videoId + ': ' + text.length + ' chars notes, tokens in ' + (u.promptTokenCount || '?') + ' / out ' + (u.candidatesTokenCount || '?'));
+  return text;
+}
+const fmtMins = (secs) => (secs >= 3600 ? Math.floor(secs / 3600) + 'h' + String(Math.round((secs % 3600) / 60)).padStart(2, '0') + 'm' : Math.round(secs / 60) + ' min');
+// One upload -> the text the analysis reads. The first bracket says what it is, so the brief and the PM can tell a watched
+// video from a fallback: [Gemini video notes] / [Not watched: reason] + description / title.
+async function youtubeItemContent(u, det) {
+  const maxMin = Number(process.env.VIDEO_MAX_MIN) > 0 ? Number(process.env.VIDEO_MAX_MIN) : 60;
+  let reason = null;
+  if (!det) reason = 'no duration or live status from the YouTube API';
+  else if (det.live === 'live' || det.live === 'upcoming') reason = det.live === 'live' ? 'live stream in progress' : 'upcoming premiere';
+  else if (det.secs == null) reason = 'duration unknown';
+  else if (det.secs > maxMin * 60) reason = fmtMins(det.secs) + ', over the ' + maxMin + '-min limit';
+  if (!reason) {
+    try { return { text: '[Gemini video notes]\n' + (await geminiVideoNotes(u.item_id)), watched: true }; }
+    catch (e) { reason = 'Gemini failed - ' + (e && e.message); }
+  }
+  const desc = String(u.description || '').trim();
+  const text = '[Not watched: ' + reason + ']\n' + (desc.length >= 100
+    ? 'Video title: ' + (u.title || '') + '\nYouTube description (the channel\'s own text, not the video): ' + desc.slice(0, 5000)
+    : 'Video title: ' + (u.title || '') + '. (Full content unavailable for this upload; analyse the title as an analyst signal about the tagged coins.)');
+  return { text, watched: false, reason };
+}
+let videoScanInProgress = false, lastVideoScan = null;   // lastVideoScan: { at, errors[] } - read by the morning brief
+// #417 daily scan: every active YouTube source, one at a time. Loud: source-level errors are kept for the brief.
+async function scanYoutubeSources() {
+  if (videoScanInProgress) { console.log('[feeds] #417 video scan already running - skipped'); return null; }
+  videoScanInProgress = true;
+  const errors = [];
+  try {
+    if (!process.env.YOUTUBE_API_KEY) errors.push('YOUTUBE_API_KEY is not set - no channel can be read');
+    else {
+      const [srcs] = await db.execute("SELECT id FROM source_feeds WHERE active = 1 AND type = 'youtube' ORDER BY id");
+      for (const s of srcs) {
+        try { const r = await fetchAllSources(s.id); for (const e of (r.errors || [])) errors.push(e.source + ': ' + e.error); }
+        catch (e) { errors.push('source ' + s.id + ': ' + e.message); }
+      }
+    }
+  } finally {
+    lastVideoScan = { at: Date.now(), errors };
+    videoScanInProgress = false;
+  }
+  console.log('[feeds] #417 video scan done' + (errors.length ? ' - errors: ' + errors.join(' | ') : ''));
+  return lastVideoScan;
+}
+// #417 one plain Gemini text call (the feed analysis). Throws with a readable reason on any failure.
+let lastFeedAnalysisError = null;
+async function geminiGenerateText(prompt, opts = {}) {
+  const key = process.env.GEMINI_API_KEY;
+  if (!key) throw new Error('GEMINI_API_KEY is not set on Railway');
+  const model = String(process.env.GEMINI_MODEL || 'gemini-3.8-flash').trim().replace(/^models\//, '');
+  const body = { contents: [{ role: 'user', parts: [{ text: prompt }] }], generationConfig: { temperature: opts.temperature != null ? opts.temperature : 0.2, maxOutputTokens: opts.maxOutputTokens || 4096 } };
+  if (opts.json) body.generationConfig.responseMimeType = 'application/json';
+  const ms = opts.timeoutMs || 60000;
+  const ctl = new AbortController(); const to = setTimeout(() => ctl.abort(), ms);
+  let r, raw;
+  try {
+    r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent', {
+      method: 'POST', signal: ctl.signal, headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key }, body: JSON.stringify(body)
+    });
+    raw = await r.text();
+  } catch (e) {
+    throw new Error(e && e.name === 'AbortError' ? 'Gemini timed out after ' + Math.round(ms / 1000) + ' s' : 'Gemini request failed: ' + (e && e.message));
+  } finally { clearTimeout(to); }
+  let j = null; try { j = JSON.parse(raw); } catch (e) { j = null; }
+  if (!r.ok) throw new Error('Gemini HTTP ' + r.status + (r.status === 429 ? ' (rate limit or quota)' : '') + ': ' + String((j && j.error && j.error.message) || raw || '').slice(0, 160));
+  const cand = j && Array.isArray(j.candidates) ? j.candidates[0] : null;
+  const parts = cand && cand.content && Array.isArray(cand.content.parts) ? cand.content.parts : [];
+  const text = parts.filter(p => p && typeof p.text === 'string' && !p.thought).map(p => p.text).join('').trim();
+  if (!text) throw new Error('Gemini returned no text' + (cand && cand.finishReason ? ' (finishReason ' + cand.finishReason + ')' : ''));
+  return text;
 }
 async function fetchYoutubeUploads(source) {
   const apiKey = process.env.YOUTUBE_API_KEY;
@@ -15414,10 +15559,12 @@ async function fetchYoutubeUploads(source) {
   const playlist = chan.items?.[0]?.contentDetails?.relatedPlaylists?.uploads;
   if (!playlist) throw new Error('No uploads playlist for '+source.channel_id);
   const list = await fetch(`https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&playlistId=${playlist}&maxResults=10&key=${apiKey}`).then(r=>r.json());
-  const since = source.last_fetched ? new Date(source.last_fetched) : new Date(0);
+  // #417 never reach back more than 48 h (last_fetched was 2 Jul: an old stamp would queue a channel's last 10 uploads)
+  const since = new Date(Math.max(source.last_fetched ? new Date(source.last_fetched).getTime() : 0, Date.now() - 48 * 3600000));
   return (list.items||[]).filter(i=>new Date(i.snippet.publishedAt)>since).map(i=>({
     item_id: i.snippet.resourceId.videoId, title: i.snippet.title,
-    published_at: i.snippet.publishedAt, url: 'https://www.youtube.com/watch?v='+i.snippet.resourceId.videoId
+    published_at: i.snippet.publishedAt, url: 'https://www.youtube.com/watch?v='+i.snippet.resourceId.videoId,
+    description: String(i.snippet.description || '')   // #417 fallback text when the video cannot be watched (#202 Build 2)
   }));
 }
 async function fetchRssItems(source) {
@@ -15435,15 +15582,22 @@ async function fetchAllSources(sourceId) {
     try {
       let newItems=[];
       if (source.type==='youtube' && process.env.YOUTUBE_API_KEY) {
-        const uploads = await fetchYoutubeUploads(source);
-        for (const u of uploads) {
-          let transcript = await fetchYoutubeTranscript(u.item_id);
-          if (!transcript || transcript.length < 100) {
-            const fallback = ('Video title: ' + (u.title||'') + '. (Full transcript unavailable for this upload; analyse the title as an analyst signal about the tagged coins.)');
-            console.log('[feeds] '+source.name+' '+u.item_id+': no transcript, using title fallback');
-            transcript = fallback;
-          }
-          newItems.push({...u, transcript});
+        // #417 Gemini watches each new upload (fetchYoutubeTranscript's page-scrape is dead - #202). Already-stored uploads
+        // are skipped before any Gemini call; at most VIDEO_MAX_PER_CHANNEL per scan; one at a time with a pause.
+        const perCh = Number(process.env.VIDEO_MAX_PER_CHANNEL) > 0 ? Number(process.env.VIDEO_MAX_PER_CHANNEL) : 3;
+        const fresh = [];
+        for (const u of await fetchYoutubeUploads(source)) {
+          const [ex] = await db.execute('SELECT 1 FROM feed_items WHERE source_id = ? AND item_id = ? LIMIT 1', [source.id, u.item_id]);
+          if (!ex.length) fresh.push(u);
+        }
+        let details = {};
+        try { details = await youtubeVideoDetails(fresh.slice(0, perCh).map(u => u.item_id)); }
+        catch (e) { console.error('[feeds] #417 ' + source.name + ': video details failed - ' + e.message); }
+        for (const u of fresh.slice(0, perCh)) {
+          const c = await youtubeItemContent(u, details[u.item_id]);
+          console.log('[feeds] ' + source.name + ' ' + u.item_id + ': ' + (c.watched ? 'watched by Gemini' : 'NOT watched - ' + c.reason));
+          newItems.push({ ...u, transcript: c.text });
+          if (c.watched) await new Promise(res => setTimeout(res, 5000));
         }
       } else if (source.type==='rss') {
         newItems = await fetchRssItems(source);
@@ -15452,9 +15606,10 @@ async function fetchAllSources(sourceId) {
         const [ins] = await db.execute('INSERT IGNORE INTO feed_items (source_id,item_id,title,published_at,url,transcript,coin_tags,thesis_status) VALUES (?,?,?,?,?,?,?,?)',[source.id,item.item_id,item.title,item.published_at,item.url,item.transcript,source.coin_tags,'pending']);
         if (ins.affectedRows>0) {
           totalFetched++;
+          lastFeedAnalysisError = null;
           const analysis = await analyseSourceFeedItem(item, source);
           if (analysis) { await db.execute('UPDATE feed_items SET analysis=?,thesis_status=? WHERE source_id=? AND item_id=?',[JSON.stringify(analysis),analysis.thesis_status,source.id,item.item_id]); totalAnalysed++; }
-          else { const reason = (!item.transcript || item.transcript.length < 100) ? 'content too short to analyse (headline/snippet only)' : 'analysis unavailable'; await db.execute('UPDATE feed_items SET analysis=?,thesis_status=? WHERE source_id=? AND item_id=?',[JSON.stringify({skipped:reason}),'neutral',source.id,item.item_id]); }
+          else { const reason = (!item.transcript || item.transcript.length < 100) ? 'content too short to analyse (headline/snippet only)' : 'analysis unavailable' + (lastFeedAnalysisError ? ': ' + String(lastFeedAnalysisError).slice(0, 200) : ''); await db.execute('UPDATE feed_items SET analysis=?,thesis_status=? WHERE source_id=? AND item_id=?',[JSON.stringify({skipped:reason}),'neutral',source.id,item.item_id]); }
         }
       }
       await db.execute('UPDATE source_feeds SET last_fetched=NOW() WHERE id=?',[source.id]);
@@ -15464,6 +15619,7 @@ async function fetchAllSources(sourceId) {
   return { totalFetched, totalAnalysed, errors: errors_ };
 }
 
+cron.schedule('30 7 * * *', () => { scanYoutubeSources().catch(e => console.error('[feeds] #417 07:30 scan failed:', e.message)); }, { timezone: 'Europe/London' });   // #417 analyst videos, ready for the 09:15 brief
 cron.schedule('15 9 * * *', async () => {   // #416 daily brief (Bryan 24 Sep): snapshot + Gemini news; replaces the 'open Claude PM' reminder (now the brief's last line)
   try { await sendMorningBriefing(); }
   catch (e) { console.error('[brief] 09:15 cron failed:', e.message); await sendTelegram('\u274c Morning brief failed: ' + escTg(e.message)); }
