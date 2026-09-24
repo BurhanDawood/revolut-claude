@@ -10415,7 +10415,7 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
       [coinBase, action, price, absQty, valueUsd, reasoning, 'pending', claudeRec]
     );
     const journalId = result.insertId;
-    if (action === 'buy' || action === 'sell') await recordManualDecision(symbol, action, 'revolut', price, absQty, 'manual_detected', { journal_id: journalId });   // #P0 (PM P0-e) app-side trade, observed not approved; audit only, never throws
+    if ((action === 'buy' || action === 'sell') && !staleClaudeMcpRowId) await recordManualDecision(symbol, action, 'revolut', price, absQty, 'manual_detected', { journal_id: journalId });   // #P0 (PM P0-e) app-side trade, observed not approved; audit only, never throws. #411 not when superseding a #20 claude_mcp/auto_rule/ai_auto row: that trade was approved (has its manual_approved row) or autonomous, never manual
     // #20: remove stale claude_mcp row superseded by actual fill at different price
     if (staleClaudeMcpRowId) {
       await db.execute('DELETE FROM trading_journal WHERE id = ?', [staleClaudeMcpRowId]).catch(() => {});
