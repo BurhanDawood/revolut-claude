@@ -9212,6 +9212,133 @@ async function recordDailyPrices() {
   }
 }
 
+// #416 MORNING BRIEF MARKET SECTION (Bryan 24 Sep): written by Gemini instead of Claude (ticket #40 turned the brief off
+// because the Claude + web-search call cost money). News comes from the crypto RSS feeds fetched here - free; with
+// GEMINI_SEARCH=on Gemini may also search Google (needs billing on the Google project). Model: GEMINI_MODEL, default below.
+// LOUD FAILURE (the condition Claude set on the original plan): every failure - no key, HTTP error, 429, timeout, empty
+// or unreadable reply, no headlines - throws, and the caller sends a visible "degraded" message. Never silence.
+function escTg(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+const BRIEF_FEEDS = [
+  ['CoinDesk', 'https://www.coindesk.com/arc/outboundfeeds/rss/'],
+  ['Cointelegraph', 'https://cointelegraph.com/rss'],
+  ['Decrypt', 'https://decrypt.co/feed'],
+  ['CryptoSlate', 'https://cryptoslate.com/feed/'],
+  ['Crypto Briefing', 'https://cryptobriefing.com/feed/'],
+  ['Bitcoin Magazine', 'https://bitcoinmagazine.com/.rss/full/'],
+  ['CNBC Markets', 'https://www.cnbc.com/id/10000664/device/rss/rss.html'],
+];
+function decodeFeedText(s) {
+  const cp = (n) => (Number.isFinite(n) && n > 0 && n <= 0x10FFFF ? String.fromCodePoint(n) : '');
+  return String(s || '').replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1').replace(/<[^>]+>/g, '')
+    .replace(/&#(\d+);/g, (m, n) => cp(Number(n))).replace(/&#x([0-9a-f]+);/gi, (m, h) => cp(parseInt(h, 16)))
+    .replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&')
+    .replace(/\s+/g, ' ').trim();
+}
+function parseFeedItems(xml) {
+  const out = [];
+  for (const b of (String(xml || '').match(/<(item|entry)\b[\s\S]*?<\/\1>/gi) || [])) {
+    const title = decodeFeedText((b.match(/<title\b[^>]*>([\s\S]*?)<\/title>/i) || [])[1]);
+    if (!title) continue;
+    const d = (b.match(/<(pubDate|published|updated|dc:date)\b[^>]*>([\s\S]*?)<\/\1>/i) || [])[2];
+    const ts = d ? Date.parse(decodeFeedText(d)) : NaN;
+    out.push({ title: title.slice(0, 200), ts: Number.isFinite(ts) ? ts : null });
+  }
+  return out;
+}
+async function fetchNewsHeadlines(hours = 26, perFeed = 10, cap = 50) {
+  const since = Date.now() - hours * 3600000;
+  const results = await Promise.allSettled(BRIEF_FEEDS.map(async ([name, url]) => {
+    const ctl = new AbortController(); const to = setTimeout(() => ctl.abort(), 8000);
+    try {
+      const r = await fetch(url, { signal: ctl.signal, headers: { 'User-Agent': 'Mozilla/5.0 (compatible; morning-brief)' } });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return parseFeedItems(await r.text()).filter(i => i.ts == null || i.ts >= since).slice(0, perFeed).map(i => ({ source: name, title: i.title, ts: i.ts }));
+    } finally { clearTimeout(to); }
+  }));
+  const seen = new Set(), items = [], failed = [];
+  results.forEach((r, i) => {
+    if (r.status !== 'fulfilled') { failed.push(BRIEF_FEEDS[i][0]); return; }
+    for (const it of r.value) {
+      const k = it.title.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+      if (!k || seen.has(k)) continue;
+      seen.add(k); items.push(it);
+    }
+  });
+  items.sort((a, b) => (b.ts || 0) - (a.ts || 0));
+  return { items: items.slice(0, cap), failed };
+}
+async function geminiMarketBrief(ctx) {
+  const key = process.env.GEMINI_API_KEY;
+  if (!key) throw new Error('GEMINI_API_KEY is not set on Railway');
+  const model = String(process.env.GEMINI_MODEL || 'gemini-3.8-flash').trim().replace(/^models\//, '');
+  const search = String(process.env.GEMINI_SEARCH || '').trim().toLowerCase() === 'on';
+  const news = await fetchNewsHeadlines();
+  if (!news.items.length && !search) throw new Error('no news headlines could be fetched' + (news.failed.length ? ' (feeds down: ' + news.failed.join(', ') + ')' : ''));
+  const ago = (ts) => (ts ? Math.max(0, Math.round((Date.now() - ts) / 3600000)) + 'h ago' : 'undated');
+  const headlines = news.items.map(i => '- ' + i.source + ', ' + ago(i.ts) + ': ' + i.title).join('\n');
+  const prompt = `You write Bryan's morning crypto briefing. He reads it on his phone in Telegram. Today is ${ctx.dateStr}.
+
+RULES
+- Use ONLY the facts given below${search ? ' and what you find with Google Search today' : ''}. Never invent prices, figures, events or quotes. If something is not covered, leave it out.
+- The prices below come from Bryan's own exchange; use them as given.
+- Do not tell Bryan to buy or sell. Say what to watch and why - his portfolio manager makes the trading decisions.
+- Plain text only: no markdown, no asterisks, no HTML tags. Keep it under 1,800 characters.
+
+DATA
+Portfolio (Revolut X): ${ctx.total}. Top holdings (change since midnight, P&L vs cost): ${ctx.holdings}
+Market: ${ctx.market}
+Alerts close to firing: ${ctx.alerts}
+Abnormal moves of 3% or more in one check, last 24 h (held coins): ${ctx.moves}
+Headlines from the last 24 h (source, age: title):
+${headlines || '(no feed headlines - use Google Search)'}
+
+FORMAT (exactly this layout)
+📰 MARKET BRIEFING — ${ctx.dateStr}
+
+🌍 MACRO:
+- BTC: [price from Market above] — [one sentence on direction, from the headlines]
+- Market: [one sentence on overall sentiment]
+
+📰 TOP NEWS:
+- [the headline that matters most for Bryan's holdings or the market - one line, name the source]
+- [second]
+- [third]
+
+👀 WATCH TODAY:
+1. [a level, event or coin to watch, from the data above]
+2. [another]
+
+🎯 FOCUS: [one of Bryan's holdings and why it deserves attention today - two sentences at most, from the data above]`;
+  const body = { contents: [{ role: 'user', parts: [{ text: prompt }] }], generationConfig: { temperature: 0.4, maxOutputTokens: 8192 } };
+  if (search) body.tools = [{ google_search: {} }];
+  const ctl = new AbortController(); const to = setTimeout(() => ctl.abort(), 60000);
+  let r, raw;
+  try {
+    r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent', {
+      method: 'POST', signal: ctl.signal, headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key }, body: JSON.stringify(body)
+    });
+    raw = await r.text();
+  } catch (e) {
+    throw new Error(e && e.name === 'AbortError' ? 'Gemini timed out after 60 s' : 'Gemini request failed: ' + (e && e.message));
+  } finally { clearTimeout(to); }
+  let j = null; try { j = JSON.parse(raw); } catch (e) { j = null; }
+  if (!r.ok) throw new Error('Gemini HTTP ' + r.status + (r.status === 429 ? ' (rate limit or quota)' : '') + ': ' + String((j && j.error && j.error.message) || raw || '').slice(0, 200));
+  const cand = j && Array.isArray(j.candidates) ? j.candidates[0] : null;
+  const parts = cand && cand.content && Array.isArray(cand.content.parts) ? cand.content.parts : [];
+  const text = parts.filter(p => p && typeof p.text === 'string' && !p.thought).map(p => p.text).join('').trim();
+  if (!text) throw new Error('Gemini returned no text' + (cand && cand.finishReason ? ' (finishReason ' + cand.finishReason + ')' : '') +
+    (j && j.promptFeedback && j.promptFeedback.blockReason ? ' (blocked: ' + j.promptFeedback.blockReason + ')' : '') + (j ? '' : ' (reply was not JSON)'));
+  return { text, model, search, headlines: news.items.length, feedsFailed: news.failed };
+}
+// Telegram parses the brief as HTML and sendTelegram cannot report a rejection, so a stray '<' from the model would make
+// the message vanish silently. Strip markdown, cap the length (Telegram's limit is 4096), then escape.
+function formatBriefForTelegram(text) {
+  let t = String(text || '').replace(/\*\*|__|`/g, '').replace(/^#+\s*/gm, '').trim();
+  if (t.length > 3400) t = t.slice(0, 3400) + '\n[...]';
+  return escTg(t);
+}
+const BRIEF_PM_NUDGE = '\n\n📋 For decisions, open Claude PM and say "morning brief".';
+
 async function sendMorningBriefing() {
   if (briefingInProgress) {
     console.log('Briefing already in progress, skipping.');
@@ -9335,12 +9462,14 @@ async function sendMorningBriefing() {
           alertsToWatch.push(`${h.coin}: ${(change * 100).toFixed(1)}% move (alert at ${(threshold * 100).toFixed(0)}%)`);
         }
       }
-      const target = priceTargets.get(h.symbol);
-      if (target) {
-        const distPct = Math.abs((h.price - target.targetPrice) / target.targetPrice) * 100;
+      const tlist = priceTargets.get(h.symbol);   // #416 the Map holds an ARRAY of targets per symbol (it was read as one object, so this never fired)
+      for (const target of (Array.isArray(tlist) ? tlist : (tlist ? [tlist] : []))) {
+        const tp = Number(target && target.targetPrice);
+        if (!(tp > 0)) continue;
+        const distPct = Math.abs((h.price - tp) / tp) * 100;
         if (distPct <= 5) {
           const dir = target.direction === 'down' ? 'floor' : 'target';
-          alertsToWatch.push(`${h.coin}: within ${distPct.toFixed(1)}% of fixed ${dir} ${fmtPrc(target.targetPrice)}`);
+          alertsToWatch.push(`${h.coin}: within ${distPct.toFixed(1)}% of fixed ${dir} ${fmtPrc(tp)}`);
         }
       }
     }
@@ -9402,46 +9531,44 @@ async function sendMorningBriefing() {
       return `${h.coin} ${fmtPrc(h.price)} ${fmtAmt(h.valueUSD)}${overnight}${pl}`;
     }).join(', ');
 
-    const claudeResponse = await anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 800,  // FIX 6: reduced from 1000
-      tools: [{ type: "web_search_20250305", name: "web_search" }],
-      messages: [{
-        role: 'user',
-        content: `Generate a concise morning market intelligence briefing.
-Today is ${dateStr}. Search for latest crypto news.
-Bryan's top holdings: ${portfolioContext}. Total portfolio: ${fmtAmt(totalUSD)}.
-
-Maximum 800 tokens. Ultra concise. 3 bullet points max per section.
-
-Format EXACTLY like this:
-📰 MARKET BRIEFING — ${dateStr}
-
-🌍 MACRO:
-- BTC: $[price] — [1 sentence on trend]
-- Market: [1 sentence on overall sentiment]
-- Key level: [most important level to watch]
-
-📰 TOP NEWS:
-- [headline 1 — 1 line]
-- [headline 2 — 1 line]
-- [headline 3 — 1 line]
-
-⚡ TODAY'S PLAN:
-1. [Specific action for Bryan's portfolio]
-2. [Specific action]
-3. [Key thing to watch]
-
-🎯 FOCUS: [One coin from Bryan's holdings to pay most attention to today and why — 2 sentences max]
-
-Keep total under 2000 characters. No long paragraphs. Be concise.`
-      }]
-    });
-    await logClaudeCall('morning briefing', claudeResponse.model || 'claude-sonnet-4-6', claudeResponse.usage);
-
-    const lastTextBlock = [...claudeResponse.content].reverse().find(b => b.type === 'text');
-    const msg2 = lastTextBlock ? lastTextBlock.text.trim() : '📰 Market intelligence unavailable — check crypto news manually.';
-
+    // #416 MESSAGE 2 - Gemini writes the market section from the feed headlines (free); on ANY failure a loud fallback.
+    let msg2;
+    try {
+      let marketTxt = [];
+      for (const s of ['BTC-USD', 'ETH-USD']) {
+        const p = priceMap[s];
+        if (!p) continue;
+        let ch = '';
+        try {
+          const [hr] = await db.execute('SELECT price FROM price_history WHERE symbol = ? ORDER BY recorded_at DESC LIMIT 1', [s]);
+          if (hr.length && Number(hr[0].price) > 0) { const c = (p / Number(hr[0].price) - 1) * 100; ch = ' (' + (c >= 0 ? '+' : '') + c.toFixed(1) + '% since midnight)'; }
+        } catch (e) { /* price only */ }
+        marketTxt.push(s.replace('-USD', '') + ' ' + fmtPrc(p) + ch);
+      }
+      let movesTxt = 'none';
+      try {
+        const held = holdings.map(h => h.symbol);
+        if (held.length) {
+          const [mv] = await db.execute('SELECT symbol, SUM(move_pct > 0) AS ups, SUM(move_pct < 0) AS downs, MAX(abs_move_pct) AS mx FROM abnormal_events WHERE event_at > DATE_SUB(NOW(), INTERVAL 24 HOUR) AND abs_move_pct >= 3 AND symbol IN (' + held.map(() => '?').join(',') + ') GROUP BY symbol ORDER BY mx DESC LIMIT 6', held);
+          if (mv.length) movesTxt = mv.map(m => String(m.symbol).replace('-USD', '') + ' ' + Number(m.ups) + ' up / ' + Number(m.downs) + ' down, largest ' + Number(m.mx).toFixed(1) + '%').join('; ');
+        }
+      } catch (e) { movesTxt = 'unavailable'; }
+      const gb = await geminiMarketBrief({
+        dateStr, total: fmtAmt(totalUSD), holdings: portfolioContext || 'none',
+        market: marketTxt.join(', ') || 'no BTC/ETH price available',
+        alerts: alertsToWatch.length ? alertsToWatch.join('; ') : 'none', moves: movesTxt
+      });
+      console.log('[brief] #416 Gemini ok: model ' + gb.model + ', ' + gb.headlines + ' headlines, search ' + (gb.search ? 'on' : 'off') + (gb.feedsFailed.length ? ', feeds down: ' + gb.feedsFailed.join(', ') : ''));
+      msg2 = formatBriefForTelegram(gb.text) + (gb.feedsFailed.length ? '\n\n(News feeds unreachable today: ' + escTg(gb.feedsFailed.join(', ')) + ')' : '') + BRIEF_PM_NUDGE;
+    } catch (ge) {
+      console.error('[brief] #416 market section DEGRADED:', ge && ge.message);
+      const wh = holdings.filter(h => h.overnightChange !== null);
+      const wv = wh.reduce((a, h) => a + h.valueUSD, 0);
+      const wc = wv > 0 ? wh.reduce((a, h) => a + h.valueUSD * h.overnightChange, 0) / wv : null;
+      msg2 = '⚠️ <b>[Morning Brief Degraded]</b>: ' + escTg(ge && ge.message) +
+        '\nRaw portfolio: ' + fmtAmt(totalUSD) + (wc !== null ? ', since midnight ' + (wc >= 0 ? '+' : '') + wc.toFixed(1) + '% (Revolut holdings, value-weighted)' : '') +
+        '\nThe snapshot above is complete - only the news section failed.' + BRIEF_PM_NUDGE;
+    }
     await sendTelegram(msg2);
     console.log('Market intelligence sent. Length:', msg2.length);
 
@@ -9472,7 +9599,7 @@ Keep total under 2000 characters. No long paragraphs. Be concise.`
 
   } catch (e) {
     console.error('sendMorningBriefing error:', e.message);
-    await sendTelegram(`❌ Morning briefing failed: ${e.message}`);
+    await sendTelegram(`❌ Morning briefing failed: ${escTg(e.message)}`);   // #416 escaped: an unescaped '<' would make this vanish
   } finally {
     briefingInProgress = false;
   }
@@ -15159,7 +15286,7 @@ cron.schedule('7,37 * * * *', async () => {
   } catch (e) { console.error('[reconciler] scheduled run failed:', e.message); }
 });
 
-// Morning briefing disabled — sendMorningBriefing() kept for manual use
+// #416: the morning brief is back - see the 09:15 cron below (snapshot + Gemini news). This old 09:05 Claude schedule stays off.
 // cron.schedule('5 9 * * *', async () => {
 //   try {
 //     await sendMorningBriefing();
@@ -15337,7 +15464,10 @@ async function fetchAllSources(sourceId) {
   return { totalFetched, totalAnalysed, errors: errors_ };
 }
 
-cron.schedule('15 9 * * *', async () => { await sendTelegram('\ud83d\udccb Morning brief time. Open Claude PM and say "morning brief" - your positions need a daily eye.'); }, { timezone: 'Europe/London' }); // daily brief reminder
+cron.schedule('15 9 * * *', async () => {   // #416 daily brief (Bryan 24 Sep): snapshot + Gemini news; replaces the 'open Claude PM' reminder (now the brief's last line)
+  try { await sendMorningBriefing(); }
+  catch (e) { console.error('[brief] 09:15 cron failed:', e.message); await sendTelegram('\u274c Morning brief failed: ' + escTg(e.message)); }
+}, { timezone: 'Europe/London' });
 cron.schedule('0 10 * * *', checkIntentionOutcomes, { timezone: 'Europe/London' });
 
 // #50: prune intraday prices older than 30 days
@@ -21950,6 +22080,13 @@ app.post('/telegram-webhook', async (req, res) => {
     // to TELEGRAM_CHAT_ID with a silent 200 for anyone else. No new auth needed.
     // NOTE: this creates ZERO new autonomous execution paths — /status reads,
     // /pause and /resume only toggle a flag the existing double-gate already reads.
+    // #416 /brief - send the morning brief now (the same function as the 09:15 cron). Reads prices and news; never trades.
+    if (commandText === 'brief') {
+      if (briefingInProgress) { await sendReply('A brief is already being built - it will arrive shortly.'); return res.status(200).json({ ok: true }); }
+      await sendReply('🌅 Building the morning brief - about a minute.');
+      sendMorningBriefing().catch(async (e) => { console.error('[brief] /brief failed:', e.message); await sendTelegram('❌ Morning brief failed: ' + escTg(e.message)); });
+      return res.status(200).json({ ok: true });
+    }
     if (commandText === 'status' || commandText === 'pause' || commandText === 'resume' || commandText === 'resume confirm') {
       let aeCfg = {};
       try {
