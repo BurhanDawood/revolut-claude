@@ -224,7 +224,7 @@ async function sweepToUSDT(proceedsUsd, sourceSymbol, realisedPnlUsd = null) {
 
     console.log(`[sweep] Sweeping $${sweepAmountUsd.toFixed(2)} to USDT after ${sourceSymbol} sell (basis: ${basisLabel})`);
 
-    await placeRevolutOrder('USDT-USD', 'buy', 'market', null, null, sweepAmountUsd);
+    const swResp = await placeRevolutOrder('USDT-USD', 'buy', 'market', null, null, sweepAmountUsd);   // #J1 keep the response for its order id
 
     const approxNewUSDT = currentUSDT + sweepAmountUsd;
 
@@ -237,11 +237,12 @@ async function sweepToUSDT(proceedsUsd, sourceSymbol, realisedPnlUsd = null) {
       `💡 Ready for next dip buy!`
     );
 
-    await db.execute(
+    const swJ = await db.execute(
       'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion) VALUES (?, ?, ?, ?, ?, ?, ?)',
       ['USDT', 'buy', 1, sweepAmountUsd, sweepAmountUsd,
        `Auto-sweep: ${config.sweep_pct}% of ${sourceSymbol} sell ${basisLabel}`, 'neutral']
-    ).catch(() => {});
+    ).catch(() => null);
+    await stampVenueOrderId(swJ && swJ[0] && swJ[0].insertId, swResp);   // #J1
 
   } catch (e) {
     console.error('[sweep] USDT sweep error:', e.message);
@@ -590,9 +591,10 @@ async function tryAwayAnalyseBuyDownTarget(symbol, coinBase, currentPrice, chang
     }
 
     // Place the market buy (USD-sized). Below-entry allowed by design.
-    let buyQty = null;
+    let buyQty = null, awayOrderResp = null;   // #J1 the response outlives the try, for its order id
     try {
       const orderResp = await placeRevolutOrder(symbol, 'buy', 'market', null, null, buyUsd);
+      awayOrderResp = orderResp;
       buyQty = buyUsd / currentPrice; // approximate fill qty for the journal
       console.log('[away-buy] EXECUTED ' + coinBase + ' buy $' + buyUsd.toFixed(2) + ' @ ~' + currentPrice + ' (order ' + (orderResp?.id || 'n/a') + ')');
     } catch (e) {
@@ -602,10 +604,11 @@ async function tryAwayAnalyseBuyDownTarget(symbol, coinBase, currentPrice, chang
     }
 
     // Journal the buy (source away_auto) + update session counter
-    await db.execute(
+    const awJ = await db.execute(
       'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
       [coinBase, 'buy', currentPrice, buyQty, buyUsd, 'AWAY MODE auto-buy \u2014 ' + coinBase + ' hit pre-set buy level ' + formatPrice(target.targetPrice) + ' (High-confidence). ' + (analysis.split('\n')[0] || ''), 'neutral', 'away_auto']
-    ).catch(() => {});
+    ).catch(() => null);
+    await stampVenueOrderId(awJ && awJ[0] && awJ[0].insertId, awayOrderResp);   // #J1
     am.session_bought_usd = bought + buyUsd;
     await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('away_mode', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)", [JSON.stringify(am)]).catch(() => {});
 
@@ -3083,6 +3086,7 @@ async function executeApprovedKraken(t) {
               [coinBase, t.side, t.price, kQtyForJournal, kValueUSD, kReasoning, 'confident', krakenSource]
             ).catch(e => { console.error('[kraken] Journal insert failed:', e.message); return [{}]; });
             if (t.side === 'sell' && kJrnIns && kJrnIns.insertId) await recordRealisedPnl(kJrnIns.insertId, t.symbol, t.price, kQtyForJournal).catch(() => {});
+            await stampVenueOrderId(kJrnIns && kJrnIns.insertId, result);   // #J1 Kraken txid
 
             // Tranche tracking
             if (t.side.toLowerCase() === 'buy') {
@@ -5022,6 +5026,7 @@ async function runLimitFillPipeline(order, filledQty, avgPrice) {
       [coinBase, side, price, qty, valueUSD, reasoning, 'confident', 'limit_fill']
     );
     const journalId = (jr && jr.insertId) ? jr.insertId : null;
+    await stampVenueOrderId(journalId, { venue_order_id: order.order_id });   // #J1 the pending row's order id
     if (matchedIntention) {
       await db.execute('UPDATE trade_intentions SET matched_at = NOW(), matched_journal_id = ? WHERE id = ?', [journalId, matchedIntention.id]).catch(() => {});
     }
@@ -6462,6 +6467,15 @@ async function ensureFillEnrichTable() {
   _fillEnrichReady = true;
 }
 // Called right after one of OUR orders is placed. Never throws into the trading path.
+// #J1 attach the venue's order id to a journal row we just wrote for an order WE placed. Never fails the trade.
+// (queueFillEnrichment already stamps it for executeApprovedRevolut, the ladder buy and autoExecuteSell.)
+async function stampVenueOrderId(journalId, orderResp) {
+  try {
+    const od = orderResp && (orderResp.data || orderResp);
+    const oid = od && (od.venue_order_id || od.id || od.order_id || (Array.isArray(od.txid) ? od.txid[0] : od.txid));
+    if (journalId && oid) await db.execute('UPDATE trading_journal SET venue_order_id = ? WHERE id = ? AND venue_order_id IS NULL', [String(oid), journalId]);
+  } catch (e) { console.error('[journal] #J1 venue_order_id stamp failed:', e.message); }
+}
 async function queueFillEnrichment(journalId, orderId, symbol, side, bookedPrice, qty, source) {
   try {
     if (!journalId || !orderId) return;
@@ -7440,9 +7454,10 @@ async function runFastScan() {
           await clearTroughTracker(ttSymbol);
 
           // Execute the buy
-          let buyQty = null;
+          let buyQty = null, ttOrderResp = null;   // #J1 the response outlives the try, for its order id
           try {
             const orderResp = await placeRevolutOrder(ttSymbol, 'buy', 'market', null, null, buyUsd);
+            ttOrderResp = orderResp;
             buyQty = buyUsd / ttPrice;
             console.log('[trough] ' + ttBase + ' EXECUTED auto-buy $' + buyUsd.toFixed(2) + ' @ ~' + ttPrice + ' qty ~' + buyQty.toFixed(6) + ' (order ' + (orderResp && orderResp.id ? orderResp.id : 'n/a') + ')');
           } catch (e) {
@@ -7456,10 +7471,11 @@ async function runFastScan() {
 
           // Journal the buy (best-effort -- not awaited on failure path)
           try {
-            await db.execute(
+            const [ttJ] = await db.execute(
               'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
               [ttBase, 'buy', ttPrice, buyQty, buyUsd, '#130 trough auto-rebuy -- trough $' + ttResult.trough.toFixed(8) + ' bounced ' + t.bouncePct + '% to $' + ttPrice + ' (sell was $' + t.salePrice + ')', 'neutral', 'trough_auto']
             );
+            await stampVenueOrderId(ttJ && ttJ.insertId, ttOrderResp);   // #J1
           } catch (e) { console.error('[trough] journal write failed:', e.message); }
 
           // Re-arm pump loop for next cycle via synthetic rule (rearmPumpLoopAfterBuyback handles guards + circuit breaker)
@@ -7550,9 +7566,9 @@ async function runFastScan() {
                 await clearStandaloneTrough(stSym); continue;
               }
               await clearStandaloneTrough(stSym);
-              let stBuyQty = null;
+              let stBuyQty = null, stResp = null;   // #J1 keep the response for its order id
               try {
-                await placeRevolutOrder(stSym, 'buy', 'market', null, null, st.buyUsd);
+                stResp = await placeRevolutOrder(stSym, 'buy', 'market', null, null, st.buyUsd);
                 stBuyQty = st.buyUsd / stP;
                 console.log('[trough-st] ' + stB + ' BOUGHT $' + st.buyUsd + ' at ' + fmtPriceShort(stP));
               } catch (stBuyErr) {
@@ -7562,10 +7578,11 @@ async function runFastScan() {
               }
               try {
                 const stR = 'trough-st: trough ' + fmtPriceShort(st.troughPrice) + ' bounced ' + (st.bouncePct||8) + '%%' + ' to ' + fmtPriceShort(stP);
-                await db.execute(
+                const [stJ] = await db.execute(
                   'INSERT INTO trading_journal (symbol,action,price,quantity,value_usd,reasoning,emotion,source) VALUES (?,?,?,?,?,?,?,?)',
                   [stB,'buy',stP,stBuyQty,st.buyUsd,stR,'neutral','trough_auto']
                 );
+                await stampVenueOrderId(stJ && stJ.insertId, stResp);   // #J1
               } catch (e) { console.error('[trough-st] journal failed:', e.message); }
               await sendTelegram(
                 '<b>[TROUGH AUTO-BOUGHT] ' + stB + '</b>\n' +
@@ -13091,7 +13108,7 @@ async function autoExecuteKrakenSell(symbol, maxPct, analysis, confidence) {
       [symbol, 'sell', `AI auto-execution on Kraken [${confidence}]: ${analysis.substring(0, 150)}`, 'confident']
     ).catch(() => {});
 
-    await executeKrakenTrade(symbol, 'sell', 'market', sellQty);
+    const kResp = await executeKrakenTrade(symbol, 'sell', 'market', sellQty);   // #J1 keep the response for its txid
 
     const [aeKrkIns] = await db.execute(
       `INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -13100,6 +13117,7 @@ async function autoExecuteKrakenSell(symbol, maxPct, analysis, confidence) {
        'confident', 'ai_auto']
     ).catch(e => { console.error('[auto-exec] Kraken journal insert:', e.message); return [{}]; });
     if (aeKrkIns && aeKrkIns.insertId) await recordRealisedPnl(aeKrkIns.insertId, symbol, currentPrice, sellQty).catch(() => {});
+    await stampVenueOrderId(aeKrkIns && aeKrkIns.insertId, kResp);   // #J1
 
     pendingUndo.set(symbol, { action: 'sell', qty: sellQty, price: currentPrice, exchange: 'kraken', timestamp: Date.now() });
     setTimeout(() => pendingUndo.delete(symbol), 2 * 60 * 1000);
@@ -21012,10 +21030,11 @@ app.post('/api/kraken/trade', async (req, res) => {
     const currentPrice = price ? parseFloat(price) : (await getCurrentPrice(symbol) || 0);
     const valueUSD = currentPrice * parseFloat(volume);
     const coinBase = symbol.replace('-USD', '');
-    await db.execute(
+    const kdJ = await db.execute(
       'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion) VALUES (?, ?, ?, ?, ?, ?, ?)',
       [coinBase, side, currentPrice, parseFloat(volume), valueUSD, 'Kraken executed trade via dashboard', 'confident']
-    ).catch(e => console.error('[kraken] Journal insert failed:', e.message));
+    ).catch(e => { console.error('[kraken] Journal insert failed:', e.message); return null; });
+    await stampVenueOrderId(kdJ && kdJ[0] && kdJ[0].insertId, result);   // #J1
     await sendTelegram(
       `✅ <b>KRAKEN TRADE EXECUTED</b>\n\n` +
       `${side.toUpperCase()} ${volume} ${coinBase} @ ${fmtPriceShort(currentPrice)}\n` +
@@ -24013,10 +24032,11 @@ app.post('/api/revolut/trade', async (req, res) => {
     const coinBase = symbol.replace('-USD', '');
     const executedPrice = price || await getCurrentPrice(symbol).catch(() => 0) || 0;
     const valueUSD = executedPrice * parseFloat(baseSize);
-    await db.execute(
+    const rdJ = await db.execute(
       'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion) VALUES (?, ?, ?, ?, ?, ?, ?)',
       [coinBase, side, executedPrice, baseSize, valueUSD, 'Revolut X trade via dashboard', 'confident']
-    ).catch(e => console.error('[revolut] Journal insert failed:', e.message));
+    ).catch(e => { console.error('[revolut] Journal insert failed:', e.message); return null; });
+    await stampVenueOrderId(rdJ && rdJ[0] && rdJ[0].insertId, result);   // #J1
     await sendTelegram(
       `✅ <b>REVOLUT X TRADE EXECUTED</b>\n\n` +
       `${side.toUpperCase()} ${baseSize} ${coinBase} @ ${fmtPriceShort(executedPrice)}\n` +
