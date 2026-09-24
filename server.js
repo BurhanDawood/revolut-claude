@@ -1961,13 +1961,6 @@ try {
   }
   if (ttRows.length) console.log('[trough] Loaded ' + ttRows.length + ' active trough tracker(s) from DB');
 } catch (e) { console.error('[trough] boot-load failed:', e.message); }
-// #A1 one-off: any loop sitting armed=1 with no live cycle and no trail is already stuck - report, never fix silently
-try {
-  const [stuck] = await db.execute('SELECT symbol FROM pump_armed_rules WHERE active = 1 AND armed = 1 AND sale_price IS NULL');
-  const names = stuck.map(r => String(r.symbol)).filter(s => !trailingStops.has(s));
-  console.log('[boot] #A1 stuck-armed check: ' + (names.length ? names.join(', ') : 'none'));
-  if (names.length) await sendTelegram('\u26a0\ufe0f <b>Stuck loops at boot:</b> ' + names.map(s => s.replace('-USD', '')).join(', ') + ' - armed=1, no cycle, no trail. Run reset_cycle for each.').catch(() => {});
-} catch (e) { console.error('[boot] #A1 stuck check failed:', e.message); }
 try {
   const [stRows] = await db.execute('SELECT symbol, buy_usd, bounce_pct, entry_floor, exchange, trough_price, arm_below, gate_hit FROM standalone_trough_trackers');   // #394
   for (const r of stRows) {
@@ -1981,6 +1974,14 @@ try {
   }
   if (stRows.length) console.log('[trough-st] Loaded ' + stRows.length + ' tracker(s)');
 } catch (e) { console.error('[trough-st] boot-load failed:', e.message); }
+// #A1 one-off: any loop sitting armed=1 with no live cycle and no trail is already stuck - report, never fix silently.
+// Placed after ALL three rehydrations so it never reads trailingStops before it is populated.
+try {
+  const [stuck] = await db.execute('SELECT symbol FROM pump_armed_rules WHERE active = 1 AND armed = 1 AND sale_price IS NULL');
+  const names = stuck.map(r => String(r.symbol)).filter(s => !trailingStops.has(s));
+  console.log('[boot] #A1 stuck-armed check: ' + (names.length ? names.join(', ') : 'none'));
+  if (names.length) await sendTelegram('\u26a0\ufe0f <b>Stuck loops at boot:</b> ' + names.map(s => s.replace('-USD', '')).join(', ') + ' - armed=1, no cycle, no trail. Run reset_cycle for each.').catch(() => {});
+} catch (e) { console.error('[boot] #A1 stuck check failed:', e.message); }
 
 // Load swing cooldowns from DB
 try {
@@ -4442,18 +4443,25 @@ async function clearTroughTracker(symbol) {
 // #A1 ABANDON = release the ring-fence AND reopen the loop. clearTroughTracker alone left armed=1, so an abandoned
 // cycle could never re-arm and the remaining position was uninsured until reset_cycle. Not for the success path -
 // rearmPumpLoopAfterBuyback owns armed=0 there, after the cycle-count and circuit-breaker checks.
+// Never throws: one symbol's failed abandon must not stop Part C servicing the others.
 async function abandonCycle(symbol, reason, detail) {
-  const coinBase = symbol.replace('-USD', '');
-  let released = 0;
-  try { const [r] = await db.execute('SELECT sale_proceeds_usd FROM pump_armed_rules WHERE symbol = ? AND active = 1 LIMIT 1', [symbol]); released = r.length ? Number(r[0].sale_proceeds_usd) || 0 : 0; } catch (e) {}
-  await clearTroughTracker(symbol);
   try {
-    await db.execute('UPDATE pump_armed_rules SET armed = 0, armed_since = NULL, baseline_price = NULL, baseline_at = NULL, tier_state = NULL WHERE symbol = ? AND active = 1', [symbol]);
-    console.log('[trough] ' + coinBase + ' cycle abandoned (' + reason + ') - loop reopened for the next pump');
-  } catch (e) { console.error('[trough] abandonCycle reopen error:', e.message); }
-  await sendTelegram('<b>[BUY-BACK ABANDONED - ' + coinBase + ']</b> ' + reason + '\n' + (detail || '') +
-    (released > 0 ? '\n$' + released.toFixed(2) + ' is no longer set aside.' : '') +
-    '\nThe loop is reopened: it will re-arm on the next qualifying pump and insure what you still hold.').catch(() => {});
+    const coinBase = String(symbol).replace('-USD', '');
+    let released = 0;
+    try { const [r] = await db.execute('SELECT sale_proceeds_usd FROM pump_armed_rules WHERE symbol = ? AND active = 1 LIMIT 1', [symbol]); released = r.length ? Number(r[0].sale_proceeds_usd) || 0 : 0; } catch (e) {}
+    await clearTroughTracker(symbol);                       // releases the ring-fence (has its own catch)
+    let reopened = false;
+    try {
+      const [u] = await db.execute('UPDATE pump_armed_rules SET armed = 0, armed_since = NULL, baseline_price = NULL, baseline_at = NULL, tier_state = NULL WHERE symbol = ? AND active = 1', [symbol]);
+      reopened = !!(u && u.affectedRows >= 1);
+    } catch (e) { console.error('[trough] abandonCycle reopen error:', e.message); }
+    console.log('[trough] ' + coinBase + ' cycle abandoned (' + reason + ') - ' + (reopened ? 'loop reopened' : 'REOPEN FAILED'));
+    const tail = reopened
+      ? '\nThe loop is reopened: it will re-arm on the next qualifying pump and insure what you still hold.'
+      : '\n\u26a0\ufe0f The ring-fence was released but the loop could NOT be reopened (armed is still 1). Run reset_cycle for ' + coinBase + ' or it will never re-arm.';
+    await sendTelegram('<b>[BUY-BACK ABANDONED - ' + coinBase + ']</b> ' + reason + '\n' + (detail || '') +
+      (released > 0 ? '\n$' + released.toFixed(2) + ' is no longer set aside.' : '') + tail).catch(() => {});
+  } catch (e) { console.error('[trough] abandonCycle failed for ' + symbol + ':', e.message); }
 }
 
 async function armStandaloneTrough(symbol, buyUsd, bouncePct, entryFloor, exchange, armBelow = null) {
