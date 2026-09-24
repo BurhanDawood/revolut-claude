@@ -591,6 +591,9 @@ async function tryAwayAnalyseBuyDownTarget(symbol, coinBase, currentPrice, chang
       return true;
     }
 
+    // #413b CLAIM the rung first: one buyer per rung (a funded-buy confirm may be racing for it)
+    const awRung = await claimBuyRung(symbol, target.targetPrice);
+    if (!awRung) { console.log('[away-buy] ' + coinBase + ' rung ' + target.targetPrice + ' already claimed - not buying'); return true; }
     // Place the market buy (USD-sized). Below-entry allowed by design.
     let buyQty = null, awayOrderResp = null;   // #J1 the response outlives the try, for its order id
     try {
@@ -599,6 +602,7 @@ async function tryAwayAnalyseBuyDownTarget(symbol, coinBase, currentPrice, chang
       buyQty = buyUsd / currentPrice; // approximate fill qty for the journal
       console.log('[away-buy] EXECUTED ' + coinBase + ' buy $' + buyUsd.toFixed(2) + ' @ ~' + currentPrice + ' (order ' + (orderResp?.id || 'n/a') + ')');
     } catch (e) {
+      await restoreBuyRung(awRung);   // #413b nothing bought: the rung goes back, still armed
       console.error('[away-buy] placeRevolutOrder failed for ' + coinBase + ': ' + e.message);
       await sendTelegram(`AWAY \u2014 ${coinBase} buy ORDER FAILED (${e.message.substring(0,80)}). Left armed \u2014 manual review.`).catch(() => {});
       return true;
@@ -621,9 +625,7 @@ async function tryAwayAnalyseBuyDownTarget(symbol, coinBase, currentPrice, chang
       `Reply 'skip payment ${buyUsd.toFixed(2)}' is NOT applicable \u2014 this was a buy. Adjust manually if needed.`
     ).catch(() => {});
     console.log('[away-buy] ' + coinBase + ' auto-bought $' + buyUsd.toFixed(2) + '; session $' + am.session_bought_usd.toFixed(2) + '/$' + buyCap);
-    await db.execute('DELETE FROM price_targets WHERE symbol = ? AND target_price = ?', [symbol, target.targetPrice]).catch(() => {});
-    if (priceTargets.has(symbol)) priceTargets.set(symbol, (priceTargets.get(symbol)||[]).filter(t => t.targetPrice !== target.targetPrice));
-    console.log('[away-buy] rung ' + target.targetPrice + ' removed for ' + coinBase + ' (executed)');
+    console.log('[away-buy] rung ' + target.targetPrice + ' removed for ' + coinBase + ' (executed; claimed before the order, #413b)');
     try {
       const today = new Date().toISOString().split('T')[0];
       const [csR] = await db.execute('SELECT strategy_md FROM coin_strategy WHERE symbol = ?', [coinBase]);
@@ -4325,6 +4327,31 @@ async function restoreTrailingStop(symbol, ts) {
   );
 }
 
+// #413b claim an Away BUY rung atomically: exactly one caller can delete it, so the automatic Away buy and a funded-buy
+// confirm can never both buy the same rung. Returns the deleted row (for a restore) or null. direction 'down' only - an
+// up (sell) rung at the same price is never touched. The in-memory copy is filtered NUMERICALLY (the DB returns DECIMAL
+// as a string), so the price monitor cannot fire on a rung that is already claimed.
+async function claimBuyRung(symbol, targetPrice) {
+  const [rows] = await db.execute("SELECT id, symbol, anchor_price, threshold_pct, target_price, entry_price, direction, note, sell_pct FROM price_targets WHERE symbol = ? AND direction = 'down' AND ABS(target_price - ?) < 0.000000001 LIMIT 1", [symbol, targetPrice]);
+  if (!rows.length) return null;
+  const [d] = await db.execute('DELETE FROM price_targets WHERE id = ?', [rows[0].id]);
+  if (!d || d.affectedRows !== 1) return null;
+  const tp = Number(rows[0].target_price);
+  if (priceTargets.has(symbol)) priceTargets.set(symbol, (priceTargets.get(symbol) || []).filter(t => !(t.id === rows[0].id || (t.direction === 'down' && Math.abs(Number(t.targetPrice) - tp) < 1e-9))));
+  return rows[0];
+}
+// Put a claimed rung back exactly as it was - only after the order was REFUSED (nothing bought). Never throws.
+async function restoreBuyRung(row) {
+  if (!row) return;
+  try {
+    const [ins] = await db.execute('INSERT INTO price_targets (symbol, anchor_price, threshold_pct, target_price, entry_price, direction, note, sell_pct) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      [row.symbol, row.anchor_price, row.threshold_pct, row.target_price, row.entry_price, row.direction, row.note, row.sell_pct]);
+    upsertPriceTarget(row.symbol, { id: ins && ins.insertId ? ins.insertId : row.id, anchorPrice: parseFloat(row.anchor_price), thresholdPct: parseFloat(row.threshold_pct),
+      targetPrice: parseFloat(row.target_price), entryPrice: row.entry_price ? parseFloat(row.entry_price) : null, direction: row.direction || 'down',
+      note: row.note || null, sellPct: row.sell_pct ? parseFloat(row.sell_pct) : null });
+  } catch (e) { console.error('[away] #413b rung restore failed (' + row.symbol + ' ' + row.target_price + '):', e.message); }
+}
+
 async function removeFixedTarget(symbol, targetPrice = null) {
   // #38 B3 — if targetPrice given, remove only that rung; else whole symbol
   if (targetPrice !== null && targetPrice !== undefined) {
@@ -7081,10 +7108,8 @@ async function evaluateAbandons() {
   }
 }
 
-async function checkRingfenceCoverage() {
-  // #378 (PM #36) ACTIONABLE: each pending buy-back is listed with what it sold at and the level the price must reach
-  // before the buy-back can start, and the available cash is allocated smallest-first so the message says exactly
-  // WHICH cycles are uncovered and by how much - a decision Bryan can make from the notification.
+// #413b the pending buy-back reservations, in ONE place: checkRingfenceCoverage and the funded-buy confirm read the same list.
+async function pendingReservations() {
   const cycles = [];
   const [rows] = await db.execute('SELECT symbol, sale_proceeds_usd, sale_price, retrace_gate, uncovered_since, COALESCE(uncovered_abandon_hours, 48) AS uh FROM pump_armed_rules WHERE active = 1 AND sale_price IS NOT NULL AND sale_proceeds_usd > 0');
   for (const r of rows) { const v = Number(r.sale_proceeds_usd); if (v > 0) cycles.push({ symbol: String(r.symbol), coin: String(r.symbol).replace('-USD', ''), usd: v, sold_at: r.sale_price != null ? Number(r.sale_price) : null, starts_at: r.retrace_gate != null ? Number(r.retrace_gate) : null, kind: 'loop',
@@ -7094,6 +7119,14 @@ async function checkRingfenceCoverage() {
     for (const x of ll) { let st = null; try { st = JSON.parse(x.state); } catch (e) { st = null; } const v = st && Number(st.reserved_left) > 0 ? Number(st.reserved_left) : 0;
       if (v > 0) cycles.push({ coin: String(x.symbol).replace('-USD', ''), usd: v, sold_at: st.sale_price != null ? Number(st.sale_price) : null, starts_at: st.gate != null ? Number(st.gate) : null, kind: 'ladder' }); }
   } catch (e) { /* no ladder table yet */ }
+  return cycles;
+}
+
+async function checkRingfenceCoverage() {
+  // #378 (PM #36) ACTIONABLE: each pending buy-back is listed with what it sold at and the level the price must reach
+  // before the buy-back can start, and the available cash is allocated smallest-first so the message says exactly
+  // WHICH cycles are uncovered and by how much - a decision Bryan can make from the notification.
+  const cycles = await pendingReservations();   // #413b extracted verbatim
   const need = cycles.reduce((a, c) => a + c.usd, 0);
   let have;
   try {
@@ -12595,8 +12628,8 @@ async function recordManualDecision(symbol, side, exchange, price, qty, reason, 
     const x = extra && typeof extra === 'object' ? extra : {};
     const usd = Number(x.usd) > 0 ? Number(x.usd) : (p != null && q != null ? p * q : null);
     const [ins] = await db.execute(
-      "INSERT INTO exec_decisions (mode, symbol, side, path, exchange, price, qty, usd, ok, reason, caller_action, order_id, journal_id) VALUES ('manual', ?, ?, 'manual', ?, ?, ?, ?, 1, ?, 'manual', ?, ?)",
-      [sym.slice(0, 24), sd, String(exchange || '').slice(0, 12), p, q, usd, String(reason || 'manual_approved').slice(0, 40),
+      "INSERT INTO exec_decisions (mode, symbol, side, path, exchange, price, qty, usd, ok, reason, caller_action, order_id, journal_id) VALUES ('manual', ?, ?, ?, ?, ?, ?, ?, 1, ?, 'manual', ?, ?)",
+      [sym.slice(0, 24), sd, String(x.path || 'manual').slice(0, 24), String(exchange || '').slice(0, 12), p, q, usd, String(reason || 'manual_approved').slice(0, 40),
        x.order_id != null ? String(x.order_id).slice(0, 64) : null, Number(x.journal_id) > 0 ? Number(x.journal_id) : null]);
     return ins && ins.insertId ? ins.insertId : null;
   } catch (e) { console.error('[P0] manual decision row failed:', e.message); return null; }
@@ -12666,14 +12699,21 @@ async function handleDeferredBuyButton(idStr, choice, reply) {
   if (!(price > 0)) { await reply('⚠️ Could not read the ' + coin + ' price right now - nothing bought. Try again in a minute.'); return; }
   const cash = await getAvailableUSD('revolut').catch(() => null);
   if (cash == null || !Number.isFinite(Number(cash))) { await reply('⚠️ Could not read your USD balance right now - nothing bought. Try again in a minute.'); return; }
+  // #413b never spend cash set aside for ANOTHER pending buy-back (this offer's own cycle was abandoned, so it is not in the list).
+  // Unreadable reservations = no Confirm (fail closed).
+  let resv = null;
+  try { resv = (await pendingReservations()).reduce((a, c) => a + Number(c.usd || 0), 0); } catch (e) { resv = null; }
+  const free = resv == null ? null : Number(cash) - resv;
   const preview = async (note) => {
     await db.execute("UPDATE deferred_buys SET preview_price = ?, preview_at = NOW() WHERE id = ? AND status = 'pending'", [price, id]);
-    const enough = cash >= usd;
+    const enough = free != null && free >= usd;
     await sendTelegram((note ? note + '\n\n' : '') + '🔎 <b>REVIEW BUY - ' + coin + '</b>\n' +
       (DEFERRED_PATH_LABEL[r.path] || r.path) + ' signalled at ' + fmtPriceShort(sig) + '.\n' +
       'Now ' + fmtPriceShort(price) + ': ' + deferredMoved(price, sig) + ' since the signal.\n' +
       'Amount $' + usd.toFixed(2) + ' at market (~' + formatTradeQty(usd / price) + ' ' + coin + ').\n' +
-      'USD available $' + Number(cash).toFixed(2) + (enough ? '.\nTap <b>Confirm</b> within 10 minutes to buy.' : ' - still short $' + (usd - cash).toFixed(2) + '. Top up, then tap Check again.'),
+      'USD available $' + Number(cash).toFixed(2) + (resv > 0 ? ' (of which $' + resv.toFixed(2) + ' is set aside for pending buy-backs)' : '') +
+      (free == null ? ' - could not check the cash set aside for pending buy-backs, so no Confirm yet. Tap Check again.'
+        : enough ? '.\nTap <b>Confirm</b> within 10 minutes to buy.' : ' - still short $' + (usd - free).toFixed(2) + ' of free USD. Top up, then tap Check again.'),
       { inline_keyboard: [[ enough ? { text: 'Confirm buy $' + usd.toFixed(2), callback_data: 'a:' + id + ':2:db' } : { text: 'Check again', callback_data: 'a:' + id + ':1:db' },
                             { text: 'Cancel', callback_data: 'a:' + id + ':3:db' } ]] });
   };
@@ -12681,7 +12721,8 @@ async function handleDeferredBuyButton(idStr, choice, reply) {
   // CONFIRM (choice 2): only straight after a review, at a price no more than 2% above it, with the cash there.
   if (!r.preview_at || !(Number(r.preview_age_s) >= 0 && Number(r.preview_age_s) <= 600)) { await preview('That review is more than 10 minutes old - here is a fresh one.'); return; }
   if (price > Number(r.preview_price) * 1.02) { await preview('The price rose more than 2% since your review - check it again.'); return; }
-  if (cash < usd) { await preview('Not enough USD yet.'); return; }
+  if (free == null) { await preview('Could not check the cash set aside for pending buy-backs - nothing bought.'); return; }
+  if (free < usd) { await preview(resv > 0 ? 'Not enough FREE USD: $' + Number(cash).toFixed(2) + ' available, of which $' + resv.toFixed(2) + ' is set aside for pending buy-backs.' : 'Not enough USD yet.'); return; }
   let ctx = {}; try { ctx = typeof r.ctx_json === 'string' ? JSON.parse(r.ctx_json) : (r.ctx_json || {}); } catch (e) { ctx = {}; }
   let am = null;
   if (r.path === 'away') {   // the same session cap as the automatic buy, and the rung must still be there
@@ -12700,9 +12741,18 @@ async function handleDeferredBuyButton(idStr, choice, reply) {
   // CLAIM: only one tap can get past this line.
   const [cl] = await db.execute("UPDATE deferred_buys SET status = 'executing' WHERE id = ? AND status = 'pending'", [id]);
   if (!cl || cl.affectedRows !== 1) { await reply('Already handled.'); return; }
+  let dbRung = null;
+  if (r.path === 'away' && ctx.target_price != null) {   // #413b claim the rung after the offer claim: one buyer per rung
+    dbRung = await claimBuyRung(r.symbol, ctx.target_price).catch(() => null);
+    if (!dbRung) {
+      await db.execute("UPDATE deferred_buys SET status = 'superseded', done_at = NOW(), note = 'rung gone' WHERE id = ? AND status = 'executing'", [id]).catch(() => {});
+      await reply('The ' + coin + ' Away buy rung was taken a moment ago (the automatic Away buy got there first, or it was removed) - nothing bought.'); return;
+    }
+  }
   let resp;
   try { resp = await placeRevolutOrder(r.symbol, 'buy', 'market', null, null, Number(usd.toFixed(2))); }
   catch (e) {
+    await restoreBuyRung(dbRung);   // #413b nothing bought: the Away rung goes back
     await db.execute("UPDATE deferred_buys SET status = 'failed', note = ?, done_at = NOW() WHERE id = ?", [String(e.message || e).slice(0, 200), id]).catch(() => {});
     await reply('⚠️ Revolut X REFUSED the ' + coin + ' buy: ' + String(e.message || '').slice(0, 150) + '. Nothing bought; this offer is closed.'); return;
   }
@@ -12711,12 +12761,13 @@ async function handleDeferredBuyButton(idStr, choice, reply) {
   let journalId = null;
   try {
     const [j] = await db.execute('INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-      [coin, 'buy', price, qty, usd, 'Funded buy #413: ' + (DEFERRED_PATH_LABEL[r.path] || r.path) + ' refused for lack of cash at ' + fmtPriceShort(sig) + '; topped up and confirmed by Bryan at ~' + fmtPriceShort(price), 'confident', 'manual']);
+      [coin, 'buy', price, qty, usd, 'Funded buy #413: ' + (DEFERRED_PATH_LABEL[r.path] || r.path) + ' refused for lack of cash at ' + fmtPriceShort(sig) + '; topped up and confirmed by Bryan at ~' + fmtPriceShort(price), 'confident', 'funded_buy']);   // #413b one label per trade
     journalId = j && j.insertId;
   } catch (e) { console.error('[funded-buy] journal failed:', e.message); }
   await stampVenueOrderId(journalId, resp);
   await queueFillEnrichment(journalId, orderId, r.symbol, 'buy', price, qty, 'funded_buy');
-  await recordManualDecision(r.symbol, 'buy', 'revolut', price, qty, 'manual_approved', { usd, order_id: orderId });
+  await recordManualDecision(r.symbol, 'buy', 'revolut', price, qty, 'manual_approved', { usd, order_id: orderId, journal_id: journalId,
+    path: r.path === 'trough_st' ? 'trough_standalone' : (r.path === 'away' ? 'away_buy' : r.path) });   // #413b the originating path (P0 enum)
   const notes = [];
   if (r.path === 'trough') {   // the loop's cycle bookkeeping - only if the loop has not moved on (armed, or a new sale) since
     try {
@@ -12729,8 +12780,6 @@ async function handleDeferredBuyButton(idStr, choice, reply) {
       am.session_bought_usd = parseFloat(am.session_bought_usd ?? 0) + usd;
       await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('away_mode', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)", [JSON.stringify(am)]);
       if (ctx.target_price != null) {
-        await db.execute('DELETE FROM price_targets WHERE symbol = ? AND target_price = ?', [r.symbol, ctx.target_price]);
-        if (priceTargets.has(r.symbol)) priceTargets.set(r.symbol, (priceTargets.get(r.symbol) || []).filter(t => t.targetPrice !== ctx.target_price));
         notes.push('Away buy rung ' + fmtPriceShort(Number(ctx.target_price)) + ' removed (done). Session bought $' + am.session_bought_usd.toFixed(2) + '.');
       }
     } catch (e) { notes.push('Away bookkeeping failed: ' + e.message); }
