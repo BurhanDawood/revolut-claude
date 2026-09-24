@@ -1464,6 +1464,26 @@ try {   // #A2 cycles already live at deploy start their 14-day clock NOW, never
   const [bf] = await db.execute('UPDATE pump_armed_rules SET sale_at = NOW() WHERE sale_price IS NOT NULL AND sale_at IS NULL');
   console.log('[boot] #A2 abandon clocks ready - sale_at backfilled for ' + (bf && bf.affectedRows || 0) + ' live cycle(s)');
 } catch (e) { console.error('[boot] #A2 sale_at backfill failed:', e.message); }
+// #P0 buy-back ceiling (NULL = the default 50%) and a time-boxed override {value, reason, amount_usd, expires_at}; the
+// effective ceiling is COMPUTED by effectiveCeilingPct, never stored.
+await safeAddColumn('pump_armed_rules', 'ceiling_pct',      'DECIMAL(6,2) NULL');
+await safeAddColumn('pump_armed_rules', 'ceiling_override', 'JSON NULL');
+// #P0 the fire-time predicate's ledger: one row per mayAutoTrade call (dry_run / shadow / enforce) and one per manual
+// trade (manual_approved / manual_detected). Nothing in Phase 0 calls the predicate from an order path.
+await db.execute(`CREATE TABLE IF NOT EXISTS exec_decisions (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  mode ENUM('dry_run','shadow','enforce','manual') NOT NULL,
+  symbol VARCHAR(24) NOT NULL, side ENUM('sell','buy') NOT NULL,
+  path VARCHAR(24) NOT NULL, trigger_type VARCHAR(24) NULL, exchange VARCHAR(12) NOT NULL,
+  price DECIMAL(24,12) NULL, qty DECIMAL(24,10) NULL, usd DECIMAL(14,4) NULL,
+  ok TINYINT(1) NOT NULL, reason VARCHAR(40) NOT NULL, check_no TINYINT NULL,
+  floor DECIMAL(24,12) NULL, edge TINYINT(1) NULL, size_cap DECIMAL(24,10) NULL,
+  inputs_json JSON NULL,
+  caller_action VARCHAR(24) NULL,
+  order_id VARCHAR(64) NULL, journal_id INT NULL,
+  INDEX (symbol, created_at), INDEX (mode, created_at), INDEX (ok, reason)
+)`).then(() => console.log('[boot] #P0 exec_decisions present')).catch(e => console.error('[migration] exec_decisions:', e.message));
 await db.execute("UPDATE pump_armed_rules SET rebuy_pct = 20.0 WHERE symbol = 'BOBA-USD'"); // #131 BOBA default
 await safeAddColumn('auto_trade_rules', 'proceeds_reserved', 'DECIMAL(12,2) NULL');
 await safeAddColumn('trading_journal',  'source',          "VARCHAR(20) DEFAULT 'auto_detected'");
@@ -3051,6 +3071,7 @@ function tradeApprovalKeyboard(t) {
 async function executeApprovedKraken(t) {
           try {
             const result = await executeKrakenTrade(t.symbol, t.side, t.orderType, t.volume, t.price);
+            await recordManualDecision(t.symbol, t.side, 'kraken', t.price, t.volume, 'manual_approved', { usd: t.valueUSD });   // #P0 audit only, never throws
             const coinBase = t.symbol.replace('-USD', '');
             const krakenSource = t.source === 'claude_mcp' ? 'claude_mcp' : 'manual';
             // Prefer explicit valueUSD; derive qty when volume was estimated from value_usd
@@ -3084,6 +3105,7 @@ async function executeApprovedKraken(t) {
 async function executeApprovedRevolut(t) {
           try {
             const result = await placeRevolutOrder(t.symbol, t.side, t.orderType, t.baseSize, t.price, t.valueUsd);
+            await recordManualDecision(t.symbol, t.side, 'revolut', t.price, t.baseSize, 'manual_approved', { usd: t.valueUsd, order_id: (result && result.data && (result.data.venue_order_id || result.data.id)) || (result && result.client_order_id) });   // #P0 audit only, never throws
             // #47 B2a: a LIMIT order rests — skip the placement pipeline; pollPendingOrders() runs journal/tranche/entry/sweep on the confirmed FILL.
             if (String(t.orderType).toLowerCase() === 'limit') {
               await sendTelegram('📌 LIMIT ' + t.side.toUpperCase() + ' ' + formatTradeQty(t.baseSize) + ' ' + t.symbol.replace('-USD','') + ' resting @ ' + formatPrice(t.price) + ' — will log on fill.').catch(() => {});
@@ -10393,6 +10415,7 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
       [coinBase, action, price, absQty, valueUsd, reasoning, 'pending', claudeRec]
     );
     const journalId = result.insertId;
+    if (action === 'buy' || action === 'sell') await recordManualDecision(symbol, action, 'revolut', price, absQty, 'manual_detected', { journal_id: journalId });   // #P0 (PM P0-e) app-side trade, observed not approved; audit only, never throws
     // #20: remove stale claude_mcp row superseded by actual fill at different price
     if (staleClaudeMcpRowId) {
       await db.execute('DELETE FROM trading_journal WHERE id = ?', [staleClaudeMcpRowId]).catch(() => {});
@@ -12232,6 +12255,319 @@ async function computeDerivedFloor(symbol, coinBase) {
   try { const [r] = await db.execute('SELECT entry_floor FROM pump_armed_rules WHERE symbol = ? AND active = 1 LIMIT 1', [symbol]); if (r.length) rf = r[0].entry_floor; } catch (e) { /* none */ }
   try { const [e] = await db.execute('SELECT entry_price FROM entry_prices WHERE symbol = ? OR symbol = ? LIMIT 1', [symbol, coinBase + '-USD']); if (e.length) cost = e[0].entry_price; } catch (e) { /* none */ }
   return derivedFloorFrom(cost, sf, rf);
+}
+
+// ── #P0 FIRE-TIME PREDICATE, PHASE 0 (spec P0 rev 3) ─────────────────────────────────────
+// Table + function + vectors, NO CALLERS: nothing on an order path calls mayAutoTrade. The only ways to run it are the
+// unit tests (tests/p0) and the read-only manage_auto_rules predicate_check dry run. Live behaviour is unchanged.
+// #P0 effective ceiling is COMPUTED, never stored: an override reverts to the default by calculation when it expires (pm #36).
+const CEILING_DEFAULT_PCT = 50;
+function effectiveCeilingPct(row, nowMs) {
+  const base = Number(row && row.ceiling_pct) > 0 ? Number(row.ceiling_pct) : CEILING_DEFAULT_PCT;
+  let ov = row && row.ceiling_override; if (typeof ov === 'string') { try { ov = JSON.parse(ov); } catch (e) { ov = null; } }
+  if (ov && Number(ov.value) > 0 && ov.expires_at && new Date(ov.expires_at).getTime() > (nowMs || Date.now())) return { pct: Number(ov.value), source: 'override until ' + ov.expires_at };
+  return { pct: base, source: base === CEILING_DEFAULT_PCT ? 'default' : 'stored' };
+}
+// #P0 write-time rule for a ceiling_override (set_pump_armed_rule, #282 validator discipline): all four fields, value in
+// (0, 50), amount_usd > 0, expires_at a future ISO date no more than 90 days out, reason of 20+ characters. Returns what is
+// wrong; an empty list means the override may be written.
+function ceilingOverrideErrors(ov, nowMs) {
+  const now = nowMs || Date.now(), errs = [];
+  if (!ov || typeof ov !== 'object' || Array.isArray(ov)) return ['ceiling_override must be an object {value, reason, amount_usd, expires_at}'];
+  for (const k of ['value', 'reason', 'amount_usd', 'expires_at']) if (ov[k] === undefined || ov[k] === null || ov[k] === '') errs.push(k + ' is required');
+  if (errs.length) return errs;
+  if (!(Number(ov.value) > 0 && Number(ov.value) < 50)) errs.push('value must be above 0 and below 50 (the default ceiling)');
+  if (!(Number(ov.amount_usd) > 0)) errs.push('amount_usd must be above 0');
+  const exp = typeof ov.expires_at === 'string' && /^\d{4}-\d{2}-\d{2}/.test(ov.expires_at) ? new Date(ov.expires_at).getTime() : NaN;
+  if (!Number.isFinite(exp)) errs.push('expires_at must be an ISO date, e.g. 2026-10-15');
+  else if (exp <= now) errs.push('expires_at must be in the future');
+  else if (exp > now + 90 * 86400000) errs.push('expires_at must be no more than 90 days out');
+  if (String(ov.reason).trim().length < 20) errs.push('reason must be at least 20 characters');
+  return errs;
+}
+
+// #P0 THE ONLY FUNCTION THAT MAY SAY AN AUTONOMOUS ORDER CAN FIRE. Fire-time, from the DB and the venue, no in-memory
+// inputs, no notification inputs (see the FORBIDDEN list and its static test). Never throws; unreadable = NO.
+// It never mutates trading state: callers react to a NO (hold / re-anchor / restore / release) per the design §4.
+// intent: { symbol:'CC-USD', side:'sell'|'buy',
+//           path:'loop_trail'|'manual_trail'|'trough'|'trough_standalone'|'ladder'|'away_sell'|'away_buy'|'ai_analysis',
+//           exchange:'revolut'|'kraken', price:Number, qty?:Number, usd?:Number,
+//           trigger?:'trailing_stop'|'fixed_target'|'pump_alert', confidence?:'High'|'Medium'|'Low',
+//           ref?:{ sell_pct?:Number, cycle_id?:String, ladder_leg?:Number } }
+// opts:   { mode:'dry_run'|'shadow'|'enforce', nowMs?:Number }
+// returns { ok:Boolean, reason:String, check_no:Number|null, floor?:Number, edge?:Boolean, size_cap?:Number, decision_id:Number|null, inputs:Object }
+// Fourteen checks in order (spec P0 §3.2), first failure wins. Every call writes exactly one exec_decisions row.
+async function mayAutoTrade(intent, opts = {}) {
+  const o = opts && typeof opts === 'object' ? opts : {};
+  const mode = ['dry_run', 'shadow', 'enforce'].includes(o.mode) ? o.mode : 'dry_run';
+  const now = Number(o.nowMs) > 0 ? Number(o.nowMs) : Date.now();
+  const it = intent && typeof intent === 'object' ? intent : {};
+  const symbol = typeof it.symbol === 'string' ? it.symbol : '';
+  const coin = symbol.endsWith('-USD') ? symbol.slice(0, -4).toUpperCase() : '';
+  const side = it.side, path = it.path, exchange = it.exchange, price = Number(it.price);
+  const ref = it.ref && typeof it.ref === 'object' ? it.ref : {};
+  const trailPath = path === 'loop_trail' || path === 'manual_trail';
+  const inputs = { enabled: null, loop_enabled: null, dnd: null, manual_only: null, hodl: null, allowed_triggers: null, trigger: null,
+    require_confidence: null, confidence: it.confidence != null ? it.confidence : null, floor: null, edge: null, available: null,
+    price: Number.isFinite(price) ? price : null, cash: null, avg_sale: null, rebuy_floor: null, ceiling: null, sale_at: null,
+    uncovered_since: null, retention: null, open_order: null, cap_pct: null, size_cap: null };
+  const res = { ok: false, reason: 'invalid_intent', check_no: 0, decision_id: null, inputs };
+  let at = 0;   // the check being evaluated, for a failure nobody anticipated
+  const no = (reason, extra) => { res.ok = false; res.reason = reason; res.check_no = at; if (extra) Object.assign(res, extra); return res; };
+  const unreadable = (what, e) => { inputs.unreadable = what + (e && e.message ? ': ' + e.message : ''); return no('config_unreadable'); };
+  const norm = (a) => (Array.isArray(a) ? a : []).map(x => String(x).toUpperCase().replace(/-USD$/, ''));
+  let rule, ruleRead = false, dnd = null, ladder = null, lstate = null, lcfg = null, venue = null;
+  const readRule = async () => {
+    if (!ruleRead) { const [r] = await db.execute('SELECT * FROM pump_armed_rules WHERE symbol = ? AND active = 1 LIMIT 1', [symbol]); rule = r.length ? r[0] : null; ruleRead = true; }
+    return rule;
+  };
+  const readDnd = async () => { if (dnd === null) { dnd = await isDndCoin(coin); inputs.dnd = dnd; } return dnd; };
+  const readVenue = async () => {   // one balances read per call, shared by checks 8, 9 and 13; null = unreadable
+    if (venue !== null) return venue;
+    venue = false;
+    if (exchange === 'revolut') {
+      const b = await revolutRequest('GET', '/balances');
+      const list = Array.isArray(b) ? b : (b && (b.data || b.balances)) || [];
+      if (!Array.isArray(list) || !list.length) return venue;
+      const row = list.find(x => String(x.currency || '').toUpperCase() === coin);
+      const cashRow = list.find(x => x.currency === 'USD' || x.currency === 'USDT');   // the getAvailableUSD('revolut') selection
+      venue = { available: row ? parseFloat(row.available) || 0 : 0, cash: parseFloat((cashRow && cashRow.available) || 0) || 0 };
+    } else {
+      const raw = await krakenRequest('/0/private/Balance');
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return venue;
+      let available = 0, cash = 0;
+      for (const [asset, amt] of Object.entries(raw)) {
+        if (['ZUSD', 'ZEUR', 'ZGBP', 'USDT', 'USDC', 'USD'].includes(asset)) cash += parseFloat(amt || 0) || 0;   // the getKrakenBalances usdCash set
+        else if (krakenAssetToStandard(asset) === coin) available += parseFloat(amt || 0) || 0;
+      }
+      venue = { available, cash };
+    }
+    return venue;
+  };
+
+  const decide = async () => {
+    // 0. Intent well-formed
+    at = 0;
+    const SELL_ONLY = ['loop_trail', 'manual_trail', 'away_sell'], BUY_ONLY = ['trough', 'trough_standalone', 'away_buy'], BOTH = ['ladder', 'ai_analysis'];
+    if (!coin || !['sell', 'buy'].includes(side) || !['revolut', 'kraken'].includes(exchange) || !(price > 0) || !Number.isFinite(price)) return no('invalid_intent');
+    if (!(SELL_ONLY.includes(path) || BUY_ONLY.includes(path) || BOTH.includes(path))) return no('invalid_intent');
+    if ((side === 'sell' && BUY_ONLY.includes(path)) || (side === 'buy' && SELL_ONLY.includes(path))) return no('invalid_intent');
+    if (it.trigger != null && !['trailing_stop', 'fixed_target', 'pump_alert'].includes(it.trigger)) return no('invalid_intent');
+    if (it.confidence != null && !['High', 'Medium', 'Low'].includes(it.confidence)) return no('invalid_intent');
+    if ((it.qty != null && !(Number(it.qty) > 0)) || (it.usd != null && !(Number(it.usd) > 0))) return no('invalid_intent');
+    if (side === 'sell') {
+      inputs.trigger = trailPath ? 'trailing_stop' : (it.trigger != null ? it.trigger : null);   // trails are 'trailing_stop' by construction
+      if (inputs.trigger == null) return no('invalid_intent');   // a sell with no trigger on a non-trail path is never a silent pass
+    }
+
+    // 1. Emergency stop
+    at = 1;
+    let cfg;
+    try {
+      const [r] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'ai_auto_execute'");
+      if (!r.length) return unreadable('ai_auto_execute row missing');
+      cfg = JSON.parse(r[0].config_value);
+      if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) return unreadable('ai_auto_execute is not an object');
+    } catch (e) { return unreadable('ai_auto_execute', e); }
+    inputs.enabled = cfg.enabled === true;
+    inputs.allowed_triggers = Array.isArray(cfg.allowed_triggers) ? cfg.allowed_triggers : null;
+    if (cfg.enabled !== true) return no('paused');
+
+    // 2. Path opt-in (tables, never the in-memory mirrors)
+    at = 2;
+    let enabled = false;
+    if (path === 'loop_trail' || path === 'trough') {
+      try { await readRule(); } catch (e) { return unreadable('pump_armed_rules', e); }
+      inputs.loop_enabled = rule ? Number(rule.loop_enabled) : null;
+      enabled = (rule && Number(rule.loop_enabled) === 1) || await readDnd();
+    } else if (path === 'manual_trail') {
+      try { const [r] = await db.execute('SELECT auto_execute FROM trailing_stops WHERE symbol = ?', [symbol]); enabled = r.length > 0 && Number(r[0].auto_execute) === 1; }
+      catch (e) { return unreadable('trailing_stops', e); }
+    } else if (path === 'trough_standalone') {
+      try { const [r] = await db.execute('SELECT 1 FROM standalone_trough_trackers WHERE symbol = ?', [symbol]); enabled = r.length > 0; }
+      catch (e) { return unreadable('standalone_trough_trackers', e); }
+    } else if (path === 'ladder') {
+      try {
+        const [sw] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'ladder_live_enabled'");
+        let rows = [];
+        try { [rows] = await db.execute('SELECT active, cfg, state FROM ladder_live WHERE symbol = ?', [symbol]); }
+        catch (e) { if (e && e.code !== 'ER_NO_SUCH_TABLE') throw e; }   // no ladder table yet = no ladder
+        ladder = rows.length ? rows[0] : null;
+        enabled = sw.length > 0 && sw[0].config_value === 'true' && !!ladder && Number(ladder.active) === 1;
+      } catch (e) { return unreadable('ladder_live', e); }
+      if (enabled) {
+        try { lstate = ladder.state ? JSON.parse(ladder.state) : null; lcfg = ladder.cfg ? JSON.parse(ladder.cfg) : {}; }
+        catch (e) { return unreadable('ladder_live.state/cfg', e); }
+      }
+    } else if (path === 'away_sell' || path === 'away_buy') {
+      enabled = await isAwayActionable(coin);
+    } else if (path === 'ai_analysis') {
+      enabled = !!(cfg.per_coin_enabled && cfg.per_coin_enabled[coin] === true);
+    }
+    inputs.path_enabled = !!enabled;
+    if (!enabled) return no('path_not_enabled');
+    if (path === 'trough' && (!rule || rule.sale_price == null)) return no('no_cycle');   // no live cycle to buy back
+    if (path === 'ladder' && side === 'buy' && !(lstate && Number(lstate.sold_qty) > 0)) return no('no_cycle');
+
+    // 3. Coin rails
+    at = 3;
+    inputs.manual_only = norm(cfg.manual_only_symbols).includes(coin);
+    inputs.hodl = norm(cfg.hodl_symbols).includes(coin);
+    if (inputs.manual_only) return no('manual_only');   // both sides, nothing overrides (pm #49)
+    if (side === 'sell' && inputs.hodl && !(await readDnd())) return no('hodl');
+
+    // 4. Trigger allow-list - sells only; buys carry no trigger and skip it
+    at = 4;
+    if (side === 'sell' && !(cfg.allowed_triggers || []).includes(inputs.trigger)) return no('trigger_not_allowed');
+
+    // 5. Confidence
+    at = 5;
+    if (path === 'ai_analysis' || path === 'away_buy') {
+      const rank = { Low: 1, Medium: 2, High: 3 };
+      inputs.require_confidence = rank[cfg.require_confidence] ? cfg.require_confidence : 'High';
+      if (!((rank[it.confidence] || 0) >= rank[inputs.require_confidence])) return no('confidence_too_low');
+    }
+
+    // 6. Floor, 7. slippage margin (a flag, never a NO)
+    if (side === 'sell') {
+      at = 6;
+      const d = await computeDerivedFloor(symbol, coin);
+      inputs.floor = { floor: d.floor, source: d.source, cost: d.cost };
+      res.floor = d.floor;
+      if (d.floor == null) return no('no_floor');
+      if (price <= Number(d.floor)) return no('floor_blocked');
+      at = 7;
+      try { inputs.edge = await edgeSellCheck(symbol, coin, price); } catch (e) { inputs.edge = { edge: null, error: e.message }; }
+      res.edge = !!(inputs.edge && inputs.edge.edge === true);
+    }
+
+    // 8. Position (sells) / 9. Cash (buys) - venue balances, read fresh
+    at = side === 'sell' ? 8 : 9;
+    let v;
+    try { v = await readVenue(); } catch (e) { inputs.unreadable = 'balances: ' + e.message; return no('balances_unreadable'); }
+    if (!v) { inputs.unreadable = 'balances'; return no('balances_unreadable'); }
+    if (side === 'sell') {
+      inputs.available = v.available;
+      if (!(v.available > 0)) return no('no_position');
+      if (v.available * price < 1) return no('dust');
+    } else {
+      inputs.cash = v.cash;
+      if (it.usd != null ? !(v.cash >= Number(it.usd)) : !(v.cash > 0)) return no('insufficient_cash');
+    }
+
+    // 10. Buy-back rails (single mode: the rule; ladder: ladder_live.state)
+    if (side === 'buy' && (path === 'trough' || path === 'ladder')) {
+      at = 10;
+      try { await readRule(); } catch (e) { return unreadable('pump_armed_rules', e); }
+      const ceil = effectiveCeilingPct(rule, now);
+      inputs.ceiling = ceil;
+      let avg, abandoned = false;
+      if (path === 'trough') {
+        avg = Number(rule.sale_price);
+        if (Number(rule.entry_floor) > 0) inputs.rebuy_floor = Number(rule.entry_floor) * (1 - (Number(rule.buyback_floor_pct) || 5) / 100);
+        if ('sale_at' in rule || 'uncovered_since' in rule) {   // A2 columns; absent -> (d) is skipped
+          inputs.sale_at = rule.sale_at || null; inputs.uncovered_since = rule.uncovered_since || null;
+          const ah = rule.abandon_hours != null ? Number(rule.abandon_hours) : 336, uh = rule.uncovered_abandon_hours != null ? Number(rule.uncovered_abandon_hours) : 48;
+          if (rule.sale_at && (now - new Date(rule.sale_at).getTime()) / 3600000 > ah) abandoned = true;
+          if (rule.uncovered_since && (now - new Date(rule.uncovered_since).getTime()) / 3600000 > uh) abandoned = true;
+        }
+      } else {
+        avg = Number(lstate.reserved) / Number(lstate.sold_qty);
+        const ah = lcfg && lcfg.abandon_hours != null ? Number(lcfg.abandon_hours) : LADDER_DEFAULTS.abandon_hours;
+        inputs.sale_at = lstate.last_sale_at != null ? new Date(Number(lstate.last_sale_at)).toISOString() : null;
+        if (Number(lstate.last_sale_at) > 0 && (now - Number(lstate.last_sale_at)) / 3600000 > ah) abandoned = true;
+      }
+      inputs.avg_sale = Number.isFinite(avg) ? avg : null;
+      if (!(avg > 0)) return no('no_cycle');
+      if (price > avg * (1 + ceil.pct / 100)) return no('above_ceiling');   // (c) before (a): above the ceiling is the stronger truth
+      if (price > avg) return no('above_avg_sale');
+      if (inputs.rebuy_floor != null && price < inputs.rebuy_floor) return no('below_rebuy_floor');
+      if (abandoned) return no('abandoned');
+    }
+
+    // 11. Retention floor - ladder sells only (pm #33)
+    let sellable = null;
+    if (side === 'sell' && path === 'ladder') {
+      at = 11;
+      if (!lstate || !(Number(lstate.qty) >= 0)) return unreadable('ladder_live.state');
+      const rpct = lcfg && lcfg.retention_floor_pct != null ? Number(lcfg.retention_floor_pct) : LADDER_DEFAULTS.retention_floor_pct;
+      const base = Number(lstate.retention_base) || 0;
+      sellable = Number(lstate.qty) - base * rpct / 100;
+      inputs.retention = { base, pct: rpct, sellable };
+      if (!(sellable > 0)) return no('retention_floor');
+    }
+
+    // 12. Open-order conflict
+    at = 12;
+    try {
+      const [r] = await db.execute("SELECT 1 FROM pending_orders WHERE symbol = ? AND status NOT IN ('filled','cancelled','rejected','replaced') LIMIT 1", [symbol]);
+      inputs.open_order = r.length > 0;
+    } catch (e) { return unreadable('pending_orders', e); }
+    if (inputs.open_order) return no('open_order');
+
+    // 13. Size cap - the caller must place size_cap, never intent.qty
+    at = 13;
+    let cap;
+    if (side === 'sell') {
+      const capPct = Math.min(cfg.max_sell_pct != null ? Number(cfg.max_sell_pct) : 100, ref.sell_pct != null ? Number(ref.sell_pct) : 100);
+      if (!Number.isFinite(capPct)) return unreadable('max_sell_pct / ref.sell_pct not numeric');
+      inputs.cap_pct = capPct;
+      cap = Math.min(it.qty != null ? Number(it.qty) : Infinity, inputs.available * capPct / 100, sellable != null ? sellable : Infinity);
+    } else {
+      let awayLeft = Infinity;
+      if (path === 'away_buy') {
+        try {
+          const [r] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'away_mode'");
+          const am = r.length ? JSON.parse(r[0].config_value) : {};
+          awayLeft = parseFloat(am.max_session_buy_usd ?? 200) - parseFloat(am.session_bought_usd ?? 0);
+          if (!Number.isFinite(awayLeft)) return unreadable('away_mode session cap not numeric');
+        } catch (e) { return unreadable('away_mode', e); }
+        inputs.away_cap_left = awayLeft;
+      }
+      cap = Math.min(it.usd != null ? Number(it.usd) : Infinity, inputs.cash, awayLeft);
+    }
+    inputs.size_cap = cap;
+    res.size_cap = cap;
+    if (!(cap > 0)) return no(side === 'sell' ? 'no_position' : 'insufficient_cash');
+
+    // 14. Pair minimums - reserved; passes until built, reads nothing
+    at = 14;
+
+    res.ok = true; res.reason = 'ok'; res.check_no = null;
+    return res;
+  };
+
+  try { await decide(); }
+  catch (e) { inputs.error = String(e && e.message || e).slice(0, 200); no('config_unreadable'); }   // never throws; unreadable = NO
+
+  try {
+    const n = (x) => (x == null || !Number.isFinite(Number(x)) ? null : Number(x));
+    const [ins] = await db.execute(
+      'INSERT INTO exec_decisions (mode, symbol, side, path, trigger_type, exchange, price, qty, usd, ok, reason, check_no, `floor`, edge, size_cap, inputs_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [mode, symbol.slice(0, 24), side, String(path == null ? '' : path).slice(0, 24), inputs.trigger, String(exchange == null ? '' : exchange).slice(0, 12),
+       n(it.price), n(it.qty), n(it.usd), res.ok ? 1 : 0, res.reason, res.check_no, n(res.floor), res.edge == null ? null : (res.edge ? 1 : 0), n(res.size_cap), JSON.stringify(inputs)]);
+    res.decision_id = ins && ins.insertId ? ins.insertId : null;
+  } catch (e) { res.decision_id = null; console.error('[P0] exec_decisions insert failed (decision still returned):', e.message); }
+  return res;
+}
+
+// #P0 audit row for a trade Bryan made himself: 'manual_approved' from executeApprovedRevolut / executeApprovedKraken,
+// 'manual_detected' from autoLogTrade (an app-side trade found by balance diff - observed, not approved). Audit only:
+// never throws, never changes what the calling path does. extra: { usd, order_id, journal_id } when known.
+async function recordManualDecision(symbol, side, exchange, price, qty, reason, extra = {}) {
+  try {
+    const sd = String(side || '').toLowerCase();
+    if (sd !== 'sell' && sd !== 'buy') return null;   // transfers, payments: not trades
+    const s = String(symbol || '').toUpperCase(), sym = s.endsWith('-USD') ? s : s + '-USD';
+    const p = Number(price) > 0 ? Number(price) : null, q = Number(qty) > 0 ? Number(qty) : null;
+    const x = extra && typeof extra === 'object' ? extra : {};
+    const usd = Number(x.usd) > 0 ? Number(x.usd) : (p != null && q != null ? p * q : null);
+    const [ins] = await db.execute(
+      "INSERT INTO exec_decisions (mode, symbol, side, path, exchange, price, qty, usd, ok, reason, caller_action, order_id, journal_id) VALUES ('manual', ?, ?, 'manual', ?, ?, ?, ?, 1, ?, 'manual', ?, ?)",
+      [sym.slice(0, 24), sd, String(exchange || '').slice(0, 12), p, q, usd, String(reason || 'manual_approved').slice(0, 40),
+       x.order_id != null ? String(x.order_id).slice(0, 64) : null, Number(x.journal_id) > 0 ? Number(x.journal_id) : null]);
+    return ins && ins.insertId ? ins.insertId : null;
+  } catch (e) { console.error('[P0] manual decision row failed:', e.message); return null; }
 }
 
 // ── #383 STOP-TO-FLOOR CLEARANCE (PM #44) ──────────────────────────────────────────
@@ -14773,6 +15109,14 @@ cron.schedule('15 2 * * *', async () => {
     const [r] = await db.execute('DELETE FROM price_intraday WHERE recorded_at < DATE_SUB(NOW(), INTERVAL 30 DAY)');
     if (r.affectedRows > 0) console.log(`[intraday] Pruned ${r.affectedRows} row(s) older than 30d`);
   } catch (e) { console.error('[intraday] prune error:', e.message); }
+}, { timezone: 'Europe/London' });
+
+// #P0 prune exec_decisions older than 180 days
+cron.schedule('20 2 * * *', async () => {
+  try {
+    const [r] = await db.execute('DELETE FROM exec_decisions WHERE created_at < DATE_SUB(NOW(), INTERVAL 180 DAY)');
+    if (r.affectedRows > 0) console.log(`[P0] Pruned ${r.affectedRows} exec_decisions row(s) older than 180d`);
+  } catch (e) { console.error('[P0] exec_decisions prune error:', e.message); }
 }, { timezone: 'Europe/London' });
 
 // Daily cleanup — 2 AM: delete expired unmatched trade intentions
@@ -17610,7 +17954,7 @@ let rows;
       sweep_pct:              z.coerce.number().optional().describe('Percentage of sell proceeds to sweep to USDT (configure_sweep)'),
       min_trade_value_usd:    z.coerce.number().optional().describe('Minimum sell value in USD to trigger sweep (configure_sweep)'),
       excluded_symbols:       zLoose(z.array(z.string())).optional().describe('Symbols to exclude from sweep e.g. ["USDT-USD"] (configure_sweep)'),
-      max_sell_pct:           z.coerce.number().optional().describe('Max % of position to sell per auto-exec trade (configure_auto_execute)'),
+      max_sell_pct:           z.coerce.number().optional().describe('Max % of position to sell per auto-exec trade (configure_auto_execute). max_sell_pct is a hard cap on EVERY automatic sale, including pump loops: it overrides any loop\'s sell_pct above it (#P0: informational in Phase 0, binding once the fire-time predicate is enforced in Phase 2)'),
       sell_floors:            z.preprocess(v => { if (typeof v === 'string') { try { return JSON.parse(v); } catch(e) { return v; } } return v; }, z.record(z.coerce.number())).optional().describe('Per-coin min sell price map e.g. {"NEAR":1.87} -- auto-sell blocked if price <= floor (#45, configure_auto_execute)'),
       per_coin_enabled:       z.preprocess(v => { if (typeof v === 'string') { try { return JSON.parse(v); } catch(e) { return v; } } return v; }, z.record(z.boolean())).optional().describe('#24 explicit per-coin auto-exec opt-in map e.g. {"BOBA":true} -- only coins listed here can shouldAutoExecute'),
       away_action:            z.enum(['set_eligible','activate','deactivate','status','set_away_buy','set_away_sell']).optional().describe('configure_away_mode: which away-mode operation'),
@@ -17986,6 +18330,11 @@ let rows;
             caWarn.push('\u26a0\ufe0f \'trailing_stop\' removed from allowed_triggers - under enforcement these loops will not sell: ' + loops.join(', ') + '.');
           if (params?.manual_only_symbols !== undefined) { const hit = loops.filter(c => upc(config.manual_only_symbols).includes(c)); if (hit.length) caWarn.push('\u26a0\ufe0f manual_only_symbols now silences these enabled loops (no autonomous sell or buy): ' + hit.join(', ') + '.'); }
           if (params?.hodl_symbols !== undefined) { const hit = loops.filter(c => upc(config.hodl_symbols).includes(c)); if (hit.length) caWarn.push('\u26a0\ufe0f hodl_symbols now stops these enabled loops SELLING (unless in DND): ' + hit.join(', ') + '.'); }
+          if (max_sell_pct != null) {   // #P0 max_sell_pct caps EVERY automatic sale once the predicate's check 13 is enforced - say which loops it would cap
+            const [sp] = await db.execute('SELECT symbol, sell_pct FROM pump_armed_rules WHERE active = 1 AND loop_enabled = 1');
+            const capped = sp.filter(x => Number(x.sell_pct) > Number(config.max_sell_pct)).map(x => String(x.symbol).replace('-USD', '') + ' (sell_pct ' + Number(x.sell_pct) + '%)');
+            if (capped.length) caWarn.push('\u26a0\ufe0f max_sell_pct ' + config.max_sell_pct + '% is below these enabled loops\u2019 sell_pct - once the fire-time predicate is enforced (Phase 2) their sales are capped at ' + config.max_sell_pct + '%: ' + capped.join(', ') + '. Informational in Phase 0.');
+          }
         } catch (e) { console.error('[auto-exec] #H1 warnings failed:', e.message); }
         if (caWarn.length) await sendTelegram(caWarn.join('\n')).catch(() => {});
         return { content: [{ type: 'text', text: JSON.stringify({ ok: true, config, saved_to: 'system_config', warnings: caWarn }) }] };
@@ -18791,7 +19140,7 @@ let rows;
   server.tool('manage_auto_rules',
     'Manage automatic trade rules — list, remove, disable or enable a rule by ID. reset_cycle (#278) clears STALE pump-loop runtime state for a symbol (armed, armed_since, ringfenced sale_proceeds_usd, trough fields, baseline, tier_state) while PRESERVING all config; it refuses on a live cycle (sale_price set) unless force=true.',
     {
-      action:  z.enum(['list', 'remove', 'disable', 'enable', 'pump_status', 'loop_enable', 'loop_disable', 'reset_cycle', 'loop_audit', 'ladder_shadow_start', 'ladder_shadow_stop', 'ladder_shadow_status', 'ladder_live_start', 'ladder_live_stop', 'ladder_live_status', 'ladder_live_switch', 'profile_list', 'profile_validate', 'profile_status']).describe('Action to perform. profile_list / profile_validate / profile_status (#379): versioned ladder profiles and their validation record (profile + ladder_cfg {start, end, source, slippage_pct, annotation} or {status, by, notes}). ladder_live_* (#359): REAL-MONEY ladder - start (symbol, cap_usd, ladder_cfg; takes the coin over from its single-mode loop), stop, status, switch (ladder_on true/false, ladder-wide). ladder_shadow_start/stop/status (#358): paper-trade the pump-loop ladder on the live price - symbol + ladder_cfg {arm_pump_pct, trail_pct, ...}; never trades. loop_audit (#353, read-only): every gate that decides whether each pump loop can really auto-sell, with both floors against the real cost.'),
+      action:  z.enum(['list', 'remove', 'disable', 'enable', 'pump_status', 'loop_enable', 'loop_disable', 'reset_cycle', 'loop_audit', 'ladder_shadow_start', 'ladder_shadow_stop', 'ladder_shadow_status', 'ladder_live_start', 'ladder_live_stop', 'ladder_live_status', 'ladder_live_switch', 'profile_list', 'profile_validate', 'profile_status', 'predicate_check']).describe('Action to perform. predicate_check (#P0, read-only): dry-run the fire-time predicate mayAutoTrade for symbol + pc_side + pc_path (optional pc_usd, pc_qty) at the live price - returns the result and every input, writes one dry_run exec_decisions row, places nothing, mutates nothing. profile_list / profile_validate / profile_status (#379): versioned ladder profiles and their validation record (profile + ladder_cfg {start, end, source, slippage_pct, annotation} or {status, by, notes}). ladder_live_* (#359): REAL-MONEY ladder - start (symbol, cap_usd, ladder_cfg; takes the coin over from its single-mode loop), stop, status, switch (ladder_on true/false, ladder-wide). ladder_shadow_start/stop/status (#358): paper-trade the pump-loop ladder on the live price - symbol + ladder_cfg {arm_pump_pct, trail_pct, ...}; never trades. loop_audit (#353, read-only): every gate that decides whether each pump loop can really auto-sell, with both floors against the real cost.'),
       rule_id: z.coerce.number().optional().describe('Rule ID to remove, disable or enable'),
       symbol: z.string().optional().describe('Symbol e.g. BOBA-USD for loop_enable/loop_disable/reset_cycle'),
       force:  z.boolean().optional().describe('#278 reset_cycle only — override the live-cycle guard (sale_price set). Default false.'),
@@ -18799,8 +19148,12 @@ let rows;
       ladder_on: z.preprocess(v => v === 'true' ? true : (v === 'false' ? false : v), z.boolean()).optional().describe('#359 ladder_live_switch: true = the live ladder may trade, false = it may not (ladder-wide)'),
       profile: z.string().optional().describe("#379 a stored ladder profile, e.g. 'WIDE@1' or 'TIGHT' (latest version). ladder_shadow_start / ladder_live_start take their settings from it (live requires status 'validated'); profile_validate / profile_status act on it."),
       ladder_cfg: z.preprocess(v => { if (typeof v === 'string') { try { return JSON.parse(v); } catch (e) { return v; } } return v; }, z.record(z.any())).optional().describe('#358 ladder_shadow_start: {arm_pump_pct, trail_pct} required; optional sell_pct, max_legs, retrace_pct, bounce_pct, buy_pct, further_drop_pct, buyback_ceiling_pct, abandon_hours, paper_slippage_pct'),
+      pc_side: z.enum(['sell', 'buy']).optional().describe('#P0 predicate_check: side of the hypothetical autonomous order'),
+      pc_path: z.enum(['loop_trail', 'manual_trail', 'trough', 'trough_standalone', 'ladder', 'away_sell', 'away_buy', 'ai_analysis']).optional().describe('#P0 predicate_check: the autonomous path to evaluate'),
+      pc_usd: z.coerce.number().optional().describe('#P0 predicate_check: optional USD size (buys)'),
+      pc_qty: z.coerce.number().optional().describe('#P0 predicate_check: optional coin quantity (sells)'),
     },
-    async ({ action, rule_id, symbol, force, ladder_cfg, cap_usd, ladder_on, profile }) => {
+    async ({ action, rule_id, symbol, force, ladder_cfg, cap_usd, ladder_on, profile, pc_side, pc_path, pc_usd, pc_qty }) => {
       try {
         if (action === 'list') {
           const [rules] = await db.execute('SELECT * FROM auto_trade_rules ORDER BY created_at DESC');
@@ -18984,6 +19337,18 @@ let rows;
           }
           return { content: [{ type: 'text', text: JSON.stringify({ paper_only: true, shadows: out }, null, 2) }] };
         }
+        if (action === 'predicate_check') {
+          // #P0 READ-ONLY dry run of the fire-time predicate against the live rows: fetch the price, ask mayAutoTrade in
+          // dry_run mode (it writes its one exec_decisions row), return the full result + inputs. Places nothing, mutates nothing.
+          if (!symbol || !pc_side || !pc_path) throw new Error('predicate_check needs symbol, pc_side (sell|buy) and pc_path');
+          const sym = symbol.includes('-') ? symbol.toUpperCase() : symbol.toUpperCase() + '-USD';
+          const livePrice = await getCurrentPrice(sym).catch(() => null);
+          const intent = { symbol: sym, side: pc_side, path: pc_path, exchange: KRAKEN_MONITORED_COINS.includes(sym) ? 'kraken' : 'revolut', price: livePrice };
+          if (pc_qty != null) intent.qty = Number(pc_qty);
+          if (pc_usd != null) intent.usd = Number(pc_usd);
+          const pc = await mayAutoTrade(intent, { mode: 'dry_run' });
+          return { content: [{ type: 'text', text: JSON.stringify({ read_only: true, places_nothing: true, intent, result: pc }, null, 2) }] };
+        }
         if (action === 'loop_audit') {
           // #353 READ-ONLY. One row per active pump loop (plus any coin with a sell_floors entry): every gate on the
           // pump-loop auto-sell path (handleTrailingStopAlert #93 -> autoExecuteSell) in the order they apply, both
@@ -19056,6 +19421,7 @@ let rows;
                                   : { pass: null, reason: sc.reason }; })() : null,
               loop_enabled: rule ? Number(rule.loop_enabled) : null, armed: rule ? Number(rule.armed) : null,
               arm: rule ? `+${Number(rule.arm_pump_pct)}% in ${Number(rule.arm_window_min)}min, trail ${Number(rule.trail_pct)}%, sell ${Number(rule.sell_pct)}%` : null,
+              ceiling: rule ? (() => { const c = effectiveCeilingPct(rule); return c.pct + '% (' + c.source + ')'; })() : null,   // #P0 buy-back ceiling
               blocked_by: blocks,
               verdict: !canSell ? 'CANNOT auto-sell' : (price != null && eff != null && price <= eff ? `can auto-sell only above ${r6(eff)} (price is at/below the floor)` : 'CAN auto-sell on a trail breach')
             };
@@ -19475,8 +19841,10 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
       min_tier_usd:     z.coerce.number().optional().describe('#282 dust guard — skip and mark-filled any tier below this USD notional (default 2.0)'),
       abandon_hours:    z.coerce.number().optional().describe('#A2 abandon a pending buy-back this many hours after the sale (default 336 = 14 d)'),
       uncovered_abandon_hours: z.coerce.number().optional().describe('#A2 abandon when the buy-back cash has been missing this many hours (default 48)'),
+      ceiling_pct:      z.coerce.number().optional().describe('#P0 buy-back ceiling, %% above the average sale (5-200; unset = the default 50). Read by the fire-time predicate (not enforced until Phase 2)'),
+      ceiling_override: zLoose(z.object({ value: z.coerce.number().optional(), reason: z.string().optional(), amount_usd: z.coerce.number().optional(), expires_at: z.string().optional() })).optional().describe('#P0 time-boxed ceiling override {value, reason, amount_usd, expires_at}: ALL four required, value above 0 and below 50, amount_usd > 0, expires_at a future ISO date at most 90 days out, reason 20+ characters - otherwise the call is REFUSED and nothing is written. Reverts to the stored/default ceiling by calculation when it expires'),
     },
-    async ({ symbol, arm_pump_pct, trail_pct, sell_pct, entry_floor, arm_window_min, rebuy_pct, retrace_pct, bounce_pct, buyback_floor_pct, rule_mode, sell_tiers, buy_tiers, tier_cooldown_min, min_tier_usd, abandon_hours, uncovered_abandon_hours }) => {
+    async ({ symbol, arm_pump_pct, trail_pct, sell_pct, entry_floor, arm_window_min, rebuy_pct, retrace_pct, bounce_pct, buyback_floor_pct, rule_mode, sell_tiers, buy_tiers, tier_cooldown_min, min_tier_usd, abandon_hours, uncovered_abandon_hours, ceiling_pct, ceiling_override }) => {
       try {
         const sym = symbol.includes('-USD') ? symbol.toUpperCase() : `${symbol.toUpperCase()}-USD`;
 
@@ -19529,6 +19897,13 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
         // not armed. An INACTIVE or missing rule is a fresh set-up (defaults, re-activated) - unchanged from before.
         const [exRows] = await db.execute('SELECT * FROM pump_armed_rules WHERE symbol = ? LIMIT 1', [sym]);
         const ex = exRows.length && Number(exRows[0].active) === 1 ? exRows[0] : null;
+        // #P0 buy-back ceiling write-time rule, alongside the #383 guard (#282 validator discipline): refused = nothing written.
+        if (ceiling_pct != null && !(Number(ceiling_pct) >= 5 && Number(ceiling_pct) <= 200))
+          return { content: [{ type: 'text', text: JSON.stringify({ ok: false, refused: true, reason: 'ceiling_pct must be between 5 and 200 - nothing was written' }) }] };
+        if (ceiling_override != null) {
+          const ceErr = ceilingOverrideErrors(ceiling_override, Date.now());
+          if (ceErr.length) return { content: [{ type: 'text', text: JSON.stringify({ ok: false, refused: true, reason: 'ceiling_override refused - nothing was written', errors: ceErr }) }] };
+        }
         // #383 stop-to-floor clearance - checked BEFORE anything is written.
         // #384 (PM #45) refuse only an edit that makes an ENABLED loop LESS safe. A loop far below its floor is unfireable
         // today for reasons unrelated to config; routine maintenance on it (a trail tweak) must not be forced into an
@@ -19588,6 +19963,11 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
           await db.execute('UPDATE pump_armed_rules SET abandon_hours = COALESCE(?, abandon_hours), uncovered_abandon_hours = COALESCE(?, uncovered_abandon_hours) WHERE symbol = ?',
             [abandon_hours != null && Number(abandon_hours) > 0 ? Math.round(Number(abandon_hours)) : null, uncovered_abandon_hours != null && Number(uncovered_abandon_hours) > 0 ? Math.round(Number(uncovered_abandon_hours)) : null, sym]);
         }
+        if (ceiling_pct != null || ceiling_override != null) {   // #P0 written separately and only when supplied (validated above)
+          await db.execute('UPDATE pump_armed_rules SET ceiling_pct = COALESCE(?, ceiling_pct), ceiling_override = COALESCE(?, ceiling_override) WHERE symbol = ?',
+            [ceiling_pct != null ? Number(ceiling_pct) : null,
+             ceiling_override != null ? JSON.stringify({ value: Number(ceiling_override.value), reason: String(ceiling_override.reason), amount_usd: Number(ceiling_override.amount_usd), expires_at: String(ceiling_override.expires_at) }) : null, sym]);
+        }
         const [finRows] = await db.execute('SELECT * FROM pump_armed_rules WHERE symbol = ? LIMIT 1', [sym]);
         const fin = finRows[0] || {};
         const spWarn = Number(fin.loop_enabled) === 1 ? await emitEnableWarnings(sym, { side: 'both', trigger: 'trailing_stop' }, 'set_pump_armed_rule') : [];   // #H1
@@ -19609,6 +19989,7 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
           entry_floor: num(fin.entry_floor), rebuy_pct: num(fin.rebuy_pct), retrace_pct: num(fin.retrace_pct), bounce_pct: num(fin.bounce_pct),
           buyback_floor_pct: num(fin.buyback_floor_pct), rule_mode: fin.rule_mode, tier_cooldown_min: num(fin.tier_cooldown_min), min_tier_usd: num(fin.min_tier_usd),
           abandon_hours: fin.abandon_hours != null ? num(fin.abandon_hours) : 336, uncovered_abandon_hours: fin.uncovered_abandon_hours != null ? num(fin.uncovered_abandon_hours) : 48,   // #A2
+          ceiling: effectiveCeilingPct(fin),   // #P0
           loop_enabled: num(fin.loop_enabled), armed: num(fin.armed), active: num(fin.active) }, tier_validation: tierInfo, conflict_warning: conflictWarning || null }) }] };
       } catch (e) {
         return { content: [{ type: 'text', text: JSON.stringify({ error: e.message }) }] };
