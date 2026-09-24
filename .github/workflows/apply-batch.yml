@@ -55,7 +55,7 @@ jobs:
           if (parts.length === 0) fail('the batch lists no files.');
 
           // v3: only these files may ever be changed by a batch.
-          const ALLOWED = /^(server\.js|public\/[A-Za-z0-9_-]+\.(js|html|css))$/;
+          const ALLOWED = /^(server\.js|ARCHITECTURE\.md|public\/[A-Za-z0-9_-]+\.(js|html|css))$/;
           const seen = new Set();
           const results = [];
           for (const p of parts) {
