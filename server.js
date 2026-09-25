@@ -13074,6 +13074,25 @@ async function handleDeferredBuyButton(idStr, choice, reply) {
 // when there are 10+, else the book-wide sell p90 of 1.0% measured in #360). An ENABLED loop that fails is REFUSED
 // with nothing written; a disabled one is written with a warning (it cannot fire).
 const STOP_CLEARANCE_MULT = 3, BOOK_SELL_SLIP_P90 = 1.0;
+// #431 (Fable, from PM P11): a coin you muted (permanently ignored, or acknowledged for 24 h) that still has a live
+// money path - an enabled pump loop or an auto-executing trailing stop. Ignore mutes alerts only; it never stops those,
+// so without this the coin is invisible in every read while it can still sell. Read-only.
+async function mutedButArmed() {
+  const muted = (c) => { const k = [c, c + '-USD', c + '/USD']; return k.some(x => ignoredCoins.has(x)) ? 'permanently_ignored' : k.some(x => alertState.acknowledged.has(x)) ? 'acknowledged' : null; };
+  const out = new Map();
+  const [rules] = await db.execute('SELECT symbol, armed FROM pump_armed_rules WHERE active = 1 AND loop_enabled = 1');
+  for (const r of rules) {
+    const c = String(r.symbol).toUpperCase().replace(/-USD$/, ''), m = muted(c);
+    if (m) out.set(c, { coin: c, muted: m, live: ['pump loop enabled' + (Number(r.armed) ? ' (ARMED now)' : '')] });
+  }
+  for (const [sym, ts] of trailingStops) {
+    if (!ts || ts.autoExecute !== true) continue;
+    const c = String(sym).toUpperCase().replace(/[-/]USD$/, ''), m = muted(c);
+    if (!m) continue;
+    if (out.has(c)) out.get(c).live.push('auto-executing trailing stop'); else out.set(c, { coin: c, muted: m, live: ['auto-executing trailing stop'] });
+  }
+  return [...out.values()].map(x => ({ coin: x.coin, muted: x.muted, still_live: x.live.join(' + '), note: 'Muting hides alerts only - this coin can still sell automatically. Un-mute it, or disable the loop / trail.' }));
+}
 async function coinSellSlipP90(coin) {
   try {
     const [r] = await db.execute("SELECT slip_pct FROM trading_journal WHERE (symbol = ? OR symbol = ?) AND action = 'sell' AND slip_pct IS NOT NULL ORDER BY id DESC LIMIT 50", [coin, coin + '-USD']);
@@ -15110,7 +15129,7 @@ async function checkPortfolio() {
             `This is OUTSIDE normal trading range!\n\n` +
             `📊 Bryan's buy signal criteria:\n` +
             `• Outside normal range: ✅ (-${dropPct}% from avg)\n` +
-            `• RSI likely oversold at this level ✅\n\n` +
+            `\n` +   // #431 was "RSI likely oversold ✅" - never computed (Fable: drop it)
             entryLine +
             dipRecLine + `\n\n` +
             `Tap a button, or reply:\n` +
@@ -15149,7 +15168,7 @@ async function checkPortfolio() {
             `This is OUTSIDE normal trading range!\n\n` +
             `📊 Bryan's sell signal criteria:\n` +
             `• Outside normal range: ✅ (+${pumpPct}% from avg)\n` +
-            `• RSI likely overbought at this level ✅\n\n` +
+            `\n` +   // #431 was "RSI likely overbought ✅" - never computed (Fable: drop it)
             entryLine +
             `⚡ <b>RECOMMENDATION:</b> Sell signal based on your swing strategy.\n` +
             pumpRecLine + `\n\n` +
@@ -20665,7 +20684,8 @@ let rows;
             master_auto_execute: ae.enabled === true,
             triggers: (ae.allowed_triggers || []).join(', ') || 'none',   // #H1 the live policy, where the loops are
             note: '/pause (ai_auto_execute.enabled=false) HOLDS every loop sell and buy-back since #F1; loop_disable stops a single loop. Floor (#377): the HIGHEST of real cost + 0.5% and any stored override - an override can raise it, never lower it; no cost and no override = sale blocked.',
-            dnd_coins: dndCoins, loops
+            dnd_coins: dndCoins, loops,
+            muted_but_armed: await mutedButArmed().catch(e => [{ error: e.message }])   // #431
           }, null, 2) }] };
         }
         if (action === 'pump_status') {
@@ -20953,6 +20973,7 @@ let rows;
         pmDecisionsDigest: pmDecisionsSinceLastSession || [],
         pmRecommendations: pmRecommendations,
         crossThreadPrinciples: crossThreadDecRows || [],
+        muted_but_armed: await mutedButArmed().catch(e => [{ error: e.message }]),   // #431 a muted coin that can still sell - never invisible
       };
       console.log('[mcp] get_context called');
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
