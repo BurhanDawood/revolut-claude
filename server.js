@@ -1504,6 +1504,30 @@ await safeAddColumn('trading_journal',  'tool_key',   'VARCHAR(60) NULL');    //
 await safeAddColumn('trading_journal',  'cycle_id',   'VARCHAR(40) NULL');    // #L1 <COIN>:<armed_since> shared by a loop's sell and its buy-back
 await safeAddColumn('trading_journal',  'regime_tag', 'VARCHAR(12) NULL');    // #L1 quiet|elevated|hot|unknown at trade time
 await safeAddColumn('pump_armed_rules', 'cycle_id',   'VARCHAR(40) NULL');    // #L1 stamped at the sale, read by the buy-back
+// #426 move shape: every call the system makes (loop armed / morning brief / asked) and, 7 days later, what happened.
+await db.execute(`CREATE TABLE IF NOT EXISTS move_shape_log (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  symbol VARCHAR(20) NOT NULL,
+  context VARCHAR(12) NOT NULL,
+  ref_key VARCHAR(40) NOT NULL,
+  at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  price DECIMAL(20,10),
+  gain_pct DECIMAL(8,2),
+  hours INT,
+  shape VARCHAR(8),
+  lean VARCHAR(16),
+  conc DECIMAL(6,3),
+  dip_pct DECIMAL(8,2),
+  stats_n INT,
+  stats_pull8 DECIMAL(5,1),
+  stats_higher7 DECIMAL(5,1),
+  out_pull8 TINYINT NULL,
+  out_higher7 TINYINT NULL,
+  out_r7 DECIMAL(8,2) NULL,
+  filled_at TIMESTAMP NULL,
+  UNIQUE KEY uq_msl (symbol, context, ref_key),
+  INDEX idx_msl_fill (filled_at, at)
+)`).catch(e => console.error('[migration] move_shape_log:', e.message));
 await safeAddColumn('trailing_stops',   'auto_execute',    'TINYINT(1) NOT NULL DEFAULT 0'); // #93
 await safeAddColumn('price_targets',    'sell_pct',        'DECIMAL(5,2) NULL'); // #144 per-rung sell %% override for Away Mode up-targets
 await safeAddColumn('trailing_stops',   'sell_pct',        'DECIMAL(10,4) DEFAULT 25.0');   // #93
@@ -9542,6 +9566,17 @@ async function sendMorningBriefing() {
         (by.DEAD.length ? ' \u00b7 ' + by.DEAD.length + ' cannot sell at today\u2019s price (' + by.DEAD.join(', ') + ')' : '') +
         (by.other.length ? ' \u00b7 ' + by.other.length + ' unchecked (' + by.other.join(', ') + ')' : '');
     } catch (e) { loopLine = '\n\n\ud83d\udee1\ufe0f Loop check unavailable: ' + String(e.message || e).replace(/[<>&]/g, ''); }
+    // #426 coins well above their 7-day low: rocket (sell/buy-back favoured) or steady climb (hold favoured). Advice only.
+    let moveLine = '';
+    try {
+      const movers = await moveShapeMovers(6);
+      const parts = [];
+      for (const mv of movers) {
+        const r = await moveShape(mv.coin, { log: { context: 'brief', ref: new Date().toISOString().slice(0, 10) } });
+        if (r.ok && r.shape !== 'NONE') parts.push(escTg(r.coin) + ' +' + Math.round(r.move.gain_pct) + '% ' + MOVE_SHAPE_WORD[r.shape] + (MOVE_SHAPE_LEAN_WORD[r.lean] ? ' \u2192 ' + MOVE_SHAPE_LEAN_WORD[r.lean] : ''));
+      }
+      if (parts.length) moveLine = '\n\n\ud83d\udcd0 <b>MOVES:</b> ' + parts.join(' \u00b7 ') + ' <i>(/shape COIN for why)</i>';
+    } catch (e) { moveLine = '\n\n\ud83d\udcd0 Move check unavailable: ' + String(e.message || e).replace(/[<>&]/g, ''); }
 
     // ── Recent outcomes + weekly stats ──────────────────────────────────────
     let recentOutcomesBlock = '';
@@ -9581,7 +9616,7 @@ async function sendMorningBriefing() {
       (tangemLine ? tangemLine : '') +
       capitalLine + breakEvenLine + `\n\n` +
       `📊 <b>TOP HOLDINGS:</b>\n${topHoldings}\n\n` +
-      `🚨 <b>ALERTS:</b> ${alertsBlock}` + loopLine +   // #423
+      `🚨 <b>ALERTS:</b> ${alertsBlock}` + loopLine + moveLine +   // #423 #426
       recentOutcomesBlock + weeklyPnlBlock;
 
     await sendTelegram(msg1);
@@ -15825,6 +15860,263 @@ async function fetchAllSources(sourceId) {
 }
 
 cron.schedule('30 7 * * *', () => { scanYoutubeSources().catch(e => console.error('[feeds] #417 07:30 scan failed:', e.message)); }, { timezone: 'Europe/London' });   // #417 analyst videos, ready for the 09:15 brief
+
+// ── #426 MOVE SHAPE (Bryan 25 Sep): is a rise a ROCKET (a few big hours, deep swings - usually gives some back) or a
+// STEADY climb (spread out, shallow dips - more often still higher a week later)? ADVICE ONLY: reads prices, news and its
+// own log; sends messages; never places, changes or blocks an order, and never touches a loop's settings.
+// Evidence (Dev study 25 Sep, 15 coins, ~90k hourly bars, rises >=15% from the 7-day low): ROCKET 78% pulled back >=8%
+// within 7 days / 32% higher a week later (n=201); STEADY 46% / 54% (n=100). Same split before and after May 2026.
+const MOVE_SHAPE_MIN_RISE = 10;     // % above the 7-day low before a move is judged at all
+const MOVE_SHAPE_MIN_N = 5;         // fewer same-shape events for this coin -> use the all-coin figures
+let moveShapeStatsCache = null;     // { at, pooled, coins } from system_config 'move_shape_stats'
+let moveShapeStatsRunning = false;
+
+// hourly bars {t(ms), h, l, c}: the long-kept hourly table, with the last 4 days rebuilt from the 2-min captures
+async function loadHourlyBars(sym, days) {
+  const iso = (ms) => new Date(ms).toISOString().slice(0, 19).replace('T', ' ');
+  const startMs = Date.now() - days * 86400000;
+  const m = new Map();
+  const [h] = await db.execute('SELECT hour_bucket, high_px, low_px, close_px FROM price_intraday_hourly WHERE symbol = ? AND hour_bucket >= ? ORDER BY hour_bucket ASC', [sym, iso(startMs)]);
+  for (const r of h) { const t = new Date(r.hour_bucket).getTime(), c = parseFloat(r.close_px); if (c > 0) m.set(t, { t, h: parseFloat(r.high_px), l: parseFloat(r.low_px), c }); }
+  const recentMs = Math.floor(Math.max(startMs, Date.now() - 4 * 86400000) / 3600000) * 3600000;
+  const [p] = await db.execute('SELECT price, recorded_at FROM price_intraday WHERE symbol = ? AND recorded_at >= ? ORDER BY recorded_at ASC', [sym, iso(recentMs)]);
+  const fresh = new Map();
+  for (const r of p) {
+    const px = parseFloat(r.price); if (!(px > 0)) continue;
+    const t = Math.floor(new Date(r.recorded_at).getTime() / 3600000) * 3600000;
+    const b = fresh.get(t);
+    if (!b) fresh.set(t, { t, h: px, l: px, c: px }); else { if (px > b.h) b.h = px; if (px < b.l) b.l = px; b.c = px; }
+  }
+  for (const [t, b] of fresh) m.set(t, b);
+  return [...m.values()].sort((a, b) => a.t - b.t);
+}
+
+// the shape of the rise that ends at bar i (from the lowest low of the 7 days before it)
+function moveShapeAt(bars, i, withPace) {
+  const b = bars[i]; if (!b || !(b.c > 0)) return null;
+  const t = b.t, W = 7 * 86400000;
+  let lo = Infinity, loI = -1;
+  for (let k = i; k >= 0 && bars[k].t >= t - W; k--) if (bars[k].l <= lo) { lo = bars[k].l; loI = k; }
+  if (!(lo > 0) || loI < 0) return null;
+  const gain = (b.c / lo - 1) * 100;
+  const tot = Math.log(b.c / lo);
+  const ups = [];
+  for (let k = loI + 1; k <= i; k++) { const mv = Math.log(bars[k].c / bars[k - 1].c); if (mv > 0) ups.push(mv); }
+  ups.sort((x, y) => y - x);
+  const top3 = (ups[0] || 0) + (ups[1] || 0) + (ups[2] || 0);
+  const conc = tot > 0 ? top3 / tot : 1;
+  let pk = lo, dip = 0;
+  for (let k = loI; k <= i; k++) { if (bars[k].h > pk) pk = bars[k].h; const d = bars[k].l / pk - 1; if (d < dip) dip = d; }
+  const out = { price: b.c, low: lo, low_at: new Date(bars[loI].t).toISOString(), gain, hours: Math.max(1, Math.round((t - bars[loI].t) / 3600000)), conc, dip: dip * 100 };
+  if (withPace) {   // how fast vs its normal: median |24 h change| over the 30 days before the low
+    const ch = [];
+    for (let k = loI; k >= 24 && bars[k].t >= bars[loI].t - 30 * 86400000; k -= 24) if (bars[k - 24].c > 0) ch.push(Math.abs(bars[k].c / bars[k - 24].c - 1));
+    ch.sort((x, y) => x - y);
+    const med = ch.length >= 7 ? ch[Math.floor(ch.length / 2)] : null;
+    out.pace_x = med > 0 ? Number(((gain / 100) / (out.hours / 24) / med).toFixed(1)) : null;
+  }
+  return out;
+}
+function classifyMove(f) {
+  if (!f || f.gain < MOVE_SHAPE_MIN_RISE) return 'NONE';
+  if (f.conc >= 0.75 || (f.conc >= 0.55 && f.dip <= -15)) return 'ROCKET';
+  if (f.conc <= 0.55 && f.dip >= -12) return 'STEADY';
+  return 'MIXED';
+}
+// every past rise of >= MOVE_SHAPE_MIN_RISE% in this coin's history (72 h apart) and what happened in the 7 days after
+function moveShapeHistory(bars) {
+  const ev = [];
+  if (bars.length < 24 * 40) return ev;
+  const start = bars[0].t + 30 * 86400000, lastT = bars[bars.length - 1].t;
+  let last = -Infinity;
+  for (let i = 0; i < bars.length; i++) {
+    const t = bars[i].t;
+    if (t < start || t - last < 72 * 3600000) continue;
+    const end = t + 7 * 86400000;
+    if (lastT < end - 12 * 3600000) break;
+    const f = moveShapeAt(bars, i, false);
+    if (!f || f.gain < MOVE_SHAPE_MIN_RISE) continue;
+    last = t;
+    let mn = Infinity, cEnd = null;
+    for (let k = i + 1; k < bars.length && bars[k].t <= end; k++) { if (bars[k].l < mn) mn = bars[k].l; cEnd = bars[k].c; }
+    if (cEnd == null) continue;
+    ev.push({ t, gain: f.gain, shape: classifyMove(f), pull8: mn / f.price - 1 <= -0.08, higher7: cEnd > f.price, r7: (cEnd / f.price - 1) * 100 });
+  }
+  return ev;
+}
+const moveShapeBand = (gain) => (gain >= 20 ? 'ge20' : 'lt20');
+function summariseShapeEvents(ev) {
+  const out = {};
+  for (const band of ['lt20', 'ge20', 'all']) {
+    out[band] = {};
+    for (const shape of ['ROCKET', 'MIXED', 'STEADY']) {
+      const g = ev.filter(e => e.shape === shape && (band === 'all' || moveShapeBand(e.gain) === band));
+      if (!g.length) continue;
+      const r7 = g.map(e => e.r7).sort((a, b) => a - b);
+      out[band][shape] = { n: g.length, pull8: Math.round(g.filter(e => e.pull8).length / g.length * 100), higher7: Math.round(g.filter(e => e.higher7).length / g.length * 100), med_r7: Number(r7[Math.floor(r7.length / 2)].toFixed(1)) };
+    }
+  }
+  return out;
+}
+// nightly (02:40) and once after boot: every coin's history -> system_config 'move_shape_stats'
+async function refreshMoveShapeStats() {
+  if (moveShapeStatsRunning) return null;
+  moveShapeStatsRunning = true;
+  try {
+    const [cs] = await db.execute("SELECT symbol FROM coin_strategy WHERE symbol NOT IN ('DEAD_BAGS','EXITED')");
+    const coins = {}, all = [];
+    for (const r of cs) {
+      const coin = String(r.symbol).toUpperCase();
+      try {
+        const ev = moveShapeHistory(await loadHourlyBars(coin + '-USD', 400));
+        if (!ev.length) continue;
+        coins[coin] = summariseShapeEvents(ev); all.push(...ev);
+      } catch (e) { console.error('[shape] history ' + coin + ':', e.message); }
+    }
+    const stats = { at: new Date().toISOString(), events: all.length, pooled: summariseShapeEvents(all), coins };
+    await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('move_shape_stats', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)", [JSON.stringify(stats)]);
+    moveShapeStatsCache = stats;
+    console.log('[shape] #426 history refreshed: ' + all.length + ' past rises across ' + Object.keys(coins).length + ' coins');
+    return stats;
+  } finally { moveShapeStatsRunning = false; }
+}
+async function moveShapeStats() {
+  if (moveShapeStatsCache && Date.now() - Date.parse(moveShapeStatsCache.at) < 26 * 3600000) return moveShapeStatsCache;
+  try {
+    const [r] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'move_shape_stats'");
+    if (r.length) moveShapeStatsCache = JSON.parse(r[0].config_value);
+  } catch (e) { /* none yet */ }
+  return moveShapeStatsCache;
+}
+// the lean, from this coin's own history when it has enough same-shape rises in the same size band, else all coins
+function moveShapeLean(shape, gain, stats, coin) {
+  if (shape === 'NONE') return { lean: 'none', text: 'No big move to judge - under ' + MOVE_SHAPE_MIN_RISE + '% above its 7-day low.', basis: null };
+  const band = moveShapeBand(gain);
+  const own = stats && stats.coins && stats.coins[coin] && stats.coins[coin][band] && stats.coins[coin][band][shape];
+  const pooled = stats && stats.pooled && stats.pooled[band] && stats.pooled[band][shape];
+  const basis = own && own.n >= MOVE_SHAPE_MIN_N ? Object.assign({ from: coin }, own) : pooled ? Object.assign({ from: 'all coins' }, pooled) : null;
+  const size = band === 'ge20' ? 'rises of 20%+' : 'rises of 10-20%';
+  const hist = basis ? ' In the past (' + basis.from + ', ' + size + ', ' + basis.n + ' like this): ' + basis.pull8 + '% pulled back 8%+ within a week, ' + basis.higher7 + '% were higher a week later.' : ' No history to check this against yet.';
+  if (shape === 'ROCKET') {
+    if (basis && basis.pull8 >= 60) return { lean: 'sell_buyback', text: 'Sell-and-buy-back favoured - a spike like this usually gives some back.' + hist, basis };
+    return { lean: 'unclear', text: 'Spike, but this has not reliably pulled back before - no clear lean.' + hist, basis };
+  }
+  if (shape === 'STEADY') {
+    if (basis && basis.higher7 >= 50) return { lean: 'hold', text: 'Hold favoured - steady climbs like this were more often still higher a week later; a sell risks buying back higher.' + hist, basis };
+    return { lean: 'unclear', text: 'Steady climb, but these have not reliably kept going here - no clear lean.' + hist, basis };
+  }
+  return { lean: 'unclear', text: 'Mixed shape - neither a clean spike nor a steady climb; no clear lean.' + hist, basis };
+}
+// what the analyst videos (Gemini notes) and the news headlines said about the coin
+function coinMentionTest(coin) {
+  const names = Object.entries(COIN_NAMES).filter(([, s]) => s === coin).map(([n]) => n);
+  const tick = coin.length >= 3 ? new RegExp('(^|[^A-Za-z0-9])\\$?' + coin + '(?![A-Za-z0-9])') : new RegExp('\\$' + coin + '(?![A-Za-z0-9])');
+  const name = names.length ? new RegExp('\\b(' + names.join('|') + ')\\b', 'i') : null;
+  return (s) => { s = String(s || ''); return tick.test(s) || (name ? name.test(s) : false); };
+}
+async function moveShapeNews(coin, hours = 72) {
+  const out = { videos: [], headlines: [], errors: [] };
+  const hit = coinMentionTest(coin);
+  try {
+    const [rows] = await db.execute('SELECT sf.name AS source_name, fi.id, fi.title, fi.published_at, fi.thesis_status, LEFT(fi.transcript, 8000) AS notes FROM feed_items fi JOIN source_feeds sf ON sf.id = fi.source_id WHERE fi.published_at > DATE_SUB(NOW(), INTERVAL ' + (parseInt(hours) || 72) + ' HOUR) ORDER BY fi.published_at DESC LIMIT 80');
+    out.videos = rows.filter(r => hit(r.title) || hit(r.notes)).slice(0, 3).map(r => ({ item_id: r.id, source: r.source_name, title: r.title, published_at: r.published_at, thesis_status: r.thesis_status }));
+  } catch (e) { out.errors.push('videos: ' + e.message); }
+  try {
+    const { items } = await fetchNewsHeadlines(hours, 15, 120);
+    out.headlines = items.filter(i => hit(i.title)).slice(0, 3).map(i => ({ source: i.source, title: i.title, at: i.ts ? new Date(i.ts).toISOString() : null }));
+  } catch (e) { out.errors.push('headlines: ' + e.message); }
+  return out;
+}
+async function moveShape(symbol, opts = {}) {
+  const coin = String(symbol || '').toUpperCase().replace(/-USD$/, '').trim();
+  if (!/^[A-Z0-9]{1,15}$/.test(coin)) return { ok: false, error: 'bad symbol' };
+  const bars = await loadHourlyBars(coin + '-USD', 40);
+  if (bars.length < 24 * 3) return { ok: false, coin, error: 'not enough price history (' + bars.length + ' hours)' };
+  const f = moveShapeAt(bars, bars.length - 1, true);
+  if (!f) return { ok: false, coin, error: 'could not read the move' };
+  const shape = classifyMove(f);
+  const stats = await moveShapeStats();
+  const lean = moveShapeLean(shape, f.gain, stats, coin);
+  const r = {
+    ok: true, coin, shape, lean: lean.lean, advice: lean.text, basis: lean.basis,
+    move: { price: f.price, gain_pct: Number(f.gain.toFixed(1)), from_low: f.low, low_at: f.low_at, hours: f.hours, best_3_hours_share_pct: Math.min(100, Math.round(f.conc * 100)), deepest_dip_on_the_way_pct: Number(f.dip.toFixed(1)), pace_vs_normal_x: f.pace_x },
+    history_as_of: stats ? stats.at : null, note: 'Advice only - nothing was changed. Loops and orders run exactly as set.'
+  };
+  if (opts.news) r.news = await moveShapeNews(coin, 72);
+  if (opts.log && shape !== 'NONE') await logMoveShape(r, opts.log.context, opts.log.ref).catch(() => {});
+  return r;
+}
+async function logMoveShape(r, context, ref) {
+  const [res] = await db.execute('INSERT IGNORE INTO move_shape_log (symbol, context, ref_key, price, gain_pct, hours, shape, lean, conc, dip_pct, stats_n, stats_pull8, stats_higher7) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
+    [r.coin, context, String(ref).slice(0, 40), r.move.price, r.move.gain_pct, r.move.hours, r.shape, r.lean, r.move.best_3_hours_share_pct / 100, r.move.deepest_dip_on_the_way_pct, r.basis ? r.basis.n : null, r.basis ? r.basis.pull8 : null, r.basis ? r.basis.higher7 : null]);
+  return res && res.affectedRows === 1;
+}
+// coins now >= MOVE_SHAPE_MIN_RISE% above their 7-day low (quick screen on the 2-min captures), biggest first
+async function moveShapeMovers(limit = 8) {
+  const [rows] = await db.execute("SELECT symbol, MIN(price) AS lo, SUBSTRING_INDEX(GROUP_CONCAT(price ORDER BY recorded_at DESC), ',', 1) AS last_px FROM price_intraday WHERE recorded_at >= DATE_SUB(NOW(), INTERVAL 7 DAY) GROUP BY symbol");
+  return rows.map(r => ({ coin: String(r.symbol).replace(/-USD$/, ''), gain: (parseFloat(r.last_px) / parseFloat(r.lo) - 1) * 100 }))
+    .filter(x => x.gain >= MOVE_SHAPE_MIN_RISE && isFinite(x.gain)).sort((a, b) => b.gain - a.gain).slice(0, limit);
+}
+async function moveShapeTrackRecord() {
+  const [rows] = await db.execute('SELECT shape, COUNT(*) AS n, ROUND(AVG(out_pull8) * 100) AS pull8, ROUND(AVG(out_higher7) * 100) AS higher7 FROM move_shape_log WHERE filled_at IS NOT NULL GROUP BY shape');
+  return rows.map(r => ({ shape: r.shape, calls: Number(r.n), pulled_back_8pct: r.pull8 == null ? null : Number(r.pull8), higher_a_week_later: r.higher7 == null ? null : Number(r.higher7) }));
+}
+const MOVE_SHAPE_WORD = { ROCKET: 'rocket', STEADY: 'steady climb', MIXED: 'mixed', NONE: 'no big move' };
+const MOVE_SHAPE_LEAN_WORD = { sell_buyback: 'sell/buy-back', hold: 'hold', unclear: 'no clear lean', none: '' };
+function formatMoveShape(r, heading) {
+  if (!r || !r.ok) return '📐 ' + escTg((r && r.coin) || '') + ' - ' + escTg((r && r.error) || 'unavailable');
+  const m = r.move;
+  let s = (heading ? heading + '\n' : '') + '📐 <b>' + escTg(r.coin) + '</b> - ' + MOVE_SHAPE_WORD[r.shape].toUpperCase() + '\n';
+  if (r.shape === 'NONE') s += 'Up ' + m.gain_pct + '% from its 7-day low - too small to judge.';
+  else {
+    s += '+' + m.gain_pct + '% from its 7-day low in ' + m.hours + ' h. The best 3 hours did ' + m.best_3_hours_share_pct + '% of it; deepest dip on the way ' + Math.abs(m.deepest_dip_on_the_way_pct) + '%' + (m.pace_vs_normal_x != null ? '; ' + m.pace_vs_normal_x + '× its normal pace' : '') + '.\n';
+    s += '👉 ' + escTg(r.advice);
+  }
+  if (r.news) {
+    const n = r.news.videos.map(v => '🎥 ' + escTg(v.source) + ': ' + escTg(String(v.title || '').slice(0, 90))).concat(r.news.headlines.map(h => '📰 ' + escTg(h.source) + ': ' + escTg(String(h.title || '').slice(0, 110))));
+    s += '\n' + (n.length ? 'Last 72 h:\n' + n.join('\n') : 'No analyst video or headline mentioned ' + escTg(r.coin) + ' in the last 72 h.');
+  }
+  return s + '\n<i>Advice only - nothing was changed.</i>';
+}
+// every 10 min: a loop that has just armed gets one shape message (logged, so it can be scored a week later)
+async function moveShapeArmCheck() {
+  const [rows] = await db.execute('SELECT symbol, armed_since, arm_pump_pct, loop_enabled FROM pump_armed_rules WHERE armed = 1 AND active = 1 AND armed_since IS NOT NULL AND armed_since > DATE_SUB(NOW(), INTERVAL 2 HOUR)');
+  for (const row of rows) {
+    const coin = String(row.symbol).toUpperCase().replace(/-USD$/, '');
+    const ref = new Date(row.armed_since).toISOString();
+    try {
+      const [seen] = await db.execute("SELECT id FROM move_shape_log WHERE symbol = ? AND context = 'arm' AND ref_key = ?", [coin, ref]);
+      if (seen.length) continue;
+      const r = await moveShape(coin, { news: true });
+      if (!r.ok) continue;
+      if (!(await logMoveShape(r, 'arm', ref))) continue;   // logged even when small, so each arming gets exactly one message
+      await sendTelegram(formatMoveShape(r, '🔔 <b>' + escTg(coin) + ' loop armed</b>' + (Number(row.loop_enabled) ? '' : ' (loop off)') + ' - how it got here:'));
+    } catch (e) { console.error('[shape] arm check ' + coin + ':', e.message); }
+  }
+}
+// nightly: fill in what happened 7 days after each call (price_intraday keeps 30 days)
+async function fillMoveShapeOutcomes() {
+  const [rows] = await db.execute('SELECT id, symbol, at, price FROM move_shape_log WHERE filled_at IS NULL AND at < DATE_SUB(NOW(), INTERVAL 7 DAY) AND at > DATE_SUB(NOW(), INTERVAL 28 DAY) LIMIT 200');
+  let n = 0;
+  for (const r of rows) {
+    const from = new Date(r.at), to = new Date(from.getTime() + 7 * 86400000), iso = (d) => d.toISOString().slice(0, 19).replace('T', ' ');
+    const [p] = await db.execute('SELECT price FROM price_intraday WHERE symbol = ? AND recorded_at > ? AND recorded_at <= ? ORDER BY recorded_at ASC', [r.symbol + '-USD', iso(from), iso(to)]);
+    const px = p.map(x => parseFloat(x.price)).filter(x => x > 0), p0 = parseFloat(r.price);
+    if (px.length < 100 || !(p0 > 0)) continue;
+    const last = px[px.length - 1];
+    await db.execute('UPDATE move_shape_log SET out_pull8 = ?, out_higher7 = ?, out_r7 = ?, filled_at = NOW() WHERE id = ?', [Math.min(...px) / p0 - 1 <= -0.08 ? 1 : 0, last > p0 ? 1 : 0, Number(((last / p0 - 1) * 100).toFixed(2)), r.id]);
+    n++;
+  }
+  if (n) console.log('[shape] #426 outcomes filled: ' + n);
+}
+cron.schedule('*/10 * * * *', () => { moveShapeArmCheck().catch(e => console.error('[shape] arm check failed:', e.message)); });   // #426
+cron.schedule('40 2 * * *', async () => {   // #426 after the 02:05 hourly rollup
+  try { await refreshMoveShapeStats(); } catch (e) { console.error('[shape] history refresh failed:', e.message); }
+  try { await fillMoveShapeOutcomes(); } catch (e) { console.error('[shape] outcome fill failed:', e.message); }
+}, { timezone: 'Europe/London' });
+setTimeout(async () => {   // #426 first boot: build the history now rather than wait for 02:40
+  try { const s = await moveShapeStats(); if (!s) await refreshMoveShapeStats(); } catch (e) { console.error('[shape] boot history failed:', e.message); }
+}, 4 * 60 * 1000);
 cron.schedule('15 9 * * *', async () => {   // #416 daily brief (Bryan 24 Sep): snapshot + Gemini news; replaces the 'open Claude PM' reminder (now the brief's last line)
   try { await sendMorningBriefing(); }
   catch (e) { console.error('[brief] 09:15 cron failed:', e.message); await sendTelegram('\u274c Morning brief failed: ' + escTg(e.message)); }
@@ -16992,6 +17284,30 @@ function createMcpServer() {
         ) }] };
       }
       return { content: [{ type: 'text', text: JSON.stringify({ prices: results }) }] };
+    }
+  );
+
+  // ── Tool: get_move_shape (#426) — rocket vs steady climb, with history and news. Read-only, advice only. ──
+  server.tool('get_move_shape',
+    'Is a coin\'s rise a ROCKET (a few big hours did most of it, deep swings - historically usually gives some back: sell-and-buy-back favoured) or a STEADY climb (spread out, shallow dips - more often still higher a week later: hold favoured), or MIXED? Measured on hourly prices from the coin\'s 7-day low, checked against that coin\'s own past rises (or all coins when it has fewer than 5 like it), with the last 72 h of analyst-video notes and headlines that mention it. Use it when a coin is running, when a loop arms, and before advising sell vs hold. Omit symbol for every coin now 10%+ above its 7-day low. track_record = how past calls turned out 7 days later. Read-only: never trades, never changes a loop.',
+    {
+      symbol: z.string().optional().describe('Coin, e.g. JTO or JTO-USD. Omit for all current movers.'),
+      include_news: z.boolean().optional().describe('Default true for one coin, false for the movers list'),
+    },
+    async ({ symbol, include_news } = {}) => {
+      try {
+        let result;
+        if (symbol) result = await moveShape(symbol, { news: include_news !== false, log: { context: 'ask', ref: new Date().toISOString().slice(0, 10) } });
+        else {
+          const movers = await moveShapeMovers(10), list = [];
+          for (const mv of movers) list.push(await moveShape(mv.coin, { news: include_news === true }));
+          result = { movers: list, note: movers.length ? undefined : 'No coin is ' + MOVE_SHAPE_MIN_RISE + '%+ above its 7-day low right now.' };
+        }
+        result.track_record = await moveShapeTrackRecord().catch(() => []);
+        const st = await moveShapeStats();
+        result.method = { min_rise_pct: MOVE_SHAPE_MIN_RISE, rocket: 'best 3 hours >= 75% of the rise, or >= 55% with a 15%+ dip on the way', steady: 'best 3 hours <= 55% and no dip deeper than 12%', history_events: st ? st.events : null, history_as_of: st ? st.at : null };
+        return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+      } catch (e) { return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: e.message }) }] }; }
     }
   );
 
@@ -22506,6 +22822,23 @@ app.post('/telegram-webhook', async (req, res) => {
       await sendReply('🎥 Watching it with Gemini - usually under 2 minutes.');
       watchVideoLink(ytLink[1]).then(r => sendTelegram(formatWatchResult(r)))
         .catch(async (e) => { console.error('[feeds] #420 watch failed:', e.message); await sendTelegram('❌ Could not watch that video: ' + escTg(e.message)); });
+      return res.status(200).json({ ok: true });
+    }
+    // #426 /shape [COIN] - rocket or steady climb, and which way it leans (with the last 72 h of news). Advice only.
+    const shapeCmd = /^shape(?:\s+\$?([a-z0-9]{1,15})(?:-usd)?)?$/.exec(commandText);
+    if (shapeCmd) {
+      try {
+        if (shapeCmd[1]) await sendReply(formatMoveShape(await moveShape(shapeCmd[1], { news: true, log: { context: 'ask', ref: new Date().toISOString().slice(0, 10) } })));
+        else {
+          const movers = await moveShapeMovers(8);
+          if (!movers.length) await sendReply('📐 No coin is ' + MOVE_SHAPE_MIN_RISE + '%+ above its 7-day low right now. Try /shape COIN for any coin.');
+          else {
+            const lines = [];
+            for (const mv of movers) { const r = await moveShape(mv.coin); if (r.ok) lines.push('<b>' + escTg(r.coin) + '</b> +' + Math.round(r.move.gain_pct) + '% ' + MOVE_SHAPE_WORD[r.shape] + (MOVE_SHAPE_LEAN_WORD[r.lean] ? ' \u2192 ' + MOVE_SHAPE_LEAN_WORD[r.lean] : '')); }
+            await sendReply('📐 <b>Moves now</b> (above the 7-day low)\n' + lines.join('\n') + '\n<i>/shape COIN for the reasons and the news. Advice only.</i>');
+          }
+        }
+      } catch (e) { await sendReply('❌ Move check failed: ' + escTg(e.message)); }
       return res.status(200).json({ ok: true });
     }
     // #419 /videos - Gemini watches new videos from every YouTube source now; a summary arrives when done. Never trades.
