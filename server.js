@@ -1533,6 +1533,15 @@ await safeAddColumn('move_shape_log', 'rsi_4h', 'DECIMAL(5,1) NULL');
 await safeAddColumn('move_shape_log', 'rsi_1d', 'DECIMAL(5,1) NULL');
 await safeAddColumn('move_shape_log', 'vs_sma20_pct', 'DECIMAL(8,2) NULL');
 await safeAddColumn('move_shape_log', 'range30_pct', 'DECIMAL(5,1) NULL');
+// #432 macro (PM ask 3 / dev #405): daily closes of the US dollar, stored read-only. Context only - nothing reads it to act.
+await db.execute(`CREATE TABLE IF NOT EXISTS macro_daily (
+  series VARCHAR(16) NOT NULL,
+  d DATE NOT NULL,
+  close DECIMAL(12,4) NOT NULL,
+  source VARCHAR(24) NOT NULL,
+  fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (series, d)
+)`).catch(e => console.error('[migration] macro_daily:', e.message));
 await safeAddColumn('trailing_stops',   'auto_execute',    'TINYINT(1) NOT NULL DEFAULT 0'); // #93
 await safeAddColumn('price_targets',    'sell_pct',        'DECIMAL(5,2) NULL'); // #144 per-rung sell %% override for Away Mode up-targets
 await safeAddColumn('trailing_stops',   'sell_pct',        'DECIMAL(10,4) DEFAULT 25.0');   // #93
@@ -16290,6 +16299,96 @@ cron.schedule('40 2 * * *', async () => {   // #426 after the 02:05 hourly rollu
 setTimeout(async () => {   // #426 first boot: build the history now rather than wait for 02:40
   try { const s = await moveShapeStats(); if (!s) await refreshMoveShapeStats(); } catch (e) { console.error('[shape] boot history failed:', e.message); }
 }, 4 * 60 * 1000);
+// #432 macro: the US dollar (PM ask 3, dev #405). Two separate series, never mixed:
+//   DXY       = ICE US Dollar Index (DX-Y.NYB) daily closes from Yahoo's public chart endpoint (no key)
+//   USD_BROAD = the Fed's broad trade-weighted dollar index (FRED DTWEXBGS, no key; published weekly, so ~1 week behind)
+// Only CLOSED sessions are stored. Read-only: shown on get_context / get_portfolio_summary, used by no rule, loop or order.
+const MACRO_SOURCES = {
+  DXY: { source: 'yahoo:DX-Y.NYB', url: 'https://query1.finance.yahoo.com/v8/finance/chart/DX-Y.NYB?range=2y&interval=1d', kind: 'yahoo', label: 'US Dollar Index (DXY)' },
+  USD_BROAD: { source: 'fred:DTWEXBGS', url: 'https://fred.stlouisfed.org/graph/fredgraph.csv?id=DTWEXBGS', kind: 'fred', label: 'Fed broad dollar index (weekly release)' }
+};
+function parseYahooChart(j, nowMs = Date.now()) {
+  const r = j && j.chart && j.chart.result && j.chart.result[0];
+  if (!r) throw new Error((j && j.chart && j.chart.error && (j.chart.error.description || j.chart.error.code)) || 'no chart result');
+  const tz = (r.meta && r.meta.exchangeTimezoneName) || 'America/New_York';
+  const ts = r.timestamp || [], cl = (r.indicators && r.indicators.quote && r.indicators.quote[0] && r.indicators.quote[0].close) || [];
+  const day = (ms) => new Date(ms).toLocaleDateString('en-CA', { timeZone: tz });
+  // a bar's timestamp may be its local midnight or the previous evening's session open: +12 h lands on the trade date either way.
+  // A session counts as closed once it is past 17:06 local on its date (the ICE close is 17:00 New York).
+  const lastClosed = day(nowMs - (17 * 60 + 6) * 60000), out = new Map();
+  for (let i = 0; i < ts.length; i++) {
+    const c = Number(cl[i]); if (!(c > 0)) continue;
+    const d = day(ts[i] * 1000 + 12 * 3600000); if (d > lastClosed) continue;   // still trading
+    out.set(d, c);
+  }
+  return [...out].map(([d, close]) => ({ d, close })).sort((a, b) => (a.d < b.d ? -1 : 1));
+}
+function parseFredCsv(text, sinceDay = '') {
+  const lines = String(text || '').trim().split(/\r?\n/);
+  if (!lines.length || !/date/i.test(lines[0])) throw new Error('not a FRED csv: ' + String(lines[0] || '').slice(0, 60));
+  const out = [];
+  for (const ln of lines.slice(1)) {
+    const [d, v] = ln.split(',');
+    const c = Number(v);
+    if (/^\d{4}-\d{2}-\d{2}$/.test(d) && c > 0 && d >= sinceDay) out.push({ d, close: c });
+  }
+  return out;
+}
+async function refreshMacroDaily() {
+  const since = new Date(Date.now() - 800 * 86400000).toISOString().slice(0, 10), status = { at: new Date().toISOString() };
+  for (const [series, s] of Object.entries(MACRO_SOURCES)) {
+    const ctl = new AbortController(); const to = setTimeout(() => ctl.abort(), 15000);
+    try {
+      const r = await fetch(s.url, { signal: ctl.signal, headers: { 'User-Agent': 'Mozilla/5.0 (compatible; revx-macro)', Accept: s.kind === 'yahoo' ? 'application/json' : 'text/csv' } });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const rows = (s.kind === 'yahoo' ? parseYahooChart(await r.json()) : parseFredCsv(await r.text())).filter(x => x.d >= since);
+      if (!rows.length) throw new Error('no closed rows');
+      for (let i = 0; i < rows.length; i += 200) {
+        const chunk = rows.slice(i, i + 200);
+        await db.execute('INSERT INTO macro_daily (series, d, close, source) VALUES ' + chunk.map(() => '(?,?,?,?)').join(',') + ' ON DUPLICATE KEY UPDATE close = VALUES(close), source = VALUES(source)',
+          chunk.flatMap(x => [series, x.d, x.close, s.source]));
+      }
+      status[series] = { ok: true, rows: rows.length, last: rows[rows.length - 1] };
+    } catch (e) {
+      status[series] = { ok: false, error: String(e.message || e).slice(0, 160) };
+      console.error('[macro] ' + series + ' fetch failed:', status[series].error);
+    } finally { clearTimeout(to); }
+  }
+  await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('macro_daily_status', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)", [JSON.stringify(status)]).catch(() => {});
+  console.log('[macro] #432 refresh: ' + Object.keys(MACRO_SOURCES).map(k => k + ' ' + (status[k].ok ? status[k].rows + ' rows to ' + status[k].last.d : 'FAILED')).join(', '));
+  return status;
+}
+function summariseMacroSeries(rows, nowMs = Date.now()) {   // rows oldest first: [{ d: 'YYYY-MM-DD', close }]
+  if (!rows || !rows.length) return null;
+  const n = rows.length, last = rows[n - 1], pct = (a, b) => (b > 0 ? Number(((a / b - 1) * 100).toFixed(2)) : null);
+  const back = (k) => (n > k ? rows[n - 1 - k].close : null);
+  const avg = (k) => (n >= k ? rows.slice(-k).reduce((s, r) => s + r.close, 0) / k : null);
+  const cut = new Date(Date.parse(last.d) - 365 * 86400000).toISOString().slice(0, 10), yr = rows.filter(r => r.d >= cut).map(r => r.close);
+  const hi = Math.max(...yr), lo = Math.min(...yr), s50 = avg(50), c20 = back(20) ? pct(last.close, back(20)) : null, v50 = s50 ? pct(last.close, s50) : null;
+  const ageDays = Math.floor((nowMs - Date.parse(last.d + 'T00:00:00Z')) / 86400000);
+  return { last_close: last.close, as_of: last.d, age_days: ageDays, closes_stored: n,
+    change_5_closes_pct: back(5) ? pct(last.close, back(5)) : null, change_20_closes_pct: c20,
+    vs_50_close_avg_pct: v50, range_52w_pct: hi > lo ? Number(((last.close - lo) / (hi - lo) * 100).toFixed(1)) : null, high_52w: hi, low_52w: lo,
+    direction: v50 == null || c20 == null ? null : (v50 > 1 && c20 > 0 ? 'rising' : v50 < -1 && c20 < 0 ? 'falling' : 'flat') };
+}
+async function macroSnapshot() {
+  const [rows] = await db.execute("SELECT series, DATE_FORMAT(d, '%Y-%m-%d') AS d, close FROM macro_daily WHERE d >= DATE_SUB(CURDATE(), INTERVAL 400 DAY) ORDER BY series, d");
+  let status = null;
+  try { const [s] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'macro_daily_status'"); if (s.length) status = JSON.parse(s[0].config_value); } catch (e) { /* first run */ }
+  const out = {};
+  for (const [series, s] of Object.entries(MACRO_SOURCES)) {
+    const sum = summariseMacroSeries(rows.filter(r => r.series === series).map(r => ({ d: r.d, close: Number(r.close) })));
+    const st = status && status[series];
+    out[series] = { label: s.label, source: s.source, ...(sum || { last_close: null, note: 'no closes stored yet' }),
+      ...(st && !st.ok ? { last_fetch_error: st.error, last_fetch_at: status.at } : {}),
+      ...(sum && sum.age_days > (series === 'DXY' ? 4 : 14) ? { stale: true } : {}) };
+  }
+  out.note = 'Context only (#432): stored and shown, used by no rule, loop or order. direction = rising if >1% above its 50-close average AND up over 20 closes; falling if the mirror; otherwise flat.';
+  return out;
+}
+cron.schedule('20 23 * * 1-5', () => { refreshMacroDaily().catch(e => console.error('[macro] refresh failed:', e.message)); }, { timezone: 'Europe/London' });   // #432 after the 22:00 London DXY close
+cron.schedule('20 7 * * *', () => { refreshMacroDaily().catch(e => console.error('[macro] refresh failed:', e.message)); }, { timezone: 'Europe/London' });     // #432 catch-up before the 09:15 brief
+setTimeout(() => { refreshMacroDaily().catch(e => console.error('[macro] boot refresh failed:', e.message)); }, 5 * 60 * 1000);   // #432 backfill on first boot
 cron.schedule('15 9 * * *', async () => {   // #416 daily brief (Bryan 24 Sep): snapshot + Gemini news; replaces the 'open Claude PM' reminder (now the brief's last line)
   try { await sendMorningBriefing(); }
   catch (e) { console.error('[brief] 09:15 cron failed:', e.message); await sendTelegram('\u274c Morning brief failed: ' + escTg(e.message)); }
@@ -20327,7 +20426,8 @@ let rows;
         positions: cleanPositions,
         dust_positions: dustCount,
         ignored_positions: ignoredCount,
-        cash_available
+        cash_available,
+        macro: await macroSnapshot().catch(e => ({ error: e.message }))   // #432 the dollar (DXY), context only
       }, null, 2) }] };
     }
   );
@@ -20974,6 +21074,7 @@ let rows;
         pmRecommendations: pmRecommendations,
         crossThreadPrinciples: crossThreadDecRows || [],
         muted_but_armed: await mutedButArmed().catch(e => [{ error: e.message }]),   // #431 a muted coin that can still sell - never invisible
+        macro: await macroSnapshot().catch(e => ({ error: e.message })),   // #432 the dollar (DXY), context only
       };
       console.log('[mcp] get_context called');
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
