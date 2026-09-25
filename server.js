@@ -7898,6 +7898,59 @@ async function agentApiState() {
     rails: { per_trade_pct: cfg.per_trade_pct, max_positions: cfg.max_positions, min_trade_usd: cfg.min_trade_usd, daily_loss_pct: cfg.daily_loss_pct, drawdown_halt_pct: cfg.drawdown_halt_pct, runs_per_day: cfg.runs_per_day, orders_per_run: cfg.orders_per_run } };
 }
 
+// #A3v THE AGENT, READ BY THE PM (Bryan 25 Sep: "could I ask PM these questions and it pulls the data from the agent's files?").
+// Read-only views of the agent's own tables. The first row of each run carries the run's full input (what it screened, the
+// shortlist with shape/indicators/ranges/research, its notes) - that is how "why did it look at GRT" is answered.
+const AGENT_SHORTLIST_RULE = 'Each run: every Revolut X USD pair -> drop stablecoins, spreads over the limit and coins outside its universe (Bryan holds them, a pump loop runs on them, or Kraken) -> rank by the size of the 7-day move, up or down -> the top 15 + anything it holds + the coins it asked to watch last run (watch_next). Only the shortlist gets hourly shape, indicators, 24 h / 72 h ranges and research.';
+const agentJ = (v) => { if (v == null) return null; if (typeof v === 'string') { try { return JSON.parse(v); } catch (e) { return null; } } return v; };
+function agentRunDigest(rows) {   // rows of one run, oldest first
+  const first = rows.find(r => r.inputs) || rows[0], inp = agentJ(first.inputs) || {}, input = inp.input || {};
+  const short = (input.shortlist || []).map(s => ({ coin: s.coin, held: s.held || undefined, price: s.px, ch1_pct: s.ch1, ch24h_pct: s.ch24h, ch7_pct: s.ch7, range30_pos_pct: s.range30,
+    shape: s.shape || s.shape_note || null, lean: s.lean || null, off_72h_high_pct: s.range_72h ? s.range_72h.off_high_pct : undefined,
+    rsi_4h: s.indicators ? s.indicators.rsi_4h : undefined, mentions: (s.mentions || []).length + (s.headlines || []).length,
+    research: s.research ? (s.research.error ? 'failed: ' + s.research.error : (s.research.grounded ? 'web' : 'no web') + (s.research.cached_at ? ' (cached)' : '')) : 'not researched' }));
+  const watchedIn = (input.shortlist || []).filter(s => !s.held).length > 15 ? 'includes watch_next from the previous run' : undefined;
+  return { run_id: first.run_id, at: first.at, trigger: first.trigger_kind, model: first.model, tokens_in: first.tokens_in, tokens_out: first.tokens_out,
+    cost_usd: first.model_cost_usd != null ? Number(first.model_cost_usd) : null,
+    outcome: rows.map(r => ({ id: r.id, symbol: r.symbol, side: r.side, usd: r.usd != null ? Number(r.usd) : null, status: r.status, drop_reason: r.drop_reason, thesis: r.thesis, invalidation: r.invalidation, confidence: r.confidence, tool_key: r.tool_key,
+      fill_price: r.fill_price != null ? Number(r.fill_price) : null, fill_qty: r.fill_qty != null ? Number(r.fill_qty) : null })),
+    notes_for_self: first.notes_for_self || null, watch_next: inp.watch_next || null, requests: (inp.requests || []).map(q => q.title),
+    screen: input.screen || null, shortlist: short, shortlist_note: watchedIn, model_raw_on_bad_json: inp.model_raw ? String(inp.model_raw).slice(0, 2000) : undefined };
+}
+async function agentMcpView({ view, run_id, coin, limit } = {}) {
+  const v = view || 'status', lim = Math.min(20, Math.max(1, parseInt(limit) || 6));
+  if (v === 'status') return { view: v, ...(await agentApiState()), shortlist_rule: AGENT_SHORTLIST_RULE };
+  if (v === 'runs' || v === 'run') {
+    let ids;
+    if (v === 'run' && run_id) ids = [String(run_id)];
+    else { const [r] = await db.execute('SELECT run_id, MAX(id) AS m FROM agent_decisions GROUP BY run_id ORDER BY m DESC LIMIT ' + (v === 'run' ? 1 : lim)); ids = r.map(x => x.run_id); }
+    const out = [];
+    for (const id of ids) {
+      const [rows] = await db.execute("SELECT id, run_id, DATE_FORMAT(at, '%Y-%m-%d %H:%i') AS at, trigger_kind, symbol, side, usd, status, drop_reason, thesis, invalidation, confidence, tool_key, fill_price, fill_qty, inputs, model, tokens_in, tokens_out, model_cost_usd, notes_for_self FROM agent_decisions WHERE run_id = ? ORDER BY id", [id]);
+      if (!rows.length) continue;
+      const d = agentRunDigest(rows);
+      if (v === 'run') { const inp = agentJ((rows.find(r => r.inputs) || {}).inputs) || {}; d.full_input = inp.input || null; }   // everything the model saw
+      out.push(d);
+    }
+    return { view: v, shortlist_rule: AGENT_SHORTLIST_RULE, runs: out, note: out.length ? undefined : 'No runs found.' };
+  }
+  if (v === 'coin') {
+    const c = String(coin || '').toUpperCase().replace(/-USD$/, '');
+    if (!/^[A-Z0-9]{1,15}$/.test(c)) return { view: v, error: 'coin is required, e.g. GRT' };
+    const [p] = await db.execute("SELECT pack, gemini_ok, DATE_FORMAT(at, '%Y-%m-%d %H:%i') AS at FROM agent_research WHERE symbol = ? ORDER BY at DESC LIMIT 1", [c]);
+    const [d] = await db.execute("SELECT run_id, DATE_FORMAT(at, '%Y-%m-%d %H:%i') AS at, side, usd, status, drop_reason, thesis, invalidation, fill_price, fill_qty FROM agent_decisions WHERE symbol = ? ORDER BY id DESC LIMIT 10", [c + '-USD']);
+    const [runs] = await db.execute("SELECT run_id, DATE_FORMAT(at, '%Y-%m-%d %H:%i') AS at, inputs FROM agent_decisions WHERE inputs IS NOT NULL ORDER BY id DESC LIMIT " + lim);
+    const seen = [];
+    for (const r of runs) { const inp = agentJ(r.inputs) || {}, s = ((inp.input || {}).shortlist || []).find(x => x.coin === c); if (s) seen.push({ run_id: r.run_id, at: r.at, row: s }); }
+    return { view: v, coin: c, why_on_shortlist: seen.length ? 'It was among the biggest 7-day movers in its universe (or held, or on its watch list) in the runs below.' : 'Not on the shortlist in the last ' + lim + ' runs.',
+      shortlisted_in: seen, research: p.length ? { at: p[0].at, ok: !!p[0].gemini_ok, pack: agentJ(p[0].pack) } : null, decisions: d, shortlist_rule: AGENT_SHORTLIST_RULE };
+  }
+  if (v === 'requests') { const [rq] = await db.execute("SELECT id, title, detail, status, DATE_FORMAT(created_at, '%Y-%m-%d %H:%i') AS at FROM dev_log WHERE category = 'agent_request' ORDER BY id DESC LIMIT 30"); return { view: v, requests: rq }; }
+  if (v === 'reviews') { const [rv] = await db.execute("SELECT DATE_FORMAT(week_start, '%Y-%m-%d') AS week_start, DATE_FORMAT(at, '%Y-%m-%d %H:%i') AS at, review, stats, model FROM agent_reviews ORDER BY id DESC LIMIT 4"); return { view: v, reviews: rv.map(r => ({ ...r, stats: agentJ(r.stats) })) }; }
+  if (v === 'equity') { const [rows] = await db.execute("SELECT DATE_FORMAT(d, '%Y-%m-%d') AS d, equity_usd, cash_usd, bench_btc_usd, bench_basket_usd, model_cost_usd FROM agent_equity_daily ORDER BY d DESC LIMIT 90"); return { view: v, rows: rows.reverse() }; }
+  return { view: v, error: 'view must be status | runs | run | coin | requests | reviews | equity' };
+}
+
 async function pendingReservations() {
   const cycles = [];
   const [rows] = await db.execute('SELECT symbol, sale_proceeds_usd, sale_price, retrace_gate, uncovered_since, COALESCE(uncovered_abandon_hours, 48) AS uh FROM pump_armed_rules WHERE active = 1 AND sale_price IS NOT NULL AND sale_proceeds_usd > 0');
@@ -18479,6 +18532,21 @@ function createMcpServer() {
           all_coins: st ? st.pooled : null };   // #427 the all-coin comparison: pull8 / higher7 per shape and size band
         return { content: [{ type: 'text', text: JSON.stringify(result) }] };
       } catch (e) { return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: e.message }) }] }; }
+    }
+  );
+
+  // ── Tool: get_agent (#A3v - the paper budget agent, read-only) ──
+  server.tool('get_agent',
+    'The paper budget agent ($1,000, decides with Sonnet every 4 h). Read-only - never trades. view: status (equity, cash, positions, rails, benchmarks, how it picks coins) | runs (the last few runs: what it decided and why, cost, and every shortlisted coin with its 7-day move, shape, lean, 72 h high distance, RSI 4h and research state) | run (one run in full: everything the model saw; run_id optional = latest) | coin (why a coin was on its shortlist, the research it read, its decisions on it) | requests (what it has asked the Dev for) | reviews (its Sunday self-reviews) | equity (daily equity vs cash / BTC / its basket). Use it to answer Bryan\'s questions about the agent.',
+    {
+      view: z.enum(['status', 'runs', 'run', 'coin', 'requests', 'reviews', 'equity']).optional().describe('Default status'),
+      run_id: z.string().optional().describe('For view run'),
+      coin: z.string().optional().describe('For view coin, e.g. GRT'),
+      limit: z.number().optional().describe('Runs to return / scan (1-20, default 6)'),
+    },
+    async (args = {}) => {
+      try { return { content: [{ type: 'text', text: JSON.stringify(await agentMcpView(args)) }] }; }
+      catch (e) { return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: e.message }) }] }; }
     }
   );
 
