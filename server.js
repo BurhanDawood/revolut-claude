@@ -7525,7 +7525,7 @@ async function agentUniverseFilter(led) {
 }
 // SCREEN (code, no model): every USD pair on Revolut X, minus stablecoins, wide spreads and anything outside the universe;
 // ranked by the size of its 7-day move; the top `shortlist` plus everything the agent holds get hourly candles, shape and lean.
-async function agentScreen(cfg, led) {
+async function agentScreen(cfg, led, watch = []) {   // #A2d watch = the coins it asked to watch last run
   const tick = await revolutTickerMap(0);
   const held = Object.entries(led.positions).filter(([, p]) => Number(p && p.qty) > 0).map(([c]) => c);
   const inUniverse = await agentUniverseFilter(led);
@@ -7573,6 +7573,7 @@ async function agentScreen(cfg, led) {
   }
   const ranked = rowsOut.filter(r => !r.held).sort((a, b) => Math.abs(b.ch7 || 0) - Math.abs(a.ch7 || 0));
   const shortlist = ranked.slice(0, cfg.shortlist).concat(rowsOut.filter(r => r.held));
+  for (const w of watch) { const r = rowsOut.find(x => x.coin === String(w).toUpperCase()); if (r && !shortlist.includes(r)) { r.watched = true; shortlist.push(r); } else if (r) r.watched = true; }   // #A2d before the hourly pass: shape, indicators, ranges
   const stats = await moveShapeStats().catch(() => null);
   for (const r of shortlist) {   // hourly candles (10 days) -> the move's shape, the lean, the standard indicators
     try {
@@ -7596,7 +7597,7 @@ async function agentScreen(cfg, led) {
 // string, a stray token after an array element). Repair the two common faults; anything else is "no JSON" -> the plain JSON-mode call.
 function agentLooseJson(s) {
   try { return JSON.parse(s); } catch (e1) { /* repair below */ }
-  const t = String(s).replace(/[\u0000-\u001F]+/g, ' ').replace(/,\s*([}\]])/g, '$1');
+  const t = String(s).replace(/[\u0000-\u001F]+/g, ' ').replace(/\[\s*(?:cite:?\s*)?\d+(?:\s*,\s*\d+)*\s*\]/gi, '').replace(/,\s*([}\]])/g, '$1');   // #A2d + citation markers ([2], [cite: 1, 3]) that grounding inserts between elements
   try { return JSON.parse(t); } catch (e2) { throw new Error('Gemini returned no JSON (' + String(e2.message).slice(0, 90) + ')'); }
 }
 // Gemini research note with Google Search grounding; plain Gemini (no search) if the grounded call is refused. Cached per coin.
@@ -7728,18 +7729,18 @@ async function runAgent(trigger = 'scheduled') {
     led = await agentRollDay(led, eq.equity);
     if (eq.equity > (led.high_water_usd || 0)) await db.execute('UPDATE agent_ledger SET high_water_usd = ? WHERE id = 1 AND high_water_usd < ?', [Number(eq.equity.toFixed(6)), Number(eq.equity.toFixed(6))]);
     const costs = { research: 0, model: 0 };
-    const scr = await agentScreen(cfg, led);
-    // what the agent asked to look at last run joins the shortlist
+    // what the agent asked to look at last run joins the shortlist - read BEFORE the screen so those coins get the full hourly pass
+    // and research priority (#A2d: live 25 Sep, IMX was added after the screen and reached the model with no shape, RSI or research)
     const [ln] = await db.execute("SELECT notes_for_self, inputs FROM agent_decisions WHERE notes_for_self IS NOT NULL ORDER BY id DESC LIMIT 1").catch(() => [[]]);
     let watch = [];
-    try { const inp = ln.length && ln[0].inputs ? (typeof ln[0].inputs === 'string' ? JSON.parse(ln[0].inputs) : ln[0].inputs) : null; watch = (inp && inp.watch_next) || []; } catch (e) { watch = []; }
-    for (const w of watch) { const r = scr.all.find(x => x.coin === w); if (r && !scr.shortlist.includes(r)) scr.shortlist.push(r); }
+    try { const inp = ln.length && ln[0].inputs ? (typeof ln[0].inputs === 'string' ? JSON.parse(ln[0].inputs) : ln[0].inputs) : null; watch = (inp && Array.isArray(inp.watch_next) ? inp.watch_next : []).slice(0, 5); } catch (e) { watch = []; }
+    const scr = await agentScreen(cfg, led, watch);
     // mentions (videos + headlines) and research for the shortlist
     let headlines = [];
     try { headlines = (await fetchNewsHeadlines(72, 15, 150)).items || []; } catch (e) { headlines = []; }
     const frozenNow = !!(led.frozen_until && new Date(led.frozen_until).getTime() > Date.now());   // (Fable A2 note) frozen = no buys, so research only what it holds
     const toResearch = frozenNow ? scr.shortlist.filter(r => r.held)
-      : scr.shortlist.filter(r => r.held).concat(scr.shortlist.filter(r => !r.held)).slice(0, Math.max(cfg.research_per_run, scr.shortlist.filter(r => r.held).length));
+      : scr.shortlist.filter(r => r.held).concat(scr.shortlist.filter(r => !r.held && r.watched), scr.shortlist.filter(r => !r.held && !r.watched)).slice(0, Math.max(cfg.research_per_run, scr.shortlist.filter(r => r.held || r.watched).length));   // #A2d held, then watched, then the rest
     for (const r of scr.shortlist) {
       const hit = coinMentionTest(r.coin);
       let vids = []; try { vids = await videoMoments(r.coin, { days: 3, find: false, limit: 3 }); } catch (e) { vids = []; }
