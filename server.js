@@ -1507,6 +1507,8 @@ await safeAddColumn('trading_journal',  'updated_at',      'TIMESTAMP DEFAULT CU
 await safeAddColumn('trading_journal',  'realised_pnl_usd', 'DECIMAL(20,8) NULL');
 await safeAddColumn('trading_journal',  'venue_tx_id',     'VARCHAR(64) NULL UNIQUE');
 await safeAddColumn('trading_journal',  'reason_tag',      'VARCHAR(24) NULL');   // #L0 structured why (NULL = untagged, never reconstructed)
+await safeAddColumn('trading_journal',  'fill_at',    'DATETIME NULL');   // #R1 the venue's fill time; created_at keeps meaning "when the system saw it"
+setTimeout(() => { backfillR1().catch(e => console.error('[R1] backfill failed:', e.message)); }, 90 * 1000);   // #R1 one-time, guarded
 await safeAddColumn('trading_journal',  'tool_key',   'VARCHAR(60) NULL');    // #L1 which catalogue tool wrote this row
 await safeAddColumn('trading_journal',  'cycle_id',   'VARCHAR(40) NULL');    // #L1 <COIN>:<armed_since> shared by a loop's sell and its buy-back
 await safeAddColumn('trading_journal',  'regime_tag', 'VARCHAR(12) NULL');    // #L1 quiet|elevated|hot|unknown at trade time
@@ -10900,6 +10902,74 @@ async function findMatchingIntention(symbol, action) {
   }
 }
 
+// #R1 (Fable 25 Sep) THE VENUE'S FILL FOR A DETECTED BALANCE CHANGE. The detector sees a balance change up to 5 min (or a deploy
+// gap) after the trade, so its rows were stamped late. One /transactions read finds the fill: a single unclaimed fill of the
+// same coin and side within 0.5% of the quantity (its id is claimed as venue_tx_id), or else the most recent fills whose sum
+// makes up the change (several fills seen as one balance change: the time of the last one, no id claimed). Null = not found;
+// the caller never blocks on it.
+async function findDetectedFill(coin, side, qty, fromMs, toMs) {
+  if (!coin || !(qty > 0) || !['buy', 'sell'].includes(side)) return null;
+  const qs = new URLSearchParams({ start_date: String(Math.floor(fromMs)), end_date: String(Math.floor(toMs)), limit: '100' });
+  const page = await revolutRequest('GET', '/transactions?' + qs.toString());
+  const rows = Array.isArray(page) ? page : (page && (page.data || page.items)) || [];
+  const cands = [];
+  for (const t of rows) {
+    if (!t || t.type !== side || (t.status && t.status !== 'completed')) continue;
+    const leg = side === 'buy' ? t.destination : t.source;
+    if (!leg || String(leg.currency || '').toUpperCase() !== coin) continue;
+    const amt = parseFloat(leg.amount), v = t.processed_date || t.created_date;
+    const at = typeof v === 'number' ? v : Date.parse(v);
+    if (amt > 0 && at > 0 && t.id) cands.push({ id: String(t.id), amt, at });
+  }
+  if (!cands.length) return null;
+  const [cl] = await db.execute('SELECT venue_tx_id FROM trading_journal WHERE venue_tx_id IN (' + cands.map(() => '?').join(',') + ')', cands.map(c => c.id));
+  const claimed = new Set(cl.map(r => String(r.venue_tx_id)));
+  const free = cands.filter(c => !claimed.has(c.id)).sort((a, b) => b.at - a.at);
+  const one = free.find(c => Math.abs(c.amt - qty) <= qty * 0.005);
+  if (one) return { at: new Date(one.at), tx_id: one.id, fills: 1 };
+  let sum = 0;
+  for (let k = 0; k < free.length; k++) {
+    sum += free[k].amt;
+    if (Math.abs(sum - qty) <= qty * 0.005) return { at: new Date(free[0].at), tx_id: null, fills: k + 1, tx_ids: free.slice(0, k + 1).map(c => c.id) };
+    if (sum > qty * 1.005) break;
+  }
+  return null;
+}
+async function stampDetectedFill(journalId, vf) {
+  try { await db.execute('UPDATE trading_journal SET fill_at = ?, venue_tx_id = COALESCE(venue_tx_id, ?) WHERE id = ?', [vf.at, vf.tx_id || null, journalId]); }
+  catch (e) { await db.execute('UPDATE trading_journal SET fill_at = ? WHERE id = ?', [vf.at, journalId]).catch(() => {}); }   // the id is claimed elsewhere (UNIQUE): keep the time only
+}
+// #R1 (c) one-time backfill (guarded by system_config 'r1_backfill_done'): fill times for the 25 Sep 17:37-17:42 detector rows
+// 3465-3469, and the JTO buy the old dedupe dropped - 70.55529 + 1.74726 JTO for $38.00 + $0.94 at 17:38:38 / 17:39:40 UTC.
+// Its tranche and entry price come from the venue in the 02:40 ledger re-sync; this restores the journal row and the tax lot.
+async function backfillR1() {
+  const [done] = await db.execute("SELECT 1 FROM system_config WHERE config_key = 'r1_backfill_done'");
+  if (done.length) return null;
+  const out = { stamped: [], missed: [], jto: null };
+  const [rows] = await db.execute("SELECT id, symbol, action, quantity, created_at FROM trading_journal WHERE id BETWEEN 3465 AND 3469 AND fill_at IS NULL AND action IN ('buy', 'sell')");
+  for (const r of rows) {
+    const t = new Date(r.created_at).getTime();
+    const vf = await findDetectedFill(String(r.symbol).toUpperCase(), r.action, Number(r.quantity), t - 30 * 60000, t + 60000).catch(() => null);
+    if (vf) { await stampDetectedFill(r.id, vf); out.stamped.push(r.id); } else out.missed.push(r.id);
+  }
+  const JTO_TX = ['6ab6b19e-2ced-a6bc-83ec-34ebce136a98', '6ab6b1dc-7941-abc2-816b-bee05cde174f'];
+  const [ex] = await db.execute("SELECT id FROM trading_journal WHERE (symbol = 'JTO' AND action = 'buy' AND ABS(quantity - 72.30255) < 0.72 AND created_at > DATE_SUB(NOW(), INTERVAL 30 DAY)) OR venue_tx_id IN (?, ?) OR reasoning LIKE '%#R1 backfill%' LIMIT 1", JTO_TX);
+  if (!ex.length) {
+    const qty = 72.30255, usd = 38.94, px = usd / qty, fillAt = new Date(Date.UTC(2026, 8, 25, 17, 39, 40, 563));
+    const [ins] = await db.execute("INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source, tool_key, fill_at) VALUES ('JTO', 'buy', ?, ?, ?, ?, 'neutral', 'auto_detected', 'manual', ?)",
+      [Number(px.toFixed(10)), qty, usd, '#R1 backfill: two app-side buys (venue ' + JTO_TX.join(', ') + ') seen as one balance change at 17:42 UTC on 25 Sep and dropped by the old dedupe', fillAt]);
+    await db.execute('INSERT IGNORE INTO coin_cash_flows (symbol, flow_type, cash_amount, token_quantity, price, journal_id) VALUES (?, ?, ?, ?, ?, ?)', ['JTO', 'buy', usd, qty, px, ins.insertId]).catch(() => {});
+    await addTaxLot('JTO', 'revolut', qty, px, fillAt, ins.insertId, '#R1 backfill - buy dropped by the detector dedupe 25 Sep');
+    out.p0 = await recordManualDecision('JTO', 'buy', 'revolut', px, qty, 'manual_detected', { usd, journal_id: ins.insertId, order_id: JTO_TX[0] });   // #R1 (Fable) the P0 audit row every app-side trade gets; never throws
+    out.jto = ins.insertId;
+  } else out.jto = 'already present (id ' + ex[0].id + ')';
+  await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('r1_backfill_done', ?) ON DUPLICATE KEY UPDATE config_value = config_value", [JSON.stringify({ at: new Date().toISOString(), ...out })]);
+  console.log('[R1] backfill: ' + JSON.stringify(out));
+  await sendTelegram('🧾 Records fix (R1): fill times stamped on ' + out.stamped.length + ' of today\'s detected trades' + (out.missed.length ? ' (' + out.missed.length + ' not matched)' : '') +
+    (typeof out.jto === 'number' ? '; the missed JTO buy (72.30 JTO, $38.94, 18:39) is now in the journal and the tax lots.' : '.') + ' The JTO position and average cost are re-synced from Revolut X at 02:40.').catch(() => {});
+  return out;
+}
+
 async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
   try {
     const coinBase = symbol.replace('-USD', '');
@@ -10916,8 +10986,8 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
 
     // Debounce: if same symbol detected within 10 minutes, skip
     const existing = pendingTradeContext.get(symbol);
-    if (existing && (Date.now() - existing.detectedAt) < 10 * 60 * 1000) {
-      console.log(`Trade detection debounced for ${symbol} (within 10 min window)`);
+    if (existing && (Date.now() - existing.detectedAt) < 10 * 60 * 1000 && existing.action === action && Math.abs(Number(existing.qty) - absQty) <= absQty * 0.02) {   // #R1 the same change seen again - a second, different trade within 10 min is logged
+      console.log(`Trade detection debounced for ${symbol} (same ${action} of ${absQty} within 10 min)`);
       return;
     }
 
@@ -10943,8 +11013,10 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
          AND action = ?
          AND ABS(CAST(price AS DECIMAL(20,10)) - ?) < (? * 0.01 + 0.000001)
          AND created_at > DATE_SUB(NOW(), INTERVAL 10 MINUTE)
-         LIMIT 1`,
-        [coinBase, action, price, price]
+         AND (source IS NULL OR source <> 'auto_detected')
+         AND (ABS(quantity - ?) <= ? * 0.02 OR ABS(value_usd - ?) <= ? * 0.02)
+         LIMIT 1`,   // #R1 the same trade only: an approved row (possibly an estimated qty - hence value too), never an earlier detected change
+        [coinBase, action, price, price, absQty, absQty, valueUsd, valueUsd]
       );
       if (intentionLog.length > 0) {
         console.log(`[autoLog] ${coinBase} already logged by intention match (id=${intentionLog[0].id}) — skipping`);
@@ -11040,6 +11112,11 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
       [coinBase, action, price, absQty, valueUsd, reasoning, 'pending', claudeRec, await regimeTagFor(coinBase)]
     );
     const journalId = result.insertId;
+    let fillAt = null;   // #R1 the venue's fill time (null when not found - never blocks the record)
+    if (action === 'buy' || action === 'sell') {
+      try { const vf = await findDetectedFill(coinBase, action, absQty, Date.now() - 30 * 60000, Date.now() + 60000); if (vf) { fillAt = vf.at; await stampDetectedFill(journalId, vf); } }
+      catch (e) { console.error('[autoLog] #R1 fill lookup failed (row kept, fill_at empty):', e.message); }
+    }
     if ((action === 'buy' || action === 'sell') && !staleClaudeMcpRowId) await recordManualDecision(symbol, action, 'revolut', price, absQty, 'manual_detected', { journal_id: journalId });   // #P0 (PM P0-e) app-side trade, observed not approved; audit only, never throws. #411 not when superseding a #20 claude_mcp/auto_rule/ai_auto row: that trade was approved (has its manual_approved row) or autonomous, never manual
     // #20: remove stale claude_mcp row superseded by actual fill at different price
     if (staleClaudeMcpRowId) {
@@ -11070,12 +11147,12 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
     if (action === 'buy') {
       await addTaxLot(
         symbol.replace('-USD', ''), 'revolut', absQty, price,
-        new Date(), journalId, 'Buy detected via auto-log'
+        fillAt || new Date(), journalId, 'Buy detected via auto-log'   // #R1 the lot is dated at the fill
       );
     }
     if (action === 'sell') {
       const disposals = await disposeTaxLotsHIFO(
-        symbol.replace('-USD', ''), absQty, price, new Date(), journalId
+        symbol.replace('-USD', ''), absQty, price, fillAt || new Date(), journalId   // #R1
       );
       if (disposals.length > 0) {
         const totalGL = disposals.reduce((s, d) => s + d.gain_loss_usd, 0);
@@ -11283,8 +11360,8 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
       // summing lots, not stored per-row). Non-fatal on error, mirrors the other paths.
       if (price > 0 && absQty > 0) {
         await db.execute(
-          "INSERT INTO position_tranches (symbol, exchange, quantity, entry_price, entry_date, remaining_quantity, is_legacy, notes) VALUES (?, ?, ?, ?, NOW(), ?, 0, ?)",
-          [coinBase, (KRAKEN_MONITORED_COINS.includes(symbol) ? 'kraken' : 'revolut'), absQty, price, absQty, 'Auto-detected buy (#221) - journal ' + journalId]
+          "INSERT INTO position_tranches (symbol, exchange, quantity, entry_price, entry_date, remaining_quantity, is_legacy, notes) VALUES (?, ?, ?, ?, COALESCE(?, NOW()), ?, 0, ?)",   // #R1 dated at the fill when the venue lookup found it
+          [coinBase, (KRAKEN_MONITORED_COINS.includes(symbol) ? 'kraken' : 'revolut'), absQty, price, fillAt, absQty, 'Auto-detected buy (#221) - journal ' + journalId]
         ).catch(e => console.error('[tranches] #221 autoLogTrade insert failed:', e.message));
       }
     }
@@ -11419,7 +11496,7 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
           'UPDATE trading_journal SET reasoning = ?, emotion = ? WHERE id = ? AND reasoning = ?',
           ['no reason provided', 'neutral', journalId, 'auto-detected']
         );
-        pendingTradeContext.delete(symbol);
+        if (!pendingTradeContext.has(symbol) || pendingTradeContext.get(symbol).journalId === journalId) pendingTradeContext.delete(symbol);   // #R1 only its own context
         await sendTelegram(`⏰ <b>${symbol}</b> trade auto-logged without context.`);
         await updateLearningModel().catch(() => {});
       } catch (e) { /* ignore */ }
