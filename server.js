@@ -15997,15 +15997,16 @@ function moveShapeLean(shape, gain, stats, coin) {
   const basis = own && own.n >= MOVE_SHAPE_MIN_N ? Object.assign({ from: coin }, own) : pooled ? Object.assign({ from: 'all coins' }, pooled) : null;
   const size = band === 'ge20' ? 'rises of 20%+' : 'rises of 10-20%';
   const hist = basis ? ' In the past (' + basis.from + ', ' + size + ', ' + basis.n + ' like this): ' + basis.pull8 + '% pulled back 8%+ within a week, ' + basis.higher7 + '% were higher a week later.' : ' No history to check this against yet.';
-  if (shape === 'ROCKET') {
-    if (basis && basis.pull8 >= 60) return { lean: 'sell_buyback', text: 'Sell-and-buy-back favoured - a spike like this usually gives some back.' + hist, basis };
-    return { lean: 'unclear', text: 'Spike, but this has not reliably pulled back before - no clear lean.' + hist, basis };
-  }
-  if (shape === 'STEADY') {
-    if (basis && basis.higher7 >= 50) return { lean: 'hold', text: 'Hold favoured - steady climbs like this were more often still higher a week later; a sell risks buying back higher.' + hist, basis };
-    return { lean: 'unclear', text: 'Steady climb, but these have not reliably kept going here - no clear lean.' + hist, basis };
-  }
-  return { lean: 'unclear', text: 'Mixed shape - neither a clean spike nor a steady climb; no clear lean.' + hist, basis };
+  if (shape === 'ROCKET' && basis && basis.pull8 >= 60) return { lean: 'sell_buyback', text: 'Sell-and-buy-back favoured - a spike like this usually gives some back.' + hist, basis };
+  if (shape === 'STEADY' && basis && basis.higher7 >= 50) return { lean: 'hold', text: 'Hold favoured - steady climbs like this were more often still higher a week later; a sell risks buying back higher.' + hist, basis };
+  // #427 (Bryan 25 Sep): strong history sets the lean even when the shape itself is not clear-cut
+  const word = shape === 'ROCKET' ? 'spikes' : shape === 'STEADY' ? 'steady climbs' : 'mixed rises';
+  const of = (pct) => Math.round(pct * basis.n / 100) + ' of ' + (basis.from === 'all coins' ? basis.n + ' ' : 'its last ' + basis.n + ' ') + word;
+  if (basis && basis.n >= MOVE_SHAPE_MIN_N && basis.pull8 >= 75) return { lean: 'sell_buyback', text: 'Likely to give some back - ' + (basis.from === 'all coins' ? 'across all coins, ' : basis.from + ': ') + of(basis.pull8) + ' this size pulled back 8%+ within a week.' + hist, basis };
+  if (basis && basis.n >= MOVE_SHAPE_MIN_N && basis.higher7 >= 60 && basis.pull8 <= 50) return { lean: 'hold', text: 'Tends to keep going - ' + (basis.from === 'all coins' ? 'across all coins, ' : basis.from + ': ') + of(basis.higher7) + ' this size were higher a week later.' + hist, basis };
+  if (shape === 'ROCKET') return { lean: 'unclear', text: 'Spike, but this has not reliably pulled back before - no clear lean.' + hist, basis };
+  if (shape === 'STEADY') return { lean: 'unclear', text: 'Steady climb, but these have not reliably kept going here - no clear lean.' + hist, basis };
+  return { lean: 'unclear', text: 'Mixed shape - neither a clean spike nor a steady climb, and its history is split; no clear lean.' + hist, basis };
 }
 // what the analyst videos (Gemini notes) and the news headlines said about the coin
 function coinMentionTest(coin) {
@@ -17305,7 +17306,9 @@ function createMcpServer() {
         }
         result.track_record = await moveShapeTrackRecord().catch(() => []);
         const st = await moveShapeStats();
-        result.method = { min_rise_pct: MOVE_SHAPE_MIN_RISE, rocket: 'best 3 hours >= 75% of the rise, or >= 55% with a 15%+ dip on the way', steady: 'best 3 hours <= 55% and no dip deeper than 12%', history_events: st ? st.events : null, history_as_of: st ? st.at : null };
+        result.method = { min_rise_pct: MOVE_SHAPE_MIN_RISE, rocket: 'best 3 hours >= 75% of the rise, or >= 55% with a 15%+ dip on the way', steady: 'best 3 hours <= 55% and no dip deeper than 12%', history_events: st ? st.events : null, history_as_of: st ? st.at : null,
+          lean_rules: 'ROCKET + 60%+ pulled back -> sell/buy-back; STEADY + 50%+ higher a week later -> hold; any shape with 75%+ pulled back -> sell/buy-back; any shape with 60%+ higher and <=50% pulled back -> hold; else no clear lean. History = this coin when it has 5+ same-shape rises in the size band (10-20% / 20%+), else all coins.',
+          all_coins: st ? st.pooled : null };   // #427 the all-coin comparison: pull8 / higher7 per shape and size band
         return { content: [{ type: 'text', text: JSON.stringify(result) }] };
       } catch (e) { return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: e.message }) }] }; }
     }
