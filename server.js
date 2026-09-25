@@ -9387,7 +9387,7 @@ FORMAT (exactly this layout)
 - [third]
 
 🎥 ANALYST VIDEOS:
-- [up to three lines: which analyst said what about Bryan's coins or the market, from the video notes above, each ending with that video's tag, e.g. [v2]; write "No new analyst videos." if there are none]
+- [up to three lines: which analyst said what about Bryan's coins or the market, from the video notes above, each ending with that video's tag, e.g. [v2]; when the notes give a time like [12:34] for the point you describe, put it in the tag: [v2 12:34]; write "No new analyst videos." if there are none]
 
 👀 WATCH TODAY:
 1. [a level, event or coin to watch, from the data above]
@@ -9685,7 +9685,12 @@ async function sendMorningBriefing() {
         alerts: alertsToWatch.length ? alertsToWatch.join('; ') : 'none', moves: movesTxt
       });
       console.log('[brief] #416 Gemini ok: model ' + gb.model + ', ' + gb.headlines + ' headlines, search ' + (gb.search ? 'on' : 'off') + (gb.feedsFailed.length ? ', feeds down: ' + gb.feedsFailed.join(', ') : ''));
-      msg2 = formatBriefForTelegram(gb.text).replace(/ ?\[v(\d{1,2})\]/g, (m, n) => { const v = briefVideos[Number(n) - 1]; return v && v.url ? ' <a href="' + escTg(videoLinkAt(v.url, null)) + '">▶</a>' : ''; }) + (gb.feedsFailed.length ? '\n\n(News feeds unreachable today: ' + escTg(gb.feedsFailed.join(', ')) + ')' : '') + videoStatus + BRIEF_PM_NUDGE;
+      // #430 [v2 12:34] -> a link that starts at that point; the time is used only if that video's notes contain it (never an invented time)
+      msg2 = formatBriefForTelegram(gb.text).replace(/ ?\[v(\d{1,2})(?:[ @,]+(\d{1,2}:\d{2}(?::\d{2})?))?\]/g, (m, n, ts) => {
+        const v = briefVideos[Number(n) - 1]; if (!v || !v.url) return '';
+        const secs = ts && String(v.transcript || '').includes('[' + ts + ']') ? tsToSecs(ts) : null;
+        return ' <a href="' + escTg(videoLinkAt(v.url, secs)) + '">' + (secs != null ? '▶ ' + ts : '▶') + '</a>';
+      }) + (gb.feedsFailed.length ? '\n\n(News feeds unreachable today: ' + escTg(gb.feedsFailed.join(', ')) + ')' : '') + videoStatus + BRIEF_PM_NUDGE;
     } catch (ge) {
       console.error('[brief] #416 market section DEGRADED:', ge && ge.message);
       const wh = holdings.filter(h => h.overnightChange !== null);
@@ -15552,7 +15557,7 @@ const VIDEO_NOTES_PROMPT = `You are taking notes on a crypto analyst's YouTube v
 Write factual notes on what is SAID in the video. Plain text, no markdown, at most about 900 words:
 1. SUMMARY: one line - the video's main message.
 2. COINS: every coin or token discussed, one line each, starting with its full project name, ticker and the time in the video where the presenter starts on it, like "- Aster (ASTER) [12:34]:" - then what was said, any price levels, targets, supports or invalidation levels, the stance (bullish / bearish / neutral) and the timeframe. Give the ticker the project really uses; if you are not sure of it, say so.
-3. MARKET: views on BTC, the overall market, macro, rates, ETF flows, regulation.
+3. MARKET: views on BTC, the overall market, macro, rates, ETF flows, regulation - one point per line, each starting with the time in the video where it is said, like "- [8:15] BTC rejected 86,200...".
 4. METHODS: any repeatable trading method or rule the presenter describes (entry, exit, sizing criteria), stated precisely.
 5. SPONSOR: note any sponsored segment or promotion in one line.
 Do not add your own opinions. Do not invent numbers. If something is unclear, say it is unclear.`;
@@ -15680,7 +15685,7 @@ async function geminiVideoTranscript(videoId) {
   const key = process.env.GEMINI_API_KEY;
   if (!key) throw new Error('GEMINI_API_KEY is not set on Railway');
   const model = String(process.env.GEMINI_VIDEO_MODEL || process.env.GEMINI_MODEL || 'gemini-3.8-flash').trim().replace(/^models\//, '');
-  const body = { contents: [{ role: 'user', parts: [{ file_data: { file_uri: 'https://www.youtube.com/watch?v=' + videoId } }, { text: 'Transcribe the spoken audio of this video verbatim as plain text, in order, from start to finish. Output only the transcript - no summary, no commentary, no timestamps. Start a new paragraph when the speaker or topic changes.' }] }],
+  const body = { contents: [{ role: 'user', parts: [{ file_data: { file_uri: 'https://www.youtube.com/watch?v=' + videoId } }, { text: 'Transcribe the spoken audio of this video verbatim as plain text, in order, from start to finish. Output only the transcript - no summary, no commentary. Start a new paragraph when the speaker or topic changes, and begin every paragraph with its start time in the video as [m:ss] or [h:mm:ss].' }] }],
     generationConfig: { temperature: 0, maxOutputTokens: 32768 } };
   const ctl = new AbortController(); const to = setTimeout(() => ctl.abort(), 300000);
   let r, raw;
@@ -21675,7 +21680,7 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
   server.tool('manage_sources',
     'Content intelligence feed: manage YouTube channels and RSS news sources and fetch and read their analysed items. Monitors crypto analyst videos and news articles, pulls transcripts, and analyses each against saved coin strategies for thesis impact. Actions: add (add a YouTube or RSS source with coin tags), list (list all sources), remove (deactivate a source), fetch_now (fetch and analyse latest videos/articles now), get_items (read analysed content items, filter by coin). Use for morning brief content review, checking what analysts and news say about held coins, source feed management, and in-chat research.',
     {
-      action:      z.enum(['add','list','remove','fetch_now','get_items','scan_videos','scan_status','get_notes','transcribe','watch','update','mentions']).describe('mentions (#429): which videos mentioned coin_filter in the last since_days (default 7), each with link = a URL that starts where the coin is discussed (time from the video notes, or found by Gemini unless find_moments is false - up to 3 per call, cached); named_as = the project name the video uses when it is not the ticker (e.g. Aster for AST) - tickers collide, so check it is the same project; add: add source; list: list all; remove: deactivate; update (#423): change source_id\'s coin_tags and/or name, keeping its items (future analyses use the new tags); fetch_now: fetch new items now (waits - slow for YouTube, prefer scan_videos); get_items: retrieve analysed items; scan_videos (#419): Gemini watches new videos from every YouTube source (or source_id) IN THE BACKGROUND - returns at once, poll scan_status; scan_status: progress + the videos stored by the last scan with a one-line summary each; get_notes: Gemini\'s full notes + the analysis for item_id; transcribe: Gemini\'s VERBATIM transcript of item_id or video_url (slow, up to ~5 min; stored on the item); watch (#420): Gemini watches ANY public YouTube video_url (or item_id) - notes + analysis against the plans of the coins it mentions, saved as a feed item (under "Bryan\'s links" if new); ~30-90 s; already watched -> cached (refresh: true to re-watch)'),
+      action:      z.enum(['add','list','remove','fetch_now','get_items','scan_videos','scan_status','get_notes','transcribe','watch','update','mentions','find_moment']).describe('find_moment (#430): the time in video_url (or item_id) where topic starts - any free text, e.g. "the Aster setup" or "BTC support at 82,915" - found by Gemini (~30-90 s), returned with link = a URL that starts there; give Bryan that link whenever you point him to a moment. Video notes and transcripts also carry [m:ss] times; get_notes returns them as timed_points with ready links; mentions (#429): which videos mentioned coin_filter in the last since_days (default 7), each with link = a URL that starts where the coin is discussed (time from the video notes, or found by Gemini unless find_moments is false - up to 3 per call, cached); named_as = the project name the video uses when it is not the ticker (e.g. Aster for AST) - tickers collide, so check it is the same project; add: add source; list: list all; remove: deactivate; update (#423): change source_id\'s coin_tags and/or name, keeping its items (future analyses use the new tags); fetch_now: fetch new items now (waits - slow for YouTube, prefer scan_videos); get_items: retrieve analysed items; scan_videos (#419): Gemini watches new videos from every YouTube source (or source_id) IN THE BACKGROUND - returns at once, poll scan_status; scan_status: progress + the videos stored by the last scan with a one-line summary each; get_notes: Gemini\'s full notes + the analysis for item_id; transcribe: Gemini\'s VERBATIM transcript of item_id or video_url (slow, up to ~5 min; stored on the item); watch (#420): Gemini watches ANY public YouTube video_url (or item_id) - notes + analysis against the plans of the coins it mentions, saved as a feed item (under "Bryan\'s links" if new); ~30-90 s; already watched -> cached (refresh: true to re-watch)'),
       source_id:   z.coerce.number().optional().describe('source id for remove/fetch_now/get_items'),
       name:        z.string().optional().describe('add: display name e.g. CoinBureau'),
       type:        z.enum(['youtube','rss']).optional().describe('add: source type'),
@@ -21689,8 +21694,9 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
       include_notes: z.preprocess(v => (v === 'true' ? true : v === 'false' ? false : v), z.boolean()).optional().describe('get_items: also return each item\'s notes/text (capped at 4000 chars)'),
       refresh:     z.preprocess(v => (v === 'true' ? true : v === 'false' ? false : v), z.boolean()).optional().describe('watch: re-watch even if already watched'),
       find_moments: z.preprocess(v => (v === 'true' ? true : v === 'false' ? false : v), z.boolean()).optional().describe('mentions (#429): ask Gemini for the start time when the notes have none (default true; slower)'),
+      topic:       z.string().optional().describe('find_moment (#430): what to find in the video, in plain words'),
     },
-    async ({ action, source_id, name, type, url, coin_tags, coin_filter, limit, since_days, item_id, video_url, include_notes, refresh, find_moments }) => {
+    async ({ action, source_id, name, type, url, coin_tags, coin_filter, limit, since_days, item_id, video_url, include_notes, refresh, find_moments, topic }) => {
       let result = {};
       if (action === 'add') {
         let channelId = null;
@@ -21736,9 +21742,25 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
         const vids = s && s.startedDb ? await videosSince(s.startedDb) : [];
         result = { ok: true, action: 'scan_status', running: videoScanInProgress, last_scan: s ? { trigger: s.trigger, started: new Date(s.started || s.at).toISOString(), finished: s.running ? null : new Date(s.at).toISOString(), sources_done: s.sources_done, sources_total: s.sources_total, errors: s.errors } : null,
           note: s ? undefined : 'no scan since the last restart', videos: vids };
+      } else if (action === 'find_moment') {   // #430 a link to any point in a video, for the PM to hand Bryan
+        let vid = null;
+        if (item_id) { const [fr] = await db.execute('SELECT url FROM feed_items WHERE id = ?', [item_id]); vid = fr.length ? youtubeIdFromUrl(fr[0].url) : null; }
+        else vid = youtubeIdFromUrl(video_url);
+        if (!vid) result = { ok: false, action: 'find_moment', error: item_id ? 'no YouTube video for item ' + item_id : 'give item_id or video_url' };
+        else if (!topic || !String(topic).trim()) result = { ok: false, action: 'find_moment', error: 'give topic - what to find, in plain words' };
+        else {
+          try { const secs = await geminiFindMoment(vid, String(topic).slice(0, 200)); result = { ok: true, action: 'find_moment', topic, found: secs != null, starts_at: secs != null ? fmtTs(secs) : null, link: videoLinkAt('https://www.youtube.com/watch?v=' + vid, secs), note: secs != null ? 'Link starts 5 s before the moment. Times from Gemini can be a few seconds out.' : 'Gemini did not find it in the video - link starts at the beginning.' }; }
+          catch (e) { result = { ok: false, action: 'find_moment', error: e.message }; }
+        }
       } else if (action === 'get_notes') {
         const [rows] = await db.execute('SELECT fi.id, sf.name source_name, fi.title, fi.url, fi.published_at, fi.transcript AS notes, fi.analysis, fi.thesis_status, (fi.full_transcript IS NOT NULL) AS has_full_transcript FROM feed_items fi JOIN source_feeds sf ON sf.id = fi.source_id WHERE fi.id = ?', [item_id || 0]);
         result = rows.length ? { ok: true, action: 'get_notes', item: rows[0] } : { ok: false, action: 'get_notes', error: 'no feed item ' + item_id };
+        if (rows.length) {   // #430 every [m:ss] in the notes as a ready link
+          const tp = [];
+          for (const line of String(rows[0].notes || '').split('\n')) { const m = /\[(\d{1,2}:\d{2}(?::\d{2})?)\]/.exec(line); if (m && tp.length < 60) tp.push({ at: m[1], link: videoLinkAt(rows[0].url, tsToSecs(m[1])), text: line.trim().slice(0, 140) }); }
+          result.timed_points = tp;
+          if (!tp.length) result.timed_points_note = 'These notes have no times (made before 25 Sep). Use find_moment with a topic to get a link to a point.';
+        }
       } else if (action === 'watch') {   // #420
         let link = video_url;
         if (!link && item_id) { const [rows] = await db.execute('SELECT url FROM feed_items WHERE id = ?', [item_id]); link = rows[0] ? rows[0].url : null; }
