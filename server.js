@@ -1528,6 +1528,11 @@ await db.execute(`CREATE TABLE IF NOT EXISTS move_shape_log (
   UNIQUE KEY uq_msl (symbol, context, ref_key),
   INDEX idx_msl_fill (filled_at, at)
 )`).catch(e => console.error('[migration] move_shape_log:', e.message));
+await safeAddColumn('move_shape_log', 'rsi_1h', 'DECIMAL(5,1) NULL');          // #428 indicators at the time of the call
+await safeAddColumn('move_shape_log', 'rsi_4h', 'DECIMAL(5,1) NULL');
+await safeAddColumn('move_shape_log', 'rsi_1d', 'DECIMAL(5,1) NULL');
+await safeAddColumn('move_shape_log', 'vs_sma20_pct', 'DECIMAL(8,2) NULL');
+await safeAddColumn('move_shape_log', 'range30_pct', 'DECIMAL(5,1) NULL');
 await safeAddColumn('trailing_stops',   'auto_execute',    'TINYINT(1) NOT NULL DEFAULT 0'); // #93
 await safeAddColumn('price_targets',    'sell_pct',        'DECIMAL(5,2) NULL'); // #144 per-rung sell %% override for Away Mode up-targets
 await safeAddColumn('trailing_stops',   'sell_pct',        'DECIMAL(10,4) DEFAULT 25.0');   // #93
@@ -16028,10 +16033,40 @@ async function moveShapeNews(coin, hours = 72) {
   } catch (e) { out.errors.push('headlines: ' + e.message); }
   return out;
 }
+// #428 standard indicators from our own stored prices (no outside source): Wilder RSI(14) on 1 h / 4 h / daily closes,
+// distance from the 20- and 50-day averages, and where the price sits in its 30-day range. CONTEXT ONLY: in the 25 Sep
+// study (15 coins, ~700 rises) RSI alone did not predict pullbacks (1 h RSI 70-80: 52% pulled back vs 63% under 60),
+// so it is shown and logged, never used for the lean, until the scored log says otherwise.
+function rsiWilder(closes, n = 14) {
+  if (!closes || closes.length < n + 1) return null;
+  let g = 0, l = 0;
+  for (let i = 1; i <= n; i++) { const d = closes[i] - closes[i - 1]; if (d > 0) g += d; else l -= d; }
+  let ag = g / n, al = l / n;
+  for (let i = n + 1; i < closes.length; i++) { const d = closes[i] - closes[i - 1]; ag = (ag * (n - 1) + (d > 0 ? d : 0)) / n; al = (al * (n - 1) + (d < 0 ? -d : 0)) / n; }
+  if (al === 0) return ag === 0 ? 50 : 100;
+  return 100 - 100 / (1 + ag / al);
+}
+function bucketCloses(bars, ms) {   // last close in each time bucket, oldest first (the current bucket is the live price)
+  const out = []; let key = null;
+  for (const b of bars) { const k = Math.floor(b.t / ms); if (k === key) out[out.length - 1] = b.c; else { out.push(b.c); key = k; } }
+  return out;
+}
+function moveIndicators(bars) {
+  if (!bars || bars.length < 48) return null;
+  const px = bars[bars.length - 1].c, r1 = (x) => (x == null || !isFinite(x) ? null : Number(x.toFixed(1)));
+  const c1 = bars.map(b => b.c).slice(-250), c4 = bucketCloses(bars, 4 * 3600000).slice(-250), cd = bucketCloses(bars, 86400000);
+  const sma = (n) => (cd.length > n ? cd.slice(-n - 1, -1).reduce((a, b) => a + b, 0) / n : null);   // the n full days before today
+  const s20 = sma(20), s50 = sma(50);
+  const cut = bars[bars.length - 1].t - 30 * 86400000; let hi = -Infinity, lo = Infinity;
+  for (const b of bars) if (b.t >= cut) { if (b.h > hi) hi = b.h; if (b.l < lo) lo = b.l; }
+  return { rsi_1h: r1(rsiWilder(c1)), rsi_4h: r1(rsiWilder(c4)), rsi_1d: r1(rsiWilder(cd.slice(-90))),
+    vs_sma20_pct: s20 ? r1((px / s20 - 1) * 100) : null, vs_sma50_pct: s50 ? r1((px / s50 - 1) * 100) : null,
+    range30_pct: hi > lo ? r1((px - lo) / (hi - lo) * 100) : null };
+}
 async function moveShape(symbol, opts = {}) {
   const coin = String(symbol || '').toUpperCase().replace(/-USD$/, '').trim();
   if (!/^[A-Z0-9]{1,15}$/.test(coin)) return { ok: false, error: 'bad symbol' };
-  const bars = await loadHourlyBars(coin + '-USD', 40);
+  const bars = await loadHourlyBars(coin + '-USD', 90);   // #428 was 40: daily RSI and the 50-day average need more
   if (bars.length < 24 * 3) return { ok: false, coin, error: 'not enough price history (' + bars.length + ' hours)' };
   const f = moveShapeAt(bars, bars.length - 1, true);
   if (!f) return { ok: false, coin, error: 'could not read the move' };
@@ -16041,15 +16076,18 @@ async function moveShape(symbol, opts = {}) {
   const r = {
     ok: true, coin, shape, lean: lean.lean, advice: lean.text, basis: lean.basis,
     move: { price: f.price, gain_pct: Number(f.gain.toFixed(1)), from_low: f.low, low_at: f.low_at, hours: f.hours, best_3_hours_share_pct: Math.min(100, Math.round(f.conc * 100)), deepest_dip_on_the_way_pct: Number(f.dip.toFixed(1)), pace_vs_normal_x: f.pace_x },
-    history_as_of: stats ? stats.at : null, note: 'Advice only - nothing was changed. Loops and orders run exactly as set.'
+    history_as_of: stats ? stats.at : null, note: 'Advice only - nothing was changed. Loops and orders run exactly as set.',
+    indicators: moveIndicators(bars), indicators_note: 'Context only, not used for the lean: in testing on these coins RSI alone did not predict pullbacks. Logged with each call so the weekly scoring can show whether it adds anything.'
   };
   if (opts.news) r.news = await moveShapeNews(coin, 72);
   if (opts.log && shape !== 'NONE') await logMoveShape(r, opts.log.context, opts.log.ref).catch(() => {});
   return r;
 }
 async function logMoveShape(r, context, ref) {
-  const [res] = await db.execute('INSERT IGNORE INTO move_shape_log (symbol, context, ref_key, price, gain_pct, hours, shape, lean, conc, dip_pct, stats_n, stats_pull8, stats_higher7) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
-    [r.coin, context, String(ref).slice(0, 40), r.move.price, r.move.gain_pct, r.move.hours, r.shape, r.lean, r.move.best_3_hours_share_pct / 100, r.move.deepest_dip_on_the_way_pct, r.basis ? r.basis.n : null, r.basis ? r.basis.pull8 : null, r.basis ? r.basis.higher7 : null]);
+  const ind = r.indicators || {};   // #428
+  const [res] = await db.execute('INSERT IGNORE INTO move_shape_log (symbol, context, ref_key, price, gain_pct, hours, shape, lean, conc, dip_pct, stats_n, stats_pull8, stats_higher7, rsi_1h, rsi_4h, rsi_1d, vs_sma20_pct, range30_pct) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+    [r.coin, context, String(ref).slice(0, 40), r.move.price, r.move.gain_pct, r.move.hours, r.shape, r.lean, r.move.best_3_hours_share_pct / 100, r.move.deepest_dip_on_the_way_pct, r.basis ? r.basis.n : null, r.basis ? r.basis.pull8 : null, r.basis ? r.basis.higher7 : null,
+     ind.rsi_1h ?? null, ind.rsi_4h ?? null, ind.rsi_1d ?? null, ind.vs_sma20_pct ?? null, ind.range30_pct ?? null]);
   return res && res.affectedRows === 1;
 }
 // coins now >= MOVE_SHAPE_MIN_RISE% above their 7-day low (quick screen on the 2-min captures), biggest first
@@ -16060,7 +16098,13 @@ async function moveShapeMovers(limit = 8) {
 }
 async function moveShapeTrackRecord() {
   const [rows] = await db.execute('SELECT shape, COUNT(*) AS n, ROUND(AVG(out_pull8) * 100) AS pull8, ROUND(AVG(out_higher7) * 100) AS higher7 FROM move_shape_log WHERE filled_at IS NOT NULL GROUP BY shape');
-  return rows.map(r => ({ shape: r.shape, calls: Number(r.n), pulled_back_8pct: r.pull8 == null ? null : Number(r.pull8), higher_a_week_later: r.higher7 == null ? null : Number(r.higher7) }));
+  const out = rows.map(r => ({ shape: r.shape, calls: Number(r.n), pulled_back_8pct: r.pull8 == null ? null : Number(r.pull8), higher_a_week_later: r.higher7 == null ? null : Number(r.higher7) }));
+  // #428 does RSI add anything? the same scores split by 4 h RSI at the time of the call
+  try {
+    const [rr] = await db.execute("SELECT shape, IF(rsi_4h >= 70, '70+', 'under 70') AS rsi_4h, COUNT(*) AS n, ROUND(AVG(out_pull8) * 100) AS pull8, ROUND(AVG(out_higher7) * 100) AS higher7 FROM move_shape_log WHERE filled_at IS NOT NULL AND rsi_4h IS NOT NULL GROUP BY shape, IF(rsi_4h >= 70, '70+', 'under 70')");
+    for (const r of rr) out.push({ shape: r.shape, rsi_4h: r.rsi_4h, calls: Number(r.n), pulled_back_8pct: r.pull8 == null ? null : Number(r.pull8), higher_a_week_later: r.higher7 == null ? null : Number(r.higher7) });
+  } catch (e) { /* columns not there yet */ }
+  return out;
 }
 const MOVE_SHAPE_WORD = { ROCKET: 'rocket', STEADY: 'steady climb', MIXED: 'mixed', NONE: 'no big move' };
 const MOVE_SHAPE_LEAN_WORD = { sell_buyback: 'sell/buy-back', hold: 'hold', unclear: 'no clear lean', none: '' };
@@ -16072,6 +16116,15 @@ function formatMoveShape(r, heading) {
   else {
     s += '+' + m.gain_pct + '% from its 7-day low in ' + m.hours + ' h. The best 3 hours did ' + m.best_3_hours_share_pct + '% of it; deepest dip on the way ' + Math.abs(m.deepest_dip_on_the_way_pct) + '%' + (m.pace_vs_normal_x != null ? '; ' + m.pace_vs_normal_x + '× its normal pace' : '') + '.\n';
     s += '👉 ' + escTg(r.advice);
+  }
+  const ind = r.indicators;   // #428
+  if (ind) {
+    const bits = [];
+    const rs = [['1h', ind.rsi_1h], ['4h', ind.rsi_4h], ['1d', ind.rsi_1d]].filter(x => x[1] != null).map(x => x[0] + ' ' + Math.round(x[1]));
+    if (rs.length) bits.push('RSI ' + rs.join(' / '));
+    if (ind.vs_sma20_pct != null) bits.push(Math.abs(Math.round(ind.vs_sma20_pct)) + '% ' + (ind.vs_sma20_pct >= 0 ? 'above' : 'below') + ' its 20-day average');
+    if (ind.range30_pct != null) bits.push(Math.round(ind.range30_pct) + '% up its 30-day range');
+    if (bits.length) s += '\n📊 ' + bits.join(' · ') + ' <i>(context only)</i>';
   }
   if (r.news) {
     const n = r.news.videos.map(v => '🎥 ' + escTg(v.source) + ': ' + escTg(String(v.title || '').slice(0, 90))).concat(r.news.headlines.map(h => '📰 ' + escTg(h.source) + ': ' + escTg(String(h.title || '').slice(0, 110))));
@@ -19938,7 +19991,8 @@ let rows;
             const ts = list.map(k => Number(k.start)).filter(t => t > 0).sort((a, b) => a - b);
             out.push({ interval: label, window_from: start, window_to: new Date(until).toISOString().slice(0, 10), http: r.status,
               candles: list.length, first: ts.length ? new Date(ts[0]).toISOString().slice(0, 16) : null, last: ts.length ? new Date(ts[ts.length - 1]).toISOString().slice(0, 16) : null,
-              sample_close: list.length ? list[0].close : null, error: r.ok ? null : JSON.stringify(r.body).slice(0, 120) });
+              sample_close: list.length ? list[0].close : null, sample_fields: list.length ? Object.keys(list[0]) : null, sample_candle: list.length ? list[0] : null,   // #428 is there volume?
+              error: r.ok ? null : JSON.stringify(r.body).slice(0, 120) });
             await new Promise(res => setTimeout(res, 700));
           }
           return { content: [{ type: 'text', text: JSON.stringify({ coin, read_only: true, probes: out }, null, 2) }] };
