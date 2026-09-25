@@ -9483,6 +9483,19 @@ async function sendMorningBriefing() {
       }
     }
     const alertsBlock = alertsToWatch.length > 0 ? alertsToWatch.join('\n') : 'All clear ✅';
+    // #423 (PM ask): which enabled loops can actually sell - from the #383 clearance check (every 30 min). A loop whose
+    // lowest possible stop sits below its floor is DEAD: it reads "live" everywhere but cannot produce a sale.
+    let loopLine = '';
+    try {
+      const [cs] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'clearance_states'");
+      const st = cs.length ? (JSON.parse(cs[0].config_value || '{}') || {}) : {};
+      const by = { PASS: [], EDGE: [], DEAD: [], other: [] };
+      for (const [coin, v] of Object.entries(st)) (by[v && v.state] || by.other).push(coin);
+      if (Object.keys(st).length) loopLine = '\n\n\ud83d\udee1\ufe0f <b>LOOPS:</b> ' + by.PASS.length + ' can sell' +
+        (by.EDGE.length ? ' \u00b7 ' + by.EDGE.length + ' on the edge (' + by.EDGE.join(', ') + ')' : '') +
+        (by.DEAD.length ? ' \u00b7 ' + by.DEAD.length + ' cannot sell at today\u2019s price (' + by.DEAD.join(', ') + ')' : '') +
+        (by.other.length ? ' \u00b7 ' + by.other.length + ' unchecked (' + by.other.join(', ') + ')' : '');
+    } catch (e) { loopLine = '\n\n\ud83d\udee1\ufe0f Loop check unavailable: ' + String(e.message || e).replace(/[<>&]/g, ''); }
 
     // ── Recent outcomes + weekly stats ──────────────────────────────────────
     let recentOutcomesBlock = '';
@@ -9522,7 +9535,7 @@ async function sendMorningBriefing() {
       (tangemLine ? tangemLine : '') +
       capitalLine + breakEvenLine + `\n\n` +
       `📊 <b>TOP HOLDINGS:</b>\n${topHoldings}\n\n` +
-      `🚨 <b>ALERTS:</b> ${alertsBlock}` +
+      `🚨 <b>ALERTS:</b> ${alertsBlock}` + loopLine +   // #423
       recentOutcomesBlock + weeklyPnlBlock;
 
     await sendTelegram(msg1);
@@ -18426,6 +18439,7 @@ let rows;
           tlQuery += ' ORDER BY acquired_at DESC LIMIT 50';
           const [tlRows] = await db.execute(tlQuery, tlParams);
           result.tax_lots = tlRows;
+          result.tax_lots_label = 'HIFO lots - not for UK filing, and not reliable for tax (D1 rev 2). pm #50: the tax source is chosen at filing time.';   // #423
         } catch (e) { result.tax_lots = { error: e.message }; }
       }
 
@@ -21139,7 +21153,7 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
   server.tool('manage_sources',
     'Content intelligence feed: manage YouTube channels and RSS news sources and fetch and read their analysed items. Monitors crypto analyst videos and news articles, pulls transcripts, and analyses each against saved coin strategies for thesis impact. Actions: add (add a YouTube or RSS source with coin tags), list (list all sources), remove (deactivate a source), fetch_now (fetch and analyse latest videos/articles now), get_items (read analysed content items, filter by coin). Use for morning brief content review, checking what analysts and news say about held coins, source feed management, and in-chat research.',
     {
-      action:      z.enum(['add','list','remove','fetch_now','get_items','scan_videos','scan_status','get_notes','transcribe','watch']).describe('add: add source; list: list all; remove: deactivate; fetch_now: fetch new items now (waits - slow for YouTube, prefer scan_videos); get_items: retrieve analysed items; scan_videos (#419): Gemini watches new videos from every YouTube source (or source_id) IN THE BACKGROUND - returns at once, poll scan_status; scan_status: progress + the videos stored by the last scan with a one-line summary each; get_notes: Gemini\'s full notes + the analysis for item_id; transcribe: Gemini\'s VERBATIM transcript of item_id or video_url (slow, up to ~5 min; stored on the item); watch (#420): Gemini watches ANY public YouTube video_url (or item_id) - notes + analysis against the plans of the coins it mentions, saved as a feed item (under "Bryan\'s links" if new); ~30-90 s; already watched -> cached (refresh: true to re-watch)'),
+      action:      z.enum(['add','list','remove','fetch_now','get_items','scan_videos','scan_status','get_notes','transcribe','watch','update']).describe('add: add source; list: list all; remove: deactivate; update (#423): change source_id\'s coin_tags and/or name, keeping its items (future analyses use the new tags); fetch_now: fetch new items now (waits - slow for YouTube, prefer scan_videos); get_items: retrieve analysed items; scan_videos (#419): Gemini watches new videos from every YouTube source (or source_id) IN THE BACKGROUND - returns at once, poll scan_status; scan_status: progress + the videos stored by the last scan with a one-line summary each; get_notes: Gemini\'s full notes + the analysis for item_id; transcribe: Gemini\'s VERBATIM transcript of item_id or video_url (slow, up to ~5 min; stored on the item); watch (#420): Gemini watches ANY public YouTube video_url (or item_id) - notes + analysis against the plans of the coins it mentions, saved as a feed item (under "Bryan\'s links" if new); ~30-90 s; already watched -> cached (refresh: true to re-watch)'),
       source_id:   z.coerce.number().optional().describe('source id for remove/fetch_now/get_items'),
       name:        z.string().optional().describe('add: display name e.g. CoinBureau'),
       type:        z.enum(['youtube','rss']).optional().describe('add: source type'),
@@ -21167,6 +21181,21 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
       } else if (action === 'remove') {
         await db.execute('UPDATE source_feeds SET active=0 WHERE id=?', [source_id]);
         result = { ok: true, action: 'remove', source_id };
+      } else if (action === 'update') {   // #423 (PM ask): re-tag without deactivating - remove would cost the item history
+        const [cur] = await db.execute('SELECT id, name, coin_tags FROM source_feeds WHERE id = ?', [source_id || 0]);
+        if (!cur.length) result = { ok: false, action: 'update', error: 'no source ' + source_id };
+        else if (coin_tags === undefined && !name) result = { ok: false, action: 'update', error: 'give coin_tags and/or name' };
+        else {
+          let tags = null;
+          if (coin_tags !== undefined) {
+            const arr = Array.isArray(coin_tags) ? coin_tags : String(coin_tags || '').split(',');
+            tags = [...new Set(arr.map(t => String(t).trim().toUpperCase().replace(/-USD$/, '')).filter(t => /^[A-Z0-9]{1,15}$/.test(t)))];
+            await db.execute('UPDATE source_feeds SET coin_tags = ? WHERE id = ?', [JSON.stringify(tags), source_id]);
+          }
+          if (name) await db.execute('UPDATE source_feeds SET name = ? WHERE id = ?', [String(name).slice(0, 100), source_id]);
+          const [after] = await db.execute('SELECT id, name, type, coin_tags, active FROM source_feeds WHERE id = ?', [source_id]);
+          result = { ok: true, action: 'update', before: cur[0], after: after[0], note: 'Existing items keep the tags they were analysed with; new items use the new tags.' };
+        }
       } else if (action === 'fetch_now') {
         if (videoScanInProgress) { result = { ok: false, action: 'fetch_now', error: 'a video scan is running - wait for it (scan_status) so no video is watched twice' }; }
         else { const fr = await fetchAllSources(source_id || null); result = { ok: true, action: 'fetch_now', ...fr }; }
@@ -21664,7 +21693,9 @@ app.get('/api/tax/summary', async (req, res) => {
     const [s104] = await db.execute('SELECT * FROM uk_s104_pool ORDER BY symbol');
 
     res.json({
+      label: 'HIFO - not for UK filing',   // #423 (PM ask, pm #50): the UK figure comes from the external tool at tax time
       us_hifo: {
+        label: 'HIFO - not for UK filing',
         total_gain_loss_usd: totalGL.toFixed(2),
         long_term_gain_loss_usd: longTermGL.toFixed(2),
         short_term_gain_loss_usd: shortTermGL.toFixed(2),
