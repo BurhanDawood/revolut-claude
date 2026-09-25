@@ -7490,7 +7490,7 @@ async function agentStatusText() {
 // Paper only: runAgent refuses any mode but 'paper', and executeAgentOrder (A1) is its only route to a fill. Every run is
 // recorded in agent_decisions (a 'sit' row when it does nothing); model and research costs are charged to the agent's cash.
 const AGENT_SKIP = new Set(['USD', 'USDT', 'USDC', 'EUR', 'GBP', 'DAI', 'TUSD', 'PYUSD', 'FDUSD', 'USDE', 'EURC', 'USDP', 'BUSD', 'USDS', 'RLUSD', 'EURT', 'XAUT', 'PAXG']);
-const AGENT_A2_DEFAULTS = { daily_fetch_per_run: 40, research_per_run: 8, gemini_call_usd: 0.035, candle_pace_ms: 350, model_timeout_ms: 150000, max_tokens: 3000 };
+const AGENT_A2_DEFAULTS = { daily_fetch_per_run: 40, research_per_run: 8, gemini_call_usd: 0.035, candle_pace_ms: 350, model_timeout_ms: 150000, max_tokens: 4000 };   // #A2b 3000 -> 4000: the first live run wrote 2,322
 const agentSleep = (ms) => new Promise(r => setTimeout(r, ms));
 let _agentRunning = false;
 
@@ -7621,12 +7621,12 @@ async function agentGeminiResearch(coin, feedNotes) {
 async function agentResearch(coin, mentions, cfg, costs) {
   try {
     const [c] = await db.execute('SELECT pack, at FROM agent_research WHERE symbol = ? AND gemini_ok = 1 AND at > DATE_SUB(NOW(), INTERVAL ? HOUR) ORDER BY at DESC LIMIT 1', [coin, Number(cfg.research_ttl_h) || 24]);
-    if (c.length) { const p = typeof c[0].pack === 'string' ? JSON.parse(c[0].pack) : c[0].pack; return { ...p, cached_at: c[0].at }; }
+    if (c.length) { const p = typeof c[0].pack === 'string' ? JSON.parse(c[0].pack) : c[0].pack; costs.cached = (costs.cached || 0) + 1; return { ...p, cached_at: c[0].at }; }
   } catch (e) { /* no cache */ }
   const feed = mentions.map(m => (m.source || '') + ': ' + (m.title || '') + ' ' + (m.lines || []).join(' ')).join(' | ').slice(0, 1500);
   let out;
-  try { out = await agentGeminiResearch(coin, feed); costs.research += cfg.gemini_call_usd; }
-  catch (e) { out = { error: String(e.message).slice(0, 160) }; }
+  try { out = await agentGeminiResearch(coin, feed); costs.research += cfg.gemini_call_usd; costs.ok = (costs.ok || 0) + 1; if (!out.grounded) costs.ungrounded = (costs.ungrounded || 0) + 1; }
+  catch (e) { out = { error: String(e.message).slice(0, 160) }; costs.failed = (costs.failed || 0) + 1; costs.firstError = costs.firstError || (coin + ': ' + out.error); console.error('[agent] #A2b research ' + coin + ' failed: ' + out.error); }
   await db.execute('INSERT IGNORE INTO agent_research (symbol, pack, gemini_ok) VALUES (?, ?, ?)', [coin, JSON.stringify(out), out.error ? 0 : 1]).catch(() => {});
   return out;
 }
@@ -7797,7 +7797,8 @@ async function runAgent(trigger = 'scheduled') {
     }
     const fills = done.filter(d => d.status === 'filled').length, drops = done.filter(d => d.status !== 'filled');
     const after = await agentEquity(await readAgentLedger()).catch(() => null);
-    await sendTelegram('🤖 <b>Agent run</b> (' + kind + ') - ' + (dv.actions.length ? fills + ' filled' + (drops.length ? ', ' + drops.length + ' dropped (' + escTg(drops.map(d => d.a.coin + ' ' + d.reason).join(', ')) + ')' : '') : 'sat out: ' + escTg(String(dv.sit_reason || '').slice(0, 200))) +
+    await sendTelegram('🤖 <b>Agent run</b> (' + kind + ') - ' + (dv.actions.length ? fills + ' filled' + (drops.length ? ', ' + drops.length + ' dropped (' + escTg(drops.map(d => d.a.coin + ' ' + d.reason).join(', ')) + ')' : '') : 'sat out: ' + escTg(String(dv.sit_reason || '').slice(0, 400))) +
+      '\nResearch: ' + (costs.ok || 0) + ' new' + (costs.ungrounded ? ' (' + costs.ungrounded + ' without web search)' : '') + ', ' + (costs.cached || 0) + ' cached, ' + (costs.failed || 0) + ' failed' + (costs.firstError ? ' - ' + escTg(costs.firstError.slice(0, 160)) : '') +   // #A2b
       '\nLooked at ' + scr.shortlist.length + ' of ' + scr.all.length + ' coins - cost $' + (costs.model + costs.research).toFixed(3) + (after ? ' - equity $' + after.equity.toFixed(2) : '') +
       (dv.requests.length ? '\n🤖 requests: ' + escTg(dv.requests.map(q => q.title).join('; ')) : '')).catch(() => {});
     return { ok: true, run_id: runId, actions: dv.actions.length, filled: fills, dropped: drops.length, cost_usd: costs.model + costs.research };
