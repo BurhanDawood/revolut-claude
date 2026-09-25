@@ -1549,6 +1549,30 @@ await db.execute(`CREATE TABLE IF NOT EXISTS macro_daily (
   fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (series, d)
 )`).catch(e => console.error('[migration] macro_daily:', e.message));
+// #B21 A1 the budget agent's own tables (paper $1,000 - Bryan 25 Sep). halted_from remembers the mode a halt interrupted.
+await db.execute(`CREATE TABLE IF NOT EXISTS agent_ledger (
+  id TINYINT NOT NULL PRIMARY KEY, mode VARCHAR(8) NOT NULL DEFAULT 'paper',
+  stopped TINYINT(1) NOT NULL DEFAULT 0, frozen_until DATETIME NULL, halt_reason VARCHAR(120) NULL, halted_from VARCHAR(8) NULL,
+  budget_usd DECIMAL(14,2) NOT NULL, cash_usd DECIMAL(14,6) NOT NULL, positions JSON NOT NULL,
+  realised_usd DECIMAL(14,6) NOT NULL DEFAULT 0, fees_usd DECIMAL(14,6) NOT NULL DEFAULT 0, model_cost_usd DECIMAL(14,6) NOT NULL DEFAULT 0,
+  high_water_usd DECIMAL(14,6) NOT NULL, day_start_equity_usd DECIMAL(14,6) NULL, day_start_at DATE NULL,
+  funded_gbp DECIMAL(14,2) NULL, funded_rate DECIMAL(14,6) NULL, started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+)`).catch(e => console.error('[migration] agent_ledger:', e.message));
+await db.execute("INSERT IGNORE INTO agent_ledger (id, mode, budget_usd, cash_usd, positions, high_water_usd) VALUES (1, 'paper', 1000, 1000, '{}', 1000)").catch(e => console.error('[migration] agent_ledger row:', e.message));
+await db.execute(`CREATE TABLE IF NOT EXISTS agent_decisions (
+  id INT AUTO_INCREMENT PRIMARY KEY, run_id VARCHAR(40) NOT NULL, at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, trigger_kind VARCHAR(12) NOT NULL,
+  mode VARCHAR(8) NOT NULL, symbol VARCHAR(20) NULL, side VARCHAR(4) NULL, usd DECIMAL(14,6) NULL, qty DECIMAL(24,10) NULL,
+  status VARCHAR(16) NOT NULL, drop_reason VARCHAR(40) NULL, thesis VARCHAR(400) NULL, tool_key VARCHAR(60) NULL, horizon VARCHAR(12) NULL,
+  invalidation VARCHAR(160) NULL, confidence VARCHAR(8) NULL, inputs_hash CHAR(16) NULL, inputs JSON NULL, model VARCHAR(40) NULL,
+  tokens_in INT NULL, tokens_out INT NULL, model_cost_usd DECIMAL(10,6) NULL, predicate_decision_id INT NULL, order_id VARCHAR(64) NULL,
+  client_order_id VARCHAR(64) NULL, journal_id INT NULL, fill_price DECIMAL(24,12) NULL, fill_qty DECIMAL(24,10) NULL, fee_usd DECIMAL(14,6) NULL,
+  equity_after DECIMAL(14,6) NULL, notes_for_self TEXT NULL,
+  INDEX idx_run (run_id), INDEX idx_sym (symbol, at), INDEX idx_status (status, equity_after)
+)`).catch(e => console.error('[migration] agent_decisions:', e.message));
+await db.execute('CREATE TABLE IF NOT EXISTS agent_research (symbol VARCHAR(20) NOT NULL, at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, pack JSON NOT NULL, gemini_ok TINYINT(1) NOT NULL, PRIMARY KEY (symbol, at))').catch(e => console.error('[migration] agent_research:', e.message));
+await db.execute('CREATE TABLE IF NOT EXISTS agent_reviews (id INT AUTO_INCREMENT PRIMARY KEY, week_start DATE NOT NULL, at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, review TEXT NOT NULL, stats JSON NULL, model VARCHAR(40) NULL)').catch(e => console.error('[migration] agent_reviews:', e.message));
+await db.execute('CREATE TABLE IF NOT EXISTS agent_equity_daily (d DATE NOT NULL PRIMARY KEY, equity_usd DECIMAL(14,6) NOT NULL, cash_usd DECIMAL(14,6) NOT NULL, bench_btc_usd DECIMAL(14,6) NULL, bench_basket_usd DECIMAL(14,6) NULL, model_cost_usd DECIMAL(14,6) NULL)').catch(e => console.error('[migration] agent_equity_daily:', e.message));
+setTimeout(() => { repairAgentFills().catch(e => console.error('[agent] boot repair failed:', e.message)); }, 30 * 1000);   // #B21 a fill recorded but not applied before a restart
 await safeAddColumn('trailing_stops',   'auto_execute',    'TINYINT(1) NOT NULL DEFAULT 0'); // #93
 await safeAddColumn('price_targets',    'sell_pct',        'DECIMAL(5,2) NULL'); // #144 per-rung sell %% override for Away Mode up-targets
 await safeAddColumn('trailing_stops',   'sell_pct',        'DECIMAL(10,4) DEFAULT 25.0');   // #93
@@ -7222,6 +7246,241 @@ async function evaluateAbandons() {
 }
 
 // #413b the pending buy-back reservations, in ONE place: checkRingfenceCoverage and the funded-buy confirm read the same list.
+// ── #B21 A1 THE BUDGET AGENT'S FENCE (Fable spec 25 Sep; Bryan: paper $1,000, full discretion inside the budget) ──
+// The agent owns a ledger (agent_ledger row 1) and reaches a fill ONLY through executeAgentOrder, which asks the P0
+// predicate (path 'agent') first. PAPER fills touch nothing but the agent's own tables: no trading_journal row (103
+// readers - stats, tax, learning, P&L - would count paper trades as real), no entry_prices, no tranches, no sweep, no
+// cascade. LIVE (A4 only; nothing in A1/A2 sets mode 'live') adds a journal row with source 'agent' and a venue order
+// whose client_order_id is 'agent-<decision id>'.
+const AGENT_DEFAULTS = { per_trade_pct: 25, max_positions: 4, min_trade_usd: 5, daily_loss_pct: 10, drawdown_halt_pct: 40,
+  runs_per_day: 6, orders_per_run: 3, run_cron: '5 */4 * * *', paper_slip_pct: 1.3, paper_fee_pct: 0.09,
+  // Bryan 25 Sep: decide with Sonnet, screen with Haiku; upgrade only if the scored results justify the cost. USD per million
+  // tokens [in, out] - the Sonnet 5 figure is assumed equal to Sonnet 4.6's until A2 confirms it.
+  model: 'claude-sonnet-5', screen_model: 'claude-haiku-4-5', review_model: 'claude-sonnet-5',
+  price_per_mtok: { 'claude-haiku-4-5': [1, 5], 'claude-sonnet-5': [3, 15], 'claude-sonnet-4-6': [3, 15] },
+  research_ttl_h: 24, shortlist: 15, model_adds: 5, max_spread_pct: 2 };
+async function readAgentConfig() {
+  let c = {};
+  try { const [r] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'agent'"); if (r.length) c = JSON.parse(r[0].config_value) || {}; } catch (e) { c = {}; }
+  return { ...AGENT_DEFAULTS, ...(c && typeof c === 'object' && !Array.isArray(c) ? c : {}) };
+}
+// conn given = inside a transaction: the row is locked FOR UPDATE. Throws when the row or its positions are unreadable.
+async function readAgentLedger(conn) {
+  const c = conn || db;
+  const [r] = await c.execute("SELECT mode, stopped, frozen_until, halt_reason, halted_from, budget_usd, cash_usd, positions, realised_usd, fees_usd, model_cost_usd, high_water_usd, day_start_equity_usd, DATE_FORMAT(day_start_at, '%Y-%m-%d') AS day_start_s FROM agent_ledger WHERE id = 1" + (conn ? ' FOR UPDATE' : ''));
+  if (!r.length) throw new Error('agent_ledger row 1 missing');
+  const x = r[0];
+  let pos = x.positions;
+  if (typeof pos === 'string') { try { pos = JSON.parse(pos); } catch (e) { pos = null; } }
+  if (!pos || typeof pos !== 'object' || Array.isArray(pos)) throw new Error('agent_ledger.positions unreadable');
+  const num = (v) => (v == null ? null : Number(v));
+  return { mode: String(x.mode), stopped: Number(x.stopped) === 1, frozen_until: x.frozen_until ? new Date(x.frozen_until).getTime() : null,
+    halt_reason: x.halt_reason || null, halted_from: x.halted_from || null, budget_usd: num(x.budget_usd), cash_usd: num(x.cash_usd) || 0, positions: pos,
+    realised_usd: num(x.realised_usd) || 0, fees_usd: num(x.fees_usd) || 0, model_cost_usd: num(x.model_cost_usd) || 0, high_water_usd: num(x.high_water_usd),
+    day_start_equity_usd: num(x.day_start_equity_usd), day_start_at: x.day_start_s || null };
+}
+// Revolut X prices only (the agent trades Revolut X assets): mid of bid/ask, else the venue's mid, else the last trade. 20 s cache.
+let _agentTickCache = { at: 0, map: null };
+async function revolutTickerMap(maxAgeMs = 20000) {
+  if (_agentTickCache.map && Date.now() - _agentTickCache.at < maxAgeMs) return _agentTickCache.map;
+  const t = await revolutRequest('GET', '/tickers');
+  const list = Array.isArray(t) ? t : (t && t.data) || [];
+  const m = {};
+  for (const x of list) {
+    if (!x || !x.symbol) continue;
+    const s = String(x.symbol).toUpperCase();
+    if (!/[\/-]USD$/.test(s)) continue;
+    const bid = parseFloat(x.bid), ask = parseFloat(x.ask), last = parseFloat(x.last_price);
+    const mid = (bid > 0 && ask > 0) ? (bid + ask) / 2 : (parseFloat(x.mid) > 0 ? parseFloat(x.mid) : last);
+    if (mid > 0) m[s.replace(/[\/-]USD$/, '')] = { mid, bid: bid > 0 ? bid : null, ask: ask > 0 ? ask : null, last: last > 0 ? last : null, spread_pct: bid > 0 && ask > 0 ? (ask - bid) / mid * 100 : null };
+  }
+  if (Object.keys(m).length) _agentTickCache = { at: Date.now(), map: m };
+  return m;
+}
+async function latestMidPrice(coin) { const m = await revolutTickerMap(); const k = String(coin || '').toUpperCase(); return m[k] ? m[k].mid : null; }
+// Equity = cash + every position at the live mid. A position with no price is carried at cost and listed in stale.
+async function agentEquity(led, tick) {
+  const m = tick || await revolutTickerMap();
+  let equity = Number(led.cash_usd) || 0; const marks = {}, stale = [];
+  for (const [c, p] of Object.entries(led.positions || {})) {
+    const q = Number(p && p.qty) || 0; if (!(q > 0)) continue;
+    const px = m[c] ? m[c].mid : null, v = px ? q * px : (Number(p.cost_usd) || 0);
+    if (!px) stale.push(c);
+    marks[c] = { qty: q, price: px, value: v, cost_usd: Number(p.cost_usd) || 0 }; equity += v;
+  }
+  return { equity, marks, stale };
+}
+// The universe (Fable 20:50): any Revolut X coin that Bryan does not hold ON THE VENUE and no loop manages. The venue balance,
+// not entry_prices (which keeps rows for coins sold long ago), in both modes: bryan = available + reserved - the agent's own
+// qty; outside when that is worth $1 or more. One /balances read per 20 s. Unreadable = outside (fail closed).
+let _agentBalCache = { at: 0, list: null };
+async function revolutBalancesCached(maxAgeMs = 20000) {
+  if (_agentBalCache.list && Date.now() - _agentBalCache.at < maxAgeMs) return _agentBalCache.list;
+  const b = await revolutRequest('GET', '/balances');
+  const list = Array.isArray(b) ? b : (b && (b.data || b.balances)) || [];
+  if (!Array.isArray(list) || !list.length) throw new Error('balances unreadable');
+  _agentBalCache = { at: Date.now(), list };
+  return list;
+}
+async function agentUniverseOk(coin) {
+  try {
+    if (!coin || KRAKEN_MONITORED_COINS.includes(coin + '-USD')) return false;
+    const [pr] = await db.execute('SELECT 1 FROM pump_armed_rules WHERE symbol = ? AND active = 1 LIMIT 1', [coin + '-USD']);
+    if (pr.length) return false;
+    const led = await readAgentLedger();
+    const row = (await revolutBalancesCached()).find(x => String(x.currency || '').toUpperCase() === coin);
+    const bryan = (row ? (parseFloat(row.available) || 0) + (parseFloat(row.reserved) || 0) : 0) - ((led.positions[coin] || {}).qty || 0);
+    const px = await latestMidPrice(coin);
+    if (!(px > 0)) return false;   // no Revolut X price: not tradeable here
+    return !(bryan * px >= 1);
+  } catch (e) { return false; }
+}
+// A new London day: remember the equity it started with (the daily-loss rail reads it).
+async function agentRollDay(led, eq) {
+  const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Europe/London' });
+  if (led.day_start_at === today) return led;
+  await db.execute('UPDATE agent_ledger SET day_start_equity_usd = ?, day_start_at = ? WHERE id = 1', [Number(eq.toFixed(6)), today]);
+  return { ...led, day_start_equity_usd: eq, day_start_at: today };
+}
+async function freezeAgent(hours, reason) {
+  await db.execute('UPDATE agent_ledger SET frozen_until = DATE_ADD(NOW(), INTERVAL ? HOUR), halt_reason = ? WHERE id = 1', [hours, String(reason).slice(0, 120)]);
+  await sendTelegram('🧊 <b>Agent frozen for ' + hours + ' h</b> - ' + escTg(reason) + '. No new buys until then (it may still sell to cut risk); <code>/agent resume</code> ends it early.').catch(() => {});
+}
+async function haltAgent(reason) {
+  await db.execute("UPDATE agent_ledger SET halted_from = IF(mode = 'halted', halted_from, mode), mode = 'halted', halt_reason = ? WHERE id = 1", [String(reason).slice(0, 120)]);
+  let held = '';   // Fable 20:50: a halted agent does nothing, so say what is still exposed
+  try {
+    const led = await readAgentLedger(); const ps = Object.entries((await agentEquity(led)).marks);
+    held = ps.length ? '\nStill open (a halted agent does not sell):\n' + ps.map(([c, m]) => '\u2022 ' + escTg(c) + ' $' + m.value.toFixed(2) + (m.cost_usd > 0 ? ' (' + ((m.value / m.cost_usd - 1) * 100).toFixed(1) + '%)' : '')).join('\n') + '\nCash $' + led.cash_usd.toFixed(2)
+                     : '\nNo open positions; cash $' + led.cash_usd.toFixed(2);
+  } catch (e) { held = ''; }
+  await sendTelegram('🛑 <b>Agent HALTED</b> - ' + escTg(reason) + '. It will not trade again until you decide: <code>/agent resume confirm</code> restarts it (a halt is a failed proof, so restarting is a decision).' + held).catch(() => {});
+}
+async function agentDrop(d, status, reason) {
+  await db.execute('UPDATE agent_decisions SET status = ?, drop_reason = ? WHERE id = ?', [status, String(reason || '').slice(0, 40), d.id]).catch(e => console.error('[agent] decision update failed:', e.message));
+  console.log('[agent] #' + d.id + ' ' + d.side + ' ' + d.symbol + ' ' + status + ': ' + reason);
+  return { ok: false, status, reason };
+}
+// Step 2 of a fill, and the boot repair: apply a 'filled' decision to the ledger exactly once (equity_after IS NULL = not yet applied).
+async function agentApplyFill(id) {
+  const tick = await revolutTickerMap().catch(() => ({}));
+  const conn = await db.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [dr] = await conn.execute('SELECT id, symbol, side, fill_price, fill_qty, fee_usd, status, equity_after FROM agent_decisions WHERE id = ? FOR UPDATE', [id]);
+    const d = dr[0];
+    if (!d || d.status !== 'filled' || d.equity_after != null) { await conn.rollback(); return null; }
+    const led = await readAgentLedger(conn);
+    const coin = String(d.symbol).replace('-USD', ''), px = Number(d.fill_price), qty = Number(d.fill_qty), fee = Number(d.fee_usd) || 0, gross = qty * px;
+    if (!(px > 0) || !(qty > 0)) throw new Error('decision ' + id + ' has no fill');
+    const pos = { ...led.positions }; const p = pos[coin] ? { ...pos[coin] } : { qty: 0, cost_usd: 0, opened_at: new Date().toISOString() };
+    let cash = led.cash_usd, realised = led.realised_usd, wrote_off = 0;
+    if (d.side === 'buy') { cash -= gross + fee; p.qty = Number(p.qty) + qty; p.cost_usd = Number(p.cost_usd) + gross + fee; pos[coin] = p; }
+    else {
+      const held = Number(p.qty) || 0; if (!(held > 0)) throw new Error('decision ' + id + ' sells ' + coin + ' the ledger does not hold');
+      const q = Math.min(qty, held), costSold = (Number(p.cost_usd) || 0) * q / held;
+      cash += gross - fee; realised += (gross - fee) - costSold; p.qty = held - q; p.cost_usd = (Number(p.cost_usd) || 0) - costSold;
+      if (p.qty * px < 1) { wrote_off = p.cost_usd; realised -= p.cost_usd; delete pos[coin]; }   // under $1 left: unsellable (check 8 dust) - written off
+      else pos[coin] = p;
+    }
+    const tickNow = { ...tick, [coin]: { mid: px } };
+    const eq = (await agentEquity({ cash_usd: cash, positions: pos }, tickNow)).equity;
+    const hw = Math.max(Number(led.high_water_usd) || 0, eq);
+    await conn.execute('UPDATE agent_ledger SET cash_usd = ?, positions = ?, realised_usd = ?, fees_usd = ?, high_water_usd = ? WHERE id = 1',
+      [Number(cash.toFixed(6)), JSON.stringify(pos), Number(realised.toFixed(6)), Number((led.fees_usd + fee).toFixed(6)), Number(hw.toFixed(6))]);
+    await conn.execute('UPDATE agent_decisions SET equity_after = ? WHERE id = ?', [Number(eq.toFixed(6)), id]);
+    await conn.commit();
+    return { equity: eq, cash, wrote_off };
+  } catch (e) { await conn.rollback().catch(() => {}); throw e; }
+  finally { conn.release(); }
+}
+// The agent's ONLY route to a fill. d = an agent_decisions row with status 'proposed' (symbol 'XXX-USD', side, usd for a buy
+// or qty for a sell). The predicate's size_cap is what is filled, never d.usd / d.qty.
+async function executeAgentOrder(d) {
+  const sym = String(d.symbol || '').toUpperCase(), coin = sym.replace('-USD', '');
+  let led; try { led = await readAgentLedger(); } catch (e) { return agentDrop(d, 'failed', 'ledger_unreadable'); }
+  const cfg = await readAgentConfig();
+  const px = await latestMidPrice(coin).catch(() => null);
+  if (!(px > 0)) return agentDrop(d, 'failed', 'no_price');
+  try { led = await agentRollDay(led, (await agentEquity(led)).equity); } catch (e) { /* the day roll is best-effort; check 17 then reads the old day */ }
+  const intent = { symbol: coin + '-USD', side: d.side, path: 'agent', exchange: 'revolut', price: px, usd: d.side === 'buy' ? Number(d.usd) : null,
+    qty: d.side === 'sell' ? Number(d.qty) : null, trigger: 'agent', ref: { agent_decision_id: d.id } };
+  const pd = await mayAutoTrade(intent, { mode: led.mode === 'live' ? 'enforce' : 'shadow' });
+  await db.execute('UPDATE agent_decisions SET predicate_decision_id = ? WHERE id = ?', [pd.decision_id || null, d.id]).catch(() => {});
+  if (!pd.ok) {
+    if (pd.reason === 'daily_loss_stop') await freezeAgent(24, 'daily loss stop (equity down ' + cfg.daily_loss_pct + '% on the day)');
+    if (pd.reason === 'drawdown_halt') await haltAgent('drawdown halt (equity down ' + cfg.drawdown_halt_pct + '% from its high)');
+    return agentDrop(d, 'dropped_predicate', pd.reason);
+  }
+  const size = Number(pd.size_cap);
+  if (led.mode === 'paper') {
+    const slip = cfg.paper_slip_pct / 100, feeP = cfg.paper_fee_pct / 100;
+    const fillPx = d.side === 'buy' ? px * (1 + slip) : px * (1 - slip);
+    let qty, fee;
+    if (d.side === 'buy') { const gross = size / (1 + feeP); fee = size - gross; qty = gross / fillPx; }   // spends exactly size, fee included
+    else { qty = size; fee = qty * fillPx * feeP; }
+    await db.execute("UPDATE agent_decisions SET status = 'filled', fill_price = ?, fill_qty = ?, fee_usd = ?, order_id = ?, client_order_id = ? WHERE id = ?",
+      [fillPx, qty, Number(fee.toFixed(6)), 'paper-' + d.id, 'agent-' + d.id, d.id]);
+    return await agentFinishFill(d, coin, 'paper', fillPx, qty, fee);
+  }
+  if (led.mode !== 'live') return agentDrop(d, 'dropped_rail', 'mode_' + led.mode);   // belt and braces: only 'live' reaches the venue
+  // ── LIVE (A4 switches it on; inert in A1) ──
+  const cid = 'agent-' + d.id;
+  await db.execute('UPDATE agent_decisions SET client_order_id = ? WHERE id = ?', [cid, d.id]).catch(() => {});
+  let resp;
+  try {
+    resp = d.side === 'buy' ? await placeRevolutOrder(sym, 'buy', 'market', null, null, size.toFixed(2), cid)
+                            : await placeRevolutOrder(sym, 'sell', 'market', size, null, null, cid);
+  } catch (e) { return agentDrop(d, 'failed', 'venue: ' + e.message); }
+  const od = resp && resp.data ? resp.data : {};
+  const oid = String(od.venue_order_id || od.id || cid);
+  const qty = d.side === 'buy' ? size / px : size;   // booked at the mid; #362 enrichment corrects the journal row with the real fill
+  const [jr] = await db.execute("INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source, tool_key, regime_tag, venue_order_id) VALUES (?, ?, ?, ?, ?, ?, 'neutral', 'agent', 'agent', ?, ?)",
+    [coin, d.side, px, qty, qty * px, ('[agent live] ' + (d.thesis || '')).slice(0, 500), await regimeTagFor(coin), oid]).catch(e => { console.error('[agent] journal insert failed:', e.message); return [{}]; });
+  const journalId = jr && jr.insertId ? jr.insertId : null;
+  await db.execute("UPDATE agent_decisions SET status = 'filled', fill_price = ?, fill_qty = ?, fee_usd = 0, order_id = ?, journal_id = ? WHERE id = ?", [px, qty, oid, journalId, d.id]);
+  const out = await agentFinishFill(d, coin, 'live', px, qty, 0);
+  await queueFillEnrichment(journalId, oid, sym, d.side, px, qty, 'agent');
+  return out;
+}
+async function agentFinishFill(d, coin, mode, fillPx, qty, fee) {
+  let applied = null;
+  try { applied = await agentApplyFill(d.id); }
+  catch (e) {   // the decision row already says 'filled'; the boot repair (and the next call) re-applies it
+    console.error('[agent] ledger update failed for #' + d.id + ':', e.message);
+    await sendTelegram('⚠️ Agent fill #' + d.id + ' recorded but its ledger update failed (' + escTg(e.message) + '). It is re-applied at the next boot.').catch(() => {});
+    return { ok: true, status: 'filled', ledger: 'pending' };
+  }
+  const usd = qty * fillPx;
+  await sendTelegram('🧪 <b>Agent ' + (mode === 'paper' ? '[paper] ' : '') + d.side.toUpperCase() + ' ' + escTg(coin) + '</b> $' + usd.toFixed(2) + ' @ ' + fmtPriceShort(fillPx) +
+    (fee > 0 ? ' (fee $' + fee.toFixed(2) + ')' : '') + (applied ? ' - equity $' + applied.equity.toFixed(2) + ', cash $' + applied.cash.toFixed(2) : '') +
+    (applied && applied.wrote_off > 0 ? ' - dust written off $' + applied.wrote_off.toFixed(2) : '') + (d.thesis ? '\n' + escTg(String(d.thesis).slice(0, 200)) : '')).catch(() => {});
+  return { ok: true, status: 'filled', equity: applied ? applied.equity : null };
+}
+// Boot: a fill recorded on its decision row but never applied to the ledger (a crash between the two steps) is applied now.
+async function repairAgentFills() {
+  const [rows] = await db.execute("SELECT id FROM agent_decisions WHERE status = 'filled' AND equity_after IS NULL ORDER BY id");
+  let n = 0;
+  for (const r of rows) { try { if (await agentApplyFill(r.id)) n++; } catch (e) { console.error('[agent] repair of #' + r.id + ' failed:', e.message); } }
+  if (n) { console.log('[agent] boot repair applied ' + n + ' fill(s)'); await sendTelegram('🔧 Agent: ' + n + ' fill(s) recorded before a restart were applied to its ledger now.').catch(() => {}); }
+  return n;
+}
+async function agentStatusText() {
+  const led = await readAgentLedger(); const cfg = await readAgentConfig();
+  const eq = await agentEquity(led);
+  const lines = ['🧪 <b>Budget agent - ' + led.mode.toUpperCase() + (led.stopped ? ', STOPPED' : '') + (led.frozen_until > Date.now() ? ', FROZEN until ' + new Date(led.frozen_until).toISOString().slice(11, 16) + ' UTC' : '') + '</b>'];
+  lines.push('Equity $' + eq.equity.toFixed(2) + ' (budget $' + Number(led.budget_usd).toFixed(0) + ', ' + ((eq.equity / led.budget_usd - 1) * 100).toFixed(1) + '%) - cash $' + led.cash_usd.toFixed(2));
+  if (led.day_start_equity_usd) lines.push('Today ' + (eq.equity - led.day_start_equity_usd >= 0 ? '+' : '') + '$' + (eq.equity - led.day_start_equity_usd).toFixed(2) + ' (freeze at -' + cfg.daily_loss_pct + '%)');
+  if (led.high_water_usd) lines.push('From its high $' + led.high_water_usd.toFixed(2) + ': ' + ((eq.equity / led.high_water_usd - 1) * 100).toFixed(1) + '% (halt at -' + cfg.drawdown_halt_pct + '%)');
+  lines.push('Realised $' + led.realised_usd.toFixed(2) + ' - fees $' + led.fees_usd.toFixed(2) + ' - model cost $' + led.model_cost_usd.toFixed(2));
+  const ps = Object.entries(eq.marks);
+  lines.push(ps.length ? ps.map(([c, m]) => '• ' + escTg(c) + ': $' + m.value.toFixed(2) + ' (' + (m.cost_usd > 0 ? ((m.value / m.cost_usd - 1) * 100).toFixed(1) + '%' : '-') + (m.price ? '' : ', no price') + ')').join('\n') : 'No positions.');
+  lines.push(ps.length + ' of ' + cfg.max_positions + ' positions - up to ' + cfg.per_trade_pct + '% of equity per trade');
+  if (led.mode === 'halted') lines.push('Halted: ' + escTg(led.halt_reason || '') + ' - <code>/agent resume confirm</code> to restart.');
+  lines.push('Runs: not yet - the research-and-decide loop arrives with A2.');
+  return lines.join('\n');
+}
+
 async function pendingReservations() {
   const cycles = [];
   const [rows] = await db.execute('SELECT symbol, sale_proceeds_usd, sale_price, retrace_gate, uncovered_since, COALESCE(uncovered_abandon_hours, 48) AS uh FROM pump_armed_rules WHERE active = 1 AND sale_price IS NOT NULL AND sale_proceeds_usd > 0');
@@ -7232,6 +7491,8 @@ async function pendingReservations() {
     for (const x of ll) { let st = null; try { st = JSON.parse(x.state); } catch (e) { st = null; } const v = st && Number(st.reserved_left) > 0 ? Number(st.reserved_left) : 0;
       if (v > 0) cycles.push({ coin: String(x.symbol).replace('-USD', ''), usd: v, sold_at: st.sale_price != null ? Number(st.sale_price) : null, starts_at: st.gate != null ? Number(st.gate) : null, kind: 'ladder' }); }
   } catch (e) { /* no ladder table yet */ }
+  try { const al = await readAgentLedger(); if (al.mode === 'live' && al.cash_usd > 0) cycles.push({ coin: 'AGENT', usd: al.cash_usd, sold_at: null, starts_at: null, kind: 'agent' }); }   // #B21 live only
+  catch (e) { /* no agent ledger yet */ }
   return cycles;
 }
 
@@ -10696,7 +10957,7 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
     // between the order and this scan, which would REPLACE the ladder's row and send Bryan buttons for its own trade).
     try {
       const [lad] = await db.execute(
-        "SELECT id FROM trading_journal WHERE symbol IN (?, ?) AND action = ? AND source = 'ladder' AND created_at > DATE_SUB(NOW(), INTERVAL 60 MINUTE) AND ABS(value_usd - ?) < (? * 0.20 + 0.01) LIMIT 1",
+        "SELECT id FROM trading_journal WHERE symbol IN (?, ?) AND action = ? AND source IN ('ladder', 'agent') AND created_at > DATE_SUB(NOW(), INTERVAL 60 MINUTE) AND ABS(value_usd - ?) < (? * 0.20 + 0.01) LIMIT 1",
         [coinBase, symbol, action, valueUsd, valueUsd]);
       if (lad.length) { console.log('[autoLog] Suppressing - the live ladder\'s own trade (id=' + lad[0].id + ')'); return; }
     } catch (e) { console.error('[autoLog] ladder check error:', e.message); }
@@ -12681,7 +12942,7 @@ async function mayAutoTrade(intent, opts = {}) {
   const no = (reason, extra) => { res.ok = false; res.reason = reason; res.check_no = at; if (extra) Object.assign(res, extra); return res; };
   const unreadable = (what, e) => { inputs.unreadable = what + (e && e.message ? ': ' + e.message : ''); return no('config_unreadable'); };
   const norm = (a) => (Array.isArray(a) ? a : []).map(x => String(x).toUpperCase().replace(/-USD$/, ''));
-  let rule, ruleRead = false, dnd = null, ladder = null, lstate = null, lcfg = null, venue = null;
+  let rule, ruleRead = false, dnd = null, ladder = null, lstate = null, lcfg = null, venue = null, agentLed = null, agentCfg = null, agentEq = null;   // #B21
   const readRule = async () => {
     if (!ruleRead) { const [r] = await db.execute('SELECT * FROM pump_armed_rules WHERE symbol = ? AND active = 1 LIMIT 1', [symbol]); rule = r.length ? r[0] : null; ruleRead = true; }
     return rule;
@@ -12690,6 +12951,12 @@ async function mayAutoTrade(intent, opts = {}) {
   const readVenue = async () => {   // one balances read per call, shared by checks 8, 9 and 13; null = unreadable
     if (venue !== null) return venue;
     venue = false;
+    if (path === 'agent' && agentLed && agentLed.mode !== 'live') {   // #B21 paper: the ledger IS the balance - no venue read
+      const lq = Number((agentLed.positions[coin] || {}).qty) || 0;
+      venue = { available: lq, cash: agentLed.cash_usd };
+      inputs.ledger = { qty: lq, cash: agentLed.cash_usd, mode: agentLed.mode };
+      return venue;
+    }
     if (exchange === 'revolut') {
       const b = await revolutRequest('GET', '/balances');
       const list = Array.isArray(b) ? b : (b && (b.data || b.balances)) || [];
@@ -12707,17 +12974,27 @@ async function mayAutoTrade(intent, opts = {}) {
       }
       venue = { available, cash };
     }
+    if (path === 'agent' && venue && agentLed) {   // #B21 live: never more than the ledger owns, never cash a loop has reserved
+      const lq = Number((agentLed.positions[coin] || {}).qty) || 0;
+      const reserved = (await pendingReservations()).filter(c => c.kind !== 'agent').reduce((a, c) => a + c.usd, 0);
+      venue = { available: Math.min(venue.available, lq), cash: Math.min(venue.cash - reserved, agentLed.cash_usd) };
+      inputs.ledger = { qty: lq, cash: agentLed.cash_usd, mode: agentLed.mode, venue_reserved: reserved };
+    }
     return venue;
   };
 
   const decide = async () => {
     // 0. Intent well-formed
     at = 0;
-    const SELL_ONLY = ['loop_trail', 'manual_trail', 'away_sell'], BUY_ONLY = ['trough', 'trough_standalone', 'away_buy'], BOTH = ['ladder', 'ai_analysis'];
+    const SELL_ONLY = ['loop_trail', 'manual_trail', 'away_sell'], BUY_ONLY = ['trough', 'trough_standalone', 'away_buy'], BOTH = ['ladder', 'ai_analysis', 'agent'];   // #B21 agent
     if (!coin || !['sell', 'buy'].includes(side) || !['revolut', 'kraken'].includes(exchange) || !(price > 0) || !Number.isFinite(price)) return no('invalid_intent');
     if (!(SELL_ONLY.includes(path) || BUY_ONLY.includes(path) || BOTH.includes(path))) return no('invalid_intent');
     if ((side === 'sell' && BUY_ONLY.includes(path)) || (side === 'buy' && SELL_ONLY.includes(path))) return no('invalid_intent');
-    if (it.trigger != null && !['trailing_stop', 'fixed_target', 'pump_alert'].includes(it.trigger)) return no('invalid_intent');
+    if (it.trigger != null && !(['trailing_stop', 'fixed_target', 'pump_alert'].includes(it.trigger) || (path === 'agent' && it.trigger === 'agent'))) return no('invalid_intent');
+    if (path === 'agent') {   // #B21 an agent intent always says so, trades Revolut X only, and names its decision row
+      if (it.trigger !== 'agent' || exchange !== 'revolut') return no('invalid_intent');
+      inputs.trigger = 'agent'; inputs.agent_decision_id = ref.agent_decision_id != null ? ref.agent_decision_id : null;
+    }
     if (it.confidence != null && !['High', 'Medium', 'Low'].includes(it.confidence)) return no('invalid_intent');
     if ((it.qty != null && !(Number(it.qty) > 0)) || (it.usd != null && !(Number(it.usd) > 0))) return no('invalid_intent');
     if (side === 'sell') {
@@ -12768,6 +13045,11 @@ async function mayAutoTrade(intent, opts = {}) {
       enabled = await isAwayActionable(coin);
     } else if (path === 'ai_analysis') {
       enabled = !!(cfg.per_coin_enabled && cfg.per_coin_enabled[coin] === true);
+    } else if (path === 'agent') {   // #B21 the ledger decides: paper or live, not stopped, not frozen (halted = neither mode)
+      try { agentLed = await readAgentLedger(); } catch (e) { return unreadable('agent_ledger', e); }
+      inputs.agent = { mode: agentLed.mode, stopped: agentLed.stopped, frozen_until: agentLed.frozen_until ? new Date(agentLed.frozen_until).toISOString() : null };
+      if (side === 'buy' && agentLed.frozen_until && agentLed.frozen_until > now) { inputs.path_enabled = false; return no('agent_frozen'); }   // frozen = no new buys; cutting is its charter (Fable 20:50)
+      enabled = ['paper', 'live'].includes(agentLed.mode) && !agentLed.stopped;
     }
     inputs.path_enabled = !!enabled;
     if (!enabled) return no('path_not_enabled');
@@ -12783,7 +13065,7 @@ async function mayAutoTrade(intent, opts = {}) {
 
     // 4. Trigger allow-list - sells only; buys carry no trigger and skip it
     at = 4;
-    if (side === 'sell' && !(cfg.allowed_triggers || []).includes(inputs.trigger)) return no('trigger_not_allowed');
+    if (side === 'sell' && path !== 'agent' && !(cfg.allowed_triggers || []).includes(inputs.trigger)) return no('trigger_not_allowed');   // #B21 4/5 gate the AI-analysis paths, not the agent
 
     // 5. Confidence
     at = 5;
@@ -12794,7 +13076,10 @@ async function mayAutoTrade(intent, opts = {}) {
     }
 
     // 6. Floor, 7. slippage margin (a flag, never a NO)
-    if (side === 'sell') {
+    if (side === 'sell' && path === 'agent') {   // #B21 6/7 skipped (Bryan: it may sell at a loss) - the cost is recorded so every loss-sale shows as one
+      const ap = agentLed.positions[coin] || {};
+      inputs.floor = { cost: Number(ap.qty) > 0 ? Number(ap.cost_usd) / Number(ap.qty) : null, source: 'agent_ledger' };
+    } else if (side === 'sell') {
       at = 6;
       const d = await computeDerivedFloor(symbol, coin);
       inputs.floor = { floor: d.floor, source: d.source, cost: d.cost };
@@ -12873,7 +13158,9 @@ async function mayAutoTrade(intent, opts = {}) {
     // 13. Size cap - the caller must place size_cap, never intent.qty
     at = 13;
     let cap;
-    if (side === 'sell') {
+    if (side === 'sell' && path === 'agent') {   // #B21 what the ledger owns; max_sell_pct is the loops' rail, not the agent's
+      cap = Math.min(it.qty != null ? Number(it.qty) : Infinity, inputs.available); inputs.cap_pct = 100;
+    } else if (side === 'sell') {
       const capPct = Math.min(cfg.max_sell_pct != null ? Number(cfg.max_sell_pct) : 100, ref.sell_pct != null ? Number(ref.sell_pct) : 100);
       if (!Number.isFinite(capPct)) return unreadable('max_sell_pct / ref.sell_pct not numeric');
       inputs.cap_pct = capPct;
@@ -12890,6 +13177,11 @@ async function mayAutoTrade(intent, opts = {}) {
         inputs.away_cap_left = awayLeft;
       }
       cap = Math.min(it.usd != null ? Number(it.usd) : Infinity, inputs.cash, awayLeft);
+      if (path === 'agent') {   // #B21 at most per_trade_pct of the agent's equity per trade
+        agentCfg = agentCfg || await readAgentConfig(); agentEq = agentEq || await agentEquity(agentLed);
+        inputs.equity = Number(agentEq.equity.toFixed(6)); inputs.cap_pct = agentCfg.per_trade_pct;
+        cap = Math.min(cap, agentEq.equity * agentCfg.per_trade_pct / 100);
+      }
     }
     inputs.size_cap = cap;
     res.size_cap = cap;
@@ -12897,6 +13189,25 @@ async function mayAutoTrade(intent, opts = {}) {
 
     // 14. Pair minimums - reserved; passes until built, reads nothing
     at = 14;
+
+    // #B21 15-18: the agent's own rails (agent path only; nothing above is renumbered)
+    if (path === 'agent') {
+      agentCfg = agentCfg || await readAgentConfig();
+      at = 15;   // universe - buys only: a coin it already holds can always be sold
+      if (side === 'buy') { inputs.universe = await agentUniverseOk(coin); if (!inputs.universe) return no('outside_universe'); }
+      at = 16;   // positions
+      const held = Object.entries(agentLed.positions).filter(([, p]) => Number(p && p.qty) > 0).map(([c]) => c);
+      inputs.positions = held.length;
+      if (side === 'buy' && !held.includes(coin) && held.length >= agentCfg.max_positions) return no('max_positions');
+      at = 17;   // daily loss / drawdown refuse BUYS only - a sell reduces risk (Fable 20:50); the caller freezes (24 h) or halts
+      agentEq = agentEq || await agentEquity(agentLed);
+      inputs.equity = Number(agentEq.equity.toFixed(6)); inputs.day_start_equity = agentLed.day_start_equity_usd; inputs.high_water = agentLed.high_water_usd;
+      if (side === 'buy' && agentLed.day_start_equity_usd > 0 && agentEq.equity <= agentLed.day_start_equity_usd * (1 - agentCfg.daily_loss_pct / 100)) return no('daily_loss_stop');
+      if (side === 'buy' && agentLed.high_water_usd > 0 && agentEq.equity <= agentLed.high_water_usd * (1 - agentCfg.drawdown_halt_pct / 100)) return no('drawdown_halt');
+      at = 18;   // minimum trade - selling a whole small position is never blocked
+      const closesAll = side === 'sell' && cap >= inputs.available * 0.999;
+      if (!closesAll && (side === 'sell' ? cap * price : cap) < agentCfg.min_trade_usd) return no('below_min_trade');
+    }
 
     res.ok = true; res.reason = 'ok'; res.check_no = null;
     return res;
@@ -14165,7 +14476,7 @@ async function checkPortfolio() {
             const [recentTrade] = await db.execute(
               `SELECT id FROM trading_journal
                WHERE action IN ('buy', 'add')
-               AND source IN ('claude_mcp', 'auto_detected', 'manual')
+               AND source IN ('claude_mcp', 'auto_detected', 'manual', 'agent')   -- #B21
                AND created_at > DATE_SUB(NOW(), INTERVAL 10 MINUTE)
                LIMIT 1`
             ).catch(() => [[]]);
@@ -14320,7 +14631,7 @@ async function checkPortfolio() {
           const [recentBuy86] = await db.execute(
             `SELECT id FROM trading_journal
              WHERE action IN ('buy', 'add')
-             AND source IN ('claude_mcp', 'auto_detected', 'manual')
+             AND source IN ('claude_mcp', 'auto_detected', 'manual', 'agent')
              AND created_at > DATE_SUB(NOW(), INTERVAL 10 MINUTE)
              LIMIT 1`
           ).catch(() => [[]]);
@@ -23243,6 +23554,27 @@ app.post('/telegram-webhook', async (req, res) => {
       if (videoScanInProgress) { await sendReply('A video scan is already running (' + ((lastVideoScan && lastVideoScan.sources_done) || 0) + ' of ' + ((lastVideoScan && lastVideoScan.sources_total) || '?') + ' channels done). The summary will arrive when it finishes.'); return res.status(200).json({ ok: true }); }
       await sendReply('🎥 Scanning the YouTube channels - Gemini watches each new video (up to 3 per channel, under an hour long). A summary arrives when it is done, usually within 10 minutes.');
       scanYoutubeSources({ notify: true, trigger: 'telegram' }).catch(async (e) => { console.error('[feeds] /videos failed:', e.message); await sendTelegram('❌ Video scan failed: ' + escTg(e.message)); });
+      return res.status(200).json({ ok: true });
+    }
+    if (/^agent(\s|$)/.test(commandText)) {   // #B21 A1: /agent, /agent stop, /agent resume [confirm]
+      const sub = commandText.replace(/^agent\s*/, '').trim();
+      try {
+        if (sub === '' || sub === 'status') await sendReply(await agentStatusText());
+        else if (sub === 'stop') {
+          await db.execute('UPDATE agent_ledger SET stopped = 1 WHERE id = 1');
+          await sendReply('⏹️ Agent <b>stopped</b>. It will not trade until <code>/agent resume</code>. Its positions stay as they are.');
+        } else if (sub === 'resume') {
+          const led = await readAgentLedger();
+          if (led.mode === 'halted') await sendReply('⚠️ The agent is <b>halted</b> (' + escTg(led.halt_reason || '') + '). A halt is a failed proof, so restarting is a decision.\nReply <code>/agent resume confirm</code> to restart it in ' + escTg(led.halted_from || 'paper') + ' mode.');
+          else { await db.execute('UPDATE agent_ledger SET stopped = 0, frozen_until = NULL WHERE id = 1'); await sendReply('▶️ Agent resumed (' + escTg(led.mode) + ').'); }
+        } else if (sub === 'resume confirm') {
+          const led = await readAgentLedger();
+          const back = led.mode === 'halted' ? (led.halted_from === 'live' ? 'live' : 'paper') : led.mode;
+          await db.execute('UPDATE agent_ledger SET mode = ?, halted_from = NULL, stopped = 0, frozen_until = NULL WHERE id = 1', [back]);
+          await sendReply('▶️ Agent running in <b>' + escTg(back) + '</b> mode.');
+        } else if (sub === 'think') await sendReply('The research-and-decide run arrives with A2. For now <code>/agent</code> shows its ledger.');
+        else await sendReply('Agent commands: <code>/agent</code> (status) · <code>/agent stop</code> · <code>/agent resume</code>');
+      } catch (e) { await sendReply('❌ Agent: ' + escTg(e.message)); }
       return res.status(200).json({ ok: true });
     }
     if (commandText === 'brief') {
