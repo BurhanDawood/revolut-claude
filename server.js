@@ -1579,7 +1579,8 @@ await db.execute(`CREATE TABLE IF NOT EXISTS agent_alerts (
   value DECIMAL(24,12) NOT NULL, source VARCHAR(16) NOT NULL, why VARCHAR(200) NULL, ref_price DECIMAL(24,12) NULL, ref_high DECIMAL(24,12) NULL, ref_low DECIMAL(24,12) NULL,
   expires_at DATETIME NOT NULL, status VARCHAR(12) NOT NULL DEFAULT 'armed', fired_at DATETIME NULL, fired_price DECIMAL(24,12) NULL, INDEX idx_status (status)
 )`).catch(e => console.error('[migration] agent_alerts:', e.message));   // #A2e the agent's own wake-up conditions
-await safeAddColumn('agent_decisions', 'stop_price', 'DECIMAL(24,12) NULL');   // #A2e a buy's "wrong if" as a price the watcher can check
+await safeAddColumn('agent_decisions', 'stop_price', 'DECIMAL(24,12) NULL');
+await safeAddColumn('agent_alerts', 'hit_at', 'DATETIME NULL');   // #A2f first check that met the condition (agent alerts confirm on a second)   // #A2e a buy's "wrong if" as a price the watcher can check
 setTimeout(() => { repairAgentFills().catch(e => console.error('[agent] boot repair failed:', e.message)); }, 30 * 1000);   // #B21 a fill recorded but not applied before a restart
 await safeAddColumn('trailing_stops',   'auto_execute',    'TINYINT(1) NOT NULL DEFAULT 0'); // #93
 await safeAddColumn('price_targets',    'sell_pct',        'DECIMAL(5,2) NULL'); // #144 per-rung sell %% override for Away Mode up-targets
@@ -8003,8 +8004,8 @@ function agentAlertHit(a, price) {   // a: { kind, value, ref_high, ref_low } ->
 }
 function agentAlertText(a) {
   const v = Number(a.value), p = (x) => fmtPriceShort(Number(x));
-  if (a.kind === 'price_below') return a.symbol + ' below $' + p(v);
-  if (a.kind === 'price_above') return a.symbol + ' above $' + p(v);
+  if (a.kind === 'price_below') return a.symbol + ' below ' + p(v);   // #A2f fmtPriceShort prints the $
+  if (a.kind === 'price_above') return a.symbol + ' above ' + p(v);
   if (a.kind === 'drop_from_high_pct') return a.symbol + ' ' + v + '% off its high';
   return a.symbol + ' ' + v + '% up from its low';
 }
@@ -8030,7 +8031,7 @@ async function agentAlertTick() {
   if (_agentAlertTicking || _agentRunning) return { skipped: 'busy' };
   _agentAlertTicking = true;
   try {
-    const [rows] = await db.execute("SELECT id, run_id, symbol, kind, value, source, why, ref_price, ref_high, ref_low, expires_at, created_at FROM agent_alerts WHERE status = 'armed'");
+    const [rows] = await db.execute("SELECT id, run_id, symbol, kind, value, source, why, ref_price, ref_high, ref_low, expires_at, created_at, hit_at FROM agent_alerts WHERE status = 'armed'");
     if (!rows.length) return { armed: 0 };
     const led = await readAgentLedger();
     if (led.mode !== 'paper' || led.stopped || await isAutoExecPaused()) return { skipped: 'agent not running' };
@@ -8047,7 +8048,13 @@ async function agentAlertTick() {
       const t = tick[a.symbol]; if (!t) continue;
       const hi = Math.max(Number(a.ref_high) || 0, t.mid), lo = Math.min(Number(a.ref_low) || Infinity, t.mid);
       if (hi !== Number(a.ref_high) || lo !== Number(a.ref_low)) { a.ref_high = hi; a.ref_low = lo; await db.execute('UPDATE agent_alerts SET ref_high = ?, ref_low = ? WHERE id = ?', [hi, lo, a.id]); }
-      if (agentAlertHit(a, t.mid)) fired.push({ ...a, price_now: t.mid });
+      const hit = agentAlertHit(a, t.mid);
+      if (hit && a.source === 'agent' && !(a.hit_at && now - new Date(a.hit_at).getTime() >= 90000)) {   // #A2f confirm on a second check
+        if (!a.hit_at) await db.execute('UPDATE agent_alerts SET hit_at = NOW() WHERE id = ?', [a.id]);
+        continue;
+      }
+      if (!hit && a.hit_at) { await db.execute('UPDATE agent_alerts SET hit_at = NULL WHERE id = ?', [a.id]); continue; }   // a wick: reset
+      if (hit) fired.push({ ...a, price_now: t.mid });
     }
     if (!fired.length) return { armed: live.length, fired: 0 };
     const cfg = { ...AGENT_A2_DEFAULTS, ...(await readAgentConfig()) };
