@@ -1508,6 +1508,7 @@ await safeAddColumn('trading_journal',  'source',          "VARCHAR(20) DEFAULT 
 await safeAddColumn('trading_journal',  'updated_at',      'TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP');
 await safeAddColumn('trading_journal',  'realised_pnl_usd', 'DECIMAL(20,8) NULL');
 await safeAddColumn('trading_journal',  'venue_tx_id',     'VARCHAR(64) NULL UNIQUE');
+await safeAddColumn('trading_journal',  'reason_tag',      'VARCHAR(24) NULL');   // #L0 structured why (NULL = untagged, never reconstructed)
 await safeAddColumn('trailing_stops',   'auto_execute',    'TINYINT(1) NOT NULL DEFAULT 0'); // #93
 await safeAddColumn('price_targets',    'sell_pct',        'DECIMAL(5,2) NULL'); // #144 per-rung sell %% override for Away Mode up-targets
 await safeAddColumn('trailing_stops',   'sell_pct',        'DECIMAL(10,4) DEFAULT 25.0');   // #93
@@ -2886,6 +2887,8 @@ async function handleMoneyButton(typeCode, idStr, choice, reply) {
 // The meaning of each choice is STORED in trade_alert_choices when the alert is drawn, so a button
 // always does exactly what its label said - even after a restart, and even if new trades have since
 // landed in the time window (re-deriving the options at tap time could shift them).
+// #L0 structured reason tags - validated in code, not an ENUM (the list will grow)
+const REASON_TAGS = new Set(['took_profit','cut_loss','dip_buy','rebalance_in','rebalance_out','topup','payment','thesis_change','funding','other']);
 let _tradeChoiceTableReady = false;
 async function ensureTradeChoiceTable() {
   if (_tradeChoiceTableReady) return;
@@ -2940,9 +2943,11 @@ async function buildTradeKeyboard(journalId, coinBase, action) {
     opts.push({ label: 'Top-up for spending', act: 'topup', from: null });
     opts.push({ label: 'Paid with it', act: 'payment', from: null });
     opts.push({ label: 'Rebalance', act: 'rebalance_out', from: null });
+    opts.push({ label: 'Thesis changed', act: 'thesis', from: null });    // #L0
+    opts.push({ label: 'Funding a buy', act: 'funding', from: null });    // #L0
     opts.push({ label: 'Skip', act: 'skip', from: null });
   }
-  const top = opts.slice(0, 5);
+  const top = opts.slice(0, 7);   // #L0 sells now have 7 (4 rows of 2); buys stay at <= 5
   for (let i = 0; i < top.length; i++) {
     await db.execute(
       'INSERT INTO trade_alert_choices (journal_id, choice, act, from_coin, label) VALUES (?, ?, ?, ?, ?) ' +
@@ -2961,6 +2966,27 @@ function clearPendingTradeFor(coin, journalId) {
     const p = pendingTradeContext.get(key);
     if (p && p.journalId === journalId) { clearTimeout(p.timeoutHandle); pendingTradeContext.delete(key); }
   }
+}
+
+// #L0 Sunday digest: manual trades still unanswered after the 30-min timer, re-offered with the same stateless buttons.
+// The row filter is exactly handleTradeButton's UNRESOLVED set, so every button offered can still be claimed.
+async function sendUntaggedTradesDigest() {
+  try {
+    const [rows] = await db.execute(
+      `SELECT id, symbol, action, price, value_usd, created_at FROM trading_journal
+       WHERE reason_tag IS NULL AND reasoning IN ('auto-detected', 'no reason provided')
+         AND action IN ('buy', 'sell', 'add')
+         AND created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY) AND created_at < DATE_SUB(NOW(), INTERVAL 35 MINUTE)
+       ORDER BY created_at ASC LIMIT 10`);
+    if (!rows.length) return;                       // silent when there is nothing to ask
+    await sendTelegram('📋 <b>' + rows.length + ' trade' + (rows.length === 1 ? '' : 's') + ' this week ' + (rows.length === 1 ? 'has' : 'have') + ' no reason tag</b> - tap one below each, or ignore.');
+    for (const r of rows) {
+      const coin = String(r.symbol).replace('-USD', '').toUpperCase();
+      const when = new Date(r.created_at).toLocaleString('en-GB', { timeZone: 'Europe/London', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+      let kb; try { kb = await buildTradeKeyboard(r.id, coin, r.action); } catch (e) { kb = undefined; }
+      await sendTelegram(coin + ' ' + String(r.action).toUpperCase() + ' ' + when + ' - $' + Math.abs(Number(r.value_usd) || 0).toFixed(2) + ' @ ' + fmtPriceShort(Number(r.price) || 0) + ' (j' + r.id + ')', kb);
+    }
+  } catch (e) { console.error('[untagged-digest] failed:', e.message); }
 }
 
 async function handleTradeButton(idStr, choice, reply) {
@@ -3014,7 +3040,7 @@ async function handleTradeButton(idStr, choice, reply) {
     }
     const otherCoin = String(other.symbol).replace('-USD', '').toUpperCase();
     const reason = isOut ? ('Rebalance exit -- rotating into ' + otherCoin) : ('Rebalance entry -- rotated from ' + otherCoin);
-    if (!(await claim('reasoning = ?, emotion = ?', [reason, 'neutral']))) { await reply(alreadyMsg); return; }
+    if (!(await claim('reasoning = ?, emotion = ?, reason_tag = ?', [reason, 'neutral', isOut ? 'rebalance_out' : 'rebalance_in']))) { await reply(alreadyMsg); return; }   // #L0
     clearPendingTradeFor(coin, id);
     const sellSide = isOut ? row : other, buySide = isOut ? other : row;
     await logRebalancePair({
@@ -3028,10 +3054,15 @@ async function handleTradeButton(idStr, choice, reply) {
   }
 
   let setSql, params, doneMsg;
-  if (opt.act === 'reason') { setSql = 'reasoning = ?, emotion = ?'; params = [opt.label, 'neutral']; doneMsg = 'Noted: ' + opt.label + '.'; }
-  else if (opt.act === 'topup') { setSql = 'reasoning = ?, emotion = ?'; params = ['Sold to top up for card spending - capital is counted on the card payment itself', 'neutral']; doneMsg = 'Noted: top-up for spending. Capital unchanged - the card payment itself counts it.'; }
+  if (opt.act === 'reason') {   // #L0 'Planned exit' (P&L unknown) -> other
+    const tag = ({ 'Took profit': 'took_profit', 'Cut loss': 'cut_loss', 'Dip buy': 'dip_buy' })[opt.label] || 'other';
+    setSql = 'reasoning = ?, emotion = ?, reason_tag = ?'; params = [opt.label, 'neutral', tag]; doneMsg = 'Noted: ' + opt.label + '.';
+  }
+  else if (opt.act === 'topup') { setSql = 'reasoning = ?, emotion = ?, reason_tag = ?'; params = ['Sold to top up for card spending - capital is counted on the card payment itself', 'neutral', 'topup']; doneMsg = 'Noted: top-up for spending. Capital unchanged - the card payment itself counts it.'; }
   else if (opt.act === 'transfer') { setSql = "action = 'transfer', reasoning = ?, emotion = ?"; params = ['Internal transfer - invested capital unchanged', 'neutral']; doneMsg = 'Logged as a transfer - capital unchanged.'; }
-  else if (opt.act === 'payment') { setSql = "action = 'payment', reasoning = ?, emotion = ?"; params = ['Paid directly with ' + coin + ' via card', 'neutral']; doneMsg = 'Logged as a payment made with ' + coin + '.'; }
+  else if (opt.act === 'payment') { setSql = "action = 'payment', reasoning = ?, emotion = ?, reason_tag = ?"; params = ['Paid directly with ' + coin + ' via card', 'neutral', 'payment']; doneMsg = 'Logged as a payment made with ' + coin + '.'; }
+  else if (opt.act === 'thesis') { setSql = 'reasoning = ?, emotion = ?, reason_tag = ?'; params = ['Thesis changed', 'neutral', 'thesis_change']; doneMsg = 'Noted: thesis changed.'; }   // #L0
+  else if (opt.act === 'funding') { setSql = 'reasoning = ?, emotion = ?, reason_tag = ?'; params = ['Sold to fund a buy', 'neutral', 'funding']; doneMsg = 'Noted: funding a buy.'; }   // #L0
   else if (opt.act === 'skip') { setSql = 'reasoning = ?, emotion = ?'; params = ['Skipped via button - no reason given', 'neutral']; doneMsg = 'Skipped.'; }
   else { await reply('\u26a0\ufe0f Unrecognised option.'); return; }
 
@@ -15780,6 +15811,7 @@ cron.schedule('15 9 * * *', async () => {   // #416 daily brief (Bryan 24 Sep): 
   catch (e) { console.error('[brief] 09:15 cron failed:', e.message); await sendTelegram('\u274c Morning brief failed: ' + escTg(e.message)); }
 }, { timezone: 'Europe/London' });
 cron.schedule('0 10 * * *', checkIntentionOutcomes, { timezone: 'Europe/London' });
+cron.schedule('0 18 * * 0', sendUntaggedTradesDigest, { timezone: 'Europe/London' });   // #L0 Sunday 18:00 London
 
 // #50: prune intraday prices older than 30 days
 cron.schedule('15 2 * * *', async () => {
@@ -18649,6 +18681,7 @@ let rows;
       reasoning:              z.string().optional().describe('Why the trade was or will be made'),
       emotion:                z.enum(['confident', 'uncertain', 'fomo', 'fearful', 'neutral']).optional().describe('Emotional state'),
       followed_recommendation: zLoose(z.boolean()).optional().describe('Whether Claude recommendation was followed'),
+      reason_tag:             z.string().optional().describe('#L0 log_journal: structured why - took_profit | cut_loss | dip_buy | rebalance_in | rebalance_out | topup | payment | thesis_change | funding | other. Anything else is stored as NULL (never coerced).'),
       expires_hours:          z.coerce.number().optional().describe('Hours until intention expires, default 24'),
       key:                    z.string().optional().describe('Preference key for save_preference'),
       value:                  z.string().optional().describe('Preference value for save_preference'),
@@ -18756,7 +18789,7 @@ let rows;
       candles_since:    z.string().optional().describe('#370 candles_backfill start: earliest date to reach back to, YYYY-MM-DD (default 2023-01-01; each coin stops at its own listing date)'),
       reconciler_on:    z.preprocess(v => v === 'true' ? true : (v === 'false' ? false : v), z.boolean()).optional().describe('#355 reconciler_switch: true = record card payments/deposits from Revolut transactions (runs once immediately, then every 30 min); false = dry run only'),
     },
-    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, expires_hours, key, value, amount, away_buy_usd, away_sell_pct, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam, manual_only_symbols: manualOnlyParam, title, detail, category, status: devStatus, source: devSource, related_symbol: relSymbol, dev_log_id, active_workstream, progress, open_threads, next_action, recent_decision, recent_decisions, cs_status, cs_role, cs_theme, cs_strategy_md, pm_decision, pm_principle_tag, pm_conviction, pm_captured_by, pm_supersedes_id, dev_decision, dev_principle_tag, dev_cross_thread, dev_alternatives, dev_related_log, dev_supersedes_id, journal_id, tax_lot_id, away_action, away_coins, sell_floors, per_coin_enabled, catalyst_id, catalyst, catalyst_date, catalyst_type, expected_impact, priced_in_risk, catalyst_confidence, catalyst_source, catalyst_status, abn_alert_floor_pct, abn_broad_floor_pct, abn_broad_threshold, abn_cooldown_min, dnd_action, dnd_coins, dnd_arm_pct, dnd_trail_pct, dnd_sell_pct, dnd_retrace_pct, dnd_bounce_pct, conviction, bull_case, bear_case, invalidation_triggers, supporting_refs, tn_enabled, tn_min_severity, tn_cooldown_min, cat_kind, cat_key, cat_name, cat_active, cat_description, cat_detection_signals, cat_detection_criteria, cat_data_available, cat_data_gap, cat_dev_ref, cat_status, cat_what_it_does, cat_when_it_wins, cat_when_it_loses, cat_parameters, cat_conflicts, cat_evidence, cat_notes, ledger_confirm, ledger_run_id, reconciler_on, candles_op, candles_symbols, candles_since, candles_interval }) => {
+    async ({ action, symbol, trade_action, price, quantity, reasoning, emotion, followed_recommendation, reason_tag, expires_hours, key, value, amount, away_buy_usd, away_sell_pct, capital_type, note, enabled, sweep_pct, min_trade_value_usd, excluded_symbols, max_sell_pct, allowed_triggers, require_confidence, cooldown_minutes, hodl_symbols: hodlSymbolsParam, manual_only_symbols: manualOnlyParam, title, detail, category, status: devStatus, source: devSource, related_symbol: relSymbol, dev_log_id, active_workstream, progress, open_threads, next_action, recent_decision, recent_decisions, cs_status, cs_role, cs_theme, cs_strategy_md, pm_decision, pm_principle_tag, pm_conviction, pm_captured_by, pm_supersedes_id, dev_decision, dev_principle_tag, dev_cross_thread, dev_alternatives, dev_related_log, dev_supersedes_id, journal_id, tax_lot_id, away_action, away_coins, sell_floors, per_coin_enabled, catalyst_id, catalyst, catalyst_date, catalyst_type, expected_impact, priced_in_risk, catalyst_confidence, catalyst_source, catalyst_status, abn_alert_floor_pct, abn_broad_floor_pct, abn_broad_threshold, abn_cooldown_min, dnd_action, dnd_coins, dnd_arm_pct, dnd_trail_pct, dnd_sell_pct, dnd_retrace_pct, dnd_bounce_pct, conviction, bull_case, bear_case, invalidation_triggers, supporting_refs, tn_enabled, tn_min_severity, tn_cooldown_min, cat_kind, cat_key, cat_name, cat_active, cat_description, cat_detection_signals, cat_detection_criteria, cat_data_available, cat_data_gap, cat_dev_ref, cat_status, cat_what_it_does, cat_when_it_wins, cat_when_it_loses, cat_parameters, cat_conflicts, cat_evidence, cat_notes, ledger_confirm, ledger_run_id, reconciler_on, candles_op, candles_symbols, candles_since, candles_interval }) => {
       // Make hodl_symbols accessible in configure_auto_execute via params object
       const params = { hodl_symbols: hodlSymbolsParam, manual_only_symbols: manualOnlyParam };
 
@@ -18787,25 +18820,27 @@ let rows;
           // on error, fall through to normal INSERT (fail open — never lose a trade)
         }
 
+        const rTag = (typeof reason_tag === 'string' && REASON_TAGS.has(reason_tag)) ? reason_tag : null;   // #L0 validated, never coerced
         if (existingId) {
           // Enrich the existing row instead of inserting a duplicate
           await db.execute(
             `UPDATE trading_journal
              SET reasoning = COALESCE(?, reasoning),
                  emotion = COALESCE(?, emotion),
-                 followed_recommendation = COALESCE(?, followed_recommendation)
+                 followed_recommendation = COALESCE(?, followed_recommendation),
+                 reason_tag = COALESCE(?, reason_tag)
              WHERE id = ?`,
-            [reasoning ?? null, emotion ?? null, followed_recommendation ?? null, existingId]
+            [reasoning ?? null, emotion ?? null, followed_recommendation ?? null, rTag, existingId]
           );
           console.log('[log_journal] Enriched existing row ' + existingId + ' instead of inserting duplicate');
-          return { content: [{ type: 'text', text: JSON.stringify({ ok: true, journal_id: existingId, enriched: true }) }] };
+          return { content: [{ type: 'text', text: JSON.stringify({ ok: true, journal_id: existingId, enriched: true, reason_tag: rTag }) }] };
         }
 
         const [result] = await db.execute(
-          'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, followed_recommendation) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-          [coinBase, trade_action, price ?? null, quantity ?? null, valueUsd, reasoning ?? null, emotion ?? null, followed_recommendation ?? null]
+          'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, followed_recommendation, reason_tag) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+          [coinBase, trade_action, price ?? null, quantity ?? null, valueUsd, reasoning ?? null, emotion ?? null, followed_recommendation ?? null, rTag]
         );
-        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, journal_id: result.insertId, symbol: coinBase, action: trade_action, price }) }] };
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, journal_id: result.insertId, symbol: coinBase, action: trade_action, price, reason_tag: rTag }) }] };
 
       } else if (action === 'log_intention') {
         // #228: mirror log_journal #115 guard + #213 null-coalesce. trade_action was bound raw, so an
@@ -22222,7 +22257,8 @@ app.post('/telegram-webhook', async (req, res) => {
       }
       // callback_data is capped at 64 BYTES by Telegram, so keep it minimal: a:<coin>:<choice>
       const cbData = (cbq.data || '').trim();
-      const cbMatch = cbData.match(/^a:([a-z0-9]{1,12}):([1-5])(?::([a-z]{1,3}))?$/i);
+      const cbMatch = cbData.match(/^a:([a-z0-9]{1,12}):([1-5])(?::([a-z]{1,3}))?$/i)
+        || cbData.match(/^a:(\d{1,12}):([67]):(tj)$/i);   // #L0 sell Trade Detected keyboards have 7 choices - tj ONLY, never a money button
       if (!cbMatch) {
         await ackCb('Unrecognised button');
         return res.status(200).json({ ok: true });
