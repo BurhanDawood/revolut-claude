@@ -46,6 +46,7 @@ const SKIP_CURRENCIES = ['USD', 'USDT', 'USDC', 'EUR', 'GBP'];
 
 // Coins held on Kraken — not in Revolut X tickers, need separate price fetch
 const KRAKEN_MONITORED_COINS = ['GHIBLI-USD', 'ZK-USD', 'XPL-USD', 'TAO-USD'];
+const PROCESS_STARTED_AT = Date.now();   // #K1 (d) the first Kraken private call waits until 60 s after boot
 
 // Explicit Kraken pair names — avoids guessing for non-standard pairs
 const KRAKEN_PAIR_MAP = {
@@ -169,10 +170,16 @@ async function placeRevolutOrder(symbol, side, orderType, baseSize, price = null
     order_configuration: orderConfig,
   };
   console.log('[revolut] Placing order:', JSON.stringify(body));
-  const result = await revolutRequest('POST', '/orders', body);
+  // #K1 withStatus: the thrown error carries the HTTP status (venue_status), so the #93 sale can tell a rate limit (429,
+  // nothing placed) from an ambiguous failure. A non-2xx answer now always throws (it used to count as placed when the
+  // body had no message field); an unreadable body throws as before (JSON.parse used to throw).
+  const rs = await revolutRequest('POST', '/orders', body, null, { withStatus: true });
+  const result = rs.body || {};
   console.log('[revolut] Full order response:', JSON.stringify(result));
-  if (result.message || result.error || result.errors) {
-    throw new Error(result.message || JSON.stringify(result.error || result.errors));
+  if (!rs.ok || result.raw !== undefined || result.message || result.error || result.errors) {
+    const oe = new Error(result.message || ((result.error || result.errors) ? JSON.stringify(result.error || result.errors) : (result.raw !== undefined ? 'unreadable venue response (HTTP ' + rs.status + '): ' + result.raw : 'HTTP ' + rs.status)));
+    oe.venue_status = rs.status;
+    throw oe;
   }
   // hash47a Phase A - record every order placed (additive; no pipeline change).
   // Captures venue order id + initial status so the Phase B fill-confirmation loop can later
@@ -3634,6 +3641,8 @@ async function krakenRequest(path, data = {}) {
   if (!apiKey || !privateKey) {
     throw new Error('Kraken API credentials not configured. Add KRAKEN_API_KEY and KRAKEN_PRIVATE_KEY to Railway environment variables.');
   }
+  const k1Wait = PROCESS_STARTED_AT + 60000 - Date.now();   // #K1 (d) during a deploy the old instance may still be using this key
+  if (k1Wait > 0) { console.log('[kraken] #K1 boot delay: first private call waits ' + Math.ceil(k1Wait / 1000) + ' s'); await new Promise(r => setTimeout(r, k1Wait)); }
 
   try {
     const nonce    = Date.now().toString();
@@ -7363,6 +7372,13 @@ async function runExecutionWatchdog(priceOf) {
       kind = 'STUCK'; detail = 'armed since ' + (r.armed_since ? new Date(r.armed_since).toISOString().slice(11, 16) + ' UTC' : '?') + ', but it has NO trailing stop and no pending buy-back - it can never sell and never re-arm. Fix: reset_cycle.';
     } else if (ts && price && price <= ts.stopPrice && paused) {   // #F1 held by the emergency stop - correct, not a failure
       kind = 'HELD'; detail = 'price ' + price + ' is at/below the stop ' + ts.stopPrice + ' - held by /pause (correctly not selling). It will sell on the first scan after /resume confirm.';
+    } else if (ts && price && price <= ts.stopPrice && venueBackoffUntil(ts.exchange || (KRAKEN_MONITORED_COINS.includes(sym) ? 'kraken' : 'revolut'))) {   // #K1
+      // Held by a venue back-off: K1 has already said so on Telegram, so this is recorded, not re-alerted. The PAST grace
+      // starts again when the back-off ends.
+      const w = _watchdog.get(sym);
+      if (!w || w.kind !== 'BACKOFF') console.log('[watchdog] ' + sym + ' BACKOFF: price ' + price + ' at/below the stop ' + ts.stopPrice + ' - held by a venue back-off until ' + new Date(venueBackoffUntil(ts.exchange || (KRAKEN_MONITORED_COINS.includes(sym) ? 'kraken' : 'revolut'))).toISOString().slice(11, 16) + ' UTC');
+      _watchdog.set(sym, { kind: 'BACKOFF', since: now, alerted: false });
+      continue;
     } else if (ts && price && price <= ts.stopPrice) {
       const w = _watchdog.get(sym);
       const since = w && w.kind === 'PAST' ? w.since : now;
@@ -13206,6 +13222,7 @@ async function floorCappedLimitSell(symbol, qty, floor, refPrice, clientOrderId,
 
 async function autoExecuteSell(symbol, maxPct, analysis, confidence, opts = {}) {
   const coinBase = symbol.replace('-USD', '');
+  let aeOrderSent = false;   // #K1 (a) true from the moment an order request goes to the venue
   try {
     if (await isAutoExecPaused()) { console.log('[auto-exec] #F1 ' + coinBase + ' sell refused - auto-exec paused'); return { executed: false, reason: 'paused' }; }
     let currentPrice = await getCurrentPrice(symbol);   // #387 let: updated to the actual fill after an EDGE limit sale
@@ -13271,6 +13288,7 @@ async function autoExecuteSell(symbol, maxPct, analysis, confidence, opts = {}) 
     }
     if (aeEdge && aeEdge.edge) {
       const wanted = sellQty;
+      aeOrderSent = true;   // #K1 (set before getPairQuoteStep inside floorCappedLimitSell, so a failure there counts as post-send: the safe direction)
       const lim = await floorCappedLimitSell(symbol, sellQty, aeEdge.floor, currentPrice, opts.clientOrderId || null);
       aeLim = lim;
       // #389 (PM #50) the first live EDGE sale is a REVIEWED event: every EDGE outcome reports exactly what it did.
@@ -13307,6 +13325,7 @@ async function autoExecuteSell(symbol, maxPct, analysis, confidence, opts = {}) 
         'Filled ' + sellQty + (sellQty < wanted ? ' of ' + wanted + ' (the rest was cancelled and is still held)' : '') + ' at ' + currentPrice + ' - never below the floor ' + aeEdge.floor + '.' +
         (lim.remainder_resting ? '\n\u26a0\ufe0f The unfilled remainder could not be cancelled and may still be resting at ' + lim.limit_price + ' (at or above the floor only). Please check Revolut X. The loop is switched OFF: no buy-back is armed and the proceeds are simply cash - nothing is reserved.' : '')).catch(() => {});
     } else {
+      aeOrderSent = true;   // #K1
       aeOrder = await placeRevolutOrder(symbol, 'sell', 'market', sellQty, null, null, opts.clientOrderId || null);
     }
 
@@ -13371,8 +13390,9 @@ async function autoExecuteSell(symbol, maxPct, analysis, confidence, opts = {}) 
     return { executed: true, qty: sellQty, price: currentPrice, client_order_id: aeOrder && aeOrder.client_order_id, journal_id: aeRevIns && aeRevIns.insertId }; // #309 #359
   } catch (e) {
     console.error('[auto-exec] sell error:', e.message);
-    await sendTelegram(`❌ AUTO-EXEC FAILED — ${coinBase}\nError: ${e.message}\nManual review needed`);
-    return { executed: false, reason: 'error', message: e.message }; // #309
+    if (aeOrderSent) await sendTelegram(`❌ AUTO-EXEC FAILED — ${coinBase}\nError: ${e.message}\nManual review needed`);
+    else await sendTelegram(`⚠️ AUTO-EXEC: ${coinBase} sale not placed - the error came before any order was sent (${String(e.message || '').slice(0, 120)}). Nothing was sold.`).catch(() => {});   // #K1
+    return { executed: false, reason: 'error', message: e.message, order_sent: aeOrderSent, venue_status: e.venue_status || null }; // #309 #K1
   }
 }
 
@@ -13396,6 +13416,42 @@ async function autoResetTrailingStop(symbol) {
 }
 
 // Reusable trailing stop alert handler — works for both Revolut X and Kraken coins
+// #K1 VENUE ERRORS ON THE #93 SALE (Fable 25 Sep; Dev design a-d with Fable's amendments).
+// Neither sell function throws: each returns { executed:false, reason:'error', message, order_sent }. The #93 path
+// restores the trail when NOTHING can have been placed - the error came before the order was sent, or the venue's own
+// code says it refused the request - and keeps today's clear-and-alert when the order may have gone (timeout, reset,
+// 5xx after sending), because a retry there could sell twice. A refusal starts a PER-VENUE back-off (the lockout is on
+// the API key): 2, 4, 8, 16, then 30-minute waits; the trails stay and keep ratcheting; one Telegram per incident and
+// one more if three waits in a row hit the cap. In memory only: a restart forgets it (one extra attempt, accepted).
+const VENUE_DEFINITIVE_KRAKEN = ['EAPI:Invalid nonce', 'EGeneral:Temporary lockout', 'EAPI:Rate limit exceeded'];
+function isDefinitiveVenueRejection(venue, r) {   // a refusal that locks the whole API key: starts the per-venue back-off
+  if (!r || r.reason !== 'error') return false;
+  if (venue === 'kraken') return String(r.message || '').split(',').some(c => VENUE_DEFINITIVE_KRAKEN.includes(c.trim()));
+  return Number(r.venue_status) === 429;   // Revolut X: rate limited - the order was not accepted
+}
+function isVenueRefusal(venue, r) {   // the venue answered and refused: nothing was placed, so the trail can be restored
+  if (isDefinitiveVenueRejection(venue, r)) return true;
+  const st = Number(r && r.venue_status);
+  return venue !== 'kraken' && st >= 400 && st < 500;   // Revolut X 400/401/403/422...: refused (Fable 20:50) - per-coin retry, no back-off
+}
+const VENUE_BACKOFF_CAP_MIN = 30;
+const _venueBackoff = new Map();   // venue -> { level, until, capStreak, since, last }
+const _presendRetry = new Map();   // symbol -> next attempt time after an error before the order was sent
+function venueBackoffUntil(venue) { const b = _venueBackoff.get(venue); return b && b.until > Date.now() ? b.until : 0; }
+async function venueBackoffHit(venue, coinBase, message) {
+  const prev = _venueBackoff.get(venue), level = prev ? prev.level + 1 : 1;
+  const mins = Math.min(VENUE_BACKOFF_CAP_MIN, Math.pow(2, level));
+  const capStreak = mins >= VENUE_BACKOFF_CAP_MIN ? (prev ? prev.capStreak : 0) + 1 : 0;
+  const b = { level, until: Date.now() + mins * 60000, capStreak, since: prev ? prev.since : Date.now(), last: String(message || '').slice(0, 120) };
+  _venueBackoff.set(venue, b);
+  const at = new Date(b.until).toISOString().slice(11, 16) + ' UTC', name = venue === 'kraken' ? 'Kraken' : 'Revolut X';
+  console.log('[trailing] #K1 ' + name + ' refused (' + b.last + ') - back-off ' + mins + ' min, until ' + at);
+  if (!prev) await sendTelegram('⏳ <b>' + name + ' refused a sale - backing off</b>\n' + coinBase + ': ' + b.last + '. Nothing was sold and the trailing stop is back in place.\nEvery ' + name + ' auto-sale waits until ' + at + ' (then 4, 8, 16, up to 30 min while it keeps refusing). The trails stay and keep ratcheting.').catch(() => {});
+  else if (capStreak === 3) await sendTelegram('🚨 <b>' + name + ' is still refusing after three 30-minute back-offs</b>\nLast error: ' + b.last + '. Auto-sales on ' + name + ' keep retrying every 30 min. Please check the API key' + (venue === 'kraken' ? ' (a nonce window on the Kraken key stops "Invalid nonce").' : '.')).catch(() => {});
+  return b;
+}
+function venueBackoffClear(venue) { if (_venueBackoff.delete(venue)) console.log('[trailing] #K1 ' + venue + ' back-off cleared after a successful sale'); }
+
 async function handleTrailingStopAlert(symbol, currentPrice, ts, exchange = 'revolut') {
   const coinBase = symbol.replace('-USD', '');
 
@@ -13435,6 +13491,11 @@ async function handleTrailingStopAlert(symbol, currentPrice, ts, exchange = 'rev
         // #F5b (Bryan decision): no cooldown on the #93 path. F4's clear-first makes a double fire structurally
         // impossible, so the cooldown only held legitimate re-arms. The _executed stamp below is kept so the AI
         // path (shouldAutoExecute) still cannot fire a second sale on the same coin inside its own window.
+        // #K1 (c) while the venue is backing off, or a pre-send error is waiting out its retry, hold the breach: the trail
+        // is untouched (it keeps ratcheting) and the sale is tried on the first scan after the wait.
+        const k1Until = venueBackoffUntil(ts.exchange || exchange), k1Retry = _presendRetry.get(symbol);
+        if (k1Until) { console.log('[trailing] #K1 ' + coinBase + ' breach held - ' + (ts.exchange || exchange) + ' back-off until ' + new Date(k1Until).toISOString().slice(11, 16) + ' UTC'); return; }
+        if (k1Retry && k1Retry.at > Date.now()) { console.log('[trailing] #K1 ' + coinBase + ' breach held - retry after a pre-send error at ' + new Date(k1Retry.at).toISOString().slice(11, 16) + ' UTC'); return; }
         // Arm cooldown and execute directly
         analysisRateLimit.set(symbol + '_executed', Date.now());
         // #F4 CLEAR FIRST. The trail is gone from memory AND the DB before any venue call, so a restart or a concurrent
@@ -13479,6 +13540,25 @@ async function handleTrailingStopAlert(symbol, currentPrice, ts, exchange = 'rev
         // NOTE: Revolut only for now -- autoExecuteKrakenSell still returns undefined, so Kraken
         // coins fall through to the original remove-the-trail behaviour (no regression).
         if (ae93Result && ae93Result.reason === 'paused') { analysisRateLimit.delete(symbol + '_executed'); await restoreTrailingStop(symbol, ae93Saved).catch(() => {}); return; }   // #F1 hold / #F4 restore as-is
+        if (ae93Result && ae93Result.executed === true) { venueBackoffClear(ae93Exchange); _presendRetry.delete(symbol); }   // #K1
+        if (ae93Result && ae93Result.reason === 'error') {   // #K1 (b)
+          const k1Definitive = isDefinitiveVenueRejection(ae93Exchange, ae93Result);
+          if (!ae93Result.order_sent || k1Definitive || isVenueRefusal(ae93Exchange, ae93Result)) {
+            // Nothing can have been placed: put the trail back exactly as it was and let a later scan retry.
+            analysisRateLimit.delete(symbol + '_executed');
+            await restoreTrailingStop(symbol, ae93Saved).catch(e => console.error('[trailing] #K1 trail restore failed:', e.message));
+            if (k1Definitive) await venueBackoffHit(ae93Exchange, coinBase, ae93Result.message);
+            else {
+              const prevRetry = _presendRetry.get(symbol);
+              _presendRetry.set(symbol, { at: Date.now() + 2 * 60000 });
+              if (!prevRetry || Date.now() - prevRetry.at > 10 * 60000) await sendTelegram('↩️ <b>' + coinBase + ' sale not placed - trailing stop restored</b>\n' + (ae93Result.order_sent ? (ae93Exchange === 'kraken' ? 'Kraken' : 'Revolut X') + ' refused the order' + (ae93Result.venue_status ? ' (HTTP ' + ae93Result.venue_status + ')' : '') : 'The error came before any order was sent') + ' (' + String(ae93Result.message || '').slice(0, 120) + '). Nothing was sold; the stop is back in place and the sale will be retried every 2 min while the price stays below it.').catch(() => {});
+            }
+            return;
+          }
+          // The order may have reached the venue: a retry could sell twice, so the trail stays cleared (single-use, #F4).
+          await sendTelegram('<b>[#93 AUTO-TRAIL FAILED]</b> ' + coinBase + ' -- the order may have reached ' + (ae93Exchange === 'kraken' ? 'Kraken' : 'Revolut X') + ' before the error (' + String(ae93Result.message || '').substring(0, 100) + '). The trail stays cleared so nothing can sell twice. Please check the venue and the position.').catch(() => {});
+          return;
+        }
         const ae93Blocked = ae93Result && ae93Result.executed === false
           && ['floor_blocked', 'no_floor', 'floor_error', 'edge_limit_unfilled'].indexOf(ae93Result.reason) !== -1;   // #387
         if (ae93Blocked) {
@@ -13563,6 +13643,7 @@ async function handleTrailingStopAlert(symbol, currentPrice, ts, exchange = 'rev
 
 async function autoExecuteKrakenSell(symbol, maxPct, analysis, confidence, opts = {}) {   // #L1 opts.tool_key (additive; 4-arg callers unchanged)
   const coinBase = symbol.replace('-USD', '');
+  let akOrderSent = false;   // #K1 (a)
   try {
     if (await isAutoExecPaused()) { console.log('[auto-exec] #F1 ' + coinBase + ' Kraken sell refused - auto-exec paused'); return { executed: false, reason: 'paused' }; }
     const currentPrice = await getKrakenPriceForSymbol(symbol);
@@ -13617,6 +13698,7 @@ async function autoExecuteKrakenSell(symbol, maxPct, analysis, confidence, opts 
       [symbol, 'sell', `AI auto-execution on Kraken [${confidence}]: ${analysis.substring(0, 150)}`, 'confident']
     ).catch(() => {});
 
+    akOrderSent = true;   // #K1
     const kResp = await executeKrakenTrade(symbol, 'sell', 'market', sellQty);   // #J1 keep the response for its txid
 
     const [aeKrkIns] = await db.execute(
@@ -13659,9 +13741,12 @@ async function autoExecuteKrakenSell(symbol, maxPct, analysis, confidence, opts 
         console.log(`[auto-exec] Stage 3 single-rebuy cascade spawned for pump-armed ${coinBase} after Kraken sell`);
       }
     } catch (e) { console.error('[auto-exec] Stage 3 Kraken cascade error (non-fatal):', e.message); }
+    return { executed: true, qty: sellQty, price: currentPrice };   // #K1
   } catch (e) {
     console.error('[auto-exec] Kraken sell error:', e.message);
-    await sendTelegram(`❌ AUTO-EXEC FAILED — Kraken ${coinBase}\nError: ${e.message}`);
+    if (akOrderSent) await sendTelegram(`❌ AUTO-EXEC FAILED — Kraken ${coinBase}\nError: ${e.message}`);
+    else await sendTelegram(`⚠️ AUTO-EXEC: Kraken ${coinBase} sale not placed - the error came before any order was sent (${String(e.message || '').slice(0, 120)}). Nothing was sold.`).catch(() => {});   // #K1
+    return { executed: false, reason: 'error', message: e.message, order_sent: akOrderSent };   // #K1
   }
 }
 
