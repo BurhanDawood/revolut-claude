@@ -1597,6 +1597,7 @@ await db.execute("CREATE TABLE IF NOT EXISTS portfolio_value_hourly (ts INT UNSI
 await db.execute("CREATE TABLE IF NOT EXISTS portfolio_value_daily (d DATE NOT NULL PRIMARY KEY, o DECIMAL(16,4) NOT NULL, h DECIMAL(16,4) NOT NULL, l DECIMAL(16,4) NOT NULL, c DECIMAL(16,4) NOT NULL, ko DECIMAL(16,4) NULL, kh DECIMAL(16,4) NULL, kl DECIMAL(16,4) NULL, kc DECIMAL(16,4) NULL, src VARCHAR(8) NOT NULL DEFAULT 'rebuilt')").catch(e => console.error('[migration] portfolio_value_daily:', e.message));   // #PV2 London days before the hourly history
 await db.execute('CREATE TABLE IF NOT EXISTS portfolio_flows (tx_id VARCHAR(80) NOT NULL PRIMARY KEY, ts INT UNSIGNED NOT NULL, kind VARCHAR(12) NOT NULL, currency VARCHAR(16) NOT NULL, qty DECIMAL(30,10) NOT NULL, usd DECIMAL(16,2) NOT NULL, INDEX idx_ts (ts))').catch(e => console.error('[migration] portfolio_flows:', e.message));   // #PV2 money in / out markers
 await db.execute('CREATE TABLE IF NOT EXISTS dip_alerts (symbol VARCHAR(20) NOT NULL PRIMARY KEY, armed TINYINT(1) NOT NULL DEFAULT 1, last_alert_at DATETIME NULL, last_off_pct DECIMAL(8,2) NULL, last_rsi DECIMAL(6,2) NULL)').catch(e => console.error('[migration] dip_alerts:', e.message));   // #DIP1 one alert per dip per watchlist coin
+await db.execute("CREATE TABLE IF NOT EXISTS spike_events (id INT AUTO_INCREMENT PRIMARY KEY, symbol VARCHAR(20) NOT NULL, triggered_at DATETIME NOT NULL, low_ref DECIMAL(24,10) NOT NULL, ref_7d DECIMAL(24,10) NULL, trigger_price DECIMAL(24,10) NOT NULL, peak DECIMAL(24,10) NOT NULL, peak_at DATETIME NULL, status VARCHAR(12) NOT NULL DEFAULT 'active', qty_held DECIMAL(30,10) NULL, ended_at DATETIME NULL, end_price DECIMAL(24,10) NULL, sold_qty DECIMAL(30,10) NULL, avg_price DECIMAL(24,10) NULL, cycle_id VARCHAR(64) NULL, INDEX idx_sym (symbol, triggered_at), INDEX idx_status (status))").catch(e => console.error('[migration] spike_events:', e.message));   // #B23 A5 one row per spike (S1 records; S2 fills sold_qty / avg_price / cycle_id)
 setTimeout(() => { repairAgentFills().catch(e => console.error('[agent] boot repair failed:', e.message)); }, 30 * 1000);   // #B21 a fill recorded but not applied before a restart
 await safeAddColumn('trailing_stops',   'auto_execute',    'TINYINT(1) NOT NULL DEFAULT 0'); // #93
 await safeAddColumn('price_targets',    'sell_pct',        'DECIMAL(5,2) NULL'); // #144 per-rung sell %% override for Away Mode up-targets
@@ -18165,6 +18166,138 @@ async function dipAlertTick() {
   } finally { _dipBusy = false; }
 }
 setTimeout(() => { const t = () => dipAlertTick().then(r => { if (r && r.alerts && r.alerts.length) console.log('[dip] #DIP1 alerts: ' + r.alerts.join(', ')); }).catch(e => console.error('[dip] tick failed:', e.message)); t(); setInterval(t, 15 * 60 * 1000); console.log('[dip] #DIP1 watchlist dip check every 15 min'); }, 5 * 60 * 1000);
+// ── #B23 S1 SPIKE INSURANCE, STEP 1: DETECT AND TELL, NEVER SELL (spec #5; Bryan 26 Sep 00:34; Fable cleared with A1-A8) ─────────
+// A held Revolut X coin is in "spike mode" when its price is >= 2x its LOWEST HOURLY CLOSE of the last 24 h (A1: never the tick / candle
+// low, a one-tick wick halves that) AND >= 1.5x its 7-day median hourly close (A1: a crash-and-recover is not a spike). Under 20 hourly
+// closes in the 24 h window it fails closed. S1 only records the event (spike_events, A5), follows its peak for 24 h and sends Bryan an
+// advice message. S2 (the 15 % insurance trail on half + the chasing-limit sale) comes separately, after Fable's pre-ship review.
+// spikeReplay() answers Fable's Q3 once: over every coin's stored hourly history, how often would the naive rule (2x the 24 h candle
+// low) and the A1 rule fire, and what would hold / trail+chase / half-at-trigger have realised after 7 and 21 days.
+const SPIKE_DEFAULTS = { enabled: true, trigger_pct: 100, ref7_mult: 1.5, window_h: 24, cooldown_h: 24, min_closes: 20, min_value_usd: 5, trail_pct: 15 };
+const SPIKE_REPLAY_VERSION = 1;
+let _spikeBusy = false;
+async function spikeCfg() {
+  let c = {};
+  try { const [r] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'spike_exit'"); if (r.length) c = JSON.parse(r[0].config_value) || {}; } catch (e) {}
+  return { ...SPIKE_DEFAULTS, ...c };
+}
+function spikeMedian(a) { if (!a.length) return null; const s = [...a].sort((x, y) => x - y), m = Math.floor(s.length / 2); return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2; }
+// bars: hourly {t(ms), h, l, c} oldest first (the current, unfinished hour may be last). Closed hours only form the references.
+function spikeRef(bars, px, cfg = SPIKE_DEFAULTS, nowMs = Date.now()) {
+  const H = 3600000, cur = Math.floor(nowMs / H) * H;
+  const closed = (bars || []).filter(b => b.t < cur && b.c > 0);
+  const c24 = closed.filter(b => b.t >= cur - cfg.window_h * H).map(b => b.c), c7 = closed.filter(b => b.t >= cur - 7 * 24 * H).map(b => b.c);
+  if (c24.length < cfg.min_closes || !(px > 0)) return { triggered: false, reason: 'fewer than ' + cfg.min_closes + ' hourly closes in 24 h (' + c24.length + ')', n24: c24.length };
+  const low24 = Math.min(...c24), ref7 = spikeMedian(c7);
+  const ratio = px / low24, vs7 = ref7 ? px / ref7 : null;
+  const triggered = ratio >= 1 + cfg.trigger_pct / 100 && vs7 != null && vs7 >= cfg.ref7_mult;
+  return { triggered, low24, ref7, ratio: Number(ratio.toFixed(3)), vs7: vs7 == null ? null : Number(vs7.toFixed(3)), n24: c24.length,
+    reason: triggered ? 'spike' : ratio < 1 + cfg.trigger_pct / 100 ? 'under ' + (1 + cfg.trigger_pct / 100) + 'x the 24 h low close' : 'under ' + cfg.ref7_mult + 'x the 7-day median (crash-and-recover)' };
+}
+async function spikeTick(nowMs = Date.now()) {
+  if (_spikeBusy) return { skipped: 'busy' };
+  _spikeBusy = true;
+  const out = { checked: 0, triggered: [], ended: [], peaks: 0 };
+  try {
+    const cfg = await spikeCfg();
+    if (!cfg.enabled) return { skipped: 'disabled' };
+    const [bal, tick] = await Promise.all([revolutBalancesCached(60000), revolutTickerMap(60000)]);
+    const held = [];
+    for (const a of bal || []) {
+      const c = String(a.currency || '').toUpperCase(); if (!/^[A-Z0-9]{1,15}$/.test(c) || /^(USD|USDT|USDC|GBP|EUR)$/.test(c)) continue;
+      const q = (parseFloat(a.available) || 0) + (parseFloat(a.reserved) || 0), px = tick[c] ? tick[c].mid : null;
+      if (q > 0 && px > 0 && q * px >= cfg.min_value_usd) held.push({ coin: c, qty: q, px });
+    }
+    for (const h of held) {
+      const [act] = await db.execute("SELECT id, peak, UNIX_TIMESTAMP(triggered_at) AS t FROM spike_events WHERE symbol = ? AND status = 'active' ORDER BY id DESC LIMIT 1", [h.coin]);
+      if (act.length) {   // follow the live event's peak; end it after the window
+        const ev = act[0];
+        if (h.px > Number(ev.peak)) { await db.execute('UPDATE spike_events SET peak = ?, peak_at = NOW() WHERE id = ?', [h.px, ev.id]); out.peaks++; }
+        if (nowMs / 1000 - Number(ev.t) >= cfg.window_h * 3600) { await db.execute("UPDATE spike_events SET status = 'ended', ended_at = NOW(), end_price = ? WHERE id = ?", [h.px, ev.id]); out.ended.push(h.coin); }
+        continue;
+      }
+      const [recent] = await db.execute('SELECT id FROM spike_events WHERE symbol = ? AND triggered_at > DATE_SUB(NOW(), INTERVAL ? HOUR) LIMIT 1', [h.coin, cfg.cooldown_h]);
+      if (recent.length) continue;
+      let r;
+      try { r = spikeRef(await loadHourlyBars(h.coin + '-USD', 8), h.px, cfg, nowMs); } catch (e) { continue; }
+      out.checked++;
+      if (!r.triggered) continue;
+      await db.execute("INSERT INTO spike_events (symbol, triggered_at, low_ref, ref_7d, trigger_price, peak, peak_at, status, qty_held) VALUES (?, NOW(), ?, ?, ?, ?, NOW(), 'active', ?)", [h.coin, r.low24, r.ref7, h.px, h.px, h.qty]);
+      out.triggered.push(h.coin);
+      await sendTelegram('🚀 <b>SPIKE — ' + escTg(h.coin) + '</b> $' + Number(h.px.toPrecision(6)) + ' is <b>' + r.ratio.toFixed(2) + '×</b> its lowest hourly close in 24 h ($' + Number(r.low24.toPrecision(6)) + ') and ' + r.vs7.toFixed(2) + '× its 7-day median.' +
+        '\nYou hold ' + Number(h.qty.toPrecision(6)) + ' (≈ $' + Math.round(h.qty * h.px).toLocaleString('en-US') + ').' +
+        '\n<b>Spike insurance step 1: advice only, nothing is sold.</b> If you want to protect it, a trailing stop or a part-sale is your call now. When step 2 is live, a ' + cfg.trail_pct + '% insurance trail on half would start here.').catch(() => {});
+    }
+    // an event on a coin no longer held (sold, moved) still ends after the window
+    const [sw] = await db.execute("UPDATE spike_events SET status = 'ended', ended_at = NOW() WHERE status = 'active' AND triggered_at < DATE_SUB(NOW(), INTERVAL ? HOUR)", [cfg.window_h]);
+    if (sw && sw.affectedRows) out.swept = sw.affectedRows;
+    return out;
+  } finally { _spikeBusy = false; }
+}
+// ── the replay (Fable's Q3): every coin's stored hourly candles, naive vs A1, and what each exit would have realised
+function spikeReplayCoin(rows, cfg = SPIKE_DEFAULTS) {   // rows: [{t(s), h, l, c}] hourly, oldest first
+  const H = 3600, ev = [], naive = []; let lastA = -Infinity, lastN = -Infinity;
+  for (let i = 7 * 24; i < rows.length; i++) {
+    const t = rows[i].t, px = rows[i].c; if (!(px > 0)) continue;
+    const w7 = rows.slice(Math.max(0, i - 168), i).filter(r => r.t >= t - 168 * H), w24 = w7.filter(r => r.t >= t - 24 * H);
+    if (!w24.length) continue;
+    const minLow = Math.min(...w24.map(r => r.l).filter(x => x > 0));
+    if (px >= 2 * minLow && t - lastN >= cfg.cooldown_h * H) { naive.push(t); lastN = t; }
+    const c24 = w24.map(r => r.c).filter(x => x > 0);
+    if (c24.length < cfg.min_closes) continue;
+    const low = Math.min(...c24), med = spikeMedian(w7.map(r => r.c).filter(x => x > 0));
+    if (!(px >= low * (1 + cfg.trigger_pct / 100) && med && px >= med * cfg.ref7_mult) || t - lastA < cfg.cooldown_h * H) continue;
+    lastA = t;
+    const idx = (tt) => { let lo = i, hi = rows.length; while (lo < hi) { const m = (lo + hi) >> 1; if (rows[m].t < tt) lo = m + 1; else hi = m; } return lo; };   // first row at or after tt (hours can be missing)
+    const at = (h) => { const k = idx(t + h * H); return k < rows.length && rows[k].t - (t + h * H) < 24 * H ? rows[k].c : null; };
+    const end21 = idx(t + 504 * H);
+    let peak = px, exit = null, exitH = null;
+    for (let k = i + 1; k < end21; k++) {   // 15 % trail on closes from the trigger; the chase sells ~1 % under the breach close
+      if (rows[k].c > peak) peak = rows[k].c;
+      if (rows[k].c <= peak * (1 - cfg.trail_pct / 100)) { exit = rows[k].c * 0.99; exitH = Math.round((rows[k].t - t) / H); break; }
+    }
+    const h7 = at(168), h21 = at(504), pk21 = Math.max(...rows.slice(i, end21).map(r => r.c));
+    const pct = (x) => (x == null ? null : Number(((x / px - 1) * 100).toFixed(1)));
+    ev.push({ t, px, low24: low, med7: med, peak_21d_pct: pct(pk21), hold_7d_pct: pct(h7), hold_21d_pct: pct(h21),
+      trail_exit_pct: pct(exit), trail_exit_after_h: exitH,
+      trail_half_plus_hold_21d_pct: exit != null && h21 != null ? Number(((0.5 * (exit / px) + 0.5 * (h21 / px) - 1) * 100).toFixed(1)) : null,
+      half_at_trigger_21d_pct: h21 != null ? Number(((0.5 + 0.5 * (h21 / px) - 1) * 100).toFixed(1)) : null });
+  }
+  return { a1: ev, naive_n: naive.length, naive_only_n: naive.filter(n => !ev.some(e => Math.abs(e.t - n) <= 24 * H)).length };
+}
+async function spikeReplay(force = false) {
+  const prev = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'spike_replay'").then(r => (r[0].length ? JSON.parse(r[0][0].config_value) : null)).catch(() => null);
+  if (!force && prev && prev.version === SPIKE_REPLAY_VERSION) return prev;
+  const cfg = await spikeCfg();
+  const [syms] = await db.execute('SELECT symbol, COUNT(*) AS n FROM price_intraday_hourly GROUP BY symbol HAVING n >= 500 ORDER BY symbol');
+  const all = [], perCoin = []; let naiveN = 0, naiveOnly = 0, hours = 0;
+  for (const s of syms) {
+    const [r] = await db.execute('SELECT UNIX_TIMESTAMP(hour_bucket) AS t, high_px AS h, low_px AS l, close_px AS c FROM price_intraday_hourly WHERE symbol = ? ORDER BY hour_bucket', [s.symbol]);
+    const rows = r.map(x => ({ t: Number(x.t), h: +x.h, l: +x.l, c: +x.c }));
+    hours += rows.length;
+    await new Promise(r => setImmediate(r));   // one coin at a time; the event loop breathes between coins
+    const res = spikeReplayCoin(rows, cfg);
+    naiveN += res.naive_n; naiveOnly += res.naive_only_n;
+    for (const e of res.a1) all.push({ coin: String(s.symbol).replace(/-USD$/, ''), at: new Date(e.t * 1000).toISOString().slice(0, 16), ...e });
+    if (res.naive_n || res.a1.length) perCoin.push({ coin: String(s.symbol).replace(/-USD$/, ''), naive: res.naive_n, a1: res.a1.length });
+  }
+  const avg = (k) => { const v = all.map(e => e[k]).filter(x => x != null); return v.length ? { n: v.length, avg_pct: Number((v.reduce((a, b) => a + b, 0) / v.length).toFixed(1)), median_pct: Number(spikeMedian(v).toFixed(1)) } : { n: 0 }; };
+  const out = { version: SPIKE_REPLAY_VERSION, at: new Date().toISOString(), coins: syms.length, hours, rule: { trigger: '>= ' + (1 + cfg.trigger_pct / 100) + 'x the lowest hourly close in 24 h AND >= ' + cfg.ref7_mult + 'x the 7-day median; cooldown ' + cfg.cooldown_h + ' h', trail_pct: cfg.trail_pct },
+    naive_triggers: naiveN, a1_triggers: all.length, naive_only: naiveOnly,
+    outcomes: { peak_21d: avg('peak_21d_pct'), hold_7d: avg('hold_7d_pct'), hold_21d: avg('hold_21d_pct'), trail_exit: avg('trail_exit_pct'), trail_half_plus_hold_21d: avg('trail_half_plus_hold_21d_pct'), half_at_trigger_21d: avg('half_at_trigger_21d_pct') },
+    per_coin: perCoin.slice(0, 60), events: all.slice(-60) };
+  await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('spike_replay', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)", [JSON.stringify(out)]).catch(() => {});
+  try {   // put the answer where Fable reviews B23: the spec's own thread
+    const [sp] = await db.execute("SELECT id FROM spec_threads WHERE title LIKE 'B23%' ORDER BY id LIMIT 1");
+    if (sp.length) await specNote(sp[0].id, 'S1 replay (Fable Q3), ' + out.coins + ' coins, ' + out.hours + ' hourly candles: naive rule (2x the 24 h candle low) fired ' + out.naive_triggers + ' times, the A1 rule ' + out.a1_triggers + ' times; ' + out.naive_only + ' naive triggers had no A1 trigger within 24 h (wicks / crash-and-recover).\n' +
+      'After an A1 trigger: peak within 21 d ' + JSON.stringify(out.outcomes.peak_21d) + '; hold 7 d ' + JSON.stringify(out.outcomes.hold_7d) + '; hold 21 d ' + JSON.stringify(out.outcomes.hold_21d) + '; 15% trail + chase exit ' + JSON.stringify(out.outcomes.trail_exit) +
+      '; half trail + half hold 21 d ' + JSON.stringify(out.outcomes.trail_half_plus_hold_21d) + '; half sold at the trigger + half hold 21 d ' + JSON.stringify(out.outcomes.half_at_trigger_21d) + '. Full event list in system_config spike_replay.', 'desk', 'note', { per_coin: out.per_coin, events: out.events.slice(-30) });
+  } catch (e) { console.error('[spike] replay note failed:', e.message); }
+  console.log('[spike] #B23 S1 replay: ' + JSON.stringify({ coins: out.coins, hours: out.hours, naive: out.naive_triggers, a1: out.a1_triggers, naive_only: out.naive_only, outcomes: out.outcomes }));
+  return out;
+}
+setTimeout(() => { const t = () => spikeTick().then(r => { if (r && r.triggered && r.triggered.length) console.log('[spike] #B23 spike mode: ' + r.triggered.join(', ')); }).catch(e => console.error('[spike] tick failed:', e.message)); t(); setInterval(t, 3 * 60 * 1000); console.log('[spike] #B23 S1 spike check every 3 min (advice only)'); }, 6 * 60 * 1000);
+setTimeout(() => { spikeReplay().catch(e => console.error('[spike] replay failed:', e.message)); }, 8 * 60 * 1000);
 async function moveShape(symbol, opts = {}) {
   const coin = String(symbol || '').toUpperCase().replace(/-USD$/, '').trim();
   if (!/^[A-Z0-9]{1,15}$/.test(coin)) return { ok: false, error: 'bad symbol' };
