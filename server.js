@@ -8692,8 +8692,12 @@ async function seniorReview(spec, q, cfg) {
   };
   for (let turn = 0; turn < cfg.senior_max_tool_calls + 2 && !review; turn++) {
     const force = calls >= cfg.senior_max_tool_calls || cost() >= cfg.senior_per_review_cap_usd * 0.75;   // the per-review cap: finish before it
+    if (force) {   // #D5a Fable 5.1 refuses a forced tool_choice ("type tool and any are not supported"): offer ONLY the submit tool and say so
+      const last = messages[messages.length - 1], say = 'Stop reading now and submit your review with submit_senior_review, from what you have found so far.';
+      if (last.role === 'user') { if (typeof last.content === 'string') last.content += '\n\n' + say; else last.content.push({ type: 'text', text: say }); }
+    }
     markLast();
-    const msg = await anthropic.messages.create({ model, max_tokens: 6000, system, tools, tool_choice: force ? { type: 'tool', name: 'submit_senior_review' } : { type: 'auto' }, messages }, { maxRetries: 1 });
+    const msg = await anthropic.messages.create({ model, max_tokens: 6000, system, tools: force ? [tools[tools.length - 1]] : tools, tool_choice: { type: 'auto' }, messages }, { maxRetries: 1 });
     const u = msg.usage || {};
     tin += u.input_tokens || 0; tout += u.output_tokens || 0; cw += u.cache_creation_input_tokens || 0; cr += u.cache_read_input_tokens || 0;
     messages.push({ role: 'assistant', content: msg.content });
