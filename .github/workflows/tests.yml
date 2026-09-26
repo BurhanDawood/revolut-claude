@@ -1,0 +1,87 @@
+name: Tests (T1 suite, report only)
+
+# node --check + an acorn parse of server.js, then tests/run-all.mjs (tests/p0, tests/money, tests/static).
+# Everything is stubbed: no exchange, database, Telegram or model API is ever called, and no secret is used.
+#
+# REPORT ONLY - it must never hold or change the Railway deploy:
+# - Railway's production service waits for GitHub check suites on main (checkSuites: true). So on push and workflow_run the
+#   test steps are continue-on-error: the job ends green, and a failure shows as an error annotation and in the run summary.
+# - On pull_request (nothing deploys) a failure makes the check red.
+# - It deploys nothing, writes nothing (contents: read) and does not touch package.json (acorn is installed outside the repo).
+# workflow_run: the Apply * workflows push with GITHUB_TOKEN, which does not trigger `push` workflows, so the suite also runs
+# after them, on the new head of main.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_run:
+    workflows: [ "Apply Batch Patch", "Apply Surgical Patch", "Deploy Approved Spec" ]
+    types: [ completed ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      REPORT_ONLY: ${{ github.event_name != 'pull_request' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && 'main' || '' }}
+          fetch-depth: 0   # tests/p0 reads origin/main for its comparisons
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install acorn (outside the repo; not an app dependency)
+        run: |
+          npm install --prefix "$RUNNER_TEMP/acorn" --no-save --no-package-lock --no-audit --no-fund acorn@8
+          echo "ACORN_PATH=$RUNNER_TEMP/acorn/node_modules/acorn" >> "$GITHUB_ENV"
+
+      - name: node --check server.js
+        id: check
+        continue-on-error: ${{ github.event_name != 'pull_request' }}
+        run: node --check server.js
+
+      - name: acorn parse server.js
+        id: parse
+        continue-on-error: ${{ github.event_name != 'pull_request' }}
+        run: node tests/static/parse.mjs
+
+      - name: Run all tests
+        id: tests
+        continue-on-error: ${{ github.event_name != 'pull_request' }}
+        run: |
+          set -o pipefail
+          node tests/run-all.mjs 2>&1 | tee "$RUNNER_TEMP/tests.log"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## T1 test suite"
+            echo ""
+            echo "| Step | Result |"
+            echo "|---|---|"
+            echo "| node --check server.js | ${{ steps.check.outcome }} |"
+            echo "| acorn parse server.js | ${{ steps.parse.outcome }} |"
+            echo "| tests/run-all.mjs | ${{ steps.tests.outcome }} |"
+            echo ""
+            echo '```'
+            if [ -f "$RUNNER_TEMP/tests.log" ]; then grep -E '^(== |[A-Za-z0-9+]+ +(PASS|FAIL|SKIP) |(PASS|FAIL|SKIP) +|-- )' "$RUNNER_TEMP/tests.log" || true; fi
+            echo '```'
+            if [ "$REPORT_ONLY" = "true" ]; then echo ""; echo "_Report only on ${{ github.event_name }}: this job stays green so the Railway deploy is never held._"; fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          for s in "${{ steps.check.outcome }}" "${{ steps.parse.outcome }}" "${{ steps.tests.outcome }}"; do
+            if [ "$s" = "failure" ]; then if [ "$REPORT_ONLY" = "true" ]; then echo "::error title=T1 tests failed::A step failed - see the run summary. Report only on ${{ github.event_name }}: the job stays green so the Railway deploy is not held."; else echo "::error title=T1 tests failed::A step failed - see the run summary."; fi; break; fi
+          done
