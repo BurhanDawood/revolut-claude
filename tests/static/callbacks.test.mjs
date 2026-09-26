@@ -34,6 +34,8 @@ const bakCalls = [...SRC.matchAll(/buildAlertKeyboard\(([^,]+),\s*(\[[^\]]*\]|[^
 // 2. inline literals: callback_data: 'a:' + <id> + ':<n>:<type>'   and the variable-choice helper   'a:' + <id> + ':' + n + ':<type>'
 const litSites = [...SRC.matchAll(/callback_data:\s*'a:'\s*\+\s*([^+]+?)\s*\+\s*':([0-9]+):([a-z]+)'/g)].map(m => ({ line: lineOf(m.index), id: m[1], n: Number(m[2]), type: m[3] }));
 const varSites = [...SRC.matchAll(/callback_data:\s*'a:'\s*\+\s*([^+]+?)\s*\+\s*':'\s*\+\s*(\w+)\s*\+\s*':([a-z]+)'/g)].map(m => ({ line: lineOf(m.index), id: m[1], n: m[2], type: m[3] }));
+// 3. whole literals: callback_data: 'a:all:3:sx'
+const fullSites = [...SRC.matchAll(/callback_data:\s*'(a:[^']*)'\s*[,}]/g)].map(m => ({ line: lineOf(m.index), data: m[1] }));
 const builderSite = /callback_data: 'a:' \+ c \+ ':' \+ \(i \+ 1\)/.test(SRC);
 
 await test('CB0', 'the router and every callback_data site were found (a new, unrecognised builder fails here)', async () => {
@@ -41,8 +43,9 @@ await test('CB0', 'the router and every callback_data site were found (a new, un
   assert.ok(CB_REGEXES.length >= 1, 'cbMatch regex(es) found'); assert.ok(MONEY_TYPES.size > 5, 'money-button types found'); assert.ok(ALERT_TYPES.size > 5, 'CB_TYPES found');
   assert.ok(builderSite, 'buildAlertKeyboard builds a:<coin>:<n>[:<type>]');
   const total = (SRC.match(/callback_data\s*:/g) || []).length;
-  const known = litSites.length + varSites.length + 1;
-  assert.equal(total, known, 'every "callback_data:" in server.js is one of the recognised shapes (' + litSites.length + ' literal, ' + varSites.length + ' helper, 1 buildAlertKeyboard); found ' + total);
+  const known = litSites.length + varSites.length + fullSites.length + 1;
+  assert.equal(total, known, 'every "callback_data:" in server.js is one of the recognised shapes (' + litSites.length + ' inline, ' + varSites.length + ' helper, ' +
+    fullSites.length + ' whole-literal, 1 buildAlertKeyboard); found ' + total);
   assert.ok(bakCalls.length >= 20, 'buildAlertKeyboard call sites: ' + bakCalls.length);
   const all = (SRC.match(/buildAlertKeyboard\(/g) || []).length - 1;   // minus the definition
   assert.equal(bakCalls.length, all, 'every buildAlertKeyboard call has a literal type code');
@@ -73,6 +76,11 @@ await test('CB2', 'every inline a:<id>:<n>:<type> button matches cbMatch, and it
   assert.ok(litSites.length >= 8, 'inline sites found: ' + litSites.length);
   assert.deepEqual(bad, []);
 });
+await test('CB2b', 'every whole-literal button (e.g. a:all:3:sx) matches cbMatch, and its type is routed', async () => {
+  const bad = [];
+  for (const f of fullSites) { const m = cbMatch(f.data); if (!m) bad.push('line ' + f.line + ': ' + f.data); else if (!routed((m[3] || '').toLowerCase())) bad.push('line ' + f.line + ": type '" + m[3] + "' is not routed"); }
+  assert.deepEqual(bad, []);
+});
 await test('CB3', 'the spec-desk helper (variable choice): every button specKeyboard draws, for every status, matches and is routed', async () => {
   assert.deepEqual(varSites.map(s => s.type), ['sk'], 'the only variable-choice builder is specKeyboard (sk)');
   const bad = [];
@@ -93,4 +101,4 @@ await test('CB4', 'router sanity: no type is routed two ways; choices 6-7 only f
 });
 report();
 console.log('   (found: ' + CB_REGEXES.length + ' cbMatch regexes, money types [' + [...MONEY_TYPES].join(' ') + '], alert types [' + [...ALERT_TYPES].join(' ') + '], ' +
-  bakCalls.length + ' buildAlertKeyboard calls, ' + litSites.length + ' inline sites, ' + varSites.length + ' helper site)');
+  bakCalls.length + ' buildAlertKeyboard calls, ' + litSites.length + ' inline sites, ' + fullSites.length + ' whole-literal sites, ' + varSites.length + ' helper site)');

@@ -83,5 +83,5 @@ jobs:
             if [ "$REPORT_ONLY" = "true" ]; then echo ""; echo "_Report only on ${{ github.event_name }}: this job stays green so the Railway deploy is never held._"; fi
           } >> "$GITHUB_STEP_SUMMARY"
           for s in "${{ steps.check.outcome }}" "${{ steps.parse.outcome }}" "${{ steps.tests.outcome }}"; do
-            if [ "$s" = "failure" ]; then echo "::error title=T1 tests failed::A step failed - see the run summary (report only on ${{ github.event_name }})."; break; fi
+            if [ "$s" = "failure" ]; then if [ "$REPORT_ONLY" = "true" ]; then echo "::error title=T1 tests failed::A step failed - see the run summary. Report only on ${{ github.event_name }}: the job stays green so the Railway deploy is not held."; else echo "::error title=T1 tests failed::A step failed - see the run summary."; fi; break; fi
           done
