@@ -5,10 +5,12 @@ name: Export prices (data-prices branch)
 #
 # - Needs two repository secrets: EXPORT_URL and EXPORT_TOKEN. Either missing -> a notice, and the run ends green having done nothing.
 # - Pages through GET {EXPORT_URL}/export/prices?table=hourly|daily[&after=<cursor>] with curl --fail --compressed, 3 retries with
-#   backoff, and at least 11 s between requests (the server allows 60 requests per 10 min).
+#   backoff for errors, and at least 11 s between requests (the server allows 60 requests per 10 min). A 429 never fails the run
+#   by itself: it waits 60/120/240/300 s (12 min in total) first, since anyone probing the URL counts against the same limit.
 # - Every page is validated by tools/data/validate.mjs (the module tests/tools tests): JSON on every line, the end line present,
 #   its row count right, the field types right. Then the whole table (order, no overlap) and the SHRINK GUARD: a table with more
-#   than 10 % fewer rows than the MANIFEST already on data-prices fails the run and nothing is pushed.
+#   than 10 % fewer rows than the MANIFEST already on data-prices fails the run and nothing is pushed. Pages from more than one
+#   server_sha (a redeploy mid-export) also fail the run: two server versions are never mixed.
 # - Publishes data/prices/{hourly,daily}.ndjson.gz + MANIFEST.json as ONE parentless commit, force-pushed to data-prices only
 #   (history never grows). It never pushes to main: Railway deploys from main and tests.yml runs on it.
 # - The token is masked and only ever read by curl from a mode-600 header file: never echoed, never in a URL, no curl -v.
@@ -34,7 +36,7 @@ concurrency:
 jobs:
   export:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30   # up to 12 min of 429 waits + ~5 min of paging + retries
     steps:
       - name: Check the secrets
         id: cfg
@@ -76,27 +78,36 @@ jobs:
           unset EXPORT_TOKEN
           BASE="${EXPORT_URL%/}/export/prices"
           last_req=0
-          fetch() {   # fetch <table> <cursor> <out>: one page, 1 try + 3 retries, never faster than one request per 11 s
-            local table="$1" cursor="$2" out="$3" attempt code wait
-            for attempt in 1 2 3 4; do
+          # Retry budgets, for the whole run: HTTP 429 never fails the run on its own (the rate limit counts every request, so a
+          # stranger probing the URL can use it up): wait 60 s, 120 s, 240 s, 300 s (12 min in total) before giving up.
+          # Any other failure (network, 5xx, a page that fails validation): 3 quick retries per page (15 s, 30 s, 60 s).
+          RL_WAITS=(60 120 240 300); rl_used=0
+          fetch() {   # fetch <table> <cursor> <out>: one page, never faster than one request per 11 s
+            local table="$1" cursor="$2" out="$3" code wait other=0
+            while :; do
               wait=$(( last_req + 11 - $(date +%s) )); if [ "$wait" -gt 0 ]; then sleep "$wait"; fi
               last_req=$(date +%s)
               args=(--silent --show-error --fail --compressed --max-time 120 -H "@$HDR" --get --data-urlencode "table=$table")
               if [ -n "$cursor" ]; then args+=(--data-urlencode "after=$cursor"); fi
               code=$(curl "${args[@]}" -o "$out" -w '%{http_code}' "$BASE") && {
                 if node tools/data/validate.mjs page "$table" "$out" > "$out.next"; then return 0; fi
-                echo "::warning::$table page (attempt $attempt) failed validation"
+                echo "::warning::$table page failed validation"
               } || {
                 case "$code" in
                   404) echo "::error title=Price export::404: the export endpoint is off (the server has no EXPORT_TOKEN set)"; return 1 ;;
                   401) echo "::error title=Price export::401: the server refused EXPORT_TOKEN (the secret and the server's EXPORT_TOKEN differ)"; return 1 ;;
                   400) echo "::error title=Price export::400: the server refused the table or cursor ($table)"; return 1 ;;
+                  429)
+                    if [ "$rl_used" -ge "${#RL_WAITS[@]}" ]; then echo "::error title=Price export::still rate-limited (429) after waiting 12 minutes in total; re-run the workflow later"; return 1; fi
+                    echo "::warning::$table: rate-limited (429), waiting ${RL_WAITS[$rl_used]} s"
+                    sleep "${RL_WAITS[$rl_used]}"; rl_used=$((rl_used + 1)); continue ;;
                 esac
-                echo "::warning::$table request (attempt $attempt) failed: HTTP $code"
+                echo "::warning::$table request failed: HTTP $code"
               }
-              if [ "$attempt" -lt 4 ]; then sleep $(( 15 * 2 ** (attempt - 1) )); fi   # 15 s, 30 s, 60 s
+              other=$((other + 1))
+              if [ "$other" -gt 3 ]; then echo "::error title=Price export::$table: a page still failed after 3 retries"; return 1; fi
+              sleep $(( 15 * 2 ** (other - 1) ))   # 15 s, 30 s, 60 s
             done
-            echo "::error title=Price export::$table: a page still failed after 3 retries"; return 1
           }
           for table in hourly daily; do
             cursor=""; n=0

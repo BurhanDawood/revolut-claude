@@ -120,6 +120,7 @@ export function buildOutput(tables, { serverSha, runId = null, exportedAt = new 
 }
 
 // Reads a pages directory written by the workflow (<table>-0001.ndjson, ...), validates everything and returns what buildOutput needs.
+// Every page of the run (both tables) must carry the same server_sha: pages from two server versions are never mixed.
 export function readPages(pagesDir) {
   const names = readdirSync(pagesDir).filter(f => /^(hourly|daily)-\d{4}\.ndjson$/.test(f)).sort();
   const tables = { hourly: [], daily: [] }, shas = new Set();
@@ -134,9 +135,10 @@ export function readPages(pagesDir) {
       shas.add(end.server_sha); serverSha = end.server_sha;
     });
     if (!tables[t].length) throw new Error(t + ': the export has no rows');
+    if (shas.size > 1) throw new Error('the pages come from more than one server version (server_sha ' + [...shas].join(', ') + '): the server was redeployed during the export. Nothing published; re-run the workflow.');
     checkTableOrder(t, tables[t]);
   }
-  return { tables, serverSha, serverShas: [...shas] };
+  return { tables, serverSha };
 }
 
 // ── CLI ──────────────────────────────────────────────────────────────────────────────────────
@@ -157,8 +159,7 @@ function cli(argv) {
     if (prevFile && existsSync(prevFile)) {
       try { prev = JSON.parse(readFileSync(prevFile, 'utf8')); } catch (e) { throw new Error('the published MANIFEST is not valid JSON (' + e.message + '); refusing to overwrite blind'); }
     }
-    const { tables, serverSha, serverShas } = readPages(pagesDir);
-    if (serverShas.length > 1) console.log('::warning title=Price export::the server was redeployed during the export (' + serverShas.join(', ') + ')');
+    const { tables, serverSha } = readPages(pagesDir);
     const counts = { hourly: tables.hourly.length, daily: tables.daily.length };
     const shrink = shrinkProblems(prev, counts);
     if (shrink.length) {

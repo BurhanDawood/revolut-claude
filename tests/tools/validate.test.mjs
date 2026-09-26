@@ -68,6 +68,19 @@ await test('PV7', 'readPages: pages chain (next on all but the last), a missing 
     throws(() => readPages(d), /has a next cursor/);
   } finally { rmSync(d, { recursive: true, force: true }); }
 });
+await test('PV8', 'mixed server_sha (a redeploy mid-export) fails the build, within a table or across the two tables', async () => {
+  const d = mkdtempSync(join(tmpdir(), 't2-pages-'));
+  try {
+    writeFileSync(join(d, 'hourly-0001.ndjson'), page('hourly', HR.slice(0, 2), { next: 'c1' }));
+    writeFileSync(join(d, 'hourly-0002.ndjson'), page('hourly', HR.slice(2), { sha: '99999999' }));
+    writeFileSync(join(d, 'daily-0001.ndjson'), page('daily', DR));
+    throws(() => readPages(d), /more than one server version \(server_sha abcdef12, 99999999\)[\s\S]*re-run the workflow/);
+    writeFileSync(join(d, 'hourly-0002.ndjson'), page('hourly', HR.slice(2)));
+    assert.equal(readPages(d).serverSha, 'abcdef12', 'control: one sha passes');
+    writeFileSync(join(d, 'daily-0001.ndjson'), page('daily', DR, { sha: '99999999' }));
+    throws(() => readPages(d), /more than one server version/);
+  } finally { rmSync(d, { recursive: true, force: true }); }
+});
 
 const prev = { tables: { hourly: { rows: 100000 }, daily: { rows: 20000 } } };
 await test('SG1', 'shrink guard: 9% fewer rows passes (either table), 10% exactly passes', async () => {
