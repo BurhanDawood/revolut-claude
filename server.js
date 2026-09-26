@@ -1594,6 +1594,8 @@ await db.execute(`CREATE TABLE IF NOT EXISTS spec_messages (
 setTimeout(() => { specImportAgentRequests().then(n => { if (n) console.log('[desk] #D1 imported ' + n + ' agent request(s) into the inbox'); }).catch(e => console.error('[desk] import failed:', e.message)); }, 45 * 1000);
 await db.execute('CREATE TABLE IF NOT EXISTS portfolio_value_1m (ts INT UNSIGNED NOT NULL PRIMARY KEY, total_usd DECIMAL(16,4) NOT NULL, coins_usd DECIMAL(16,4) NOT NULL, cash_usd DECIMAL(16,4) NOT NULL, rx_usd DECIMAL(16,4) NULL, kraken_usd DECIMAL(16,4) NULL, tangem_usd DECIMAL(16,4) NULL, partial TINYINT(1) NOT NULL DEFAULT 0)').catch(e => console.error('[migration] portfolio_value_1m:', e.message));   // #PV1 whole-book value, one row a minute
 await db.execute("CREATE TABLE IF NOT EXISTS portfolio_value_hourly (ts INT UNSIGNED NOT NULL PRIMARY KEY, o DECIMAL(16,4) NOT NULL, h DECIMAL(16,4) NOT NULL, l DECIMAL(16,4) NOT NULL, c DECIMAL(16,4) NOT NULL, ko DECIMAL(16,4) NULL, kh DECIMAL(16,4) NULL, kl DECIMAL(16,4) NULL, kc DECIMAL(16,4) NULL, src VARCHAR(8) NOT NULL DEFAULT 'live')").catch(e => console.error('[migration] portfolio_value_hourly:', e.message));
+await db.execute("CREATE TABLE IF NOT EXISTS portfolio_value_daily (d DATE NOT NULL PRIMARY KEY, o DECIMAL(16,4) NOT NULL, h DECIMAL(16,4) NOT NULL, l DECIMAL(16,4) NOT NULL, c DECIMAL(16,4) NOT NULL, ko DECIMAL(16,4) NULL, kh DECIMAL(16,4) NULL, kl DECIMAL(16,4) NULL, kc DECIMAL(16,4) NULL, src VARCHAR(8) NOT NULL DEFAULT 'rebuilt')").catch(e => console.error('[migration] portfolio_value_daily:', e.message));   // #PV2 London days before the hourly history
+await db.execute('CREATE TABLE IF NOT EXISTS portfolio_flows (tx_id VARCHAR(80) NOT NULL PRIMARY KEY, ts INT UNSIGNED NOT NULL, kind VARCHAR(12) NOT NULL, currency VARCHAR(16) NOT NULL, qty DECIMAL(30,10) NOT NULL, usd DECIMAL(16,2) NOT NULL, INDEX idx_ts (ts))').catch(e => console.error('[migration] portfolio_flows:', e.message));   // #PV2 money in / out markers
 setTimeout(() => { repairAgentFills().catch(e => console.error('[agent] boot repair failed:', e.message)); }, 30 * 1000);   // #B21 a fill recorded but not applied before a restart
 await safeAddColumn('trailing_stops',   'auto_execute',    'TINYINT(1) NOT NULL DEFAULT 0'); // #93
 await safeAddColumn('price_targets',    'sell_pct',        'DECIMAL(5,2) NULL'); // #144 per-rung sell %% override for Away Mode up-targets
@@ -8247,6 +8249,13 @@ async function pvKrakenValue() {
   }
   return { usd, cash: _pvKraken.cash };
 }
+const _pvFx = {};   // GBP / EUR -> USD, refreshed hourly (Revolut X lists no GBP/USD pair; getCurrentPrice falls back to Kraken)
+async function pvFx(cur, nowMs = Date.now()) {
+  const k = _pvFx[cur];
+  if (k && nowMs - k.at < 3600000) return k.px;
+  try { const p = await getCurrentPrice(cur + '-USD'); if (p > 0) { _pvFx[cur] = { at: nowMs, px: p }; return p; } } catch (e) {}
+  return k ? k.px : null;
+}
 function pvMinute(ms) { return Math.floor(ms / 60000) * 60; }
 async function portfolioValueSample(nowMs = Date.now()) {
   // Kraken holdings every 10 min (through the K2a queue); prices every minute from Kraken's public ticker.
@@ -8269,7 +8278,7 @@ async function portfolioValueSample(nowMs = Date.now()) {
     const qty = (parseFloat(a.available) || 0) + (parseFloat(a.reserved) || 0);
     if (!(qty > 0)) continue;
     if (PV_CASH_USD.includes(cur)) { cash += qty; continue; }
-    if (cur === 'EUR' || cur === 'GBP') { const fx = px[cur + '-USD'] || _pvLastPx[cur + '-USD']; if (fx) { _pvLastPx[cur + '-USD'] = fx; cash += qty * fx; } continue; }
+    if (cur === 'EUR' || cur === 'GBP') { const fx = px[cur + '-USD'] || await pvFx(cur, nowMs); if (fx) { _pvLastPx[cur + '-USD'] = fx; cash += qty * fx; } continue; }
     const sym = cur + '-USD';
     const p = px[sym] || _pvLastPx[sym];
     if (p > 0) { _pvLastPx[sym] = p; rx += qty * p; }
@@ -8332,7 +8341,8 @@ function pvMergeInto(map, key, x) {
   if (!cur) map.set(key, { t: key, o: x.o, h: x.h, l: x.l, c: x.c });
   else { cur.h = Math.max(cur.h, x.h); cur.l = Math.min(cur.l, x.l); cur.c = x.c; }
 }
-const PV_IVS = { '1m': 60, '5m': 300, '30m': 1800, '1h': 3600, '4h': 14400, '1d': 'day', '1w': 'week' };
+const PV_IVS = { '1m': 60, '5m': 300, '30m': 1800, '1h': 3600, '4h': 14400, '1d': 'day', '1w': 'week', '1mo': 'month' };
+function pvMonthKey(day) { return day.slice(0, 8) + '01'; }
 async function portfolioValueCandles(iv, series = 'total', nowMs = Date.now()) {
   if (!PV_IVS[iv]) throw new Error('interval must be one of ' + Object.keys(PV_IVS).join(', '));
   const coins = series === 'coins';
@@ -8344,7 +8354,8 @@ async function portfolioValueCandles(iv, series = 'total', nowMs = Date.now()) {
     const [rows] = await db.execute('SELECT ts, ' + f + ' FROM portfolio_value_1m WHERE ts >= ? ORDER BY ts', [nowS - span]);
     candles = pvCandlesFromMinutes(rows, PV_IVS[iv], f);
   } else {
-    const [hrs] = await db.execute('SELECT ts, ' + (coins ? 'ko AS o, kh AS h, kl AS l, kc AS c' : 'o, h, l, c') + ' FROM portfolio_value_hourly ORDER BY ts');
+    const cols = coins ? 'ko AS o, kh AS h, kl AS l, kc AS c' : 'o, h, l, c';
+    const [hrs] = await db.execute('SELECT ts, ' + cols + ' FROM portfolio_value_hourly ORDER BY ts');
     const hourly = hrs.filter(r => r.c != null).map(r => ({ t: Number(r.ts), o: Number(r.o), h: Number(r.h), l: Number(r.l), c: Number(r.c) }));
     const lastH = hourly.length ? hourly[hourly.length - 1].t : 0;
     const [mins] = await db.execute('SELECT ts, ' + f + ' FROM portfolio_value_1m WHERE ts >= ? ORDER BY ts', [Math.max(lastH, nowS - 3 * 86400) - 300]);
@@ -8353,31 +8364,260 @@ async function portfolioValueCandles(iv, series = 'total', nowMs = Date.now()) {
     if (iv === '1h') candles = all;
     else if (iv === '4h') { const m = new Map(); for (const x of all) pvMergeInto(m, Math.floor(x.t / 14400) * 14400, x); candles = [...m.values()]; }
     else {
+      // #PV2 days older than the hourly history come from the rebuilt daily table
+      const firstDay = all.length ? pvLondonDay(all[0].t) : '9999-12-31';
+      const [drs] = await db.execute("SELECT DATE_FORMAT(d, '%Y-%m-%d') AS d, " + cols + ' FROM portfolio_value_daily WHERE d < ? ORDER BY d', [firstDay]);
+      const key = (day) => (iv === '1d' ? day : iv === '1w' ? pvWeekKey(day) : pvMonthKey(day));
       const m = new Map();
-      for (const x of all) { const day = pvLondonDay(x.t); pvMergeInto(m, iv === '1d' ? day : pvWeekKey(day), x); }
+      for (const r of drs) if (r.c != null) pvMergeInto(m, key(r.d), { o: Number(r.o), h: Number(r.h), l: Number(r.l), c: Number(r.c) });
+      for (const x of all) pvMergeInto(m, key(pvLondonDay(x.t)), x);
       candles = [...m.values()];
     }
   }
   return candles;
 }
+// #PV2 money in and out (deposits, card spends, transfers) for the chart's markers: only flows of $25 or more
+async function portfolioValueFlows(sinceS = 0) {
+  const [rows] = await db.execute('SELECT ts, kind, currency, qty, usd FROM portfolio_flows WHERE ts >= ? AND ABS(usd) >= 25 ORDER BY ts', [sinceS]);
+  return rows.map(r => ({ ts: Number(r.ts), kind: r.kind, currency: r.currency, qty: Number(r.qty), usd: Number(r.usd) }));
+}
 async function portfolioValueState(nowMs = Date.now()) {
   const nowS = Math.floor(nowMs / 1000);
   const [last] = await db.execute('SELECT * FROM portfolio_value_1m ORDER BY ts DESC LIMIT 1');
-  const [first] = await db.execute('SELECT MIN(t) AS t FROM (SELECT MIN(ts) AS t FROM portfolio_value_1m UNION ALL SELECT MIN(ts) AS t FROM portfolio_value_hourly) x');
+  const [first] = await db.execute('SELECT MIN(ts) AS t FROM portfolio_value_1m');
+  const [hist] = await db.execute("SELECT (SELECT MIN(ts) FROM portfolio_value_hourly) AS h, (SELECT UNIX_TIMESTAMP(MIN(d)) FROM portfolio_value_daily) AS d");
   const [day] = await db.execute('SELECT MIN(ts) AS t0, MAX(total_usd) AS hi, MIN(total_usd) AS lo, MAX(coins_usd) AS khi, MIN(coins_usd) AS klo FROM portfolio_value_1m WHERE ts >= ?', [nowS - 86400]);
   let ago = null;
   if (day[0] && day[0].t0 != null) { const [a] = await db.execute('SELECT ts, total_usd, coins_usd FROM portfolio_value_1m WHERE ts >= ? ORDER BY ts LIMIT 1', [nowS - 86400]); ago = a[0] || null; }
   const L = last[0] || null;
   const num = v => (v == null ? null : Number(v));
+  const hs = [hist[0] && hist[0].h, hist[0] && hist[0].d].filter(v => v != null).map(Number);
   return {
     latest: L ? { ts: Number(L.ts), total: num(L.total_usd), coins: num(L.coins_usd), cash: num(L.cash_usd), revolut_x: num(L.rx_usd), kraken: num(L.kraken_usd), tangem: num(L.tangem_usd), partial: !!Number(L.partial) } : null,
     day: ago ? { since: Number(ago.ts), total_then: num(ago.total_usd), coins_then: num(ago.coins_usd), hi: num(day[0].hi), lo: num(day[0].lo), coins_hi: num(day[0].khi), coins_lo: num(day[0].klo) } : null,
     recording_since: first[0] && first[0].t != null ? Number(first[0].t) : null,
+    history_from: hs.length ? Math.min(...hs) : null,
     intervals: Object.keys(PV_IVS),
+    rebuild: await pv2Status().catch(() => null),
   };
+}
+// ── #PV2 HISTORY REBUILD: the book's value before live recording began, from the venue's own transaction record.
+// Revolut X /transactions lists every completed buy, sell, send (card spend, transfer out) and receive (deposit) with
+// both legs. Walking it BACKWARDS from today's balances gives what was held at every hour; x the venue's candles
+// (price_intraday_hourly / price_daily_ohlc, fetched here if a coin has none) gives the value. Hourly for the last
+// PV2_HOURLY_DAYS days, daily before that. Rows are written with src 'rebuilt' and NEVER over a live row.
+// Limits, stated on the page: Kraken is not rebuilt (its history is not in this record); the Tangem wallet is counted
+// only after the XRP that was sent to it left Revolut; GBP/EUR cash uses today's rate; a candle's high/low assumes
+// every coin peaked together, so it is an outer bound. Read-only against every trading table.
+const PV2_VERSION = 1, PV2_HOURLY_DAYS = 90, PV2_MAX_DAYS = 1100, PV2_KEY = 'pv_rebuild';
+const PV2_STABLE = { USD: 1, USDT: 1, USDC: 1 };
+let _pv2Running = false;
+async function pv2Status() {
+  const [r] = await db.execute('SELECT config_value FROM system_config WHERE config_key = ?', [PV2_KEY]);
+  return r.length ? JSON.parse(r[0].config_value) : null;
+}
+async function pv2Save(st) {
+  st.updated_at = new Date().toISOString();
+  await db.execute('INSERT INTO system_config (config_key, config_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)', [PV2_KEY, JSON.stringify(st)]).catch(() => {});
+}
+// One completed transaction -> signed currency legs. A leg with no counterpart is money entering or leaving the book.
+function pv2Legs(rows) {
+  const out = [];
+  for (const t of rows) {
+    if (!t || t.status !== 'completed') continue;
+    const ts = Number(t.processed_date || t.created_date || 0); if (!(ts > 0)) continue;
+    const src = t.source && t.source.currency ? { cur: String(t.source.currency).toUpperCase(), amt: parseFloat(t.source.amount) || 0 } : null;
+    const dst = t.destination && t.destination.currency ? { cur: String(t.destination.currency).toUpperCase(), amt: parseFloat(t.destination.amount) || 0 } : null;
+    if (src && src.amt) out.push({ ts, cur: src.cur, amt: -src.amt, type: String(t.type || ''), id: t.id || null, flow: !dst });
+    if (dst && dst.amt) out.push({ ts, cur: dst.cur, amt: dst.amt, type: String(t.type || ''), id: t.id || null, flow: !src });
+  }
+  return out.sort((a, b) => b.ts - a.ts);   // newest first: the walk goes backwards
+}
+// Holdings at each boundary (seconds, any order): balance(B) = balance(now) - every leg at or after B.
+// A balance that would go negative means the record starts later than the holding: clamped to 0 and counted.
+function pv2Holdings(legs, nowBal, boundaries) {
+  const bs = [...new Set(boundaries)].sort((a, b) => b - a);
+  const bal = { ...nowBal }, snaps = new Map(); let i = 0, clamped = 0;
+  for (const B of bs) {
+    while (i < legs.length && legs[i].ts >= B * 1000) { const l = legs[i++]; bal[l.cur] = (bal[l.cur] || 0) - l.amt; }
+    const snap = {};
+    for (const [c, q] of Object.entries(bal)) { if (q > 1e-12) snap[c] = q; else if (q < -1e-9) clamped++; }
+    snaps.set(B, snap);
+  }
+  return { snaps, clamped };
+}
+function pv2LondonMidnight(day) {   // 'YYYY-MM-DD' -> the UTC second London's day starts
+  const t0 = Date.UTC(+day.slice(0, 4), +day.slice(5, 7) - 1, +day.slice(8, 10));
+  for (const off of [0, -3600000]) if (pvLondonDay((t0 + off) / 1000) === day && pvLondonDay((t0 + off - 1000) / 1000) !== day) return (t0 + off) / 1000;
+  return t0 / 1000;
+}
+async function pv2FetchCandles(coin, ivMin, sinceMs, untilMs, sleep) {
+  const step = 100 * ivMin * 60000, rows = []; let until = untilMs, reqs = 0;
+  while (until > sinceMs) {
+    const since = Math.max(sinceMs, until - step);
+    let r = null;
+    for (let a = 0; a < 4; a++) {
+      try { r = await revolutRequest('GET', '/candles/' + coin + '-USD?' + new URLSearchParams({ interval: String(ivMin), since: String(since), until: String(until) }).toString(), null, null, { withStatus: true }); }
+      catch (e) { r = { status: 0, ok: false, body: { message: e.message } }; }
+      reqs++;
+      if (r.status === 429) { await sleep(30000); continue; }
+      break;
+    }
+    if (r.status === 400 || r.status === 404) return { listed: false, rows, reqs };
+    if (!r.ok) return { listed: true, rows, reqs, error: 'HTTP ' + r.status };
+    for (const k of (r.body && Array.isArray(r.body.data) ? r.body.data : [])) {
+      const t = Number(k.start), o = parseFloat(k.open), h = parseFloat(k.high), l = parseFloat(k.low), c = parseFloat(k.close);
+      if (t > 0 && o > 0 && h > 0 && l > 0 && c > 0) rows.push({ t, o, h, l, c });
+    }
+    until = since;
+    await sleep(400);
+  }
+  return { listed: true, rows, reqs };
+}
+async function pv2Run(opt = {}) {
+  if (_pv2Running) return { skipped: 'already running' };
+  _pv2Running = true;
+  const sleep = opt.sleep || ((ms) => new Promise(r => setTimeout(r, ms)));
+  const nowMs = opt.nowMs || Date.now(), H = 3600;
+  const st = { version: PV2_VERSION, status: 'running', started_at: new Date(nowMs).toISOString(), step: 'reading your transaction history' };
+  try {
+    await pv2Save(st);
+    // 1. where live recording begins: rebuilt rows stop there
+    const [lv] = await db.execute("SELECT MIN(ts) AS t FROM portfolio_value_1m");
+    const liveStart = lv[0] && lv[0].t != null ? Number(lv[0].t) : Math.floor(nowMs / 1000);
+    const liveHour = Math.floor(liveStart / H) * H;
+    // 2. the whole record, and today's balances
+    const tx = await (opt.fetchTx || fetchAllTransactionsForRebuild)(PV2_MAX_DAYS);
+    const legs = pv2Legs(tx.rows || []);
+    if (!legs.length) throw new Error('no transactions returned');
+    st.transactions = (tx.rows || []).length; st.incomplete_windows = (tx.incomplete || []).length;
+    const balList = await revolutRequest('GET', '/balances');
+    const nowBal = {};
+    for (const a of (Array.isArray(balList) ? balList : (balList && (balList.data || balList.balances)) || [])) {
+      const c = String(a.currency || '').toUpperCase(); const q = (parseFloat(a.available) || 0) + (parseFloat(a.reserved) || 0);
+      if (c && q > 0) nowBal[c] = q;
+    }
+    let tangemNow = 0; try { tangemNow = (await getTangemXRPBalance()) || 0; } catch (e) {}
+    const fx = {}; for (const c of ['GBP', 'EUR']) fx[c] = await pvFx(c, nowMs) || 0;
+    // 3. the grid: London days before the hourly span, then hours up to live recording
+    const firstTs = Math.floor(legs[legs.length - 1].ts / 1000);
+    const hourlyFromDay = pvLondonDay(Math.max(firstTs, liveHour - PV2_HOURLY_DAYS * 86400));
+    const hourlyFrom = Math.max(pv2LondonMidnight(hourlyFromDay), Math.floor(firstTs / H) * H);
+    const days = []; for (let d = pvLondonDay(firstTs); d < hourlyFromDay; ) { days.push(d); d = pvLondonDay(pv2LondonMidnight(d) + 86400 + 7200); }
+    const dayB = days.map(pv2LondonMidnight).concat([hourlyFrom]);
+    const hourB = []; for (let t = hourlyFrom; t <= liveHour; t += H) hourB.push(t);
+    const { snaps, clamped } = pv2Holdings(legs, nowBal, dayB.concat(hourB));
+    st.clamped = clamped;
+    // Tangem: counted once the XRP that went to it has left Revolut (every XRP send after B is taken off today's wallet)
+    const xrpSends = legs.filter(l => l.cur === 'XRP' && l.flow && l.amt < 0);
+    const tangemAt = (B) => { let q = tangemNow; for (const l of xrpSends) if (l.ts >= B * 1000) q += l.amt; return Math.max(0, q); };
+    // 4. prices: which coins were held, and do we have their candles?
+    st.step = 'checking price history'; await pv2Save(st);
+    const coinSpan = {};   // coin -> [first, last] boundary it was held at
+    for (const [B, snap] of snaps) for (const c of Object.keys(snap)) {
+      if (PV2_STABLE[c] || c === 'GBP' || c === 'EUR') continue;
+      const s0 = coinSpan[c] || [B, B]; coinSpan[c] = [Math.min(s0[0], B), Math.max(s0[1], B)];
+    }
+    if (tangemNow > 0) coinSpan.XRP = [coinSpan.XRP ? coinSpan.XRP[0] : dayB[0], liveHour];   // the wallet holds XRP up to now
+    const coins = Object.keys(coinSpan).sort();
+    const daily = {}, hourly = {};
+    const loadDaily = async (c) => { const [r] = await db.execute("SELECT DATE_FORMAT(day, '%Y-%m-%d') AS d, open_px AS o, high_px AS h, low_px AS l, close_px AS c FROM price_daily_ohlc WHERE symbol = ? ORDER BY day", [c + '-USD']); daily[c] = new Map(r.map(x => [x.d, { o: +x.o, h: +x.h, l: +x.l, c: +x.c }])); };
+    const loadHourly = async (c) => { const [r] = await db.execute('SELECT UNIX_TIMESTAMP(hour_bucket) AS t, open_px AS o, high_px AS h, low_px AS l, close_px AS c FROM price_intraday_hourly WHERE symbol = ? AND hour_bucket >= FROM_UNIXTIME(?) ORDER BY hour_bucket', [c + '-USD', hourlyFrom]); hourly[c] = new Map(r.map(x => [Number(x.t), { o: +x.o, h: +x.h, l: +x.l, c: +x.c }])); };
+    st.fetched = []; st.not_listed = []; st.requests = 0;
+    for (const c of coins) {
+      await loadDaily(c);
+      const [a, b] = coinSpan[c];
+      if (a < hourlyFrom && daily[c].size === 0) {   // no daily candles at all: fetch the span it was held
+        const f = await pv2FetchCandles(c, 1440, (a - 86400) * 1000, Math.min(b + 86400, hourlyFrom + 86400) * 1000, sleep); st.requests += f.reqs;
+        if (!f.listed) { st.not_listed.push(c); continue; }
+        const rows = f.rows.filter(k => k.t + 86400000 <= nowMs).map(k => [c + '-USD', pvLondonDay(k.t / 1000 + 7200), k.o, k.h, k.l, k.c]);
+        if (rows.length) await db.execute('INSERT IGNORE INTO price_daily_ohlc (symbol, day, open_px, high_px, low_px, close_px, source) VALUES ' + rows.map(() => "(?, ?, ?, ?, ?, ?, 'venue')").join(', '), rows.flat());
+        st.fetched.push(c + ' daily'); await loadDaily(c);
+      }
+      if (b >= hourlyFrom) {
+        await loadHourly(c);
+        const need = Math.max(1, (Math.min(b, liveHour) - Math.max(a, hourlyFrom)) / H);
+        if (hourly[c].size < need * 0.8 && !st.not_listed.includes(c)) {
+          const f = await pv2FetchCandles(c, 60, Math.max(a, hourlyFrom) * 1000, (Math.min(b, liveHour) + H) * 1000, sleep); st.requests += f.reqs;
+          if (!f.listed) { st.not_listed.push(c); continue; }
+          const rows = f.rows.map(k => [c + '-USD', new Date(Math.floor(k.t / 3600000) * 3600000).toISOString().slice(0, 19).replace('T', ' '), k.o, k.h, k.l, k.c]);
+          for (let i = 0; i < rows.length; i += 500) { const part = rows.slice(i, i + 500); await db.execute('INSERT IGNORE INTO price_intraday_hourly (symbol, hour_bucket, open_px, high_px, low_px, close_px, sample_count, source) VALUES ' + part.map(() => "(?, ?, ?, ?, ?, ?, 0, 'venue')").join(', '), part.flat()); }
+          st.fetched.push(c + ' hourly'); await loadHourly(c);
+        }
+      }
+      st.progress = Math.round(100 * (coins.indexOf(c) + 1) / coins.length); await pv2Save(st);
+    }
+    // 5. value every step. A missing candle uses the nearest earlier close (or, before the first, the first close).
+    st.step = 'valuing each hour and day'; await pv2Save(st);
+    const lastPx = {}, firstPx = {};
+    for (const c of coins) { const d = daily[c] && [...daily[c].values()][0]; const h = hourly[c] && [...hourly[c].values()][0]; firstPx[c] = (d && d.c) || (h && h.c) || null; }
+    const pxAt = (c, B, B1, isDay) => {
+      let k = null;
+      if (isDay) k = daily[c] && daily[c].get(pvLondonDay(B + 7200));
+      else k = (hourly[c] && hourly[c].get(B)) || null;
+      if (!k && !isDay && daily[c]) { const d = daily[c].get(pvLondonDay(B)); if (d) k = { o: d.c, h: d.c, l: d.c, c: d.c }; }
+      if (k) { lastPx[c] = k.c; return k; }
+      const p = lastPx[c] || firstPx[c]; return p ? { o: p, h: p, l: p, c: p } : null;
+    };
+    let unpricedMax = 0;
+    const valueStep = (B, B1, isDay) => {
+      const s0 = snaps.get(B) || {}, s1 = snaps.get(B1) || {};
+      const cashOf = (s) => Object.entries(s).reduce((v, [c, q]) => v + (PV2_STABLE[c] ? q : (fx[c] ? q * fx[c] : 0)), 0);
+      let ko = 0, kc = 0, kh = 0, kl = 0, unpriced = 0;
+      const set = new Set(Object.keys(s0).concat(Object.keys(s1)));
+      const t0 = tangemAt(B), t1 = tangemAt(B1);
+      if (t0 > 0 || t1 > 0) set.add('XRP');
+      for (const c of set) {
+        if (PV2_STABLE[c] || c === 'GBP' || c === 'EUR') continue;
+        const q0 = (s0[c] || 0) + (c === 'XRP' ? t0 : 0), q1 = (s1[c] || 0) + (c === 'XRP' ? t1 : 0);
+        const k = pxAt(c, B, B1, isDay);
+        if (!k) { if (q1 > 0) unpriced++; continue; }
+        ko += q0 * k.o; kc += q1 * k.c; kh += q1 * k.h; kl += q1 * k.l;
+      }
+      unpricedMax = Math.max(unpricedMax, unpriced);
+      const c0 = cashOf(s0), c1 = cashOf(s1);
+      const r4 = (x) => Number(x.toFixed(4));
+      const K = { o: ko, c: kc, h: Math.max(ko, kc, kh), l: Math.min(ko, kc, kl) };
+      const T = { o: ko + c0, c: kc + c1, h: Math.max(ko + c0, kc + c1, kh + c1), l: Math.min(ko + c0, kc + c1, kl + c1) };
+      return [r4(T.o), r4(T.h), r4(T.l), r4(T.c), r4(K.o), r4(K.h), r4(K.l), r4(K.c)];
+    };
+    let dRows = 0, hRows = 0;
+    for (let i = 0; i < days.length; i++) {
+      const v = valueStep(dayB[i], dayB[i + 1], true);
+      await db.execute("INSERT INTO portfolio_value_daily (d, o, h, l, c, ko, kh, kl, kc, src) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'rebuilt') ON DUPLICATE KEY UPDATE o = VALUES(o), h = VALUES(h), l = VALUES(l), c = VALUES(c), ko = VALUES(ko), kh = VALUES(kh), kl = VALUES(kl), kc = VALUES(kc)", [days[i], ...v]);
+      dRows++;
+    }
+    for (let i = 0; i + 1 < hourB.length; i++) {
+      if (hourB[i] >= liveHour) break;
+      const v = valueStep(hourB[i], hourB[i + 1], false);
+      await db.execute("INSERT INTO portfolio_value_hourly (ts, o, h, l, c, ko, kh, kl, kc, src) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'rebuilt') ON DUPLICATE KEY UPDATE o = IF(src = 'live', o, VALUES(o)), h = IF(src = 'live', h, VALUES(h)), l = IF(src = 'live', l, VALUES(l)), c = IF(src = 'live', c, VALUES(c)), ko = IF(src = 'live', ko, VALUES(ko)), kh = IF(src = 'live', kh, VALUES(kh)), kl = IF(src = 'live', kl, VALUES(kl)), kc = IF(src = 'live', kc, VALUES(kc))", [hourB[i], ...v]);
+      hRows++;
+    }
+    // 6. money in and out, for the chart's markers (XRP sent to the Tangem wallet stays in the book: not a flow)
+    let fRows = 0, tangemLeft = tangemNow;
+    for (const l of legs) {   // newest first
+      if (!l.flow || !l.id) continue;
+      if (l.cur === 'XRP' && l.amt < 0 && tangemLeft > 0) { tangemLeft += l.amt; continue; }
+      const ts = Math.floor(l.ts / 1000);
+      const p = PV2_STABLE[l.cur] ? 1 : fx[l.cur] ? fx[l.cur] : (() => { const k = ts >= hourlyFrom ? hourly[l.cur] && hourly[l.cur].get(Math.floor(ts / H) * H) : null; const d = daily[l.cur] && daily[l.cur].get(pvLondonDay(ts)); return (k && k.c) || (d && d.c) || firstPx[l.cur] || 0; })();
+      const kind = l.amt > 0 ? (PV2_STABLE[l.cur] || fx[l.cur] ? 'deposit' : 'coin_in') : (l.type === 'send' ? 'send' : 'out');
+      await db.execute('INSERT INTO portfolio_flows (tx_id, ts, kind, currency, qty, usd) VALUES (?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE ts = VALUES(ts), kind = VALUES(kind), qty = VALUES(qty), usd = VALUES(usd)', [String(l.id) + (l.amt > 0 ? ':in' : ':out'), ts, kind, l.cur, l.amt, Number((l.amt * p).toFixed(2))]);
+      fRows++;
+    }
+    Object.assign(st, { status: 'done', finished_at: new Date().toISOString(), step: null, progress: 100, first_day: days[0] || hourlyFromDay, hourly_from: new Date(hourlyFrom * 1000).toISOString(), live_from: new Date(liveStart * 1000).toISOString(), daily_rows: dRows, hourly_rows: hRows, flows: fRows, coins: coins.length, unpriced_coins_max: unpricedMax });
+    await pv2Save(st);
+    console.log('[pv] #PV2 history rebuilt: ' + dRows + ' days + ' + hRows + ' hours from ' + st.first_day + ', ' + coins.length + ' coins, ' + fRows + ' flows' + (st.not_listed.length ? '; no Revolut X prices for ' + st.not_listed.join(', ') : ''));
+    return st;
+  } catch (e) {
+    Object.assign(st, { status: 'failed', error: e.message, finished_at: new Date().toISOString() });
+    await pv2Save(st);
+    console.error('[pv] #PV2 rebuild failed:', e.message);
+    return st;
+  } finally { _pv2Running = false; }
 }
 setTimeout(() => { portfolioValueTick(); setInterval(portfolioValueTick, 60 * 1000); console.log('[pv] #PV1 portfolio value sampling every minute'); }, 60 * 1000);
 setTimeout(() => { const roll = () => portfolioValueRollup().catch(e => console.error('[pv] rollup failed:', e.message)); roll(); setInterval(roll, 10 * 60 * 1000); }, 5 * 60 * 1000);
+setTimeout(async () => { try { const st = await pv2Status(); if (!st || st.version !== PV2_VERSION || st.status !== 'done') await pv2Run(); } catch (e) { console.error('[pv] #PV2 start failed:', e.message); } }, 3 * 60 * 1000);   // #PV2 rebuild the history once (and after a failed or interrupted run)
 
 async function pendingReservations() {
   const cycles = [];
@@ -23390,11 +23630,17 @@ const DESK_PAGE_JS = "(function () {\n  var $ = function (id) { return document.
 app.get('/desk', (req, res) => { res.set('Cache-Control', 'no-store').type('html').send(DESK_PAGE_HTML.replace('<head>', '<head>\n<script src="/dashboard-auth.js"></script>')); });
 app.get('/desk-page.js', (req, res) => { res.set('Cache-Control', 'no-store').type('application/javascript').send(DESK_PAGE_JS); });
 // #PV1 THE PORTFOLIO CHART PAGE (read-only; data under /api/ behind the dashboard key like /agent)
-const PV_PAGE_HTML = "<!doctype html>\n<html lang=\"en\"><head>\n<meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">\n<title>Portfolio</title>\n<style>\n:root { --bg:#f4f5f7; --card:#ffffff; --ink:#171a1f; --soft:#5f6672; --line:#dfe3e8; --grid:#eceef2; --acc:#3656a8; --up:#1f9d78; --down:#d64550; color-scheme:light; }\n@media (prefers-color-scheme: dark) { :root:not([data-theme=\"light\"]) { --bg:#0d0f12; --card:#15181d; --ink:#e8ebef; --soft:#9aa2ae; --line:#262b33; --grid:#1d2128; --acc:#8ea8f0; --up:#2ec4a0; --down:#f0606b; color-scheme:dark; } }\n:root[data-theme=\"dark\"] { --bg:#0d0f12; --card:#15181d; --ink:#e8ebef; --soft:#9aa2ae; --line:#262b33; --grid:#1d2128; --acc:#8ea8f0; --up:#2ec4a0; --down:#f0606b; color-scheme:dark; }\n* { box-sizing:border-box; }\nbody { margin:0; background:var(--bg); color:var(--ink); font:15px/1.5 system-ui,-apple-system,\"Segoe UI\",sans-serif; }\nmain { max-width:1100px; margin:0 auto; padding:20px 16px 60px; display:flex; flex-direction:column; gap:14px; }\nh1 { font-size:14px; margin:0; color:var(--soft); font-weight:600; text-transform:uppercase; letter-spacing:.06em; }\n.soft { color:var(--soft); } .num { font-variant-numeric:tabular-nums; }\n.head { display:flex; flex-wrap:wrap; gap:8px 28px; align-items:flex-end; }\n.big { font-size:34px; font-weight:600; line-height:1.1; }\n.stat b { display:block; font-size:18px; font-weight:600; } .stat span { color:var(--soft); font-size:13px; }\n.up { color:var(--up); } .down { color:var(--down); }\n.bar { display:flex; flex-wrap:wrap; gap:6px; align-items:center; }\n.iv { background:var(--card); border:1px solid var(--line); color:var(--ink); border-radius:999px; padding:5px 12px; font:600 13px/1 system-ui,-apple-system,\"Segoe UI\",sans-serif; cursor:pointer; }\n.iv.on { background:var(--ink); color:var(--bg); border-color:var(--ink); }\n.sep { width:1px; height:20px; background:var(--line); margin:0 4px; }\n.card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:8px; }\n#chart { width:100%; height:min(62vh, 520px); min-height:300px; }\n.parts { display:flex; flex-wrap:wrap; gap:6px 20px; font-size:14px; }\n.parts span b { font-weight:600; }\n#note { font-size:13px; }\nhtml.embed:root { --bg:#1a1a1a; --card:#1a1a1a; --ink:#e8e8e8; --soft:#888888; --line:#2e2e2e; --grid:#232323; --acc:#00ffc8; --up:#00c896; --down:#ff4d6a; color-scheme:dark; }\nhtml.embed main { max-width:none; padding:0; gap:10px; }\nhtml.embed h1, html.embed .big, html.embed #parts, html.embed .foot { display:none; }\nhtml.embed .head { gap:4px 22px; align-items:baseline; }\nhtml.embed .stat b { font-size:15px; display:inline; margin-left:6px; }\nhtml.embed .card { border:0; padding:0; border-radius:0; }\nhtml.embed #chart { height:300px; min-height:0; }\nhtml.embed .iv { padding:5px 10px; }\nhtml.embed .iv.on { background:var(--acc); color:#0d0d0d; border-color:var(--acc); }\nhtml.embed #note { font-size:12px; }\n</style></head>\n<body><main>\n<h1>Portfolio value</h1>\n<div class=\"head\">\n  <div><div class=\"big num\" id=\"val\">\u2026</div><div class=\"num\" id=\"chg\">&nbsp;</div></div>\n  <div class=\"stat num\"><span>24h high</span><b id=\"hi\">\u2013</b></div>\n  <div class=\"stat num\"><span>24h low</span><b id=\"lo\">\u2013</b></div>\n</div>\n<div class=\"bar\" id=\"ivs\">\n  <button class=\"iv\" data-k=\"1m\">1m</button><button class=\"iv\" data-k=\"5m\">5m</button><button class=\"iv\" data-k=\"30m\">30m</button><button class=\"iv\" data-k=\"1h\">1h</button><button class=\"iv\" data-k=\"4h\">4h</button><button class=\"iv\" data-k=\"1D\">1D</button><button class=\"iv\" data-k=\"1W\">1W</button><button class=\"iv\" data-k=\"1Y\">1Y</button><button class=\"iv\" data-k=\"5Y\">5Y</button><button class=\"iv\" data-k=\"All\">All</button>\n  <span class=\"sep\"></span>\n  <button class=\"iv\" data-s=\"total\">With cash</button><button class=\"iv\" data-s=\"coins\">Coins only</button>\n</div>\n<div class=\"card\"><div id=\"chart\"></div></div>\n<div class=\"parts num\" id=\"parts\"></div>\n<div class=\"soft\" id=\"note\">Loading\u2026</div>\n<div class=\"soft foot\" style=\"font-size:13px\">Read-only. Revolut X, Kraken, the Tangem XRP wallet and cash on both exchanges, sampled every minute; times are London time. Pinch or scroll to zoom, drag to go back. Refreshes every 60 s.</div>\n</main>\n<script src=\"https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js\" onerror=\"var s=document.createElement('script');s.src='https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js';document.head.appendChild(s);s.onload=function(){window.__pvStart&&window.__pvStart();}\"></script>\n<script src=\"/portfolio-page.js\"></script>\n</body></html>\n";
-const PV_PAGE_JS = "(function () {\n  'use strict';\n  var $ = function (id) { return document.getElementById(id); };\n  var EMBED = /[?&]embed=1(&|$)/.test(location.search);   // shown inside the dashboard's Portfolio tab\n  if (EMBED) document.documentElement.classList.add('embed');\n  function fit() { if (EMBED && window.parent !== window) try { window.parent.postMessage({ pvHeight: document.documentElement.scrollHeight }, location.origin); } catch (e) {} }\n  var get = function (p) { return fetch(p).then(function (r) { if (!r.ok) throw new Error(p + ' HTTP ' + r.status); return r.json(); }); };\n  var usd = function (v) { if (v == null || !isFinite(v)) return '\u2013'; var a = Math.abs(v); return '$' + v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: a < 10 ? 4 : 2 }); };\n  var DAY = 86400;\n  // button -> [candle interval, visible window in seconds (0 = everything)]\n  var VIEWS = { '1m': ['1m', 6 * 3600], '5m': ['5m', DAY], '30m': ['30m', 7 * DAY], '1h': ['1h', 30 * DAY], '4h': ['4h', 90 * DAY], '1D': ['1d', 180 * DAY], '1W': ['1w', 730 * DAY], '1Y': ['1d', 365 * DAY], '5Y': ['1w', 1826 * DAY], 'All': ['1w', 0] };\n  var view = '1h', series = 'total', chart = null, candles = null, lastKey = null, state = null;\n  try { view = localStorage.getItem('pv.view') || view; series = localStorage.getItem('pv.series') || series; } catch (e) {}\n  if (!VIEWS[view]) view = '1h';\n  function css(n) { return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); }\n  function londonOffset(t) {   // seconds to add to a UTC timestamp so the chart's axis reads London time\n    var d = new Date(t * 1000);\n    return (Date.parse(d.toLocaleString('en-US', { timeZone: 'Europe/London' })) - Date.parse(d.toLocaleString('en-US', { timeZone: 'UTC' }))) / 1000;\n  }\n  function toChartTime(t) { return typeof t === 'string' ? Date.UTC(+t.slice(0, 4), +t.slice(5, 7) - 1, +t.slice(8, 10)) / 1000 : t + londonOffset(t); }\n  function paintMarks() {\n    $('ivs').querySelectorAll('button').forEach(function (b) {\n      b.classList.toggle('on', b.getAttribute('data-k') === view || b.getAttribute('data-s') === series);\n    });\n  }\n  function build() {\n    var el = $('chart');\n    chart = LightweightCharts.createChart(el, {\n      autoSize: true,\n      layout: { background: { type: 'solid', color: css('--card') }, textColor: css('--soft'), fontFamily: 'system-ui,-apple-system,\"Segoe UI\",sans-serif' },\n      grid: { vertLines: { color: css('--grid') }, horzLines: { color: css('--grid') } },\n      rightPriceScale: { borderColor: css('--line') },\n      timeScale: { borderColor: css('--line'), timeVisible: true, secondsVisible: false, rightOffset: 4 },\n      crosshair: { mode: 0 },\n      localization: { priceFormatter: function (p) { return '$' + p.toLocaleString('en-US', { maximumFractionDigits: 2, minimumFractionDigits: 2 }); } }\n    });\n    candles = chart.addCandlestickSeries({ upColor: css('--up'), downColor: css('--down'), borderUpColor: css('--up'), borderDownColor: css('--down'), wickUpColor: css('--up'), wickDownColor: css('--down'), priceLineColor: css('--acc') });\n    var mq = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;\n    var retheme = function () {\n      chart.applyOptions({ layout: { background: { type: 'solid', color: css('--card') }, textColor: css('--soft') }, grid: { vertLines: { color: css('--grid') }, horzLines: { color: css('--grid') } } });\n      candles.applyOptions({ upColor: css('--up'), downColor: css('--down'), borderUpColor: css('--up'), borderDownColor: css('--down'), wickUpColor: css('--up'), wickDownColor: css('--down') });\n    };\n    if (mq && mq.addEventListener) mq.addEventListener('change', retheme);\n    new MutationObserver(retheme).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });\n  }\n  function head() {\n    if (!state || !state.latest) { $('val').textContent = '\u2013'; return; }\n    var L = state.latest, coins = series === 'coins';\n    var now = coins ? L.coins : L.total;\n    $('val').textContent = usd(now);\n    var d = state.day;\n    if (d) {\n      var then = coins ? d.coins_then : d.total_then, pc = then ? (now - then) / then * 100 : null;\n      var span = Math.round((L.ts - d.since) / 3600);\n      $('chg').innerHTML = pc == null ? '&nbsp;' : '<span class=\"' + (pc >= 0 ? 'up' : 'down') + '\">' + (pc >= 0 ? '\u25b2 ' : '\u25bc ') + Math.abs(pc).toFixed(2) + '%</span> <span class=\"soft\">\u00b7 ' + (span >= 23 ? '24h' : span + 'h so far') + ' (' + (now - then >= 0 ? '+' : '\u2212') + usd(Math.abs(now - then)) + ')</span>';\n      $('hi').textContent = usd(coins ? d.coins_hi : d.hi); $('lo').textContent = usd(coins ? d.coins_lo : d.lo);\n    }\n    $('parts').innerHTML = '<span class=\"soft\">Revolut X <b>' + usd(L.revolut_x) + '</b></span><span class=\"soft\">Kraken <b>' + usd(L.kraken) + '</b></span><span class=\"soft\">Tangem XRP <b>' + usd(L.tangem) + '</b></span><span class=\"soft\">Cash <b>' + usd(L.cash) + '</b></span>' + (L.partial ? '<span class=\"down\">Kraken not read yet: total is missing Kraken</span>' : '');\n  }\n  function note(n) {\n    var since = state && state.recording_since;\n    var txt = !since ? 'Recording starts within a minute or two of the deploy.' :\n      'Recording since ' + new Date(since * 1000).toLocaleString('en-GB', { timeZone: 'Europe/London', day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }) + '. History before that arrives with the rebuild step.';\n    if (n === 0) txt = 'No candles at this interval yet. ' + txt;\n    $('note').textContent = txt;\n  }\n  function load(keepRange) {\n    var v = VIEWS[view], key = view + '|' + series;\n    return Promise.all([get('/api/portfolio/candles?iv=' + v[0] + '&s=' + series), get('/api/portfolio/state')]).then(function (res) {\n      state = res[1]; head();\n      var data = (res[0].candles || []).map(function (c) { return { time: toChartTime(c.t), open: c.o, high: c.h, low: c.l, close: c.c }; });\n      var saved = keepRange && lastKey === key ? chart.timeScale().getVisibleLogicalRange() : null;\n      candles.setData(data);\n      if (saved) chart.timeScale().setVisibleLogicalRange(saved);\n      else if (data.length) {\n        var last = data[data.length - 1].time, first = data[0].time;\n        if (!v[1] || last - v[1] <= first) chart.timeScale().fitContent();\n        else chart.timeScale().setVisibleRange({ from: last - v[1], to: last });\n      }\n      chart.applyOptions({ timeScale: { timeVisible: v[0] !== '1d' && v[0] !== '1w' } });\n      lastKey = key; note(data.length); fit();\n    }).catch(function (e) { $('note').textContent = 'Could not load: ' + e.message; });\n  }\n  function start() {\n    if (chart || typeof LightweightCharts === 'undefined') return;\n    build(); paintMarks(); load(false);\n    $('ivs').addEventListener('click', function (e) {\n      var b = e.target.closest('button'); if (!b) return;\n      if (b.getAttribute('data-k')) view = b.getAttribute('data-k'); else series = b.getAttribute('data-s');\n      try { localStorage.setItem('pv.view', view); localStorage.setItem('pv.series', series); } catch (err) {}\n      paintMarks(); load(false);\n    });\n    setInterval(function () { if (!document.hidden) load(true); }, 60000);\n    window.addEventListener('resize', fit);\n  }\n  window.__pvStart = start;\n  if (typeof LightweightCharts !== 'undefined') start();\n  else window.addEventListener('load', function () { setTimeout(start, 50); });\n})();\n";
+const PV_PAGE_HTML = "<!doctype html>\n<html lang=\"en\"><head>\n<meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">\n<title>Portfolio</title>\n<style>\n:root { --bg:#0d0d0d; --card:#1a1a1a; --ink:#e8e8e8; --soft:#8a8a8a; --line:#2e2e2e; --grid:#232323; --acc:#00ffc8; --up:#00c896; --down:#ff4d6a; color-scheme:dark; }\n* { box-sizing:border-box; }\nbody { margin:0; background:var(--bg); color:var(--ink); font:15px/1.5 system-ui,-apple-system,\"Segoe UI\",sans-serif; }\nmain { max-width:1100px; margin:0 auto; padding:20px 16px 60px; display:flex; flex-direction:column; gap:14px; }\nh1 { font-size:14px; margin:0; color:var(--soft); font-weight:600; text-transform:uppercase; letter-spacing:.06em; }\n.soft { color:var(--soft); } .num { font-variant-numeric:tabular-nums; }\n.head { display:flex; flex-wrap:wrap; gap:8px 28px; align-items:flex-end; }\n.big { font-size:34px; font-weight:600; line-height:1.1; }\n.stat b { display:block; font-size:18px; font-weight:600; } .stat span { color:var(--soft); font-size:13px; }\n.up { color:var(--up); } .down { color:var(--down); }\n.bar { display:flex; flex-wrap:wrap; gap:6px; align-items:center; }\n.iv { background:var(--card); border:1px solid var(--line); color:var(--ink); border-radius:999px; padding:5px 12px; font:600 13px/1 system-ui,-apple-system,\"Segoe UI\",sans-serif; cursor:pointer; }\n.iv.on { background:var(--acc); color:#0d0d0d; border-color:var(--acc); }\n.sep { width:1px; height:20px; background:var(--line); margin:0 4px; }\n.card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:8px; }\n#chart { width:100%; height:min(62vh, 520px); min-height:300px; }\n.parts { display:flex; flex-wrap:wrap; gap:6px 20px; font-size:14px; }\n.parts span b { font-weight:600; }\n#note { font-size:13px; }\nhtml.embed:root { --bg:#1a1a1a; }\nhtml.embed main { max-width:none; padding:0; gap:10px; }\nhtml.embed h1, html.embed .big, html.embed #parts, html.embed .foot { display:none; }\nhtml.embed .head { gap:4px 22px; align-items:baseline; }\nhtml.embed .stat b { font-size:15px; display:inline; margin-left:6px; }\nhtml.embed .card { border:0; padding:0; border-radius:0; }\nhtml.embed #chart { height:300px; min-height:0; }\nhtml.embed .iv { padding:5px 10px; }\nhtml.embed #note { font-size:12px; }\n</style></head>\n<body><main>\n<h1>Portfolio value <a href=\"/\" style=\"float:right;color:var(--acc);text-decoration:none;text-transform:none;letter-spacing:0\">\u2039 Dashboard</a></h1>\n<div class=\"head\">\n  <div><div class=\"big num\" id=\"val\">\u2026</div><div class=\"num\" id=\"chg\">&nbsp;</div></div>\n  <div class=\"stat num\"><span>24h high</span><b id=\"hi\">\u2013</b></div>\n  <div class=\"stat num\"><span>24h low</span><b id=\"lo\">\u2013</b></div>\n</div>\n<div class=\"bar\" id=\"ivs\">\n  <button class=\"iv\" data-k=\"1m\">1m</button><button class=\"iv\" data-k=\"5m\">5m</button><button class=\"iv\" data-k=\"30m\">30m</button><button class=\"iv\" data-k=\"1h\">1h</button><button class=\"iv\" data-k=\"4h\">4h</button><button class=\"iv\" data-k=\"1D\">1D</button><button class=\"iv\" data-k=\"1W\">1W</button><button class=\"iv\" data-k=\"1Y\">1Y</button><button class=\"iv\" data-k=\"5Y\">5Y</button><button class=\"iv\" data-k=\"All\">All</button>\n  <span class=\"sep\"></span>\n  <button class=\"iv\" data-s=\"total\">With cash</button><button class=\"iv\" data-s=\"coins\">Coins only</button>\n</div>\n<div class=\"card\"><div id=\"chart\"></div></div>\n<div class=\"parts num\" id=\"parts\"></div>\n<div class=\"soft\" id=\"note\">Loading\u2026</div>\n<div class=\"soft foot\" style=\"font-size:13px\">Read-only. Revolut X, Kraken, the Tangem XRP wallet and cash on both exchanges, sampled every minute; times are London time. Pinch or scroll to zoom, drag to go back. Refreshes every 60 s.</div>\n</main>\n<script src=\"https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js\" onerror=\"var s=document.createElement('script');s.src='https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js';document.head.appendChild(s);s.onload=function(){window.__pvStart&&window.__pvStart();}\"></script>\n<script src=\"/portfolio-page.js\"></script>\n</body></html>\n";
+const PV_PAGE_JS = "(function () {\n  'use strict';\n  var $ = function (id) { return document.getElementById(id); };\n  var EMBED = /[?&]embed=1(&|$)/.test(location.search);   // shown inside the dashboard's Portfolio tab\n  if (EMBED) document.documentElement.classList.add('embed');\n  function fit() { if (EMBED && window.parent !== window) try { window.parent.postMessage({ pvHeight: document.documentElement.scrollHeight }, location.origin); } catch (e) {} }\n  var get = function (p) { return fetch(p, { cache: 'no-store' }).then(function (r) { if (!r.ok) throw new Error(p + ' HTTP ' + r.status); return r.json(); }); };\n  var usd = function (v) { if (v == null || !isFinite(v)) return '\u2013'; var a = Math.abs(v); return '$' + v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: a < 10 ? 4 : 2 }); };\n  var short = function (v) { var a = Math.abs(v); return (v < 0 ? '\u2212' : '+') + '$' + (a >= 1000 ? (a / 1000).toFixed(a >= 10000 ? 0 : 1) + 'k' : Math.round(a)); };\n  // button -> [candle interval, bars to show (0 = all of it)]. Candles keep a fixed, thin width; drag or pinch to see more.\n  var VIEWS = { '1m': ['1m'], '5m': ['5m'], '30m': ['30m'], '1h': ['1h'], '4h': ['4h'], '1D': ['1d'], '1W': ['1w'], '1Y': ['1w', 52], '5Y': ['1mo', 60], 'All': ['1w', 0] };\n  var SPACING = 7;\n  var view = '1h', series = 'total', chart = null, candles = null, lastKey = null, state = null, seq = 0;\n  try { view = localStorage.getItem('pv.view') || view; series = localStorage.getItem('pv.series') || series; } catch (e) {}\n  if (!VIEWS[view]) view = '1h';\n  function css(n) { return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); }\n  function londonOffset(t) {   // seconds to add to a UTC timestamp so the chart's axis reads London time\n    var d = new Date(t * 1000);\n    return (Date.parse(d.toLocaleString('en-US', { timeZone: 'Europe/London' })) - Date.parse(d.toLocaleString('en-US', { timeZone: 'UTC' }))) / 1000;\n  }\n  function dayStart(t) { return Date.UTC(+t.slice(0, 4), +t.slice(5, 7) - 1, +t.slice(8, 10)) / 1000; }\n  function toChartTime(t) { return typeof t === 'string' ? dayStart(t) : t + londonOffset(t); }\n  function paintMarks() {\n    $('ivs').querySelectorAll('button').forEach(function (b) {\n      b.classList.toggle('on', b.getAttribute('data-k') === view || b.getAttribute('data-s') === series);\n    });\n  }\n  function build() {\n    chart = LightweightCharts.createChart($('chart'), {\n      autoSize: true,\n      layout: { background: { type: 'solid', color: css('--card') }, textColor: css('--soft'), fontFamily: 'system-ui,-apple-system,\"Segoe UI\",sans-serif' },\n      grid: { vertLines: { color: css('--grid') }, horzLines: { color: css('--grid') } },\n      rightPriceScale: { borderColor: css('--line') },\n      timeScale: { borderColor: css('--line'), timeVisible: true, secondsVisible: false, rightOffset: 3, barSpacing: SPACING, minBarSpacing: 0.5 },\n      crosshair: { mode: 0 },\n      localization: { priceFormatter: function (p) { return '$' + p.toLocaleString('en-US', { maximumFractionDigits: 2, minimumFractionDigits: 2 }); } }\n    });\n    candles = chart.addCandlestickSeries({ upColor: css('--up'), downColor: css('--down'), borderUpColor: css('--up'), borderDownColor: css('--down'), wickUpColor: css('--up'), wickDownColor: css('--down'), priceLineColor: css('--acc') });\n  }\n  function head() {\n    if (!state || !state.latest) { $('val').textContent = '\u2013'; return; }\n    var L = state.latest, coins = series === 'coins';\n    var now = coins ? L.coins : L.total;\n    $('val').textContent = usd(now);\n    var d = state.day;\n    if (d) {\n      var then = coins ? d.coins_then : d.total_then, pc = then ? (now - then) / then * 100 : null;\n      var hrs = (L.ts - d.since) / 3600;\n      var when = hrs >= 23 ? '24h' : hrs >= 1 ? Math.floor(hrs) + 'h so far' : 'since ' + new Date(d.since * 1000).toLocaleTimeString('en-GB', { timeZone: 'Europe/London', hour: '2-digit', minute: '2-digit' });\n      $('chg').innerHTML = pc == null ? '&nbsp;' : '<span class=\"' + (pc >= 0 ? 'up' : 'down') + '\">' + (pc >= 0 ? '\u25b2 ' : '\u25bc ') + Math.abs(pc).toFixed(2) + '%</span> <span class=\"soft\">\u00b7 ' + when + ' (' + (now - then >= 0 ? '+' : '\u2212') + usd(Math.abs(now - then)) + ')</span>';\n      $('hi').textContent = usd(coins ? d.coins_hi : d.hi); $('lo').textContent = usd(coins ? d.coins_lo : d.lo);\n    }\n    $('parts').innerHTML = '<span class=\"soft\">Revolut X <b>' + usd(L.revolut_x) + '</b></span><span class=\"soft\">Kraken <b>' + usd(L.kraken) + '</b></span><span class=\"soft\">Tangem XRP <b>' + usd(L.tangem) + '</b></span><span class=\"soft\">Cash <b>' + usd(L.cash) + '</b></span>' + (L.partial ? '<span class=\"down\">Kraken not read yet: total is missing Kraken</span>' : '');\n  }\n  function fmtDay(s) { return new Date(s * 1000).toLocaleDateString('en-GB', { timeZone: 'Europe/London', day: 'numeric', month: 'short', year: 'numeric' }); }\n  function note(n) {\n    var st = state || {}, rb = st.rebuild, parts = [];\n    if (rb && rb.status === 'running') parts.push('Rebuilding your past values from your Revolut X history' + (rb.step ? ' (' + rb.step + (rb.progress ? ', ' + rb.progress + '%' : '') + ')' : '') + '. The older candles appear when it finishes.');\n    else if (rb && rb.status === 'failed') parts.push('The history rebuild failed (' + (rb.error || 'unknown error') + '); live recording is unaffected.');\n    else if (rb && rb.status === 'done') parts.push('History from ' + fmtDay(st.history_from || Date.parse(rb.first_day) / 1000) + ', rebuilt from your Revolut X transactions (Kraken is not included before live recording). Arrows mark money in and out of $25+.');\n    if (st.recording_since) parts.push('Live every minute since ' + new Date(st.recording_since * 1000).toLocaleString('en-GB', { timeZone: 'Europe/London', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) + '.');\n    else parts.push('Live recording starts within a minute or two of the deploy.');\n    if (n === 0) parts.unshift('No candles at this interval yet.');\n    else if (n < 5) parts.unshift('Only ' + n + ' candle' + (n === 1 ? '' : 's') + ' at this interval so far: 1m shows today\u2019s moves.');\n    $('note').textContent = parts.join(' ');\n  }\n  function markersFor(data, raw, flows) {\n    if (!flows || !flows.length || !data.length) return [];\n    var byDay = typeof raw[0].t === 'string', net = {};\n    for (var i = 0; i < flows.length; i++) {\n      var f = flows[i], idx = -1;\n      if (byDay) {   // daily / weekly / monthly candles: the last candle starting on or before the flow's London day\n        var day = new Date(f.ts * 1000).toLocaleDateString('en-CA', { timeZone: 'Europe/London' });\n        for (var j = raw.length - 1; j >= 0; j--) if (raw[j].t <= day) { idx = j; break; }\n      } else {\n        for (var k = raw.length - 1; k >= 0; k--) if (raw[k].t <= f.ts) { idx = k; break; }\n      }\n      if (idx < 0) continue;\n      net[idx] = (net[idx] || 0) + f.usd;\n    }\n    var out = [];\n    Object.keys(net).map(Number).sort(function (a, b) { return a - b; }).forEach(function (k) {\n      var v = net[k]; if (Math.abs(v) < 25) return;\n      out.push(v > 0 ? { time: data[k].time, position: 'belowBar', color: css('--acc'), shape: 'arrowUp', text: short(v) } : { time: data[k].time, position: 'aboveBar', color: css('--soft'), shape: 'arrowDown', text: short(v) });\n    });\n    return out;\n  }\n  function load(keepRange) {\n    var v = VIEWS[view], key = view + '|' + series, my = ++seq;\n    return Promise.all([get('/api/portfolio/candles?iv=' + v[0] + '&s=' + series), get('/api/portfolio/state')]).then(function (res) {\n      if (my !== seq) return;   // a newer tap won: drop this answer\n      state = res[1]; head();\n      var raw = res[0].candles || [];\n      var data = raw.map(function (c) { return { time: toChartTime(c.t), open: c.o, high: c.h, low: c.l, close: c.c }; });\n      var ts = chart.timeScale();\n      var saved = keepRange && lastKey === key ? ts.getVisibleLogicalRange() : null;\n      chart.applyOptions({ timeScale: { timeVisible: ['1d', '1w', '1mo'].indexOf(v[0]) < 0 } });\n      candles.setData(data);\n      candles.setMarkers(markersFor(data, raw, res[0].flows));\n      if (saved) ts.setVisibleLogicalRange(saved);\n      else if (data.length) {\n        var want = v[1];\n        if (want && data.length >= want) ts.setVisibleLogicalRange({ from: data.length - want, to: data.length + 1 });\n        else if (want === 0 && data.length * SPACING > ts.width()) ts.fitContent();\n        else { ts.applyOptions({ barSpacing: SPACING }); ts.scrollToRealTime(); }\n      }\n      lastKey = key; note(data.length); fit();\n    }).catch(function (e) { if (my === seq) $('note').textContent = 'Could not load: ' + e.message; });\n  }\n  function start() {\n    if (chart || typeof LightweightCharts === 'undefined') return;\n    build(); paintMarks(); load(false);\n    $('ivs').addEventListener('click', function (e) {\n      var b = e.target.closest('button'); if (!b) return;\n      if (b.getAttribute('data-k')) view = b.getAttribute('data-k'); else series = b.getAttribute('data-s');\n      try { localStorage.setItem('pv.view', view); localStorage.setItem('pv.series', series); } catch (err) {}\n      paintMarks(); load(false);\n    });\n    setInterval(function () { if (!document.hidden) load(true); }, 60000);\n    window.addEventListener('resize', fit);\n  }\n  window.__pvStart = start;\n  if (typeof LightweightCharts !== 'undefined') start();\n  else window.addEventListener('load', function () { setTimeout(start, 50); });\n})();\n";
 app.get('/portfolio', (req, res) => { res.set('Cache-Control', 'no-store').type('html').send(PV_PAGE_HTML.replace('<head>', '<head>\n<script src="/dashboard-auth.js"></script>')); });
 app.get('/portfolio-page.js', (req, res) => { res.set('Cache-Control', 'no-store').type('application/javascript').send(PV_PAGE_JS); });
-app.get('/api/portfolio/candles', async (req, res) => { try { res.set('Cache-Control', 'no-store').json({ candles: await portfolioValueCandles(String(req.query.iv || '1h'), req.query.s === 'coins' ? 'coins' : 'total') }); } catch (e) { res.status(400).json({ error: e.message }); } });
+app.get('/api/portfolio/candles', async (req, res) => {
+  try {
+    const candles = await portfolioValueCandles(String(req.query.iv || '1h'), req.query.s === 'coins' ? 'coins' : 'total');
+    const t0 = candles.length ? (typeof candles[0].t === 'string' ? pv2LondonMidnight(candles[0].t) : candles[0].t) : Math.floor(Date.now() / 1000);
+    res.set('Cache-Control', 'no-store').json({ candles, flows: await portfolioValueFlows(t0).catch(() => []) });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
 app.get('/api/portfolio/state', async (req, res) => { try { res.set('Cache-Control', 'no-store').json(await portfolioValueState()); } catch (e) { res.status(500).json({ error: e.message }); } });
 app.get('/api/desk/state', async (req, res) => { try { res.json(await specDeskState()); } catch (e) { res.status(500).json({ error: e.message }); } });
 app.get('/api/desk/spec/:id', async (req, res) => { try { const s = await specGet(parseInt(req.params.id)); if (!s) return res.status(404).json({ error: 'no such spec' }); res.json(s); } catch (e) { res.status(500).json({ error: e.message }); } });
