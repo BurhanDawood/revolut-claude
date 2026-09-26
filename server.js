@@ -18604,7 +18604,7 @@ async function spikeTick(nowMs = Date.now()) {
         if (nowMs / 1000 - Number(ev.t) >= cfg.window_h * 3600) { await db.execute("UPDATE spike_events SET status = 'ended', ended_at = NOW(), end_price = ? WHERE id = ?", [h.px, ev.id]); out.ended.push(h.coin); }
         else if (cfg.insure && Number(ev.insured) !== 1) {   // #B23 S2 switched on mid-spike, or the stop now clears the floor: insure it now
           const ins = await spikeInsure(ev.id, h.coin, h.px, cfg).catch(e => ({ ok: false, why: e.message }));
-          if (ins.ok) { out.insured = (out.insured || []).concat(h.coin); await sendTelegram(spikeInsuredText(h.coin, h.qty, ins, cfg)).catch(() => {}); }
+          if (ins.ok) { out.insured = (out.insured || []).concat(h.coin); await sendTelegram(spikeInsuredText(h.coin, h.qty, ins, cfg), spikeKeyboard(h.coin)).catch(() => {}); }
         }
         continue;
       }
@@ -18622,7 +18622,7 @@ async function spikeTick(nowMs = Date.now()) {
         '\nYou hold ' + Number(h.qty.toPrecision(6)) + ' (≈ $' + Math.round(h.qty * h.px).toLocaleString('en-US') + ').' +
         (!cfg.insure ? '\n<b>Advice only, nothing is sold:</b> spike insurance is switched off (<code>/spike on</code>). A trailing stop or a part-sale is your call.'
           : ins && ins.ok ? '\n' + spikeInsuredText(h.coin, h.qty, ins, cfg, true)
-          : '\n<b>No insurance trail:</b> ' + escTg((ins && ins.why) || 'not set') + '.' + (ins && ins.existing ? ' If that trail fires during the spike, it sells with the chasing limit.' : ''))).catch(() => {});
+          : '\n<b>No insurance trail:</b> ' + escTg((ins && ins.why) || 'not set') + '.' + (ins && ins.existing ? ' If that trail fires during the spike, it sells with the chasing limit.' : '')), cfg.insure && ins && ins.ok ? spikeKeyboard(h.coin) : undefined).catch(() => {});   // #B23 S3 Keep button
     }
     // an event on a coin no longer held (sold, moved) still ends after the window
     const [sw] = await db.execute("UPDATE spike_events SET status = 'ended', ended_at = NOW() WHERE status = 'active' AND triggered_at < DATE_SUB(NOW(), INTERVAL ? HOUR)", [cfg.window_h]);
@@ -18823,7 +18823,7 @@ async function spikeAfterSale(symbol, ctx, res) {
     // A8 as amended by Fable S2-2: while the spike is live, whatever is still held (>= $1: the part a per-coin override kept, or what the
     // chase left at the give-up line / out of steps / without a price) gets a fresh 15 % insurance trail from the current price.
     // Never after a failed cancel or an order error (S2-1: an order may be resting), and never over a trail that appeared meanwhile.
-    if (ev && !unsafe && !trailingStops.has(symbol)) {
+    if (ev && !unsafe && !trailingStops.has(symbol) && spikeSellPct(await spikeCfg(), coin) > 0) {   // senior pass (Q2): a Keep tapped mid-chase is honoured - no re-arm
       try {
         const cfg = await spikeCfg(), trail = Number(cfg.trail_pct) || 15;
         const [bal, tk] = await Promise.all([revolutBalancesCached(0), revolutTickerMap(0)]);
@@ -18903,6 +18903,43 @@ async function spikeSetCfg(patch) {
   const next = { ...cur, ...patch };
   await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('spike_exit', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)", [JSON.stringify(next)]);
   return { ...SPIKE_DEFAULTS, ...next };
+}
+// #B23 S3 spike buttons (Bryan 26 Sep 15:59 "are there buttons for that?"; 16:01 "I want the insurance to remain on unless I click keep coin"):
+// insurance stays ON; the only off-switch offered is per coin - "Keep COIN alerts-only" - and "Insure COIN again" undoes it. There is no
+// global off button (the typed /spike off remains for an emergency). Money path by code rule (keep removes an insurance trail): it only
+// ever removes protection Bryan asked to remove on that coin.
+async function spikeKeepCoin(coin) {   // per-coin advice only + remove a running INSURANCE trail (a loop's or a hand-set trail is never touched)
+  const c = String(coin || '').toUpperCase(), sym = c + '-USD';
+  if (!/^[A-Z0-9]{1,15}$/.test(c)) throw new Error('bad coin');
+  const had = trailingStops.get(sym), removed = !!(had && had.source === 'spike');   // the boot loader restores source (455 A5)
+  if (removed) await removeTrailingStop(sym);   // senior pass #2: remove first, so a failure never leaves "alerts-only" saved over a live trail
+  const cfg = await spikeCfg();
+  await spikeSetCfg({ per_coin: { ...(cfg.per_coin || {}), [c]: 0 } });
+  return escTg(c) + ': spikes are reported only, no insurance.' + (removed ? ' The insurance trail that was running on ' + escTg(c) + ' is removed.' : '') + ' <code>/spike default ' + escTg(c) + '</code> undoes it.';
+}
+function spikeKeyboard(coin, cfg) {
+  const ok = (c) => /^[a-z0-9]{1,12}$/.test(String(c).toLowerCase());
+  if (coin) return ok(coin) ? { inline_keyboard: [[{ text: '🔕 Keep ' + String(coin).toUpperCase() + ' alerts-only', callback_data: 'a:' + String(coin).toLowerCase() + ':1:sx' }]] } : undefined;
+  if (!cfg || !cfg.insure) return { inline_keyboard: [[{ text: '🛡️ Switch insurance on', callback_data: 'a:all:3:sx' }]] };
+  const kept = Object.entries(cfg.per_coin || {}).filter(([c, v]) => Number(v) === 0 && ok(c)).slice(0, 6);   // the coins Bryan kept alerts-only
+  return kept.length ? { inline_keyboard: kept.map(([c]) => [{ text: '🛡️ Insure ' + String(c).toUpperCase() + ' again', callback_data: 'a:' + String(c).toLowerCase() + ':5:sx' }]) } : undefined;
+}
+async function handleSpikeButton(id, choice, reply) {
+  try {
+    if (choice === 1) return await reply(await spikeKeepCoin(id));
+    if (choice === 3) return await sendTelegram('🛡️ Switching spike insurance <b>on</b> means: when a coin you hold on Revolut X spikes, a 15% trailing stop goes on the whole holding; if it fires, the coin is sold with a chasing limit, never below 25% under the peak and never below your cost floor. No buy-back. A trailing stop already running is never touched.', { inline_keyboard: [[{ text: '✅ Yes, switch it on', callback_data: 'a:all:4:sx' }]] });
+    if (choice === 4) { await spikeSetCfg({ insure: true }); return await reply('🛡️ Spike insurance is <b>ON</b>.'); }
+    if (choice === 5) {   // undo a Keep: back to the default share
+      const c = String(id || '').toUpperCase(); if (!/^[A-Z0-9]{1,15}$/.test(c)) throw new Error('bad coin');
+      const cfg = await spikeCfg(), pc = { ...(cfg.per_coin || {}) }; delete pc[c]; await spikeSetCfg({ per_coin: pc });
+      // senior pass #4: insurance stays on unless Bryan keeps a coin, so undoing a Keep mid-spike re-insures on the next 3-min check
+      const [up] = await db.execute("UPDATE spike_events SET insured = 0 WHERE symbol = ? AND status = 'active' AND insured <> 1", [c]).catch(() => [{}]);
+      const [up2] = await db.execute("UPDATE spike_events SET insured = 0 WHERE symbol = ? AND status = 'active' AND insured = 1 AND NOT EXISTS (SELECT 1 FROM trailing_stops WHERE symbol = ?)", [c, c + '-USD']).catch(() => [{}]);
+      const live = (up && up.affectedRows) || (up2 && up2.affectedRows);
+      return await reply('🛡️ ' + escTg(c) + ' is insured again (' + cfg.sell_pct + '% of the holding)' + (live ? ': its spike is still running, so the insurance trail goes back on within 3 minutes (if the stop clears your cost floor).' : ', from its next spike.'));
+    }
+    return await reply('Unknown spike button');
+  } catch (e) { await reply('❌ Spike: ' + escTg(e.message)); }
 }
 setTimeout(() => { const t = () => spikeTick().then(r => { if (r && r.triggered && r.triggered.length) console.log('[spike] #B23 spike mode: ' + r.triggered.join(', ')); }).catch(e => console.error('[spike] tick failed:', e.message)); t(); setInterval(t, 3 * 60 * 1000); console.log('[spike] #B23 S1 spike check every 3 min (advice only)'); }, 6 * 60 * 1000);
 setTimeout(() => { spikeReplay().catch(e => console.error('[spike] replay failed:', e.message)); }, 8 * 60 * 1000);
@@ -25753,7 +25790,7 @@ app.post('/telegram-webhook', async (req, res) => {
       // New Trade Detected buttons use 'tj'; numeric 'td' keeps already-sent ones working.
       const cbIsTradeJournal = cbMoneyType === 'tj' || (cbMoneyType === 'td' && /^\d+$/.test(cbCoin));
       if (cbMoneyType === 'np' || cbMoneyType === 'cc' || cbIsTradeJournal || cbMoneyType === 'ta' || cbMoneyType === 'mu' ||
-          cbMoneyType === 'sd' || cbMoneyType === 'sp' || cbMoneyType === 'rp' || cbMoneyType === 'db' || cbMoneyType === 'sk' || cbMoneyType === 'ro' || cbMoneyType === 'rq') {
+          cbMoneyType === 'sd' || cbMoneyType === 'sp' || cbMoneyType === 'rp' || cbMoneyType === 'db' || cbMoneyType === 'sk' || cbMoneyType === 'ro' || cbMoneyType === 'rq' || cbMoneyType === 'sx') {
         await ackCb('Working...');
         try {
           if (cbMoneyType === 'ta') await handleTradeApprovalButton(cbCoin, cbChoice, cbReply);
@@ -25763,6 +25800,7 @@ app.post('/telegram-webhook', async (req, res) => {
           else if (cbMoneyType === 'sk') await handleSpecButton(cbCoin, cbChoice, cbReply);   // #D2 spec desk status buttons (never money)
           else if (cbMoneyType === 'ro') await handleRotationUntagButton(cbCoin, cbReply);   // #8 records only
           else if (cbMoneyType === 'rq') await handleRotationAskButton(cbCoin, cbChoice, cbReply);   // #8 records only
+          else if (cbMoneyType === 'sx') await handleSpikeButton(cbCoin, cbChoice, cbReply);   // #B23 S3 keep a coin alerts-only / insure it again / switch on (with confirm); no off button
           else if (cbMoneyType === 'mu') await handleMuteButton(cbCoin, cbReply);
           else if (cbIsTradeJournal) await handleTradeButton(cbCoin, cbChoice, cbReply);
           else await handleMoneyButton(cbMoneyType, cbCoin, cbChoice, cbReply);
@@ -26037,16 +26075,12 @@ app.post('/telegram-webhook', async (req, res) => {
       const sub = commandText.replace(/^spike\s*/, '').trim();
       try {
         let m;
-        if (sub === '' || sub === 'status') await sendReply(await spikeStatusText());
+        if (sub === '' || sub === 'status') await sendTelegram(await spikeStatusText(), spikeKeyboard(null, await spikeCfg()));   // #B23 S3 "Insure COIN again" for kept coins (no global off button)
         else if (sub === 'on') await sendReply('🛡️ Switching spike insurance <b>on</b> means: when a coin you hold on Revolut X spikes (2× its lowest hourly close in 24 h and 1.5× its 7-day median), a 15% trailing stop goes on the whole holding. If it fires, the coin is sold with a chasing limit, never below 25% under the peak and never below your cost floor. No buy-back. A trailing stop that is already running is never touched.\nReply <code>/spike on confirm</code> to switch it on.');
         else if (sub === 'on confirm') { await spikeSetCfg({ insure: true }); await sendReply('🛡️ Spike insurance is <b>ON</b>. <code>/spike off</code> switches it off; a trail already set stays until it fires or you remove it.'); }
         else if (sub === 'off') { await spikeSetCfg({ insure: false }); await sendReply('Spike insurance is <b>OFF</b>: spikes are reported only. Insurance trails already set stay until they fire or you remove them (<code>/spike keep COIN</code> removes one).'); }
         else if ((m = /^keep\s+([a-z0-9]{1,15})$/.exec(sub))) {
-          const c = m[1].toUpperCase(), cfg = await spikeCfg(), sym = c + '-USD';
-          await spikeSetCfg({ per_coin: { ...(cfg.per_coin || {}), [c]: 0 } });
-          const had = trailingStops.get(sym);
-          if (had && had.source === 'spike') await removeTrailingStop(sym);
-          await sendReply(escTg(c) + ': spikes are reported only, no insurance.' + (had && had.source === 'spike' ? ' The insurance trail that was running on ' + escTg(c) + ' is removed.' : ''));
+          await sendReply(await spikeKeepCoin(m[1]));   // #B23 S3 one function for the command and the button
         } else if ((m = /^sell\s+([a-z0-9]{1,15})\s+(\d{1,3})%?$/.exec(sub))) {
           const c = m[1].toUpperCase(), p = Number(m[2]);
           if (!(p >= 1 && p <= 100)) await sendReply('The share must be 1-100%.');
