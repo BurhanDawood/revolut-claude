@@ -1512,6 +1512,9 @@ setTimeout(() => { backfillR1().catch(e => console.error('[R1] backfill failed:'
 await safeAddColumn('trading_journal',  'tool_key',   'VARCHAR(60) NULL');    // #L1 which catalogue tool wrote this row
 await safeAddColumn('trading_journal',  'cycle_id',   'VARCHAR(40) NULL');    // #L1 <COIN>:<armed_since> shared by a loop's sell and its buy-back
 await safeAddColumn('trading_journal',  'regime_tag', 'VARCHAR(12) NULL');    // #L1 quiet|elevated|hot|unknown at trade time
+await safeAddColumn('trading_journal',  'rotation_id', 'VARCHAR(20) NULL');   // #8 a rotation session (Fable 15:40: its own column, never cycle_id)
+await db.execute('CREATE INDEX idx_rotation ON trading_journal (rotation_id)').catch(() => {});   // exists after the first boot
+await db.execute("CREATE TABLE IF NOT EXISTS rotation_sessions (id VARCHAR(20) NOT NULL PRIMARY KEY, opened_at DATETIME NOT NULL, expires_at DATETIME NOT NULL, closed_at DATETIME NULL, status VARCHAR(10) NOT NULL, trigger_kind VARCHAR(10) NOT NULL, anchor_journal_id INT NULL, INDEX idx_status (status, expires_at))").catch(e => console.error('[migration] rotation_sessions:', e.message));   // #8
 await safeAddColumn('pump_armed_rules', 'cycle_id',   'VARCHAR(40) NULL');    // #L1 stamped at the sale, read by the buy-back
 // #426 move shape: every call the system makes (loop armed / morning brief / asked) and, 7 days later, what happened.
 await db.execute(`CREATE TABLE IF NOT EXISTS move_shape_log (
@@ -2986,7 +2989,7 @@ async function handleMoneyButton(typeCode, idStr, choice, reply) {
 // always does exactly what its label said - even after a restart, and even if new trades have since
 // landed in the time window (re-deriving the options at tap time could shift them).
 // #L0 structured reason tags - validated in code, not an ENUM (the list will grow)
-const REASON_TAGS = new Set(['took_profit','cut_loss','dip_buy','rebalance_in','rebalance_out','topup','payment','thesis_change','funding','other']);
+const REASON_TAGS = new Set(['took_profit','cut_loss','dip_buy','rebalance_in','rebalance_out','rotation_in','rotation_out','topup','payment','thesis_change','funding','other']);   // #8 rotation_*
 let _tradeChoiceTableReady = false;
 async function ensureTradeChoiceTable() {
   if (_tradeChoiceTableReady) return;
@@ -3068,6 +3071,157 @@ function clearPendingTradeFor(coin, journalId) {
 
 // #L0 Sunday digest: manual trades still unanswered after the 30-min timer, re-offered with the same stateless buttons.
 // The row filter is exactly handleTradeButton's UNRESOLVED set, so every button offered can still be claimed.
+// ── #8 ROTATION SESSIONS (Bryan 26 Sep 14:33/14:35; spec #8, Fable 15:40: records only) ──────────────────────────────────────────
+// Bryan trims runners and buys others in one sitting. 🔄 on its own (or "rotating", or /rotation [minutes]) opens a session: every
+// manual trade the detector sees while it is open is tagged rotation_out / rotation_in under one rotation_id (its own column, never
+// cycle_id, so no loop code can see it), the per-trade TRADE DETECTED prompt is replaced by one summary at the close, and sells in the
+// 30 min before the 🔄 are swept in. A second 🔄 closes it early; otherwise it closes after 60 min. With no session open, a sell and a buy
+// within 30 min bring ONE question instead of the second prompt: tag them all as one rotation? Only rows the detector wrote for Bryan's
+// own trades (tool_key 'manual', source 'auto_detected') are ever tagged: loops, the agent, funded buys, the reconciler, payments,
+// top-ups and transfers never are. Nothing here places, sizes or cancels anything.
+const ROT_DEFAULTS = { emoji: '🔄', emojis: ['🔄', '🔁', '🔃', '♻'], minutes: 60, lookback_min: 30, auto_detect: true };   // Bryan 15:28: his keyboard finds 🔁 ("repeat") and ♻️ ("recycle"), not 🔄
+async function rotationCfg() {
+  let c = {};
+  try { const [r] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'rotation'"); if (r.length) c = JSON.parse(r[0].config_value) || {}; } catch (e) {}
+  return { ...ROT_DEFAULTS, ...c };
+}
+const ROT_ELIGIBLE = "tool_key = 'manual' AND source = 'auto_detected' AND action IN ('buy', 'sell', 'add', 'reduce') AND rotation_id IS NULL AND (reason_tag IS NULL OR reason_tag NOT IN ('payment', 'topup'))";
+async function rotationOpenSession() {
+  const [r] = await db.execute("SELECT id, UNIX_TIMESTAMP(opened_at) AS o, UNIX_TIMESTAMP(expires_at) AS e FROM rotation_sessions WHERE status = 'open' AND expires_at > NOW() ORDER BY opened_at DESC LIMIT 1");
+  return r.length ? r[0] : null;
+}
+// Tags one detector row into a rotation. Keeps a reason Bryan already gave (only an empty or rebalance tag becomes rotation_*).
+async function rotationTag(rotId, journalId) {
+  const [up] = await db.execute("UPDATE trading_journal SET rotation_id = ?, reason_tag = IF(reason_tag IS NULL OR reason_tag LIKE 'rebalance%', IF(action IN ('sell', 'reduce'), 'rotation_out', 'rotation_in'), reason_tag), " +
+    "reasoning = IF(reasoning IN ('auto-detected', 'no reason provided'), CONCAT('Rotation ', ?, IF(action IN ('sell', 'reduce'), ' - trimmed', ' - bought')), reasoning), emotion = IF(emotion = 'pending', 'neutral', emotion) " +
+    'WHERE id = ? AND ' + ROT_ELIGIBLE, [rotId, rotId, journalId]);
+  if (up && up.affectedRows === 1) {
+    const [r] = await db.execute('SELECT symbol FROM trading_journal WHERE id = ?', [journalId]);
+    if (r.length) clearPendingTradeFor(String(r[0].symbol).replace('-USD', '').toUpperCase(), journalId);   // its 30-min timer has nothing to ask any more
+    return true;
+  }
+  return false;
+}
+async function rotationStart(trigger, minutes, fromJournalIds = null) {
+  const cfg = await rotationCfg(), mins = Math.max(5, Math.min(240, Number(minutes) || cfg.minutes));
+  const id = 'R' + Date.now().toString(36).toUpperCase();
+  await db.execute("INSERT INTO rotation_sessions (id, opened_at, expires_at, status, trigger_kind) VALUES (?, NOW(), DATE_ADD(NOW(), INTERVAL ? MINUTE), 'open', ?)", [id, mins, trigger]);
+  let rows;
+  if (fromJournalIds) rows = fromJournalIds.map(x => ({ id: x }));   // the auto-detected cluster
+  else [rows] = await db.execute("SELECT id FROM trading_journal WHERE " + ROT_ELIGIBLE + " AND action IN ('sell', 'reduce') AND created_at >= DATE_SUB(NOW(), INTERVAL ? MINUTE) ORDER BY id", [cfg.lookback_min]);
+  let n = 0; for (const r of rows) if (await rotationTag(id, r.id)) n++;
+  return { id, minutes: mins, swept: n };
+}
+async function rotationRows(rotId) {
+  const [r] = await db.execute('SELECT id, symbol, action, quantity, price, value_usd FROM trading_journal WHERE rotation_id = ? ORDER BY id', [rotId]);
+  return r;
+}
+async function rotationSummary(rotId, closedBy) {
+  const rows = await rotationRows(rotId);
+  const out = rows.filter(r => ['sell', 'reduce'].includes(r.action)), inn = rows.filter(r => !['sell', 'reduce'].includes(r.action));
+  const sum = (a) => a.reduce((s, r) => s + Math.abs(Number(r.value_usd) || 0), 0), line = (r) => String(r.symbol).replace('-USD', '') + ' $' + Math.abs(Number(r.value_usd) || 0).toFixed(2);
+  const text = '🔄 <b>Rotation ' + escTg(rotId) + ' closed</b>' + (closedBy ? ' (' + escTg(closedBy) + ')' : '') +
+    (rows.length ? '\nTrimmed: ' + (out.length ? out.map(line).join(', ') + ' = <b>$' + sum(out).toFixed(2) + '</b>' : 'nothing') +
+      '\nBought: ' + (inn.length ? inn.map(line).join(', ') + ' = <b>$' + sum(inn).toFixed(2) + '</b>' : 'nothing yet') +
+      (!inn.length ? '\nNo buy yet: the rotation stays open on the books as cash waiting to be redeployed, and the Sunday note tracks it.' : '') +
+      '\nTap a row below to take it out of the rotation and tag it on its own.'
+      : '\nNo trades were recorded in it.');
+  const kb = rows.length ? { inline_keyboard: rows.slice(0, 12).map(r => [{ text: 'Untag ' + (['sell', 'reduce'].includes(r.action) ? '↓ ' : '↑ ') + line(r), callback_data: 'a:' + r.id + ':1:ro' }]) } : undefined;
+  return { text, kb, rows: rows.length };
+}
+async function rotationClose(rotId, closedBy) {
+  const [up] = await db.execute("UPDATE rotation_sessions SET status = 'closed', closed_at = NOW() WHERE id = ? AND status = 'open'", [rotId]);
+  if (!up || up.affectedRows !== 1) return null;   // already closed (a restart and the tick can race: one summary only)
+  const s = await rotationSummary(rotId, closedBy);
+  await sendTelegram(s.text, s.kb).catch(() => {});
+  return s;
+}
+async function rotationTick() {
+  const [due] = await db.execute("SELECT id FROM rotation_sessions WHERE status = 'open' AND expires_at <= NOW()");
+  for (const d of due) await rotationClose(d.id, 'time up').catch(e => console.error('[rotation] close failed:', e.message));
+  return due.length;
+}
+// Bryan's message: 🔄 / "rotating" / /rotation [minutes|stop]. Returns the reply text, or null when the message is not ours.
+async function rotationClaimText(rawText) {
+  const cfg = await rotationCfg();
+  const t = String(rawText || '').replace(/️/g, '').trim(), emoji = String(cfg.emoji || '🔄').replace(/️/g, '');
+  const toggles = [emoji].concat(Array.isArray(cfg.emojis) ? cfg.emojis : []).map(x => String(x).replace(/️/g, ''));
+  const isToggle = toggles.includes(t) || /^(rotate|rotating|rotation)$/i.test(t);   // any of them opens, and closes an open one
+  const cmd = /^\/rotation(?:@\S+)?(?:\s+(\d{1,3}|stop|off|close))?$/i.exec(t);
+  if (!(isToggle || cmd)) return null;
+  const open = await rotationOpenSession();
+  const stop = cmd && cmd[1] && /^(stop|off|close)$/i.test(cmd[1]);
+  if (open && (isToggle || stop)) { const s = await rotationClose(open.id, 'closed by you'); return s ? '' : 'That rotation was already closed.'; }
+  if (stop) return 'No rotation is open.';
+  if (open) return '🔄 Rotation ' + escTg(open.id) + ' is already open until ' + new Date(open.e * 1000).toLocaleTimeString('en-GB', { timeZone: 'Europe/London', hour: '2-digit', minute: '2-digit' }) + '. Send 🔄, 🔁, ♻️ or "rotate" again to close it.';
+  const r = await rotationStart(isToggle ? 'emoji' : 'command', cmd && cmd[1] ? Number(cmd[1]) : null);
+  return '🔄 <b>Rotation ' + escTg(r.id) + ' open</b> for ' + r.minutes + ' min. Trade away: each trim and buy is recorded as part of it, without the usual questions, and you get one summary at the end.' +
+    (r.swept ? ' ' + r.swept + ' sell' + (r.swept > 1 ? 's' : '') + ' from the last ' + cfg.lookback_min + ' min ' + (r.swept > 1 ? 'are' : 'is') + ' included.' : '') + ' Send 🔄, 🔁, ♻️ or "rotate" again to close it early.';
+}
+// Called by autoLogTrade for a detector row it is about to ask about. { handled: true } = the rotation took it (no individual prompt).
+async function rotationOnDetected(journalId, coinBase, action) {
+  if (!['buy', 'sell', 'add', 'reduce'].includes(action)) return null;
+  const open = await rotationOpenSession();
+  if (open) return { handled: await rotationTag(open.id, journalId), rotation_id: open.id };
+  const cfg = await rotationCfg();
+  if (!cfg.auto_detect) return null;
+  const isSell = ['sell', 'reduce'].includes(action);
+  const [opp] = await db.execute("SELECT id FROM trading_journal WHERE " + ROT_ELIGIBLE + " AND id <> ? AND action IN " + (isSell ? "('buy', 'add')" : "('sell', 'reduce')") + " AND created_at >= DATE_SUB(NOW(), INTERVAL ? MINUTE) LIMIT 1", [journalId, cfg.lookback_min]);
+  if (!opp.length) return null;
+  const [asked] = await db.execute("SELECT id FROM rotation_sessions WHERE trigger_kind = 'ask' AND opened_at >= DATE_SUB(NOW(), INTERVAL ? MINUTE) LIMIT 1", [cfg.lookback_min]);
+  if (asked.length) return null;   // one question per cluster
+  const [cl] = await db.execute("SELECT id, symbol, action, value_usd FROM trading_journal WHERE " + ROT_ELIGIBLE + " AND created_at >= DATE_SUB(NOW(), INTERVAL ? MINUTE) ORDER BY id", [cfg.lookback_min]);
+  await db.execute("INSERT INTO rotation_sessions (id, opened_at, expires_at, status, trigger_kind, anchor_journal_id) VALUES (?, NOW(), NOW(), 'asked', 'ask', ?)", ['Q' + journalId, journalId]);
+  const line = (r) => (['sell', 'reduce'].includes(r.action) ? '↓ ' : '↑ ') + String(r.symbol).replace('-USD', '') + ' $' + Math.abs(Number(r.value_usd) || 0).toFixed(2);
+  await sendTelegram('🔄 <b>Looks like a rotation</b>: ' + cl.map(line).join(', ') + ' in the last ' + cfg.lookback_min + ' min.\nTag all ' + cl.length + ' as one rotation? (Send ' + escTg(cfg.emoji) + ' before you start next time and I will not need to ask.)',
+    { inline_keyboard: [[{ text: '✅ Yes, one rotation', callback_data: 'a:' + journalId + ':1:rq' }], [{ text: 'Tag individually', callback_data: 'a:' + journalId + ':2:rq' }, { text: 'Skip', callback_data: 'a:' + journalId + ':3:rq' }]] });
+  return { handled: true, asked: true };
+}
+async function handleRotationAskButton(jidStr, choice, reply) {
+  const jid = parseInt(jidStr, 10), cfg = await rotationCfg();
+  const [q] = await db.execute("SELECT id, status, UNIX_TIMESTAMP(opened_at) AS o FROM rotation_sessions WHERE id = ?", ['Q' + jid]);
+  if (!q.length || q[0].status !== 'asked') return reply('Already answered.');
+  await db.execute("UPDATE rotation_sessions SET status = ? WHERE id = ? AND status = 'asked'", [choice === 1 ? 'accepted' : choice === 2 ? 'individual' : 'declined', 'Q' + jid]);
+  const [cl] = await db.execute("SELECT id, symbol, action FROM trading_journal WHERE " + ROT_ELIGIBLE + " AND created_at >= DATE_SUB(FROM_UNIXTIME(?), INTERVAL ? MINUTE) AND created_at <= DATE_ADD(FROM_UNIXTIME(?), INTERVAL 2 MINUTE) ORDER BY id", [q[0].o, cfg.lookback_min, q[0].o]);
+  if (choice === 1) {
+    const r = await rotationStart('auto', null, cl.map(x => x.id));
+    return reply('🔄 <b>Rotation ' + escTg(r.id) + ' open</b>: ' + r.swept + ' trade' + (r.swept === 1 ? '' : 's') + ' tagged. Anything else you trade in the next ' + r.minutes + ' min joins it; one summary at the end. Send ' + escTg(cfg.emoji) + ' to close it now.');
+  }
+  if (choice === 2) {
+    for (const r of cl) { let kb; try { kb = await buildTradeKeyboard(r.id, String(r.symbol).replace('-USD', ''), r.action); } catch (e) { kb = undefined; } await sendTelegram(String(r.symbol).replace('-USD', '') + ' ' + String(r.action).toUpperCase() + ' (j' + r.id + ') - tap its reason:', kb).catch(() => {}); }
+    return reply('OK, each one on its own.');
+  }
+  return reply('Skipped - they stay untagged (the Sunday digest re-offers them).');
+}
+async function handleRotationUntagButton(jidStr, reply) {
+  const jid = parseInt(jidStr, 10);
+  const [up] = await db.execute("UPDATE trading_journal SET rotation_id = NULL, reason_tag = IF(reason_tag LIKE 'rotation%', NULL, reason_tag), reasoning = IF(reasoning LIKE 'Rotation R%', 'no reason provided', reasoning) WHERE id = ? AND rotation_id IS NOT NULL", [jid]);
+  if (!up || up.affectedRows !== 1) return reply('Already out of the rotation.');
+  const [r] = await db.execute('SELECT symbol, action FROM trading_journal WHERE id = ?', [jid]);
+  let kb; try { kb = await buildTradeKeyboard(jid, String(r[0].symbol).replace('-USD', ''), r[0].action); } catch (e) { kb = undefined; }
+  await sendTelegram(String(r[0].symbol).replace('-USD', '') + ' ' + String(r[0].action).toUpperCase() + ' (j' + jid + ') is out of the rotation - tap its reason:', kb).catch(() => {});
+  return reply('Untagged.');
+}
+// Sunday: each rotation of the last 35 days, then vs now: what the trimmed coins would be worth had they been held, and what the
+// bought ones are worth. Edge = bought % minus trimmed %; positive = the rotation helped so far. Records only, a scorecard for L2.
+async function rotationWeekly(nowMs = Date.now()) {
+  const [ss] = await db.execute("SELECT id, UNIX_TIMESTAMP(opened_at) AS o FROM rotation_sessions WHERE status = 'closed' AND opened_at >= DATE_SUB(NOW(), INTERVAL 35 DAY) ORDER BY opened_at");
+  if (!ss.length) return null;
+  const tk = await revolutTickerMap(60000).catch(() => ({}));
+  const lines = [];
+  for (const s of ss) {
+    const rows = await rotationRows(s.id); if (!rows.length) continue;
+    const leg = (a) => { let paid = 0, now = 0, ok = true; for (const r of a) { const c = String(r.symbol).replace('-USD', '').toUpperCase(), px = tk[c] && tk[c].mid; paid += Math.abs(Number(r.value_usd) || 0); if (px) now += Math.abs(Number(r.quantity) || 0) * px; else ok = false; } return { paid, now, ok }; };
+    const o = leg(rows.filter(r => ['sell', 'reduce'].includes(r.action))), i = leg(rows.filter(r => !['sell', 'reduce'].includes(r.action)));
+    const pct = (l) => (l.paid > 0 && l.ok ? (l.now / l.paid - 1) * 100 : null), po = pct(o), pi = pct(i), days = Math.floor((nowMs / 1000 - Number(s.o)) / 86400);
+    const f = (x) => (x == null ? '–' : (x >= 0 ? '+' : '') + x.toFixed(1) + '%');
+    lines.push(escTg(s.id) + ' (' + days + ' d): trimmed $' + o.paid.toFixed(0) + ' ' + f(po) + ' since · bought $' + i.paid.toFixed(0) + ' ' + f(pi) + (po != null && pi != null ? ' · <b>edge ' + f(pi - po) + '</b>' : '') + (!(i.paid > 0) ? ' · cash not yet redeployed' : ''));
+  }
+  if (!lines.length) return null;
+  const text = '🔄 <b>Rotations, last 5 weeks</b> (vs today: the trimmed coins as if held, the bought ones as they are)\n' + lines.join('\n') + '\nEdge > 0 = the rotation has helped so far. Scored properly at 7 and 30 days once L2 lands.';
+  await sendTelegram(text).catch(() => {});
+  return text;
+}
 async function sendUntaggedTradesDigest() {
   try {
     const [rows] = await db.execute(
@@ -12957,6 +13111,9 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
     }
     // ──────────────────────────────────────────────────────────────────────────
 
+    // #8 a rotation session takes the row (tag, no individual prompt), or a sell + buy within 30 min asks once "one rotation?"
+    const rotHit = await rotationOnDetected(journalId, coinBase, action).catch(e => { console.error('[rotation] detect failed (prompt sent as usual):', e.message); return null; });
+    if (rotHit && rotHit.handled) { console.log('[rotation] ' + coinBase + ' ' + action + ' j' + journalId + (rotHit.asked ? ' - asked "one rotation?"' : ' - tagged into ' + rotHit.rotation_id)); return; }
     const actionLabel = action === 'buy' ? 'BOUGHT' : action === 'sell' ? 'SOLD' : action.toUpperCase();
 
     // Check if a trailing stop recently triggered for this symbol (within 2 hours)
@@ -18817,6 +18974,8 @@ cron.schedule('15 9 * * *', async () => {   // #416 daily brief (Bryan 24 Sep): 
 }, { timezone: 'Europe/London' });
 cron.schedule('0 10 * * *', checkIntentionOutcomes, { timezone: 'Europe/London' });
 cron.schedule('0 18 * * 0', sendUntaggedTradesDigest, { timezone: 'Europe/London' });   // #L0 Sunday 18:00 London
+cron.schedule('5 18 * * 0', () => { rotationWeekly().catch(e => console.error('[rotation] weekly failed:', e.message)); }, { timezone: 'Europe/London' });   // #8 Sunday 18:05 London
+setInterval(() => { rotationTick().catch(e => console.error('[rotation] tick failed:', e.message)); }, 60 * 1000);   // #8 closes sessions on time (DB-backed: survives a restart)
 
 // #50: prune intraday prices older than 30 days
 cron.schedule('15 2 * * *', async () => {
@@ -21755,7 +21914,7 @@ let rows;
       reasoning:              z.string().optional().describe('Why the trade was or will be made'),
       emotion:                z.enum(['confident', 'uncertain', 'fomo', 'fearful', 'neutral']).optional().describe('Emotional state'),
       followed_recommendation: zLoose(z.boolean()).optional().describe('Whether Claude recommendation was followed'),
-      reason_tag:             z.string().optional().describe('#L0 log_journal: structured why - took_profit | cut_loss | dip_buy | rebalance_in | rebalance_out | topup | payment | thesis_change | funding | other. Anything else is stored as NULL (never coerced).'),
+      reason_tag:             z.string().optional().describe('#L0 log_journal: structured why - took_profit | cut_loss | dip_buy | rebalance_in | rebalance_out | rotation_in | rotation_out | topup | payment | thesis_change | funding | other. Anything else is stored as NULL (never coerced).'),
       expires_hours:          z.coerce.number().optional().describe('Hours until intention expires, default 24'),
       key:                    z.string().optional().describe('Preference key for save_preference'),
       value:                  z.string().optional().describe('Preference value for save_preference'),
@@ -25439,7 +25598,7 @@ app.post('/telegram-webhook', async (req, res) => {
       // New Trade Detected buttons use 'tj'; numeric 'td' keeps already-sent ones working.
       const cbIsTradeJournal = cbMoneyType === 'tj' || (cbMoneyType === 'td' && /^\d+$/.test(cbCoin));
       if (cbMoneyType === 'np' || cbMoneyType === 'cc' || cbIsTradeJournal || cbMoneyType === 'ta' || cbMoneyType === 'mu' ||
-          cbMoneyType === 'sd' || cbMoneyType === 'sp' || cbMoneyType === 'rp' || cbMoneyType === 'db' || cbMoneyType === 'sk') {
+          cbMoneyType === 'sd' || cbMoneyType === 'sp' || cbMoneyType === 'rp' || cbMoneyType === 'db' || cbMoneyType === 'sk' || cbMoneyType === 'ro' || cbMoneyType === 'rq') {
         await ackCb('Working...');
         try {
           if (cbMoneyType === 'ta') await handleTradeApprovalButton(cbCoin, cbChoice, cbReply);
@@ -25447,6 +25606,8 @@ app.post('/telegram-webhook', async (req, res) => {
           else if (cbMoneyType === 'sd' || cbMoneyType === 'sp') await handleSwingButton(cbCoin, cbChoice, cbMoneyType, cbReply);
           else if (cbMoneyType === 'rp') await handleRebalanceConfirmButton(cbCoin, cbChoice, cbReply);
           else if (cbMoneyType === 'sk') await handleSpecButton(cbCoin, cbChoice, cbReply);   // #D2 spec desk status buttons (never money)
+          else if (cbMoneyType === 'ro') await handleRotationUntagButton(cbCoin, cbReply);   // #8 records only
+          else if (cbMoneyType === 'rq') await handleRotationAskButton(cbCoin, cbChoice, cbReply);   // #8 records only
           else if (cbMoneyType === 'mu') await handleMuteButton(cbCoin, cbReply);
           else if (cbIsTradeJournal) await handleTradeButton(cbCoin, cbChoice, cbReply);
           else await handleMoneyButton(cbMoneyType, cbCoin, cbChoice, cbReply);
@@ -25647,6 +25808,10 @@ app.post('/telegram-webhook', async (req, res) => {
     if (_specAwaitNote && rawText && !rawText.startsWith('/')) {   // #D5b "Needs something first": Bryan's next plain message is the note
       const sn = await specTakeNote(rawText.slice(0, 4000)).catch(e => ({ text: '❌ Spec desk: ' + escTg(e.message) }));
       if (sn) { if (sn.kb) await sendTelegram(sn.text, sn.kb); else await sendReply(sn.text); return res.status(200).json({ ok: true }); }
+    }
+    { // #8 🔄 alone / "rotating" / /rotation [minutes|stop]: claimed beside the watch-link claim, before any reply parsing (Fable 15:40)
+      const rt = await rotationClaimText(rawText).catch(e => '❌ Rotation: ' + escTg(e.message));
+      if (rt !== null) { if (rt) await sendReply(rt); return res.status(200).json({ ok: true }); }
     }
     // #420 a YouTube link on its own (or "/watch <link>") -> Gemini watches it; the result arrives when done. Never trades.
     // Matched on rawText: video ids are case-sensitive and commandText is lower-cased.
