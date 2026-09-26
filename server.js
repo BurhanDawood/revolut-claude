@@ -3181,6 +3181,10 @@ async function rotationOnDetected(journalId, coinBase, action) {
   if (open) return { handled: await rotationTag(open.id, journalId), rotation_id: open.id };
   const cfg = await rotationCfg();
   if (!cfg.auto_detect) return null;
+  // #12 (Bryan 26 Sep 21:51): while "one rotation?" is waiting for his answer, every further trade JOINS that question - no
+  // separate TRADE DETECTED prompt, no REBALANCING prompt. His answer covers all of them (handleRotationAskButton, up to cfg.minutes).
+  const [pend] = await db.execute("SELECT id FROM rotation_sessions WHERE trigger_kind = 'ask' AND status = 'asked' AND opened_at >= DATE_SUB(NOW(), INTERVAL ? MINUTE) ORDER BY opened_at DESC LIMIT 1", [cfg.minutes]);
+  if (pend.length) return { handled: true, joined: pend[0].id };
   const isSell = ['sell', 'reduce'].includes(action);
   const [opp] = await db.execute("SELECT id FROM trading_journal WHERE " + ROT_ELIGIBLE + " AND id <> ? AND action IN " + (isSell ? "('buy', 'add')" : "('sell', 'reduce')") + " AND created_at >= DATE_SUB(NOW(), INTERVAL ? MINUTE) LIMIT 1", [journalId, cfg.lookback_min]);
   if (!opp.length) return null;
@@ -3198,7 +3202,7 @@ async function handleRotationAskButton(jidStr, choice, reply) {
   const [q] = await db.execute("SELECT id, status, UNIX_TIMESTAMP(opened_at) AS o FROM rotation_sessions WHERE id = ?", ['Q' + jid]);
   if (!q.length || q[0].status !== 'asked') return reply('Already answered.');
   await db.execute("UPDATE rotation_sessions SET status = ? WHERE id = ? AND status = 'asked'", [choice === 1 ? 'accepted' : choice === 2 ? 'individual' : 'declined', 'Q' + jid]);
-  const [cl] = await db.execute("SELECT id, symbol, action FROM trading_journal WHERE " + ROT_ELIGIBLE + " AND created_at >= DATE_SUB(FROM_UNIXTIME(?), INTERVAL ? MINUTE) AND created_at <= DATE_ADD(FROM_UNIXTIME(?), INTERVAL 2 MINUTE) ORDER BY id", [q[0].o, cfg.lookback_min, q[0].o]);
+  const [cl] = await db.execute("SELECT id, symbol, action FROM trading_journal WHERE " + ROT_ELIGIBLE + " AND created_at >= DATE_SUB(FROM_UNIXTIME(?), INTERVAL ? MINUTE) AND created_at <= DATE_ADD(FROM_UNIXTIME(?), INTERVAL ? MINUTE) ORDER BY id", [q[0].o, cfg.lookback_min, q[0].o, cfg.minutes]);   // #12 trades that joined the question after it was asked
   if (choice === 1) {
     const r = await rotationStart('auto', null, cl.map(x => x.id));
     return reply('🔄 <b>Rotation ' + escTg(r.id) + ' open</b>: ' + r.swept + ' trade' + (r.swept === 1 ? '' : 's') + ' tagged. Anything else you trade in the next ' + r.minutes + ' min joins it; one summary at the end. Send ' + escTg(cfg.emoji) + ' to close it now.');
@@ -12646,6 +12650,9 @@ async function checkForRebalancePair(newSymbol, newAction, newJournalId, newPric
   try {
     const oppositeAction = newAction === 'sell' ? 'buy' : newAction === 'buy' ? 'sell' : null;
     if (!oppositeAction) return;
+    // #12 (Bryan 26 Sep 21:51 "this should be auto detected as rotation"): with rotation detection on (#8), a sell + buy pair is
+    // handled there ("one rotation?"), so the older REBALANCING DETECTED prompt is not sent. Typed "rebalance COIN" still works.
+    if ((await rotationCfg()).auto_detect) return;
 
     // Check 4: skip if this is a test trade
     if (reasoning && reasoning.toLowerCase().includes('test')) {
@@ -13293,7 +13300,7 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
 
     // #8 a rotation session takes the row (tag, no individual prompt), or a sell + buy within 30 min asks once "one rotation?"
     const rotHit = await rotationOnDetected(journalId, coinBase, action).catch(e => { console.error('[rotation] detect failed (prompt sent as usual):', e.message); return null; });
-    if (rotHit && rotHit.handled) { console.log('[rotation] ' + coinBase + ' ' + action + ' j' + journalId + (rotHit.asked ? ' - asked "one rotation?"' : ' - tagged into ' + rotHit.rotation_id)); return; }
+    if (rotHit && rotHit.handled) { console.log('[rotation] ' + coinBase + ' ' + action + ' j' + journalId + (rotHit.asked ? ' - asked "one rotation?"' : rotHit.joined ? ' - joined the waiting question ' + rotHit.joined : ' - tagged into ' + rotHit.rotation_id)); return; }
     const actionLabel = action === 'buy' ? 'BOUGHT' : action === 'sell' ? 'SOLD' : action.toUpperCase();
 
     // Check if a trailing stop recently triggered for this symbol (within 2 hours)
