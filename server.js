@@ -11,7 +11,7 @@ import { dirname, join } from 'path';
 import mysql from 'mysql2/promise';
 import Anthropic from '@anthropic-ai/sdk';
 import cron from 'node-cron';
-import { gzipSync } from 'zlib';
+import { gzipSync, gzip } from 'zlib';
 
 // #209: transport-tolerant schema wrapper -- MCP client may serialize arrays/booleans/objects as JSON strings.
 // Mirrors the inline JSON.parse preprocess pattern already used on dnd_coins/coin_tags/sell_floors/per_coin_enabled/resolutions (#152).
@@ -19365,6 +19365,69 @@ app.get('/dev-log/context', async (req, res) => {
     res.type('text/markdown').send(md.length > CAP ? md.slice(0, CAP) + '\n\n[... briefing capped at ' + CAP + ' characters]' : md);
   } catch (e) { res.status(500).type('text/plain').send('error: ' + e.message); }
 });
+
+// #T2 READ-ONLY PRICE EXPORT for offline replays (cloud sessions cannot reach MySQL). A GitHub Actions workflow pages through it
+// daily and publishes the result to the data-prices branch. Like /dev-log/context it sits OUTSIDE /api/ with its OWN key
+// (EXPORT_TOKEN, sent as "Authorization: Bearer ...") that grants nothing else. FAIL-CLOSED and DARK by default: with the variable
+// unset or under 24 characters every request gets 404, so the endpoint does not even show it exists. Market prices only (two
+// candle tables, fixed columns): no holdings, balances, orders, trades or config. Keyset pages of at most 50,000 rows, gzipped
+// NDJSON, the last line always {"end":true,...}. At most 60 requests per 10 minutes (every request counts, so a key cannot be
+// guessed quickly).
+const EXPORT_PAGE = 50000, EXPORT_WINDOW_MS = 10 * 60 * 1000, EXPORT_MAX_REQ = 60, _exportHits = [];
+let _serverSha = null;
+function exportServerSha() {
+  if (_serverSha == null) { try { _serverSha = createHash('sha256').update(readFileSync(fileURLToPath(import.meta.url))).digest('hex').slice(0, 8); } catch (e) { _serverSha = 'unknown'; } }
+  return _serverSha;
+}
+function exportRateOk(nowMs = Date.now()) {   // sliding window over every request that reached the key check
+  while (_exportHits.length && _exportHits[0] <= nowMs - EXPORT_WINDOW_MS) _exportHits.shift();
+  if (_exportHits.length >= EXPORT_MAX_REQ) return false;
+  _exportHits.push(nowMs); return true;
+}
+// Cursor = base64url of JSON [symbol, t] (hourly: unix seconds) or [symbol, 'YYYY-MM-DD'] (daily). Anything else is refused.
+function exportCursor(table, after) {
+  if (after == null || after === '') return { ok: true, cur: null };
+  if (typeof after !== 'string' || after.length > 200 || !/^[A-Za-z0-9_-]+$/.test(after)) return { ok: false };
+  let v; try { v = JSON.parse(Buffer.from(after, 'base64url').toString('utf8')); } catch (e) { return { ok: false }; }
+  if (!Array.isArray(v) || v.length !== 2 || typeof v[0] !== 'string' || !/^[A-Za-z0-9._-]{1,50}$/.test(v[0])) return { ok: false };
+  if (table === 'hourly' && !(Number.isInteger(v[1]) && v[1] >= 0 && v[1] < 4102444800)) return { ok: false };
+  if (table === 'daily' && !(typeof v[1] === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v[1]))) return { ok: false };
+  return { ok: true, cur: v };
+}
+const exportCursorOf = (v) => Buffer.from(JSON.stringify(v), 'utf8').toString('base64url');
+async function exportPricesHandler(req, res) {
+  const tok = process.env.EXPORT_TOKEN;
+  if (typeof tok !== 'string' || tok.length < 24) return res.status(404).type('text/plain').send('Not found');   // dark until Bryan sets the key
+  if (!exportRateOk()) return res.status(429).type('text/plain').send('too many requests');
+  const m = /^Bearer (\S+)$/.exec(String(req.headers.authorization || ''));
+  if (!m || !safeEqual(m[1], tok)) return res.status(401).type('text/plain').send('unauthorized');   // #351 constant-time
+  const table = String(req.query.table || '');
+  if (table !== 'hourly' && table !== 'daily') return res.status(400).type('text/plain').send('table must be hourly or daily');
+  const c = exportCursor(table, req.query.after);
+  if (!c.ok) return res.status(400).type('text/plain').send('bad cursor');
+  try {
+    let rows;
+    if (table === 'hourly') {
+      const where = c.cur ? 'WHERE symbol > ? OR (symbol = ? AND hour_bucket > FROM_UNIXTIME(?)) ' : '';
+      [rows] = await db.execute('SELECT symbol, UNIX_TIMESTAMP(hour_bucket) AS t, open_px, high_px, low_px, close_px, sample_count FROM price_intraday_hourly ' + where +
+        'ORDER BY symbol, hour_bucket LIMIT ' + EXPORT_PAGE, c.cur ? [c.cur[0], c.cur[0], c.cur[1]] : []);
+    } else {
+      const where = c.cur ? 'WHERE symbol > ? OR (symbol = ? AND day > ?) ' : '';
+      [rows] = await db.execute("SELECT symbol, DATE_FORMAT(day, '%Y-%m-%d') AS d, open_px, high_px, low_px, close_px, source FROM price_daily_ohlc " + where +
+        'ORDER BY symbol, day LIMIT ' + EXPORT_PAGE, c.cur ? [c.cur[0], c.cur[0], c.cur[1]] : []);
+    }
+    const lines = rows.map(r => JSON.stringify(table === 'hourly'
+      ? { s: r.symbol, t: Number(r.t), o: Number(r.open_px), h: Number(r.high_px), l: Number(r.low_px), c: Number(r.close_px), n: Number(r.sample_count) }
+      : { s: r.symbol, d: r.d, o: Number(r.open_px), h: Number(r.high_px), l: Number(r.low_px), c: Number(r.close_px), src: r.source }));
+    const last = rows[rows.length - 1];
+    const next = rows.length === EXPORT_PAGE ? exportCursorOf(table === 'hourly' ? [last.symbol, Number(last.t)] : [last.symbol, last.d]) : null;
+    lines.push(JSON.stringify({ end: true, table, rows: rows.length, next, server_sha: exportServerSha(), at: new Date().toISOString() }));
+    const body = await new Promise((ok, no) => gzip(Buffer.from(lines.join('\n') + '\n', 'utf8'), (e, z) => (e ? no(e) : ok(z))));   // off the event loop
+    console.log('[export] ' + table + ' page: ' + rows.length + ' rows' + (next ? ', more to come' : ', last page'));
+    res.set({ 'Content-Type': 'application/x-ndjson', 'Content-Encoding': 'gzip', 'Cache-Control': 'no-store' }).status(200).send(body);
+  } catch (e) { console.error('[export] failed:', e.message); res.status(500).type('text/plain').send('error'); }
+}
+app.get('/export/prices', exportPricesHandler);
 
 // CORS middleware
 app.use((req, res, next) => {
