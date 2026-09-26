@@ -1,4 +1,5 @@
-// T1 runs the whole suite: node --check server.js, the acorn parse, then every test file in tests/p0, tests/money and tests/static.
+// T1 runs the whole suite: node --check server.js, the acorn parse, then every test file in tests/p0, tests/money, tests/static and
+// tests/tools (T2: the price-export validator, the loader and the offline spike replay).
 // Each file prints PASS / FAIL / SKIP per test; this prints one line per step and a total. Exit 1 if anything failed.
 // Nothing here starts server.js or reaches an exchange, a database, Telegram or a model API.
 // Run: node tests/run-all.mjs
@@ -13,7 +14,7 @@ const files = (dir) => readdirSync(join(ROOT, dir)).filter(f => f.endsWith('.tes
 const steps = [
   ['node --check server.js', ['--check', SERVER]],
   ['acorn parse server.js', ['tests/static/parse.mjs'], { skipCode: 3 }],
-  ...['tests/p0', 'tests/money', 'tests/static'].flatMap(files).map(f => [f, [f]]),
+  ...['tests/p0', 'tests/money', 'tests/static', 'tests/tools'].flatMap(files).map(f => [f, [f]]),
 ];
 const out = [];
 for (const [name, args, o = {}] of steps) {

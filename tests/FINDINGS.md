@@ -44,3 +44,17 @@ mutation (the relevant line of a local copy of server.js was broken and the test
   (after Apply Batch Patch / Apply Patch / Apply Approved Spec complete) against the new head of main.
 - **package.json is not touched.** Railway's watch patterns include package.json, so editing it would redeploy. acorn is installed
   by CI into `$RUNNER_TEMP`, outside the repo, and passed in with `ACORN_PATH`.
+
+## T2 (price export + offline spike replay)
+
+**Nothing blocks running the live replay offline; server.js is unchanged.** `spikeReplay` and everything it calls (`spikeCfg`,
+`spikeMedian`, `spikeReplayCoin`, `SPIKE_DEFAULTS`, `SPIKE_REPLAY_VERSION`; `spikeRef` is extracted too) run as extracted, in a
+strict sandbox, with a stub db and a no-op `specNote`. Notes for whoever reads the results (not bugs):
+
+- **T2-1 Timestamps must match `UNIX_TIMESTAMP(hour_bucket)`.** The live replay reads `t` through MySQL's `UNIX_TIMESTAMP` in the
+  server's session time zone. The export's `t` must be produced the same way (or both must be UTC), or offline hours would be shifted
+  against the live run. The spike rule only uses relative hours, so a constant shift changes nothing except the printed `at`; a DST
+  mismatch would. Worth one check against a live `/spike` replay once the export is on.
+- **T2-2 Symbol order.** The server's `ORDER BY symbol` uses the column collation (case-insensitive); the stub sorts upper-case first,
+  which is the same for the uppercase `XXX-USD` symbols in use. It only affects the order of `per_coin` / `events` (both truncated to 60).
+- **T2-3 The replay writes are swallowed.** Offline runs never store `system_config.spike_replay` and never post the spec note, by design.

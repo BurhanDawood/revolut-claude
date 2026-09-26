@@ -1,0 +1,178 @@
+name: Export prices (data-prices branch)
+
+# T2: copies the PRICE history (price_intraday_hourly, price_daily_ohlc) from the live server's read-only export endpoint into the
+# orphan branch `data-prices`, so cloud sessions can run replays offline (tools/README.md).
+#
+# - Needs two repository secrets: EXPORT_URL and EXPORT_TOKEN. Either missing -> a notice, and the run ends green having done nothing.
+# - Pages through GET {EXPORT_URL}/export/prices?table=hourly|daily[&after=<cursor>] with curl --fail --compressed, 3 retries with
+#   backoff for errors, and at least 11 s between requests (the server allows 60 requests per 10 min). A 429 never fails the run
+#   by itself: it waits 60/120/240/300 s (12 min in total) first, since anyone probing the URL counts against the same limit.
+# - Every page is validated by tools/data/validate.mjs (the module tests/tools tests): JSON on every line, the end line present,
+#   its row count right, the field types right. Then the whole table (order, no overlap) and the SHRINK GUARD: a table with more
+#   than 10 % fewer rows than the MANIFEST already on data-prices fails the run and nothing is pushed. Pages from more than one
+#   server_sha (a redeploy mid-export) also fail the run: two server versions are never mixed.
+# - Publishes data/prices/{hourly,daily}.ndjson.gz + MANIFEST.json as ONE parentless commit, force-pushed to data-prices only
+#   (history never grows). It never pushes to main: Railway deploys from main and tests.yml runs on it.
+# - The token is masked and only ever read by curl from a mode-600 header file: never echoed, never in a URL, no curl -v.
+# - Market prices only: no holdings, balances, orders or trades.
+
+on:
+  workflow_dispatch:
+    inputs:
+      allow_shrink:
+        description: 'Publish even if a table shrank by more than 10% (only for a deliberate server-side cleanup)'
+        type: boolean
+        default: false
+  schedule:
+    - cron: '17 4 * * *'   # 04:17 UTC daily
+
+permissions:
+  contents: write
+
+concurrency:
+  group: export-prices
+  cancel-in-progress: false
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30   # up to 12 min of 429 waits + ~5 min of paging + retries
+    steps:
+      - name: Check the secrets
+        id: cfg
+        env:
+          EXPORT_URL: ${{ secrets.EXPORT_URL }}
+          EXPORT_TOKEN: ${{ secrets.EXPORT_TOKEN }}
+        run: |
+          if [ -z "$EXPORT_URL" ] || [ -z "$EXPORT_TOKEN" ]; then
+            echo "::notice title=Price export not configured::The EXPORT_URL and/or EXPORT_TOKEN repository secret is not set, so nothing was exported. Set both to enable it."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::add-mask::$EXPORT_TOKEN"
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout
+        if: steps.cfg.outputs.enabled == 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Node.js
+        if: steps.cfg.outputs.enabled == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Fetch every page (hourly, then daily)
+        if: steps.cfg.outputs.enabled == 'true'
+        env:
+          EXPORT_URL: ${{ secrets.EXPORT_URL }}
+          EXPORT_TOKEN: ${{ secrets.EXPORT_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$EXPORT_TOKEN"
+          PAGES="$RUNNER_TEMP/pages"; mkdir -p "$PAGES"
+          HDR="$RUNNER_TEMP/auth.hdr"
+          ( umask 077; printf 'Authorization: Bearer %s\n' "$EXPORT_TOKEN" > "$HDR" )
+          unset EXPORT_TOKEN
+          BASE="${EXPORT_URL%/}/export/prices"
+          last_req=0
+          # Retry budgets, for the whole run: HTTP 429 never fails the run on its own (the rate limit counts every request, so a
+          # stranger probing the URL can use it up): wait 60 s, 120 s, 240 s, 300 s (12 min in total) before giving up.
+          # Any other failure (network, 5xx, a page that fails validation): 3 quick retries per page (15 s, 30 s, 60 s).
+          RL_WAITS=(60 120 240 300); rl_used=0
+          fetch() {   # fetch <table> <cursor> <out>: one page, never faster than one request per 11 s
+            local table="$1" cursor="$2" out="$3" code wait other=0
+            while :; do
+              wait=$(( last_req + 11 - $(date +%s) )); if [ "$wait" -gt 0 ]; then sleep "$wait"; fi
+              last_req=$(date +%s)
+              args=(--silent --show-error --fail --compressed --max-time 120 -H "@$HDR" --get --data-urlencode "table=$table")
+              if [ -n "$cursor" ]; then args+=(--data-urlencode "after=$cursor"); fi
+              code=$(curl "${args[@]}" -o "$out" -w '%{http_code}' "$BASE") && {
+                if node tools/data/validate.mjs page "$table" "$out" > "$out.next"; then return 0; fi
+                echo "::warning::$table page failed validation"
+              } || {
+                case "$code" in
+                  404) echo "::error title=Price export::404: the export endpoint is off (the server has no EXPORT_TOKEN set)"; return 1 ;;
+                  401) echo "::error title=Price export::401: the server refused EXPORT_TOKEN (the secret and the server's EXPORT_TOKEN differ)"; return 1 ;;
+                  400) echo "::error title=Price export::400: the server refused the table or cursor ($table)"; return 1 ;;
+                  429)
+                    if [ "$rl_used" -ge "${#RL_WAITS[@]}" ]; then echo "::error title=Price export::still rate-limited (429) after waiting 12 minutes in total; re-run the workflow later"; return 1; fi
+                    echo "::warning::$table: rate-limited (429), waiting ${RL_WAITS[$rl_used]} s"
+                    sleep "${RL_WAITS[$rl_used]}"; rl_used=$((rl_used + 1)); continue ;;
+                esac
+                echo "::warning::$table request failed: HTTP $code"
+              }
+              other=$((other + 1))
+              if [ "$other" -gt 3 ]; then echo "::error title=Price export::$table: a page still failed after 3 retries"; return 1; fi
+              sleep $(( 15 * 2 ** (other - 1) ))   # 15 s, 30 s, 60 s
+            done
+          }
+          for table in hourly daily; do
+            cursor=""; n=0
+            while :; do
+              n=$((n + 1)); if [ "$n" -gt 400 ]; then echo "::error title=Price export::$table: over 400 pages, giving up"; exit 1; fi
+              f="$PAGES/$table-$(printf '%04d' "$n").ndjson"
+              fetch "$table" "$cursor" "$f"
+              next=$(cat "$f.next"); rm -f "$f.next"
+              if [ -z "$next" ]; then break; fi
+              if [ "$next" = "$cursor" ]; then echo "::error title=Price export::$table: the server returned the same cursor twice"; exit 1; fi
+              cursor="$next"
+            done
+            echo "$table: $n page(s)"
+          done
+          rm -f "$HDR"
+
+      - name: Validate, shrink guard, build the files
+        if: steps.cfg.outputs.enabled == 'true'
+        env:
+          ALLOW_SHRINK: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_shrink && '--allow-shrink' || '' }}
+        run: |
+          set -euo pipefail
+          PREV="$RUNNER_TEMP/prev-MANIFEST.json"
+          if git fetch --quiet --depth=1 origin +refs/heads/data-prices:refs/remotes/origin/data-prices 2>/dev/null; then
+            git show origin/data-prices:data/prices/MANIFEST.json > "$PREV" || { echo "::error title=Price export::data-prices exists but has no data/prices/MANIFEST.json; refusing to overwrite it blind"; exit 1; }
+            echo "previous export: $(git rev-parse origin/data-prices)"
+          else
+            echo "data-prices does not exist yet: first export, no shrink guard to apply"
+          fi
+          node tools/data/validate.mjs build "$RUNNER_TEMP/pages" "$RUNNER_TEMP/export-out/data/prices" --prev "$PREV" --run-id "$GITHUB_RUN_ID" $ALLOW_SHRINK
+
+      - name: Publish to data-prices (one orphan commit, force-pushed)
+        if: steps.cfg.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/export-out"
+          cat > "$OUT/README.md" <<'EOF'
+          # data-prices
+
+          Price history exported from the live server by `.github/workflows/export-prices.yml` (on main). Rewritten as a single commit on
+          every run; do not commit here. Market prices only. `data/prices/MANIFEST.json` has the row counts and sha256 of each file.
+          How to use it: `tools/README.md` on main.
+          EOF
+          # Build the commit with plumbing, from files outside the working tree: no parent, nothing on main is touched.
+          export GIT_INDEX_FILE="$RUNNER_TEMP/data-prices.index"
+          rm -f "$GIT_INDEX_FILE"
+          git --work-tree="$OUT" add -f README.md data/prices/hourly.ndjson.gz data/prices/daily.ndjson.gz data/prices/MANIFEST.json
+          TREE=$(git write-tree)
+          unset GIT_INDEX_FILE
+          ROWS=$(node -e "const m=require(process.argv[1]);console.log('hourly '+m.tables.hourly.rows+', daily '+m.tables.daily.rows+', server '+m.server_sha)" "$OUT/data/prices/MANIFEST.json")
+          COMMIT=$(GIT_AUTHOR_NAME="github-actions[bot]" GIT_AUTHOR_EMAIL="41898282+github-actions[bot]@users.noreply.github.com" \
+                   GIT_COMMITTER_NAME="github-actions[bot]" GIT_COMMITTER_EMAIL="41898282+github-actions[bot]@users.noreply.github.com" \
+                   git commit-tree "$TREE" -m "Price export: $ROWS (run $GITHUB_RUN_ID)")
+          if git rev-parse --verify --quiet refs/remotes/origin/data-prices >/dev/null; then
+            LEASE="--force-with-lease=refs/heads/data-prices:$(git rev-parse refs/remotes/origin/data-prices)"
+          else
+            LEASE="--force-with-lease=refs/heads/data-prices:"
+          fi
+          git push "$LEASE" origin "$COMMIT:refs/heads/data-prices"
+          {
+            echo "## Price export"
+            echo ""
+            echo "Published \`$COMMIT\` to \`data-prices\`: $ROWS."
+            echo ""
+            echo '```json'
+            cat "$OUT/data/prices/MANIFEST.json"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
