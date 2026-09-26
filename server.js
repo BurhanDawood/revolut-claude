@@ -1598,6 +1598,11 @@ await db.execute("CREATE TABLE IF NOT EXISTS portfolio_value_daily (d DATE NOT N
 await db.execute('CREATE TABLE IF NOT EXISTS portfolio_flows (tx_id VARCHAR(80) NOT NULL PRIMARY KEY, ts INT UNSIGNED NOT NULL, kind VARCHAR(12) NOT NULL, currency VARCHAR(16) NOT NULL, qty DECIMAL(30,10) NOT NULL, usd DECIMAL(16,2) NOT NULL, INDEX idx_ts (ts))').catch(e => console.error('[migration] portfolio_flows:', e.message));   // #PV2 money in / out markers
 await db.execute('CREATE TABLE IF NOT EXISTS dip_alerts (symbol VARCHAR(20) NOT NULL PRIMARY KEY, armed TINYINT(1) NOT NULL DEFAULT 1, last_alert_at DATETIME NULL, last_off_pct DECIMAL(8,2) NULL, last_rsi DECIMAL(6,2) NULL)').catch(e => console.error('[migration] dip_alerts:', e.message));   // #DIP1 one alert per dip per watchlist coin
 await db.execute("CREATE TABLE IF NOT EXISTS spike_events (id INT AUTO_INCREMENT PRIMARY KEY, symbol VARCHAR(20) NOT NULL, triggered_at DATETIME NOT NULL, low_ref DECIMAL(24,10) NOT NULL, ref_7d DECIMAL(24,10) NULL, trigger_price DECIMAL(24,10) NOT NULL, peak DECIMAL(24,10) NOT NULL, peak_at DATETIME NULL, status VARCHAR(12) NOT NULL DEFAULT 'active', qty_held DECIMAL(30,10) NULL, ended_at DATETIME NULL, end_price DECIMAL(24,10) NULL, sold_qty DECIMAL(30,10) NULL, avg_price DECIMAL(24,10) NULL, cycle_id VARCHAR(64) NULL, INDEX idx_sym (symbol, triggered_at), INDEX idx_status (status))").catch(e => console.error('[migration] spike_events:', e.message));   // #B23 A5 one row per spike (S1 records; S2 fills sold_qty / avg_price / cycle_id)
+await safeAddColumn('spike_events', 'insured', 'TINYINT(1) NOT NULL DEFAULT 0');   // #B23 S2: 0 none, 1 insurance trail set, 2 an existing trail left as it was
+await safeAddColumn('spike_events', 'sell_pct', 'DECIMAL(6,2) NULL');
+await safeAddColumn('spike_events', 'sold_at', 'DATETIME NULL');
+await safeAddColumn('spike_events', 'note', 'VARCHAR(200) NULL');
+await safeAddColumn('trailing_stops', 'source', 'VARCHAR(8) NULL');   // #B23 A5: loop | manual | spike (NULL = rows from before)
 setTimeout(() => { repairAgentFills().catch(e => console.error('[agent] boot repair failed:', e.message)); }, 30 * 1000);   // #B21 a fill recorded but not applied before a restart
 await safeAddColumn('trailing_stops',   'auto_execute',    'TINYINT(1) NOT NULL DEFAULT 0'); // #93
 await safeAddColumn('price_targets',    'sell_pct',        'DECIMAL(5,2) NULL'); // #144 per-rung sell %% override for Away Mode up-targets
@@ -2091,7 +2096,8 @@ try {
       entryPrice: row.entry_price ? parseFloat(row.entry_price) : null,
       autoExecute: row.auto_execute ? Boolean(parseInt(row.auto_execute)) : false, // #93
       sellPct:     row.sell_pct != null ? parseFloat(row.sell_pct) : 25,            // #93
-      exchange:    row.exchange || 'revolut'                                         // #93
+      exchange:    row.exchange || 'revolut',                                        // #93
+      source:      row.source || null                                                // #B23 A5
     });
   }
   console.log(`Loaded ${tsRows.length} trailing stops from database`);
@@ -4439,7 +4445,7 @@ async function resumeAlerts(symbol) {
 
 // ── Trailing Stop Functions ───────────────────────────────────────────────────
 
-async function setTrailingStop(symbol, trailPct, currentPrice, entryPrice = null, autoExecute = null, sellPct = null, exchange = null) {
+async function setTrailingStop(symbol, trailPct, currentPrice, entryPrice = null, autoExecute = null, sellPct = null, exchange = null, source = undefined) {   // #B23 A5 source: undefined = keep
   const stopPrice = currentPrice * (1 - trailPct / 100);
   // #93 preserve existing fields when NOT specified; #F3 THREE-VALUED autoExecute: null/undefined = preserve,
   // true = on, false = explicitly OFF (honoured - it used to be impossible to lower, so a notify-only caller could
@@ -4449,11 +4455,12 @@ async function setTrailingStop(symbol, trailPct, currentPrice, entryPrice = null
   const preserved = { autoExecute: !(autoExecute === true || autoExecute === false) && existing.autoExecute !== undefined, sellPct: sellPct == null && existing.sellPct != null };
   const finalSellPct     = sellPct != null ? sellPct : (existing.sellPct != null ? existing.sellPct : 25);
   const finalExchange    = exchange || existing.exchange || 'revolut';
-  const ts = { trailPct, peakPrice: currentPrice, stopPrice, entryPrice, autoExecute: finalAutoExecute, sellPct: finalSellPct, exchange: finalExchange };
+  const finalSource      = source !== undefined ? source : (existing.source || null);   // #B23 A5
+  const ts = { trailPct, peakPrice: currentPrice, stopPrice, entryPrice, autoExecute: finalAutoExecute, sellPct: finalSellPct, exchange: finalExchange, source: finalSource };
   trailingStops.set(symbol, ts);
   await db.execute(
-    'INSERT INTO trailing_stops (symbol, trail_pct, peak_price, stop_price, entry_price, auto_execute, sell_pct, exchange) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE trail_pct=VALUES(trail_pct), peak_price=VALUES(peak_price), stop_price=VALUES(stop_price), entry_price=VALUES(entry_price), auto_execute=VALUES(auto_execute), sell_pct=VALUES(sell_pct), exchange=VALUES(exchange), updated_at=CURRENT_TIMESTAMP',
-    [symbol, trailPct, currentPrice, stopPrice, entryPrice, finalAutoExecute ? 1 : 0, finalSellPct, finalExchange]
+    'INSERT INTO trailing_stops (symbol, trail_pct, peak_price, stop_price, entry_price, auto_execute, sell_pct, exchange, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE trail_pct=VALUES(trail_pct), peak_price=VALUES(peak_price), stop_price=VALUES(stop_price), entry_price=VALUES(entry_price), auto_execute=VALUES(auto_execute), sell_pct=VALUES(sell_pct), exchange=VALUES(exchange), source=VALUES(source), updated_at=CURRENT_TIMESTAMP',
+    [symbol, trailPct, currentPrice, stopPrice, entryPrice, finalAutoExecute ? 1 : 0, finalSellPct, finalExchange, finalSource]
   );
   alertState.acknowledged.delete(symbol); // Setting new trail re-enables coin
   return { trailPct, peakPrice: currentPrice, stopPrice, autoExecute: finalAutoExecute, sellPct: finalSellPct, exchange: finalExchange, preserved };
@@ -4469,8 +4476,8 @@ async function removeTrailingStop(symbol) {
 async function restoreTrailingStop(symbol, ts) {
   trailingStops.set(symbol, ts);
   await db.execute(
-    'INSERT INTO trailing_stops (symbol, trail_pct, peak_price, stop_price, entry_price, auto_execute, sell_pct, exchange) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE trail_pct=VALUES(trail_pct), peak_price=VALUES(peak_price), stop_price=VALUES(stop_price), entry_price=VALUES(entry_price), auto_execute=VALUES(auto_execute), sell_pct=VALUES(sell_pct), exchange=VALUES(exchange), updated_at=CURRENT_TIMESTAMP',
-    [symbol, ts.trailPct, ts.peakPrice, ts.stopPrice, ts.entryPrice, ts.autoExecute ? 1 : 0, ts.sellPct != null ? ts.sellPct : 25, ts.exchange || 'revolut']
+    'INSERT INTO trailing_stops (symbol, trail_pct, peak_price, stop_price, entry_price, auto_execute, sell_pct, exchange, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE trail_pct=VALUES(trail_pct), peak_price=VALUES(peak_price), stop_price=VALUES(stop_price), entry_price=VALUES(entry_price), auto_execute=VALUES(auto_execute), sell_pct=VALUES(sell_pct), exchange=VALUES(exchange), source=VALUES(source), updated_at=CURRENT_TIMESTAMP',
+    [symbol, ts.trailPct, ts.peakPrice, ts.stopPrice, ts.entryPrice, ts.autoExecute ? 1 : 0, ts.sellPct != null ? ts.sellPct : 25, ts.exchange || 'revolut', ts.source || null]   // #B23 A5 the source survives a restore
   );
 }
 
@@ -5741,7 +5748,7 @@ async function checkPumpArm(symbol, currentPrice) {
         const [lowRow] = await db.execute('SELECT MIN(price) as lo FROM price_intraday WHERE symbol = ? AND recorded_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)', [symbol]); // #286 was captured_at — a column that does not exist; the throw aborted checkPumpArm before setTrailingStop, so DND coins could never arm
         const floor24 = lowRow.length && lowRow[0].lo != null ? parseFloat(lowRow[0].lo) : null;
         if (floor24) await db.execute('UPDATE pump_armed_rules SET entry_floor = ? WHERE symbol = ? AND active = 1', [floor24, symbol]);
-        await setTrailingStop(symbol, parseFloat(rule.trail_pct), currentPrice, floor24, true, rule.sell_pct || 100);
+        if (!(await spikeLoopArmOver(symbol, currentPrice, parseFloat(rule.trail_pct), floor24, true, rule.sell_pct || 100))) await setTrailingStop(symbol, parseFloat(rule.trail_pct), currentPrice, floor24, true, rule.sell_pct || 100, null, 'loop');   // #B23 A2
         await db.execute('UPDATE pump_armed_rules SET armed = 1, armed_since = NOW() WHERE symbol = ?', [symbol]);
         await logArmEvent(symbol, currentPrice, rule, 'dnd');   // #393
         console.log(`[pump-arm] ${symbol} ARMED (DND) — 24h floor=$${floor24 ? floor24.toFixed(4) : 'none'}, trail ${rule.trail_pct}%`);
@@ -5756,7 +5763,7 @@ async function checkPumpArm(symbol, currentPrice) {
       // non-DND pump-armed coin was silently notify-only and never auto-sold (the
       // IDEX overnight non-execution). The DND branch above already passed true.
       const loopEnabledArm = parseInt(rule.loop_enabled) === 1;
-      await setTrailingStop(symbol, parseFloat(rule.trail_pct), currentPrice, entryFloor, loopEnabledArm, loopEnabledArm ? (rule.sell_pct || 50) : null);
+      if (!(await spikeLoopArmOver(symbol, currentPrice, parseFloat(rule.trail_pct), entryFloor, loopEnabledArm, loopEnabledArm ? (rule.sell_pct || 50) : null))) await setTrailingStop(symbol, parseFloat(rule.trail_pct), currentPrice, entryFloor, loopEnabledArm, loopEnabledArm ? (rule.sell_pct || 50) : null, null, 'loop');   // #B23 A2
       await db.execute('UPDATE pump_armed_rules SET armed = 1, armed_since = NOW() WHERE symbol = ?', [symbol]);
       await logArmEvent(symbol, currentPrice, rule, 'loop');   // #393
       console.log(`[pump-arm] ${symbol} ARMED — pumped +${pumpPct.toFixed(1)}% to ${fmtPriceShort(currentPrice)}, trailing stop set ${rule.trail_pct}%`);
@@ -15179,7 +15186,22 @@ async function autoExecuteSell(symbol, maxPct, analysis, confidence, opts = {}) 
       await sendTelegram('\ud83d\uded1 AUTO-SELL BLOCKED - ' + coinBase + ': the slippage-margin check errored (' + e.message + '), so a fill below the floor could not be ruled out. Failing safe - no sale, loop stays armed.').catch(() => {});
       return { executed: false, reason: 'floor_error' };
     }
-    if (aeEdge && aeEdge.edge) {
+    if (opts.chase) {   // #B23 S2 spike mode: a chasing limit, never a market order (Fable A3/A4/A6); the floor guard above has already run
+      const wanted = sellQty;
+      const ch = await spikeChase(symbol, coinBase, sellQty, opts.chase, { onSend: () => { aeOrderSent = true; } });   // #K1 set just before the first order
+      aeLim = ch;
+      await sendTelegram(spikeChaseText(coinBase, wanted, ch)).catch(() => {});
+      if (ch.stopped === 'cancel_failed' || ch.stopped === 'error') {   // A3 / S2-1: a cancel did not confirm, or an order errored after it may have been sent - an order may be resting, loop state can no longer be trusted (as #388)
+        aeLoopOff = true;
+        await db.execute('UPDATE pump_armed_rules SET loop_enabled = 0, armed = 0, sale_price = NULL, sale_proceeds_usd = NULL, retrace_gate = NULL, trough_low = NULL, trough_armed = 0 WHERE symbol = ? AND active = 1', [symbol]).catch(() => {});
+        troughTrackers.delete(symbol);
+        if (!(ch.filled_qty > 0)) return { executed: false, reason: 'chase_resting', price: currentPrice, chase: ch };
+      }
+      if (!(ch.filled_qty > 0)) return { executed: false, reason: 'chase_unfilled', floor: ch.line, price: currentPrice, chase: ch };
+      const chFilled = ch.orders.filter(x => x.filled > 0);
+      aeOrder = chFilled.length === 1 ? chFilled[0].order : null;   // A6: one journal row for the aggregate; the venue re-check only when one order holds every fill
+      sellQty = ch.filled_qty; currentPrice = ch.avg_price; valueUSD = sellQty * currentPrice;
+    } else if (aeEdge && aeEdge.edge) {
       const wanted = sellQty;
       aeOrderSent = true;   // #K1 (set before getPairQuoteStep inside floorCappedLimitSell, so a failure there counts as post-send: the safe direction)
       const lim = await floorCappedLimitSell(symbol, sellQty, aeEdge.floor, currentPrice, opts.clientOrderId || null);
@@ -15229,6 +15251,11 @@ async function autoExecuteSell(symbol, maxPct, analysis, confidence, opts = {}) 
        'confident', opts.source || 'ai_auto', opts.tool_key || 'ai_auto', opts.cycle_id || await pumpCycleId(symbol), await regimeTagFor(coinBase)]
     ).catch(e => { console.error('[auto-exec] journal insert:', e.message); return [{}]; });
     if (aeRevIns && aeRevIns.insertId) await recordRealisedPnl(aeRevIns.insertId, symbol, currentPrice, sellQty).catch(() => {});
+    if (opts.chase && aeLim && aeRevIns && aeRevIns.insertId) {   // #B23 S2-3: the aggregate row names every filled order, so D1 and the detector can match the fills
+      const chF = (aeLim.orders || []).filter(x => x.filled > 0);
+      if (chF.length) await db.execute('UPDATE trading_journal SET venue_order_id = COALESCE(venue_order_id, ?), reasoning = CONCAT(COALESCE(reasoning, \'\'), ?) WHERE id = ?',
+        [String(chF[0].order_id), ' | chase fills ' + JSON.stringify(chF.map(x => ({ id: x.order_id, qty: x.filled, avg: x.avg }))), aeRevIns.insertId]).catch(e => console.error('[spike] fills record:', e.message));
+    }
 
     pendingUndo.set(symbol, { action: 'sell', qty: sellQty, price: currentPrice, timestamp: Date.now() });
     setTimeout(() => pendingUndo.delete(symbol), 2 * 60 * 1000);
@@ -15280,7 +15307,7 @@ async function autoExecuteSell(symbol, maxPct, analysis, confidence, opts = {}) 
         console.log(`[auto-exec] Stage 3 single-rebuy cascade spawned for pump-armed ${coinBase} after sell`);
       }
     } catch (e) { console.error('[auto-exec] Stage 3 cascade error (non-fatal):', e.message); }
-    return { executed: true, qty: sellQty, price: currentPrice, client_order_id: aeOrder && aeOrder.client_order_id, journal_id: aeRevIns && aeRevIns.insertId }; // #309 #359
+    return { executed: true, qty: sellQty, price: currentPrice, client_order_id: aeOrder && aeOrder.client_order_id, journal_id: aeRevIns && aeRevIns.insertId, chase: opts.chase ? aeLim : undefined }; // #309 #359 #B23
   } catch (e) {
     console.error('[auto-exec] sell error:', e.message);
     if (aeOrderSent) await sendTelegram(`❌ AUTO-EXEC FAILED — ${coinBase}\nError: ${e.message}\nManual review needed`);
@@ -15413,7 +15440,9 @@ async function handleTrailingStopAlert(symbol, currentPrice, ts, exchange = 'rev
           if (ae93Exchange === 'kraken') {
             ae93Result = await autoExecuteKrakenSell(symbol, ae93SellPct, ae93Analysis, 'High', { tool_key: ae93ToolKey });
           } else {
-            ae93Result = await autoExecuteSell(symbol, ae93SellPct, ae93Analysis, 'High', { tool_key: ae93ToolKey });
+            const ae93Sx = await spikeSaleContext(symbol, ae93Saved).catch(e => { console.error('[spike] sale context:', e.message); return null; });   // #B23 S2 spike mode -> the chase
+            ae93Result = await autoExecuteSell(symbol, ae93SellPct, ae93Analysis, 'High', ae93Sx ? ae93Sx.opts(ae93ToolKey) : { tool_key: ae93ToolKey });
+            if (ae93Sx) await spikeAfterSale(symbol, ae93Sx, ae93Result).catch(e => console.error('[spike] after-sale:', e.message));
           }
         } catch (ae93Err) {
           console.error('[trailing] #93 auto-exec error:', ae93Err.message);
@@ -15453,12 +15482,12 @@ async function handleTrailingStopAlert(symbol, currentPrice, ts, exchange = 'rev
           return;
         }
         const ae93Blocked = ae93Result && ae93Result.executed === false
-          && ['floor_blocked', 'no_floor', 'floor_error', 'edge_limit_unfilled'].indexOf(ae93Result.reason) !== -1;   // #387
+          && ['floor_blocked', 'no_floor', 'floor_error', 'edge_limit_unfilled', 'chase_unfilled'].indexOf(ae93Result.reason) !== -1;   // #387 #B23
         if (ae93Blocked) {
           // No trade occurred, so the execution cooldown must not be held against the next attempt.
           analysisRateLimit.delete(symbol + '_executed');
           try {
-            await setTrailingStop(symbol, ts.trailPct, currentPrice, ts.entryPrice, ts.autoExecute, ts.sellPct, ts.exchange);
+            await setTrailingStop(symbol, ts.trailPct, currentPrice, ts.entryPrice, ts.autoExecute, ts.sellPct, ts.exchange, ts.source || null);   // #B23 A5 an insurance trail stays one
             const ae93Floor = ae93Result.floor != null ? fmtPriceShort(ae93Result.floor) : 'unset';
             await sendTelegram('<b>[#93 FLOOR-BLOCKED]</b> ' + coinBase + ' sale blocked at $' + fmtPriceShort(currentPrice) +
               ' (floor ' + ae93Floor + ', reason ' + ae93Result.reason + ').\nTrail RE-ANCHORED from here -- still trailing ' + ts.trailPct +
@@ -18218,15 +18247,18 @@ async function dipAlertTick() {
   } finally { _dipBusy = false; }
 }
 setTimeout(() => { const t = () => dipAlertTick().then(r => { if (r && r.alerts && r.alerts.length) console.log('[dip] #DIP1 alerts: ' + r.alerts.join(', ')); }).catch(e => console.error('[dip] tick failed:', e.message)); t(); setInterval(t, 15 * 60 * 1000); console.log('[dip] #DIP1 watchlist dip check every 15 min'); }, 5 * 60 * 1000);
-// ── #B23 S1 SPIKE INSURANCE, STEP 1: DETECT AND TELL, NEVER SELL (spec #5; Bryan 26 Sep 00:34; Fable cleared with A1-A8) ─────────
+// ── #B23 SPIKE INSURANCE (spec #5; Bryan 26 Sep 00:34, "all" 14:22; Fable cleared with A1-A8, "full" recorded 14:50) ─────────────
 // A held Revolut X coin is in "spike mode" when its price is >= 2x its LOWEST HOURLY CLOSE of the last 24 h (A1: never the tick / candle
 // low, a one-tick wick halves that) AND >= 1.5x its 7-day median hourly close (A1: a crash-and-recover is not a spike). Under 20 hourly
 // closes in the 24 h window it fails closed. S1 only records the event (spike_events, A5), follows its peak for 24 h and sends Bryan an
-// advice message. S2 (the 15 % insurance trail on half + the chasing-limit sale) comes separately, after Fable's pre-ship review.
+// advice message. S2 (below the replay): with spike_exit.insure on, the spike also sets a 15 % INSURANCE trail (trailing_stops.source
+// 'spike') on the WHOLE holding (sell_pct 100, per-coin override), never over a running trail (A2); a trail that fires in spike mode sells
+// with a chasing limit (A3/A4/A6) instead of a market order. Off by default: Bryan switches it on (/spike on confirm) once S1 has run clean.
 // spikeReplay() answers Fable's Q3 once: over every coin's stored hourly history, how often would the naive rule (2x the 24 h candle
 // low) and the A1 rule fire, and what would hold / trail+chase / half-at-trigger have realised after 7 and 21 days.
-const SPIKE_DEFAULTS = { enabled: true, trigger_pct: 100, ref7_mult: 1.5, window_h: 24, cooldown_h: 24, min_closes: 20, min_value_usd: 5, trail_pct: 15 };
-const SPIKE_REPLAY_VERSION = 1;
+const SPIKE_DEFAULTS = { enabled: true, trigger_pct: 100, ref7_mult: 1.5, window_h: 24, cooldown_h: 24, min_closes: 20, min_value_usd: 5, trail_pct: 15,
+  insure: false, sell_pct: 100, per_coin: {}, chase_steps: 10, chase_step_pct: 1, give_up_pct: 25, chase_polls: 3 };   // #B23 S2
+const SPIKE_REPLAY_VERSION = 2;   // 2: comparators (e) sell all at the trigger and (f) sell all at the trigger with the chase (Fable 14:30)
 let _spikeBusy = false;
 async function spikeCfg() {
   let c = {};
@@ -18261,11 +18293,15 @@ async function spikeTick(nowMs = Date.now()) {
       if (q > 0 && px > 0 && q * px >= cfg.min_value_usd) held.push({ coin: c, qty: q, px });
     }
     for (const h of held) {
-      const [act] = await db.execute("SELECT id, peak, UNIX_TIMESTAMP(triggered_at) AS t FROM spike_events WHERE symbol = ? AND status = 'active' ORDER BY id DESC LIMIT 1", [h.coin]);
+      const [act] = await db.execute("SELECT id, peak, insured, UNIX_TIMESTAMP(triggered_at) AS t FROM spike_events WHERE symbol = ? AND status = 'active' ORDER BY id DESC LIMIT 1", [h.coin]);
       if (act.length) {   // follow the live event's peak; end it after the window
         const ev = act[0];
         if (h.px > Number(ev.peak)) { await db.execute('UPDATE spike_events SET peak = ?, peak_at = NOW() WHERE id = ?', [h.px, ev.id]); out.peaks++; }
         if (nowMs / 1000 - Number(ev.t) >= cfg.window_h * 3600) { await db.execute("UPDATE spike_events SET status = 'ended', ended_at = NOW(), end_price = ? WHERE id = ?", [h.px, ev.id]); out.ended.push(h.coin); }
+        else if (cfg.insure && Number(ev.insured) !== 1) {   // #B23 S2 switched on mid-spike, or the stop now clears the floor: insure it now
+          const ins = await spikeInsure(ev.id, h.coin, h.px, cfg).catch(e => ({ ok: false, why: e.message }));
+          if (ins.ok) { out.insured = (out.insured || []).concat(h.coin); await sendTelegram(spikeInsuredText(h.coin, h.qty, ins, cfg)).catch(() => {}); }
+        }
         continue;
       }
       const [recent] = await db.execute('SELECT id FROM spike_events WHERE symbol = ? AND triggered_at > DATE_SUB(NOW(), INTERVAL ? HOUR) LIMIT 1', [h.coin, cfg.cooldown_h]);
@@ -18274,11 +18310,15 @@ async function spikeTick(nowMs = Date.now()) {
       try { r = spikeRef(await loadHourlyBars(h.coin + '-USD', 8), h.px, cfg, nowMs); } catch (e) { continue; }
       out.checked++;
       if (!r.triggered) continue;
-      await db.execute("INSERT INTO spike_events (symbol, triggered_at, low_ref, ref_7d, trigger_price, peak, peak_at, status, qty_held) VALUES (?, NOW(), ?, ?, ?, ?, NOW(), 'active', ?)", [h.coin, r.low24, r.ref7, h.px, h.px, h.qty]);
+      const [evIns] = await db.execute("INSERT INTO spike_events (symbol, triggered_at, low_ref, ref_7d, trigger_price, peak, peak_at, status, qty_held) VALUES (?, NOW(), ?, ?, ?, ?, NOW(), 'active', ?)", [h.coin, r.low24, r.ref7, h.px, h.px, h.qty]);
       out.triggered.push(h.coin);
+      let ins = null;   // #B23 S2
+      if (cfg.insure) ins = await spikeInsure(evIns && evIns.insertId, h.coin, h.px, cfg).catch(e => ({ ok: false, why: 'could not set it (' + e.message + ')' }));
       await sendTelegram('🚀 <b>SPIKE — ' + escTg(h.coin) + '</b> $' + Number(h.px.toPrecision(6)) + ' is <b>' + r.ratio.toFixed(2) + '×</b> its lowest hourly close in 24 h ($' + Number(r.low24.toPrecision(6)) + ') and ' + r.vs7.toFixed(2) + '× its 7-day median.' +
         '\nYou hold ' + Number(h.qty.toPrecision(6)) + ' (≈ $' + Math.round(h.qty * h.px).toLocaleString('en-US') + ').' +
-        '\n<b>Spike insurance step 1: advice only, nothing is sold.</b> If you want to protect it, a trailing stop or a part-sale is your call now. When step 2 is live, a ' + cfg.trail_pct + '% insurance trail on half would start here.').catch(() => {});
+        (!cfg.insure ? '\n<b>Advice only, nothing is sold:</b> spike insurance is switched off (<code>/spike on</code>). A trailing stop or a part-sale is your call.'
+          : ins && ins.ok ? '\n' + spikeInsuredText(h.coin, h.qty, ins, cfg, true)
+          : '\n<b>No insurance trail:</b> ' + escTg((ins && ins.why) || 'not set') + '.' + (ins && ins.existing ? ' If that trail fires during the spike, it sells with the chasing limit.' : ''))).catch(() => {});
     }
     // an event on a coin no longer held (sold, moved) still ends after the window
     const [sw] = await db.execute("UPDATE spike_events SET status = 'ended', ended_at = NOW() WHERE status = 'active' AND triggered_at < DATE_SUB(NOW(), INTERVAL ? HOUR)", [cfg.window_h]);
@@ -18336,20 +18376,233 @@ async function spikeReplay(force = false) {
   const avg = (k) => { const v = all.map(e => e[k]).filter(x => x != null); return v.length ? { n: v.length, avg_pct: Number((v.reduce((a, b) => a + b, 0) / v.length).toFixed(1)), median_pct: Number(spikeMedian(v).toFixed(1)) } : { n: 0 }; };
   const out = { version: SPIKE_REPLAY_VERSION, at: new Date().toISOString(), coins: syms.length, hours, rule: { trigger: '>= ' + (1 + cfg.trigger_pct / 100) + 'x the lowest hourly close in 24 h AND >= ' + cfg.ref7_mult + 'x the 7-day median; cooldown ' + cfg.cooldown_h + ' h', trail_pct: cfg.trail_pct },
     naive_triggers: naiveN, a1_triggers: all.length, naive_only: naiveOnly,
-    outcomes: { peak_21d: avg('peak_21d_pct'), hold_7d: avg('hold_7d_pct'), hold_21d: avg('hold_21d_pct'), trail_exit: avg('trail_exit_pct'), trail_half_plus_hold_21d: avg('trail_half_plus_hold_21d_pct'), half_at_trigger_21d: avg('half_at_trigger_21d_pct') },
+    outcomes: { peak_21d: avg('peak_21d_pct'), hold_7d: avg('hold_7d_pct'), hold_21d: avg('hold_21d_pct'), trail_exit: avg('trail_exit_pct'), trail_half_plus_hold_21d: avg('trail_half_plus_hold_21d_pct'), half_at_trigger_21d: avg('half_at_trigger_21d_pct'),
+      sell_all_at_trigger: { n: all.length, avg_pct: 0, median_pct: 0, note: '(e) 0 % by construction' }, sell_all_at_trigger_chase: { n: all.length, avg_pct: -1, median_pct: -1, note: '(f) the chase starts 1 % under the bid' } },
     per_coin: perCoin.slice(0, 60), events: all.slice(-60) };
   await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('spike_replay', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)", [JSON.stringify(out)]).catch(() => {});
   try {   // put the answer where Fable reviews B23: the spec's own thread
     const [sp] = await db.execute("SELECT id FROM spec_threads WHERE title LIKE 'B23%' ORDER BY id LIMIT 1");
     if (sp.length) await specNote(sp[0].id, 'S1 replay (Fable Q3), ' + out.coins + ' coins, ' + out.hours + ' hourly candles: naive rule (2x the 24 h candle low) fired ' + out.naive_triggers + ' times, the A1 rule ' + out.a1_triggers + ' times; ' + out.naive_only + ' naive triggers had no A1 trigger within 24 h (wicks / crash-and-recover).\n' +
       'After an A1 trigger: peak within 21 d ' + JSON.stringify(out.outcomes.peak_21d) + '; hold 7 d ' + JSON.stringify(out.outcomes.hold_7d) + '; hold 21 d ' + JSON.stringify(out.outcomes.hold_21d) + '; 15% trail + chase exit ' + JSON.stringify(out.outcomes.trail_exit) +
-      '; half trail + half hold 21 d ' + JSON.stringify(out.outcomes.trail_half_plus_hold_21d) + '; half sold at the trigger + half hold 21 d ' + JSON.stringify(out.outcomes.half_at_trigger_21d) + '. Full event list in system_config spike_replay.', 'desk', 'note', { per_coin: out.per_coin, events: out.events.slice(-30) });
+      '; half trail + half hold 21 d ' + JSON.stringify(out.outcomes.trail_half_plus_hold_21d) + '; half sold at the trigger + half hold 21 d ' + JSON.stringify(out.outcomes.half_at_trigger_21d) +
+      '; (e) sell ALL at the trigger 0 % and (f) sell all at the trigger with the chase -1 % (by construction; Bryan chose the trail on purpose, the comparators stay visible). Full event list in system_config spike_replay.', 'desk', 'note', { per_coin: out.per_coin, events: out.events.slice(-30) });
   } catch (e) { console.error('[spike] replay note failed:', e.message); }
   console.log('[spike] #B23 S1 replay: ' + JSON.stringify({ coins: out.coins, hours: out.hours, naive: out.naive_triggers, a1: out.a1_triggers, naive_only: out.naive_only, outcomes: out.outcomes }));
   return out;
 }
+// ── #B23 S2: the insurance trail and the chasing-limit sale (money path; Fable pre-ship review) ───────────────────────────────────
+function spikeSellPct(cfg, coin) {   // whole holding by default (Bryan 14:22 "All"); per-coin override 0..100 (0 = advice only for that coin)
+  const o = cfg.per_coin && cfg.per_coin[coin] != null ? Number(cfg.per_coin[coin]) : Number(cfg.sell_pct);
+  return Number.isFinite(o) ? Math.max(0, Math.min(100, o)) : 100;
+}
+// Sets the 15 % insurance trail on a coin in spike mode. A2: never over a running trail (INSERT IGNORE on the symbol key, and the
+// in-memory map is checked first), so a loop's or a hand-set trail is left exactly as it is. Returns { ok, why, existing, stop, floor, pct }.
+async function spikeInsure(eventId, coin, px, cfg) {
+  const sym = coin + '-USD', pct = spikeSellPct(cfg, coin);
+  if (!(pct > 0)) return { ok: false, why: 'your per-coin setting keeps ' + coin + ' advice-only' };
+  if (KRAKEN_MONITORED_COINS.includes(sym)) return { ok: false, why: coin + ' is watched on Kraken; insurance covers Revolut X only' };
+  let ae = {};
+  try { const [r] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'ai_auto_execute'"); ae = r.length ? JSON.parse(r[0].config_value) || {} : {}; } catch (e) { return { ok: false, why: 'auto-sell settings unreadable' }; }
+  const norm = (a) => (Array.isArray(a) ? a : []).map(x => String(x).toUpperCase().replace(/-USD$/, ''));
+  if (norm(ae.manual_only_symbols).includes(coin)) return { ok: false, why: coin + ' is manual-only' };
+  if (norm(ae.hodl_symbols).includes(coin)) return { ok: false, why: coin + ' is on your hold list' };
+  if (trailingStops.has(sym)) {
+    if (eventId) await db.execute("UPDATE spike_events SET insured = 2, note = 'existing trail left untouched' WHERE id = ? AND insured = 0", [eventId]).catch(() => {});
+    return { ok: false, existing: true, why: coin + ' already has a trailing stop, left exactly as it is' };
+  }
+  const trail = Number(cfg.trail_pct) || 15, stop = px * (1 - trail / 100);
+  const dfl = await computeDerivedFloor(sym, coin);
+  const floor = dfl && Number(dfl.floor) > 0 ? Number(dfl.floor) : null;
+  if (floor == null) return { ok: false, why: 'no cost floor on record for ' + coin + ', so nothing can be sold safely' };
+  if (!(stop > floor)) return { ok: false, why: 'the ' + trail + '% stop ($' + Number(stop.toPrecision(6)) + ') would sit below your cost floor ($' + Number(floor.toPrecision(6)) + '); it is set as soon as it clears the floor', floor };
+  const [ins] = await db.execute("INSERT IGNORE INTO trailing_stops (symbol, trail_pct, peak_price, stop_price, entry_price, auto_execute, sell_pct, exchange, source) VALUES (?, ?, ?, ?, NULL, 1, ?, 'revolut', 'spike')", [sym, trail, px, stop, pct]);
+  if (!ins || ins.affectedRows !== 1) return { ok: false, existing: true, why: 'a trailing stop appeared on ' + coin + ' first, left exactly as it is' };
+  trailingStops.set(sym, { trailPct: trail, peakPrice: px, stopPrice: stop, entryPrice: null, autoExecute: true, sellPct: pct, exchange: 'revolut', source: 'spike' });
+  if (eventId) await db.execute("UPDATE spike_events SET insured = 1, sell_pct = ?, note = NULL WHERE id = ?", [pct, eventId]).catch(() => {});
+  console.log('[spike] #B23 insurance trail set on ' + coin + ': ' + trail + '% from ' + px + ', stop ' + stop + ', sells ' + pct + '%');
+  return { ok: true, stop, floor, pct, trail };
+}
+function spikeInsuredText(coin, qty, ins, cfg, short) {
+  return (short ? '' : '🛡️ <b>Spike insurance set — ' + escTg(coin) + '</b>\n') + '<b>Insured:</b> a ' + ins.trail + '% trailing stop now covers ' + (ins.pct >= 100 ? 'all your ' : ins.pct + '% of your ') + escTg(coin) +
+    ' (stop $' + Number(ins.stop.toPrecision(6)) + ', rising with the peak). If the price falls ' + ins.trail + '% from its peak it sells with a chasing limit: ' + cfg.chase_step_pct + '% under the bid, then ' + cfg.chase_step_pct +
+    '% lower each step, at most ' + cfg.chase_steps + ' steps, never below ' + cfg.give_up_pct + '% under the peak and never below your cost floor ($' + Number(ins.floor.toPrecision(6)) + '). No buy-back. <code>/spike keep ' + escTg(coin) + '</code> removes it for this coin.';
+}
+// A2 (the other direction): a pump loop arming over a running INSURANCE trail takes it over but never loosens it: peak = GREATEST(old, now),
+// trail % = the tighter of the two, stop = GREATEST(old stop, peak x (1 - trail)). A notify-only loop leaves the insurance trail untouched.
+// Returns true when it handled the arm (the caller then skips its own setTrailingStop).
+async function spikeLoopArmOver(symbol, price, loopTrailPct, entryFloor, autoExec, sellPct) {
+  const old = trailingStops.get(symbol);
+  if (!old || old.source !== 'spike') return false;
+  if (!autoExec) { console.log('[spike] #B23 A2 ' + symbol + ': notify-only loop armed over the insurance trail - insurance kept as it is'); return true; }
+  const trailPct = Math.min(Number(loopTrailPct) || old.trailPct, old.trailPct);
+  const peak = Math.max(old.peakPrice, price), stop = Math.max(old.stopPrice, peak * (1 - trailPct / 100));
+  const ts = { trailPct, peakPrice: peak, stopPrice: stop, entryPrice: entryFloor != null ? entryFloor : old.entryPrice, autoExecute: true, sellPct: sellPct != null ? sellPct : old.sellPct, exchange: 'revolut', source: 'loop' };
+  await db.execute("UPDATE trailing_stops SET trail_pct = ?, peak_price = ?, stop_price = ?, entry_price = ?, auto_execute = 1, sell_pct = ?, source = 'loop', updated_at = CURRENT_TIMESTAMP WHERE symbol = ?",
+    [ts.trailPct, ts.peakPrice, ts.stopPrice, ts.entryPrice, ts.sellPct, symbol]);
+  trailingStops.set(symbol, ts);
+  console.log('[spike] #B23 A2 ' + symbol + ': loop took over the insurance trail - peak ' + peak + ', stop ' + stop + ' (never lowered), trail ' + trailPct + '%');
+  return true;
+}
+// The #93 sale's context: spike mode = an insurance trail, or any trail on a coin with a live spike event (A6: a loop trail stays the loop's
+// sale, sold with the chase). null = not spike mode (the sale is unchanged). Marks the event 'chasing' so a restart can recover it (A7).
+async function spikeSaleContext(symbol, ts) {
+  const coin = symbol.replace(/-USD$/, ''), insurance = !!(ts && ts.source === 'spike');
+  let ev = null;
+  try { const [r] = await db.execute("SELECT id, peak, sell_pct FROM spike_events WHERE symbol = ? AND status IN ('active', 'chasing') ORDER BY id DESC LIMIT 1", [coin]); ev = r.length ? r[0] : null; }
+  catch (e) { if (!insurance) return null; }   // unreadable: an insurance trail still chases (its own source says so); a loop trail sells as today
+  if (!insurance && !ev) return null;
+  const peak = Math.max(Number(ts && ts.peakPrice) || 0, ev ? Number(ev.peak) || 0 : 0);
+  const cid = 'sx-' + (ev ? ev.id : coin.toLowerCase()) + '-' + Date.now().toString(36);
+  if (ev) await db.execute("UPDATE spike_events SET status = 'chasing' WHERE id = ?", [ev.id]).catch(() => {});
+  return { coin, insurance, event_id: ev ? ev.id : null, peak, cid, sell_pct: ts && ts.sellPct,
+    opts(loopToolKey) {
+      const chase = { peak, cid, event_id: ev ? ev.id : null };
+      return insurance ? { tool_key: 'spike_exit', chase, skipCascade: true, silent: true, cycle_id: 'SX:' + coin + ':' + (ev ? ev.id : 'na') }   // Q2: no buy-back; spikeAfterSale reports
+        : { tool_key: loopToolKey, chase };   // A6: the loop's own sale and bookkeeping, on the chase aggregate
+    } };
+}
+// The chasing limit (Bryan 00:34; Fable A3/A4). Step k offers what is left at bid x (1 - k x step%) through floorCappedLimitSell, whose
+// floor is max(step price, cost floor, give-up line) (A4), so nothing is ever offered under the give-up line or the floor. Once a step has
+// offered AT the line and not filled, it stops. A3: a step whose cancel did not confirm stops the chase dead (no next step: double-sell).
+async function spikeChase(symbol, coin, qty, ch, o = {}) {
+  const cfg = o.cfg || await spikeCfg();
+  const steps = Math.max(1, Math.min(20, Number(cfg.chase_steps) || 10)), stepPct = Number(cfg.chase_step_pct) || 1, giveUpPct = Number(cfg.give_up_pct) || 25;
+  const dfl = await computeDerivedFloor(symbol, coin);
+  const floor = dfl && Number(dfl.floor) > 0 ? Number(dfl.floor) : null;
+  if (floor == null) throw new Error('no cost floor for the chase');   // autoExecuteSell blocks this earlier; belt and braces, before any order
+  const giveUp = Number(ch.peak) > 0 ? Number(ch.peak) * (1 - giveUpPct / 100) : 0, line = Math.max(floor, giveUp);
+  const dec = Math.min(12, (String(qty).split('.')[1] || '').length || 8);
+  const out = { orders: [], filled_qty: 0, usd: 0, steps: 0, floor, give_up: giveUp, line, stopped: null, resting_order_id: null, start_bid: null };
+  const tick = o.ticker || revolutTickerMap, sell = o.sell || floorCappedLimitSell;
+  let lastLim = null;
+  for (let k = 1; k <= steps; k++) {
+    const left = Number((qty - out.filled_qty).toFixed(dec));
+    let t = null; try { t = await tick(0); } catch (e) { t = null; }   // an unreadable ticker is 'no_price', never an error after an order
+    const q = t && t[coin], bid = q ? (q.bid || q.mid) : null;
+    if (!(bid > 0)) { out.stopped = 'no_price'; break; }
+    if (out.start_bid == null) out.start_bid = bid;
+    if (!(left > 0) || left * bid < 1) { out.stopped = 'done'; break; }
+    const want = bid * (1 - k * stepPct / 100), lim = Math.max(want, line);
+    if (lastLim != null && want < line && lim >= lastLim - 1e-12) { out.stopped = giveUp >= floor ? 'give_up' : 'floor'; break; }   // already offered at the line
+    let r;
+    if (o.onSend) o.onSend();   // #K1: from the first venue call on, an order may have been sent
+    try { r = await sell(symbol, left, lim, bid, ch.cid + '-' + k, { polls: Number(cfg.chase_polls) || 3 }); }
+    catch (e) { if (!out.filled_qty && !out.orders.length) throw e; out.stopped = 'error'; out.error = String(e.message || e).slice(0, 160); break; }
+    out.steps++; lastLim = lim;
+    out.orders.push({ order_id: r.order_id, limit: r.limit_price, filled: r.filled_qty, avg: r.avg_price, state: r.state, order: r.order });
+    if (r.filled_qty > 0) { out.filled_qty += r.filled_qty; out.usd += r.filled_qty * (r.avg_price || r.limit_price); }
+    if (r.remainder_resting) { out.stopped = 'cancel_failed'; out.resting_order_id = r.order_id; out.resting_limit = r.limit_price; break; }
+  }
+  if (!out.stopped) out.stopped = Number((qty - out.filled_qty).toFixed(dec)) > 0 ? 'steps' : 'done';
+  out.left = Math.max(0, Number((qty - out.filled_qty).toFixed(dec)));
+  out.avg_price = out.filled_qty > 0 ? out.usd / out.filled_qty : null;
+  return out;
+}
+const SPIKE_STOP_WHY = { done: 'all sold', give_up: 'reached the give-up line', floor: 'reached your cost floor', steps: 'used all its steps', no_price: 'no live price', error: 'an order error', cancel_failed: 'a cancel did not confirm' };
+function spikeChaseText(coin, qty, ch) {
+  return '🛡️ <b>' + escTg(coin) + ' chasing-limit sale</b>: filled ' + Number(ch.filled_qty.toPrecision(8)) + ' of ' + Number(Number(qty).toPrecision(8)) + (ch.avg_price ? ' at an average $' + Number(ch.avg_price.toPrecision(6)) : '') +
+    ' in ' + ch.steps + ' step' + (ch.steps === 1 ? '' : 's') + ' (bid at the start $' + (ch.start_bid ? Number(ch.start_bid.toPrecision(6)) : '?') + '). Stopped: ' + (SPIKE_STOP_WHY[ch.stopped] || ch.stopped) +
+    '. Lowest allowed $' + Number(ch.line.toPrecision(6)) + ' (' + (ch.give_up >= ch.floor ? 'the give-up line' : 'your cost floor') + ').' +
+    (ch.stopped === 'error' ? '\n⚠️ Step ' + (ch.steps + 1) + '\'s order failed after it may have reached Revolut X (' + escTg(ch.error || 'unknown') + '), so it may be resting. The chase stopped there so nothing can sell twice, and any pump loop on ' + escTg(coin) + ' is switched OFF until you re-enable it. Please check Revolut X.' : '') +
+    (ch.resting_order_id ? '\n⚠️ Order ' + escTg(ch.resting_order_id) + ' could not be cancelled and may still be resting at $' + ch.resting_limit + ' (never below the line). The chase stopped there so nothing can sell twice, and any pump loop on ' + escTg(coin) + ' is switched OFF until you re-enable it. Please check Revolut X.' : '');
+}
+// After the #93 sale in spike mode: the event's bookkeeping, A8 for a partial insurance, and the message. Never throws into the caller.
+async function spikeAfterSale(symbol, ctx, res) {
+  const coin = ctx.coin, ev = ctx.event_id;
+  const sold = res && res.executed === true ? Number(res.qty) || 0 : 0;
+  const unsafe = !!(res && (res.reason === 'chase_resting' || (res.chase && ['cancel_failed', 'error'].includes(res.chase.stopped))));   // S2-1: an order may be resting
+  const status = unsafe ? 'resting' : sold > 0 ? (res.chase && res.chase.left > 0 && res.chase.left * (res.price || 0) >= 1 ? 'partial' : 'sold') : 'active';
+  if (ev) await db.execute('UPDATE spike_events SET status = ?, sold_qty = COALESCE(sold_qty, 0) + ?, avg_price = COALESCE(?, avg_price), cycle_id = COALESCE(cycle_id, ?), sold_at = IF(? > 0, NOW(), sold_at) WHERE id = ?',
+    [status, sold, sold > 0 ? res.price : null, ctx.insurance ? 'SX:' + coin + ':' + ev : null, sold, ev]).catch(e => console.error('[spike] event update:', e.message));
+  if (sold > 0 && ctx.insurance) {
+    let rearm = '';
+    // A8 as amended by Fable S2-2: while the spike is live, whatever is still held (>= $1: the part a per-coin override kept, or what the
+    // chase left at the give-up line / out of steps / without a price) gets a fresh 15 % insurance trail from the current price.
+    // Never after a failed cancel or an order error (S2-1: an order may be resting), and never over a trail that appeared meanwhile.
+    if (ev && !unsafe && !trailingStops.has(symbol)) {
+      try {
+        const cfg = await spikeCfg(), trail = Number(cfg.trail_pct) || 15;
+        const [bal, tk] = await Promise.all([revolutBalancesCached(0), revolutTickerMap(0)]);
+        const row = (bal || []).find(b => String(b.currency || '').toUpperCase() === coin);
+        const left = row ? (parseFloat(row.available) || 0) + (parseFloat(row.reserved) || 0) : 0, px = (tk && tk[coin] && tk[coin].mid) || Number(res.price);
+        if (left * px >= 1) {
+          await setTrailingStop(symbol, trail, px, null, true, 100, 'revolut', 'spike');
+          rearm = '\nThe ' + Number(left.toPrecision(6)) + ' ' + escTg(coin) + ' still held (≈ $' + Math.round(left * px).toLocaleString('en-US') + ') has a fresh ' + trail + '% insurance trail from $' + Number(px.toPrecision(6)) + ' while the spike lasts.';
+        }
+      } catch (e) { rearm = '\n⚠️ A fresh trail on what is still held could not be set (' + escTg(e.message) + ').'; }
+    }
+    await sendTelegram('🛡️ <b>Spike insurance sold ' + escTg(coin) + '</b>: ' + Number(sold.toPrecision(8)) + ' at an average $' + Number(Number(res.price).toPrecision(6)) + '. The cash is now available to the loops (no buy-back).' + rearm).catch(() => {});
+  }
+}
+// A7 at boot: cancel any sx- order still open (a restart mid-chase), then put the insurance trail back for an event that was chasing,
+// if the coin is still held and has no trail. Only 'chasing' events: any other missing trail was removed on purpose or already sold.
+async function spikeBootRecover() {
+  const out = { cancelled: [], rearmed: [], cancel_failed: [] };
+  const [po] = await db.execute("SELECT order_id, symbol FROM pending_orders WHERE client_order_id LIKE 'sx-%' AND (status IS NULL OR status NOT IN ('filled', 'completed', 'cancelled', 'canceled', 'rejected', 'expired'))");
+  for (const o of po) {
+    try {
+      const r = await revolutRequest('GET', '/orders/' + o.order_id); const d = (r && r.data) || r || {}, s = String(d.state || d.status || '').toLowerCase();
+      if (/fill|complet|cancel|reject|expire/.test(s)) continue;
+      const c = await revolutRequest('DELETE', '/orders/' + o.order_id, null, null, { withStatus: true });
+      if (c && c.ok) out.cancelled.push(o.order_id); else out.cancel_failed.push(o.order_id);
+    } catch (e) { out.cancel_failed.push(o.order_id); }
+  }
+  const [evs] = await db.execute("SELECT id, symbol, peak, sell_pct, UNIX_TIMESTAMP(triggered_at) AS t FROM spike_events WHERE status = 'chasing'");
+  if (evs.length) {
+    const cfg = await spikeCfg();
+    let bal = []; try { bal = await revolutBalancesCached(0); } catch (e) { bal = null; }
+    for (const ev of evs) {
+      const sym = ev.symbol + '-USD', inWindow = Date.now() / 1000 - Number(ev.t) < cfg.window_h * 3600;
+      await db.execute('UPDATE spike_events SET status = ? WHERE id = ?', [inWindow ? 'active' : 'ended', ev.id]).catch(() => {});
+      if (bal === null || out.cancel_failed.length) continue;   // unknown balance, or an order may still be resting: do not re-arm (A3)
+      const row = bal.find(b => String(b.currency || '').toUpperCase() === ev.symbol);
+      const q = row ? (parseFloat(row.available) || 0) + (parseFloat(row.reserved) || 0) : 0;
+      if (!(q > 0) || trailingStops.has(sym)) continue;
+      const trail = Number(cfg.trail_pct) || 15, peak = Number(ev.peak), pct = ev.sell_pct != null ? Number(ev.sell_pct) : spikeSellPct(cfg, ev.symbol);
+      const [ins] = await db.execute("INSERT IGNORE INTO trailing_stops (symbol, trail_pct, peak_price, stop_price, entry_price, auto_execute, sell_pct, exchange, source) VALUES (?, ?, ?, ?, NULL, 1, ?, 'revolut', 'spike')", [sym, trail, peak, peak * (1 - trail / 100), pct]);
+      if (ins && ins.affectedRows === 1) { trailingStops.set(sym, { trailPct: trail, peakPrice: peak, stopPrice: peak * (1 - trail / 100), entryPrice: null, autoExecute: true, sellPct: pct, exchange: 'revolut', source: 'spike' }); out.rearmed.push(ev.symbol); }
+    }
+  }
+  if (out.cancelled.length || out.rearmed.length || out.cancel_failed.length) await sendTelegram('🛡️ <b>Spike insurance after a restart</b>' + (out.cancelled.length ? '\nCancelled ' + out.cancelled.length + ' chase order(s) left open.' : '') +
+    (out.cancel_failed.length ? '\n⚠️ Could not confirm the cancel of ' + out.cancel_failed.map(escTg).join(', ') + ': please check Revolut X. No trail was re-armed while an order may be resting.' : '') +
+    (out.rearmed.length ? '\nInsurance trail put back on ' + out.rearmed.map(escTg).join(', ') + ' (it was mid-sale when the server restarted).' : '')).catch(() => {});
+  return out;
+}
+// The live scorecard (Fable 14:30): every event with what the insurance did next to hold, and comparators (e) / (f) always shown.
+async function spikeScorecard(limit = 10) {
+  const [evs] = await db.execute('SELECT id, symbol, trigger_price, peak, status, insured, sold_qty, avg_price, UNIX_TIMESTAMP(triggered_at) AS t FROM spike_events ORDER BY id DESC LIMIT ' + Math.max(1, Math.min(50, Number(limit) || 10)));
+  const rows = [];
+  for (const e of evs) {
+    const at = async (days) => {
+      const [p] = await db.execute('SELECT close_px FROM price_intraday_hourly WHERE symbol = ? AND hour_bucket >= FROM_UNIXTIME(?) ORDER BY hour_bucket ASC LIMIT 1', [e.symbol + '-USD', Number(e.t) + days * 86400]);
+      return p.length && Number(e.t) + days * 86400 <= Date.now() / 1000 ? Number(p[0].close_px) : null;
+    };
+    const tp = Number(e.trigger_price), pct = (x) => (x == null || !(tp > 0) ? null : Number(((x / tp - 1) * 100).toFixed(1)));
+    rows.push({ id: e.id, coin: e.symbol, at: new Date(Number(e.t) * 1000).toISOString().slice(0, 16), status: e.status, insured: Number(e.insured) || 0,
+      sold_pct_vs_trigger: e.avg_price != null && Number(e.sold_qty) > 0 ? pct(Number(e.avg_price)) : null, hold_7d: pct(await at(7)), hold_21d: pct(await at(21)), sell_all_at_trigger: 0, sell_all_at_trigger_chase: -1 });
+  }
+  return rows;
+}
+async function spikeStatusText() {
+  const cfg = await spikeCfg(), sc = await spikeScorecard(8).catch(() => []);
+  const over = Object.entries(cfg.per_coin || {}).map(([c, v]) => escTg(c) + ' ' + (Number(v) > 0 ? v + '%' : 'advice only'));
+  const f = (x) => (x == null ? '–' : (x > 0 ? '+' : '') + x + '%');
+  return '🛡️ <b>Spike insurance</b>: ' + (cfg.insure ? '<b>ON</b>' : '<b>OFF</b> (alerts only)') + ' · sells ' + cfg.sell_pct + '% on a ' + cfg.trail_pct + '% trail · chase ' + cfg.chase_step_pct + '% steps × ' + cfg.chase_steps + ', give-up ' + cfg.give_up_pct + '% under the peak' +
+    (over.length ? '\nPer coin: ' + over.join(', ') : '') +
+    (sc.length ? '\n\n<b>Spikes</b> (vs the trigger price · (e) sell all at the trigger 0% · (f) with the chase −1%)\n' + sc.map(r => escTg(r.coin) + ' ' + escTg(r.at.replace('T', ' ')) + ' ' + escTg(r.status) + (r.insured === 1 ? ' 🛡️' : '') +
+      ' · sold ' + f(r.sold_pct_vs_trigger) + ' · hold 7d ' + f(r.hold_7d) + ' · 21d ' + f(r.hold_21d)).join('\n') : '\n\nNo spikes yet.') +
+    '\n\n<code>/spike on</code> · <code>/spike off</code> · <code>/spike keep COIN</code> (advice only) · <code>/spike sell COIN 50</code> · <code>/spike default COIN</code>';
+}
+async function spikeSetCfg(patch) {
+  const [r] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'spike_exit'");
+  const cur = r.length ? JSON.parse(r[0].config_value) || {} : {};
+  const next = { ...cur, ...patch };
+  await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('spike_exit', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)", [JSON.stringify(next)]);
+  return { ...SPIKE_DEFAULTS, ...next };
+}
 setTimeout(() => { const t = () => spikeTick().then(r => { if (r && r.triggered && r.triggered.length) console.log('[spike] #B23 spike mode: ' + r.triggered.join(', ')); }).catch(e => console.error('[spike] tick failed:', e.message)); t(); setInterval(t, 3 * 60 * 1000); console.log('[spike] #B23 S1 spike check every 3 min (advice only)'); }, 6 * 60 * 1000);
 setTimeout(() => { spikeReplay().catch(e => console.error('[spike] replay failed:', e.message)); }, 8 * 60 * 1000);
+setTimeout(() => { spikeBootRecover().then(r => { if (r.cancelled.length || r.rearmed.length || r.cancel_failed.length) console.log('[spike] #B23 A7 boot: ' + JSON.stringify(r)); }).catch(e => console.error('[spike] boot recovery failed:', e.message)); }, 90 * 1000);   // #B23 A7
 async function moveShape(symbol, opts = {}) {
   const coin = String(symbol || '').toUpperCase().replace(/-USD$/, '').trim();
   if (!/^[A-Z0-9]{1,15}$/.test(coin)) return { ok: false, error: 'bad symbol' };
@@ -21373,7 +21626,7 @@ let rows;
         // #93: derive exchange (Kraken-monitored coin or default Revolut). Pass auto_execute + sell_pct (Zod-coerced).
         const tsExchange = KRAKEN_MONITORED_COINS.includes(sym) ? 'kraken' : 'revolut';
         // #F3 omitted auto_execute = keep the existing trail's setting; false = switch auto-sell OFF; true = ON
-        const r = await setTrailingStop(sym, trail_pct, resolvedPrice, entryPrice, (auto_execute === true || auto_execute === false) ? auto_execute : null, sell_pct != null ? sell_pct : null, tsExchange);
+        const r = await setTrailingStop(sym, trail_pct, resolvedPrice, entryPrice, (auto_execute === true || auto_execute === false) ? auto_execute : null, sell_pct != null ? sell_pct : null, tsExchange, 'manual');   // #B23 A5
         const msgSuffix = r.autoExecute ? ` — AUTO-EXEC ON: will sell ${r.sellPct}% on breach (${r.exchange})` + (r.preserved && r.preserved.autoExecute ? ' (kept from the existing trail; pass auto_execute:false to switch it off)' : '') : ` — notify-only`;
         const stWarn = r.autoExecute ? await emitEnableWarnings(sym, { side: 'sell', trigger: 'trailing_stop' }, 'set_trailing') : [];   // #H1
         result = { ok: true, warnings: stWarn, action: 'set_trailing', symbol: sym, trail_pct, peak_price: r.peakPrice, stop_price: r.stopPrice, current_price: resolvedPrice, auto_execute: r.autoExecute, auto_execute_preserved: !!(r.preserved && r.preserved.autoExecute), sell_pct: r.sellPct, exchange: r.exchange, message: `Trailing stop set — alerts if ${sym} drops ${trail_pct}% from any peak` + msgSuffix };
@@ -24504,7 +24757,7 @@ app.post('/api/trailing-stops/:symbol', async (req, res) => {
     const currentPrice = await getCurrentPrice(symbol);
     if (!currentPrice) return res.status(404).json({ error: `No price for ${symbol}` });
     const entryPrice = entryPrices.get(symbol) || null;
-    const result = await setTrailingStop(symbol, parseFloat(trail_pct), currentPrice, entryPrice);
+    const result = await setTrailingStop(symbol, parseFloat(trail_pct), currentPrice, entryPrice, null, null, null, 'manual');   // #B23 A5
     res.json({ ok: true, symbol, ...result });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -25460,6 +25713,32 @@ app.post('/telegram-webhook', async (req, res) => {
       } catch (e) { await sendReply('❌ Spec desk: ' + escTg(e.message)); }
       return res.status(200).json({ ok: true });
     }
+    if (/^spike(\s|$)/.test(commandText)) {   // #B23 S2 spike insurance: /spike (status + scorecard), on [confirm], off, keep COIN, sell COIN N, default COIN
+      const sub = commandText.replace(/^spike\s*/, '').trim();
+      try {
+        let m;
+        if (sub === '' || sub === 'status') await sendReply(await spikeStatusText());
+        else if (sub === 'on') await sendReply('🛡️ Switching spike insurance <b>on</b> means: when a coin you hold on Revolut X spikes (2× its lowest hourly close in 24 h and 1.5× its 7-day median), a 15% trailing stop goes on the whole holding. If it fires, the coin is sold with a chasing limit, never below 25% under the peak and never below your cost floor. No buy-back. A trailing stop that is already running is never touched.\nReply <code>/spike on confirm</code> to switch it on.');
+        else if (sub === 'on confirm') { await spikeSetCfg({ insure: true }); await sendReply('🛡️ Spike insurance is <b>ON</b>. <code>/spike off</code> switches it off; a trail already set stays until it fires or you remove it.'); }
+        else if (sub === 'off') { await spikeSetCfg({ insure: false }); await sendReply('Spike insurance is <b>OFF</b>: spikes are reported only. Insurance trails already set stay until they fire or you remove them (<code>/spike keep COIN</code> removes one).'); }
+        else if ((m = /^keep\s+([a-z0-9]{1,15})$/.exec(sub))) {
+          const c = m[1].toUpperCase(), cfg = await spikeCfg(), sym = c + '-USD';
+          await spikeSetCfg({ per_coin: { ...(cfg.per_coin || {}), [c]: 0 } });
+          const had = trailingStops.get(sym);
+          if (had && had.source === 'spike') await removeTrailingStop(sym);
+          await sendReply(escTg(c) + ': spikes are reported only, no insurance.' + (had && had.source === 'spike' ? ' The insurance trail that was running on ' + escTg(c) + ' is removed.' : ''));
+        } else if ((m = /^sell\s+([a-z0-9]{1,15})\s+(\d{1,3})%?$/.exec(sub))) {
+          const c = m[1].toUpperCase(), p = Number(m[2]);
+          if (!(p >= 1 && p <= 100)) await sendReply('The share must be 1-100%.');
+          else { const cfg = await spikeCfg(); await spikeSetCfg({ per_coin: { ...(cfg.per_coin || {}), [c]: p } }); await sendReply(escTg(c) + ': a spike insures ' + p + '% of the holding' + (p < 100 ? '; after that sale the part you keep gets a fresh 15% trail while the spike lasts.' : '.') + ' (Applies to the next spike.)'); }
+        } else if ((m = /^default\s+([a-z0-9]{1,15})$/.exec(sub))) {
+          const c = m[1].toUpperCase(), cfg = await spikeCfg(), pc = { ...(cfg.per_coin || {}) };
+          delete pc[c]; await spikeSetCfg({ per_coin: pc });
+          await sendReply(escTg(c) + ' back to the default (' + cfg.sell_pct + '% of the holding).');
+        } else await sendReply(await spikeStatusText());
+      } catch (e) { await sendReply('❌ Spike: ' + escTg(e.message)); }
+      return res.status(200).json({ ok: true });
+    }
     if (/^agent(\s|$)/.test(commandText)) {   // #B21 A1: /agent, /agent stop, /agent resume [confirm]
       const sub = commandText.replace(/^agent\s*/, '').trim();
       try {
@@ -26332,7 +26611,7 @@ app.post('/telegram-webhook', async (req, res) => {
         return res.status(200).json({ ok: true });
       }
       const entryPrice = entryPrices.get(symbol) || null;
-      const result = await setTrailingStop(symbol, trailPct, currentPrice, entryPrice);
+      const result = await setTrailingStop(symbol, trailPct, currentPrice, entryPrice, null, null, null, 'manual');   // #B23 A5
       await sendReply(
         `✅ <b>Trailing stop set on ${coinBase}</b>\n\n` +
         `Current/Peak: ${fmtPriceShort(result.peakPrice)}\n` +
