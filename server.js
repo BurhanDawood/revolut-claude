@@ -2130,13 +2130,13 @@ try {
   for (const row of ttRows) {
     troughTrackers.set(row.symbol, {
       salePrice:       parseFloat(row.sale_price),
-      referenceBase:   parseFloat(row.reference_base),
+      referenceBase:   pumpPos(row.reference_base),   // #10 F3: NULL (no usable base) rehydrates as null, not NaN
       retraceGate:     parseFloat(row.retrace_gate),
       troughLow:       row.trough_low ? parseFloat(row.trough_low) : null,
       troughArmed:     row.trough_armed === 1,
       bouncePct:       parseFloat(row.bounce_pct || 8),
       buybackFloorPct: parseFloat(row.buyback_floor_pct || 5),
-      entryFloor:      row.entry_floor ? parseFloat(row.entry_floor) : null,
+      entryFloor:      pumpPos(row.entry_floor),   // #10 F4: "0.0000000000" is a truthy string - positive-only parse
       saleProceedsUsd: row.sale_proceeds_usd != null ? parseFloat(row.sale_proceeds_usd) : null
     });
   }
@@ -2147,7 +2147,7 @@ try {
   for (const r of stRows) {
     standaloneTroughTrackers.set(r.symbol, {
       buyUsd: parseFloat(r.buy_usd), bouncePct: parseFloat(r.bounce_pct || 8),
-      entryFloor: r.entry_floor ? parseFloat(r.entry_floor) : null,
+      entryFloor: pumpPos(r.entry_floor),   // #10 F4
       exchange: r.exchange || 'revolut',
       troughPrice: r.trough_price ? parseFloat(r.trough_price) : null,
       armBelow: r.arm_below != null && parseFloat(r.arm_below) > 0 ? parseFloat(r.arm_below) : null, gateHit: parseInt(r.gate_hit) === 1   // #394
@@ -2155,6 +2155,21 @@ try {
   }
   if (stRows.length) console.log('[trough-st] Loaded ' + stRows.length + ' tracker(s)');
 } catch (e) { console.error('[trough-st] boot-load failed:', e.message); }
+// #10 (Fable F5) READ-ONLY audit: a stored entry_floor <= 0 is ignored as a buy-back base from #10 on. Name the coins so Bryan can
+// set a real floor or clear it by hand. No UPDATE - other readers treat 0 as "no override" and are not re-verified here.
+try {
+  const [zf] = await db.execute('SELECT symbol, entry_floor FROM pump_armed_rules WHERE active = 1 AND entry_floor IS NOT NULL AND entry_floor <= 0');
+  const zfNames = zf.map(r => String(r.symbol).replace('-USD', ''));
+  console.log('[boot] #10 entry_floor <= 0 audit: ' + (zfNames.length ? zfNames.join(', ') : 'none'));
+  // Bryan 19:25: tell him ONCE per coin, not on every deploy. The coins already reported live in system_config (not in pump_armed_rules).
+  // Only the CURRENT list is stored (Fable 19:32), so a coin whose floor is fixed and later set to 0 again is reported again.
+  const [zfSeenR] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'entry_floor_zero_reported'").catch(() => [[]]);
+  const zfSeen = (() => { try { return zfSeenR.length ? JSON.parse(zfSeenR[0].config_value) : []; } catch (e) { return []; } })();
+  const zfNew = zfNames.filter(c => !zfSeen.includes(c));
+  if (zfNew.length) await sendTelegram('\u2139\ufe0f <b>Loops with a stored entry floor of 0:</b> ' + zfNew.join(', ') + '. Since #10 a 0 is ignored: their buy-back gate is measured from your cost (or the pump start). Set a real floor if you want one; nothing was changed. (Reported once per coin.)').catch(() => {});
+  if (JSON.stringify([...zfNames].sort()) !== JSON.stringify([...zfSeen].sort()))   // keep the stored list = today's list, so a fixed coin drops out
+    await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('entry_floor_zero_reported', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)", [JSON.stringify(zfNames.slice(0, 200))]).catch(() => {});
+} catch (e) { console.error('[boot] #10 audit failed:', e.message); }
 // #A1 one-off: any loop sitting armed=1 with no live cycle and no trail is already stuck - report, never fix silently.
 // Placed after ALL three rehydrations so it never reads trailingStops before it is populated.
 try {
@@ -4761,6 +4776,15 @@ async function updateTrailingStop(symbol, currentPrice) {
   return { triggered: false, ts };
 }
 
+// #10 (desk; Fable F1-F3, 26 Sep): mysql2 returns DECIMAL as a STRING, so a stored entry_floor "0.0000000000" is truthy and the old
+// `row.entry_floor ? parseFloat(...) : ...` took it as a buy-back base of 0 (HIGH 18:43: gate $0.02055 - a 50% collapse before the
+// tracker would even start). pumpPos is the derivedFloorFrom idiom. pumpRefBase: first POSITIVE of the stored entry_floor, the cost,
+// the pump baseline; else null (armReboundTracker then uses 50% of the sale price, silently). Both cascade call sites use it.
+// The cost step is the raw cost map entryPrices (the #377 cost basis WITHOUT its +0.5% sell buffer: a base, not a floor).
+function pumpPos(x) { return Number(x) > 0 ? Number(x) : null; }
+function pumpRefBase(row, costPrice) {
+  return pumpPos(row && row.entry_floor) ?? pumpPos(costPrice) ?? pumpPos(row && row.baseline_price) ?? null;
+}
 // Quick price formatter for alert messages
 // #130 Trough Tracker - Phase A (inert foundation, called by nothing yet)
 async function armReboundTracker(symbol, salePrice, referenceBase, params, saleProceedsUsd) {
@@ -4769,28 +4793,37 @@ async function armReboundTracker(symbol, salePrice, referenceBase, params, saleP
     const retracePct      = parseFloat(params.retrace_pct      || 50);
     const bouncePct       = parseFloat(params.bounce_pct       || 8);
     const buybackFloorPct = parseFloat(params.buyback_floor_pct || 5);
-    const entryFloor      = params.entry_floor ? parseFloat(params.entry_floor) : null;
+    const entryFloor      = pumpPos(params.entry_floor);   // #10 F4
     const proceedsUsd     = (saleProceedsUsd != null && !isNaN(parseFloat(saleProceedsUsd))) ? parseFloat(saleProceedsUsd) : null;
-    const moveSize        = salePrice - referenceBase;
+    // #10 F3: a base must be > 0 and below the sale. None given -> 50% of the price, silently; one given but unusable -> the same
+    // fallback plus ONE alert (Bryan 19:09: "alert only on reject"). reference_base is stored NULL then - never 0, never the bad value.
+    const baseGiven       = referenceBase != null;
+    const base            = (Number(referenceBase) > 0 && Number(referenceBase) < salePrice) ? Number(referenceBase) : null;
+    const moveSize        = base != null ? salePrice - base : 0;
     const retraceGate     = moveSize > 0
       ? salePrice - (moveSize * retracePct / 100)
       : salePrice * (1 - retracePct / 100);
     troughTrackers.set(symbol, {
-      salePrice, referenceBase, retraceGate,
+      salePrice, referenceBase: base, retraceGate,
       troughLow: null, troughArmed: false,
       bouncePct, buybackFloorPct, entryFloor,
       saleProceedsUsd: proceedsUsd
     });
     await db.execute(
       'UPDATE pump_armed_rules SET sale_price=?, reference_base=?, retrace_gate=?, trough_low=NULL, trough_armed=0, sale_proceeds_usd=?, sale_at=NOW(), uncovered_since=NULL, cycle_id = IF(armed_since IS NULL, NULL, CONCAT(?, \':\', DATE_FORMAT(armed_since, \'%Y%m%dT%H%i%s\'))) WHERE symbol=? AND active=1',   // #A2 start the clocks; #L1 cycle stamp
-      [salePrice, referenceBase, retraceGate, proceedsUsd, symbol.replace('-USD', '').toUpperCase(), symbol]
+      [salePrice, base, retraceGate, proceedsUsd, symbol.replace('-USD', '').toUpperCase(), symbol]
     );
     const coinBaseTrk = symbol.replace('-USD', '');
-    console.log('[trough] ' + symbol + ' armed: sale=' + salePrice + ' base=' + referenceBase + ' gate=' + retraceGate.toFixed(8) + ' (' + retracePct + '% of move) proceeds=$' + (proceedsUsd != null ? proceedsUsd.toFixed(2) : 'n/a'));
+    if (baseGiven && base == null) {   // senior pass: alert AFTER the tracker and the DB row are persisted, never before
+      console.warn('[trough] #10 ' + symbol + ' reference base ' + referenceBase + ' rejected (sale ' + salePrice + ') - gate = ' + retracePct + '% of the sale price');
+      sendTelegram('\u26a0\ufe0f <b>[#10 BUY-BACK BASE REJECTED] ' + symbol.replace('-USD', '') + '</b>\nBase $' + referenceBase + ' is not between 0 and the sale price $' + salePrice +
+        ', so the buy-back gate uses ' + retracePct + '% of the sale price: $' + retraceGate.toFixed(8) + '. Check this loop\'s entry floor.').catch(() => {});
+    }
+    console.log('[trough] ' + symbol + ' armed: sale=' + salePrice + ' base=' + (base != null ? base : 'none (50% of price)') + ' gate=' + retraceGate.toFixed(8) + ' (' + retracePct + '% of move) proceeds=$' + (proceedsUsd != null ? proceedsUsd.toFixed(2) : 'n/a'));
     const floorAnchor = (salePrice != null && salePrice > 0) ? salePrice : entryFloor;
     await sendTelegram(
       '<b>[#130 TROUGH ARMED] ' + coinBaseTrk + '</b>\n\n' +
-      'Sell @ $' + salePrice + ' (base $' + referenceBase + ')\n' +
+      'Sell @ $' + salePrice + (base != null ? ' (base $' + base + ')' : ' (base: none, 50% of price)') + '\n' +
       'Retrace gate: $' + retraceGate.toFixed(8) + ' (' + retracePct + '% of move)\n' +
       'On bounce: ' + bouncePct + '% off trough, floor $' + (floorAnchor != null ? (floorAnchor * (1 - buybackFloorPct/100)).toFixed(8) : 'n/a') + '\n' +
       'Rebuy size: $' + (proceedsUsd != null ? proceedsUsd.toFixed(2) : 'n/a')
@@ -13882,7 +13915,7 @@ async function cascadeRulesAfterTrade(rule, executedPrice) {
         const PL_FEE_BUFFER_USD = 1.0;
         const plAvailableForBuyback = Math.max(0, plSellProceeds - plSweepDeduction - PL_FEE_BUFFER_USD);
 
-        const plRefBase = pumpLoopRow.entry_floor ? parseFloat(pumpLoopRow.entry_floor) : (entryPrices.get(symbol) || executedPrice);
+        const plRefBase = pumpRefBase(pumpLoopRow, entryPrices.get(symbol));   // #10 F1: never a string "0"; null -> 50% of the price
         try {
           await armReboundTracker(symbol, executedPrice, plRefBase, {
             retrace_pct:       pumpLoopRow.retrace_pct       || 50,
@@ -13953,7 +13986,7 @@ async function cascadeRulesAfterTrade(rule, executedPrice) {
             const [pumpRows] = await db.execute('SELECT * FROM pump_armed_rules WHERE symbol = ? AND active = 1 LIMIT 1', [symbol]);
             if (pumpRows.length) {
               const pr = pumpRows[0];
-              const refBase = pr.entry_floor ? parseFloat(pr.entry_floor) : (entryPrices.get(symbol) || executedPrice);
+              const refBase = pumpRefBase(pr, entryPrices.get(symbol));   // #10 F1: the same helper as the #223 branch
               await armReboundTracker(symbol, executedPrice, refBase, {
                 retrace_pct:       pr.retrace_pct       || 50,
                 bounce_pct:        pr.bounce_pct        || 8,
