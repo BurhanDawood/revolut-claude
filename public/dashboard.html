@@ -729,6 +729,78 @@
     <script>window.addEventListener('message', function (e) { if (e.origin === location.origin && e.data && e.data.pvHeight > 200) document.getElementById('pv-frame').style.height = Math.min(e.data.pvHeight, 900) + 'px'; });</script>
   </div>
 
+  <!-- Budget agent + Spec desk at a glance (#W1): tap a card for the full page -->
+  <style>
+    .mini-card { cursor:pointer; }
+    .mini-head { display:flex; justify-content:space-between; align-items:center; }
+    .mini-head a { color:var(--accent); text-decoration:none; }
+    .mini-row { display:flex; flex-wrap:wrap; gap:6px 18px; margin:6px 0 8px; font-size:0.85rem; color:var(--text-muted); }
+    .mini-row b { color:var(--text); font-weight:600; font-variant-numeric:tabular-nums; }
+    .mini-up { color:var(--accent) !important; } .mini-down { color:var(--danger) !important; }
+    .mini-line { font-size:0.85rem; padding:6px 0; border-top:1px solid rgba(255,255,255,0.06); color:var(--text); overflow-wrap:anywhere; }
+    .mini-line .mut { color:var(--text-muted); }
+    .mini-badge { display:inline-block; font-size:0.7rem; padding:0 7px; border-radius:99px; border:1px solid rgba(255,255,255,0.18); color:var(--text-muted); margin-left:6px; }
+    .mini-badge.hot { border-color:var(--accent); color:var(--accent); } .mini-badge.money { border-color:var(--warn); color:var(--warn); }
+  </style>
+  <div class="card mini-card" id="agent-card" onclick="location.href='/agent'">
+    <div class="card-title mini-head">🤖 Budget agent <span class="mini-badge" id="ag-mode">…</span><a href="/agent" onclick="event.stopPropagation()" style="margin-left:auto">Full view ↗</a></div>
+    <div class="mini-row" id="ag-stats"><span>Loading…</span></div>
+    <div id="ag-lines"></div>
+  </div>
+  <div class="card mini-card" id="desk-card" onclick="location.href='/desk'">
+    <div class="card-title mini-head">📝 Dev &amp; PM assistants <span class="mini-badge" id="dk-mode">…</span><a href="/desk" onclick="event.stopPropagation()" style="margin-left:auto">Full view ↗</a></div>
+    <div class="mini-row" id="dk-stats"><span>Loading…</span></div>
+    <div id="dk-lines"></div>
+  </div>
+  <script>
+  (function () {
+    var esc = function (s) { return String(s == null ? '' : s).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); };
+    var usd = function (v, d) { return v == null || !isFinite(v) ? '–' : '$' + Number(v).toLocaleString('en-US', { minimumFractionDigits: d == null ? 2 : d, maximumFractionDigits: d == null ? 2 : d }); };
+    var pct = function (v) { return v == null || !isFinite(v) ? '–' : (v >= 0 ? '+' : '−') + Math.abs(v).toFixed(2) + '%'; };
+    var cls = function (v) { return v == null ? '' : v >= 0 ? 'mini-up' : 'mini-down'; };
+    var get = function (p) { return fetch(p, { cache: 'no-store' }).then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); }); };
+    var ago = function (iso) { if (!iso) return 'never'; var m = Math.round((Date.now() - Date.parse(iso)) / 60000); return m < 60 ? m + ' min ago' : m < 1440 ? Math.round(m / 60) + ' h ago' : Math.round(m / 1440) + ' d ago'; };
+    function agent() {
+      return Promise.all([get('/api/agent/state'), get('/api/agent/decisions?limit=3')]).then(function (a) {
+        var st = a[0], decs = (a[1] && a[1].rows) || [], bm = st.benchmarks || {};
+        document.getElementById('ag-mode').textContent = String(st.mode || '').toUpperCase() + (st.stopped ? ' · STOPPED' : '');
+        var vsBtc = bm.btc ? (st.equity / bm.btc - 1) * 100 : null, vsBudget = st.budget_usd ? (st.equity / st.budget_usd - 1) * 100 : null;
+        document.getElementById('ag-stats').innerHTML =
+          '<span>Equity <b class="' + cls(vsBudget) + '">' + usd(st.equity) + '</b> (' + pct(vsBudget) + ')</span>' +
+          '<span>vs hold BTC <b class="' + cls(vsBtc) + '">' + pct(vsBtc) + '</b></span>' +
+          '<span>Cash <b>' + usd(st.cash) + '</b></span>' +
+          '<span>Positions <b>' + (st.positions || []).length + '</b></span>' +
+          '<span>Alerts armed <b>' + (st.alerts || []).length + '</b></span>' +
+          '<span>Runs today <b>' + st.runs_today + '</b> · last ' + esc(ago(st.last_activity)) + '</span>';
+        var pos = (st.positions || []).map(function (p) { return '<div class="mini-line"><b>' + esc(p.coin) + '</b> ' + usd(p.value) + ' <span class="' + cls(p.pnl_pct) + '">' + pct(p.pnl_pct) + '</span>' + (p.invalidation ? ' <span class="mut">· wrong if ' + esc(String(p.invalidation).slice(0, 80)) + '</span>' : '') + '</div>'; });
+        var d = decs[0];
+        var last = d ? '<div class="mini-line"><span class="mut">' + esc(d.at) + '</span> ' + (d.symbol ? '<b>' + esc(String(d.side || '').toUpperCase()) + ' ' + esc(String(d.symbol).replace(/-USD$/, '')) + '</b> <span class="mini-badge">' + esc(d.status) + '</span>' : '<b>Sat out</b>') +
+          (d.thesis ? '<div class="mut">' + esc(String(d.thesis).slice(0, 220)) + (String(d.thesis).length > 220 ? '…' : '') + '</div>' : '') + '</div>' : '<div class="mini-line mut">No runs yet.</div>';
+        document.getElementById('ag-lines').innerHTML = pos.join('') + last;
+      }).catch(function (e) { document.getElementById('ag-stats').innerHTML = '<span>Could not load: ' + esc(e.message) + '</span>'; });
+    }
+    function desk() {
+      return get('/api/desk/state').then(function (st) {
+        var c = st.counts || {}, working = (c.drafting || 0) + (c.review || 0);
+        document.getElementById('dk-mode').textContent = (st.assistants || 'off') === 'on' ? 'on' : 'paused';
+        document.getElementById('dk-stats').innerHTML =
+          '<span>Working <b>' + working + '</b></span><span>Ready <b class="' + (c.ready ? 'mini-up' : '') + '">' + (c.ready || 0) + '</b></span>' +
+          '<span>Inbox <b>' + (c.inbox || 0) + '</b></span><span>Accepted <b>' + (c.accepted || 0) + '</b></span><span>Building <b>' + (c.building || 0) + '</b></span>' +
+          '<span>Today <b>' + usd(st.today_spend_usd) + '</b> of ' + usd(st.daily_cap_usd, 0) + '</span>';
+        var order = { drafting: 0, review: 0, ready: 1, accepted: 2, building: 3, inbox: 4 };
+        var list = (st.specs || []).filter(function (s) { return s.status in order; }).sort(function (a, b) { return order[a.status] - order[b.status] || (a.updated < b.updated ? 1 : -1); }).slice(0, 4);
+        document.getElementById('dk-lines').innerHTML = list.length ? list.map(function (s) {
+          var hot = s.status === 'drafting' || s.status === 'review' || s.status === 'ready';
+          var label = s.status === 'drafting' ? 'PM drafting' : s.status === 'review' ? 'Dev reviewing' : s.status;
+          return '<div class="mini-line"><span class="mut">#' + s.id + '</span> ' + esc(s.title) + '<span class="mini-badge' + (hot ? ' hot' : '') + '">' + esc(label) + '</span>' + (s.money_path ? '<span class="mini-badge money">money path</span>' : '') + (s.unresolved ? '<span class="mini-badge money">open findings</span>' : '') + '</div>';
+        }).join('') : '<div class="mini-line mut">Nothing on the desk. Add an idea with /spec in Telegram.</div>';
+      }).catch(function (e) { document.getElementById('dk-stats').innerHTML = '<span>Could not load: ' + esc(e.message) + '</span>'; });
+    }
+    function all() { if (!document.hidden) { agent(); desk(); } }
+    all(); setInterval(all, 60000);
+  })();
+  </script>
+
   <!-- USDT Sweep Config -->
   <div class="card" id="sweep-card">
     <div class="card-title">💰 USDT Sweep</div>

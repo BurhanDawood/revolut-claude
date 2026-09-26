@@ -8426,10 +8426,11 @@ async function specDevReview(spec, cfg) {
   }
   if (!review) throw new Error('the review did not finish');
   const usd = (tin * pi + cw * pi * 1.25 + cr * pi * 0.1 + tout * po) / 1e6;   // cache writes 1.25x, cache reads 0.1x the input price
-  // money path by CODE RULE (Fable): any touched or cited function that the code index marks as a money path
+  // money path by CODE RULE (Fable): any function the build would change (touches) or that a blocker/change finding cites, if the code index marks it
+  // as a money path. A 'note' that only points at existing code as an example ("pattern to follow: checkPumpArm") does not count (#D3c).
   const idx = specCodeIndex();
   const cited = new Set((review.touches || []).map(String));
-  for (const f of review.findings || []) { for (const m of String(f.code_ref || '').matchAll(/\b([A-Za-z_]\w{3,})\b/g)) cited.add(m[1]); for (const m of String(f.code_ref || '').matchAll(/\bL?(\d{2,6})\b/g)) { const fn = specFnAt(idx, Number(m[1])); if (fn) cited.add(fn); } }
+  for (const f of (review.findings || []).filter(x => x.severity !== 'note')) { for (const m of String(f.code_ref || '').matchAll(/\b([A-Za-z_]\w{3,})\b/g)) cited.add(m[1]); for (const m of String(f.code_ref || '').matchAll(/\bL?(\d{2,6})\b/g)) { const fn = specFnAt(idx, Number(m[1])); if (fn) cited.add(fn); } }
   const moneyHits = [...cited].filter(n => idx.money.has(n));
   const V = String(review.verdict || 'needs_changes');
   const body = '**Dev assistant review: ' + V.replace('_', ' ') + '** · size ' + (review.size || '?') + (review.batches ? ' (' + review.batches + ' batch' + (review.batches > 1 ? 'es' : '') + ')' : '') + (moneyHits.length ? ' · 💷 money path: ' + moneyHits.join(', ') : '') + '\n\n' +
