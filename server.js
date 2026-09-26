@@ -3678,18 +3678,36 @@ async function getTangemXRPBalance() {
 
 // ── Kraken Exchange Integration ───────────────────────────────────────────────
 
+// #K2a (Fable 25 Sep 23:00) ONE QUEUE FOR KRAKEN PRIVATE CALLS. The nonce was Date.now() and up to five private calls ran at
+// once (four getKrakenBalances in one tick; K1's boot delay released them together), so calls signed in the same ms or reached
+// Kraken out of order and were refused "EAPI:Invalid nonce" (3 of the 5 deploys on 25 Sep). Now: every /0/private/* call goes
+// through one FIFO chain, so one is in flight at a time; the nonce is strictly increasing and stays in MILLISECONDS
+// (max(now, last + 1)) so undoing this batch never leaves the key with a higher nonce than the base file can sign; each call has
+// a 20 s timeout (a hung /Balance cannot hold an AddOrder behind it; a timed-out AddOrder is K1's post-send case: clear and alert);
+// concurrent /Balance readers share the one in-flight read (no cache: the next caller after it settles reads fresh).
+const KRAKEN_PRIVATE_TIMEOUT_MS = 20000;
+let _krakenQueue = Promise.resolve(), _krakenLastNonce = 0, _krakenBalanceInflight = null;
+function krakenNextNonce() { const n = Math.max(Date.now(), _krakenLastNonce + 1); _krakenLastNonce = n; return String(n); }
 async function krakenRequest(path, data = {}) {
+  const k1Wait = PROCESS_STARTED_AT + 60000 - Date.now();   // #K1 (d) kept: the deploy overlap is a different cause
+  if (k1Wait > 0) { console.log('[kraken] #K1 boot delay: first private call waits ' + Math.ceil(k1Wait / 1000) + ' s'); await new Promise(r => setTimeout(r, k1Wait)); }
+  const coalesce = path === '/0/private/Balance' && (!data || !Object.keys(data).length);
+  if (coalesce && _krakenBalanceInflight) return _krakenBalanceInflight;
+  const run = _krakenQueue.then(() => krakenSendPrivate(path, data));
+  _krakenQueue = run.catch(() => {});
+  if (coalesce) { _krakenBalanceInflight = run; run.then(() => { _krakenBalanceInflight = null; }, () => { _krakenBalanceInflight = null; }); }
+  return run;
+}
+async function krakenSendPrivate(path, data = {}) {
   const apiKey     = process.env.KRAKEN_API_KEY;
   const privateKey = process.env.KRAKEN_PRIVATE_KEY;
 
   if (!apiKey || !privateKey) {
     throw new Error('Kraken API credentials not configured. Add KRAKEN_API_KEY and KRAKEN_PRIVATE_KEY to Railway environment variables.');
   }
-  const k1Wait = PROCESS_STARTED_AT + 60000 - Date.now();   // #K1 (d) during a deploy the old instance may still be using this key
-  if (k1Wait > 0) { console.log('[kraken] #K1 boot delay: first private call waits ' + Math.ceil(k1Wait / 1000) + ' s'); await new Promise(r => setTimeout(r, k1Wait)); }
-
+  const ctl = new AbortController(), tm = setTimeout(() => ctl.abort(), KRAKEN_PRIVATE_TIMEOUT_MS);   // #K2a
   try {
-    const nonce    = Date.now().toString();
+    const nonce    = krakenNextNonce();   // #K2a strictly increasing, ms
     const postData = new URLSearchParams({ nonce, ...data }).toString();
 
     // Kraken signing: HMAC-SHA512(path + SHA256(nonce + postData), base64-decoded secret)
@@ -3708,15 +3726,17 @@ async function krakenRequest(path, data = {}) {
         'API-Sign': signature,
         'Content-Type': 'application/x-www-form-urlencoded'
       },
-      body: postData
+      body: postData,
+      signal: ctl.signal   // #K2a
     });
     const result = await response.json();
     if (result.error && result.error.length > 0) throw new Error(result.error.join(', '));
     return result.result;
   } catch (e) {
+    if (ctl.signal.aborted) e = new Error('Kraken ' + path + ' timed out after ' + (KRAKEN_PRIVATE_TIMEOUT_MS / 1000) + ' s');   // #K2a (never a definitive rejection: K1 treats it as post-send)
     console.error('[kraken] API error:', e.message);
     throw e;
-  }
+  } finally { clearTimeout(tm); }
 }
 
 // Map Kraken asset codes → standard ticker symbols
@@ -14634,8 +14654,8 @@ async function handleTrailingStopAlert(symbol, currentPrice, ts, exchange = 'rev
         // lifts peak x (1 - trail) above the floor then sells normally.
         // setTrailingStop preserves autoExecute/sellPct/exchange from the EXISTING entry, so this
         // must run INSTEAD of removeTrailingStop, never after it.
-        // NOTE: Revolut only for now -- autoExecuteKrakenSell still returns undefined, so Kraken
-        // coins fall through to the original remove-the-trail behaviour (no regression).
+        // #K2: autoExecuteKrakenSell now returns the same shapes as autoExecuteSell (floor_blocked / no_floor / floor_error /
+        // dust / no_position), so a floor-blocked Kraken trail re-anchors here too instead of being removed.
         if (ae93Result && ae93Result.reason === 'paused') { analysisRateLimit.delete(symbol + '_executed'); await restoreTrailingStop(symbol, ae93Saved).catch(() => {}); return; }   // #F1 hold / #F4 restore as-is
         if (ae93Result && ae93Result.executed === true) { venueBackoffClear(ae93Exchange); _presendRetry.delete(symbol); }   // #K1
         if (ae93Result && ae93Result.reason === 'error') {   // #K1 (b)
@@ -14752,7 +14772,7 @@ async function autoExecuteKrakenSell(symbol, maxPct, analysis, confidence, opts 
 
     if (currentQty <= 0) {
       await sendTelegram(`⚠️ AUTO-EXEC: No ${coinBase} on Kraken to sell`);
-      return;
+      return { executed: false, reason: 'no_position' };   // #K2 parity
     }
 
     const sellQty = currentQty * (maxPct / 100);
@@ -14761,7 +14781,7 @@ async function autoExecuteKrakenSell(symbol, maxPct, analysis, confidence, opts 
     // Dust guard: skip if the sell is negligible
     if (sellQty <= 0 || !isFinite(sellQty) || valueUSD < 1) {
       await sendTelegram('⚠️ AUTO-EXEC skipped: ' + coinBase + ' Kraken position is dust (qty ' + currentQty + ', sell value $' + (valueUSD || 0).toFixed(4) + '). Nothing to sell.');
-      return;
+      return { executed: false, reason: 'dust' };   // #K2 parity
     }
 
     // #95+#125+#45: HARD ENTRY-FLOOR GUARD (Kraken path) — never auto-sell below entry or sell_floors config.
@@ -14774,7 +14794,7 @@ async function autoExecuteKrakenSell(symbol, maxPct, analysis, confidence, opts 
       if (entryFloor === null) {
         await sendTelegram('AUTO-SELL BLOCKED - ' + coinBase + ' (Kraken): no entry floor established (no sell_floors, no pump entry_floor, no entry_price). Never-sell-below-entry cannot be verified - failing safe, position untouched.').catch(() => {});
         console.log('[auto-exec] FLOOR GUARD blocked Kraken ' + coinBase + ' sell: entryFloor null - fail-safe hash187');
-        return;
+        return { executed: false, reason: 'no_floor' };   // #K2 parity
       }
       if (entryFloor !== null && currentPrice <= entryFloor) {
         await sendTelegram(
@@ -14783,11 +14803,11 @@ async function autoExecuteKrakenSell(symbol, maxPct, analysis, confidence, opts 
           `Never-sell-below-entry guard held. Position untouched — your call.`
         ).catch(() => {});
         console.log(`[auto-exec] FLOOR GUARD blocked Kraken ${coinBase} sell: price ${currentPrice} <= floor ${entryFloor}`);
-        return;
+        return { executed: false, reason: 'floor_blocked', floor: entryFloor, price: currentPrice };   // #K2 parity
       }
     } catch (e) { console.error('[auto-exec] Kraken floor guard error (failing safe — blocking sell):', e.message);
       await sendTelegram(`🛑 AUTO-SELL BLOCKED — Kraken ${coinBase}: floor-guard check errored, failing safe (no sell). Manual review.`).catch(() => {});
-      return;
+      return { executed: false, reason: 'floor_error' };   // #K2 parity
     }
 
     await db.execute(
