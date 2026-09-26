@@ -5914,6 +5914,22 @@ const FAST_SCAN_SYMBOLS = ['GHIBLI-USD', 'FLOKI-USD', 'BOBA-USD'];
 
 
 // ── #95 Stage 1: pump-arm detector — arms a dormant trailing stop when a coin pumps. SELLS NOTHING. ──
+// #11 (Bryan 26 Sep 19:53, TON): "I don't hold TON right now and am only interested in entry". A pump watch left on a coin he no
+// longer holds armed a trailing stop and sent PUMP-ARMED alerts about a position that does not exist. It now stays quiet while
+// the Revolut X holding is under $5 (#11's own value; the same figure as SPIKE_DEFAULTS.min_value_usd, which spikeTick uses to skip
+// holdings under $5, but not shared with it) and wakes up by itself when he buys the coin again.
+// Kraken coins are not checked (their balance is elsewhere). If the balance cannot be read, it arms as before (never silently
+// drops a watch on a coin he may hold).
+const PUMP_MIN_HELD_USD = 5, _pumpQuiet = new Set();
+async function pumpHeldUsd(symbol, price) {
+  if (KRAKEN_MONITORED_COINS.includes(symbol)) return null;
+  try {
+    const coin = String(symbol).replace('-USD', '').toUpperCase();
+    const row = (await revolutBalancesCached()).find(x => String(x.currency || '').toUpperCase() === coin);
+    const qty = row ? (parseFloat(row.available) || 0) + (parseFloat(row.reserved) || 0) : 0;
+    return qty * Number(price);
+  } catch (e) { return null; }
+}
 async function checkPumpArm(symbol, currentPrice) {
   try {
     const [rows] = await db.execute('SELECT * FROM pump_armed_rules WHERE symbol = ? AND active = 1 AND armed = 0 LIMIT 1', [symbol]);
@@ -5932,6 +5948,12 @@ async function checkPumpArm(symbol, currentPrice) {
     // Pump check
     const pumpPct = ((currentPrice - parseFloat(rule.baseline_price)) / parseFloat(rule.baseline_price)) * 100;
     if (pumpPct >= parseFloat(rule.arm_pump_pct)) {
+      const heldUsd = await pumpHeldUsd(symbol, currentPrice);   // #11 not held -> no trail, no alert
+      if (heldUsd != null && heldUsd < PUMP_MIN_HELD_USD) {
+        if (!_pumpQuiet.has(symbol)) { _pumpQuiet.add(symbol); console.log('[pump-arm] ' + symbol + ' would arm (+' + pumpPct.toFixed(1) + '%) but only $' + heldUsd.toFixed(2) + ' is held - staying quiet (#11)'); }
+        return;
+      }
+      _pumpQuiet.delete(symbol);
       // ARM — set a trailing stop, mark armed. NO SELL (Stage 1).
       const entryFloor = rule.entry_floor != null ? parseFloat(rule.entry_floor) : null;
       const isDnd = await isDndCoin(symbol.replace('-USD',''));
