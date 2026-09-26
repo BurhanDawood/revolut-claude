@@ -1592,6 +1592,8 @@ await db.execute(`CREATE TABLE IF NOT EXISTS spec_messages (
   model VARCHAR(40) NULL, tokens_in INT NULL, tokens_out INT NULL, cost_usd DECIMAL(10,6) NULL, at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, INDEX idx_spec (spec_id, id), INDEX idx_at (at)
 )`).catch(e => console.error('[migration] spec_messages:', e.message));
 setTimeout(() => { specImportAgentRequests().then(n => { if (n) console.log('[desk] #D1 imported ' + n + ' agent request(s) into the inbox'); }).catch(e => console.error('[desk] import failed:', e.message)); }, 45 * 1000);
+await db.execute('CREATE TABLE IF NOT EXISTS portfolio_value_1m (ts INT UNSIGNED NOT NULL PRIMARY KEY, total_usd DECIMAL(16,4) NOT NULL, coins_usd DECIMAL(16,4) NOT NULL, cash_usd DECIMAL(16,4) NOT NULL, rx_usd DECIMAL(16,4) NULL, kraken_usd DECIMAL(16,4) NULL, tangem_usd DECIMAL(16,4) NULL, partial TINYINT(1) NOT NULL DEFAULT 0)').catch(e => console.error('[migration] portfolio_value_1m:', e.message));   // #PV1 whole-book value, one row a minute
+await db.execute("CREATE TABLE IF NOT EXISTS portfolio_value_hourly (ts INT UNSIGNED NOT NULL PRIMARY KEY, o DECIMAL(16,4) NOT NULL, h DECIMAL(16,4) NOT NULL, l DECIMAL(16,4) NOT NULL, c DECIMAL(16,4) NOT NULL, ko DECIMAL(16,4) NULL, kh DECIMAL(16,4) NULL, kl DECIMAL(16,4) NULL, kc DECIMAL(16,4) NULL, src VARCHAR(8) NOT NULL DEFAULT 'live')").catch(e => console.error('[migration] portfolio_value_hourly:', e.message));
 setTimeout(() => { repairAgentFills().catch(e => console.error('[agent] boot repair failed:', e.message)); }, 30 * 1000);   // #B21 a fill recorded but not applied before a restart
 await safeAddColumn('trailing_stops',   'auto_execute',    'TINYINT(1) NOT NULL DEFAULT 0'); // #93
 await safeAddColumn('price_targets',    'sell_pct',        'DECIMAL(5,2) NULL'); // #144 per-rung sell %% override for Away Mode up-targets
@@ -8211,6 +8213,171 @@ async function specImportAgentRequests() {   // agent requests from dev_log land
   return rq.length;
 }
 function specLine(s) { return '#' + s.id + ' ' + (s.money_path ? '💷 ' : '') + escTg(s.title) + ' <i>(' + s.status + (s.draft_requested && s.status === 'inbox' ? ', draft requested' : '') + ')</i>'; }
+
+// ── #PV1 PORTFOLIO VALUE HISTORY: one sample a minute of the whole book (Revolut X + Kraken + Tangem XRP + cash),
+// kept 35 days at 1-minute resolution and forever as hourly candles; served as candles for the /portfolio chart.
+// Read-only: nothing here trades or writes to any trading table.
+const PV_KEEP_1M_DAYS = 35;
+const PV_CASH_USD = ['USD', 'USDT', 'USDC'];
+let _pvKraken = { at: 0, tried: 0, coins: [], cash: 0, ok: false };   // coins: [{ std, base, qty, px }]
+let _pvTangem = { at: 0, qty: 0 };
+let _pvLastPx = {};   // symbol -> last good price, so a missing ticker holds the coin at its last price instead of zeroing it
+let _pvBootAt = Date.now();
+let _pvRunning = false;
+function pvKrakenPx(map, base) { return map[base + 'USD'] || map['X' + base + 'ZUSD'] || map[base + 'ZUSD'] || null; }
+async function pvRefreshKraken(nowMs = Date.now()) {
+  _pvKraken.tried++;
+  const k = await getKrakenBalances();
+  if (!k || !Array.isArray(k.balances)) throw new Error('kraken balances unreadable');
+  _pvKraken = { at: nowMs, tried: 0, ok: true, cash: parseFloat(k.usdCash) || 0,
+    coins: k.balances.map(b => ({ std: b.standard, base: b.standard === 'BTC' ? 'XBT' : b.standard, qty: parseFloat(b.quantity) || 0, px: parseFloat(b.price) || 0 })).filter(c => c.qty > 0) };
+}
+async function pvKrakenValue() {
+  if (!_pvKraken.coins.length) return { usd: 0, cash: _pvKraken.cash };
+  let map = {};
+  try {
+    const ctl = new AbortController(); const tm = setTimeout(() => ctl.abort(), 8000);
+    const r = await fetch(KRAKEN_API_URL + '/0/public/Ticker?pair=' + _pvKraken.coins.map(c => c.base + 'USD').join(','), { signal: ctl.signal }).then(x => x.json()).finally(() => clearTimeout(tm));
+    for (const [pair, d] of Object.entries((r && r.result) || {})) map[pair] = parseFloat(d.c[0]);
+  } catch (e) { /* public ticker down: fall back to the last prices below */ }
+  let usd = 0;
+  for (const c of _pvKraken.coins) {
+    const px = pvKrakenPx(map, c.base) || _pvLastPx['K:' + c.std] || c.px;
+    if (px > 0) { _pvLastPx['K:' + c.std] = px; usd += c.qty * px; }
+  }
+  return { usd, cash: _pvKraken.cash };
+}
+function pvMinute(ms) { return Math.floor(ms / 60000) * 60; }
+async function portfolioValueSample(nowMs = Date.now()) {
+  // Kraken holdings every 10 min (through the K2a queue); prices every minute from Kraken's public ticker.
+  if (!_pvKraken.ok || nowMs - _pvKraken.at > 10 * 60 * 1000) {
+    try { await pvRefreshKraken(nowMs); } catch (e) { if (_pvKraken.tried <= 1) console.error('[pv] kraken refresh failed:', e.message); }
+  }
+  if (!_pvKraken.ok && nowMs - _pvBootAt < 5 * 60 * 1000) return null;   // wait for a first Kraken read after boot, else the line starts with a false drop
+  if (nowMs - _pvTangem.at > 30 * 60 * 1000) {
+    try { const q = await getTangemXRPBalance(); if (q > 0) _pvTangem = { at: nowMs, qty: q }; else _pvTangem.at = nowMs; } catch (e) { _pvTangem.at = nowMs; }
+  }
+  const balances = await revolutBalancesCached(50000);
+  const tr = await revolutRequest('GET', '/tickers');
+  const tickers = Array.isArray(tr) ? tr : ((tr && tr.data) || []);
+  const px = {};
+  for (const t of tickers) { if (!t.symbol) continue; const p = parseFloat(t.last_price || t.mid || t.ask || t.bid); if (p > 0) px[t.symbol.replace('/', '-')] = p; }
+  if (!Object.keys(px).length) throw new Error('tickers unreadable');
+  let rx = 0, cash = 0;
+  for (const a of balances) {
+    const cur = String(a.currency || '').toUpperCase(); if (!cur) continue;
+    const qty = (parseFloat(a.available) || 0) + (parseFloat(a.reserved) || 0);
+    if (!(qty > 0)) continue;
+    if (PV_CASH_USD.includes(cur)) { cash += qty; continue; }
+    if (cur === 'EUR' || cur === 'GBP') { const fx = px[cur + '-USD'] || _pvLastPx[cur + '-USD']; if (fx) { _pvLastPx[cur + '-USD'] = fx; cash += qty * fx; } continue; }
+    const sym = cur + '-USD';
+    const p = px[sym] || _pvLastPx[sym];
+    if (p > 0) { _pvLastPx[sym] = p; rx += qty * p; }
+  }
+  let tangem = 0;
+  if (_pvTangem.qty > 0) { const p = px['XRP-USD'] || _pvLastPx['XRP-USD']; if (p > 0) tangem = _pvTangem.qty * p; }
+  const k = await pvKrakenValue();
+  cash += k.cash;
+  const coins = rx + k.usd + tangem;
+  return { ts: pvMinute(nowMs), total: coins + cash, coins, cash, rx, kraken: k.usd, tangem, partial: _pvKraken.ok ? 0 : 1 };
+}
+async function portfolioValueTick() {
+  if (_pvRunning) return; _pvRunning = true;
+  try {
+    const s = await portfolioValueSample();
+    if (s && s.total > 0) await db.execute('INSERT INTO portfolio_value_1m (ts, total_usd, coins_usd, cash_usd, rx_usd, kraken_usd, tangem_usd, partial) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE total_usd = VALUES(total_usd), coins_usd = VALUES(coins_usd), cash_usd = VALUES(cash_usd), rx_usd = VALUES(rx_usd), kraken_usd = VALUES(kraken_usd), tangem_usd = VALUES(tangem_usd), partial = VALUES(partial)',
+      [s.ts, s.total.toFixed(4), s.coins.toFixed(4), s.cash.toFixed(4), s.rx.toFixed(4), s.kraken.toFixed(4), s.tangem.toFixed(4), s.partial]);
+  } catch (e) { console.error('[pv] sample failed:', e.message); }
+  finally { _pvRunning = false; }
+}
+// Candles from 1-minute closes: each minute opens at the previous minute's close (if it is within 5 minutes) and closes at its own sample.
+function pvCandlesFromMinutes(rows, bucketSec, field) {
+  const out = []; let cur = null, prevC = null, prevTs = null;
+  for (const r of rows) {
+    const ts = Number(r.ts), c = Number(r[field]);
+    if (!(c > 0)) continue;
+    const o = prevC != null && ts - prevTs <= 300 ? prevC : c;
+    const b = Math.floor(ts / bucketSec) * bucketSec;
+    if (!cur || cur.t !== b) { if (cur) out.push(cur); cur = { t: b, o, h: Math.max(o, c), l: Math.min(o, c), c }; }
+    else { cur.h = Math.max(cur.h, o, c); cur.l = Math.min(cur.l, o, c); cur.c = c; }
+    prevC = c; prevTs = ts;
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+async function portfolioValueRollup(nowMs = Date.now()) {
+  // Every closed hour that has minutes but no hourly row (or a stale one) is rolled up; then old minutes are trimmed.
+  const hourNow = Math.floor(nowMs / 3600000) * 3600;
+  const [mx] = await db.execute('SELECT MAX(ts) AS t FROM portfolio_value_hourly');
+  const since = mx[0] && mx[0].t != null ? Number(mx[0].t) : 0;
+  const [rows] = await db.execute('SELECT ts, total_usd, coins_usd FROM portfolio_value_1m WHERE ts >= ? AND ts < ? ORDER BY ts', [Math.max(0, since - 3600), hourNow]);
+  if (rows.length) {
+    const tot = pvCandlesFromMinutes(rows, 3600, 'total_usd'), coi = pvCandlesFromMinutes(rows, 3600, 'coins_usd');
+    const byT = new Map(coi.map(x => [x.t, x]));
+    for (const h of tot) {
+      if (h.t < since) continue;
+      const k = byT.get(h.t) || { o: null, h: null, l: null, c: null };
+      await db.execute("INSERT INTO portfolio_value_hourly (ts, o, h, l, c, ko, kh, kl, kc, src) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'live') ON DUPLICATE KEY UPDATE o = VALUES(o), h = VALUES(h), l = VALUES(l), c = VALUES(c), ko = VALUES(ko), kh = VALUES(kh), kl = VALUES(kl), kc = VALUES(kc), src = 'live'",
+        [h.t, h.o, h.h, h.l, h.c, k.o, k.h, k.l, k.c]);
+    }
+  }
+  const cut = pvMinute(nowMs) - PV_KEEP_1M_DAYS * 86400;
+  await db.execute('DELETE FROM portfolio_value_1m WHERE ts < ? AND ts < ?', [cut, Math.max(since, 0)]);
+}
+const _pvLondon = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/London', year: 'numeric', month: '2-digit', day: '2-digit' });
+function pvLondonDay(tsSec) { return _pvLondon.format(new Date(tsSec * 1000)); }   // 'YYYY-MM-DD'
+function pvWeekKey(day) { const d = new Date(day + 'T00:00:00Z'); const dow = (d.getUTCDay() + 6) % 7; return new Date(d.getTime() - dow * 86400000).toISOString().slice(0, 10); }
+function pvMergeInto(map, key, x) {
+  const cur = map.get(key);
+  if (!cur) map.set(key, { t: key, o: x.o, h: x.h, l: x.l, c: x.c });
+  else { cur.h = Math.max(cur.h, x.h); cur.l = Math.min(cur.l, x.l); cur.c = x.c; }
+}
+const PV_IVS = { '1m': 60, '5m': 300, '30m': 1800, '1h': 3600, '4h': 14400, '1d': 'day', '1w': 'week' };
+async function portfolioValueCandles(iv, series = 'total', nowMs = Date.now()) {
+  if (!PV_IVS[iv]) throw new Error('interval must be one of ' + Object.keys(PV_IVS).join(', '));
+  const coins = series === 'coins';
+  const f = coins ? 'coins_usd' : 'total_usd';
+  const nowS = Math.floor(nowMs / 1000);
+  let candles;
+  if (typeof PV_IVS[iv] === 'number' && PV_IVS[iv] < 3600) {
+    const span = { '1m': 2, '5m': 10, '30m': PV_KEEP_1M_DAYS }[iv] * 86400;
+    const [rows] = await db.execute('SELECT ts, ' + f + ' FROM portfolio_value_1m WHERE ts >= ? ORDER BY ts', [nowS - span]);
+    candles = pvCandlesFromMinutes(rows, PV_IVS[iv], f);
+  } else {
+    const [hrs] = await db.execute('SELECT ts, ' + (coins ? 'ko AS o, kh AS h, kl AS l, kc AS c' : 'o, h, l, c') + ' FROM portfolio_value_hourly ORDER BY ts');
+    const hourly = hrs.filter(r => r.c != null).map(r => ({ t: Number(r.ts), o: Number(r.o), h: Number(r.h), l: Number(r.l), c: Number(r.c) }));
+    const lastH = hourly.length ? hourly[hourly.length - 1].t : 0;
+    const [mins] = await db.execute('SELECT ts, ' + f + ' FROM portfolio_value_1m WHERE ts >= ? ORDER BY ts', [Math.max(lastH, nowS - 3 * 86400) - 300]);
+    const live = pvCandlesFromMinutes(mins, 3600, f).filter(x => x.t > lastH);   // the hours not rolled up yet, including the one in progress
+    const all = hourly.concat(live);
+    if (iv === '1h') candles = all;
+    else if (iv === '4h') { const m = new Map(); for (const x of all) pvMergeInto(m, Math.floor(x.t / 14400) * 14400, x); candles = [...m.values()]; }
+    else {
+      const m = new Map();
+      for (const x of all) { const day = pvLondonDay(x.t); pvMergeInto(m, iv === '1d' ? day : pvWeekKey(day), x); }
+      candles = [...m.values()];
+    }
+  }
+  return candles;
+}
+async function portfolioValueState(nowMs = Date.now()) {
+  const nowS = Math.floor(nowMs / 1000);
+  const [last] = await db.execute('SELECT * FROM portfolio_value_1m ORDER BY ts DESC LIMIT 1');
+  const [first] = await db.execute('SELECT MIN(t) AS t FROM (SELECT MIN(ts) AS t FROM portfolio_value_1m UNION ALL SELECT MIN(ts) AS t FROM portfolio_value_hourly) x');
+  const [day] = await db.execute('SELECT MIN(ts) AS t0, MAX(total_usd) AS hi, MIN(total_usd) AS lo, MAX(coins_usd) AS khi, MIN(coins_usd) AS klo FROM portfolio_value_1m WHERE ts >= ?', [nowS - 86400]);
+  let ago = null;
+  if (day[0] && day[0].t0 != null) { const [a] = await db.execute('SELECT ts, total_usd, coins_usd FROM portfolio_value_1m WHERE ts >= ? ORDER BY ts LIMIT 1', [nowS - 86400]); ago = a[0] || null; }
+  const L = last[0] || null;
+  const num = v => (v == null ? null : Number(v));
+  return {
+    latest: L ? { ts: Number(L.ts), total: num(L.total_usd), coins: num(L.coins_usd), cash: num(L.cash_usd), revolut_x: num(L.rx_usd), kraken: num(L.kraken_usd), tangem: num(L.tangem_usd), partial: !!Number(L.partial) } : null,
+    day: ago ? { since: Number(ago.ts), total_then: num(ago.total_usd), coins_then: num(ago.coins_usd), hi: num(day[0].hi), lo: num(day[0].lo), coins_hi: num(day[0].khi), coins_lo: num(day[0].klo) } : null,
+    recording_since: first[0] && first[0].t != null ? Number(first[0].t) : null,
+    intervals: Object.keys(PV_IVS),
+  };
+}
+setTimeout(() => { portfolioValueTick(); setInterval(portfolioValueTick, 60 * 1000); console.log('[pv] #PV1 portfolio value sampling every minute'); }, 60 * 1000);
+setTimeout(() => { const roll = () => portfolioValueRollup().catch(e => console.error('[pv] rollup failed:', e.message)); roll(); setInterval(roll, 10 * 60 * 1000); }, 5 * 60 * 1000);
 
 async function pendingReservations() {
   const cycles = [];
@@ -23222,6 +23389,13 @@ const DESK_PAGE_HTML = "<!doctype html>\n<html lang=\"en\"><head>\n<meta charset
 const DESK_PAGE_JS = "(function () {\n  var $ = function (id) { return document.getElementById(id); };\n  var esc = function (s) { return String(s == null ? '' : s).replace(/[&<>\"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;', \"'\": '&#39;' }[c]; }); };\n  var get = function (p) { return fetch(p).then(function (r) { if (!r.ok) throw new Error(p + ' HTTP ' + r.status); return r.json(); }); };\n  var WHO = { bryan: 'Bryan', pm_chat: 'PM chat', dev_chat: 'Dev thread', fable: 'Fable', pm_assistant: 'PM assistant', dev_assistant: 'Dev assistant', agent: 'Paper agent' };\n  var ORDER = ['inbox', 'drafting', 'review', 'ready', 'accepted', 'building', 'shipped', 'parked', 'rejected'];\n  var filter = null, current = null, state = null;\n  function lanes() {\n    $('lanes').innerHTML = '<button class=\"lane' + (filter ? '' : ' on') + '\" data-f=\"\">All<b class=\"num\">' + state.specs.length + '</b></button>' +\n      ORDER.map(function (s) { return '<button class=\"lane' + (filter === s ? ' on' : '') + '\" data-f=\"' + s + '\">' + s + '<b class=\"num\">' + (state.counts[s] || 0) + '</b></button>'; }).join('');\n    Array.prototype.forEach.call(document.querySelectorAll('.lane'), function (b) { b.onclick = function () { filter = b.getAttribute('data-f') || null; lanes(); list(); }; });\n  }\n  function list() {\n    var rows = state.specs.filter(function (s) { return !filter || s.status === filter; });\n    $('list').innerHTML = rows.length ? rows.map(function (s) {\n      return '<button class=\"spec' + (current === s.id ? ' on' : '') + '\" data-id=\"' + s.id + '\"><span class=\"t\">#' + s.id + ' ' + esc(s.title) + '</span><br>' +\n        '<span class=\"badge st-' + esc(s.status) + '\">' + esc(s.status) + '</span>' + (s.money_path ? '<span class=\"badge money\">money path</span>' : '') + (s.unresolved ? '<span class=\"badge\">unresolved</span>' : '') +\n        (s.draft_requested && s.status === 'inbox' ? '<span class=\"badge\">draft requested</span>' : '') +\n        ' <span class=\"soft num\" style=\"font-size:13px\">' + esc(WHO[s.source] || s.source) + ' \u00b7 ' + s.messages + ' msg \u00b7 ' + esc(s.updated) + (s.cost_usd ? ' \u00b7 $' + s.cost_usd.toFixed(2) : '') + (s.batch_ref ? ' \u00b7 batch ' + esc(s.batch_ref) : '') + '</span></button>';\n    }).join('') : '<p class=\"soft\">Nothing here.</p>';\n    Array.prototype.forEach.call(document.querySelectorAll('.spec'), function (b) { b.onclick = function () { open(Number(b.getAttribute('data-id'))); }; });\n  }\n  function open(id) {\n    current = id; list();\n    get('/api/desk/spec/' + id).then(function (s) {\n      $('dh').textContent = '#' + s.id + ' ' + s.title;\n      $('detail').innerHTML = '<div class=\"soft\" style=\"font-size:13px;margin-bottom:6px\">' + esc(s.status) + (s.money_path ? ' \u00b7 money path (needs Fable)' : '') + ' \u00b7 from ' + esc(WHO[s.source] || s.source) + ' \u00b7 opened ' + esc(s.created) + (s.cost_usd ? ' \u00b7 cost $' + s.cost_usd.toFixed(2) : '') + '</div>' +\n        (s.messages.length ? s.messages.map(function (m) {\n          return '<div class=\"msg a-' + esc(m.author) + ' kind-' + esc(m.kind) + '\"><div class=\"who\"><b>' + esc(WHO[m.author] || m.author) + '</b> \u00b7 ' + esc(m.kind) + ' \u00b7 ' + esc(m.at) + (m.model ? ' \u00b7 ' + esc(m.model) : '') + (m.cost_usd ? ' \u00b7 $' + Number(m.cost_usd).toFixed(3) : '') + '</div><div class=\"body\">' + esc(m.body) + '</div></div>';\n        }).join('') : '<p class=\"soft\">No messages yet.</p>');\n    }).catch(function (e) { $('detail').textContent = e.message; });\n  }\n  function load() {\n    get('/api/desk/state').then(function (s) {\n      state = s;\n      $('sub').innerHTML = 'Spend today <b class=\"num\">$' + s.today_spend_usd.toFixed(2) + '</b> of $' + s.daily_cap_usd + ' \u00b7 ' + esc(s.rules);\n      lanes(); list(); if (current) open(current);\n    }).catch(function (e) { $('sub').textContent = 'Could not load: ' + e.message; });\n  }\n  load(); setInterval(load, 60000);\n})();\n";
 app.get('/desk', (req, res) => { res.set('Cache-Control', 'no-store').type('html').send(DESK_PAGE_HTML.replace('<head>', '<head>\n<script src="/dashboard-auth.js"></script>')); });
 app.get('/desk-page.js', (req, res) => { res.set('Cache-Control', 'no-store').type('application/javascript').send(DESK_PAGE_JS); });
+// #PV1 THE PORTFOLIO CHART PAGE (read-only; data under /api/ behind the dashboard key like /agent)
+const PV_PAGE_HTML = "<!doctype html>\n<html lang=\"en\"><head>\n<meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">\n<title>Portfolio</title>\n<style>\n:root { --bg:#f4f5f7; --card:#ffffff; --ink:#171a1f; --soft:#5f6672; --line:#dfe3e8; --grid:#eceef2; --acc:#3656a8; --up:#1f9d78; --down:#d64550; color-scheme:light; }\n@media (prefers-color-scheme: dark) { :root:not([data-theme=\"light\"]) { --bg:#0d0f12; --card:#15181d; --ink:#e8ebef; --soft:#9aa2ae; --line:#262b33; --grid:#1d2128; --acc:#8ea8f0; --up:#2ec4a0; --down:#f0606b; color-scheme:dark; } }\n:root[data-theme=\"dark\"] { --bg:#0d0f12; --card:#15181d; --ink:#e8ebef; --soft:#9aa2ae; --line:#262b33; --grid:#1d2128; --acc:#8ea8f0; --up:#2ec4a0; --down:#f0606b; color-scheme:dark; }\n* { box-sizing:border-box; }\nbody { margin:0; background:var(--bg); color:var(--ink); font:15px/1.5 system-ui,-apple-system,\"Segoe UI\",sans-serif; }\nmain { max-width:1100px; margin:0 auto; padding:20px 16px 60px; display:flex; flex-direction:column; gap:14px; }\nh1 { font-size:14px; margin:0; color:var(--soft); font-weight:600; text-transform:uppercase; letter-spacing:.06em; }\n.soft { color:var(--soft); } .num { font-variant-numeric:tabular-nums; }\n.head { display:flex; flex-wrap:wrap; gap:8px 28px; align-items:flex-end; }\n.big { font-size:34px; font-weight:600; line-height:1.1; }\n.stat b { display:block; font-size:18px; font-weight:600; } .stat span { color:var(--soft); font-size:13px; }\n.up { color:var(--up); } .down { color:var(--down); }\n.bar { display:flex; flex-wrap:wrap; gap:6px; align-items:center; }\n.iv { background:var(--card); border:1px solid var(--line); color:var(--ink); border-radius:999px; padding:5px 12px; font:600 13px/1 system-ui,-apple-system,\"Segoe UI\",sans-serif; cursor:pointer; }\n.iv.on { background:var(--ink); color:var(--bg); border-color:var(--ink); }\n.sep { width:1px; height:20px; background:var(--line); margin:0 4px; }\n.card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:8px; }\n#chart { width:100%; height:min(62vh, 520px); min-height:300px; }\n.parts { display:flex; flex-wrap:wrap; gap:6px 20px; font-size:14px; }\n.parts span b { font-weight:600; }\n#note { font-size:13px; }\nhtml.embed:root { --bg:#1a1a1a; --card:#1a1a1a; --ink:#e8e8e8; --soft:#888888; --line:#2e2e2e; --grid:#232323; --acc:#00ffc8; --up:#00c896; --down:#ff4d6a; color-scheme:dark; }\nhtml.embed main { max-width:none; padding:0; gap:10px; }\nhtml.embed h1, html.embed .big, html.embed #parts, html.embed .foot { display:none; }\nhtml.embed .head { gap:4px 22px; align-items:baseline; }\nhtml.embed .stat b { font-size:15px; display:inline; margin-left:6px; }\nhtml.embed .card { border:0; padding:0; border-radius:0; }\nhtml.embed #chart { height:300px; min-height:0; }\nhtml.embed .iv { padding:5px 10px; }\nhtml.embed .iv.on { background:var(--acc); color:#0d0d0d; border-color:var(--acc); }\nhtml.embed #note { font-size:12px; }\n</style></head>\n<body><main>\n<h1>Portfolio value</h1>\n<div class=\"head\">\n  <div><div class=\"big num\" id=\"val\">\u2026</div><div class=\"num\" id=\"chg\">&nbsp;</div></div>\n  <div class=\"stat num\"><span>24h high</span><b id=\"hi\">\u2013</b></div>\n  <div class=\"stat num\"><span>24h low</span><b id=\"lo\">\u2013</b></div>\n</div>\n<div class=\"bar\" id=\"ivs\">\n  <button class=\"iv\" data-k=\"1m\">1m</button><button class=\"iv\" data-k=\"5m\">5m</button><button class=\"iv\" data-k=\"30m\">30m</button><button class=\"iv\" data-k=\"1h\">1h</button><button class=\"iv\" data-k=\"4h\">4h</button><button class=\"iv\" data-k=\"1D\">1D</button><button class=\"iv\" data-k=\"1W\">1W</button><button class=\"iv\" data-k=\"1Y\">1Y</button><button class=\"iv\" data-k=\"5Y\">5Y</button><button class=\"iv\" data-k=\"All\">All</button>\n  <span class=\"sep\"></span>\n  <button class=\"iv\" data-s=\"total\">With cash</button><button class=\"iv\" data-s=\"coins\">Coins only</button>\n</div>\n<div class=\"card\"><div id=\"chart\"></div></div>\n<div class=\"parts num\" id=\"parts\"></div>\n<div class=\"soft\" id=\"note\">Loading\u2026</div>\n<div class=\"soft foot\" style=\"font-size:13px\">Read-only. Revolut X, Kraken, the Tangem XRP wallet and cash on both exchanges, sampled every minute; times are London time. Pinch or scroll to zoom, drag to go back. Refreshes every 60 s.</div>\n</main>\n<script src=\"https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js\" onerror=\"var s=document.createElement('script');s.src='https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js';document.head.appendChild(s);s.onload=function(){window.__pvStart&&window.__pvStart();}\"></script>\n<script src=\"/portfolio-page.js\"></script>\n</body></html>\n";
+const PV_PAGE_JS = "(function () {\n  'use strict';\n  var $ = function (id) { return document.getElementById(id); };\n  var EMBED = /[?&]embed=1(&|$)/.test(location.search);   // shown inside the dashboard's Portfolio tab\n  if (EMBED) document.documentElement.classList.add('embed');\n  function fit() { if (EMBED && window.parent !== window) try { window.parent.postMessage({ pvHeight: document.documentElement.scrollHeight }, location.origin); } catch (e) {} }\n  var get = function (p) { return fetch(p).then(function (r) { if (!r.ok) throw new Error(p + ' HTTP ' + r.status); return r.json(); }); };\n  var usd = function (v) { if (v == null || !isFinite(v)) return '\u2013'; var a = Math.abs(v); return '$' + v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: a < 10 ? 4 : 2 }); };\n  var DAY = 86400;\n  // button -> [candle interval, visible window in seconds (0 = everything)]\n  var VIEWS = { '1m': ['1m', 6 * 3600], '5m': ['5m', DAY], '30m': ['30m', 7 * DAY], '1h': ['1h', 30 * DAY], '4h': ['4h', 90 * DAY], '1D': ['1d', 180 * DAY], '1W': ['1w', 730 * DAY], '1Y': ['1d', 365 * DAY], '5Y': ['1w', 1826 * DAY], 'All': ['1w', 0] };\n  var view = '1h', series = 'total', chart = null, candles = null, lastKey = null, state = null;\n  try { view = localStorage.getItem('pv.view') || view; series = localStorage.getItem('pv.series') || series; } catch (e) {}\n  if (!VIEWS[view]) view = '1h';\n  function css(n) { return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); }\n  function londonOffset(t) {   // seconds to add to a UTC timestamp so the chart's axis reads London time\n    var d = new Date(t * 1000);\n    return (Date.parse(d.toLocaleString('en-US', { timeZone: 'Europe/London' })) - Date.parse(d.toLocaleString('en-US', { timeZone: 'UTC' }))) / 1000;\n  }\n  function toChartTime(t) { return typeof t === 'string' ? Date.UTC(+t.slice(0, 4), +t.slice(5, 7) - 1, +t.slice(8, 10)) / 1000 : t + londonOffset(t); }\n  function paintMarks() {\n    $('ivs').querySelectorAll('button').forEach(function (b) {\n      b.classList.toggle('on', b.getAttribute('data-k') === view || b.getAttribute('data-s') === series);\n    });\n  }\n  function build() {\n    var el = $('chart');\n    chart = LightweightCharts.createChart(el, {\n      autoSize: true,\n      layout: { background: { type: 'solid', color: css('--card') }, textColor: css('--soft'), fontFamily: 'system-ui,-apple-system,\"Segoe UI\",sans-serif' },\n      grid: { vertLines: { color: css('--grid') }, horzLines: { color: css('--grid') } },\n      rightPriceScale: { borderColor: css('--line') },\n      timeScale: { borderColor: css('--line'), timeVisible: true, secondsVisible: false, rightOffset: 4 },\n      crosshair: { mode: 0 },\n      localization: { priceFormatter: function (p) { return '$' + p.toLocaleString('en-US', { maximumFractionDigits: 2, minimumFractionDigits: 2 }); } }\n    });\n    candles = chart.addCandlestickSeries({ upColor: css('--up'), downColor: css('--down'), borderUpColor: css('--up'), borderDownColor: css('--down'), wickUpColor: css('--up'), wickDownColor: css('--down'), priceLineColor: css('--acc') });\n    var mq = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;\n    var retheme = function () {\n      chart.applyOptions({ layout: { background: { type: 'solid', color: css('--card') }, textColor: css('--soft') }, grid: { vertLines: { color: css('--grid') }, horzLines: { color: css('--grid') } } });\n      candles.applyOptions({ upColor: css('--up'), downColor: css('--down'), borderUpColor: css('--up'), borderDownColor: css('--down'), wickUpColor: css('--up'), wickDownColor: css('--down') });\n    };\n    if (mq && mq.addEventListener) mq.addEventListener('change', retheme);\n    new MutationObserver(retheme).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });\n  }\n  function head() {\n    if (!state || !state.latest) { $('val').textContent = '\u2013'; return; }\n    var L = state.latest, coins = series === 'coins';\n    var now = coins ? L.coins : L.total;\n    $('val').textContent = usd(now);\n    var d = state.day;\n    if (d) {\n      var then = coins ? d.coins_then : d.total_then, pc = then ? (now - then) / then * 100 : null;\n      var span = Math.round((L.ts - d.since) / 3600);\n      $('chg').innerHTML = pc == null ? '&nbsp;' : '<span class=\"' + (pc >= 0 ? 'up' : 'down') + '\">' + (pc >= 0 ? '\u25b2 ' : '\u25bc ') + Math.abs(pc).toFixed(2) + '%</span> <span class=\"soft\">\u00b7 ' + (span >= 23 ? '24h' : span + 'h so far') + ' (' + (now - then >= 0 ? '+' : '\u2212') + usd(Math.abs(now - then)) + ')</span>';\n      $('hi').textContent = usd(coins ? d.coins_hi : d.hi); $('lo').textContent = usd(coins ? d.coins_lo : d.lo);\n    }\n    $('parts').innerHTML = '<span class=\"soft\">Revolut X <b>' + usd(L.revolut_x) + '</b></span><span class=\"soft\">Kraken <b>' + usd(L.kraken) + '</b></span><span class=\"soft\">Tangem XRP <b>' + usd(L.tangem) + '</b></span><span class=\"soft\">Cash <b>' + usd(L.cash) + '</b></span>' + (L.partial ? '<span class=\"down\">Kraken not read yet: total is missing Kraken</span>' : '');\n  }\n  function note(n) {\n    var since = state && state.recording_since;\n    var txt = !since ? 'Recording starts within a minute or two of the deploy.' :\n      'Recording since ' + new Date(since * 1000).toLocaleString('en-GB', { timeZone: 'Europe/London', day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }) + '. History before that arrives with the rebuild step.';\n    if (n === 0) txt = 'No candles at this interval yet. ' + txt;\n    $('note').textContent = txt;\n  }\n  function load(keepRange) {\n    var v = VIEWS[view], key = view + '|' + series;\n    return Promise.all([get('/api/portfolio/candles?iv=' + v[0] + '&s=' + series), get('/api/portfolio/state')]).then(function (res) {\n      state = res[1]; head();\n      var data = (res[0].candles || []).map(function (c) { return { time: toChartTime(c.t), open: c.o, high: c.h, low: c.l, close: c.c }; });\n      var saved = keepRange && lastKey === key ? chart.timeScale().getVisibleLogicalRange() : null;\n      candles.setData(data);\n      if (saved) chart.timeScale().setVisibleLogicalRange(saved);\n      else if (data.length) {\n        var last = data[data.length - 1].time, first = data[0].time;\n        if (!v[1] || last - v[1] <= first) chart.timeScale().fitContent();\n        else chart.timeScale().setVisibleRange({ from: last - v[1], to: last });\n      }\n      chart.applyOptions({ timeScale: { timeVisible: v[0] !== '1d' && v[0] !== '1w' } });\n      lastKey = key; note(data.length); fit();\n    }).catch(function (e) { $('note').textContent = 'Could not load: ' + e.message; });\n  }\n  function start() {\n    if (chart || typeof LightweightCharts === 'undefined') return;\n    build(); paintMarks(); load(false);\n    $('ivs').addEventListener('click', function (e) {\n      var b = e.target.closest('button'); if (!b) return;\n      if (b.getAttribute('data-k')) view = b.getAttribute('data-k'); else series = b.getAttribute('data-s');\n      try { localStorage.setItem('pv.view', view); localStorage.setItem('pv.series', series); } catch (err) {}\n      paintMarks(); load(false);\n    });\n    setInterval(function () { if (!document.hidden) load(true); }, 60000);\n    window.addEventListener('resize', fit);\n  }\n  window.__pvStart = start;\n  if (typeof LightweightCharts !== 'undefined') start();\n  else window.addEventListener('load', function () { setTimeout(start, 50); });\n})();\n";
+app.get('/portfolio', (req, res) => { res.set('Cache-Control', 'no-store').type('html').send(PV_PAGE_HTML.replace('<head>', '<head>\n<script src="/dashboard-auth.js"></script>')); });
+app.get('/portfolio-page.js', (req, res) => { res.set('Cache-Control', 'no-store').type('application/javascript').send(PV_PAGE_JS); });
+app.get('/api/portfolio/candles', async (req, res) => { try { res.set('Cache-Control', 'no-store').json({ candles: await portfolioValueCandles(String(req.query.iv || '1h'), req.query.s === 'coins' ? 'coins' : 'total') }); } catch (e) { res.status(400).json({ error: e.message }); } });
+app.get('/api/portfolio/state', async (req, res) => { try { res.set('Cache-Control', 'no-store').json(await portfolioValueState()); } catch (e) { res.status(500).json({ error: e.message }); } });
 app.get('/api/desk/state', async (req, res) => { try { res.json(await specDeskState()); } catch (e) { res.status(500).json({ error: e.message }); } });
 app.get('/api/desk/spec/:id', async (req, res) => { try { const s = await specGet(parseInt(req.params.id)); if (!s) return res.status(404).json({ error: 'no such spec' }); res.json(s); } catch (e) { res.status(500).json({ error: e.message }); } });
 app.get('/api/agent/state', async (req, res) => { try { res.json(await agentApiState()); } catch (e) { res.status(500).json({ error: e.message }); } });

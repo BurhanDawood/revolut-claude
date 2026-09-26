@@ -722,6 +722,13 @@
     </div>
   </div>
 
+  <!-- Portfolio value chart (#PV1): the /portfolio page in its compact embed mode -->
+  <div class="card" id="pv-card">
+    <div class="card-title" style="display:flex;justify-content:space-between;align-items:center">📈 Portfolio value <a href="/portfolio" style="color:var(--accent);text-decoration:none">Full view ↗</a></div>
+    <iframe id="pv-frame" src="/portfolio?embed=1" title="Portfolio value chart" loading="lazy" style="display:block;width:100%;height:470px;border:0;background:transparent"></iframe>
+    <script>window.addEventListener('message', function (e) { if (e.origin === location.origin && e.data && e.data.pvHeight > 200) document.getElementById('pv-frame').style.height = Math.min(e.data.pvHeight, 900) + 'px'; });</script>
+  </div>
+
   <!-- USDT Sweep Config -->
   <div class="card" id="sweep-card">
     <div class="card-title">💰 USDT Sweep</div>
