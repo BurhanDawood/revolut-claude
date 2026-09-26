@@ -1596,6 +1596,7 @@ await db.execute('CREATE TABLE IF NOT EXISTS portfolio_value_1m (ts INT UNSIGNED
 await db.execute("CREATE TABLE IF NOT EXISTS portfolio_value_hourly (ts INT UNSIGNED NOT NULL PRIMARY KEY, o DECIMAL(16,4) NOT NULL, h DECIMAL(16,4) NOT NULL, l DECIMAL(16,4) NOT NULL, c DECIMAL(16,4) NOT NULL, ko DECIMAL(16,4) NULL, kh DECIMAL(16,4) NULL, kl DECIMAL(16,4) NULL, kc DECIMAL(16,4) NULL, src VARCHAR(8) NOT NULL DEFAULT 'live')").catch(e => console.error('[migration] portfolio_value_hourly:', e.message));
 await db.execute("CREATE TABLE IF NOT EXISTS portfolio_value_daily (d DATE NOT NULL PRIMARY KEY, o DECIMAL(16,4) NOT NULL, h DECIMAL(16,4) NOT NULL, l DECIMAL(16,4) NOT NULL, c DECIMAL(16,4) NOT NULL, ko DECIMAL(16,4) NULL, kh DECIMAL(16,4) NULL, kl DECIMAL(16,4) NULL, kc DECIMAL(16,4) NULL, src VARCHAR(8) NOT NULL DEFAULT 'rebuilt')").catch(e => console.error('[migration] portfolio_value_daily:', e.message));   // #PV2 London days before the hourly history
 await db.execute('CREATE TABLE IF NOT EXISTS portfolio_flows (tx_id VARCHAR(80) NOT NULL PRIMARY KEY, ts INT UNSIGNED NOT NULL, kind VARCHAR(12) NOT NULL, currency VARCHAR(16) NOT NULL, qty DECIMAL(30,10) NOT NULL, usd DECIMAL(16,2) NOT NULL, INDEX idx_ts (ts))').catch(e => console.error('[migration] portfolio_flows:', e.message));   // #PV2 money in / out markers
+await db.execute('CREATE TABLE IF NOT EXISTS dip_alerts (symbol VARCHAR(20) NOT NULL PRIMARY KEY, armed TINYINT(1) NOT NULL DEFAULT 1, last_alert_at DATETIME NULL, last_off_pct DECIMAL(8,2) NULL, last_rsi DECIMAL(6,2) NULL)').catch(e => console.error('[migration] dip_alerts:', e.message));   // #DIP1 one alert per dip per watchlist coin
 setTimeout(() => { repairAgentFills().catch(e => console.error('[agent] boot repair failed:', e.message)); }, 30 * 1000);   // #B21 a fill recorded but not applied before a restart
 await safeAddColumn('trailing_stops',   'auto_execute',    'TINYINT(1) NOT NULL DEFAULT 0'); // #93
 await safeAddColumn('price_targets',    'sell_pct',        'DECIMAL(5,2) NULL'); // #144 per-rung sell %% override for Away Mode up-targets
@@ -7625,6 +7626,7 @@ async function agentScreen(cfg, led, watch = [], only = null) {   // #A2d watch 
         r.shape = shape; r.lean = lean ? lean.lean : null; r.lean_text = lean ? lean.text : null;
         r.move = f ? { gain_pct: Number(f.gain.toFixed(1)), hours: f.hours, best_3h_share_pct: Math.min(100, Math.round(f.conc * 100)), deepest_dip_pct: Number(f.dip.toFixed(1)), pace_x: f.pace_x } : null;
         r.indicators = moveIndicators(bars);
+        r.dip = dipConfirmFromBars(bars, r.px);   // #DIP1 spec #1 (the agent asked for it): candidate trough 8-15% off the 48h high with 1h RSI < 45
         r.ch24h = bars.length > 24 ? Number(((bars[bars.length - 1].c / bars[bars.length - 25].c - 1) * 100).toFixed(1)) : null;
         for (const [k, n] of [['range_24h', 24], ['range_72h', 72]]) {   // #A2c agent request 25 Sep: recent high / low and where the price sits
           const w = bars.slice(-n), hi = Math.max(...w.map(b => b.h)), lo = Math.min(...w.map(b => b.l));
@@ -7695,6 +7697,7 @@ FACTS (enforced in code after you answer - they are not requests, and an order t
 - If your equity falls daily_loss_pct in a day you are frozen for 24 h: sells still work, buys are refused. If it falls drawdown_halt_pct from its high you are halted and Bryan decides.
 - Paper fills are the mid price plus/minus 1.3% slippage, plus a 0.09% fee. Every model call and research call you trigger is charged to your cash. Trading and churn cost money.
 - At most orders_per_run actions are executed per run, in the order you list them. You run about every 4 hours.
+- Each shortlisted coin carries "dip" (your request, spec #1): off_high_pct below its 48 h high, rsi_1h, and in_zone = 8-15% off the high with 1h RSI < 45. It marks a candidate trough, not a bottom: weigh it with the shape, the base rates and your research; it is not a buy rule.
 - A woken run is narrow: the shortlist is only the coins that woke you plus what you hold; the next scheduled run screens everything again.
 - Between runs you can be WOKEN by your own alerts. Every run replaces all your alerts with the "alerts" list you return (at most max_alerts; each lasts "hours", 1-72, default 24) - restate any you still want. Your held positions also wake you automatically: at the stop_price you gave when buying, and on a position_drop_pct fall since the run. At most wakes_per_day wake-ups a day, 30 min apart, for your own alerts (position alerts always wake you); an alert that fires past that cap is shown to your next run as alerts_fired_while_you_could_not_be_woken. If input.woken_by is set, this run exists because those alerts fired: deal with them first. A wake-up costs the same as a run, so set alerts that would change your decision, not curiosities.
 
@@ -7979,7 +7982,7 @@ function agentRunDigest(rows) {   // rows of one run, oldest first
   const first = rows.find(r => r.inputs) || rows[0], inp = agentJ(first.inputs) || {}, input = inp.input || {};
   const short = (input.shortlist || []).map(s => ({ coin: s.coin, held: s.held || undefined, price: s.px, ch1_pct: s.ch1, ch24h_pct: s.ch24h, ch7_pct: s.ch7, range30_pos_pct: s.range30,
     shape: s.shape || s.shape_note || null, lean: s.lean || null, off_72h_high_pct: s.range_72h ? s.range_72h.off_high_pct : undefined,
-    rsi_4h: s.indicators ? s.indicators.rsi_4h : undefined, mentions: (s.mentions || []).length + (s.headlines || []).length,
+    rsi_4h: s.indicators ? s.indicators.rsi_4h : undefined, dip_zone: s.dip ? s.dip.in_zone : undefined, off_48h_high_pct: s.dip ? s.dip.off_high_pct : undefined, mentions: (s.mentions || []).length + (s.headlines || []).length,
     research: s.research ? (s.research.error ? 'failed: ' + s.research.error : (s.research.grounded ? 'web' : 'no web') + (s.research.cached_at ? ' (cached)' : '')) : 'not researched' }));
   const watchedIn = (input.shortlist || []).filter(s => !s.held).length > 15 ? 'includes watch_next from the previous run' : undefined;
   return { run_id: first.run_id, at: first.at, trigger: first.trigger_kind, model: first.model, tokens_in: first.tokens_in, tokens_out: first.tokens_out,
@@ -18113,6 +18116,55 @@ function moveIndicators(bars) {
     vs_sma20_pct: s20 ? r1((px / s20 - 1) * 100) : null, vs_sma50_pct: s50 ? r1((px / s50 - 1) * 100) : null,
     range30_pct: hi > lo ? r1((px - lo) / (hi - lo) * 100) : null };
 }
+// ── #DIP1 DIP CONFIRMATION (spec #1: the budget agent asked for it 26 Sep; Fable 13:20: it must reach the agent's run) ─────────
+// A candidate trough, not a guarantee: the price sits 8-15 % below its 48-hour high AND the 1-hour RSI is under 45. One helper,
+// two consumers: (1) every coin on the agent's shortlist carries it (runAgent's screen); (2) Bryan's watchlist / radar coins get a
+// Telegram alert, once per dip (re-armed only after the price is back within 8 % of its high) and at most every 12 h. Informational
+// only: nothing here buys, sells or changes a rule.
+const DIP_ZONE = { min_off_pct: 8, max_off_pct: 15, rsi_below: 45, lookback_h: 48, cooldown_h: 12 };
+function dipConfirmFromBars(bars, px) {
+  if (!Array.isArray(bars) || bars.length < 48) return null;
+  const last = px > 0 ? px : bars[bars.length - 1].c;
+  const w = bars.slice(-DIP_ZONE.lookback_h), hi = Math.max(...w.map(b => Math.max(b.h || 0, b.c || 0)));
+  const ind = moveIndicators(bars), rsi = ind ? ind.rsi_1h : null;
+  if (!(hi > 0) || !(last > 0)) return null;
+  const off = (1 - last / hi) * 100;
+  const inZone = rsi != null && off >= DIP_ZONE.min_off_pct && off <= DIP_ZONE.max_off_pct && rsi < DIP_ZONE.rsi_below;
+  return { high_48h: Number(hi.toPrecision(6)), off_high_pct: Number(off.toFixed(1)), rsi_1h: rsi, in_zone: inZone,
+    rule: '8-15% below the 48h high and 1h RSI < 45 = a candidate trough, not a guarantee (it can keep falling)' };
+}
+let _dipBusy = false;
+async function dipAlertTick() {
+  if (_dipBusy) return { skipped: 'busy' };
+  _dipBusy = true;
+  const out = { checked: 0, alerts: [], rearmed: [] };
+  try {
+    try { const [c] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'dip_alerts'"); if (c.length && JSON.parse(c[0].config_value).enabled === false) return { skipped: 'disabled' }; } catch (e) {}
+    const [coins] = await db.execute("SELECT symbol, status FROM coin_strategy WHERE status IN ('watchlist', 'radar') ORDER BY symbol");
+    for (const row of coins) {
+      const coin = String(row.symbol || '').toUpperCase().replace(/-USD$/, '');
+      if (!/^[A-Z0-9]{1,15}$/.test(coin)) continue;
+      let d = null;
+      try { d = dipConfirmFromBars(await loadHourlyBars(coin + '-USD', 10)); } catch (e) { continue; }
+      if (!d) continue;
+      out.checked++;
+      const [st] = await db.execute('SELECT armed, last_alert_at FROM dip_alerts WHERE symbol = ?', [coin]);
+      const armed = !st.length || Number(st[0].armed) === 1;
+      const lastAt = st.length && st[0].last_alert_at ? new Date(st[0].last_alert_at).getTime() : 0;
+      if (d.in_zone && armed && Date.now() - lastAt >= DIP_ZONE.cooldown_h * 3600000) {
+        await db.execute('INSERT INTO dip_alerts (symbol, armed, last_alert_at, last_off_pct, last_rsi) VALUES (?, 0, NOW(), ?, ?) ON DUPLICATE KEY UPDATE armed = 0, last_alert_at = NOW(), last_off_pct = VALUES(last_off_pct), last_rsi = VALUES(last_rsi)', [coin, d.off_high_pct, d.rsi_1h]);
+        await sendTelegram('📉 <b>DIP ZONE — ' + escTg(coin) + '</b> (your ' + escTg(String(row.status || 'watchlist')) + ')\n' + d.off_high_pct + '% below its 48 h high of $' + d.high_48h + ' · 1h RSI ' + d.rsi_1h +
+          '\nA candidate trough, not a guarantee: it can keep falling. Alert only, nothing is bought. Next alert for ' + escTg(coin) + ' after it recovers to within 8% of its high.').catch(() => {});
+        out.alerts.push(coin);
+      } else if (!armed && d.off_high_pct < DIP_ZONE.min_off_pct) {
+        await db.execute('UPDATE dip_alerts SET armed = 1 WHERE symbol = ?', [coin]);
+        out.rearmed.push(coin);
+      }
+    }
+    return out;
+  } finally { _dipBusy = false; }
+}
+setTimeout(() => { const t = () => dipAlertTick().then(r => { if (r && r.alerts && r.alerts.length) console.log('[dip] #DIP1 alerts: ' + r.alerts.join(', ')); }).catch(e => console.error('[dip] tick failed:', e.message)); t(); setInterval(t, 15 * 60 * 1000); console.log('[dip] #DIP1 watchlist dip check every 15 min'); }, 5 * 60 * 1000);
 async function moveShape(symbol, opts = {}) {
   const coin = String(symbol || '').toUpperCase().replace(/-USD$/, '').trim();
   if (!/^[A-Z0-9]{1,15}$/.test(coin)) return { ok: false, error: 'bad symbol' };
