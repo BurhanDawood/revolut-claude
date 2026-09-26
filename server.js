@@ -8223,8 +8223,8 @@ function specLine(s) { return '#' + s.id + ' ' + (s.money_path ? '💷 ' : '') +
 // a Telegram message with Accept / Park / Reject (status buttons only - never money). The harness moves status; the assistants only
 // write messages. money_path is RAISED by a code rule from the review's own code references (Fable), never cleared here.
 // Caps: $3 a day across the desk, $1.50 per spec, one spec at a time, 15 tool calls per review. Text written by anyone is data.
-const SPEC_AI_DEFAULTS = { enabled: true, daily_cap_usd: 3, per_spec_cap_usd: 1.5, max_rounds: 2, max_tool_calls: 15,
-  pm_model: null, dev_model: 'claude-sonnet-5', gemini_price_per_mtok: [0.5, 3], sonnet_price_per_mtok: [3, 15], tool_bytes_cap: 150000 };
+const SPEC_AI_DEFAULTS = { enabled: true, daily_cap_usd: 3, per_spec_cap_usd: 1.5, max_rounds: 2, max_tool_calls: 12,
+  pm_model: null, dev_model: 'claude-sonnet-5', gemini_price_per_mtok: [0.5, 3], sonnet_price_per_mtok: [3, 15], tool_bytes_cap: 120000 };
 let _specBusy = false, _specCodeIdx = null;
 async function specAiCfg() {
   let c = {};
@@ -8317,7 +8317,20 @@ function specCodeIndex() {
   if (_specCodeIdx) return _specCodeIdx;
   const src = readFileSync(__filename, 'utf8'), lines = src.split('\n'), fns = [];
   for (let i = 0; i < lines.length; i++) { const m = /^(?:async )?function (\w+)\(/.exec(lines[i]); if (m) fns.push({ name: m[1], start: i + 1 }); }
-  for (let k = 0; k < fns.length; k++) fns[k].end = k + 1 < fns.length ? fns[k + 1].start - 1 : lines.length;
+  for (let k = 0; k < fns.length; k++) {
+    const limit = k + 1 < fns.length ? fns[k + 1].start - 1 : lines.length;
+    const first = lines[fns[k].start - 1], open = (first.match(/\{/g) || []).length - (first.match(/\}/g) || []).length;
+    let e = fns[k].start;
+    if (open > 0) {   // #D3b the closing brace at column 0 (a one-line function ends on its own line), not the next function's start
+      for (;;) {
+        e++; while (e < limit && !/^\}/.test(lines[e - 1])) e++;
+        let j = e; while (j < limit && !lines[j].trim()) j++;   // a '}' at column 0 inside a template string: the code after it is still indented
+        if (e >= limit || j >= limit || !/^(\s|[})\]`])/.test(lines[j])) break;
+        e = j;
+      }
+    }
+    fns[k].end = e;
+  }
   // money-path functions, computed from the code itself: anything that places / cancels orders or writes the trading tables
   const MONEY_RE = /revolutRequest\(\s*'(POST|DELETE)'|\/0\/private\/(AddOrder|CancelOrder)|(INSERT INTO|UPDATE|DELETE FROM)\s+(trading_journal|trailing_stops|pump_armed_rules|tax_lots|price_targets|invested_capital|coin_strategy)\b|placeRevolutOrder\(|executeKrakenTrade\(|autoExecuteSell\(|autoExecuteKrakenSell\(|floorCappedLimitSell\(/;
   const money = new Set(['mayAutoTrade', 'autoExecuteSell', 'autoExecuteKrakenSell', 'placeRevolutOrder', 'executeKrakenTrade', 'floorCappedLimitSell', 'handleTrailingStopAlert', 'handleMoneyButton', 'handleTradeApprovalButton', 'handleDeferredBuyButton', 'handleSwingButton', 'handleRebalanceConfirmButton', 'updateInvestedCapital']);
@@ -8384,11 +8397,21 @@ async function specDevReview(spec, cfg) {
   const [pi, po] = cfg.sonnet_price_per_mtok;
   const budget = { bytes: 0, cap: cfg.tool_bytes_cap };
   const messages = [{ role: 'user', content: '<spec id="' + spec.id + '" title="' + String(spec.title).replace(/"/g, "'") + '">\n' + String(draft.body).slice(0, 20000) + '\n</spec>\n<thread>\n' + specThreadText({ messages: spec.messages.filter(m => m !== draft) }).slice(-12000) + '\n</thread>' }];
-  let tin = 0, tout = 0, calls = 0, review = null, usedTools = [];
+  let tin = 0, tout = 0, cw = 0, cr = 0, calls = 0, review = null, usedTools = [];
+  const system = [{ type: 'text', text: SPEC_DEV_PROMPT, cache_control: { type: 'ephemeral' } }];
+  const tools = SPEC_DEV_TOOLS.map((t, i) => (i === SPEC_DEV_TOOLS.length - 1 ? { ...t, cache_control: { type: 'ephemeral' } } : t));
+  const markLast = () => {   // #D3b prompt caching: each turn re-sends the conversation, so cache it up to the newest message
+    for (const m of messages) if (Array.isArray(m.content)) for (const b of m.content) if (b && b.cache_control) delete b.cache_control;
+    const last = messages[messages.length - 1];
+    if (typeof last.content === 'string') last.content = [{ type: 'text', text: last.content }];
+    const blk = last.content[last.content.length - 1]; if (blk) blk.cache_control = { type: 'ephemeral' };
+  };
   for (let turn = 0; turn < cfg.max_tool_calls + 2 && !review; turn++) {
     const force = calls >= cfg.max_tool_calls;
-    const msg = await anthropic.messages.create({ model: cfg.dev_model, max_tokens: 4000, system: SPEC_DEV_PROMPT, tools: SPEC_DEV_TOOLS, tool_choice: force ? { type: 'tool', name: 'submit_review' } : { type: 'auto' }, messages }, { maxRetries: 1 });
-    tin += (msg.usage && msg.usage.input_tokens) || 0; tout += (msg.usage && msg.usage.output_tokens) || 0;
+    markLast();
+    const msg = await anthropic.messages.create({ model: cfg.dev_model, max_tokens: 4000, system, tools, tool_choice: force ? { type: 'tool', name: 'submit_review' } : { type: 'auto' }, messages }, { maxRetries: 1 });
+    const u = msg.usage || {};
+    tin += u.input_tokens || 0; tout += u.output_tokens || 0; cw += u.cache_creation_input_tokens || 0; cr += u.cache_read_input_tokens || 0;
     messages.push({ role: 'assistant', content: msg.content });
     const uses = (msg.content || []).filter(b => b.type === 'tool_use');
     if (!uses.length) { messages.push({ role: 'user', content: 'Call submit_review now.' }); calls = cfg.max_tool_calls; continue; }
@@ -8402,7 +8425,7 @@ async function specDevReview(spec, cfg) {
     if (!review) messages.push({ role: 'user', content: results });
   }
   if (!review) throw new Error('the review did not finish');
-  const usd = (tin * pi + tout * po) / 1e6;
+  const usd = (tin * pi + cw * pi * 1.25 + cr * pi * 0.1 + tout * po) / 1e6;   // cache writes 1.25x, cache reads 0.1x the input price
   // money path by CODE RULE (Fable): any touched or cited function that the code index marks as a money path
   const idx = specCodeIndex();
   const cited = new Set((review.touches || []).map(String));
@@ -8414,7 +8437,7 @@ async function specDevReview(spec, cfg) {
     ((review.touches || []).length ? '\n\nWould change: ' + review.touches.join(', ') : '') + ((review.questions || []).length ? '\n\nQuestions for Bryan:\n' + review.questions.map(q => '- ' + q).join('\n') : '') +
     '\n\n_' + calls + ' tool call' + (calls === 1 ? '' : 's') + '. Verify against the code before building._';
   await db.execute("INSERT INTO spec_messages (spec_id, author, kind, body, data, model, tokens_in, tokens_out, cost_usd) VALUES (?, 'dev_assistant', 'review', ?, ?, ?, ?, ?, ?)",
-    [spec.id, specRedact(body).slice(0, 60000), JSON.stringify({ ...review, money_path_hits: moneyHits, tools: usedTools }), cfg.dev_model, tin, tout, usd.toFixed(6)]);
+    [spec.id, specRedact(body).slice(0, 60000), JSON.stringify({ ...review, money_path_hits: moneyHits, tools: usedTools, tokens: { input: tin, cache_write: cw, cache_read: cr, output: tout } }), cfg.dev_model, tin + cw + cr, tout, usd.toFixed(6)]);
   await db.execute('UPDATE spec_threads SET cost_usd = cost_usd + ?, rounds = rounds + 1, size = ?, updated_at = NOW()' + (moneyHits.length ? ', money_path = 1' : '') + ' WHERE id = ?', [usd.toFixed(6), String(review.size || '').slice(0, 8) || null, spec.id]);
   return { verdict: V, moneyHits, usd, questions: (review.questions || []).length };
 }
