@@ -4858,6 +4858,19 @@ function pumpPos(x) { return Number(x) > 0 ? Number(x) : null; }
 function pumpRefBase(row, costPrice) {
   return pumpPos(row && row.entry_floor) ?? pumpPos(costPrice) ?? pumpPos(row && row.baseline_price) ?? null;
 }
+// #463 THE BUY-BACK SAFETY LINE (Bryan 26 Sep "MEASURE FROM COST"; Fable desk #10 msg 97). A trough below it = alert only.
+// line = anchor x (1 - pct/100). anchor = the cycle's stored base when it sits between 0 and the sale (462: entry floor
+// override, else cost, else pump baseline); else the sale price, exactly as before 463 (no cost information = no wider
+// autonomy); else the loop's entry floor (a tracker with no sale - not reachable today). pct: the stored buyback_floor_pct,
+// 0 included; unreadable = 5. Used by the tracker, its armed message and loop_audit; mayAutoTrade inlines the same maths.
+function pumpRebuyLine(referenceBase, salePrice, floorPct, fallback) {
+  const s = pumpPos(salePrice), b0 = pumpPos(referenceBase);
+  const b = b0 != null && (s == null || b0 < s) ? b0 : null;
+  const anchor = b ?? s ?? pumpPos(fallback);
+  if (anchor == null) return null;
+  const fp = Number.isFinite(parseFloat(floorPct)) && parseFloat(floorPct) >= 0 ? parseFloat(floorPct) : 5;
+  return { line: anchor * (1 - fp / 100), anchor, from: b != null ? 'base' : (s != null ? 'sale' : 'entry_floor'), pct: fp };
+}
 // Quick price formatter for alert messages
 // #130 Trough Tracker - Phase A (inert foundation, called by nothing yet)
 async function armReboundTracker(symbol, salePrice, referenceBase, params, saleProceedsUsd) {
@@ -4893,12 +4906,14 @@ async function armReboundTracker(symbol, salePrice, referenceBase, params, saleP
         ', so the buy-back gate uses ' + retracePct + '% of the sale price: $' + retraceGate.toFixed(8) + '. Check this loop\'s entry floor.').catch(() => {});
     }
     console.log('[trough] ' + symbol + ' armed: sale=' + salePrice + ' base=' + (base != null ? base : 'none (50% of price)') + ' gate=' + retraceGate.toFixed(8) + ' (' + retracePct + '% of move) proceeds=$' + (proceedsUsd != null ? proceedsUsd.toFixed(2) : 'n/a'));
-    const floorAnchor = (salePrice != null && salePrice > 0) ? salePrice : entryFloor;
+    const rl = pumpRebuyLine(base, salePrice, buybackFloorPct, entryFloor);   // #463 the same line updateTroughTracker enforces
     await sendTelegram(
       '<b>[#130 TROUGH ARMED] ' + coinBaseTrk + '</b>\n\n' +
       'Sell @ $' + salePrice + (base != null ? ' (base $' + base + ')' : ' (base: none, 50% of price)') + '\n' +
       'Retrace gate: $' + retraceGate.toFixed(8) + ' (' + retracePct + '% of move)\n' +
-      'On bounce: ' + bouncePct + '% off trough, floor $' + (floorAnchor != null ? (floorAnchor * (1 - buybackFloorPct/100)).toFixed(8) : 'n/a') + '\n' +
+      'On bounce: ' + bouncePct + '% off trough, ' + (rl == null ? 'safety line: n/a'
+        : rl.from === 'base' ? 'safety line $' + rl.line.toFixed(8) + ' (' + rl.pct + '% under the base $' + base + ') - buys back only if the trough stays above it'
+        : 'safety line: none stored - alert only below $' + rl.line.toFixed(8)) + '\n' +
       'Rebuy size: $' + (proceedsUsd != null ? proceedsUsd.toFixed(2) : 'n/a')
     ).catch(() => {});
   } catch (e) { console.error('[trough] armReboundTracker error:', e.message); }
@@ -4950,12 +4965,12 @@ async function updateTroughTracker(symbol, currentPrice) {
       console.log('[trough] ' + symbol + ' retrace gate met @ ' + currentPrice + ' - tracking trough');
       return { action: 'tracking' };
     }
-    const floorAnchor = (t.salePrice != null && t.salePrice > 0) ? t.salePrice : t.entryFloor;
+    const rl = pumpRebuyLine(t.referenceBase, t.salePrice, t.buybackFloorPct, t.entryFloor);   // #463 base-anchored; no base = the sale, as before
     if (currentPrice < t.troughLow) {
       t.troughLow = currentPrice;
       await db.execute('UPDATE pump_armed_rules SET trough_low=? WHERE symbol=? AND active=1', [currentPrice, symbol]);
-      if (floorAnchor) {
-        const rebuyFloor = floorAnchor * (1 - t.buybackFloorPct / 100);
+      if (rl) {
+        const rebuyFloor = rl.line;
         if (currentPrice < rebuyFloor) {
           console.log('[trough] ' + symbol + ' trough ' + currentPrice + ' below floor ' + rebuyFloor + ' - alert only');
           return { action: 'alert', trough: currentPrice, rebuyFloor };
@@ -4965,8 +4980,8 @@ async function updateTroughTracker(symbol, currentPrice) {
     }
     const bounceTarget = t.troughLow * (1 + t.bouncePct / 100);
     if (currentPrice >= bounceTarget) {
-      if (floorAnchor) {
-        const rebuyFloor = floorAnchor * (1 - t.buybackFloorPct / 100);
+      if (rl) {
+        const rebuyFloor = rl.line;
         if (t.troughLow < rebuyFloor) {
           console.log('[trough] ' + symbol + ' bounce confirmed but trough ' + t.troughLow + ' below floor - alert only');
           return { action: 'alert', trough: t.troughLow, rebuyFloor };
@@ -6060,7 +6075,7 @@ async function checkPumpArm(symbol, currentPrice) {
       }
       _pumpQuiet.delete(symbol);
       // ARM — set a trailing stop, mark armed. NO SELL (Stage 1).
-      const entryFloor = rule.entry_floor != null ? parseFloat(rule.entry_floor) : null;
+      const entryFloor = pumpPos(rule.entry_floor);   // #463 (Fable on 464): "0.0000000000" is no floor, not a floor of 0
       const isDnd = await isDndCoin(symbol.replace('-USD',''));
       if (isDnd) {
         // DND: compute 24h low as entry_floor (overrides entry_prices fallback in autoExecuteSell + trough rebuy floor)
@@ -6158,7 +6173,10 @@ function shadowEvalLadder(state, bar, cfg, ctx) {
     retentionPct: num(cfg.retention_floor_pct, 0),
     minQtyAbs: num(cfg.min_qty, 0),
     abandonMs: num(cfg.abandon_hours, 48) * 3600000, cdMs: num(cfg.tier_cooldown_min, 15) * 60000,
-    minUsd: num(cfg.min_tier_usd, 2), floor: cfg.entry_floor ? Number(cfg.entry_floor) : null
+    minUsd: num(cfg.min_tier_usd, 2), floor: cfg.entry_floor ? Number(cfg.entry_floor) : null,
+    // #463 T3-1 TEST OPTION: an absolute buy-back safety line (price). A trough below it = no buy-back (live's 'alert only');
+    // the trough only falls, so the cycle then waits for the abandon timer. Default null = unchanged; nothing live sets it.
+    buybackFloor: Number(cfg.buyback_floor) > 0 ? Number(cfg.buyback_floor) : null
   };
   // A price EXACTLY at a level counts (1.10 * 1.05 is 1.1550000000000002 in floating point).
   const EPS = 1e-9, atOrAbove = (x, lvl) => x >= lvl * (1 - EPS), atOrBelow = (x, lvl) => x <= lvl * (1 + EPS);
@@ -6193,6 +6211,10 @@ function shadowEvalLadder(state, bar, cfg, ctx) {
   };
   const buy = (tier, trig, share) => {
     const price = op > trig ? op : trig;
+    if (P.buybackFloor && state.trough != null && state.trough < P.buybackFloor) {   // #463 T3-1
+      if (state.floor_noted !== state.cycle_id + ':' + tier) { rec('buy', tier, trig, price, null, null, false, 'below_buyback_floor'); state.floor_noted = state.cycle_id + ':' + tier; }
+      return 'wait';
+    }
     // #375 (PM decision with Bryan, 23 Sept - alongside PM #24's ceiling): NEVER buy back above the cycle's average
     // sale price, so a completed round trip always ends with MORE coins. The buy-back trigger is measured from the
     // PEAK, and after a big run it fired above the sale (HBAR -11.1% vs hold instead of +13.3%). Wait instead - the
@@ -6762,6 +6784,7 @@ async function runLadderBacktest(opts) {
     // mode, which made it look applied to single/rearm runs (PM's HIGH backtests sold 100% with 'retention 50' displayed).
     retention_floor_pct: opts.rule_mode === 'ladder' ? (opts.retention_floor_pct != null ? Number(opts.retention_floor_pct) : 50) : 'not applied in this mode (ladder only - in single/rearm, sell_pct is the retention control)',
     buyback_cap: opts.buyback_cap === 'peak' ? 'peak' : 'sale', arm_on: opts.arm_on === 'close' ? 'close' : 'high',   // #382 test options
+    buyback_floor: Number(opts.buyback_floor) > 0 ? Number(opts.buyback_floor) : null,   // #463 T3-1 test option (price)
     max_legs: opts.max_legs != null ? Number(opts.max_legs) : (opts.rule_mode === 'ladder' ? 2 : 5),
     rearm_from: (opts.rearm_from === 'peak' || opts.rule_mode === 'ladder') ? 'peak' : 'sale',   // #357 ladder always re-arms from the peak
     rearm_confirm_pct: opts.rearm_confirm_pct != null ? Number(opts.rearm_confirm_pct) : 1
@@ -15411,7 +15434,12 @@ async function mayAutoTrade(intent, opts = {}) {
       let avg, abandoned = false;
       if (path === 'trough') {
         avg = Number(rule.sale_price);
-        if (Number(rule.entry_floor) > 0) inputs.rebuy_floor = Number(rule.entry_floor) * (1 - (Number(rule.buyback_floor_pct) || 5) / 100);
+        {   // #463 the SAME line the tracker enforces (pumpRebuyLine, inlined): base between 0 and the sale, else the sale, else entry_floor
+          const s463 = Number(rule.sale_price) > 0 ? Number(rule.sale_price) : null, b463 = Number(rule.reference_base) > 0 ? Number(rule.reference_base) : null;
+          const a463 = (b463 != null && (s463 == null || b463 < s463) ? b463 : null) ?? s463 ?? (Number(rule.entry_floor) > 0 ? Number(rule.entry_floor) : null);
+          const p463 = Number.isFinite(parseFloat(rule.buyback_floor_pct)) && parseFloat(rule.buyback_floor_pct) >= 0 ? parseFloat(rule.buyback_floor_pct) : 5;
+          if (a463 != null) inputs.rebuy_floor = a463 * (1 - p463 / 100);
+        }
         if ('sale_at' in rule || 'uncovered_since' in rule) {   // A2 columns; absent -> (d) is skipped
           inputs.sale_at = rule.sale_at || null; inputs.uncovered_since = rule.uncovered_since || null;
           const ah = rule.abandon_hours != null ? Number(rule.abandon_hours) : 336, uh = rule.uncovered_abandon_hours != null ? Number(rule.uncovered_abandon_hours) : 48;
@@ -15843,17 +15871,22 @@ function loopCostCheck(snap, coin, storedCost, dd) {
     verdict: fvt == null ? 'no floor - sales blocked' : fvt < 0 ? 'EFFECTIVE FLOOR IS UNDER TRUE COST by ' + (-fvt).toFixed(2) + '% - a sale could lose money' : 'effective floor ' + fvt.toFixed(2) + '% above true cost (' + (dd ? dd.source : '?') + ')'
   };
 }
-// #474b (#410) Pure: where the buy-back leg stands. A buy-back executes only if the trough stays above
-// sale x (1 - buyback_floor_pct); the gate sits retrace_pct of the way back down the move, so a move bigger than
-// buyback_floor_pct / retrace_pct of the sale price puts the gate BELOW that line and the buy-back can only ALERT.
+// #474b (#410) Pure: where the buy-back leg stands. #463: a buy-back executes only if the trough stays above the SAFETY LINE,
+// buyback_floor_pct under the cycle's stored base (cost) - pumpRebuyLine, the tracker's own line. The gate sits between the
+// sale and the base, so with a base it is always above the line. With NO base the line is under the sale (as before 463) and
+// a move bigger than buyback_floor_pct / retrace_pct of the sale puts the gate below it: the buy-back can then only ALERT.
 function loopBuySide(rule, price) {
   if (!rule) return null;
-  const rp = Number(rule.retrace_pct) > 0 ? Number(rule.retrace_pct) : 50, fp = Number(rule.buyback_floor_pct) > 0 ? Number(rule.buyback_floor_pct) : 5, bp = Number(rule.bounce_pct) > 0 ? Number(rule.bounce_pct) : 8;
-  const out = { retrace_pct: rp, buyback_floor_pct: fp, bounce_pct: bp, auto_buy_only_if_move_under_pct: Number((fp / rp * 100).toFixed(2)) };
+  const rp = Number(rule.retrace_pct) > 0 ? Number(rule.retrace_pct) : 50, bp = Number(rule.bounce_pct) > 0 ? Number(rule.bounce_pct) : 8;
+  const fp = Number.isFinite(parseFloat(rule.buyback_floor_pct)) && parseFloat(rule.buyback_floor_pct) >= 0 ? parseFloat(rule.buyback_floor_pct) : 5;   // #463 as the tracker reads it
+  const out = { retrace_pct: rp, buyback_floor_pct: fp, bounce_pct: bp, safety_line: fp + '% under the cycle base (cost) when one is stored; ' + fp + '% under the sale when not',
+    auto_buy_only_if_move_under_pct_when_no_base: rp > 0 ? Number((fp / rp * 100).toFixed(2)) : null };
   const sp = Number(rule.sale_price);
-  if (!(sp > 0)) return { ...out, live_cycle: false, note: 'no live cycle. When the loop sells, the buy-back can execute only if the move from the cycle base is under ' + out.auto_buy_only_if_move_under_pct + '% of the sale price; bigger moves only alert.' };
+  if (!(sp > 0)) return { ...out, live_cycle: false, note: 'no live cycle. When the loop sells with a cycle base (cost) stored, the buy-back can execute on any retrace as long as the trough stays above base x ' + (1 - fp / 100).toFixed(4) + '. With no base stored it can execute only if the move is under ' + out.auto_buy_only_if_move_under_pct_when_no_base + '% of the sale; bigger moves only alert.' };
   const gate = Number(rule.retrace_gate) > 0 ? Number(rule.retrace_gate) : null, base = Number(rule.reference_base) > 0 ? Number(rule.reference_base) : null;
-  const rebuyFloor = sp * (1 - fp / 100), p = Number(price) > 0 ? Number(price) : null;
+  const rlx = pumpRebuyLine(rule.reference_base, sp, rule.buyback_floor_pct, null);
+  const rebuyFloor = rlx ? rlx.line : sp * (1 - fp / 100), p = Number(price) > 0 ? Number(price) : null;
+  out.safety_line_from = rlx ? rlx.from : 'sale';
   const low = Number(rule.trough_low) > 0 ? Number(rule.trough_low) : null, armed = Number(rule.trough_armed) === 1;
   const o = { ...out, live_cycle: true, sale_price: r6x(sp), reference_base: r6x(base), gate: r6x(gate), rebuy_floor: r6x(rebuyFloor), price: r6x(p),
     gate_distance_pct: gate != null && p != null ? Number(((gate / p - 1) * 100).toFixed(2)) : null,
