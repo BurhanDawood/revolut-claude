@@ -13252,7 +13252,11 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
     let avgEntryLine = '';
     if (action === 'buy') {
       try {
-        const prevQty = previousBalances.get(symbol) || 0;
+        // #411 the holding BEFORE this buy comes from the call itself (new total - change). previousBalances is already the
+        // NEW balance by now (the detector updates it right after the un-awaited call), which weighted a stale entry by the
+        // whole new position: ZKJ 27 Sep blended $0.005761 (the old, exited position) 50/50 with the $0.006619 fill -> $0.006190.
+        const cq = Number(currentQty);
+        const prevQty = Number.isFinite(cq) ? Math.max(0, cq - absQty) : (previousBalances.get(symbol) || 0);
         const existingEntry = entryPrices.get(symbol);
         const isCycleBuyback = prevQty === 0 && existingEntry != null;
         if (existingEntry && prevQty > 0) {
