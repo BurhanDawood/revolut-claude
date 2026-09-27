@@ -46,6 +46,9 @@ jobs:
 
       - name: Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # the action's default ('tools') is no longer in the SDK repository
+          packages: 'platform-tools platforms;android-36 build-tools;36.0.0'
 
       - name: Install and sync
         working-directory: mobile
