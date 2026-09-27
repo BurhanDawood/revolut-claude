@@ -158,22 +158,36 @@ async function placeRevolutOrder(symbol, side, orderType, baseSize, price = null
   const revolutSymbol = symbol.includes('-USD') ? symbol.toUpperCase() : `${symbol.toUpperCase()}-USD`;
   console.log(`[revolut] Using order symbol: ${revolutSymbol}`);
 
-  const orderConfig = orderType === 'limit' && price
-    ? { limit: { base_size: baseSize.toString(), price: price.toString() } }
-    : valueUsd
-      ? { market: { quote_size: valueUsd.toString() } }
-      : { market: { base_size: baseSize.toString() } };
-  const body = {
+  // #14 (HFT 27 Sep 00:30): the #93 sale sent the raw balance 15841.85415808 and Revolut X refused it ("base_size precision
+  // must not exceed 4 decimal places"), so nothing sold and every 2-min retry failed the same way. The size is now cut DOWN to the
+  // pair's base step (never up: a sale can never ask for more than is held); if the step is unknown the size goes as before.
+  let sizeStr = baseSize != null && !(orderType !== 'limit' && valueUsd) ? await venueBaseSizeStr(revolutSymbol, baseSize) : null;
+  const mkBody = () => ({
     client_order_id: clientOrderId,
     symbol: revolutSymbol,
     side: side.toUpperCase(),
-    order_configuration: orderConfig,
-  };
+    order_configuration: orderType === 'limit' && price
+      ? { limit: { base_size: sizeStr, price: price.toString() } }
+      : valueUsd
+        ? { market: { quote_size: valueUsd.toString() } }
+        : { market: { base_size: sizeStr } },
+  });
+  let body = mkBody();
   console.log('[revolut] Placing order:', JSON.stringify(body));
   // #K1 withStatus: the thrown error carries the HTTP status (venue_status), so the #93 sale can tell a rate limit (429,
   // nothing placed) from an ambiguous failure. A non-2xx answer now always throws (it used to count as placed when the
   // body had no message field); an unreadable body throws as before (JSON.parse used to throw).
-  const rs = await revolutRequest('POST', '/orders', body, null, { withStatus: true });
+  let rs = await revolutRequest('POST', '/orders', body, null, { withStatus: true });
+  { // #14 one retry when the venue names the precision it wants: a 400 refusal places nothing, so re-sending is safe
+    const pm = sizeStr != null && rs && rs.status === 400 && /precision must not exceed (\d{1,2}) decimal/i.exec(String((rs.body && (rs.body.message || JSON.stringify(rs.body))) || ''));
+    if (pm) {
+      const cut = truncDecimals(sizeStr, Number(pm[1]));
+      if (cut !== sizeStr && Number(cut) > 0) {
+        console.log('[revolut] #14 ' + revolutSymbol + ' size ' + sizeStr + ' -> ' + cut + ' (venue allows ' + pm[1] + ' decimals) - retrying once');
+        sizeStr = cut; body = mkBody(); rs = await revolutRequest('POST', '/orders', body, null, { withStatus: true });
+      }
+    }
+  }
   const result = rs.body || {};
   console.log('[revolut] Full order response:', JSON.stringify(result));
   if (!rs.ok || result.raw !== undefined || result.message || result.error || result.errors) {
@@ -191,11 +205,11 @@ async function placeRevolutOrder(symbol, side, orderType, baseSize, price = null
     const initStatus = od.state || od.status || (orderType === 'limit' ? 'pending_new' : 'filled');
     await db.execute(
       'INSERT INTO pending_orders (order_id, client_order_id, symbol, side, order_type, quantity, limit_price, status, last_pipeline_qty) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE status = VALUES(status)',
-      [String(oid), clientOrderId, revolutSymbol, side.toUpperCase(), orderType, (baseSize != null ? baseSize : null), (price != null ? price : null), initStatus, Number(pipelinedQty) || 0]
+      [String(oid), clientOrderId, revolutSymbol, side.toUpperCase(), orderType, (sizeStr != null ? Number(sizeStr) : (baseSize != null ? baseSize : null)), (price != null ? price : null), initStatus, Number(pipelinedQty) || 0]
     );
     if (orderType === 'limit') console.log('[orders] Recorded resting LIMIT order ' + oid + ' ' + side + ' ' + revolutSymbol + ' @ ' + price + ' (status ' + initStatus + ')');
   } catch (e) { console.error('[orders] pending_orders capture failed:', e.message); }
-  return { ...result, client_order_id: clientOrderId };
+  return { ...result, client_order_id: clientOrderId, sent_base_size: sizeStr };   // #14 the size actually sent (callers journal it)
 }
 
 async function sweepToUSDT(proceedsUsd, sourceSymbol, realisedPnlUsd = null) {
@@ -15434,6 +15448,38 @@ async function getPairQuoteStep(symbol) {   // #387 price increment per pair, ca
     return q > 0 ? q : null;
   } catch (e) { return null; }
 }
+// #14 quantity step per pair from the same cached /configuration/pairs read as getPairQuoteStep. null = unknown.
+async function getPairBaseStep(symbol) {
+  try {
+    await getPairQuoteStep(symbol);   // refreshes the shared cache when it is stale
+    const key = String(symbol).toUpperCase().replace('-', '/'), e = _pairSteps.map && (_pairSteps.map[key] || _pairSteps.map[key.replace('/', '-')]);
+    const b = e && e.base_step != null ? Number(e.base_step) : null;
+    return b > 0 ? b : null;
+  } catch (e) { return null; }
+}
+// Cut a quantity DOWN to dec decimals as a decimal string (15841.85415808, 4 -> "15841.8541"). Digits are cut from the plain
+// decimal text, never rounded, so the result can never be more than the quantity given (5.99999999, 0 -> "5", not "6").
+function truncDecimals(q, dec) {
+  const n = Number(q); if (!Number.isFinite(n) || n <= 0) return String(q);
+  const d = Math.max(0, Math.min(12, Math.floor(Number(dec) || 0)));
+  let s = typeof q === 'string' && /^\d+(\.\d+)?$/.test(q.trim()) ? q.trim() : String(n);
+  if (/e/i.test(s)) s = n.toFixed(20);
+  const i = s.indexOf('.');
+  if (i < 0) return s;
+  return d === 0 ? s.slice(0, i) : s.slice(0, i + 1 + d);
+}
+async function venueBaseSizeStr(symbol, qty) {
+  const step = await getPairBaseStep(symbol);
+  if (!(step > 0)) {   // unknown step: exactly as before #14; say so once per pair when the pairs list WAS read (a renamed field shows up)
+    const sk = String(symbol).toUpperCase(), seen = _pairSteps.noBase || (_pairSteps.noBase = new Set());
+    if (_pairSteps.map && !seen.has(sk)) { seen.add(sk); console.log('[revolut] #14 no base_step for ' + sk + ' in /configuration/pairs - size sent unrounded (' + qty + ')'); }
+    return String(qty);
+  }
+  const l = Math.log10(step);
+  if (Math.abs(l - Math.round(l)) < 1e-9 && step < 1) return truncDecimals(qty, -Math.round(l));   // 0.0001 -> 4 decimals
+  const k = Math.floor(Number(qty) / step);   // other steps (1, 5, 0.5): whole steps, rounded down (float error only ever cuts one more step)
+  return k > 0 ? (k * step).toFixed(Math.min(12, priceDecimals(step))) : String(qty);   // less than one step: as before #14
+}
 async function edgeSellCheck(symbol, coinBase, price) {
   const d = await computeDerivedFloor(symbol, coinBase);
   if (!(Number(d.floor) > 0) || !(Number(price) > 0)) return { edge: false, reason: 'no floor or price' };
@@ -15608,6 +15654,7 @@ async function autoExecuteSell(symbol, maxPct, analysis, confidence, opts = {}) 
     } else {
       aeOrderSent = true;   // #K1
       aeOrder = await placeRevolutOrder(symbol, 'sell', 'market', sellQty, null, null, opts.clientOrderId || null);
+      { const sq = aeOrder ? Number(aeOrder.sent_base_size) : NaN; if (sq > 0 && sq < sellQty) { sellQty = sq; valueUSD = sellQty * currentPrice; } }   // #14 journal what was sold, not what was asked
     }
 
     const [aeRevIns] = await db.execute(
