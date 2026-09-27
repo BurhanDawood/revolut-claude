@@ -2922,7 +2922,7 @@ async function ensurePendingCapTable() {
 // by hand, e.g. during a restart - 23 Sept: $201.66 of HONEY proceeds spent on DASH/JTO/COTI/IDEX/AST) then look
 // exactly like a hidden card payment. Revolut's own order history is the ground truth: the USD value of BUY orders
 // that FILLED in the window. (Same call pattern as the #330 history reader: epoch-ms dates, '?' not signed.)
-async function venueBuysUsdInWindow(windowMs) {
+async function venueBuysUsdInWindow(windowMs, skipCoins) {   // #C4 skipCoins: e.g. ['USDT','USD'] - a top-up is not a buy that spends USDT
   const end = Date.now(), start = end - windowMs;
   const qs = new URLSearchParams({ start_date: String(start), end_date: String(end), limit: '200' });
   const page = await revolutRequest('GET', '/orders/historical?' + qs.toString());
@@ -2932,7 +2932,9 @@ async function venueBuysUsdInWindow(windowMs) {
   for (const o of rows) {
     if (String(o.side || '').toLowerCase() !== 'buy') continue;
     const q = Number(o.filled_quantity), p = Number(o.average_fill_price);
-    if (q > 0 && p > 0) { usd += q * p; n++; coins.add(String(o.symbol || '').split(/[\/-]/)[0]); }
+    const coin = String(o.symbol || '').split(/[\/-]/)[0].toUpperCase();
+    if (skipCoins && skipCoins.includes(coin)) continue;
+    if (q > 0 && p > 0) { usd += q * p; n++; coins.add(coin); }
   }
   return { usd: Number(usd.toFixed(2)), n, coins: [...coins] };
 }
@@ -2941,6 +2943,28 @@ async function handleMoneyButton(typeCode, idStr, choice, reply) {
   const id = parseInt(idStr, 10);
   if (!Number.isFinite(id) || id <= 0) { await reply('\u26a0\ufe0f That button has no valid reference.'); return; }
 
+  if (typeCode === 'ip') {   // #C4 'It was a payment' on a USDT trade-funding notice
+    const [rows] = await db.execute('SELECT * FROM trading_journal WHERE id = ?', [id]);
+    const row = rows && rows[0];
+    if (!row || row.action !== 'transfer' || row.symbol !== 'USDT') { await reply('Already handled - that entry has already been changed.'); return; }
+    const amt = Math.abs(parseFloat(row.quantity) || 0);
+    // The reconciler may already have written this payment from Revolut's own record: then counting it here would deduct twice.
+    const [rc] = await db.execute("SELECT id FROM trading_journal WHERE action = 'payment' AND source = 'reconciler' AND symbol IN ('USDT', 'USD') AND ABS(quantity - ?) <= GREATEST(0.011, ? * 0.002) AND created_at >= ? LIMIT 1",
+      [amt, amt, row.created_at]).catch(() => [[]]);
+    if (rc && rc.length) { await reply('The reconciler already counted this payment from Revolut\'s record (journal #' + rc[0].id + '), so capital was already lowered. Nothing changed.\nCapital: $' + totalInvestedCapital.toFixed(2)); return; }
+    // CLAIM: only the tap that changes the row proceeds.
+    const [up] = await db.execute("UPDATE trading_journal SET action = 'payment', source = 'revolut_card', reasoning = CONCAT(COALESCE(reasoning, ''), ' [marked a payment by button]') WHERE id = ? AND action = 'transfer' AND symbol = 'USDT'", [id]);
+    if (!up || up.affectedRows !== 1) { await reply('Already handled.'); return; }
+    const before = totalInvestedCapital;
+    try {
+      await updateInvestedCapital(before - amt, 'Button: USDT -$' + amt.toFixed(2) + ' was a payment (j' + id + ')', { payment: true });
+    } catch (e) {
+      await reply('\u26a0\ufe0f Entry j' + id + ' is now a payment, but the capital update FAILED: ' + e.message + '. Capital unchanged at $' + before.toFixed(2) + '.');
+      return;
+    }
+    await reply('\u2705 Logged as a payment ($' + amt.toFixed(2) + ').\nCapital: $' + before.toFixed(2) + ' \u2192 $' + totalInvestedCapital.toFixed(2));
+    return;
+  }
   if (typeCode === 'np') {
     const [rows] = await db.execute('SELECT * FROM trading_journal WHERE id = ?', [id]);
     const row = rows && rows[0];
@@ -16560,22 +16584,34 @@ async function checkPortfolio() {
           } else {
             // Unexplained USDT decrease (no matching USD/crypto increase) — could be a card payment or trade-funding.
             // Fix B (#82): if a crypto trade happened in last 10 min, this is trade-funding, not a payment.
+            // #C4: coin buys only (a USD->USDT top-up is not a buy that spends USDT), and they must be big enough to
+            // explain the drop. Before, ANY buy in 10 min - even the top-up itself - swallowed a card payment silently.
             const [recentTrade] = await db.execute(
-              `SELECT id FROM trading_journal
+              `SELECT COALESCE(SUM(ABS(value_usd)), 0) AS usd, GROUP_CONCAT(DISTINCT symbol) AS syms FROM trading_journal
                WHERE action IN ('buy', 'add')
                AND source IN ('claude_mcp', 'auto_detected', 'manual', 'agent')   -- #B21
-               AND created_at > DATE_SUB(NOW(), INTERVAL 10 MINUTE)
-               LIMIT 1`
+               AND symbol NOT IN ('USDT', 'USD', 'USDT-USD', 'USDT/USD')
+               AND created_at > DATE_SUB(NOW(), INTERVAL 10 MINUTE)`
             ).catch(() => [[]]);
+            const rtUsd = recentTrade && recentTrade[0] ? Number(recentTrade[0].usd) || 0 : 0;
 
-            let vB = null; try { vB = await venueBuysUsdInWindow(30 * 60 * 1000); } catch (e) { vB = null; }   // #395
-            if (recentTrade.length > 0 || (vB && vB.usd >= decrease * 0.9)) {
-              console.log(`[usdt] USDT decrease $${decrease.toFixed(2)} — recent trade detected, treating as trade-funding (no capital change)`);
-              await db.execute(
+            let vB = null; try { vB = await venueBuysUsdInWindow(30 * 60 * 1000, ['USDT', 'USD']); } catch (e) { vB = null; }   // #395 #C4
+            if (rtUsd >= decrease * 0.9 || (vB && vB.usd >= decrease * 0.9)) {
+              console.log(`[usdt] USDT decrease $${decrease.toFixed(2)} — coin buys cover it (journal $${rtUsd.toFixed(2)}, venue $${vB ? vB.usd : 'n/a'}), treating as trade-funding (no capital change)`);
+              const [insTF] = await db.execute(
                 `INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source, tool_key)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'detector')`,
                 ['USDT', 'transfer', 1.00, decrease, decrease,
                  `USDT used for trade funding — no capital change (#82 fix B)`, 'neutral', 'auto_internal']
+              ).catch(() => [null]);
+              // #C4 never silent: say what it was matched to, with a button to count it as a payment instead.
+              const tfId = insTF && insTF.insertId ? insTF.insertId : null;
+              const tfCoins = (vB && vB.coins && vB.coins.length ? vB.coins.join(', ') : String((recentTrade[0] && recentTrade[0].syms) || 'your buys'));
+              await sendTelegram(
+                `\ud83d\udd04 USDT -$${decrease.toFixed(2)} matched to your buys (${tfCoins})\n` +
+                `Counted as paying for them. Capital unchanged: $${totalInvestedCapital.toFixed(2)}\n\n` +
+                `If you spent it (card payment or withdrawal), tap <b>It was a payment</b>.`,
+                tfId ? buildAlertKeyboard(String(tfId), ['It was a payment'], 'ip') : undefined
               ).catch(() => {});
             } else {
               // No offsetting increase, no recent trade = card payment.
@@ -26069,7 +26105,7 @@ app.post('/telegram-webhook', async (req, res) => {
       // is a trade button. Any other 'td' now falls through to the alert handler below, as it did before #334.
       // New Trade Detected buttons use 'tj'; numeric 'td' keeps already-sent ones working.
       const cbIsTradeJournal = cbMoneyType === 'tj' || (cbMoneyType === 'td' && /^\d+$/.test(cbCoin));
-      if (cbMoneyType === 'np' || cbMoneyType === 'cc' || cbIsTradeJournal || cbMoneyType === 'ta' || cbMoneyType === 'mu' ||
+      if (cbMoneyType === 'np' || cbMoneyType === 'ip' || cbMoneyType === 'cc' || cbIsTradeJournal || cbMoneyType === 'ta' || cbMoneyType === 'mu' ||
           cbMoneyType === 'sd' || cbMoneyType === 'sp' || cbMoneyType === 'rp' || cbMoneyType === 'db' || cbMoneyType === 'sk' || cbMoneyType === 'ro' || cbMoneyType === 'rq' || cbMoneyType === 'sx') {
         await ackCb('Working...');
         try {
