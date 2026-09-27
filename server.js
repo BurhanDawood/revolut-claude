@@ -15575,8 +15575,11 @@ async function offerDeferredBuy(symbol, path, usd, signalPrice, ctx, headline, c
     const usdtNow = await getRevolutUsdtAvailable();   // #C6 message only
     await sendTelegram((headline ? headline + '\n\n' : '') +
       '💳 <b>FUND IT YOURSELF? - ' + coin + '</b>\n' + (DEFERRED_PATH_LABEL[path] || path) + ' of $' + Number(usd).toFixed(2) + ' at ~' + fmtPriceShort(Number(signalPrice)) +
-      ' was refused: not enough USD' + (short != null ? ' (short $' + short.toFixed(2) + ')' : '') + '.' + usdtHint(usdtNow) + '\n' +
-      'Add USD in Revolut X, then tap <b>Buy now</b>: you see the live price first and confirm with a second tap. Valid 24 h; reminders when the price moves 5%.',
+      ' was refused: not enough USD' + (short != null ? ' (short $' + short.toFixed(2) + ')' : '') + '.' +
+      (usdtNow != null && usdtNow >= 1 ? ' You also hold $' + usdtNow.toFixed(2) + ' USDT.' : '') + '\n' +
+      (usdtNow != null && usdtNow >= 1   // #C7
+        ? 'Tap <b>Buy now</b>: you see the live price first, then <b>Convert USDT &amp; buy</b> sells just enough USDT for USD and buys with it (or add USD yourself and tap Confirm).'
+        : 'Add USD in Revolut X, then tap <b>Buy now</b>: you see the live price first and confirm with a second tap.') + ' Valid 24 h; reminders when the price moves 5%.',
       deferredKeyboard(id, usd));
     sent = true;
     return id;
@@ -15585,6 +15588,21 @@ async function offerDeferredBuy(symbol, path, usd, signalPrice, ctx, headline, c
     if (!sent && headline) await sendTelegram(headline).catch(() => {});
     return null;
   }
+}
+
+// #C7 how much USDT to sell so free USD covers usd: the shortfall + 1% (the conversion fee and any USDT discount), at
+// least USDT_CONVERT_MIN, never more than the USDT available. free < 0 (cash set aside for other buy-backs exceeds the
+// USD) = not offered: the button only ever covers THIS buy.
+const USDT_CONVERT_MIN = 2;
+async function usdtConvertPlan(usd, free) {
+  if (!(Number(free) >= 0)) return { ok: false, why: 'Cash set aside for pending buy-backs is more than your USD, so converting for this buy alone is not offered - convert USDT in Revolut X yourself.' };
+  const need = Number(usd) - Number(free);
+  if (!(need > 0)) return { ok: false, why: '' };
+  const usdt = await getRevolutUsdtAvailable();
+  if (usdt == null) return { ok: false, why: 'Could not read your USDT balance - nothing converted.' };
+  const sell = Math.max(USDT_CONVERT_MIN, Math.ceil(need * 1.01 * 100) / 100);
+  if (usdt < sell) return { ok: false, usdt, why: usdt >= 1 ? 'Your $' + usdt.toFixed(2) + ' USDT does not cover it (needs $' + sell.toFixed(2) + ' with a 1% margin for the conversion).' : '' };
+  return { ok: true, usdt, need, sell };
 }
 
 async function handleDeferredBuyButton(idStr, choice, reply) {
@@ -15603,7 +15621,7 @@ async function handleDeferredBuyButton(idStr, choice, reply) {
     const [u] = await db.execute("UPDATE deferred_buys SET status = 'cancelled', done_at = NOW() WHERE id = ? AND status = 'pending'", [id]);
     await reply(u && u.affectedRows === 1 ? 'Cancelled - the ' + coin + ' buy will not be offered again.' : 'Already handled.'); return;
   }
-  if (choice !== 1 && choice !== 2) { await reply('Unrecognised button.'); return; }
+  if (choice !== 1 && choice !== 2 && choice !== 4) { await reply('Unrecognised button.'); return; }   // #C7 4 = Convert USDT & buy
   const price = await getCurrentPrice(r.symbol).catch(() => null);
   if (!(price > 0)) { await reply('⚠️ Could not read the ' + coin + ' price right now - nothing bought. Try again in a minute.'); return; }
   const cash = await getAvailableUSD('revolut').catch(() => null);
@@ -15616,22 +15634,34 @@ async function handleDeferredBuyButton(idStr, choice, reply) {
   const preview = async (note) => {
     await db.execute("UPDATE deferred_buys SET preview_price = ?, preview_at = NOW() WHERE id = ? AND status = 'pending'", [price, id]);
     const enough = free != null && free >= usd;
+    const cv = !enough && free != null ? await usdtConvertPlan(usd, free) : null;   // #C7
     await sendTelegram((note ? note + '\n\n' : '') + '🔎 <b>REVIEW BUY - ' + coin + '</b>\n' +
       (DEFERRED_PATH_LABEL[r.path] || r.path) + ' signalled at ' + fmtPriceShort(sig) + '.\n' +
       'Now ' + fmtPriceShort(price) + ': ' + deferredMoved(price, sig) + ' since the signal.\n' +
       'Amount $' + usd.toFixed(2) + ' at market (~' + formatTradeQty(usd / price) + ' ' + coin + ').\n' +
       'USD available $' + Number(cash).toFixed(2) + (resv > 0 ? ' (of which $' + resv.toFixed(2) + ' is set aside for pending buy-backs)' : '') +
       (free == null ? ' - could not check the cash set aside for pending buy-backs, so no Confirm yet. Tap Check again.'
-        : enough ? '.\nTap <b>Confirm</b> within 10 minutes to buy.' : ' - still short $' + (usd - free).toFixed(2) + ' of free USD. Top up, then tap Check again.'),
-      { inline_keyboard: [[ enough ? { text: 'Confirm buy $' + usd.toFixed(2), callback_data: 'a:' + id + ':2:db' } : { text: 'Check again', callback_data: 'a:' + id + ':1:db' },
-                            { text: 'Cancel', callback_data: 'a:' + id + ':3:db' } ]] });
+        : enough ? '.\nTap <b>Confirm</b> within 10 minutes to buy.'
+        : ' - still short $' + (usd - free).toFixed(2) + ' of free USD.' + (cv && cv.ok
+          ? '\nTap <b>Convert USDT &amp; buy</b> within 10 minutes: it sells $' + cv.sell.toFixed(2) + ' of your $' + cv.usdt.toFixed(2) + ' USDT for USD (1% margin for the conversion), then buys straight away. Or top up USD and tap Check again.'
+          : (cv && cv.why ? '\n' + cv.why : '') + ' Top up, then tap Check again.')),
+      { inline_keyboard: enough
+        ? [[ { text: 'Confirm buy $' + usd.toFixed(2), callback_data: 'a:' + id + ':2:db' }, { text: 'Cancel', callback_data: 'a:' + id + ':3:db' } ]]
+        : cv && cv.ok
+          ? [[ { text: 'Convert $' + cv.sell.toFixed(2) + ' USDT & buy', callback_data: 'a:' + id + ':4:db' } ],
+             [ { text: 'Check again', callback_data: 'a:' + id + ':1:db' }, { text: 'Cancel', callback_data: 'a:' + id + ':3:db' } ]]
+          : [[ { text: 'Check again', callback_data: 'a:' + id + ':1:db' }, { text: 'Cancel', callback_data: 'a:' + id + ':3:db' } ]] });
   };
   if (choice === 1) { await preview(); return; }
-  // CONFIRM (choice 2): only straight after a review, at a price no more than 2% above it, with the cash there.
+  // CONFIRM (choice 2, or 4 = convert USDT first #C7): only straight after a review, at a price no more than 2% above it, with the cash there.
   if (!r.preview_at || !(Number(r.preview_age_s) >= 0 && Number(r.preview_age_s) <= 600)) { await preview('That review is more than 10 minutes old - here is a fresh one.'); return; }
   if (price > Number(r.preview_price) * 1.02) { await preview('The price rose more than 2% since your review - check it again.'); return; }
   if (free == null) { await preview('Could not check the cash set aside for pending buy-backs - nothing bought.'); return; }
-  if (free < usd) { await preview(resv > 0 ? 'Not enough FREE USD: $' + Number(cash).toFixed(2) + ' available, of which $' + resv.toFixed(2) + ' is set aside for pending buy-backs.' : 'Not enough USD yet.'); return; }
+  let conv = null;   // #C7 the USDT sale that covers the shortfall - planned BEFORE the claim, placed after it
+  if (free < usd) {
+    if (choice === 4) conv = await usdtConvertPlan(usd, free);
+    if (!conv || !conv.ok) { await preview(conv && conv.why ? conv.why : (resv > 0 ? 'Not enough FREE USD: $' + Number(cash).toFixed(2) + ' available, of which $' + resv.toFixed(2) + ' is set aside for pending buy-backs.' : 'Not enough USD yet.')); return; }
+  }
   let ctx = {}; try { ctx = typeof r.ctx_json === 'string' ? JSON.parse(r.ctx_json) : (r.ctx_json || {}); } catch (e) { ctx = {}; }
   let am = null;
   if (r.path === 'away') {   // the same session cap as the automatic buy, and the rung must still be there
@@ -15658,12 +15688,29 @@ async function handleDeferredBuyButton(idStr, choice, reply) {
       await reply('The ' + coin + ' Away buy rung was taken a moment ago (the automatic Away buy got there first, or it was removed) - nothing bought.'); return;
     }
   }
+  if (conv) {   // #C7 sell S USDT for USD, wait for the USD, then the normal buy. Short of that: nothing bought, offer back to pending.
+    const back = async (msg) => {
+      await restoreBuyRung(dbRung);
+      await db.execute("UPDATE deferred_buys SET status = 'pending' WHERE id = ? AND status = 'executing'", [id]).catch(() => {});
+      await reply(msg);
+    };
+    try { await placeRevolutOrder('USDT-USD', 'sell', 'market', conv.sell); }
+    catch (e) { await back('⚠️ Revolut X refused the USDT sale: ' + String(e.message || '').slice(0, 150) + '. Nothing converted, nothing bought - the offer is still open.'); return; }
+    let got = null;
+    for (let i = 0; i < 8 && got == null; i++) {
+      await new Promise(res => setTimeout(res, 1500));
+      const c2 = await getAvailableUSD('revolut').catch(() => null);
+      if (c2 != null && Number(c2) - resv >= usd) got = Number(c2);
+    }
+    console.log('[funded-buy] #C7 ' + coin + ' offer ' + id + ': sold ' + conv.sell + ' USDT for USD' + (got != null ? ', USD now $' + got.toFixed(2) : ', USD still short after 12 s - not buying'));
+    if (got == null) { await back('🔄 Sold $' + conv.sell.toFixed(2) + ' USDT for USD, but the USD has not shown in full yet - nothing bought. Tap <b>Buy now</b> again in a minute (the offer is still open; the USDT is now USD).'); return; }
+  }
   let resp;
   try { resp = await placeRevolutOrder(r.symbol, 'buy', 'market', null, null, Number(usd.toFixed(2))); }
   catch (e) {
     await restoreBuyRung(dbRung);   // #413b nothing bought: the Away rung goes back
     await db.execute("UPDATE deferred_buys SET status = 'failed', note = ?, done_at = NOW() WHERE id = ?", [String(e.message || e).slice(0, 200), id]).catch(() => {});
-    await reply('⚠️ Revolut X REFUSED the ' + coin + ' buy: ' + String(e.message || '').slice(0, 150) + '. Nothing bought; this offer is closed.'); return;
+    await reply('⚠️ Revolut X REFUSED the ' + coin + ' buy: ' + String(e.message || '').slice(0, 150) + '. Nothing bought; this offer is closed.' + (conv ? ' The $' + conv.sell.toFixed(2) + ' USDT converted just before is now USD in your account.' : '')); return;
   }
   const qty = usd / price;
   const orderId = (resp && resp.data ? (resp.data.venue_order_id || resp.data.id) : null) || (resp && resp.client_order_id) || null;
@@ -15671,7 +15718,7 @@ async function handleDeferredBuyButton(idStr, choice, reply) {
   try {
     const fbCycle = r.path === 'trough' ? await db.execute('SELECT cycle_id FROM pump_armed_rules WHERE symbol = ? AND active = 1 LIMIT 1', [r.symbol]).then(([x]) => (x.length ? x[0].cycle_id || null : null)).catch(() => null) : null;   // #L1
     const [j] = await db.execute('INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source, tool_key, cycle_id, regime_tag) VALUES (?, ?, ?, ?, ?, ?, ?, ?, \'funded_buy\', ?, ?)',
-      [coin, 'buy', price, qty, usd, 'Funded buy #413: ' + (DEFERRED_PATH_LABEL[r.path] || r.path) + ' refused for lack of cash at ' + fmtPriceShort(sig) + '; topped up and confirmed by Bryan at ~' + fmtPriceShort(price), 'confident', 'funded_buy', fbCycle, await regimeTagFor(coin)]);   // #413b one label per trade; #L1
+      [coin, 'buy', price, qty, usd, 'Funded buy #413: ' + (DEFERRED_PATH_LABEL[r.path] || r.path) + ' refused for lack of cash at ' + fmtPriceShort(sig) + '; ' + (conv ? 'paid by converting ' + conv.sell.toFixed(2) + ' USDT to USD (#C7) and' : 'topped up and') + ' confirmed by Bryan at ~' + fmtPriceShort(price), 'confident', 'funded_buy', fbCycle, await regimeTagFor(coin)]);   // #413b one label per trade; #L1
     journalId = j && j.insertId;
   } catch (e) { console.error('[funded-buy] journal failed:', e.message); }
   await stampVenueOrderId(journalId, resp);
@@ -15679,6 +15726,7 @@ async function handleDeferredBuyButton(idStr, choice, reply) {
   await recordManualDecision(r.symbol, 'buy', 'revolut', price, qty, 'manual_approved', { usd, order_id: orderId, journal_id: journalId,
     path: r.path === 'trough_st' ? 'trough_standalone' : (r.path === 'away' ? 'away_buy' : r.path) });   // #413b the originating path (P0 enum)
   const notes = [];
+  if (conv) notes.push('Paid with USD from $' + conv.sell.toFixed(2) + ' USDT converted just before (capital unchanged). The payment tracker will list it as a USDT->USD conversion or as USDT matched to your buys - that is this buy; do not tap It was a payment.');   // #C7 (Fable note a)
   if (r.path === 'trough') {   // the loop's cycle bookkeeping - only if the loop has not moved on (armed, or a new sale) since
     try {
       const [pr] = await db.execute('SELECT armed, sale_price FROM pump_armed_rules WHERE symbol = ? AND active = 1 LIMIT 1', [r.symbol]);
@@ -16809,6 +16857,10 @@ async function checkPortfolio() {
             // No USDT offset after a full 5-min cycle — genuine fiat withdrawal
             const w = pendingFiatWithdrawal;
             pendingFiatWithdrawal = null;
+            let v136 = null; try { v136 = await venueBuysUsdInWindow(45 * 60 * 1000, ['USDT', 'USD']); } catch (e) { v136 = null; }   // #C7
+            if (v136 && v136.usd >= w * 0.9) {
+              console.log('[withdrawal] #C7 parked $' + w.toFixed(2) + ' USD drop matched by $' + v136.usd + ' of filled coin buys on Revolut X (' + v136.coins.join(', ') + ') - trade-funding, not a withdrawal');
+            } else {
             console.log('[withdrawal] #136 Parked $' + w.toFixed(2) + ' confirmed as genuine withdrawal — auto-logging now');
             const [insW] = await db.execute(
               'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source, tool_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, \'detector\')',
@@ -16828,6 +16880,7 @@ async function checkPortfolio() {
               "Tap <b>Not a withdrawal</b> if it wasn't one, or reply '<b>skip payment " + w.toFixed(2) + "</b>'.",
               wJid ? buildAlertKeyboard(String(wJid), ['Not a withdrawal'], 'np') : undefined
             ).catch(() => {});
+            } // end #C7 venue check
           }
         }
 
@@ -16900,7 +16953,7 @@ async function checkPortfolio() {
             const [recentTrade] = await db.execute(
               `SELECT COALESCE(SUM(ABS(value_usd)), 0) AS usd, GROUP_CONCAT(DISTINCT symbol) AS syms FROM trading_journal
                WHERE action IN ('buy', 'add')
-               AND source IN ('claude_mcp', 'auto_detected', 'manual', 'agent')   -- #B21
+               AND source IN ('claude_mcp', 'auto_detected', 'manual', 'agent', 'funded_buy')   -- #B21 #C7
                AND symbol NOT IN ('USDT', 'USD', 'USDT-USD', 'USDT/USD')
                AND created_at > DATE_SUB(NOW(), INTERVAL 10 MINUTE)`
             ).catch(() => [[]]);
@@ -16991,7 +17044,7 @@ async function checkPortfolio() {
           console.log(`[usdt] #159: USD -$${usdOut159.toFixed(2)} | USDT +$${usdtIn159.toFixed(2)} | gap=$${hidden159.toFixed(2)}`);
           if (hidden159 > 1) {
             const [recentTrade159] = await db.execute(
-              `SELECT id FROM trading_journal WHERE action IN ('buy','add') AND source IN ('claude_mcp','auto_detected','manual') AND created_at > DATE_SUB(NOW(), INTERVAL 10 MINUTE) LIMIT 1`
+              `SELECT id FROM trading_journal WHERE action IN ('buy','add') AND source IN ('claude_mcp','auto_detected','manual','agent','funded_buy','trough_auto','away_auto','ladder') AND created_at > DATE_SUB(NOW(), INTERVAL 10 MINUTE) LIMIT 1`   // #C7 bot buys too
             ).catch(() => [[]]);
             // #395 the journal can miss buys (manual, during a restart) - ask Revolut which buys actually filled
             let v159 = null; try { v159 = await venueBuysUsdInWindow(30 * 60 * 1000); } catch (e) { console.warn('[usdt] #395 venue check failed:', e.message); }
@@ -17065,12 +17118,15 @@ async function checkPortfolio() {
           const [recentBuy86] = await db.execute(
             `SELECT id FROM trading_journal
              WHERE action IN ('buy', 'add')
-             AND source IN ('claude_mcp', 'auto_detected', 'manual', 'agent')
+             AND source IN ('claude_mcp', 'auto_detected', 'manual', 'agent', 'funded_buy', 'trough_auto', 'away_auto', 'ladder')   -- #C7 bot buys too
              AND created_at > DATE_SUB(NOW(), INTERVAL 10 MINUTE)
              LIMIT 1`
           ).catch(() => [[]]);
-          if (recentBuy86.length > 0) {
-            console.log(`[withdrawal] USD -$${usdDecrease.toFixed(2)} — recent buy detected, treating as trade-funding (no flag)`);
+          // #C7 the journal can miss a buy (placed by hand, or during a restart): filled coin buys on Revolut X count too (#395)
+          let v86 = null;
+          if (!recentBuy86.length) { try { v86 = await venueBuysUsdInWindow(30 * 60 * 1000, ['USDT', 'USD']); } catch (e) { v86 = null; } }
+          if (recentBuy86.length > 0 || (v86 && v86.usd >= usdDecrease * 0.9)) {
+            console.log(`[withdrawal] USD -$${usdDecrease.toFixed(2)} — recent buy detected, treating as trade-funding (no flag)` + (v86 ? ' (venue buys $' + v86.usd + ': ' + v86.coins.join(', ') + ')' : ''));
           } else {
             // #127: skip if a resting limit order (<15min) explains the USD drop.
             const [limitRes63] = await db.execute(
