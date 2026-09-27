@@ -2855,11 +2855,13 @@ function getCapitalSummary(portfolioValue) {
   return { invested, portfolioValue, pnl, pnlPct, breakEvenPct };
 }
 
-async function updateInvestedCapital(newTotal, note) {
+async function updateInvestedCapital(newTotal, note, opts) {
   const change = newTotal - totalInvestedCapital;
   const safeNote = note ? String(note).substring(0, 200) : null; // invested_capital.note is VARCHAR(200)
-  // Block suspicious single-cycle drops > $200 — real payments are rarely this large
-  if (change < -200) {
+  // Block suspicious single-cycle drops > $200 — real payments are rarely this large.
+  // #C3 (Bryan 27 Sep): except payments ({ payment: true }) - they always apply, and their alert has the undo button.
+  if (change < -200 && opts && opts.payment) console.log(`[capital] #C3 payment applied without a hold: $${totalInvestedCapital.toFixed(2)} → $${Number(newTotal).toFixed(2)} | ${note}`);
+  if (change < -200 && !(opts && opts.payment)) {
     console.error(`[capital] SUSPICIOUS DROP BLOCKED: $${totalInvestedCapital.toFixed(2)} → $${newTotal.toFixed(2)} (-$${Math.abs(change).toFixed(2)}) | reason: ${note}`);
     // #336: STORE the blocked change so a button can confirm exactly this one. Previously nothing
     // was stored and 'confirm capital X' set capital to whatever number was typed.
@@ -3364,7 +3366,7 @@ async function handleTradeButton(idStr, choice, reply) {
     else if (val > 0) {
       const before = totalInvestedCapital;
       try {
-        await updateInvestedCapital(before - val, 'Paid with ' + coin + ' (trade j' + id + '): -$' + val.toFixed(2));
+        await updateInvestedCapital(before - val, 'Paid with ' + coin + ' (trade j' + id + '): -$' + val.toFixed(2), { payment: true });
       } catch (e) {
         await reply('\u26a0\ufe0f Logged as a payment, but the capital update FAILED: ' + e.message + '. Capital unchanged at $' + before.toFixed(2) + '.');
         return;
@@ -11202,7 +11204,7 @@ async function reconcileTransactions(daysBack = 30, dryRun = null) {
         let capMsg = '';
         if (valueUsd) {
           const before = totalInvestedCapital;
-          await updateInvestedCapital(before - valueUsd, 'Reconciler: card payment with ' + currency + ' (j' + j.id + ', tx ' + tx.id + '): -$' + valueUsd.toFixed(2));
+          await updateInvestedCapital(before - valueUsd, 'Reconciler: card payment with ' + currency + ' (j' + j.id + ', tx ' + tx.id + '): -$' + valueUsd.toFixed(2), { payment: true });
           const applied = Math.abs(totalInvestedCapital - (before - valueUsd)) < 0.005;
           capMsg = applied ? '\nCapital: $' + before.toFixed(2) + ' \u2192 $' + totalInvestedCapital.toFixed(2)
                            : '\n\u26a0\ufe0f Capital change HELD for your confirmation - see the capital alert.';
@@ -11349,7 +11351,7 @@ async function reconcileTransactions(daysBack = 30, dryRun = null) {
           const note = `Reconciler ${action}: tx ${tx.id} ($${valueUsd.toFixed(2)})`;
 
           if (action === 'payment') {
-            await updateInvestedCapital(totalInvestedCapital - valueUsd, note);
+            await updateInvestedCapital(totalInvestedCapital - valueUsd, note, { payment: true });
           } else if (action === 'deposit') {
             await updateInvestedCapital(totalInvestedCapital + valueUsd, note);
           }
@@ -11366,7 +11368,12 @@ async function reconcileTransactions(daysBack = 30, dryRun = null) {
           const journalId = ins.insertId;
 
           const actionHeader = action === 'payment' ? '💳 <b>RECONCILER PAYMENT' : '📥 <b>RECONCILER DEPOSIT';
-          const capNote = capitalBlocked ? '\n⚠️ Capital drop > $200 BLOCKED (pending confirmation)\n' : '';
+          // #C1 (Bryan 27 Sep): show invested capital before -> after, as the old card-payment alert did.
+          // When the capital guard holds a drop over $200, show where it WOULD go and that it waits for Confirm.
+          const capTarget = action === 'payment' ? capBefore - valueUsd : capBefore + valueUsd;
+          const capNote = capitalBlocked
+            ? `\nCapital: $${capBefore.toFixed(2)} (unchanged)\n⚠️ Drop over $200 HELD: it goes to $${capTarget.toFixed(2)} only if you tap Confirm on the capital alert.\n`
+            : `\nCapital: $${capBefore.toFixed(2)} \u2192 $${totalInvestedCapital.toFixed(2)}\n`;
           const priceDisplay = (currency !== 'USD' && currency !== 'USDT') ? ` @ $${priceUsed.toFixed(4)}` : '';
           const alertMsg = `${actionHeader} — ${currency}</b>\n\n` +
             `Amount: ${txAmt} ${currency}${priceDisplay}\n` +
@@ -11408,6 +11415,7 @@ async function reconcileTransactions(daysBack = 30, dryRun = null) {
             `Amount: ${txAmt} ${currency}\n` +
             `Value: UNKNOWN\n` +
             `Transaction ID: ${tx.id}\n\n` +
+            `Capital: $${totalInvestedCapital.toFixed(2)} (unchanged)\n` +   // #C1
             `⚠️ Exchange rate unknown — NO capital change made. Needs manual entry.\n\n` +
             `Choose an action:`;
 
@@ -16474,7 +16482,7 @@ async function checkPortfolio() {
             const wJid = insW && insW.insertId ? insW.insertId : null;
             const prevCapW2 = totalInvestedCapital;
             const newCapW2  = totalInvestedCapital - w;
-            await updateInvestedCapital(newCapW2, 'Fiat withdrawal auto-logged: -$' + w.toFixed(2));
+            await updateInvestedCapital(newCapW2, 'Fiat withdrawal auto-logged: -$' + w.toFixed(2), { payment: true });
             // Report what capital ACTUALLY did - a withdrawal over $200 is HELD by the guard.
             const appliedW = Math.abs(totalInvestedCapital - newCapW2) < 0.005;
             await sendTelegram(
@@ -16603,7 +16611,7 @@ async function checkPortfolio() {
                 const jid146 = ins146 && ins146.insertId ? ins146.insertId : null;
                 const prevCap = totalInvestedCapital;
                 const newCap  = totalInvestedCapital - netPaymentAmt;
-                await updateInvestedCapital(newCap, `Card payment auto-logged: -$${netPaymentAmt.toFixed(2)}`);
+                await updateInvestedCapital(newCap, `Card payment auto-logged: -$${netPaymentAmt.toFixed(2)}`, { payment: true });
                 // Report what capital ACTUALLY did - a payment over $200 is HELD by the guard.
                 const applied146 = Math.abs(totalInvestedCapital - newCap) < 0.005;
                 await sendTelegram(
@@ -16662,7 +16670,7 @@ async function checkPortfolio() {
                 const jid159 = ins159 && ins159.insertId ? ins159.insertId : null;
                 const prevCap159 = totalInvestedCapital;
                 const newCap159  = totalInvestedCapital - hidden159;
-                await updateInvestedCapital(newCap159, `#159 Hidden card payment auto-logged: -$${hidden159.toFixed(2)}`);
+                await updateInvestedCapital(newCap159, `#159 Hidden card payment auto-logged: -$${hidden159.toFixed(2)}`, { payment: true });
                 const applied159 = Math.abs(totalInvestedCapital - newCap159) < 0.005;
                 await sendTelegram(
                   `\ud83d\udcb3 PAYMENT $${hidden159.toFixed(2)} USDT\n` +
@@ -24739,7 +24747,7 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
               if (payVal && payVal > 0) {
                 const prev = totalInvestedCapital;
                 const next = totalInvestedCapital - payVal;
-                await updateInvestedCapital(next, `Auto-deducted (batch): ${coinBase} payment -$${payVal.toFixed(2)}`);
+                await updateInvestedCapital(next, `Auto-deducted (batch): ${coinBase} payment -$${payVal.toFixed(2)}`, { payment: true });
                 capitalTouched = true;
                 results.push({ symbol: coinBase, type, status: 'ok', detail: `payment -$${payVal.toFixed(2)} | capital $${prev.toFixed(2)} -> $${next.toFixed(2)}` });
               } else {
@@ -25606,7 +25614,7 @@ async function processAlertChoice(ctx, choice, sendReply) {
     const { journalId, txId, action: origAction, valueUsd } = ctx;
     if (choice === 1) {
       // 'Correct': no-op, acknowledges
-      await sendReply(`✅ <b>Reconciler ${origAction} confirmed for ${coinBase} (tx ${txId}).</b>`);
+      await sendReply(`✅ <b>Reconciler ${origAction} confirmed for ${coinBase} (tx ${txId}).</b>\nCapital: $${totalInvestedCapital.toFixed(2)}`);   // #C1
       return;
     } else if (choice === 2) {
       // 'Internal transfer': change action to 'transfer' & reverse capital change
@@ -25632,19 +25640,40 @@ async function processAlertChoice(ctx, choice, sendReply) {
       // reversed.' unconditionally, the same false-success bug fixed in update_capital.
       let capNote = 'Capital change reversed.';
       let capHeld = false;
+      const capWas = totalInvestedCapital;   // #C1 capital before -> after in the reply
       if (curVal !== null && curVal > 0 && !isPendingCap) {
         const capTarget = curAction === 'payment' ? totalInvestedCapital + curVal
                         : curAction === 'deposit' ? totalInvestedCapital - curVal : null;
         if (capTarget !== null) {
           await updateInvestedCapital(capTarget, `Reconciler correction: reversed ${curAction} for tx ${txId}`);
+          capNote = 'Capital change reversed.\nCapital: $' + capWas.toFixed(2) + ' \u2192 $' + totalInvestedCapital.toFixed(2);
           if (Math.abs(totalInvestedCapital - capTarget) >= 0.005) {
             capHeld = true;
-            capNote = 'Capital reversal is HELD by the capital guard. Reply "confirm capital ' + capTarget.toFixed(2) + '" to apply it, or "skip capital" to leave capital unchanged.';
+            capNote = 'Capital: $' + capWas.toFixed(2) + ' (unchanged)\nThe reversal to $' + capTarget.toFixed(2) + ' is HELD by the capital guard. Reply "confirm capital ' + capTarget.toFixed(2) + '" to apply it, or "skip capital" to leave capital unchanged.';
           }
-        }
+        } else capNote = 'Capital: $' + capWas.toFixed(2) + ' (unchanged)';
+      } else if (isPendingCap && curAction === 'payment' && curVal !== null && curVal > 0 && (vrow.reasoning || '').includes('pending_capital_confirmation')) {
+        // #C2 (27 Sep): a payment over $200 was HELD when the reconciler wrote it. Find that hold (the #395 match: same
+        // delta, within 30 min of the row). Still pending -> cancel it, so a later Confirm cannot deduct money for a
+        // transaction that was skipped. Already CONFIRMED -> the deduction did happen, so add it back. Before, both
+        // cases said 'nothing to reverse': a skipped payment could still be deducted, and a confirmed one stayed deducted.
+        capNote = 'No capital change to reverse - the original write never moved capital.\nCapital: $' + capWas.toFixed(2);
+        try {
+          await ensurePendingCapTable();
+          const [hold] = await db.execute("SELECT id, status FROM pending_capital_changes WHERE ABS(delta + ?) < 0.01 AND created_at BETWEEN DATE_SUB(?, INTERVAL 30 MINUTE) AND DATE_ADD(?, INTERVAL 30 MINUTE) ORDER BY id DESC LIMIT 1",
+            [curVal, vrow.created_at, vrow.created_at]);
+          const h = hold && hold[0];
+          if (h && h.status === 'pending') {
+            const [c] = await db.execute("UPDATE pending_capital_changes SET status = 'cancelled', resolved_at = NOW() WHERE id = ? AND status = 'pending'", [h.id]);
+            if (c && c.affectedRows === 1) capNote = 'Its capital deduction was still on hold, so the hold is cancelled.\nCapital: $' + capWas.toFixed(2) + ' (unchanged)';
+          } else if (h && h.status === 'confirmed') {
+            await updateInvestedCapital(capWas + curVal, `Reconciler correction: reversed confirmed ${curAction} for tx ${txId}`);
+            capNote = 'You had confirmed its capital deduction, so it is added back.\nCapital: $' + capWas.toFixed(2) + ' \u2192 $' + totalInvestedCapital.toFixed(2);
+          }
+        } catch (e) { capNote = 'Could not check the capital hold (' + e.message + '). Capital: $' + capWas.toFixed(2) + ' - check it before relying on it.'; }
       } else if (isPendingCap) {
-        capNote = 'No capital change to reverse - the original write never moved capital.';
-      }
+        capNote = 'No capital change to reverse - the original write never moved capital.\nCapital: $' + capWas.toFixed(2);
+      } else capNote = 'Capital: $' + capWas.toFixed(2) + ' (unchanged)';
       if (capHeld) {
         await db.execute("UPDATE trading_journal SET reasoning = CONCAT(COALESCE(reasoning,''), ' [capital_reversal_pending]') WHERE id = ?", [journalId]);
       }
@@ -25669,19 +25698,40 @@ async function processAlertChoice(ctx, choice, sendReply) {
       // reversed.' unconditionally, the same false-success bug fixed in update_capital.
       let capNote = 'Capital change reversed.';
       let capHeld = false;
+      const capWas = totalInvestedCapital;   // #C1 capital before -> after in the reply
       if (curVal !== null && curVal > 0 && !isPendingCap) {
         const capTarget = curAction === 'payment' ? totalInvestedCapital + curVal
                         : curAction === 'deposit' ? totalInvestedCapital - curVal : null;
         if (capTarget !== null) {
           await updateInvestedCapital(capTarget, `Reconciler correction: reversed ${curAction} for tx ${txId}`);
+          capNote = 'Capital change reversed.\nCapital: $' + capWas.toFixed(2) + ' \u2192 $' + totalInvestedCapital.toFixed(2);
           if (Math.abs(totalInvestedCapital - capTarget) >= 0.005) {
             capHeld = true;
-            capNote = 'Capital reversal is HELD by the capital guard. Reply "confirm capital ' + capTarget.toFixed(2) + '" to apply it, or "skip capital" to leave capital unchanged.';
+            capNote = 'Capital: $' + capWas.toFixed(2) + ' (unchanged)\nThe reversal to $' + capTarget.toFixed(2) + ' is HELD by the capital guard. Reply "confirm capital ' + capTarget.toFixed(2) + '" to apply it, or "skip capital" to leave capital unchanged.';
           }
-        }
+        } else capNote = 'Capital: $' + capWas.toFixed(2) + ' (unchanged)';
+      } else if (isPendingCap && curAction === 'payment' && curVal !== null && curVal > 0 && (vrow.reasoning || '').includes('pending_capital_confirmation')) {
+        // #C2 (27 Sep): a payment over $200 was HELD when the reconciler wrote it. Find that hold (the #395 match: same
+        // delta, within 30 min of the row). Still pending -> cancel it, so a later Confirm cannot deduct money for a
+        // transaction that was skipped. Already CONFIRMED -> the deduction did happen, so add it back. Before, both
+        // cases said 'nothing to reverse': a skipped payment could still be deducted, and a confirmed one stayed deducted.
+        capNote = 'No capital change to reverse - the original write never moved capital.\nCapital: $' + capWas.toFixed(2);
+        try {
+          await ensurePendingCapTable();
+          const [hold] = await db.execute("SELECT id, status FROM pending_capital_changes WHERE ABS(delta + ?) < 0.01 AND created_at BETWEEN DATE_SUB(?, INTERVAL 30 MINUTE) AND DATE_ADD(?, INTERVAL 30 MINUTE) ORDER BY id DESC LIMIT 1",
+            [curVal, vrow.created_at, vrow.created_at]);
+          const h = hold && hold[0];
+          if (h && h.status === 'pending') {
+            const [c] = await db.execute("UPDATE pending_capital_changes SET status = 'cancelled', resolved_at = NOW() WHERE id = ? AND status = 'pending'", [h.id]);
+            if (c && c.affectedRows === 1) capNote = 'Its capital deduction was still on hold, so the hold is cancelled.\nCapital: $' + capWas.toFixed(2) + ' (unchanged)';
+          } else if (h && h.status === 'confirmed') {
+            await updateInvestedCapital(capWas + curVal, `Reconciler correction: reversed confirmed ${curAction} for tx ${txId}`);
+            capNote = 'You had confirmed its capital deduction, so it is added back.\nCapital: $' + capWas.toFixed(2) + ' \u2192 $' + totalInvestedCapital.toFixed(2);
+          }
+        } catch (e) { capNote = 'Could not check the capital hold (' + e.message + '). Capital: $' + capWas.toFixed(2) + ' - check it before relying on it.'; }
       } else if (isPendingCap) {
-        capNote = 'No capital change to reverse - the original write never moved capital.';
-      }
+        capNote = 'No capital change to reverse - the original write never moved capital.\nCapital: $' + capWas.toFixed(2);
+      } else capNote = 'Capital: $' + capWas.toFixed(2) + ' (unchanged)';
 
       const [ccf] = await db.execute('SELECT COUNT(*) AS n FROM coin_cash_flows WHERE journal_id = ?', [journalId]).catch(() => [[{ n: 0 }]]);
       const [txl] = await db.execute('SELECT COUNT(*) AS n FROM tax_lots WHERE journal_id = ?', [journalId]).catch(() => [[{ n: 0 }]]);
@@ -26828,7 +26878,7 @@ app.post('/telegram-webhook', async (req, res) => {
             const newTotal = totalInvestedCapital - paymentValueUsd;
             await updateInvestedCapital(
               newTotal,
-              `Auto-deducted: ${coinBase} payment -$${paymentValueUsd.toFixed(2)}`
+              `Auto-deducted: ${coinBase} payment -$${paymentValueUsd.toFixed(2)}`, { payment: true }   // #C3
             );
 
             await sendReply(
@@ -26977,7 +27027,7 @@ app.post('/telegram-webhook', async (req, res) => {
         );
         const prevCap = totalInvestedCapital;
         const newCap  = totalInvestedCapital - payAmt;
-        await updateInvestedCapital(newCap, `Card payment confirmed: -$${payAmt.toFixed(2)}`);
+        await updateInvestedCapital(newCap, `Card payment confirmed: -$${payAmt.toFixed(2)}`, { payment: true });
         await sendReply(`✅ Payment $${payAmt.toFixed(2)} logged\nCapital: $${prevCap.toFixed(2)} → $${newCap.toFixed(2)}`);
       }
       return res.status(200).json({ ok: true });
@@ -28863,7 +28913,7 @@ app.patch('/api/activity/:id', async (req, res) => {
       if (trade?.value_usd) {
         const amount   = Math.abs(parseFloat(trade.value_usd));
         const newTotal = totalInvestedCapital - amount;
-        await updateInvestedCapital(newTotal, `Payment correction — journal ID ${id}`).catch(e => console.error('[activity] capital update failed:', e.message));
+        await updateInvestedCapital(newTotal, `Payment correction — journal ID ${id}`, { payment: true }).catch(e => console.error('[activity] capital update failed:', e.message));
       }
     }
 
