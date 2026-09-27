@@ -4904,6 +4904,38 @@ async function armReboundTracker(symbol, salePrice, referenceBase, params, saleP
   } catch (e) { console.error('[trough] armReboundTracker error:', e.message); }
 }
 
+// #T1 one line on whether a trough buy of buyUsd can happen by itself. Uses the SAME cash read the buy uses
+// (getAvailableUSD) so the message and the action agree. Never throws.
+// #T1 read-only: every standalone trough tracker with where it stands, from the DB rows the boot loads.
+async function listStandaloneTroughs() {
+  const [rows] = await db.execute('SELECT * FROM standalone_trough_trackers ORDER BY symbol');
+  let cash = null; try { cash = await getAvailableUSD('revolut'); } catch (e) { cash = null; }
+  const out = [];
+  for (const r of rows) {
+    const mem = standaloneTroughTrackers.get(r.symbol) || null;
+    const ex = r.exchange || 'revolut', buy = Number(r.buy_usd), b = Number(r.bounce_pct) || 8;
+    const gate = Number(r.arm_below) > 0 ? Number(r.arm_below) : null, hit = Number(r.gate_hit) === 1 || !!(mem && mem.gateHit);
+    const low = mem && mem.troughPrice != null ? Number(mem.troughPrice) : (Number(r.trough_price) > 0 ? Number(r.trough_price) : null);
+    const px = ex === 'kraken' ? await getKrakenPriceForSymbol(r.symbol).catch(() => null) : await getCurrentPrice(r.symbol).catch(() => null);
+    const p = Number(px) > 0 ? Number(px) : null, buyAt = low != null ? low * (1 + b / 100) : null;
+    const state = gate != null && !hit ? 'DORMANT - waits for ' + fmtPriceShort(gate) + (p ? ' (' + ((gate / p - 1) * 100).toFixed(1) + '% from ' + fmtPriceShort(p) + ')' : ' (no price)')
+      : low == null ? 'watching - no low yet' + (p ? '' : ' (no price: this tracker cannot move)')
+      : 'tracking the low ' + fmtPriceShort(low) + ' - buys at ' + fmtPriceShort(buyAt) + (p ? ' (' + ((buyAt / p - 1) * 100).toFixed(1) + '% from ' + fmtPriceShort(p) + ')' : '');
+    out.push({ coin: String(r.symbol).replace('-USD', ''), exchange: ex, buy_usd: buy, bounce_pct: b, gate: gate, gate_reached: gate != null ? hit : null,
+      low, buys_at: buyAt != null ? Number(buyAt.toPrecision(6)) : null, price: p, floor: Number(r.entry_floor) > 0 ? Number(r.entry_floor) : null,
+      loaded_in_memory: !!mem, armed_at: r.created_at || null, updated_at: r.updated_at || null, state,
+      on_bounce: ex === 'kraken' ? 'alert only (Kraken)' : cash == null ? 'cash unreadable' : cash >= buy ? 'buys by itself ($' + cash.toFixed(2) + ' available)' : 'Buy now offer - $' + (buy - cash).toFixed(2) + ' short' });
+  }
+  return out;
+}
+async function troughCashLine(exchange, buyUsd) {
+  try {
+    if (exchange === 'kraken') return '\nKraken: the bounce is ALERTED only - buy it yourself';
+    const cash = await getAvailableUSD('revolut'), need = Number(buyUsd) || 0;
+    if (cash >= need) return '\nCash: $' + cash.toFixed(2) + ' available - it will buy by itself';
+    return '\n\u26a0\ufe0f Cash: $' + cash.toFixed(2) + ' available, $' + (need - cash).toFixed(2) + ' short. Add USD before the bounce and it buys by itself; otherwise at the bounce you get a <b>Buy now</b> button to fund it and tap.';
+  } catch (e) { return ''; }
+}
 // updateTroughTracker: called from fast-scan Part C each 30s cycle (Phase B).
 // Returns { action: 'buy'|'alert'|'tracking'|'waiting' } or null.
 async function updateTroughTracker(symbol, currentPrice) {
@@ -4983,7 +5015,7 @@ async function abandonCycle(symbol, reason, detail) {
   } catch (e) { console.error('[trough] abandonCycle failed for ' + symbol + ':', e.message); }
 }
 
-async function armStandaloneTrough(symbol, buyUsd, bouncePct, entryFloor, exchange, armBelow = null) {
+async function armStandaloneTrough(symbol, buyUsd, bouncePct, entryFloor, exchange, armBelow = null, priceNow = null) {   // #T1 priceNow: for the message only
   // #394 (PM #400) armBelow: a RETRACE GATE. The tracker stays DORMANT - tracking no low, buying nothing - until the price
   // falls to armBelow; only then does it start ratcheting the low and watching for the bounce. Without it (null) it
   // behaves exactly as before and starts tracking immediately.
@@ -4999,11 +5031,15 @@ async function armStandaloneTrough(symbol, buyUsd, bouncePct, entryFloor, exchan
       [symbol, buyUsd, bouncePct||8, entryFloor||null, exchange||'revolut', Number(armBelow) > 0 ? Number(armBelow) : null]
     );
     const b = symbol.replace('-USD','');
-    console.log('[trough-st] armed: ' + symbol + ' buy $' + buyUsd + ' bounce ' + (bouncePct||8) + '%%');
-    await sendTelegram('<b>[TROUGH ARMED]</b> ' + b +
-      (Number(armBelow) > 0 ? '\nDORMANT until the price falls to $' + Number(armBelow) + ' - only then does it start watching for a bounce' : '') +
-      '\nBuy $' + buyUsd + ' on ' + (bouncePct||8) + '%% bounce off trough' +
+    console.log('[trough-st] armed: ' + symbol + ' buy $' + buyUsd + ' bounce ' + (bouncePct||8) + '%');
+    const pNow = Number(priceNow) > 0 ? Number(priceNow) : null, gate = Number(armBelow) > 0 ? Number(armBelow) : null;
+    const gateLine = gate == null ? '\nWatching for the low now'
+      : (pNow != null && pNow <= gate ? '\nPrice ' + fmtPriceShort(pNow) + ' is ALREADY below the gate ' + fmtPriceShort(gate) + ' - it starts watching the low on the next check (no waiting)'
+                                      : '\nDORMANT until the price falls to ' + fmtPriceShort(gate) + (pNow != null ? ' (' + ((gate / pNow - 1) * 100).toFixed(1) + '% from ' + fmtPriceShort(pNow) + ')' : '') + ' - only then does it start watching for a bounce');
+    await sendTelegram('<b>[TROUGH ARMED]</b> ' + b + gateLine +
+      '\nBuy $' + buyUsd + ' on a ' + (bouncePct||8) + '% bounce off the low' +
       (entryFloor ? '\nFloor: $' + entryFloor : '') +
+      await troughCashLine(exchange || 'revolut', buyUsd) +
       '\nExchange: ' + (exchange||'revolut')).catch(() => {});
   } catch (e) { console.error('[trough-st] arm error:', e.message); }
 }
@@ -9923,7 +9959,7 @@ async function runFastScan() {
             standaloneTroughTrackers.set(stSym, st);
             await db.execute('UPDATE standalone_trough_trackers SET gate_hit=1, updated_at=NOW() WHERE symbol=?', [stSym]).catch(() => {});
             await sendTelegram('<b>[TROUGH GATE REACHED] ' + stB + '</b>\nPrice ' + fmtPriceShort(stP) + ' reached the retrace gate ' + fmtPriceShort(st.armBelow) +
-              '.\nNow tracking the low; buys $' + st.buyUsd + ' on a ' + (st.bouncePct || 8) + '% bounce off it.').catch(() => {});
+              '.\nNow tracking the low; buys $' + st.buyUsd + ' on a ' + (st.bouncePct || 8) + '% bounce off it.' + await troughCashLine(stEx, st.buyUsd)).catch(() => {});   // #T1
             console.log('[trough-st] ' + stB + ' retrace gate reached at ' + fmtPriceShort(stP));
           }
           if (st.troughPrice === null || stP < st.troughPrice) {
@@ -9970,7 +10006,7 @@ async function runFastScan() {
                 continue;
               }
               try {
-                const stR = 'trough-st: trough ' + fmtPriceShort(st.troughPrice) + ' bounced ' + (st.bouncePct||8) + '%%' + ' to ' + fmtPriceShort(stP);
+                const stR = 'trough-st: trough ' + fmtPriceShort(st.troughPrice) + ' bounced ' + (st.bouncePct||8) + '%' + ' to ' + fmtPriceShort(stP);
                 const [stJ] = await db.execute(
                   'INSERT INTO trading_journal (symbol,action,price,quantity,value_usd,reasoning,emotion,source,tool_key,cycle_id,regime_tag) VALUES (?,?,?,?,?,?,?,?,\'trough_standalone\',?,?)',   // #L1
                   [stB,'buy',stP,stBuyQty,st.buyUsd,stR,'neutral','trough_auto', await pumpCycleId(stB), await regimeTagFor(stB)]
@@ -9980,7 +10016,7 @@ async function runFastScan() {
               await sendTelegram(
                 '<b>[TROUGH AUTO-BOUGHT] ' + stB + '</b>\n' +
                 '$' + st.buyUsd + ' at ' + fmtPriceShort(stP) + '\n' +
-                'Trough ' + fmtPriceShort(st.troughPrice) + ' bounced ' + (st.bouncePct||8) + '%%'
+                'Trough ' + fmtPriceShort(st.troughPrice) + ' bounced ' + (st.bouncePct||8) + '%'
               ).catch(()=>{});
             }
           }
@@ -22297,14 +22333,14 @@ let rows;
           stGate = Number(reference_price) * (1 - Number(retrace_pct) / 100);
         }
         const stNow = await getCurrentPrice(sym).catch(() => null);
-        await armStandaloneTrough(sym, buy_usd, bounce_pct||8, entry_floor||null, stExch, stGate);
+        await armStandaloneTrough(sym, buy_usd, bounce_pct||8, entry_floor||null, stExch, stGate, stNow);   // #T1 price for the message
         const tgWarn = await emitEnableWarnings(sym, { side: 'buy' }, 'set_trough');   // #H1
         result = { ok: true, warnings: tgWarn, action: 'set_trough', symbol: sym, buy_usd, bounce_pct: bounce_pct||8,
           entry_floor: entry_floor||null, exchange: stExch,
           retrace_gate: stGate ? { arm_below: Number(stGate.toPrecision(6)), from: retrace_pct != null ? Number(retrace_pct) + '% below ' + reference_price : 'exact price',
             price_now: stNow, distance_pct: stNow ? Number(((stGate / stNow - 1) * 100).toFixed(2)) : null, already_reached: !!(stNow && stNow <= stGate) } : null,
           message: stGate ? ('Trough tracker DORMANT until the price falls to ' + Number(stGate.toPrecision(6)) + ', then buys $' + buy_usd + ' on a ' + (bounce_pct||8) + '% bounce off the low')
-                          : ('Trough tracker armed -- buys $' + buy_usd + ' on ' + (bounce_pct||8) + '%% bounce') };
+                          : ('Trough tracker armed -- buys $' + buy_usd + ' on ' + (bounce_pct||8) + '% bounce') };
       } else if (action === 'remove_trough') {
         await clearStandaloneTrough(sym);
         result = { ok: true, action: 'remove_trough', symbol: sym, message: 'Tracker cleared for ' + sym };
@@ -23570,7 +23606,10 @@ let rows;
       try {
         const [rules] = await db.execute('SELECT * FROM auto_trade_rules ORDER BY created_at DESC');
         const active = rules.filter(r => r.active);
-        return { content: [{ type: 'text', text: JSON.stringify({ execution: 'alert_only', rules, active_count: active.length, total: rules.length }, null, 2) }] };   // #F2
+        const standalone_troughs = await listStandaloneTroughs().catch(e => ({ error: e.message }));   // #T1
+        return { content: [{ type: 'text', text: JSON.stringify({ execution: 'alert_only', rules, active_count: active.length, total: rules.length,
+          standalone_troughs_note: 'standalone_troughs are NOT alert-only: on the bounce each one BUYS (Revolut X) if the cash is there, else offers a Buy now button. Remove with manage_alerts remove_trough.',
+          standalone_troughs }, null, 2) }] };   // #F2
       } catch (e) {
         return { content: [{ type: 'text', text: JSON.stringify({ error: e.message }) }] };
       }
