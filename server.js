@@ -2920,6 +2920,124 @@ async function ensurePendingCapTable() {
 // tap after a restart can never act twice or act on the wrong row.
 //   np = 'Not a payment' / 'Not a withdrawal' (id = trading_journal row)
 //   cc = capital change Confirm (1) / Cancel (2) (id = pending_capital_changes row)
+// ── #486 COIN CARD SPENDS, RECORDED AT THE HOLD ─────────────────────────────────────
+const CARD_WATCH = { every_ms: 2 * 60 * 1000, window_h: 24, deep_every: 15, deep_days: 10, min_usd: 0.5, settle_tol: 0.03, stale_h: 6 };
+const CARD_DEAD = ['cancelled', 'canceled', 'failed', 'declined', 'rejected', 'reverted', 'reversed'];
+// Revolut's recent transactions, newest first as the venue returns them: one or two pages of the last `hours`.
+async function revolutRecentSends(hours = CARD_WATCH.window_h, maxPages = 2) {
+  const end = Date.now(), start = end - hours * 3600 * 1000, out = [];
+  let cursor = null, pages = 0;
+  do {
+    const qs = new URLSearchParams({ start_date: String(start), end_date: String(end), limit: '100' });
+    if (cursor) qs.set('cursor', cursor);
+    const page = await revolutRequest('GET', '/transactions?' + qs.toString());
+    if (page && page.message && !page.data && !Array.isArray(page)) throw new Error('API: ' + page.message);
+    const rows = Array.isArray(page) ? page : (page && (page.data || page.items)) || [];
+    for (const t of rows) {
+      if (String(t.type || '').toLowerCase() !== 'send' || !t.id) continue;
+      const amt = parseFloat((t.source && t.source.amount) || 0), cur = String((t.source && t.source.currency) || '').toUpperCase();
+      if (!(amt > 0) || !cur) continue;
+      out.push({ id: String(t.id), status: String(t.status || '').toLowerCase(), currency: cur, amount: amt, ms: Number(t.created_date) || Date.parse(t.created_date) || 0, processed_ms: Number(t.processed_date) || 0 });
+    }
+    cursor = page && page.metadata && page.metadata.next_cursor ? page.metadata.next_cursor : null;
+    pages++;
+  } while (cursor && pages < maxPages);
+  return out;
+}
+let _cardWatchBusy = false, _cardWatchTicks = 0;
+const _cardTxStatus = new Map();   // Fable C1: tx id -> its last status read from the venue (the watch keeps it fresh)
+const cardNoteStatuses = (sends) => { for (const s of sends) _cardTxStatus.set(s.id, s.status); };
+async function cardSpendWatchTick() {
+  if (_cardWatchBusy) return { skipped: 'busy' };
+  _cardWatchBusy = true;
+  const done = { recorded: [], reversed: [], closed: [] };
+  try {
+    _cardWatchTicks++;
+    const deep = _cardWatchTicks % CARD_WATCH.deep_every === 1;   // the first tick and every 30 min: 10 days of history
+    const sends = deep ? (await fetchTransactions(CARD_WATCH.deep_days)).transactions.filter(t => String(t.type || '').toLowerCase() === 'send' && t.id).map(t => ({
+      id: String(t.id), status: String(t.status || '').toLowerCase(), currency: String((t.source && t.source.currency) || '').toUpperCase(), amount: parseFloat((t.source && t.source.amount) || 0),
+      ms: Number(t.created_date) || Date.parse(t.created_date) || 0, processed_ms: Number(t.processed_date) || 0 })) : await revolutRecentSends();
+    const byId = new Map(sends.map(s => [s.id, s]));
+    cardNoteStatuses(sends);
+    // (1) a new PENDING coin send -> a payment now
+    const fresh = sends.filter(s => s.status === 'pending' && !SKIP_CURRENCIES.includes(s.currency) && s.ms > Date.now() - CARD_WATCH.window_h * 3600 * 1000);
+    if (fresh.length) {
+      const [known] = await db.execute('SELECT venue_tx_id FROM trading_journal WHERE venue_tx_id IN (' + fresh.map(() => '?').join(',') + ')', fresh.map(s => s.id));
+      const seen = new Set(known.map(r => String(r.venue_tx_id)));
+      const tick = await revolutTickerMap();
+      for (const s of fresh) {
+        if (seen.has(s.id)) continue;
+        const px = tick[s.currency] ? tick[s.currency].mid : null;
+        if (!(px > 0)) { console.log('[card] #486 ' + s.currency + ' send ' + s.id + ' pending - no price, left for the reconciler'); continue; }
+        const usd = Number((s.amount * px).toFixed(2));
+        if (usd < CARD_WATCH.min_usd) continue;
+        const [ins] = await db.execute("INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source, venue_tx_id, reason_tag, tool_key) VALUES (?, 'payment', ?, ?, ?, ?, 'neutral', 'revolut_card', ?, 'card_pending', 'card_watch')",
+          [s.currency, px, s.amount, usd, ('Card payment with ' + s.currency + ' - Revolut tx ' + s.id + ' (pending hold, recorded by the card watch #486)').slice(0, 480), s.id])
+          .catch(e => { if (e.code === 'ER_DUP_ENTRY') return [null]; throw e; });   // venue_tx_id is UNIQUE: a row already there wins
+        if (!ins) continue;
+        const jid = ins.insertId, before = totalInvestedCapital;
+        await updateInvestedCapital(before - usd, 'Card payment with ' + s.currency + ' (j' + jid + ', tx ' + s.id + '): -$' + usd.toFixed(2), { payment: true });
+        const applied = Math.abs(totalInvestedCapital - (before - usd)) < 0.005;
+        const qtyTxt = s.amount.toLocaleString('en-GB', { maximumFractionDigits: s.amount >= 100 ? 2 : 6 });
+        await sendTelegram('💳 PAYMENT with ' + escTg(s.currency) + ' - ' + qtyTxt + ' ' + escTg(s.currency) + ' ≈ $' + usd.toFixed(2) + ' (card payment or transfer out)\n' +
+          (applied ? 'Capital: $' + before.toFixed(2) + ' \u2192 $' + totalInvestedCapital.toFixed(2) + '\n' : 'Capital change HELD for your confirmation - see the capital alert.\n') +
+          'Still pending at Revolut. When it settles nothing more happens: it will not show as a sale.\n\nTap <b>Not a payment</b> if it wasn\'t one.',
+          buildAlertKeyboard(String(jid), ['Not a payment'], 'np')).catch(() => {});
+        console.log('[card] #486 ' + s.currency + ' ' + s.amount + ' ($' + usd.toFixed(2) + ') recorded at the hold: j' + jid + ', tx ' + s.id);
+        done.recorded.push({ journal_id: jid, currency: s.currency, amount: s.amount, usd });
+      }
+    }
+    // (2) holds recorded here that Revolut cancelled -> reversed; (3) old settled ones never matched -> closed
+    const [open] = await db.execute("SELECT id, symbol, quantity, value_usd, venue_tx_id FROM trading_journal WHERE action = 'payment' AND reason_tag = 'card_pending' AND created_at > DATE_SUB(NOW(), INTERVAL 14 DAY)");
+    for (const r of open) {
+      const s = byId.get(String(r.venue_tx_id));
+      if (!s) continue;
+      if (CARD_DEAD.includes(s.status)) {
+        let said = '';
+        await handleMoneyButton('np', String(r.id), null, async (m) => { said = String(m || ''); });
+        await sendTelegram('↩️ Card hold RELEASED - ' + escTg(Number(r.quantity).toLocaleString('en-GB', { maximumFractionDigits: 6 })) + ' ' + escTg(r.symbol) + ' (Revolut: ' + escTg(s.status) + '). The payment is taken back out.\n' + said).catch(() => {});
+        done.reversed.push({ journal_id: r.id, status: s.status });
+      } else if (s.status === 'completed' && s.processed_ms && s.processed_ms < Date.now() - CARD_WATCH.stale_h * 3600 * 1000) {
+        const [u] = await db.execute("UPDATE trading_journal SET reason_tag = 'card_settled' WHERE id = ? AND reason_tag = 'card_pending'", [r.id]);
+        if (u && u.affectedRows === 1) { console.log('[card] #486 j' + r.id + ' ' + r.symbol + ' settled ' + CARD_WATCH.stale_h + ' h+ ago with no drop matched - closed'); done.closed.push(r.id); }
+      }
+    }
+    return { ok: true, deep, sends: sends.length, ...done };
+  } catch (e) {
+    console.error('[card] #486 watch failed:', e.message);
+    return { ok: false, error: e.message, ...done };
+  } finally { _cardWatchBusy = false; }
+}
+// #486 at settlement: how much of a coin drop is card spends already recorded at the hold. Consumes those rows (oldest first,
+// compare-and-set) and returns the token quantity to NOT log as a sale. Within 3% of the drop = the whole drop.
+// Fable C1: a pending hold does not move the detector's balance but a real sale does - so a row is consumed only when the venue
+// says ITS send is completed (the watch's last read; if not completed, one fresh read covering the row's age). Pending or
+// unreadable = not consumed: the drop is logged as today.
+async function cardSpendSettles(coin, dropQty) {
+  const c = String(coin || '').toUpperCase(), drop = Number(dropQty);
+  if (!c || !(drop > 0)) return 0;
+  const [rows] = await db.execute("SELECT id, quantity, venue_tx_id, created_at FROM trading_journal WHERE symbol = ? AND action = 'payment' AND reason_tag = 'card_pending' ORDER BY id", [c]);
+  const cand = rows.filter(r => Number(r.quantity) > 0 && Number(r.quantity) <= drop * (1 + CARD_WATCH.settle_tol));
+  if (!cand.length) return 0;
+  if (cand.some(r => _cardTxStatus.get(String(r.venue_tx_id)) !== 'completed')) {
+    const oldest = Math.min(...cand.map(r => new Date(r.created_at).getTime() || Date.now()));
+    const hours = Math.min(14 * 24, Math.ceil((Date.now() - oldest) / 3600000) + 2);
+    try { cardNoteStatuses(await revolutRecentSends(hours, 6)); } catch (e) { console.error('[card] #486 status refresh failed - not settling:', e.message); }
+  }
+  let left = drop, used = 0;
+  for (const r of cand) {
+    const q = Number(r.quantity);
+    if (q > left * (1 + CARD_WATCH.settle_tol)) continue;
+    if (_cardTxStatus.get(String(r.venue_tx_id)) !== 'completed') { console.log('[card] #486 ' + c + ' j' + r.id + ' matches the drop by size but its send is ' + (_cardTxStatus.get(String(r.venue_tx_id)) || 'unread') + ' - not settled here'); continue; }
+    const [u] = await db.execute("UPDATE trading_journal SET reason_tag = 'card_settled' WHERE id = ? AND reason_tag = 'card_pending'", [r.id]);
+    if (!(u && u.affectedRows === 1)) continue;
+    used += Math.min(q, left); left -= Math.min(q, left);
+    console.log('[card] #486 ' + c + ' j' + r.id + ' (' + q + ') settled inside a drop of ' + drop);
+    if (left <= drop * 1e-9) break;
+  }
+  if (used > 0 && left <= drop * CARD_WATCH.settle_tol) used = drop;   // a settlement a little off the hold is still the payment
+  return used;
+}
 // ── #395 WAS THE MISSING CASH SPENT ON COINS? ASK THE VENUE ─────────────────────────
 // The payment detectors decided 'trade-funding or payment?' from the JOURNAL alone. Buys the journal missed (placed
 // by hand, e.g. during a restart - 23 Sept: $201.66 of HONEY proceeds spent on DASH/JTO/COTI/IDEX/AST) then look
@@ -2979,7 +3097,7 @@ async function handleMoneyButton(typeCode, idStr, choice, reply) {
     await db.execute('INSERT INTO archived_journal (original_id, row_json, linked_summary, archive_reason) VALUES (?, ?, ?, ?)',
       [id, JSON.stringify(row), 'button', 'Button: not a ' + kind]).catch(e => console.error('[money-btn] archive failed:', e.message));
     await db.execute('DELETE FROM coin_cash_flows WHERE journal_id = ?', [id]).catch(() => {});
-    const amt = parseFloat(row.quantity) || 0;
+    const amt = ['USD', 'USDT', 'USDC'].includes(String(row.symbol).toUpperCase()) ? (parseFloat(row.quantity) || 0) : (parseFloat(row.value_usd) || 0);   // #486 a coin payment's dollars are its value
     const before = totalInvestedCapital;
     // #395 if this payment's capital deduction is still HELD (a drop > $200 waits for Confirm), it was never applied:
     // cancel the hold instead of adding the money back. Before, 'Not a payment' ALWAYS added it back, so on a held
@@ -17635,8 +17753,16 @@ async function checkPortfolio() {
             if (valueUsd >= 0.10) { // minimum $0.10 to avoid fee-dust noise
               const action = qtyChange > 0 ? 'buy' : 'sell';
               console.log(`[detect] ${symbol} ${action}: ${prevQty} → ${available} ($${valueUsd.toFixed(2)})`);
-              autoLogTrade(symbol, action, currentPrice, qtyChange, available).catch(e => console.error('autoLogTrade failed:', e.message));
-              if (valueUsd >= 5) scheduleTradeResync(symbol);   // #480 costs from the venue record within minutes, not at 02:40
+              // #486 a coin card spend recorded at its hold is settling: that part of the drop is the payment, not a sale
+              let logQty = qtyChange;
+              if (action === 'sell') {
+                const card = await cardSpendSettles(asset.currency, -qtyChange).catch(e => { console.error('[card] #486 settle check failed:', e.message); return 0; });
+                if (card > 0) { logQty = qtyChange + card; console.log(`[card] #486 ${symbol}: ${card} of the ${-qtyChange} drop is card spending already recorded - ${Math.abs(logQty) > 0.0001 ? 'the rest is logged as a sale' : 'no sale logged'}`); }
+              }
+              if (Math.abs(logQty) * currentPrice >= 0.10) {
+                autoLogTrade(symbol, action, currentPrice, logQty, available).catch(e => console.error('autoLogTrade failed:', e.message));
+                if (Math.abs(logQty) * currentPrice >= 5) scheduleTradeResync(symbol);   // #480 costs from the venue record within minutes, not at 02:40
+              }
               // #347: lots follow the sale regardless of whether autoLogTrade logs it (debounce / dedupe / limit suppression)
               if (action === 'sell') syncRevolutLotsDownToBalance(symbol).catch(() => {});
             } else {
@@ -20057,6 +20183,7 @@ cron.schedule('30 18 * * 0', () => { agentWeeklyReview().catch(e => console.erro
 cron.schedule('45 18 * * 0', () => { agentToolsmith('weekly').catch(e => { console.error('[agent] #483 tools check failed:', e.message); sendTelegram('⚠️ Agent tools check failed: ' + escTg(e.message)).catch(() => {}); }); }, { timezone: 'Europe/London' });   // #483 after its self-review
 setInterval(() => { agentAlertTick().catch(() => {}); }, 2 * 60 * 1000);   // #A2e the agent's alert watcher (no AI; cached tickers)
 setTimeout(() => { agentBootCleanup().catch(e => console.error('[agent] boot cleanup failed:', e.message)); }, 40 * 1000);
+setTimeout(() => { cardSpendWatchTick().catch(() => {}); setInterval(() => { cardSpendWatchTick().catch(() => {}); }, CARD_WATCH.every_ms); }, 90 * 1000);   // #486 coin card spends at the hold
 cron.schedule('15 9 * * *', async () => {   // #416 daily brief (Bryan 24 Sep): snapshot + Gemini news; replaces the 'open Claude PM' reminder (now the brief's last line)
   try { await sendMorningBriefing(); }
   catch (e) { console.error('[brief] 09:15 cron failed:', e.message); await sendTelegram('\u274c Morning brief failed: ' + escTg(e.message)); }
