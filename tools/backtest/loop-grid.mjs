@@ -10,9 +10,10 @@
 //                   driver checks every mode-A run for zero buys and throws if one appears.
 //   B as_engine     the engine's own retrace/bounce buy-back: retrace 50, bounce 8 (the live armReboundTracker defaults), the
 //                   engine's defaults for the rest (buy_pct 70, further_drop 10, ceiling 15, abandon 48 h).
-//   C cost_anchored NOT expressible through runLadderBacktest's options (see tests/FINDINGS.md T3-1). The driver reports it as such
-//                   and, from mode B's own fills, counts how many B buy-backs had a trough at or above cost x 0.95 (a diagnostic,
-//                   not a result: blocking the others would change every later bar).
+//   C cost_anchored mode B plus the batch-463 safety line: a buy-back only if the trough stayed at or above cost x 0.95, through
+//                   the engine's buyback_floor option (T3-1, added with 463). It needs a real cost, so it runs for the held coins
+//                   (LIVE) only. On a server.js without that option the driver refuses C (it would silently equal B). Mode B still
+//                   carries the old diagnostic (how many B buy-backs had a trough at or above the line).
 // Common to all modes: rule_mode 'ladder', max_legs 1 (one sale per arm, as live), retention_floor_pct 0 (live has none; the
 // engine's ladder default of 50 would trim a 100% sale), fee 0.09%, entry_floor = the live floor, $1000 of the coin at the window's
 // first close.
@@ -45,8 +46,11 @@ export const liveFloor = (c) => Math.max(c.cost * 1.005, c.stored_floor || 0);
 export const MODES = {
   A: { name: 'sell_only', opts: { abandon_hours: 0 } },
   B: { name: 'as_engine', opts: { retrace_pct: 50, bounce_pct: 8 } },
+  C: { name: 'cost_anchored', opts: { retrace_pct: 50, bounce_pct: 8 }, line_of_cost: 0.95 },   // + buyback_floor = cost x 0.95 per cell
 };
 export const C_NOTE = 'not expressible without a server.js change (tests/FINDINGS.md T3-1)';
+// T3-1: does this server.js's engine have the absolute buy-back line (463)? Without it mode C would silently run as mode B.
+export const engineHasBuybackFloor = (src = readServer()) => /buybackFloor: Number\(cfg\.buyback_floor\)/.test(src) && /buyback_floor: Number\(opts\.buyback_floor\)/.test(src);
 export const DEFAULT_GRID = { arm: [15, 20, 25, 30, 40, 50, 65], trail: [5, 6, 8, 9, 10, 12, 15, 20, 25], sell: [50, 100], window: 1440 };
 
 // The live code, extracted by name. src: server.js text (default: this checkout's).
@@ -115,26 +119,29 @@ export function makeEngine(hourly, { src } = {}) {
 }
 
 // The options one grid cell sends to runLadderBacktest.
-export function cellOpts({ coin, start, end, setting, mode, floor, slippage, initialQty, fee = 0.09 }) {
-  if (!MODES[mode]) throw new Error('mode ' + mode + ': only A and B can run (C: ' + C_NOTE + ')');
+export function cellOpts({ coin, start, end, setting, mode, floor, slippage, initialQty, fee = 0.09, cost = null, cSupported = false }) {
+  if (!MODES[mode]) throw new Error('mode ' + mode + ': unknown (A, B or C)');
+  if (mode === 'C' && !cSupported) throw new Error('mode C: ' + C_NOTE);
+  if (mode === 'C' && !(Number(cost) > 0)) throw new Error('mode C needs a real cost (the held coins in LIVE only)');
+  const extra = mode === 'C' ? { buyback_floor: Number(cost) * MODES.C.line_of_cost } : {};
   return Object.assign({
     symbol: coin + '-USD', source: 'hourly', start, end, rule_mode: 'ladder',
     arm_pump_pct: setting.arm, arm_window_min: setting.window || 1440, trail_pct: setting.trail, sell_pct: setting.sell,
     entry_floor: floor == null ? null : floor, fee_pct: fee, slippage_pct: slippage,
     initial_qty: initialQty, initial_usd: 0, retention_floor_pct: 0, max_legs: 1,
-  }, MODES[mode].opts);
+  }, MODES[mode].opts, extra);
 }
 
 const CLS = ['round_trip', 'churned', 'cash_parked', 'inert'];
 const iso = (ms) => new Date(ms).toISOString().slice(0, 16).replace('T', ' ');
 // One cell: runs the engine and keeps what the report needs. cost (mode B) feeds the mode-C diagnostic; keepFills keeps the
 // filled sales / buys and the per-cycle rows.
-export async function runCell(engine, hourly, { coin, start, end, setting, mode, floor = null, slippage = 0.5, cost = null, keepFills = false }) {
+export async function runCell(engine, hourly, { coin, start, end, setting, mode, floor = null, slippage = 0.5, cost = null, keepFills = false, cSupported = false }) {
   const rows = hourly.get(coin + '-USD') || [];
   const a = sqlTime(start) / 1000, first = rows.find(r => r.t >= a);
   const initialQty = first ? 1000 / first.c : 1000;
   const fills = [];
-  const out = await engine.backtest(cellOpts({ coin, start, end, setting, mode, floor, slippage, initialQty }), { fills });
+  const out = await engine.backtest(cellOpts({ coin, start, end, setting, mode, floor, slippage, initialQty, cost, cSupported }), { fills });
   const base = { coin, mode, start, end, arm: setting.arm, trail: setting.trail, sell: setting.sell, window: setting.window || 1440, slippage, floor };
   if (!out.ok) return Object.assign(base, { ok: false, error: out.error });
   const m = out.metrics, cyc = m.cycles || [];
@@ -145,6 +152,7 @@ export async function runCell(engine, hourly, { coin, start, end, setting, mode,
     ok: true, bars: out.window.bars, price_change_pct: out.price.change_pct,
     vs_hold_pct: m.vs_hold_pct, vs_half_cash_pct: m.vs_half_cash_pct, end_qty_pct: m.end_qty_pct_of_start,
     sells: m.sells_filled, buys: m.buys_filled, arms: cyc.length, floor_blocks: (m.blocked_by_reason || {}).below_entry_floor || 0,
+    buyback_line_blocks: (m.blocked_by_reason || {}).below_buyback_floor || 0,   // T3-1 mode C: buy-backs the 463 line refused
     cost_drag_pct: m.cost_drag_pct_of_hold,
   });
   for (const k of CLS) r['cyc_' + k] = cyc.filter(c => c.cls === k).length;
@@ -234,19 +242,21 @@ async function main(argv) {
   const windows = [{ name: 'in_sample', start: o.start || '2025-09-11', end: dayEnd(o.end || (o.split ? '2026-05-31' : '2026-09-26')) }];
   if (o.split) windows.push({ name: 'out_of_sample', start: o.split, end: dayEnd(o.end2 || '2026-09-26') });
   const engine = makeEngine(hourly);
+  const cSupported = engineHasBuybackFloor();
   const settings = gridSettings(grid), rows = [], picks = [];
   for (const coin of coins) {
     const live = LIVE[coin] || null;
     const floor = floors === 'live' && live ? liveFloor(live) : null;
     const cur = live ? { arm: live.arm, trail: live.trail, sell: live.sell, window: live.window } : null;
     for (const mode of modes) {
-      if (mode === 'C') { rows.push({ coin, mode: 'C', ok: false, error: C_NOTE }); continue; }
+      if (mode === 'C' && !cSupported) { rows.push({ coin, mode: 'C', ok: false, error: C_NOTE }); continue; }
+      if (mode === 'C' && !live) { rows.push({ coin, mode: 'C', ok: false, error: 'no cost for this coin (mode C runs for the held coins only)' }); continue; }
       const byWin = {};
       for (const w of windows) {
         const list = settings.concat(cur && !settings.some(s => s.arm === cur.arm && s.trail === cur.trail && s.sell === cur.sell) ? [cur] : []);
         byWin[w.name] = [];
         for (const s of list) {
-          const r = await runCell(engine, hourly, { coin, start: w.start, end: w.end, setting: s, mode, floor, slippage, cost: live ? live.cost : null });
+          const r = await runCell(engine, hourly, { coin, start: w.start, end: w.end, setting: s, mode, floor, slippage, cost: live ? live.cost : null, cSupported });
           r.window_name = w.name; r.is_current = !!(cur && s.arm === cur.arm && s.trail === cur.trail && s.sell === cur.sell);
           rows.push(r); byWin[w.name].push(r);
         }
@@ -261,7 +271,7 @@ async function main(argv) {
     }
     console.error(coin + ' done (' + ((Date.now() - t0) / 1000).toFixed(0) + ' s)');
   }
-  const res = { generated_at: new Date().toISOString(), data: { dir, exported_at: manifest.exported_at, server_sha: manifest.server_sha }, grid, windows, slippage, floors, modes, c_note: C_NOTE, picks, rows };
+  const res = { generated_at: new Date().toISOString(), data: { dir, exported_at: manifest.exported_at, server_sha: manifest.server_sha }, grid, windows, slippage, floors, modes, c_note: cSupported ? 'mode C runs: buyback_floor = cost x 0.95 (463)' : C_NOTE, picks, rows };
   if (o.out) {
     mkdirSync(dirname(o.out), { recursive: true });
     writeFileSync(o.out + '.json', JSON.stringify(res));

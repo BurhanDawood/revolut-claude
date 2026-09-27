@@ -5,7 +5,7 @@
 // Run: node tests/tools/loop-grid.test.mjs
 import assert from 'node:assert/strict';
 import { runner, readServer, extractFunction, strictSandbox, plain } from '../lib.mjs';
-import { makeEngine, makeStubDb, runCell, cellOpts, robustPick, extractLoopCode, sqlTime, FUNCS, Q_HOURLY, MODES } from '../../tools/backtest/loop-grid.mjs';
+import { makeEngine, makeStubDb, runCell, cellOpts, robustPick, extractLoopCode, sqlTime, FUNCS, Q_HOURLY, MODES, engineHasBuybackFloor } from '../../tools/backtest/loop-grid.mjs';
 import { series, flat, walk, toMap, T0, H } from './fixtures.mjs';
 
 const { test, report } = runner('T3 tools: offline loop settings grid (tests/tools/loop-grid.test.mjs)');
@@ -75,6 +75,18 @@ await test('LG4', 'the floor blocks the sale (the engine\'s below_entry_floor), 
   const r = await runCell(engine, DATA, { coin: 'PD', start: START, end: END, setting: { arm: 20, trail: 9, sell: 100 }, mode: 'A', floor: 1.4 });
   assert.equal(r.sells, 0); assert.ok(r.floor_blocks >= 1);
   assert.throws(() => cellOpts({ coin: 'PD', start: START, end: END, setting: { arm: 20, trail: 9, sell: 100 }, mode: 'C' }), /not expressible without a server.js change/);
+  assert.throws(() => cellOpts({ coin: 'PD', start: START, end: END, setting: { arm: 20, trail: 9, sell: 100 }, mode: 'C', cSupported: true }), /needs a real cost/);
+  assert.equal(cellOpts({ coin: 'PD', start: START, end: END, setting: { arm: 20, trail: 9, sell: 100 }, mode: 'C', cSupported: true, cost: 2 }).buyback_floor, 1.9);
+});
+await test('LG10', 'mode C (463 line, T3-1): the pump-and-dump trough 0.9 is under cost 1.0 x 0.95, so C refuses the buy-back B makes; cost 0.9 (line 0.855) lets it through', async () => {
+  if (!engineHasBuybackFloor(SRC)) { assert.throws(() => cellOpts({ coin: 'PD', start: START, end: END, setting: { arm: 20, trail: 9, sell: 100 }, mode: 'C', cost: 1 }), /not expressible/); return; }   // main before 463
+  const s = { arm: 20, trail: 9, sell: 100 };
+  const b = await runCell(engine, DATA, { coin: 'PD', start: START, end: END, setting: s, mode: 'B' });
+  const c = await runCell(engine, DATA, { coin: 'PD', start: START, end: END, setting: s, mode: 'C', cost: 1.0, cSupported: true });
+  const c2 = await runCell(engine, DATA, { coin: 'PD', start: START, end: END, setting: s, mode: 'C', cost: 0.9, cSupported: true });
+  assert.equal(b.sells, 1); assert.equal(b.buys >= 1, true);
+  assert.equal(c.sells, 1); assert.equal(c.buys, 0); assert.ok(c.buyback_line_blocks >= 1);
+  assert.equal(c2.buys, b.buys); assert.equal(c2.buyback_line_blocks, 0); assert.equal(c2.vs_hold_pct, b.vs_hold_pct);
 });
 await test('LG5', 'the stub reads the window as MySQL does (inclusive, UTC) and refuses a time it cannot read', async () => {
   const { db } = makeStubDb(DATA);
