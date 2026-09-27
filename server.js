@@ -11589,6 +11589,139 @@ async function recordDailyPrices() {
 // LOUD FAILURE (the condition Claude set on the original plan): every failure - no key, HTTP error, 429, timeout, empty
 // or unreadable reply, no headlines - throws, and the caller sends a visible "degraded" message. Never silence.
 function escTg(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+
+// ── #S1 SHARE FEED (Bryan 27 Sep): posts to ONE Telegram group (registered with /sharehere, by Bryan only) ─────────────
+// What goes: strategy notes (a loop set / changed / switched on or off, a trough buy set), every buy or sell of at least
+// min_trade_usd (default $100, automatic or by hand), and a Sunday roundup. Nothing from the group is ever obeyed except
+// /sharehere from Bryan himself. It never trades, never writes trading state, and a failed post never affects anything.
+const SHARE_DEFAULTS = { on: true, min_trade_usd: 100, weekly: true };
+async function shareCfg() {
+  try { const [r] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'share'"); return Object.assign({}, SHARE_DEFAULTS, r.length ? JSON.parse(r[0].config_value) : {}); }
+  catch (e) { return Object.assign({}, SHARE_DEFAULTS); }
+}
+async function saveShareCfg(c) {
+  await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('share', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)", [JSON.stringify(c)]);
+}
+async function sendShare(text, opts) {
+  try {
+    const c = opts && opts.cfg ? opts.cfg : await shareCfg();
+    if (!c.chat_id || (c.on === false && !(opts && opts.force))) return false;
+    const r = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: c.chat_id, text, parse_mode: 'HTML', disable_web_page_preview: true }) });
+    if (!r.ok) { let d = ''; try { d = (await r.json()).description || ''; } catch (e) {} console.error('[share] post rejected ' + r.status + ': ' + d); return false; }
+    return true;
+  } catch (e) { console.error('[share] post failed:', e.message); return false; }
+}
+function shareStrategyNote(text) { return sendShare('📐 <b>Strategy</b>\n' + text).catch(() => false); }
+function shareWho(src, tool) {
+  const s = String(src || ''), t = String(tool || '');
+  if (/^(auto_detected|manual|claude_mcp|pm_logged|revolut_card)$/.test(s)) return 'by hand';
+  const k = (t + ' ' + s).toLowerCase();
+  if (/ladder/.test(k)) return 'automatic - ladder';
+  if (/trough/.test(k)) return 'automatic - buy-back';
+  if (/pump|loop|trail|ai_auto|auto_rule/.test(k)) return 'automatic - pump loop';
+  if (/spike/.test(k)) return 'automatic - spike insurance';
+  if (/away/.test(k)) return 'automatic - away mode';
+  if (/funded/.test(k)) return 'funded buy (tapped)';
+  return 'automatic (' + (t || s || '?') + ')';
+}
+function shareTradeLine(r) {
+  const coin = String(r.symbol || '').replace(/-USD$/, ''), side = String(r.action || '').toLowerCase();
+  const up = side === 'buy' || side === 'add';
+  const px = Number(r.fill_price) > 0 ? Number(r.fill_price) : Number(r.price);
+  const pnl = r.realised_pnl_usd != null && Number.isFinite(Number(r.realised_pnl_usd)) ? Number(r.realised_pnl_usd) : null;
+  return (up ? '🟢 ' : '🔴 ') + '<b>' + (up ? 'BUY' : 'SELL') + ' ' + escTg(coin) + '</b> - $' + Number(r.value_usd).toFixed(2) + (px > 0 ? ' at ' + fmtPriceShort(px) : '') +
+    (pnl != null && !up ? ' · realised ' + (pnl >= 0 ? '+' : '-') + '$' + Math.abs(pnl).toFixed(2) : '') + '\n<i>' + shareWho(r.source, r.tool_key) + '</i>';
+}
+let _shareTickBusy = false;
+async function shareTradesTick() {
+  if (_shareTickBusy) return; _shareTickBusy = true;
+  try {
+    const c = await shareCfg();
+    if (!c.chat_id || c.on === false) return;
+    const last = Number(c.last_journal_id) || 0;
+    const [rows] = await db.execute("SELECT id, symbol, action, price, fill_price, value_usd, source, tool_key, realised_pnl_usd FROM trading_journal WHERE id > ? ORDER BY id LIMIT 100", [last]);
+    if (!rows.length) return;
+    const min = Number(c.min_trade_usd) > 0 ? Number(c.min_trade_usd) : SHARE_DEFAULTS.min_trade_usd;
+    for (const r of rows) {
+      const act = String(r.action || '').toLowerCase(), coin = String(r.symbol || '').toUpperCase().replace(/-USD$/, '');
+      if (!['buy', 'sell', 'add', 'reduce'].includes(act) || ['USD', 'USDT', 'USDC'].includes(coin) || !(Math.abs(Number(r.value_usd)) >= min)) continue;
+      await sendShare(shareTradeLine(r), { cfg: c });
+    }
+    c.last_journal_id = rows[rows.length - 1].id;   // advance past everything read (shared or not) - nothing is posted twice
+    await saveShareCfg(c);
+  } catch (e) { console.error('[share] trades tick failed:', e.message); }
+  finally { _shareTickBusy = false; }
+}
+async function buildShareWeekly() {
+  const L = [];
+  const since = new Date(Date.now() - 7 * 86400000);
+  L.push('📊 <b>Weekly strategy roundup</b> - week to ' + new Date().toISOString().slice(0, 10));
+  try {
+    const [pv] = await db.execute('SELECT total_usd FROM portfolio_value_1m ORDER BY ts DESC LIMIT 1');
+    const [pw] = await db.execute('SELECT c FROM portfolio_value_hourly WHERE ts <= ? ORDER BY ts DESC LIMIT 1', [Math.floor(since.getTime() / 1000)]);
+    const now = pv.length ? Number(pv[0].total_usd) : null, then = pw.length ? Number(pw[0].c) : null, cap = Number(totalInvestedCapital);
+    if (now != null) L.push('Portfolio: $' + now.toFixed(2) + (then ? ' (week ' + (now >= then ? '+' : '') + ((now / then - 1) * 100).toFixed(1) + '%, ' + (now >= then ? '+' : '-') + '$' + Math.abs(now - then).toFixed(2) + ')' : '') +
+      (cap > 0 ? '\nInvested capital: $' + cap.toFixed(2) + ' · overall ' + (now >= cap ? '+' : '-') + '$' + Math.abs(now - cap).toFixed(2) + ' (' + ((now / cap - 1) * 100).toFixed(1) + '%)' : ''));
+  } catch (e) { L.push('Portfolio: not available (' + e.message + ')'); }
+  try {
+    const [t] = await db.execute("SELECT symbol, action, value_usd, price, fill_price, source, tool_key, realised_pnl_usd FROM trading_journal WHERE created_at >= ? AND action IN ('buy','sell','add','reduce') AND symbol NOT IN ('USD','USDT','USDC','USDT-USD') ORDER BY value_usd DESC", [since]);
+    const buys = t.filter(r => ['buy', 'add'].includes(String(r.action))), sells = t.filter(r => !['buy', 'add'].includes(String(r.action)));
+    const sum = (a) => a.reduce((s, r) => s + (Number(r.value_usd) || 0), 0);
+    const pnl = sells.reduce((s, r) => s + (Number(r.realised_pnl_usd) || 0), 0), auto = t.filter(r => shareWho(r.source, r.tool_key).startsWith('automatic')).length;
+    L.push('\n<b>Trades:</b> ' + t.length + ' (' + buys.length + ' buys $' + sum(buys).toFixed(2) + ', ' + sells.length + ' sells $' + sum(sells).toFixed(2) + '; ' + auto + ' automatic)' +
+      (sells.length ? '\nRealised on sells: ' + (pnl >= 0 ? '+' : '-') + '$' + Math.abs(pnl).toFixed(2) : ''));
+    for (const r of t.slice(0, 5)) L.push(shareTradeLine(r).replace(/\n<i>/, ' <i>'));
+  } catch (e) { L.push('Trades: not available (' + e.message + ')'); }
+  try {
+    const [rules] = await db.execute('SELECT symbol, arm_pump_pct, trail_pct, sell_pct, armed, sale_price FROM pump_armed_rules WHERE active = 1 AND loop_enabled = 1 ORDER BY symbol');
+    if (rules.length) {
+      L.push('\n<b>Pump loops running (' + rules.length + '):</b> sell when up the arm %, trailing the peak');
+      for (const r of rules) L.push('• ' + escTg(String(r.symbol).replace('-USD', '')) + ': arm +' + Number(r.arm_pump_pct) + '%, trail ' + Number(r.trail_pct) + '%, sell ' + Number(r.sell_pct) + '%' +
+        (Number(r.sale_price) > 0 ? ' - sold, waiting to buy back' : Number(r.armed) === 1 ? ' - ARMED now' : ''));
+    }
+    const [st] = await db.execute('SELECT symbol, buy_usd, bounce_pct, arm_below, gate_hit FROM standalone_trough_trackers ORDER BY symbol');
+    if (st.length) {
+      L.push('\n<b>Dip buys waiting (' + st.length + '):</b>');
+      for (const r of st) L.push('• ' + escTg(String(r.symbol).replace('-USD', '')) + ': $' + Number(r.buy_usd).toFixed(0) + ' on a ' + Number(r.bounce_pct) + '% bounce' +
+        (Number(r.arm_below) > 0 && Number(r.gate_hit) !== 1 ? ' once below ' + fmtPriceShort(Number(r.arm_below)) : ' (watching the low)'));
+    }
+  } catch (e) { L.push('Strategies: not available (' + e.message + ')'); }
+  return L.join('\n');
+}
+async function shareWeeklyRun() {
+  const c = await shareCfg();
+  if (!c.chat_id || c.on === false || c.weekly === false) return;
+  await sendShare(await buildShareWeekly(), { cfg: c });
+}
+async function registerShareChat(chat, reply) {
+  const c = await shareCfg();
+  let maxId = 0; try { const [m] = await db.execute('SELECT MAX(id) AS m FROM trading_journal'); maxId = Number(m[0].m) || 0; } catch (e) { /* start from 0 */ }
+  const was = c.chat_id;
+  Object.assign(c, { chat_id: chat.id, title: chat.title || null, on: true, last_journal_id: Math.max(Number(c.last_journal_id) || 0, maxId), registered_at: new Date().toISOString() });
+  await saveShareCfg(c);
+  await reply('✅ This group now gets Bryan\'s strategy posts: strategy notes, trades of $' + Number(c.min_trade_usd) + ' or more, and a Sunday roundup.');
+  await sendTelegram('📤 Share feed now posts to the group <b>' + escTg(chat.title || String(chat.id)) + '</b>' + (was && String(was) !== String(chat.id) ? ' (replacing the previous group)' : '') +
+    '.\nControls: <code>/share</code> (status) · <code>/share off</code> · <code>/share on</code> · <code>/share min 250</code> · <code>/share note your text</code> · <code>/share weekly</code> (post the roundup now)').catch(() => {});
+}
+async function handleShareCommand(sub, rawSub, reply) {
+  const c = await shareCfg();
+  if (sub === '' || sub === 'status') {
+    await reply('📤 <b>Share feed</b>: ' + (!c.chat_id ? 'no group yet - add the bot to a group with your friend and send <code>/sharehere</code> in that group.' :
+      (c.on === false ? 'OFF' : 'ON') + ' -> ' + escTg(c.title || String(c.chat_id)) + '\nTrades of $' + Number(c.min_trade_usd) + '+, strategy notes, Sunday roundup ' + (c.weekly === false ? 'OFF' : 'ON (18:45)')) +
+      '\n\n<code>/share on</code> · <code>/share off</code> · <code>/share min 250</code> · <code>/share weekly</code> · <code>/share weekly off</code> · <code>/share note your text</code>');
+    return;
+  }
+  if (!c.chat_id) { await reply('No group yet - add the bot to a group with your friend and send <code>/sharehere</code> in that group.'); return; }
+  if (sub === 'on' || sub === 'off') { c.on = sub === 'on'; await saveShareCfg(c); await reply('📤 Share feed ' + sub.toUpperCase() + '.'); return; }
+  if (sub === 'weekly off' || sub === 'weekly on') { c.weekly = sub === 'weekly on'; await saveShareCfg(c); await reply('Sunday roundup ' + (c.weekly ? 'ON' : 'OFF') + '.'); return; }
+  const m = sub.match(/^min\s+\$?(\d+(?:\.\d+)?)$/);
+  if (m) { c.min_trade_usd = Number(m[1]); await saveShareCfg(c); await reply('Trades of $' + c.min_trade_usd + ' or more will be shared.'); return; }
+  if (sub === 'weekly') { const ok = await sendShare(await buildShareWeekly(), { cfg: c, force: true }); await reply(ok ? 'Roundup posted to the group.' : '❌ Could not post - is the bot still in the group?'); return; }
+  const n = rawSub.match(/^note\s+([\s\S]+)$/i);
+  if (n) { const ok = await sendShare('📝 <b>Note from Bryan</b>\n' + escTg(n[1].trim()), { cfg: c, force: true }); await reply(ok ? 'Shared.' : '❌ Could not post - is the bot still in the group?'); return; }
+  await reply('Share commands: <code>/share</code> · <code>on</code> · <code>off</code> · <code>min 250</code> · <code>weekly</code> · <code>weekly off</code> · <code>note your text</code>');
+}
 const BRIEF_FEEDS = [
   ['CoinDesk', 'https://www.coindesk.com/arc/outboundfeeds/rss/'],
   ['Cointelegraph', 'https://cointelegraph.com/rss'],
@@ -19403,7 +19536,9 @@ cron.schedule('15 9 * * *', async () => {   // #416 daily brief (Bryan 24 Sep): 
 cron.schedule('0 10 * * *', checkIntentionOutcomes, { timezone: 'Europe/London' });
 cron.schedule('0 18 * * 0', sendUntaggedTradesDigest, { timezone: 'Europe/London' });   // #L0 Sunday 18:00 London
 cron.schedule('5 18 * * 0', () => { rotationWeekly().catch(e => console.error('[rotation] weekly failed:', e.message)); }, { timezone: 'Europe/London' });   // #8 Sunday 18:05 London
-setInterval(() => { rotationTick().catch(e => console.error('[rotation] tick failed:', e.message)); }, 60 * 1000);   // #8 closes sessions on time (DB-backed: survives a restart)
+setInterval(() => { rotationTick().catch(e => console.error('[rotation] tick failed:', e.message)); }, 60 * 1000);
+setInterval(() => { shareTradesTick().catch(() => {}); }, 3 * 60 * 1000);   // #S1 trades of substantial size to the share group
+cron.schedule('45 18 * * 0', () => { shareWeeklyRun().catch(e => console.error('[share] weekly failed:', e.message)); }, { timezone: 'Europe/London' });   // #S1 Sunday 18:45 London   // #8 closes sessions on time (DB-backed: survives a restart)
 
 // #50: prune intraday prices older than 30 days
 cron.schedule('15 2 * * *', async () => {
@@ -22335,6 +22470,7 @@ let rows;
         const stNow = await getCurrentPrice(sym).catch(() => null);
         await armStandaloneTrough(sym, buy_usd, bounce_pct||8, entry_floor||null, stExch, stGate, stNow);   // #T1 price for the message
         const tgWarn = await emitEnableWarnings(sym, { side: 'buy' }, 'set_trough');   // #H1
+        shareStrategyNote('<b>' + escTg(coinBase) + ' dip buy set</b>\nBuys $' + buy_usd + ' on a ' + (bounce_pct || 8) + '% bounce off the low' + (stGate ? ', once the price is below ' + fmtPriceShort(stGate) : ''));   // #S1
         result = { ok: true, warnings: tgWarn, action: 'set_trough', symbol: sym, buy_usd, bounce_pct: bounce_pct||8,
           entry_floor: entry_floor||null, exchange: stExch,
           retrace_gate: stGate ? { arm_below: Number(stGate.toPrecision(6)), from: retrace_pct != null ? Number(retrace_pct) + '% below ' + reference_price : 'exact price',
@@ -23944,6 +24080,7 @@ let rows;
           const [after] = await db.execute('SELECT * FROM pump_armed_rules WHERE symbol = ? LIMIT 1', [sym]);
           await sendTelegram('LOOP ENABLED -- '+sym+' rinse-repeat ON. Floor $'+parseFloat(r.entry_floor).toFixed(6)+', sell '+r.sell_pct+'%, max '+r.max_cycles+' cycles. Master must also be ON to fire.'+conflictWarning).catch(()=>{});
           const leWarn = await emitEnableWarnings(sym, { side: 'both', trigger: 'trailing_stop' }, 'loop_enable');   // #H1
+          shareStrategyNote('<b>' + escTg(sym.replace('-USD', '')) + ' pump loop switched ON</b>\nSells ' + r.sell_pct + '% when up ' + Number(r.arm_pump_pct) + '% then down ' + Number(r.trail_pct) + '% from the peak; buys back on the dip');   // #S1
           return { content: [{ type: 'text', text: JSON.stringify({ ok: true, loop_enabled: 1, row: after[0], conflict_warning: conflictWarning || null, warnings: leWarn }, null, 2) }] };
         }
         if (action === 'reset_cycle') {
@@ -23998,6 +24135,7 @@ let rows;
           const [after] = await db.execute('SELECT * FROM pump_armed_rules WHERE symbol = ? LIMIT 1', [sym]);
           await sendTelegram('LOOP DISABLED -- ' + sym + ' rinse-repeat OFF.' + (wasArmed ? ' It was ARMED: its trail is removed, so it will not sell.' : '') +
             (hadBuyback ? ' A pending buy-back was cancelled and its reserved cash released.' : '')).catch(() => {});
+          shareStrategyNote('<b>' + escTg(sym.replace('-USD', '')) + ' pump loop switched OFF</b> - holding, no automatic selling');   // #S1
           return { content: [{ type: 'text', text: JSON.stringify({ ok: true, loop_enabled: 0, row: after[0] || null }, null, 2) }] };
         }
         if (action === 'remove' && rule_id) {
@@ -24469,6 +24607,11 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
           `${Number(fin.armed) === 1 ? '\nArmed state kept - this change did not disarm the loop.' : ''}` +
           `${tierInfo ? `\nMode: TIERED — sell ${stJson}, buy ${btJson} (cumulative sell ${tierInfo.cumulative_sell_pct}%, cap ${tierInfo.max_sell_pct}%)` : ''}` + conflictWarning
         ).catch(() => {});
+        shareStrategyNote('<b>' + escTg(sym.replace('-USD', '')) + ' pump loop ' + (ex ? 'changed' : 'set') + '</b>' + (ex && changed.length ? ' (' + escTg(changed.join(', ')) + ')' : '') +   // #S1
+          '\nSells ' + num(fin.sell_pct) + '% when it is up ' + num(fin.arm_pump_pct) + '% within ' + num(fin.arm_window_min) + ' min and then falls ' + num(fin.trail_pct) + '% from the peak' +
+          '\nBuys back after a ' + num(fin.retrace_pct) + '% retrace and a ' + num(fin.bounce_pct) + '% bounce' +
+          '\nNever sells below cost + 0.5%' + (Number(fin.entry_floor) > 0 ? ' (floor $' + num(fin.entry_floor) + ')' : '') +
+          '\nAuto-sell ' + (Number(fin.loop_enabled) === 1 ? 'ON' : 'OFF (alerts only)'));
         return { content: [{ type: 'text', text: JSON.stringify({ ok: true, warnings: spWarn, stop_check: _stopCheck, mode: ex ? 'updated' : 'created', changed, rule: {
           symbol: sym, arm_pump_pct: num(fin.arm_pump_pct), arm_window_min: num(fin.arm_window_min), trail_pct: num(fin.trail_pct), sell_pct: num(fin.sell_pct),
           entry_floor: num(fin.entry_floor), rebuy_pct: num(fin.rebuy_pct), retrace_pct: num(fin.retrace_pct), bounce_pct: num(fin.bounce_pct),
@@ -26234,6 +26377,13 @@ app.post('/telegram-webhook', async (req, res) => {
     // hash189 defense-in-depth: secret_token proves the request came from Telegram, not WHICH user.
     // Telegram forwards messages from any user who DMs the bot (all carry the valid secret header),
     // so hard-gate ALL routing to the authorized chat. Fail-closed: unknown chat gets a silent 200.
+    // #S1 the ONE thing the bot accepts from a group: /sharehere, and only from Bryan himself (Telegram sets from.id; a
+    // private chat's id IS the user's id). It only registers where share posts go. Everything else in a group is ignored below.
+    if (!isAuthorizedAdmin && message.chat && (message.chat.type === 'group' || message.chat.type === 'supergroup') &&
+        message.from && String(message.from.id) === String(TELEGRAM_CHAT_ID) && /^\/sharehere(@\w+)?$/i.test(rawText)) {
+      await registerShareChat(message.chat, sendReply).catch(e => console.error('[share] register failed:', e.message));
+      return res.status(200).json({ ok: true });
+    }
     if (!isAuthorizedAdmin) {
       console.warn('[security] /telegram-webhook ignoring message from unauthorized chat ' + chatId);
       return res.status(200).json({ ok: true });
@@ -26469,6 +26619,10 @@ app.post('/telegram-webhook', async (req, res) => {
           else { await sendReply('🤖 Running the agent now - screen, research, decide. The report arrives in a few minutes.'); runAgent('telegram').catch(async (e) => { await sendTelegram('❌ Agent run failed: ' + escTg(e.message)).catch(() => {}); }); }
         } else await sendReply('Agent commands: <code>/agent</code> (status) · <code>/agent think</code> (run now) · <code>/agent stop</code> · <code>/agent resume</code>');
       } catch (e) { await sendReply('❌ Agent: ' + escTg(e.message)); }
+      return res.status(200).json({ ok: true });
+    }
+    if (/^share(\s|$)/.test(commandText)) {   // #S1 share feed controls
+      await handleShareCommand(commandText.replace(/^share\s*/, '').trim(), rawText.replace(/^\/?share\s*/i, '').trim(), sendReply).catch(async (e) => { await sendReply('\u274c Share: ' + escTg(e.message)); });
       return res.status(200).json({ ok: true });
     }
     if (commandText === 'brief') {
