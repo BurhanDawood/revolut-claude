@@ -1,0 +1,91 @@
+name: Android signing setup (run once)
+
+# Creates the Android release key and stores it as the four repository secrets the Android APK workflow
+# signs with: ANDROID_KEYSTORE_B64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD.
+# Nobody ever sees the key or its passwords: they are made here, masked, piped straight into `gh secret set`,
+# and the files are deleted at the end.
+#
+# Needs the repository secret SIGNING_SETUP_TOKEN: a fine-grained token for this repository only with
+# "Secrets: Read and write". Delete the token (and that secret) afterwards.
+#
+# It refuses to run when ANDROID_KEYSTORE_B64 already exists: replacing the key would stop every
+# future build from installing over the app on the phone.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-signing-setup
+  cancel-in-progress: false
+
+jobs:
+  create-key:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Refuse if a key already exists
+        env:
+          EXISTING_KS: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          GH_TOKEN: ${{ secrets.SIGNING_SETUP_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::The repository secret SIGNING_SETUP_TOKEN is missing (a fine-grained token for this repo with Secrets: Read and write)."
+            exit 1
+          fi
+          if [ -n "$EXISTING_KS" ]; then
+            echo "::error::ANDROID_KEYSTORE_B64 already exists. The release key is never replaced; nothing was changed."
+            exit 1
+          fi
+          # a second check through the API (names only), in case the secret exists but this run cannot read it
+          NAMES="$(gh secret list --repo "$GITHUB_REPOSITORY" --json name --jq '.[].name')" || {
+            echo "::error::SIGNING_SETUP_TOKEN cannot list this repository's secrets (it needs Secrets: Read and write on $GITHUB_REPOSITORY)."
+            exit 1
+          }
+          if printf '%s\n' "$NAMES" | grep -qx ANDROID_KEYSTORE_B64; then
+            echo "::error::ANDROID_KEYSTORE_B64 already exists. The release key is never replaced; nothing was changed."
+            exit 1
+          fi
+          echo "No release key yet: creating one."
+
+      - name: Create the key and store the four secrets
+        env:
+          GH_TOKEN: ${{ secrets.SIGNING_SETUP_TOKEN }}
+        run: |
+          set -euo pipefail
+          umask 077
+          DIR="$RUNNER_TEMP/signing"
+          mkdir -p "$DIR"
+          # PKCS12 keeps one password for the store and the key, so the key password is the same value
+          PASS="$(openssl rand -hex 32)"
+          echo "::add-mask::$PASS"
+          printf '%s' "$PASS" > "$DIR/pass"
+          keytool -genkeypair -noprompt \
+            -keystore "$DIR/revolutx.keystore" -storetype PKCS12 \
+            -alias revolutx -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass:file "$DIR/pass" -keypass:file "$DIR/pass" \
+            -dname "CN=Revolut X, O=Bryan" > /dev/null 2>&1
+          base64 -w0 "$DIR/revolutx.keystore" > "$DIR/keystore.b64"
+          echo "::add-mask::$(cat "$DIR/keystore.b64")"
+
+          gh secret set ANDROID_KEYSTORE_B64      --repo "$GITHUB_REPOSITORY" < "$DIR/keystore.b64"
+          gh secret set ANDROID_KEYSTORE_PASSWORD --repo "$GITHUB_REPOSITORY" < "$DIR/pass"
+          gh secret set ANDROID_KEY_PASSWORD      --repo "$GITHUB_REPOSITORY" < "$DIR/pass"
+          printf 'revolutx' | gh secret set ANDROID_KEY_ALIAS --repo "$GITHUB_REPOSITORY"
+
+          # the certificate fingerprint is public (every APK carries it); printed so builds can be checked against it
+          keytool -list -keystore "$DIR/revolutx.keystore" -storetype PKCS12 -storepass:file "$DIR/pass" -alias revolutx \
+            | grep -i "SHA-256" | sed 's/^/Release certificate /' || true
+          echo "Stored: ANDROID_KEYSTORE_B64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD."
+          echo "Next: run the Android APK workflow, then delete the SIGNING_SETUP_TOKEN secret and the token itself."
+
+      - name: Delete the files
+        if: always()
+        run: |
+          if [ -d "$RUNNER_TEMP/signing" ]; then
+            find "$RUNNER_TEMP/signing" -type f -exec shred -u {} + 2>/dev/null || true
+            rm -rf "$RUNNER_TEMP/signing"
+          fi
+          echo "Local key files removed."

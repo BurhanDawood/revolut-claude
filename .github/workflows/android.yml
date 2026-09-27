@@ -7,8 +7,10 @@ name: Android APK
 #   ANDROID_KEYSTORE_B64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD
 #       the release key. Every APK signed with it installs over the previous one. Without all four the
 #       APK is signed with a throwaway key made for that run: it installs, but not over another build.
-#   GOOGLE_SERVICES_JSON_B64
-#       base64 of Firebase's google-services.json. Without it the app builds with push off.
+#       android-signing-setup.yml creates the release key and these four secrets once.
+#   GOOGLE_SERVICES_JSON_B64 or GOOGLE_SERVICES_JSON
+#       Firebase's google-services.json, base64 or pasted as plain JSON (the _B64 one wins when both exist).
+#       Without either the app builds with push off.
 
 on:
   push:
@@ -57,12 +59,21 @@ jobs:
       - name: google-services.json (optional)
         env:
           GS_B64: ${{ secrets.GOOGLE_SERVICES_JSON_B64 }}
+          GS_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
         run: |
+          OUT=mobile/android/app/google-services.json
           if [ -n "$GS_B64" ]; then
-            printf '%s' "$GS_B64" | base64 -d > mobile/android/app/google-services.json
-            echo "Push: on (google-services.json present)"
+            printf '%s' "$GS_B64" | base64 -d > "$OUT"
+            echo "Push: on (google-services.json from GOOGLE_SERVICES_JSON_B64)"
+          elif [ -n "$GS_JSON" ]; then
+            printf '%s' "$GS_JSON" > "$OUT"
+            echo "Push: on (google-services.json from GOOGLE_SERVICES_JSON)"
           else
-            echo "Push: off (no GOOGLE_SERVICES_JSON_B64 secret)"
+            echo "Push: off (no GOOGLE_SERVICES_JSON_B64 or GOOGLE_SERVICES_JSON secret)"
+          fi
+          if [ -f "$OUT" ] && ! python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$OUT" 2>/dev/null; then
+            echo "::error::the Firebase secret is not valid JSON (check you pasted the whole google-services.json)"
+            exit 1
           fi
 
       - name: Keystore

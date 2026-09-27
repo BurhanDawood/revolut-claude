@@ -19,8 +19,9 @@ mobile/
       BiometricAuthPlugin.java   Capacitor.Plugins.BiometricAuth.authenticate(...)
       WidgetBridgePlugin.java    Capacitor.Plugins.WidgetBridge.setConfig({ key, base })
       SecureStore.java           EncryptedSharedPreferences (key, base, widget values, push token)
-      PortfolioWidget.java       the widget (draws saved values; a tap opens Portfolio)
-      WidgetRefreshWorker.java   WorkManager: GET /api/portfolio/state every 30 min, on key save, on tap
+      PortfolioWidget.java       the widget (draws saved values; chip cycles 1D/1W/1M; a tap opens Portfolio)
+      SparkChart.java            the widget's line chart, drawn into a Bitmap
+      WidgetRefreshWorker.java   WorkManager: GET /api/portfolio/state + /spark every 30 min, on key save, on tap
       Push.java / RxMessagingService.java   FCM token -> POST /api/app/devices; notification display + tab
 ```
 
@@ -43,13 +44,32 @@ The shell (`APP_SHELL_JS` in `server.js`) runs inside the app's WebView, and Cap
 
 ## The widget
 
-The widget is read-only. It uses the dashboard key (which cannot trade) for one read, `GET /api/portfolio/state`, and shows:
-- the whole book, `latest.total`;
-- the change against `day.total_then`, as ▲/▼ $ and %;
-- "updated HH:MM", from `latest.ts`;
-- "partial" when `latest.partial` is true.
+The widget is read-only. It uses the dashboard key (which cannot trade) for reads only:
+- `GET /api/portfolio/state`;
+- `GET /api/portfolio/spark?range=1d|1w|1m`.
 
-It refreshes every 30 minutes (when there is a network), when the shell saves a key, when the widget is added, and when it is tapped.
+**Default size: 4×2.**
+- **Header:** "Revolut X", the whole book (`latest.total`), the change, and "updated HH:MM" (from `latest.ts`), plus "partial" when `latest.partial` is true.
+- **Chart:** below the header, a line chart of the chosen range:
+  - drawn natively into a Bitmap;
+  - 2dp line, green `#00c896` when last ≥ first, red `#ff4d6a` otherwise;
+  - a soft gradient under the line and a faint dashed line at the first value;
+  - no axes or labels.
+- **Range chip:** the "1D 1W 1M" chip in the chart's corner cycles the range. The range is saved per widget.
+- **Change in the header:** follows the range. 1D is `latest.total − day.total_then` from `/state`. 1W and 1M use the spark's `change` and `pct`.
+- **Taps:** tapping anywhere except the chip opens the app on Portfolio.
+
+**Resized to 4×1:** text only (the header), as in v1.
+
+**Refreshes:**
+- every 30 minutes, when there is a network;
+- when the shell saves a key;
+- when the widget is added or tapped;
+- when the range changes.
+
+State and spark are fetched together.
+
+**Size limit:** the bitmap is sized from the widget's current size × screen density, then capped at about 250k pixels (about 1 MB). This keeps RemoteViews well under its limit.
 
 What it shows when something is wrong:
 
@@ -57,9 +77,10 @@ What it shows when something is wrong:
 |---|---|
 | No key yet | "Open the app to set up" |
 | 401 | "Key not accepted - open the app" |
-| No network | the last values, marked "offline" |
+| No network | the last values and points, marked "offline" |
+| Spark answers 404 (older server) | no chart, text only |
 
-To add it: long-press the home screen → Widgets → Revolut X. It is 4×1 and can be resized to 4×2.
+To add it: long-press the home screen → Widgets → Revolut X.
 
 ## Build
 
@@ -91,21 +112,27 @@ Android installs an update only if it is signed with the same key as the install
 - `ANDROID_KEY_ALIAS`
 - `ANDROID_KEY_PASSWORD`
 
-Until all four exist, each build is signed with a one-off key made in that run. That APK installs fine, but the next one will not install over it: uninstall first. The Release title then says "(test signing)". After the real key is added, uninstall the test build once. From then on, every build updates in place.
+Until all four exist, each build is signed with a one-off key made in that run. That APK installs, but the next one will not install over it: uninstall first. The Release title then says "(test signing)". After the real key is added, uninstall the test build once. From then on, every build updates in place.
 
-To make the key (once, on a trusted computer, never in a chat):
+**Creating the key (once): the "Android signing setup (run once)" workflow.** It generates the keystore inside the Actions runner:
+- PKCS12, RSA 2048, validity 10000 days, alias `revolutx`;
+- random, masked passwords.
 
-```
-keytool -genkeypair -v -keystore revolutx.keystore -storetype PKCS12 -alias revolutx -keyalg RSA -keysize 2048 -validity 10000
-base64 -w0 revolutx.keystore > revolutx.keystore.b64      # macOS: base64 -i revolutx.keystore -o revolutx.keystore.b64
-```
+It pipes all four values straight into `gh secret set`, prints nothing secret, and deletes the files. It refuses to run if `ANDROID_KEYSTORE_B64` already exists, so the key is never replaced.
 
-Then add the four secrets in GitHub → the repo → Settings → Secrets and variables → Actions:
-- `ANDROID_KEYSTORE_B64` = the contents of the `.b64` file;
-- the two passwords;
-- the alias `revolutx`.
+It needs a temporary repository secret, `SIGNING_SETUP_TOKEN`: a fine-grained GitHub token for this repository only, with "Secrets: Read and write". Delete the token and the secret afterwards.
 
-Keep a private backup of the keystore and its passwords: a lost key means every phone must uninstall once. Never commit it. `*.jks`, `*.keystore` and `google-services.json` are git-ignored.
+Steps:
+1. github.com → your picture → Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token.
+   - Repository access: Only select repositories → `revolut-claude`.
+   - Permissions → Repository → Secrets: Read and write.
+   - Expiration: 1 day. Generate, then copy the token.
+2. The repo → Settings → Secrets and variables → Actions → New repository secret. Name `SIGNING_SETUP_TOKEN`, value: paste the token.
+3. The repo → Actions → Android signing setup (run once) → Run workflow → branch `mobile-app` → Run. It should go green.
+4. Actions → Android APK → Run workflow → branch `mobile-app`. That Release is the first release-signed build: its title has no "(test signing)".
+5. Delete the `SIGNING_SETUP_TOKEN` secret. Then delete the token itself (Developer settings → Fine-grained tokens → Delete).
+
+The key exists only inside GitHub secrets, so nobody holds a copy. If the secrets are ever lost, phones must uninstall once and the setup workflow is run again.
 
 ## Push notifications
 
@@ -129,5 +156,7 @@ Approve/Reject from a notification is not in v1. Approving needs the full key, w
 **Firebase setup (Bryan, in the browser):**
 1. At console.firebase.google.com, create a project "Revolut X".
 2. Add an Android app with package `com.bryan.revolutx`.
-3. Download `google-services.json`. Base64 it (`base64 -w0 google-services.json`, or on macOS `base64 -i google-services.json`). Add the result as the GitHub Actions secret `GOOGLE_SERVICES_JSON_B64`. Then run the Android APK workflow again.
+3. Download `google-services.json` and add it as a GitHub Actions secret. Then run the Android APK workflow again. Use either:
+   - `GOOGLE_SERVICES_JSON`: paste the file's contents as they are (easiest from a phone);
+   - `GOOGLE_SERVICES_JSON_B64`: the base64 of the file. This one wins if both exist.
 4. Project settings → Service accounts → Generate new private key. Put the whole JSON in the Railway variable `FCM_SERVICE_ACCOUNT` on the server service. The server half (device registry + sending) comes from the Dev thread.

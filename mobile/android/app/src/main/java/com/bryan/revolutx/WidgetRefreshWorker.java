@@ -22,8 +22,8 @@ import java.util.concurrent.TimeUnit;
 import org.json.JSONObject;
 
 /**
- * Reads GET {base}/api/portfolio/state with the dashboard key (a read; the widget never writes)
- * and saves what the widget shows. Every 30 min with a network, when the shell saves a key, and on a tap.
+ * Reads GET {base}/api/portfolio/state and GET {base}/api/portfolio/spark with the dashboard key (reads; the
+ * widget never writes) and saves what the widget shows. Every 30 min with a network, when the shell saves a key, and on a tap.
  */
 public class WidgetRefreshWorker extends Worker {
 
@@ -67,14 +67,11 @@ public class WidgetRefreshWorker extends Worker {
             return Result.success();
         }
         SharedPreferences.Editor e = p.edit();
+        String base = SecureStore.base(ctx);
+        boolean stateOk = false;
         HttpURLConnection c = null;
         try {
-            c = (HttpURLConnection) new URL(SecureStore.base(ctx) + "/api/portfolio/state").openConnection();
-            c.setConnectTimeout(15000);
-            c.setReadTimeout(20000);
-            c.setRequestProperty("x-api-token", key);
-            c.setRequestProperty("Accept", "application/json");
-            c.setUseCaches(false);
+            c = open(base + "/api/portfolio/state", key);
             int code = c.getResponseCode();
             if (code == 401 || code == 403) {
                 e.putString(PortfolioWidget.W_STATUS, "badkey");
@@ -96,6 +93,7 @@ public class WidgetRefreshWorker extends Worker {
                         e.remove(PortfolioWidget.W_THEN);
                     }
                     e.putString(PortfolioWidget.W_STATUS, "");
+                    stateOk = true;
                 }
             }
         } catch (IOException io) {
@@ -105,9 +103,42 @@ public class WidgetRefreshWorker extends Worker {
         } finally {
             if (c != null) c.disconnect();
         }
+        // the chart: one spark per range the placed widgets show. Offline or a server error keeps the last points.
+        if (stateOk) {
+            for (String range : PortfolioWidget.rangesInUse(ctx)) {
+                HttpURLConnection sc = null;
+                try {
+                    sc = open(base + "/api/portfolio/spark?range=" + range, key);
+                    int code = sc.getResponseCode();
+                    if (code == 404) {   // an older server without the route: text only
+                        e.putBoolean(PortfolioWidget.W_SPARK_NA, true);
+                        break;
+                    }
+                    if (code == 200) {
+                        JSONObject sp = new JSONObject(read(sc.getInputStream()));
+                        e.putBoolean(PortfolioWidget.W_SPARK_NA, false);
+                        e.putString(PortfolioWidget.W_SPARK + range, sp.toString());
+                    }
+                } catch (Exception ignored) {
+                    // keep the last points
+                } finally {
+                    if (sc != null) sc.disconnect();
+                }
+            }
+        }
         e.apply();
         PortfolioWidget.render(ctx);
         return Result.success();
+    }
+
+    private static HttpURLConnection open(String url, String key) throws IOException {
+        HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+        c.setConnectTimeout(15000);
+        c.setReadTimeout(20000);
+        c.setRequestProperty("x-api-token", key);
+        c.setRequestProperty("Accept", "application/json");
+        c.setUseCaches(false);
+        return c;
     }
 
     private static String read(InputStream in) throws IOException {
