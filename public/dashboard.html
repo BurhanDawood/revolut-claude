@@ -4,6 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Revolut X Dashboard</title>
+  <script>if (/[?&]app=1(&|$)/.test(location.search)) document.documentElement.classList.add('in-app');   // #489 shown inside the app</script>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -30,6 +31,17 @@
       min-height: 100vh;
       padding: 16px;
     }
+
+    /* #489 the tab row scrolls on its own; the page never scrolls sideways (phones, and the app's Home tab) */
+    html, body { overflow-x: clip; }
+    .tab-nav { overflow-x: auto; scrollbar-width: none; -webkit-overflow-scrolling: touch; }
+    .tab-nav::-webkit-scrollbar { display: none; }
+    .tab-btn { flex: 0 0 auto; white-space: nowrap; }
+    /* #489 inside the app (/?app=1): the app is the frame - no big title, the tab row pinned at the top */
+    html.in-app body { padding-top: 0; }
+    html.in-app header h1 { display: none; }
+    html.in-app header { margin-bottom: 0; padding: 8px 0 2px; justify-content: flex-end; }
+    html.in-app .tab-nav { position: sticky; top: 0; z-index: 20; background: var(--bg); padding: 8px 0 10px; margin: 0 0 8px; }
 
     header {
       display: flex;
