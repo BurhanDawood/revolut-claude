@@ -108,6 +108,7 @@ const buy = (o = {}) => ({ symbol: 'CC-USD', side: 'buy', path: 'trough', exchan
 function troughWorld(mut) {
   const w = baseWorld();
   w.rule.sale_price = '0.2000000000'; w.rule.sale_at = iso(NOW - 24 * H); w.rule.sale_proceeds_usd = 60;
+  w.rule.reference_base = '0.1000000000';   // #463 the cycle base 462 stores at the sale (here the cost, 0.10): safety line 0.095
   if (mut) mut(w);
   return w;
 }
@@ -363,9 +364,13 @@ await T('X3', 'Kraken: Balance read for position and cash; failure -> balances_u
   const t = troughWorld(x => { x.kraken = { ZUSD: '40' }; }); const c2 = await run(t, buy({ exchange: 'kraken', usd: 50 })); expectNo(c2, 'insufficient_cash', 9); assert.equal(c2.r.inputs.cash, 40); common(c2);
   const k = baseWorld(); k.krakenThrow = true; const c3 = await run(k, sell({ exchange: 'kraken' })); expectNo(c3, 'balances_unreadable', 8); common(c3);
 });
-await T('X4', 'rebuy floor (b): entry_floor 0.18, buyback_floor_pct 5 -> below 0.171 is below_rebuy_floor', async (run) => {
-  const c = await run(troughWorld(w => { w.rule.entry_floor = '0.18'; }), buy({ price: 0.17 })); expectNo(c, 'below_rebuy_floor', 10); assert.ok(Math.abs(c.r.inputs.rebuy_floor - 0.171) < 1e-12); common(c);
-  const c2 = await run(troughWorld(w => { w.rule.entry_floor = '0.18'; }), buy({ price: 0.172 })); expectOk(c2); common(c2);
+await T('X4', 'rebuy line (#463): 5% under the cycle base (reference_base) when it sits below the sale; else 5% under the sale; pct 0 kept', async (run) => {
+  const c = await run(troughWorld(w => { w.rule.reference_base = '0.1800000000'; }), buy({ price: 0.17 })); expectNo(c, 'below_rebuy_floor', 10); assert.ok(Math.abs(c.r.inputs.rebuy_floor - 0.171) < 1e-12); common(c);
+  const c2 = await run(troughWorld(w => { w.rule.reference_base = '0.1800000000'; }), buy({ price: 0.172 })); expectOk(c2); common(c2);
+  const c3 = await run(troughWorld(w => { w.rule.reference_base = null; }), buy({ price: 0.185 })); expectNo(c3, 'below_rebuy_floor', 10); assert.ok(Math.abs(c3.r.inputs.rebuy_floor - 0.19) < 1e-12, 'no base: the sale, as the tracker'); common(c3);
+  const c4 = await run(troughWorld(w => { w.rule.reference_base = '0.2500000000'; }), buy({ price: 0.185 })); expectNo(c4, 'below_rebuy_floor', 10); assert.ok(Math.abs(c4.r.inputs.rebuy_floor - 0.19) < 1e-12, 'a base at/above the sale is not a base'); common(c4);
+  const c5 = await run(troughWorld(w => { w.rule.entry_floor = '0.18'; }), buy({ price: 0.15 })); expectOk(c5); assert.ok(Math.abs(c5.r.inputs.rebuy_floor - 0.095) < 1e-12, 'the stored base, not entry_floor'); common(c5);
+  const c6 = await run(troughWorld(w => { w.rule.buyback_floor_pct = '0.0000'; }), buy({ price: 0.099 })); expectNo(c6, 'below_rebuy_floor', 10); assert.ok(Math.abs(c6.r.inputs.rebuy_floor - 0.10) < 1e-12, 'a stored 0% is 0%'); common(c6);
 });
 await T('X5', 'the predicate never mutates: every SQL it ran is a SELECT except its one exec_decisions INSERT', async () => {
   for (const x of all) for (const q of x.c.sql) assert.ok(/^\s*SELECT/i.test(q) || /^INSERT INTO exec_decisions/.test(q), x.id + ': ' + q);
