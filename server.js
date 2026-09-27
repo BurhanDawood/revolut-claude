@@ -15677,6 +15677,74 @@ function stopClearanceCheck(price, armPct, trailPct, floor, slip) {
                price_to_pass: Number(passP.toPrecision(6)), recovery_to_pass_pct: p < passP ? Number(((passP / p - 1) * 100).toFixed(2)) : 0 }; })() };
 }
 
+// #474a (PM #411c, Fable 27 Sep) the Revolut X record, read ONCE and kept 30 min, so loop_audit can compare each loop's
+// stored cost with the cost the venue's own transactions give. Read-only. Incomplete history = no comparison, said so.
+async function venueCostSnapshot(maxAgeMs) {
+  const c = venueCostSnapshot.cache;
+  if (c && Date.now() - c.at < maxAgeMs) return c;
+  const tx = await fetchAllTransactionsForRebuild(1100);
+  if (tx.incomplete.length) return { ok: false, at: Date.now(), error: 'the Revolut X history came back incomplete (' + tx.incomplete.length + ' window(s)) - costs not compared' };
+  const base = (x) => String(x || '').toUpperCase().replace('/', '-').replace(/-(USD|USDT|USDC|EUR|GBP)$/, '');
+  const bal = await revolutRequest('GET', '/balances');
+  const brows = Array.isArray(bal) ? bal : (bal && (bal.data || bal.balances)) || [];
+  if (!brows.length) return { ok: false, at: Date.now(), error: 'could not read Revolut X balances - costs not compared' };
+  const held = {}, pendingOut = {};
+  for (const b of brows) { const k = base(b.currency || b.symbol); const q = Number(b.balance != null ? b.balance : (b.available != null ? b.available : 0)); if (k) held[k] = (held[k] || 0) + q; }
+  for (const t of tx.rows) if (t.status === 'pending' && t.source && t.source.currency) { const k = String(t.source.currency).toUpperCase(); pendingOut[k] = (pendingOut[k] || 0) + (parseFloat(t.source.amount) || 0); }
+  const snap = { ok: true, at: Date.now(), rows: tx.rows, held, pendingOut, records: tx.rows.length };
+  venueCostSnapshot.cache = snap;
+  return snap;
+}
+const r6x = (v) => v == null || !Number.isFinite(Number(v)) ? null : Number(Number(v).toPrecision(6));
+// Pure: one loop's cost line. storedCost = entry_prices; dd = derivedFloorFrom(...) for the loop.
+function loopCostCheck(snap, coin, storedCost, dd) {
+  if (!snap) return { checked: false, reason: 'not requested (venue_cost: false)' };
+  if (!snap.ok) return { checked: false, reason: snap.error };
+  const r = rebuildPositionFromTransactions(snap.rows, coin);
+  if (!r.events) return { checked: false, reason: 'no Revolut X transactions for this coin (a Kraken coin?)' };
+  const actual = snap.held[coin] || 0, pend = snap.pendingOut[coin] || 0, tol = Math.max(1e-6, actual * 0.005);
+  const qtyOk = Math.abs(r.rebuilt_qty - pend - actual) <= tol || Math.abs(r.rebuilt_qty - pend + (r.staked_qty || 0) - actual) <= tol;
+  const v = Number(r.avg_cost) > 0 ? Number(r.avg_cost) : null;
+  if (!qtyOk) return { checked: false, reason: 'the replayed quantity ' + r.rebuilt_qty + ' does not match the balance ' + actual + ' - venue cost not trusted', venue_cost: r6x(v) };
+  if (v == null || !r.avg_trustworthy) return { checked: false, reason: 'no trustworthy venue average' + (r.avg_note ? ' (' + r.avg_note + ')' : ''), venue_cost: r6x(v) };
+  const sc = Number(storedCost) > 0 ? Number(storedCost) : null;
+  const gap = sc != null ? (sc - v) / v * 100 : null;
+  const fl = dd && Number(dd.floor) > 0 ? Number(dd.floor) : null;
+  const fvt = fl != null ? (fl - v) / v * 100 : null;
+  return {
+    checked: true, stored_cost: r6x(sc), venue_cost: r6x(v), gap_pct: gap == null ? null : Number(gap.toFixed(2)), venue_note: r.avg_note || null,
+    flag: gap == null ? 'no stored cost' : Math.abs(gap) <= 1 ? 'OK (within 1%)'
+        : gap < 0 ? 'STORED COST ' + (-gap).toFixed(2) + '% BELOW the venue cost - its cost floor is too low'
+        : 'stored cost ' + gap.toFixed(2) + '% above the venue cost (safe side - blocks some profitable sales)',
+    floor_effective: r6x(fl), floor_source: dd ? dd.source : null,
+    floor_vs_venue_cost_pct: fvt == null ? null : Number(fvt.toFixed(2)),
+    verdict: fvt == null ? 'no floor - sales blocked' : fvt < 0 ? 'EFFECTIVE FLOOR IS UNDER TRUE COST by ' + (-fvt).toFixed(2) + '% - a sale could lose money' : 'effective floor ' + fvt.toFixed(2) + '% above true cost (' + (dd ? dd.source : '?') + ')'
+  };
+}
+// #474b (#410) Pure: where the buy-back leg stands. A buy-back executes only if the trough stays above
+// sale x (1 - buyback_floor_pct); the gate sits retrace_pct of the way back down the move, so a move bigger than
+// buyback_floor_pct / retrace_pct of the sale price puts the gate BELOW that line and the buy-back can only ALERT.
+function loopBuySide(rule, price) {
+  if (!rule) return null;
+  const rp = Number(rule.retrace_pct) > 0 ? Number(rule.retrace_pct) : 50, fp = Number(rule.buyback_floor_pct) > 0 ? Number(rule.buyback_floor_pct) : 5, bp = Number(rule.bounce_pct) > 0 ? Number(rule.bounce_pct) : 8;
+  const out = { retrace_pct: rp, buyback_floor_pct: fp, bounce_pct: bp, auto_buy_only_if_move_under_pct: Number((fp / rp * 100).toFixed(2)) };
+  const sp = Number(rule.sale_price);
+  if (!(sp > 0)) return { ...out, live_cycle: false, note: 'no live cycle. When the loop sells, the buy-back can execute only if the move from the cycle base is under ' + out.auto_buy_only_if_move_under_pct + '% of the sale price; bigger moves only alert.' };
+  const gate = Number(rule.retrace_gate) > 0 ? Number(rule.retrace_gate) : null, base = Number(rule.reference_base) > 0 ? Number(rule.reference_base) : null;
+  const rebuyFloor = sp * (1 - fp / 100), p = Number(price) > 0 ? Number(price) : null;
+  const low = Number(rule.trough_low) > 0 ? Number(rule.trough_low) : null, armed = Number(rule.trough_armed) === 1;
+  const o = { ...out, live_cycle: true, sale_price: r6x(sp), reference_base: r6x(base), gate: r6x(gate), rebuy_floor: r6x(rebuyFloor), price: r6x(p),
+    gate_distance_pct: gate != null && p != null ? Number(((gate / p - 1) * 100).toFixed(2)) : null,
+    gate_vs_base: gate == null ? null : base == null ? 'no base - gate is ' + rp + '% below the sale' : gate > base ? 'above the cycle base by ' + ((gate / base - 1) * 100).toFixed(2) + '%' : 'at or below the cycle base',
+    trough_armed: armed, trough_low: r6x(low), can_auto_buy: gate != null ? gate >= rebuyFloor : null };
+  o.verdict = gate == null ? 'no gate stored'
+    : !o.can_auto_buy ? 'ALERT ONLY: the gate ' + o.gate + ' is below the rebuy floor ' + o.rebuy_floor + ' - a trough deep enough to arm is already too deep to buy'
+    : armed ? (low != null && low < rebuyFloor ? 'ALERT ONLY: the trough ' + o.trough_low + ' went below the rebuy floor ' + o.rebuy_floor
+             : 'tracking the trough - buys on a ' + bp + '% bounce off ' + o.trough_low)
+    : 'waiting for the price to reach ' + o.gate + (o.gate_distance_pct != null ? ' (' + o.gate_distance_pct + '% from here)' : '') + ', then buys on a ' + bp + '% bounce if the trough stays above ' + o.rebuy_floor;
+  return o;
+}
+
 // ── #387 FLOOR-CAPPED SELL WHEN A LOOP IS IN EDGE (PM #48) ─────────────────────────
 // Every guard so far constrains the DECISION to sell; none constrains the FILL. A market order takes whatever the
 // book gives, so when the price is close to the floor a sale that PASSED the floor check can still fill below it.
@@ -23768,8 +23836,9 @@ let rows;
       pc_path: z.enum(['loop_trail', 'manual_trail', 'trough', 'trough_standalone', 'ladder', 'away_sell', 'away_buy', 'ai_analysis']).optional().describe('#P0 predicate_check: the autonomous path to evaluate'),
       pc_usd: z.coerce.number().optional().describe('#P0 predicate_check: optional USD size (buys)'),
       pc_qty: z.coerce.number().optional().describe('#P0 predicate_check: optional coin quantity (sells)'),
+      venue_cost: z.preprocess(v => v === 'true' ? true : (v === 'false' ? false : v), z.boolean()).optional().describe('#474 loop_audit: compare each loop\'s stored cost with the Revolut X record (default true; reads the full transaction history once, ~15 s, then cached 30 min). false = skip.'),
     },
-    async ({ action, rule_id, symbol, force, ladder_cfg, cap_usd, ladder_on, profile, pc_side, pc_path, pc_usd, pc_qty }) => {
+    async ({ action, rule_id, symbol, force, ladder_cfg, cap_usd, ladder_on, profile, pc_side, pc_path, pc_usd, pc_qty, venue_cost }) => {
       try {
         if (action === 'list') {
           const [rules] = await db.execute('SELECT * FROM auto_trade_rules ORDER BY created_at DESC');
@@ -23993,6 +24062,8 @@ let rows;
           const r6 = (v) => v == null ? null : Number(Number(v).toPrecision(6));
           const slipMap = {};   // #384 each loop's p90 sell slippage, for the stop-clearance column
           for (const r of rules) { const cc = r.symbol.replace('-USD', ''); slipMap[cc] = await coinSellSlipP90(cc).catch(() => ({ p90: BOOK_SELL_SLIP_P90, source: 'fallback' })); }
+          let vcSnap = null;   // #474a
+          if (venue_cost !== false) vcSnap = await venueCostSnapshot(30 * 60 * 1000).catch(e => ({ ok: false, at: Date.now(), error: 'venue read failed: ' + e.message }));
           const loops = coins.map(c => {
             const rule = rules.find(r => r.symbol === c + '-USD') || null;
             const cost = entryPrices.has(c + '-USD') ? Number(entryPrices.get(c + '-USD')) : null;
@@ -24039,7 +24110,9 @@ let rows;
               arm: rule ? `+${Number(rule.arm_pump_pct)}% in ${Number(rule.arm_window_min)}min, trail ${Number(rule.trail_pct)}%, sell ${Number(rule.sell_pct)}%` : null,
               ceiling: rule ? (() => { const c = effectiveCeilingPct(rule); const sp = Number(rule.sale_price); return c.pct + '% (' + c.source + ')' + (sp > 0 ? ' - gives up above ' + fmtPriceShort(sp * (1 + c.pct / 100)) : ' - no live cycle'); })() : null,   // #P0 buy-back ceiling; #A3 the give-up price
               blocked_by: blocks,
-              verdict: !canSell ? 'CANNOT auto-sell' : (price != null && eff != null && price <= eff ? `can auto-sell only above ${r6(eff)} (price is at/below the floor)` : 'CAN auto-sell on a trail breach')
+              verdict: !canSell ? 'CANNOT auto-sell' : (price != null && eff != null && price <= eff ? `can auto-sell only above ${r6(eff)} (price is at/below the floor)` : 'CAN auto-sell on a trail breach'),
+              cost_check: rule ? loopCostCheck(vcSnap, c, cost, dd) : null,   // #474a stored cost vs the Revolut X record
+              buy_side: loopBuySide(rule, price)                               // #474b (#410) can the buy-back leg actually buy?
             };
           });
           return { content: [{ type: 'text', text: JSON.stringify({
@@ -24048,6 +24121,12 @@ let rows;
             triggers: (ae.allowed_triggers || []).join(', ') || 'none',   // #H1 the live policy, where the loops are
             note: '/pause (ai_auto_execute.enabled=false) HOLDS every loop sell and buy-back since #F1; loop_disable stops a single loop. Floor (#377): the HIGHEST of real cost + 0.5% and any stored override - an override can raise it, never lower it; no cost and no override = sale blocked.',
             dnd_coins: dndCoins, loops,
+            cost_check_summary: !vcSnap ? 'not requested' : !vcSnap.ok ? vcSnap.error : {   // #474a
+              read_at: new Date(vcSnap.at).toISOString(), records: vcSnap.records,
+              stored_cost_off_by_more_than_1pct: loops.filter(l => l.cost_check && l.cost_check.checked && l.cost_check.gap_pct != null && Math.abs(l.cost_check.gap_pct) > 1).map(l => l.coin + ' ' + l.cost_check.gap_pct + '%'),
+              floor_under_true_cost: loops.filter(l => l.cost_check && l.cost_check.checked && l.cost_check.floor_vs_venue_cost_pct != null && l.cost_check.floor_vs_venue_cost_pct < 0).map(l => l.coin),
+              not_checked: loops.filter(l => l.cost_check && !l.cost_check.checked).map(l => l.coin + ': ' + l.cost_check.reason) },
+            buy_side_alert_only: loops.filter(l => l.buy_side && l.buy_side.live_cycle && l.buy_side.can_auto_buy === false).map(l => l.coin),   // #474b
             muted_but_armed: await mutedButArmed().catch(e => [{ error: e.message }])   // #431
           }, null, 2) }] };
         }
@@ -24062,7 +24141,19 @@ let rows;
           if (!pr.length) throw new Error('No pump_armed_rules row for '+sym);
           const r = pr[0];
           if (r.active !== 1) throw new Error(sym+' rule is not active (active='+r.active+') — refusing to enable loop');
-          if (r.entry_floor == null || parseFloat(r.entry_floor) <= 0) throw new Error(sym+' has no entry_floor — refusing to enable loop (never-sell-below-entry guard)');
+          // #474c (#412 read side, Fable 27 Sep): refuse on the EFFECTIVE floor - the one every sell path uses (highest of
+          // real cost + 0.5% and any override) - not on the rule's override column. A loop with a real cost and no override
+          // (or a legacy 0) is protected by its cost and may be enabled; no cost and no override = refused, as before.
+          const leCoin = sym.replace('-USD', '');
+          const leFloor = await computeDerivedFloor(sym, leCoin);
+          if (!(Number(leFloor.floor) > 0)) throw new Error(sym+' has no floor: no real cost, no sell_floors entry and no rule floor — refusing to enable loop (never-sell-below-cost guard)');
+          // The same stop-to-floor clearance set_pump_armed_rule applies (#383/#384): switching a loop ON is the move that
+          // makes it able to sell, so a loop whose lowest possible stop cannot clear the floor by 3 x p90 slippage is refused.
+          const lePx = await getCurrentPrice(sym).catch(() => null);
+          const leStop = stopClearanceCheck(lePx, r.arm_pump_pct, r.trail_pct, leFloor.floor, await coinSellSlipP90(leCoin));
+          if (leStop.checked && !leStop.ok) {
+            return { content: [{ type: 'text', text: JSON.stringify({ ok: false, refused: true, reason: 'loop NOT enabled: its lowest possible stop ' + leStop.lowest_stop + ' clears the floor ' + leStop.floor + ' by only ' + leStop.clearance_pct + '% - needs ' + leStop.required_pct + '% (3 x p90 sell slippage). Raise the arm or tighten the trail first (set_pump_armed_rule). Nothing was written.', stop_check: leStop, floor: leFloor }) }] };
+          }
 
           // #237/#238 ask-3: warn if a trailing stop already exists for this symbol
           // that isn't from the pump-loop's own last arm cycle (armed=1 on this same
@@ -24078,10 +24169,10 @@ let rows;
 
           await db.execute('UPDATE pump_armed_rules SET loop_enabled = 1 WHERE symbol = ?', [sym]);
           const [after] = await db.execute('SELECT * FROM pump_armed_rules WHERE symbol = ? LIMIT 1', [sym]);
-          await sendTelegram('LOOP ENABLED -- '+sym+' rinse-repeat ON. Floor $'+parseFloat(r.entry_floor).toFixed(6)+', sell '+r.sell_pct+'%, max '+r.max_cycles+' cycles. Master must also be ON to fire.'+conflictWarning).catch(()=>{});
+          await sendTelegram('LOOP ENABLED -- '+sym+' rinse-repeat ON. Floor $'+Number(leFloor.floor).toPrecision(6)+' ('+leFloor.source+'), sell '+r.sell_pct+'%, max '+r.max_cycles+' cycles. Master must also be ON to fire.'+(leStop.checked ? '' : ' Stop clearance not checked ('+leStop.reason+').')+conflictWarning).catch(()=>{});
           const leWarn = await emitEnableWarnings(sym, { side: 'both', trigger: 'trailing_stop' }, 'loop_enable');   // #H1
           shareStrategyNote('<b>' + escTg(sym.replace('-USD', '')) + ' pump loop switched ON</b>\nSells ' + r.sell_pct + '% when up ' + Number(r.arm_pump_pct) + '% then down ' + Number(r.trail_pct) + '% from the peak; buys back on the dip');   // #S1
-          return { content: [{ type: 'text', text: JSON.stringify({ ok: true, loop_enabled: 1, row: after[0], conflict_warning: conflictWarning || null, warnings: leWarn }, null, 2) }] };
+          return { content: [{ type: 'text', text: JSON.stringify({ ok: true, loop_enabled: 1, floor: leFloor, stop_check: leStop, row: after[0], conflict_warning: conflictWarning || null, warnings: leWarn }, null, 2) }] };
         }
         if (action === 'reset_cycle') {
           // #278 — clear stale pump-loop RUNTIME state while preserving all config.
