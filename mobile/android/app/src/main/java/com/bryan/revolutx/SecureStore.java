@@ -3,7 +3,7 @@ package com.bryan.revolutx;
 import android.content.Context;
 import android.content.SharedPreferences;
 import androidx.security.crypto.EncryptedSharedPreferences;
-import androidx.security.crypto.MasterKey;
+import androidx.security.crypto.MasterKeys;
 
 /**
  * The dashboard key, the server base and the widget's last values, in EncryptedSharedPreferences.
@@ -38,11 +38,11 @@ final class SecureStore {
     }
 
     private static SharedPreferences open(Context app) throws Exception {
-        MasterKey mk = new MasterKey.Builder(app).setKeyScheme(MasterKey.KeyScheme.AES256_GCM).build();
+        String mk = MasterKeys.getOrCreate(MasterKeys.AES256_GCM_SPEC);   // an AES-256 key in the Android Keystore
         return EncryptedSharedPreferences.create(
-            app,
             FILE,
             mk,
+            app,
             EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
             EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
         );
