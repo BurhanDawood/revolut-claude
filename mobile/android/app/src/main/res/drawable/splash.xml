@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- launch screen before Android 12 (12+ uses the windowSplashScreen* attributes in styles.xml) -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:drawable="@color/rx_bg" />
+    <item
+        android:width="96dp"
+        android:height="96dp"
+        android:drawable="@mipmap/ic_launcher"
+        android:gravity="center" />
+</layer-list>

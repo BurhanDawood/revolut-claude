@@ -1,0 +1,21 @@
+{
+  "name": "revolutx-mobile",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Revolut X Android app: a Capacitor wrapper around the server's /app shell",
+  "scripts": {
+    "sync": "cap sync android"
+  },
+  "dependencies": {
+    "@capacitor/android": "^8.5.2",
+    "@capacitor/app": "^8.1.1",
+    "@capacitor/core": "^8.5.2",
+    "@capacitor/push-notifications": "^8.1.2"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^8.5.2"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

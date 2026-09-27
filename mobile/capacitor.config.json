@@ -1,0 +1,11 @@
+{
+  "appId": "com.bryan.revolutx",
+  "appName": "Revolut X",
+  "webDir": "www",
+  "server": {
+    "url": "https://revolut-claude-production.up.railway.app/app",
+    "androidScheme": "https",
+    "allowNavigation": ["revolut-claude-production.up.railway.app"]
+  },
+  "android": { "backgroundColor": "#0d0d0d" }
+}

@@ -1,0 +1,124 @@
+name: Android APK
+
+# Builds the Revolut X Android app (mobile/) and publishes the APK as a prerelease.
+# It never touches main, the server or Railway: it only reads mobile/ and writes a GitHub Release.
+#
+# Secrets (Settings -> Secrets and variables -> Actions), all optional for the build to pass:
+#   ANDROID_KEYSTORE_B64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD
+#       the release key. Every APK signed with it installs over the previous one. Without all four the
+#       APK is signed with a throwaway key made for that run: it installs, but not over another build.
+#   GOOGLE_SERVICES_JSON_B64
+#       base64 of Firebase's google-services.json. Without it the app builds with push off.
+
+on:
+  push:
+    branches: [ mobile-app ]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # to publish the Release
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+
+      - name: JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: gradle
+
+      - name: Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install and sync
+        working-directory: mobile
+        run: npm ci && npx cap sync android
+
+      - name: google-services.json (optional)
+        env:
+          GS_B64: ${{ secrets.GOOGLE_SERVICES_JSON_B64 }}
+        run: |
+          if [ -n "$GS_B64" ]; then
+            printf '%s' "$GS_B64" | base64 -d > mobile/android/app/google-services.json
+            echo "Push: on (google-services.json present)"
+          else
+            echo "Push: off (no GOOGLE_SERVICES_JSON_B64 secret)"
+          fi
+
+      - name: Keystore
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          KS="$RUNNER_TEMP/revolutx.keystore"
+          if [ -n "$KS_B64" ] && [ -n "$KS_PASS" ] && [ -n "$KEY_ALIAS" ] && [ -n "$KEY_PASS" ]; then
+            printf '%s' "$KS_B64" | base64 -d > "$KS"
+            echo "SIGNING=release" >> "$GITHUB_ENV"
+            echo "Signing: release key from repository secrets"
+          else
+            # no release key yet: a throwaway key for this run only (never stored, never printed)
+            TMP_PASS="$(openssl rand -hex 24)"
+            echo "::add-mask::$TMP_PASS"
+            keytool -genkeypair -keystore "$KS" -storetype PKCS12 -alias revolutx -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass "$TMP_PASS" -keypass "$TMP_PASS" -dname "CN=Revolut X test build" > /dev/null 2>&1
+            {
+              echo "SIGNING=temporary"
+              echo "TMP_KS_PASS=$TMP_PASS"
+            } >> "$GITHUB_ENV"
+            echo "::warning title=Temporary signing::The ANDROID_* signing secrets are not set. This APK is signed with a one-off key: it installs, but will not install over another build. See mobile/README.md."
+          fi
+          echo "ANDROID_KEYSTORE_FILE=$KS" >> "$GITHUB_ENV"
+
+      - name: Build release APK
+        working-directory: mobile/android
+        env:
+          VERSION_CODE: ${{ github.run_number }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD || env.TMP_KS_PASS }}
+          ANDROID_KEY_ALIAS: ${{ env.SIGNING == 'release' && secrets.ANDROID_KEY_ALIAS || 'revolutx' }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD || env.TMP_KS_PASS }}
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon --stacktrace
+          APK=app/build/outputs/apk/release/app-release.apk
+          test -f "$APK" || { echo "::error::no signed app-release.apk was produced"; ls -R app/build/outputs/apk; exit 1; }
+          "$ANDROID_HOME"/build-tools/*/apksigner verify --print-certs "$APK" | grep -i "certificate SHA-256" | head -1
+          cp "$APK" "$GITHUB_WORKSPACE/app-release.apk"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release-${{ github.run_number }}
+          path: app-release.apk
+          if-no-files-found: error
+
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: app-v${{ github.run_number }}
+          target_commitish: ${{ github.sha }}
+          name: Revolut X app v${{ github.run_number }}${{ env.SIGNING == 'temporary' && ' (test signing)' || '' }}
+          prerelease: true
+          files: app-release.apk
+          body: |
+            Android app build ${{ github.run_number }} from `${{ github.ref_name }}` (${{ github.sha }}).
+            Versioncode ${{ github.run_number }}. Download `app-release.apk` on the phone and open it to install.
+            ${{ env.SIGNING == 'temporary' && 'Signed with a one-off test key because the release signing secrets are not set: it will NOT install over another build (uninstall the old one first).' || 'Signed with the release key: installs over the previous build.' }}
