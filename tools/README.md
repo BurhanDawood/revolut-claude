@@ -47,3 +47,13 @@ The loader checks each file's sha256 against MANIFEST.json and refuses a mismatc
 | `tools/data/validate.mjs` | page validator, whole-table order check, shrink guard, MANIFEST builder; the CLI the workflow runs |
 | `tools/data/load.mjs` | reads `data/prices/*.ndjson.gz` into per-symbol arrays after the sha256 check |
 | `tools/replay/spike-replay.mjs` | offline driver for the live `spikeReplay` (stub db, no-op `specNote`) |
+| `tools/backtest/loop-grid.mjs` | T3: offline driver for the live `runLadderBacktest` over a pump-loop settings grid (stub db, read-only fill tap); buy-back modes A sell-only / B engine / C cost-anchored (not expressible, see tests/FINDINGS.md T3-1); walk-forward with a robust 3x3 pick |
+| `tools/backtest/loop-report.mjs` | T3: turns loop-grid output into the tables of `reports/loop-backtest-2026-09.md` (plus the 1.0% slippage rerun, monthly restarts and the HIGH trail study) |
+
+### T3 loop settings backtest (about 15 minutes in all)
+
+```sh
+node tools/backtest/loop-grid.mjs --coins held --split 2026-06-01 --buyback A,B,C --slippage 0.5 --out /tmp/held      # 9 held coins, live floors (~2 min)
+node tools/backtest/loop-grid.mjs --coins all --floors none --split 2026-06-01 --buyback A,B --out /tmp/all           # 65 coins (~13 min)
+node tools/backtest/loop-report.mjs --held /tmp/held.json --all /tmp/all.json --out reports/loop-backtest-2026-09   # tables + results JSON/CSV
+```
