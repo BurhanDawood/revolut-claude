@@ -1,0 +1,10 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Revolut X</string>
+    <string name="title_activity_main">Revolut X</string>
+    <string name="package_name">com.bryan.revolutx</string>
+    <string name="custom_url_scheme">com.bryan.revolutx</string>
+    <string name="widget_setup">Open the app to set up</string>
+    <string name="widget_description">Your whole book, its change and a 1D / 1W / 1M chart</string>
+    <string name="widget_chart_description">Portfolio value chart</string>
+</resources>

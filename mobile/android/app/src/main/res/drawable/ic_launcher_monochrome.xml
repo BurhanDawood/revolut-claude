@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- themed icon (Android 13+): the same line, one colour -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <group
+        android:scaleX="0.17"
+        android:scaleY="0.17"
+        android:translateX="10.99"
+        android:translateY="8.95">
+        <path
+            android:pathData="M104,360 L200,262 L262,314 L402,170 M332,166 H406 V240"
+            android:strokeWidth="36"
+            android:strokeColor="#FFFFFFFF"
+            android:strokeLineCap="round"
+            android:strokeLineJoin="round" />
+        <path
+            android:fillColor="#FFFFFFFF"
+            android:pathData="M104,360 m-22,0 a22,22 0 1,0 44,0 a22,22 0 1,0 -44,0" />
+    </group>
+</vector>

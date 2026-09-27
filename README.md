@@ -19,6 +19,7 @@ Node.js (v22) / Express, single `server.js` · MySQL on Railway · Telegram bot 
 - **How & why the system is built** → [`ARCHITECTURE.md`](./ARCHITECTURE.md) — system overview, data-flow map, subsystem map, design decisions + rationale, conventions.
 - **Live ticket board / open work** → the `dev_log`, queried via the MCP tool `get_trading_data` with `include=['dev_log']`. This is the authoritative source for current status — not this file.
 - **Exact diffs / build history** → git commit history.
+- **Android app (APK)** → [`mobile/README.md`](./mobile/README.md).
 
 ## Safety posture (non-negotiable)
 

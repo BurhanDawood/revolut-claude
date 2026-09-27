@@ -1,0 +1,3 @@
+node_modules/
+# the repo root ignores lock files; this one is needed for `npm ci`
+!package-lock.json

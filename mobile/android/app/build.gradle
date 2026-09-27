@@ -1,0 +1,80 @@
+apply plugin: 'com.android.application'
+
+// google-services.json is written by CI from the GOOGLE_SERVICES_JSON_B64 secret when it exists.
+// Without it the app builds and works; only push stays off (BuildConfig.HAS_FCM = false).
+def hasGoogleServices = file('google-services.json').exists()
+
+// Release signing comes from the environment (CI decodes the keystore from repository secrets).
+// Nothing secret is in this repository.
+def keystorePath = System.getenv('ANDROID_KEYSTORE_FILE')
+def canSign = keystorePath && file(keystorePath).exists()
+
+android {
+    namespace = "com.bryan.revolutx"
+    compileSdk = rootProject.ext.compileSdkVersion
+    defaultConfig {
+        applicationId "com.bryan.revolutx"
+        minSdkVersion rootProject.ext.minSdkVersion
+        targetSdkVersion rootProject.ext.targetSdkVersion
+        // CI passes github.run_number, so each APK installs over the previous one
+        versionCode((System.getenv('VERSION_CODE') ?: '1') as Integer)
+        versionName "1.0." + (System.getenv('VERSION_CODE') ?: '0')
+        buildConfigField "boolean", "HAS_FCM", hasGoogleServices.toString()
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        aaptOptions {
+             // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
+             // Default: https://android.googlesource.com/platform/frameworks/base/+/282e181b58cf72b6ca770dc7ca5f91f135444502/tools/aapt/AaptAssets.cpp#61
+            ignoreAssetsPattern = '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
+        }
+    }
+    buildFeatures {
+        buildConfig true
+    }
+    signingConfigs {
+        if (canSign) {
+            release {
+                storeFile file(keystorePath)
+                storePassword System.getenv('ANDROID_KEYSTORE_PASSWORD')
+                keyAlias System.getenv('ANDROID_KEY_ALIAS')
+                keyPassword System.getenv('ANDROID_KEY_PASSWORD')
+            }
+        }
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+            if (canSign) signingConfig signingConfigs.release
+        }
+    }
+}
+
+repositories {
+    flatDir{
+        dirs '../capacitor-cordova-android-plugins/src/main/libs', 'libs'
+    }
+}
+
+dependencies {
+    implementation fileTree(include: ['*.jar'], dir: 'libs')
+    implementation "androidx.appcompat:appcompat:$androidxAppCompatVersion"
+    implementation "androidx.coordinatorlayout:coordinatorlayout:$androidxCoordinatorLayoutVersion"
+    implementation "androidx.core:core-splashscreen:$coreSplashScreenVersion"
+    implementation "androidx.biometric:biometric:$androidxBiometricVersion"
+    implementation "androidx.security:security-crypto:$androidxSecurityCryptoVersion"
+    implementation "androidx.work:work-runtime:$androidxWorkVersion"
+    implementation "com.google.firebase:firebase-messaging:$firebaseMessagingVersion"
+    implementation project(':capacitor-android')
+    testImplementation "junit:junit:$junitVersion"
+    androidTestImplementation "androidx.test.ext:junit:$androidxJunitVersion"
+    androidTestImplementation "androidx.test.espresso:espresso-core:$androidxEspressoCoreVersion"
+    implementation project(':capacitor-cordova-android-plugins')
+}
+
+apply from: 'capacitor.build.gradle'
+
+if (hasGoogleServices) {
+    apply plugin: 'com.google.gms.google-services'
+} else {
+    logger.lifecycle("google-services.json not found: building without push")
+}

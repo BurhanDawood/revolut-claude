@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- notification icon: the app icon's rising line, white on transparent -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="512"
+    android:viewportHeight="512">
+    <path
+        android:pathData="M104,360 L200,262 L262,314 L402,170 M332,166 H406 V240"
+        android:strokeWidth="40"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M104,360 m-26,0 a26,26 0 1,0 52,0 a26,26 0 1,0 -52,0" />
+</vector>

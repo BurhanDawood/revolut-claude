@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0d0d0d">
+<title>Revolut X</title>
+<!-- Shown by the Android app when the server cannot be reached (MainActivity.showOffline). The app normally loads the live /app shell. -->
+<style>
+:root { --bg:#0d0d0d; --ink:#e8e8e8; --soft:#8f8f8f; --acc:#00ffc8; color-scheme:dark; }
+html, body { height:100%; margin:0; background:var(--bg); color:var(--ink); font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+main { min-height:100%; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px; padding:24px 16px; box-sizing:border-box; text-align:center; }
+svg { width:72px; height:72px; }
+h1 { font-size:21px; margin:6px 0 0; }
+p { color:var(--soft); margin:0; max-width:34ch; }
+button { font:600 16px system-ui,sans-serif; padding:12px 22px; border-radius:12px; border:0; background:var(--acc); color:var(--bg); min-width:180px; }
+</style>
+</head>
+<body>
+<main>
+  <svg viewBox="0 0 512 512" aria-hidden="true"><rect width="512" height="512" rx="112" fill="#0f1512"/><rect x="24" y="24" width="464" height="464" rx="96" fill="#173a2a"/><path d="M104 360 L200 262 L262 314 L402 170" fill="none" stroke="#6cc497" stroke-width="36" stroke-linecap="round" stroke-linejoin="round"/><path d="M332 166 H406 V240" fill="none" stroke="#6cc497" stroke-width="36" stroke-linecap="round" stroke-linejoin="round"/><circle cx="104" cy="360" r="22" fill="#e6ebe4"/></svg>
+  <h1>No connection to the server</h1>
+  <p>Check the phone's internet connection, then try again.</p>
+  <button id="retry" type="button">Retry</button>
+</main>
+<script>
+document.getElementById('retry').addEventListener('click', function () {
+  location.replace('https://revolut-claude-production.up.railway.app/app');
+});
+</script>
+</body>
+</html>
