@@ -5233,7 +5233,7 @@ async function runPumpArmStalenessCheck() {
       try {
         const isKraken = KRAKEN_MONITORED_COINS.includes(row.symbol);
         const price = isKraken ? await getKrakenPriceForSymbol(row.symbol).catch(() => null) : await getCurrentPrice(row.symbol).catch(() => null);
-        if (price && row.entry_floor) {
+        if (price && Number(row.entry_floor) > 0) {   // #412 a stored "0.0000000000" is a truthy string - positive only
           const belowFloor = price <= parseFloat(row.entry_floor);
           priceLine = ` | price ${fmtPriceShort(price)} vs floor ${fmtPriceShort(parseFloat(row.entry_floor))}${belowFloor ? ' (BELOW -- floor guard likely blocking)' : ''}`;
         }
@@ -24224,7 +24224,7 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
       arm_pump_pct:   z.coerce.number().describe('Pump %% that arms the trailing stop (e.g. 25 = +25%)'),
       trail_pct:      z.coerce.number().describe('Trailing stop %% below peak once armed (e.g. 8)'),
       sell_pct:       z.coerce.number().optional().describe('%% of position to sell when trail breaches (Stage 2 — stored now, default 50)'),
-      entry_floor:    z.coerce.number().optional().describe('Never sell below this price (the hard floor; Stage 2)'),
+      entry_floor:    z.coerce.number().optional().describe('Never sell below this price (the hard floor; Stage 2). 0 CLEARS the stored floor (saved as none, never as 0); omit to keep it.'),
       arm_window_min: z.coerce.number().optional().describe('Window in minutes for the pump to count (default 60)'),
       rebuy_pct:      z.coerce.number().optional().describe('Retrace %% below sale price to place rebuy (default 8). e.g. 70 = buy back 70%% below the auto-sell price'),
       retrace_pct:    z.coerce.number().optional().describe('#130 %% giveback of the pump that ARMS trough-detect (default 50)'),
@@ -24336,7 +24336,9 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
           const sets = [], vals = [];
           const put = (col, v) => { if (v === undefined || v === null) return; sets.push(col + ' = ?'); vals.push(v); if (!same(ex[col], v)) changed.push(col); };
           put('arm_pump_pct', arm_pump_pct); put('arm_window_min', arm_window_min); put('trail_pct', trail_pct); put('sell_pct', sell_pct);
-          put('entry_floor', entry_floor); put('rebuy_pct', rebuy_pct); put('retrace_pct', retrace_pct); put('bounce_pct', bounce_pct);
+          if (entry_floor != null && !(Number(entry_floor) > 0)) { sets.push('entry_floor = NULL'); if (ex.entry_floor != null) changed.push('entry_floor'); }   // #412 0 (or null, which zod coerces to 0) CLEARS the floor - never a stored 0
+          else put('entry_floor', entry_floor);
+          put('rebuy_pct', rebuy_pct); put('retrace_pct', retrace_pct); put('bounce_pct', bounce_pct);
           put('buyback_floor_pct', buyback_floor_pct); put('rule_mode', rule_mode); put('tier_cooldown_min', tier_cooldown_min); put('min_tier_usd', min_tier_usd);
           if (stJson !== null) { sets.push('sell_tiers = ?'); vals.push(stJson); changed.push('sell_tiers'); }
           if (btJson !== null) { sets.push('buy_tiers = ?'); vals.push(btJson); changed.push('buy_tiers'); }
@@ -24349,7 +24351,7 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
             `INSERT INTO pump_armed_rules (symbol, arm_pump_pct, arm_window_min, trail_pct, sell_pct, entry_floor, rebuy_pct, retrace_pct, bounce_pct, buyback_floor_pct, rule_mode, sell_tiers, buy_tiers, tier_cooldown_min, min_tier_usd, armed, baseline_price, baseline_at, active)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, 'single'), ?, ?, COALESCE(?, 15), COALESCE(?, 2.0), 0, NULL, NULL, 1)
              ON DUPLICATE KEY UPDATE arm_pump_pct=VALUES(arm_pump_pct), arm_window_min=VALUES(arm_window_min), trail_pct=VALUES(trail_pct), sell_pct=VALUES(sell_pct), entry_floor=VALUES(entry_floor), rebuy_pct=VALUES(rebuy_pct), retrace_pct=VALUES(retrace_pct), bounce_pct=VALUES(bounce_pct), buyback_floor_pct=COALESCE(?, buyback_floor_pct), rule_mode=COALESCE(?, rule_mode), sell_tiers=COALESCE(?, sell_tiers), buy_tiers=COALESCE(?, buy_tiers), tier_cooldown_min=COALESCE(?, tier_cooldown_min), min_tier_usd=COALESCE(?, min_tier_usd), armed=0, baseline_price=NULL, baseline_at=NULL, active=1, updated_at=CURRENT_TIMESTAMP`,
-            [sym, arm_pump_pct, arm_window_min || 60, trail_pct, sell_pct ?? 50, entry_floor ?? null, rebuy_pct ?? 8, retrace_pct ?? 50, bounce_pct ?? 8, buyback_floor_pct ?? 5,
+            [sym, arm_pump_pct, arm_window_min || 60, trail_pct, sell_pct ?? 50, Number(entry_floor) > 0 ? entry_floor : null, rebuy_pct ?? 8, retrace_pct ?? 50, bounce_pct ?? 8, buyback_floor_pct ?? 5,
              rule_mode ?? null, stJson, btJson, tier_cooldown_min ?? null, min_tier_usd ?? null,
              buyback_floor_pct ?? null, rule_mode ?? null, stJson, btJson, tier_cooldown_min ?? null, min_tier_usd ?? null]
           );
