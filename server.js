@@ -179,7 +179,7 @@ async function placeRevolutOrder(symbol, side, orderType, baseSize, price = null
   // body had no message field); an unreadable body throws as before (JSON.parse used to throw).
   let rs = await revolutRequest('POST', '/orders', body, null, { withStatus: true });
   { // #14 one retry when the venue names the precision it wants: a 400 refusal places nothing, so re-sending is safe
-    const pm = sizeStr != null && rs && rs.status === 400 && /precision must not exceed (\d{1,2}) decimal/i.exec(String((rs.body && (rs.body.message || JSON.stringify(rs.body))) || ''));
+    const pm = sizeStr != null && rs && rs.status === 400 && /base_size precision must not exceed (\d{1,2}) decimal/i.exec(String((rs.body && (rs.body.message || JSON.stringify(rs.body))) || ''));
     if (pm) {
       const cut = truncDecimals(sizeStr, Number(pm[1]));
       if (cut !== sizeStr && Number(cut) > 0) {
@@ -4024,16 +4024,45 @@ async function executeKrakenTrade(symbol, side, orderType, volume, price = null)
   const krakenBase  = standard === 'BTC' ? 'XBT' : standard;
   const pair        = `${krakenBase}USD`;
 
+  // K3 (27 Sep, the Kraken twin of #14): Kraken refuses a volume with more decimals than the pair's lot_decimals
+  // ("EGeneral:Invalid arguments:volume") and the raw balance has up to 10. The volume is now cut DOWN to lot_decimals
+  // (never up: a sale can never ask for more than is held); if the pair info cannot be read it is sent exactly as before.
+  const volStr = await krakenVolumeStr(pair, volume);
   const orderData = {
     pair,
     type:      side,       // 'buy' or 'sell'
     ordertype: orderType,  // 'market' or 'limit'
-    volume:    volume.toString()
+    volume:    volStr
   };
   if (orderType === 'limit' && price) orderData.price = price.toString();
 
   const result = await krakenRequest('/0/private/AddOrder', orderData);
-  return result;
+  return result && typeof result === 'object' && !Array.isArray(result) ? { ...result, sent_volume: volStr } : result;   // K3 the size actually sent
+}
+// K3 lot_decimals per Kraken pair from the public AssetPairs call, cached 6 h per pair. null = unknown (never blocks an order).
+// The cache hangs off the (hoisted) function, so no top-level binding can be read before it is initialised.
+async function krakenLotDecimals(pair) {
+  const lots = krakenLotDecimals.cache || (krakenLotDecimals.cache = new Map());
+  const key = String(pair).toUpperCase(), hit = lots.get(key);
+  if (hit && Date.now() - hit.at < 6 * 3600000) return hit.dec;
+  const ctl = new AbortController(), tm = setTimeout(() => ctl.abort(), 5000);   // a slow public read cannot hold a sale for long
+  try {
+    const r = await fetch(`${KRAKEN_API_URL}/0/public/AssetPairs?pair=${encodeURIComponent(key)}`, { signal: ctl.signal }).then(x => x.json());
+    const errs = r && Array.isArray(r.error) && r.error.length ? r.error.join(', ') : '';
+    const e = !errs && r && r.result && typeof r.result === 'object' ? Object.values(r.result)[0] : null;
+    const d = e && e.lot_decimals != null ? Number(e.lot_decimals) : NaN;
+    const dec = Number.isInteger(d) && d >= 0 && d <= 12 ? d : null;
+    if (dec == null) { console.log('[kraken] K3 no lot_decimals for ' + key + (errs ? ' (' + errs + ')' : '') + ' - volume sent as before'); return null; }   // never cached: the next order reads again
+    lots.set(key, { at: Date.now(), dec });   // only a real value is cached
+    return dec;
+  } catch (e) { console.log('[kraken] K3 AssetPairs read failed for ' + key + ' (' + e.message + ') - volume sent as before'); return null; }
+  finally { clearTimeout(tm); }
+}
+async function krakenVolumeStr(pair, volume) {
+  const dec = await krakenLotDecimals(pair);
+  if (dec == null) return volume.toString();
+  const cut = truncDecimals(volume, dec);
+  return Number(cut) > 0 ? cut : volume.toString();   // less than one lot step: as before (Kraken refuses it either way)
 }
 
 // Fetch live price for a single coin from Kraken public API
@@ -16007,8 +16036,8 @@ async function autoExecuteKrakenSell(symbol, maxPct, analysis, confidence, opts 
       return { executed: false, reason: 'no_position' };   // #K2 parity
     }
 
-    const sellQty = currentQty * (maxPct / 100);
-    const valueUSD = sellQty * currentPrice;
+    let sellQty = currentQty * (maxPct / 100);   // K3 let: lowered to the size actually sent
+    let valueUSD = sellQty * currentPrice;
 
     // Dust guard: skip if the sell is negligible
     if (sellQty <= 0 || !isFinite(sellQty) || valueUSD < 1) {
@@ -16049,6 +16078,7 @@ async function autoExecuteKrakenSell(symbol, maxPct, analysis, confidence, opts 
 
     akOrderSent = true;   // #K1
     const kResp = await executeKrakenTrade(symbol, 'sell', 'market', sellQty);   // #J1 keep the response for its txid
+    { const sq = kResp ? Number(kResp.sent_volume) : NaN; if (sq > 0 && sq < sellQty) { sellQty = sq; valueUSD = sellQty * currentPrice; } }   // K3 journal what was sold, not what was asked
 
     const [aeKrkIns] = await db.execute(
       `INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source, tool_key, cycle_id, regime_tag) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,   // #L1
