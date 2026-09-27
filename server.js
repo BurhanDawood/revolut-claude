@@ -3552,6 +3552,11 @@ function tradeApprovalKeyboard(t) {
 
 // The execution code below is moved VERBATIM out of the typed 'approve trade' handler, so the typed
 // command and the Approve button place orders through literally the same code.
+// #487 N3 the size to journal: what was SENT when the venue step cut it down (never more than asked)
+function journalQty(asked, sent) {
+  const a = Number(asked), s = Number(sent);
+  return s > 0 && (!(a > 0) || s < a) ? s : a;
+}
 async function executeApprovedKraken(t) {
           try {
             const result = await executeKrakenTrade(t.symbol, t.side, t.orderType, t.volume, t.price);
@@ -3559,8 +3564,9 @@ async function executeApprovedKraken(t) {
             const coinBase = t.symbol.replace('-USD', '');
             const krakenSource = t.source === 'claude_mcp' ? 'claude_mcp' : 'manual';
             // Prefer explicit valueUSD; derive qty when volume was estimated from value_usd
-            const kQtyForJournal = parseFloat(t.volume) || (t.valueUSD && t.price ? t.valueUSD / t.price : 0);
-            const kValueUSD = t.valueUSD ? parseFloat(t.valueUSD) : (t.price * kQtyForJournal);
+            const kAsked = parseFloat(t.volume) || (t.valueUSD && t.price ? t.valueUSD / t.price : 0);
+            const kQtyForJournal = parseFloat(t.volume) ? journalQty(kAsked, result && result.sent_volume) : kAsked;   // #487 N3 K3 cut the volume: journal what was sent
+            const kValueUSD = t.valueUSD && kQtyForJournal === kAsked ? parseFloat(t.valueUSD) : (t.price * kQtyForJournal);
             const kReasoning = 'Kraken trade approved via Telegram' + (t.qtyEstimated ? ' [qty estimated from value_usd]' : '');
             const [kJrnIns] = await db.execute(
               'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, source, tool_key, regime_tag) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',   // #L1
@@ -3599,8 +3605,9 @@ async function executeApprovedRevolut(t) {
             const coinBase = t.symbol.replace('-USD', '');
             const executedPrice = t.price || await getCurrentPrice(t.symbol).catch(() => 0) || 0;
             // Prefer explicit value_usd for value; derive quantity from it when baseSize was estimated
-            const qtyForJournal = parseFloat(t.baseSize) || (t.valueUsd && executedPrice ? t.valueUsd / executedPrice : 0);
-            const valueUSD = t.valueUsd ? parseFloat(t.valueUsd) : (executedPrice * qtyForJournal);
+            const rAsked = parseFloat(t.baseSize) || (t.valueUsd && executedPrice ? t.valueUsd / executedPrice : 0);
+            const qtyForJournal = parseFloat(t.baseSize) ? journalQty(rAsked, result && result.sent_base_size) : rAsked;   // #487 N3 #14 cut the size: journal what was sent
+            const valueUSD = t.valueUsd && qtyForJournal === rAsked ? parseFloat(t.valueUsd) : (executedPrice * qtyForJournal);
 
             // Check for matching trade intention
             const matchedIntention = await findMatchingIntention(t.symbol, t.side);
@@ -15689,7 +15696,7 @@ async function mayAutoTrade(intent, opts = {}) {
       const list = Array.isArray(b) ? b : (b && (b.data || b.balances)) || [];
       if (!Array.isArray(list) || !list.length) return venue;
       const row = list.find(x => String(x.currency || '').toUpperCase() === coin);
-      const cashRow = list.find(x => x.currency === 'USD' || x.currency === 'USDT');   // the getAvailableUSD('revolut') selection
+      const cashRow = list.find(x => String(x.currency || '').toUpperCase() === 'USD');   // #487 N6 the getAvailableUSD('revolut') selection: USD only since #C6
       venue = { available: row ? parseFloat(row.available) || 0 : 0, cash: parseFloat((cashRow && cashRow.available) || 0) || 0 };
     } else {
       const raw = await krakenRequest('/0/private/Balance');
@@ -17490,7 +17497,7 @@ async function checkPortfolio() {
               `SELECT id FROM trading_journal WHERE action IN ('buy','add') AND source IN ('claude_mcp','auto_detected','manual','agent','funded_buy','trough_auto','away_auto','ladder') AND created_at > DATE_SUB(NOW(), INTERVAL 10 MINUTE) LIMIT 1`   // #C7 bot buys too
             ).catch(() => [[]]);
             // #395 the journal can miss buys (manual, during a restart) - ask Revolut which buys actually filled
-            let v159 = null; try { v159 = await venueBuysUsdInWindow(30 * 60 * 1000); } catch (e) { console.warn('[usdt] #395 venue check failed:', e.message); }
+            let v159 = null; try { v159 = await venueBuysUsdInWindow(30 * 60 * 1000, ['USDT', 'USD']); } catch (e) { console.warn('[usdt] #395 venue check failed:', e.message); }   // #487 N7 a USD->USDT conversion is what masks the payment here - never count it as a coin buy
             const funded159 = !!(v159 && v159.usd >= hidden159 * 0.9);
             if (funded159) {
               console.log('[usdt] #395 USD -$' + hidden159.toFixed(2) + ' matched by $' + v159.usd + ' of filled buys on Revolut X (' + v159.coins.join(', ') + ') - trade-funding, not a payment');
@@ -26490,16 +26497,17 @@ app.post('/api/kraken/trade', async (req, res) => {
     if (!symbol || !side || !orderType || !volume) return res.status(400).json({ error: 'Missing required fields: symbol, side, orderType, volume' });
     const result = await executeKrakenTrade(symbol, side, orderType, parseFloat(volume), price ? parseFloat(price) : null);
     const currentPrice = price ? parseFloat(price) : (await getCurrentPrice(symbol) || 0);
-    const valueUSD = currentPrice * parseFloat(volume);
+    const kdQty = journalQty(parseFloat(volume), result && result.sent_volume);   // #487 N3
+    const valueUSD = currentPrice * kdQty;
     const coinBase = symbol.replace('-USD', '');
     const kdJ = await db.execute(
       'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, tool_key) VALUES (?, ?, ?, ?, ?, ?, ?, \'manual\')',
-      [coinBase, side, currentPrice, parseFloat(volume), valueUSD, 'Kraken executed trade via dashboard', 'confident']
+      [coinBase, side, currentPrice, kdQty, valueUSD, 'Kraken executed trade via dashboard', 'confident']
     ).catch(e => { console.error('[kraken] Journal insert failed:', e.message); return null; });
     await stampVenueOrderId(kdJ && kdJ[0] && kdJ[0].insertId, result);   // #J1
     await sendTelegram(
       `✅ <b>KRAKEN TRADE EXECUTED</b>\n\n` +
-      `${side.toUpperCase()} ${volume} ${coinBase} @ ${fmtPriceShort(currentPrice)}\n` +
+      `${side.toUpperCase()} ${kdQty} ${coinBase} @ ${fmtPriceShort(currentPrice)}\n` +
       `Value: $${valueUSD.toFixed(2)}\n` +
       `Order ID: ${result?.txid?.[0] || 'unknown'}\n\n` +
       `📝 Journal entry logged automatically`
@@ -26768,9 +26776,7 @@ async function processAlertChoice(ctx, choice, sendReply) {
     } else if (choice === 4) {
       const currentPrice = await getCurrentPrice(symbol).catch(() => null);
       if (!currentPrice) { await sendReply(`⚠️ Could not fetch ${coinBase} price`); return; }
-      const balancesNow = await revolutRequest('GET', '/balances').catch(() => []);
-      const usdAsset = balancesNow.find(b => b.currency === 'USD' || b.currency === 'USDT');
-      const availableUSD = parseFloat(usdAsset?.available || 0);
+      const availableUSD = await getAvailableUSD('revolut');   // #487 N6 USD only (#C6): the first of USD / USDT could size a USD buy from USDT
       if (availableUSD < 10) { await sendReply(`⚠️ Insufficient USD to buy ${coinBase}\nAvailable: $${availableUSD.toFixed(2)} (min $10)`); return; }
       const buyUSD = Math.min(availableUSD * 0.50, availableUSD - 5);
       const buyQty = buyUSD / currentPrice;
@@ -29684,15 +29690,16 @@ app.post('/api/revolut/trade', async (req, res) => {
     const result = await placeRevolutOrder(symbol, side, orderType, parseFloat(baseSize), price ? parseFloat(price) : null);
     const coinBase = symbol.replace('-USD', '');
     const executedPrice = price || await getCurrentPrice(symbol).catch(() => 0) || 0;
-    const valueUSD = executedPrice * parseFloat(baseSize);
+    const rdQty = journalQty(parseFloat(baseSize), result && result.sent_base_size);   // #487 N3
+    const valueUSD = executedPrice * rdQty;
     const rdJ = await db.execute(
       'INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, tool_key) VALUES (?, ?, ?, ?, ?, ?, ?, \'manual\')',
-      [coinBase, side, executedPrice, baseSize, valueUSD, 'Revolut X trade via dashboard', 'confident']
+      [coinBase, side, executedPrice, rdQty, valueUSD, 'Revolut X trade via dashboard', 'confident']
     ).catch(e => { console.error('[revolut] Journal insert failed:', e.message); return null; });
     await stampVenueOrderId(rdJ && rdJ[0] && rdJ[0].insertId, result);   // #J1
     await sendTelegram(
       `✅ <b>REVOLUT X TRADE EXECUTED</b>\n\n` +
-      `${side.toUpperCase()} ${baseSize} ${coinBase} @ ${fmtPriceShort(executedPrice)}\n` +
+      `${side.toUpperCase()} ${rdQty} ${coinBase} @ ${fmtPriceShort(executedPrice)}\n` +
       `Value: $${valueUSD.toFixed(2)}\n` +
       `Order ID: ${result?.client_order_id || 'unknown'}\n\n` +
       `📝 Journal entry logged automatically`
