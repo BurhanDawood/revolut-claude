@@ -300,7 +300,145 @@ function buildAlertKeyboard(coinBase, labels, typeCode) {
   } catch (e) { return undefined; }
 }
 
+// #491 PUSH NOTIFICATIONS to the Android app (Firebase Cloud Messaging HTTP v1). Mirrors sendTelegram; best-effort,
+// never throws, never delays Telegram. Off until FCM_SERVICE_ACCOUNT (the Firebase service-account JSON) is set on Railway.
+const APP_PUSH = { max_devices: 10, info_per_hour: 20, alerts_per_hour: 60, title_max: 70, body_max: 400 };
+const APP_PUSH_ALERT_RE = /PAYMENT|SALE|SOLD|BOUGHT|\bBUY\b|\bSELL\b|ALERT|RELEASED|STOP|PUMP|DIP|APPROV|FAILED|ERROR|🚨|⚠️|💳|🔴|🟢/i;
+const appPushStats = { sent: 0, failed: 0, dropped: 0, last_at: null, last_error: null, window: [] };
+let appPushAuth = null;   // { token, exp } - the Google access token, cached until a minute before it expires
+function appPushServiceAccount() {
+  const raw = process.env.FCM_SERVICE_ACCOUNT;
+  if (!raw) return null;
+  try {
+    const j = JSON.parse(raw);
+    const pk = typeof j.private_key === 'string' ? j.private_key.replace(/\\n/g, '\n') : null;
+    return j.project_id && j.client_email && pk ? { project_id: j.project_id, client_email: j.client_email, private_key: pk } : null;
+  } catch (e) { return null; }
+}
+// Telegram HTML -> a notification: the first line is the title, the rest the body; tags stripped, entities decoded.
+function appPushFromTelegram(message, replyMarkup) {
+  const text = String(message == null ? '' : message)
+    .replace(/<br\s*\/?>/gi, '\n').replace(/<[^>]+>/g, '')
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&');
+  const lines = text.split('\n').map(s => s.trim()).filter(Boolean);
+  if (!lines.length) return null;
+  if (/^📄 \(Part \d+ of \d+\)/.test(lines[0])) return null;   // later parts of a long report: the first part already pushed
+  if (/^📊 \(Part 1 of \d+\)$/.test(lines[0])) lines.shift();   // the first part of a long report: its header line is not the title
+  if (!lines.length) return null;
+  let title = lines[0];
+  let rest = lines.slice(1);
+  if (title.length > APP_PUSH.title_max) { rest.unshift(title.slice(APP_PUSH.title_max - 1)); title = title.slice(0, APP_PUSH.title_max - 1) + '…'; }
+  let body = rest.join('\n');
+  if (body.length > APP_PUSH.body_max) body = body.slice(0, APP_PUSH.body_max - 1) + '…';
+  const channel = replyMarkup || APP_PUSH_ALERT_RE.test(text) ? 'alerts' : 'info';
+  const tab = /paper agent|\bagent\b/i.test(text) ? 'agent' : /spec desk|\bdesk\b/i.test(text) ? 'desk'
+    : /PAYMENT|SALE|SOLD|BOUGHT|portfolio|capital/i.test(text) ? 'portfolio' : 'home';
+  return { title, body, channel, tab };
+}
+// Per-channel hourly caps, so a burst of Telegram messages cannot flood the phone. Alerts get the larger allowance.
+function appPushAllow(channel, nowMs = Date.now()) {
+  appPushStats.window = appPushStats.window.filter(w => nowMs - w.t < 3600000);
+  const used = appPushStats.window.filter(w => w.c === channel).length;
+  if (used >= (channel === 'alerts' ? APP_PUSH.alerts_per_hour : APP_PUSH.info_per_hour)) return false;
+  appPushStats.window.push({ t: nowMs, c: channel });
+  return true;
+}
+function appPushB64url(buf) { return Buffer.from(buf).toString('base64').replace(/=+$/, '').replace(/\+/g, '-').replace(/\//g, '_'); }
+async function appPushAccessToken(sa, nowMs = Date.now()) {
+  if (appPushAuth && appPushAuth.exp - 60000 > nowMs) return appPushAuth.token;
+  const iat = Math.floor(nowMs / 1000);
+  const head = appPushB64url(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
+  const claim = appPushB64url(JSON.stringify({ iss: sa.client_email, scope: 'https://www.googleapis.com/auth/firebase.messaging', aud: 'https://oauth2.googleapis.com/token', iat, exp: iat + 3600 }));
+  const sig = appPushB64url(sign('RSA-SHA256', Buffer.from(head + '.' + claim), createPrivateKey(sa.private_key)));
+  const r = await fetch('https://oauth2.googleapis.com/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'grant_type=' + encodeURIComponent('urn:ietf:params:oauth:grant-type:jwt-bearer') + '&assertion=' + head + '.' + claim + '.' + sig });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok || !j.access_token) throw new Error('google token ' + r.status + ' ' + String(j.error || '').slice(0, 60));
+  appPushAuth = { token: j.access_token, exp: nowMs + (Number(j.expires_in) || 3600) * 1000 };
+  return appPushAuth.token;
+}
+// Sends one notification to every active device (or to one token). A token Firebase reports as gone is switched off.
+async function appPushSend(note, onlyToken = null) {
+  const sa = appPushServiceAccount();
+  if (!sa || !note) return { sent: 0, skipped: 'off' };
+  let devices;
+  if (onlyToken) devices = [{ token_hash: createHash('sha256').update(onlyToken).digest('hex'), token: onlyToken }];
+  else { const [rows] = await db.execute('SELECT token_hash, token FROM app_devices WHERE disabled = 0 ORDER BY last_seen DESC LIMIT ' + APP_PUSH.max_devices); devices = rows; }
+  if (!devices.length) return { sent: 0, skipped: 'no devices' };
+  let access = await appPushAccessToken(sa);
+  let sent = 0;
+  for (const d of devices) {
+    const msg = { message: { token: d.token,
+      notification: { title: note.title, body: note.body || '' },
+      data: { tab: note.tab, channel: note.channel, title: note.title, body: note.body || '' },
+      android: { priority: note.channel === 'alerts' ? 'high' : 'normal', notification: { channel_id: note.channel } } } };
+    const post = (tok) => fetch('https://fcm.googleapis.com/v1/projects/' + encodeURIComponent(sa.project_id) + '/messages:send',
+      { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + tok }, body: JSON.stringify(msg) });
+    let r = await post(access);
+    if (r.status === 401) { appPushAuth = null; access = await appPushAccessToken(sa); r = await post(access); }
+    if (r.ok) { sent++; appPushStats.sent++; await db.execute('UPDATE app_devices SET fails = 0 WHERE token_hash = ?', [d.token_hash]).catch(() => {}); continue; }
+    const j = await r.json().catch(() => ({}));
+    const code = JSON.stringify(j).match(/UNREGISTERED|INVALID_ARGUMENT|SENDER_ID_MISMATCH/);
+    appPushStats.failed++; appPushStats.last_error = r.status + ' ' + (code ? code[0] : String((j.error && j.error.status) || '')).slice(0, 40);
+    console.warn('[push] send failed ' + appPushStats.last_error + ' device ' + d.token_hash.slice(0, 8));
+    if (code && (r.status === 404 || r.status === 400)) await db.execute('UPDATE app_devices SET disabled = 1 WHERE token_hash = ?', [d.token_hash]).catch(() => {});
+    else await db.execute('UPDATE app_devices SET fails = fails + 1 WHERE token_hash = ?', [d.token_hash]).catch(() => {});
+  }
+  appPushStats.last_at = new Date().toISOString();
+  return { sent };
+}
+function appPushMirror(message, replyMarkup) {
+  try {
+    if (!process.env.FCM_SERVICE_ACCOUNT) return;
+    const note = appPushFromTelegram(message, replyMarkup);
+    if (!note) return;
+    if (!appPushAllow(note.channel)) { appPushStats.dropped++; return; }
+    appPushSend(note).catch(e => { appPushStats.failed++; appPushStats.last_error = String(e.message || e).slice(0, 80); console.warn('[push] ' + appPushStats.last_error); });
+  } catch (e) { /* a push must never break a Telegram send */ }
+}
+// POST /api/app/devices body check: an FCM token is a long URL-safe string; anything else is refused.
+function appDeviceBody(b) {
+  if (!b || typeof b !== 'object') return null;
+  const token = typeof b.token === 'string' ? b.token.trim() : '';
+  if (token.length < 20 || token.length > 4096 || !/^[A-Za-z0-9:_\-.]+$/.test(token)) return null;
+  const platform = b.platform === 'android' ? 'android' : null;
+  if (!platform) return null;
+  const app_version = typeof b.app_version === 'string' ? b.app_version.replace(/[^\w.\-]/g, '').slice(0, 32) : '';
+  return { token, platform, app_version };
+}
+async function appDeviceRegister(body, nowMs = Date.now()) {
+  const d = appDeviceBody(body);
+  if (!d) return { ok: false, error: 'bad device' };
+  const hash = createHash('sha256').update(d.token).digest('hex'), now = Math.floor(nowMs / 1000);
+  const [had] = await db.execute('SELECT disabled FROM app_devices WHERE token_hash = ?', [hash]);
+  await db.execute('INSERT INTO app_devices (token_hash, token, platform, app_version, created_at, last_seen, fails, disabled) VALUES (?, ?, ?, ?, ?, ?, 0, 0) ' +
+    'ON DUPLICATE KEY UPDATE app_version = VALUES(app_version), last_seen = VALUES(last_seen), disabled = 0, fails = 0', [hash, d.token, d.platform, d.app_version, now, now]);
+  // at most max_devices active: the least recently seen beyond that are switched off
+  const [act] = await db.execute('SELECT token_hash FROM app_devices WHERE disabled = 0 ORDER BY last_seen DESC, created_at DESC');
+  const evicted = act.slice(APP_PUSH.max_devices);
+  for (const r of evicted) await db.execute('UPDATE app_devices SET disabled = 1 WHERE token_hash = ?', [r.token_hash]);
+  const fresh = !had.length || Number(had[0].disabled) === 1;
+  // Fable C1: the dashboard key now has a write, so every new or re-enabled device - and every device the cap switches off -
+  // is reported on Telegram, the channel that key cannot reach.
+  if (fresh || evicted.length) {
+    const active = act.length - evicted.length;
+    const lines = [];
+    if (fresh) lines.push('📱 New app device registered (v' + (d.app_version || '?') + '); ' + active + ' active.');
+    if (evicted.length) lines.push('📱 Device limit: ' + evicted.length + ' older device' + (evicted.length === 1 ? '' : 's') + ' switched off; ' + active + ' active.');
+    lines.push('Not you? Rotate the dashboard key in Railway.');
+    sendTelegram(lines.join('\n')).catch(() => {});
+  }
+  if (fresh) appPushSend({ title: '✅ Revolut X notifications are on', body: 'Your Telegram alerts will also arrive here.', channel: 'info', tab: 'home' }, d.token).catch(() => {});
+  return { ok: true, new: fresh };
+}
+async function appDeviceStatus() {
+  const [rows] = await db.execute('SELECT platform, app_version, created_at, last_seen, fails, disabled FROM app_devices ORDER BY last_seen DESC LIMIT 20');
+  return { push_configured: !!appPushServiceAccount(), devices: rows.map(r => ({ platform: r.platform, app_version: r.app_version, created_at: Number(r.created_at), last_seen: Number(r.last_seen), fails: Number(r.fails), active: Number(r.disabled) === 0 })),
+    stats: { sent: appPushStats.sent, failed: appPushStats.failed, dropped: appPushStats.dropped, last_at: appPushStats.last_at, last_error: appPushStats.last_error } };
+}
+
 async function sendTelegram(message, replyMarkup) {
+  appPushMirror(message, replyMarkup);   // #491 also to the phone (a no-op until FCM_SERVICE_ACCOUNT is set)
   // #316c: optional inline keyboard. Omitted -> the payload is byte-identical to before,
   // so every existing caller is unaffected.
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
@@ -1590,6 +1728,7 @@ await db.execute(`CREATE TABLE IF NOT EXISTS agent_decisions (
 )`).catch(e => console.error('[migration] agent_decisions:', e.message));
 await db.execute('CREATE TABLE IF NOT EXISTS agent_research (symbol VARCHAR(20) NOT NULL, at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, pack JSON NOT NULL, gemini_ok TINYINT(1) NOT NULL, PRIMARY KEY (symbol, at))').catch(e => console.error('[migration] agent_research:', e.message));
 await db.execute('CREATE TABLE IF NOT EXISTS agent_reviews (id INT AUTO_INCREMENT PRIMARY KEY, week_start DATE NOT NULL, at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, review TEXT NOT NULL, stats JSON NULL, model VARCHAR(40) NULL)').catch(e => console.error('[migration] agent_reviews:', e.message));
+await db.execute('CREATE TABLE IF NOT EXISTS app_devices (token_hash CHAR(64) NOT NULL PRIMARY KEY, token TEXT NOT NULL, platform VARCHAR(16) NOT NULL, app_version VARCHAR(32) NOT NULL DEFAULT \'\', created_at BIGINT NOT NULL, last_seen BIGINT NOT NULL, fails INT NOT NULL DEFAULT 0, disabled TINYINT NOT NULL DEFAULT 0)').catch(e => console.error('[migration] app_devices:', e.message));   // #491 the Android app's push tokens
 await db.execute('CREATE TABLE IF NOT EXISTS agent_equity_points (t BIGINT NOT NULL PRIMARY KEY, equity_usd DECIMAL(14,6) NOT NULL, cash_usd DECIMAL(14,6) NOT NULL, bench_btc_usd DECIMAL(14,6) NULL, bench_basket_usd DECIMAL(14,6) NULL)').catch(e => console.error('[migration] agent_equity_points:', e.message));   // #482 hourly points for the page's chart
 await db.execute('CREATE TABLE IF NOT EXISTS agent_equity_daily (d DATE NOT NULL PRIMARY KEY, equity_usd DECIMAL(14,6) NOT NULL, cash_usd DECIMAL(14,6) NOT NULL, bench_btc_usd DECIMAL(14,6) NULL, bench_basket_usd DECIMAL(14,6) NULL, model_cost_usd DECIMAL(14,6) NULL)').catch(e => console.error('[migration] agent_equity_daily:', e.message));
 await db.execute(`CREATE TABLE IF NOT EXISTS agent_alerts (
@@ -20322,7 +20461,8 @@ app.use(express.json());
 // Both fail closed (unset, or under 24 characters, grants nothing). Header only: x-api-token.
 // Left open on purpose: /api/health (liveness only) and /api/bridge (checks its own BRIDGE_TOKEN). Outside this gate
 // and unchanged: /telegram-webhook (own secret), /mcp-<secret>, /dev-log/context (own key), /telegram-setup.
-const DASHBOARD_WRITES = ['/api/pause', '/api/resume', '/api/sweep/config'];
+// #491 + '/api/app/devices': the app stores its push token (validated, max 10 devices). Nothing else is reachable.
+const DASHBOARD_WRITES = ['/api/pause', '/api/resume', '/api/sweep/config', '/api/app/devices'];
 // #351 (from the Dev-342 security review): routes that act or spend even on a GET. They need the FULL key, which is
 // deliberately unset, so they are OFF. /api/test/macro-news resets a rate limit and runs a paid Claude call plus
 // Telegram; /telegram-setup re-registers the webhook. Matched with case and trailing slashes normalised, and for every
@@ -25971,6 +26111,9 @@ async function portfolioSpark(range, nowMs = Date.now()) {
   const pct = change != null && first > 0 ? Math.round(change / first * 10000) / 100 : null;
   return { range: key, step: r.step, points, first, last, change, pct };
 }
+// #491 the app registers its push token here (dashboard key); GET shows the devices and push stats (never the tokens)
+app.post('/api/app/devices', async (req, res) => { try { const r = await appDeviceRegister(req.body); res.status(r.ok ? 200 : 400).json(r); } catch (e) { res.status(500).json({ error: 'register failed' }); } });
+app.get('/api/app/devices', async (req, res) => { try { res.set('Cache-Control', 'no-store').json(await appDeviceStatus()); } catch (e) { res.status(500).json({ error: e.message }); } });
 app.get('/api/portfolio/spark', async (req, res) => { try { res.set('Cache-Control', 'no-store').json(await portfolioSpark(String(req.query.range || '1d'))); } catch (e) { res.status(500).json({ error: e.message }); } });
 app.get('/api/portfolio/state', async (req, res) => { try { res.set('Cache-Control', 'no-store').json(await portfolioValueState()); } catch (e) { res.status(500).json({ error: e.message }); } });
 app.get('/api/desk/state', async (req, res) => { try { res.json(await specDeskState()); } catch (e) { res.status(500).json({ error: e.message }); } });
