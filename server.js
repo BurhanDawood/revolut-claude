@@ -11123,14 +11123,15 @@ async function undoLedgerRebuild(runId) {
 // that no longer matches the balance, or an entry price more than 0.01% off. Quiet nights change nothing and say
 // nothing. Per-trade updates use the REQUESTED price and no fee, so a little drift every day is expected.
 let _ledgerResyncRunning = false;
-async function runNightlyLedgerResync() {
+async function runNightlyLedgerResync(opts) {
   if (_ledgerResyncRunning) return { ok: false, skipped: 'already running' };
   _ledgerResyncRunning = true;
+  const trade = !!(opts && opts.trigger === 'trade');   // #480 after a detected trade: quiet unless an entry moves > 1%; failures log only (02:40 retries)
   const fmtP = (v) => v == null ? '-' : '$' + Number(v).toPrecision(5);
   try {
     const p = await planLedgerRebuild();
     if (!p.ok) {
-      await sendTelegram('\u26a0\ufe0f <b>Nightly ledger re-sync skipped</b>\n' + p.error + ' Nothing was changed - it will try again tomorrow night.').catch(() => {});
+      if (!trade) await sendTelegram('\u26a0\ufe0f <b>Nightly ledger re-sync skipped</b>\n' + p.error + ' Nothing was changed - it will try again tomorrow night.').catch(() => {});
       return { ok: false, error: p.error };
     }
     const qtyDrift = (x) => Math.abs(x.old_tranche_qty - x.new_tranche_qty) > Math.max(1e-8, Math.abs(x.held) * 1e-6);
@@ -11142,22 +11143,40 @@ async function runNightlyLedgerResync() {
       console.log('[ledger-resync] nothing drifted' + (heldMismatch.length ? '; unreconciled held coins: ' + heldMismatch.map(s => s.coin).join(', ') : ''));
       return { ok: true, changed: 0, unreconciled: heldMismatch.map(s => s.coin) };
     }
-    const runId = 'nightly_' + Date.now();
+    const runId = (trade ? 'trade_' : 'nightly_') + Date.now();
     const counts = await applyLedgerRebuild(changed, runId, { snapshot: false });
     const ent = changed.filter(x => x.entry_changes), lots = changed.filter(qtyDrift);
-    let msg = '\ud83d\udd04 <b>Nightly ledger re-sync</b>\n';
+    let msg = '\ud83d\udd04 <b>' + (trade ? 'Cost re-sync after your trade' : 'Nightly ledger re-sync') + '</b>\n';
     if (ent.length) msg += '\nEntry prices corrected:\n' + ent.slice(0, 8).map(x => '\u2022 ' + x.coin + ': ' + fmtP(x.old_entry) + ' \u2192 ' + fmtP(x.new_entry)).join('\n') + (ent.length > 8 ? '\n\u2026 and ' + (ent.length - 8) + ' more' : '') + '\n';
     if (lots.length) msg += '\nPosition quantities corrected: ' + lots.slice(0, 8).map(x => x.coin).join(', ') + (lots.length > 8 ? ' and ' + (lots.length - 8) + ' more' : '') + '\n';
     if (heldMismatch.length) msg += '\n\u26a0\ufe0f Could not reconcile (left untouched): ' + heldMismatch.map(s => s.coin).join(', ') + '\n';
     msg += '\nUndo if needed: run <code>' + runId + '</code>';
-    await sendTelegram(msg).catch(() => {});
+    const bigMove = ent.some(x => x.old_entry == null || Math.abs(x.new_entry - x.old_entry) / Math.abs(x.old_entry) > 0.01);   // #480
+    if (!trade || bigMove) await sendTelegram(msg).catch(() => {});
     console.log('[ledger-resync] ' + runId + ' ' + JSON.stringify(counts));
     return { ok: true, run_id: runId, changed: changed.length, entries: ent.map(x => ({ coin: x.coin, from: x.old_entry, to: x.new_entry })), lots: lots.map(x => ({ coin: x.coin, from: x.old_tranche_qty, to: x.new_tranche_qty })), unreconciled: heldMismatch.map(s => s.coin), ...counts };
   } catch (e) {
     console.error('[ledger-resync] failed:', e.message);
-    await sendTelegram('\u26a0\ufe0f <b>Nightly ledger re-sync failed</b> - ' + String(e.message).substring(0, 150) + '. Nothing was changed (all-or-nothing).').catch(() => {});
+    if (!trade) await sendTelegram('\u26a0\ufe0f <b>Nightly ledger re-sync failed</b> - ' + String(e.message).substring(0, 150) + '. Nothing was changed (all-or-nothing).').catch(() => {});
     return { ok: false, error: e.message };
   } finally { _ledgerResyncRunning = false; }
+}
+
+// #480 (PM #411 ask d) cost re-sync after a detected trade. Debounced: 3 min after the LAST detected trade (the venue's
+// transaction list can lag the balance), never sooner than 15 min after the previous trade-triggered run. The traded coin
+// still unreconciled (its fill not yet in the record) -> ONE retry 10 min later. Nothing here trades.
+let _tradeResyncTimer = null, _tradeResyncLast = 0;
+function scheduleTradeResync(symbol, isRetry = false) {
+  venueCostSnapshot.cache = null;   // the next stored-vs-venue comparison reads the record fresh
+  if (_tradeResyncTimer) clearTimeout(_tradeResyncTimer);
+  const wait = Math.max(3 * 60000, _tradeResyncLast + 15 * 60000 - Date.now());
+  _tradeResyncTimer = setTimeout(async () => {
+    _tradeResyncTimer = null; _tradeResyncLast = Date.now();
+    const r = await runNightlyLedgerResync({ trigger: 'trade' }).catch(e => ({ ok: false, error: e.message }));
+    console.log('[ledger-resync] #480 after a ' + symbol + ' trade: ' + JSON.stringify(r).slice(0, 400));
+    const coin = String(symbol).replace('-USD', '');
+    if (!isRetry && r && r.ok && Array.isArray(r.unreconciled) && r.unreconciled.includes(coin)) setTimeout(() => scheduleTradeResync(symbol, true), 10 * 60000);
+  }, wait);
 }
 
 async function reconcileTransactions(daysBack = 30, dryRun = null) {
@@ -17344,6 +17363,7 @@ async function checkPortfolio() {
               const action = qtyChange > 0 ? 'buy' : 'sell';
               console.log(`[detect] ${symbol} ${action}: ${prevQty} → ${available} ($${valueUsd.toFixed(2)})`);
               autoLogTrade(symbol, action, currentPrice, qtyChange, available).catch(e => console.error('autoLogTrade failed:', e.message));
+              if (valueUsd >= 5) scheduleTradeResync(symbol);   // #480 costs from the venue record within minutes, not at 02:40
               // #347: lots follow the sale regardless of whether autoLogTrade logs it (debounce / dedupe / limit suppression)
               if (action === 'sell') syncRevolutLotsDownToBalance(symbol).catch(() => {});
             } else {
@@ -17355,6 +17375,7 @@ async function checkPortfolio() {
             if (valueUsd >= 0.10) {
               console.log(`[detect] ${symbol} buy (re-entry): 0 → ${available} ($${valueUsd.toFixed(2)})`);
               autoLogTrade(symbol, 'buy', currentPrice, available, available).catch(e => console.error('autoLogTrade failed:', e.message));
+              if (valueUsd >= 5) scheduleTradeResync(symbol);   // #480
             }
           }
         } else if (prevQty === undefined && available > 0) {
@@ -24313,6 +24334,14 @@ let rows;
           // The same stop-to-floor clearance set_pump_armed_rule applies (#383/#384): switching a loop ON is the move that
           // makes it able to sell, so a loop whose lowest possible stop cannot clear the floor by 3 x p90 slippage is refused.
           const lePx = await getCurrentPrice(sym).catch(() => null);
+          if (!(Number(lePx) > 0)) return { content: [{ type: 'text', text: JSON.stringify({ ok: false, refused: true, reason: 'loop NOT enabled: could not read the ' + leCoin + ' price, so the stop-to-floor clearance cannot be checked. Try again in a minute. Nothing was written.', floor: leFloor }) }] };   // #480 (Fable on 474)
+          // #480 (PM #411 ask e) the floor is only as good as the stored cost under it: compare it with the Revolut X record, read fresh.
+          let leCost = null;
+          try { leCost = loopCostCheck(await venueCostSnapshot(60 * 1000), leCoin, leFloor.cost, leFloor); } catch (e) { leCost = { checked: false, reason: 'venue read failed: ' + e.message }; }
+          if (leCost && leCost.checked && leCost.gap_pct != null && leCost.gap_pct < -1)
+            return { content: [{ type: 'text', text: JSON.stringify({ ok: false, refused: true, reason: 'loop NOT enabled: the stored cost ' + leCost.stored_cost + ' is ' + (-leCost.gap_pct) + '% BELOW the Revolut X cost ' + leCost.venue_cost + ', so the floor would sit under the true cost and a sale could lose money. Run ledger_resync_now (manage_trading), then enable again. Nothing was written.', cost_check: leCost, floor: leFloor }) }] };
+          const leCostWarn = leCost && leCost.checked && leCost.gap_pct != null && leCost.gap_pct > 1
+            ? ' WARNING: the stored cost ' + leCost.stored_cost + ' is ' + leCost.gap_pct + '% ABOVE the Revolut X cost ' + leCost.venue_cost + ' - the floor is higher than it needs to be (blocks some profitable sales). ledger_resync_now would correct it.' : '';
           const leStop = stopClearanceCheck(lePx, r.arm_pump_pct, r.trail_pct, leFloor.floor, await coinSellSlipP90(leCoin));
           if (leStop.checked && !leStop.ok) {
             return { content: [{ type: 'text', text: JSON.stringify({ ok: false, refused: true, reason: 'loop NOT enabled: its lowest possible stop ' + leStop.lowest_stop + ' clears the floor ' + leStop.floor + ' by only ' + leStop.clearance_pct + '% - needs ' + leStop.required_pct + '% (3 x p90 sell slippage). Raise the arm or tighten the trail first (set_pump_armed_rule). Nothing was written.', stop_check: leStop, floor: leFloor }) }] };
@@ -24332,10 +24361,10 @@ let rows;
 
           await db.execute('UPDATE pump_armed_rules SET loop_enabled = 1 WHERE symbol = ?', [sym]);
           const [after] = await db.execute('SELECT * FROM pump_armed_rules WHERE symbol = ? LIMIT 1', [sym]);
-          await sendTelegram('LOOP ENABLED -- '+sym+' rinse-repeat ON. Floor $'+Number(leFloor.floor).toPrecision(6)+' ('+leFloor.source+'), sell '+r.sell_pct+'%, max '+r.max_cycles+' cycles. Master must also be ON to fire.'+(leStop.checked ? '' : ' Stop clearance not checked ('+leStop.reason+').')+conflictWarning).catch(()=>{});
+          await sendTelegram('LOOP ENABLED -- '+sym+' rinse-repeat ON. Floor $'+Number(leFloor.floor).toPrecision(6)+' ('+leFloor.source+'), sell '+r.sell_pct+'%, max '+r.max_cycles+' cycles. Master must also be ON to fire.'+(leStop.checked ? '' : ' Stop clearance not checked ('+leStop.reason+').')+conflictWarning+leCostWarn+(leCost && !leCost.checked ? ' Cost not compared with Revolut X ('+leCost.reason+').' : '')).catch(()=>{});
           const leWarn = await emitEnableWarnings(sym, { side: 'both', trigger: 'trailing_stop' }, 'loop_enable');   // #H1
           shareStrategyNote('<b>' + escTg(sym.replace('-USD', '')) + ' pump loop switched ON</b>\nSells ' + r.sell_pct + '% when up ' + Number(r.arm_pump_pct) + '% then down ' + Number(r.trail_pct) + '% from the peak; buys back on the dip');   // #S1
-          return { content: [{ type: 'text', text: JSON.stringify({ ok: true, loop_enabled: 1, floor: leFloor, stop_check: leStop, row: after[0], conflict_warning: conflictWarning || null, warnings: leWarn }, null, 2) }] };
+          return { content: [{ type: 'text', text: JSON.stringify({ ok: true, loop_enabled: 1, floor: leFloor, stop_check: leStop, cost_check: leCost, cost_warning: leCostWarn || null, row: after[0], conflict_warning: conflictWarning || null, warnings: leWarn }, null, 2) }] };
         }
         if (action === 'reset_cycle') {
           // #278 — clear stale pump-loop RUNTIME state while preserving all config.
@@ -24809,6 +24838,12 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
             }
           }
         } catch (e) { _stopCheck = { checked: false, reason: 'check failed: ' + e.message }; }
+        let _costCheck = null;   // #480 (PM #411) informational: the stored cost under the floor against the Revolut X record (never refuses here)
+        try {
+          const coinC = sym.replace('-USD', ''), dC = await computeDerivedFloor(sym, coinC);
+          _costCheck = loopCostCheck(await venueCostSnapshot(60 * 1000), coinC, dC.cost, dC);
+          if (_costCheck.checked && _costCheck.gap_pct != null && Math.abs(_costCheck.gap_pct) > 1) _costCheck.warning = _costCheck.flag + ' - the floor and the clearance above are computed on the stored cost. Run ledger_resync_now (manage_trading) to correct it' + (_costCheck.gap_pct < 0 ? '; loop_enable refuses until then.' : '.');
+        } catch (e) { _costCheck = { checked: false, reason: 'venue read failed: ' + e.message }; }
         const changed = [];
         if (ex) {
           const same = (x, y) => (x == null && y == null) || (x != null && y != null && (Number(x) === Number(y) || String(x) === String(y)));
@@ -24866,7 +24901,7 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
           '\nBuys back after a ' + num(fin.retrace_pct) + '% retrace and a ' + num(fin.bounce_pct) + '% bounce' +
           '\nNever sells below cost + 0.5%' + (Number(fin.entry_floor) > 0 ? ' (floor $' + num(fin.entry_floor) + ')' : '') +
           '\nAuto-sell ' + (Number(fin.loop_enabled) === 1 ? 'ON' : 'OFF (alerts only)'));
-        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, warnings: spWarn, stop_check: _stopCheck, mode: ex ? 'updated' : 'created', changed, rule: {
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, warnings: spWarn, stop_check: _stopCheck, cost_check: _costCheck, mode: ex ? 'updated' : 'created', changed, rule: {
           symbol: sym, arm_pump_pct: num(fin.arm_pump_pct), arm_window_min: num(fin.arm_window_min), trail_pct: num(fin.trail_pct), sell_pct: num(fin.sell_pct),
           entry_floor: num(fin.entry_floor), rebuy_pct: num(fin.rebuy_pct), retrace_pct: num(fin.retrace_pct), bounce_pct: num(fin.bounce_pct),
           buyback_floor_pct: num(fin.buyback_floor_pct), rule_mode: fin.rule_mode, tier_cooldown_min: num(fin.tier_cooldown_min), min_tier_usd: num(fin.min_tier_usd),
