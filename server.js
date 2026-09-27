@@ -6980,7 +6980,7 @@ async function runLadderShadowTick(nowMs) {
       }
       if (msgs.length) {
         const paperVal = st.qty * p + st.paper_cash, holdVal = Number(r.start_qty) * p;
-        await sendTelegram('\ud83e\uddea <b>SHADOW ' + coin + '</b> - paper only, nothing traded\n\n' + msgs.join('\n') +
+        await sendTelegram('\ud83e\uddea <b>SHADOW LADDER ' + coin + '</b> - paper only, nothing traded (not the budget agent)\n\n' + msgs.join('\n') +
           '\n\nPaper: ' + Number(st.qty).toPrecision(6) + ' ' + coin + ' + $' + st.paper_cash.toFixed(2) + ' = $' + paperVal.toFixed(2) +
           ' vs holding $' + holdVal.toFixed(2) + ' (' + ((paperVal / holdVal - 1) * 100).toFixed(2) + '%)').catch(() => {});
       }
@@ -7920,16 +7920,29 @@ async function agentCandles(coin, intervalMin, sinceMs, untilMs, paceMs) {
   return [...out.values()].sort((a, b) => a.t - b.t);
 }
 // The universe as one filter (one pump-rule read, one balances read): same rule as check 15's agentUniverseOk.
+// #481 desk #18 (Bryan 27 Sep, Fable 16:15): in PAPER the filter lets Bryan's coins, loop coins and Kraken coins in; tagOf gives
+// each one its "bryan" note for the agent's input. The A1 separation rule below is the LIVE rule, kept behind the mode switch.
 async function agentUniverseFilter(led) {
-  const [pr] = await db.execute('SELECT symbol FROM pump_armed_rules WHERE active = 1');
-  const loops = new Set(pr.map(r => String(r.symbol).toUpperCase().replace(/-USD$/, '')));
+  const [pr] = await db.execute('SELECT symbol, arm_pump_pct, trail_pct, loop_enabled FROM pump_armed_rules WHERE active = 1');
+  const loops = new Map(pr.map(r => [String(r.symbol).toUpperCase().replace(/-USD$/, ''), r]));
   const venue = {};
   for (const b of await revolutBalancesCached()) venue[String(b.currency || '').toUpperCase()] = (parseFloat(b.available) || 0) + (parseFloat(b.reserved) || 0);
-  return (coin, px) => {
+  const live = String(led && led.mode) === 'live';
+  // live: the venue balance includes the agent's own coins, so they are subtracted; paper coins are not on the venue at all
+  const bryanQty = (coin) => (venue[coin] || 0) - (live ? (Number((led.positions[coin] || {}).qty) || 0) : 0);
+  const f = (coin, px) => {
+    if (!live) return true;   // #481 paper: every pair; his coins are tagged, not excluded
     if (KRAKEN_MONITORED_COINS.includes(coin + '-USD') || loops.has(coin)) return false;
-    const bryan = (venue[coin] || 0) - (Number((led.positions[coin] || {}).qty) || 0);
-    return !(bryan * px >= 1);
+    return !(bryanQty(coin) * px >= 1);
   };
+  f.tagOf = (coin, px) => {   // #481 the note the agent sees on a coin that is also Bryan's
+    const t = [], b = bryanQty(coin), L = loops.get(coin);
+    if (Number(px) > 0 && b * px >= 1) t.push('Bryan holds about $' + Math.round(b * px) + ' of it (his real position, not yours)');
+    if (L) t.push('Bryan runs a pump loop on it: sells after a +' + Number(L.arm_pump_pct) + '% pump then a ' + Number(L.trail_pct) + '% drop from the peak' + (Number(L.loop_enabled) === 1 ? '' : ' (alerts only, not selling)'));
+    if (KRAKEN_MONITORED_COINS.includes(coin + '-USD')) t.push('Bryan trades it on Kraken');
+    return t.length ? t.join('; ') : null;
+  };
+  return f;
 }
 // SCREEN (code, no model): every USD pair on Revolut X, minus stablecoins, wide spreads and anything outside the universe;
 // ranked by the size of its 7-day move; the top `shortlist` plus everything the agent holds get hourly candles, shape and lean.
@@ -7977,7 +7990,8 @@ async function agentScreen(cfg, led, watch = [], only = null) {   // #A2d watch 
     const tail = cl.slice(-30).map(x => x.c).concat([px]), lo = Math.min(...tail), hi = Math.max(...tail);
     rowsOut.push({ coin, px, spread_pct: tick[coin].spread_pct != null ? Number(tick[coin].spread_pct.toFixed(2)) : null,
       ch1: last ? Number(((px / last - 1) * 100).toFixed(1)) : null, ch7: wk ? Number(((px / wk - 1) * 100).toFixed(1)) : null,
-      range30: hi > lo ? Math.round((px - lo) / (hi - lo) * 100) : null, from_low30: lo > 0 ? Number(((px / lo - 1) * 100).toFixed(1)) : null, held: held.includes(coin) });
+      range30: hi > lo ? Math.round((px - lo) / (hi - lo) * 100) : null, from_low30: lo > 0 ? Number(((px / lo - 1) * 100).toFixed(1)) : null, held: held.includes(coin),
+      bryan: inUniverse.tagOf ? inUniverse.tagOf(coin, px) : null });   // #481
   }
   const ranked = rowsOut.filter(r => !r.held).sort((a, b) => Math.abs(b.ch7 || 0) - Math.abs(a.ch7 || 0));
   const shortlist = Array.isArray(only) ? rowsOut.filter(r => r.held || only.includes(r.coin)) : ranked.slice(0, cfg.shortlist).concat(rowsOut.filter(r => r.held));   // #A2f narrow when woken
@@ -8057,7 +8071,7 @@ async function agentResearch(coin, mentions, cfg, costs) {
 const AGENT_SYSTEM_PROMPT = `You are the budget agent inside Bryan's Revolut X trading system. Bryan's mandate, in his words: "take this budget and make it grow." You have full discretion inside your budget: you may buy any coin in your universe, hold, add, or sell - including at a loss - whenever your judgement says so. This is a PAPER account ($1,000 starting budget); treat it exactly as if it were real money, because the paper record decides whether you are ever given a real one.
 
 FACTS (enforced in code after you answer - they are not requests, and an order that breaks one is dropped):
-- Your universe is every Revolut X USD pair that Bryan does not hold and that no loop of his manages. You never trade his coins.
+- Your universe is every Revolut X USD pair. Some are coins Bryan also holds, runs a pump loop on, or trades on Kraken; each of those carries a "bryan" note. Your paper position and Bryan's real one are different books: you can never act on his position, sell his coins or change his loops, and his trades are not yours. A loop of his is a known seller into pumps (the note gives its arm and trail).
 - One trade is at most per_trade_pct of your equity (see rails). At most max_positions coins at once. Minimum trade min_trade_usd.
 - If your equity falls daily_loss_pct in a day you are frozen for 24 h: sells still work, buys are refused. If it falls drawdown_halt_pct from its high you are halted and Bryan decides.
 - Paper fills are the mid price plus/minus 1.3% slippage, plus a 0.09% fee. Every model call and research call you trigger is charged to your cash. Trading and churn cost money.
@@ -8341,7 +8355,7 @@ async function agentApiState() {
 // #A3v THE AGENT, READ BY THE PM (Bryan 25 Sep: "could I ask PM these questions and it pulls the data from the agent's files?").
 // Read-only views of the agent's own tables. The first row of each run carries the run's full input (what it screened, the
 // shortlist with shape/indicators/ranges/research, its notes) - that is how "why did it look at GRT" is answered.
-const AGENT_SHORTLIST_RULE = 'Each run: every Revolut X USD pair -> drop stablecoins, spreads over the limit and coins outside its universe (Bryan holds them, a pump loop runs on them, or Kraken) -> rank by the size of the 7-day move, up or down -> the top 15 + anything it holds + the coins it asked to watch last run (watch_next). Only the shortlist gets hourly shape, indicators, 24 h / 72 h ranges and research.';
+const AGENT_SHORTLIST_RULE = 'Each run: every Revolut X USD pair -> drop stablecoins and spreads over the limit (paper: coins Bryan holds, runs a loop on or trades on Kraken stay in, with a "bryan" note - #481; live would drop them) -> rank by the size of the 7-day move, up or down -> the top 15 + anything it holds + the coins it asked to watch last run (watch_next). Only the shortlist gets hourly shape, indicators, 24 h / 72 h ranges and research.';
 const agentJ = (v) => { if (v == null) return null; if (typeof v === 'string') { try { return JSON.parse(v); } catch (e) { return null; } } return v; };
 function agentRunDigest(rows) {   // rows of one run, oldest first
   const first = rows.find(r => r.inputs) || rows[0], inp = agentJ(first.inputs) || {}, input = inp.input || {};
@@ -15538,7 +15552,10 @@ async function mayAutoTrade(intent, opts = {}) {
     if (path === 'agent') {
       agentCfg = agentCfg || await readAgentConfig();
       at = 15;   // universe - buys only: a coin it already holds can always be sold
-      if (side === 'buy') { inputs.universe = await agentUniverseOk(coin); if (!inputs.universe) return no('outside_universe'); }
+      if (side === 'buy') {
+        if (String(agentLed.mode) === 'live') { inputs.universe = await agentUniverseOk(coin); if (!inputs.universe) return no('outside_universe'); }   // the A1 separation rule: live only
+        else inputs.universe = 'paper: every pair, Bryan\'s coins tagged (#481 desk #18)';
+      }
       at = 16;   // positions
       const held = Object.entries(agentLed.positions).filter(([, p]) => Number(p && p.qty) > 0).map(([c]) => c);
       inputs.positions = held.length;
@@ -24181,7 +24198,7 @@ let rows;
             if (!(qty > 0) || !(price > 0)) throw new Error('need a holding and a price to start from (holding ' + qty + ', price ' + price + ')');
             await db.execute('INSERT INTO ladder_shadow (symbol, cfg, state, start_qty, start_price, active) VALUES (?, ?, NULL, ?, ?, 1) ON DUPLICATE KEY UPDATE cfg = VALUES(cfg), state = NULL, start_qty = VALUES(start_qty), start_price = VALUES(start_price), active = 1, started_at = CURRENT_TIMESTAMP',
               [sym, JSON.stringify(cfg), qty, price]);
-            await sendTelegram('\ud83e\uddea <b>SHADOW ' + coin + ' started</b> - paper only, nothing will be traded\n\nPaper position: ' + qty.toPrecision(6) + ' ' + coin + ' at $' + Number(price).toPrecision(5) +
+            await sendTelegram('\ud83e\uddea <b>SHADOW LADDER ' + coin + ' started</b> - paper only, nothing will be traded\n\nPaper position: ' + qty.toPrecision(6) + ' ' + coin + ' at $' + Number(price).toPrecision(5) +
               '\nArms on +' + cfg.arm_pump_pct + '% in ' + (cfg.arm_window_min / 60) + 'h, trails ' + cfg.trail_pct + '%, sells ' + cfg.sell_pct + '% per leg (max ' + cfg.max_legs + '), buys back ' + cfg.buy_pct + '% then the rest.' +
               '\nYou will see a message whenever it arms, would trade, or finishes a cycle.').catch(() => {});
             return { content: [{ type: 'text', text: JSON.stringify({ ok: true, symbol: sym, start_qty: qty, start_price: price, cfg }) }] };
