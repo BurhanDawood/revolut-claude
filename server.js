@@ -4933,7 +4933,7 @@ async function troughCashLine(exchange, buyUsd) {
     if (exchange === 'kraken') return '\nKraken: the bounce is ALERTED only - buy it yourself';
     const cash = await getAvailableUSD('revolut'), need = Number(buyUsd) || 0;
     if (cash >= need) return '\nCash: $' + cash.toFixed(2) + ' available - it will buy by itself';
-    return '\n\u26a0\ufe0f Cash: $' + cash.toFixed(2) + ' available, $' + (need - cash).toFixed(2) + ' short. Add USD before the bounce and it buys by itself; otherwise at the bounce you get a <b>Buy now</b> button to fund it and tap.';
+    return '\n\u26a0\ufe0f Cash: $' + cash.toFixed(2) + ' USD available, $' + (need - cash).toFixed(2) + ' short. Add USD before the bounce and it buys by itself; otherwise at the bounce you get a <b>Buy now</b> button to fund it and tap.' + usdtHint(await getRevolutUsdtAvailable());   // #C6
   } catch (e) { return ''; }
 }
 // updateTroughTracker: called from fast-scan Part C each 30s cycle (Phase B).
@@ -14506,11 +14506,21 @@ function par_proceeds_for_symbol(rule) {
 }
 
 // Returns available USD/USDT cash on a given exchange
+// #C6 USDT held on Revolut X (available), for messages only - it is never counted as buying cash. null = unreadable.
+async function getRevolutUsdtAvailable() {
+  try {
+    const b = await revolutRequest('GET', '/balances');
+    const list = Array.isArray(b) ? b : (b && (b.data || b.balances)) || [];
+    const r = list.find(x => x.currency === 'USDT');
+    return parseFloat((r && r.available) || 0) || 0;
+  } catch (e) { return null; }
+}
+function usdtHint(usdt) { return usdt != null && usdt >= 1 ? ' You also hold $' + Number(usdt).toFixed(2) + ' USDT - convert it to USD in Revolut X and it counts.' : ''; }
 async function getAvailableUSD(exchange) {
   try {
     if (exchange === 'revolut') {
       const balances = await revolutRequest('GET', '/balances');
-      const usd = balances.find(b => b.currency === 'USD' || b.currency === 'USDT');
+      const usd = balances.find(b => b.currency === 'USD');   // #C6 USD only: an X/USD buy never spends USDT directly
       return parseFloat(usd?.available || 0);
     } else {
       const krakenData = await getKrakenBalances();
@@ -15562,9 +15572,10 @@ async function offerDeferredBuy(symbol, path, usd, signalPrice, ctx, headline, c
     if (!id) throw new Error('no id');
     const coin = symbol.replace('-USD', '');
     const short = cashNow != null && Number.isFinite(Number(cashNow)) ? Math.max(0, Number(usd) - Number(cashNow)) : null;
+    const usdtNow = await getRevolutUsdtAvailable();   // #C6 message only
     await sendTelegram((headline ? headline + '\n\n' : '') +
       '💳 <b>FUND IT YOURSELF? - ' + coin + '</b>\n' + (DEFERRED_PATH_LABEL[path] || path) + ' of $' + Number(usd).toFixed(2) + ' at ~' + fmtPriceShort(Number(signalPrice)) +
-      ' was refused: not enough USD' + (short != null ? ' (short $' + short.toFixed(2) + ')' : '') + '.\n' +
+      ' was refused: not enough USD' + (short != null ? ' (short $' + short.toFixed(2) + ')' : '') + '.' + usdtHint(usdtNow) + '\n' +
       'Add USD in Revolut X, then tap <b>Buy now</b>: you see the live price first and confirm with a second tap. Valid 24 h; reminders when the price moves 5%.',
       deferredKeyboard(id, usd));
     sent = true;
@@ -26800,7 +26811,7 @@ app.post('/telegram-webhook', async (req, res) => {
         let usdTxt = 'unknown', pnlTxt = '', armedTxt = '';
         // AVAILABLE USD IS THE HEADLINE, not P&L. With cash at zero every buy-side
         // mechanism is inert, so it is the number that decides whether anything can act.
-        try { const u = await getAvailableUSD('revolut'); usdTxt = '$' + Number(u || 0).toFixed(2); } catch (e) {}
+        try { const u = await getAvailableUSD('revolut'); usdTxt = '$' + Number(u || 0).toFixed(2); const t = await getRevolutUsdtAvailable(); if (t != null && t >= 0.01) usdTxt += ' (+ $' + t.toFixed(2) + ' USDT, convert to spend)'; } catch (e) {}   // #C6
         try {
           const [pf] = await db.execute('SELECT SUM(quantity * entry_price) AS cost FROM coin_strategy WHERE status = ?', ['active_holding']);
           if (pf.length && pf[0].cost) pnlTxt = '\nTracked cost basis: $' + Number(pf[0].cost).toFixed(2);
