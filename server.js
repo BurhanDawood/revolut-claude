@@ -8853,8 +8853,8 @@ async function seniorTick() {
       if (!spec) throw new Error('no spec #' + q.spec_id);
       const r = await seniorReview(spec, q, cfg);
       await db.execute("UPDATE senior_queue SET status = 'done', done_at = NOW(), cost_usd = ?, msg_id = ? WHERE id = ?", [r.usd.toFixed(6), r.msg_id, q.id]);
-      await sendTelegram('🧑‍⚖️ <b>Senior first pass on #' + spec.id + '</b> ' + escTg(spec.title) + '\n' + escTg(q.job) + ': <b>' + r.verdict + '</b>' + (r.amendments ? ' · ' + r.amendments + ' amendment' + (r.amendments > 1 ? 's' : '') + (r.blockers ? ' (' + r.blockers + ' blocker' + (r.blockers > 1 ? 's' : '') + ')' : '') : '') +
-        ' · $' + r.usd.toFixed(2) + '\nAdvisory: Fable still decides. Full text: /desk.').catch(() => {});
+      await sendTelegram('🧑‍⚖️ <b>No reply needed</b> - senior first pass on <b>#' + spec.id + '</b> ' + escTg(spec.title) + '\n' + escTg(q.job) + ': <b>' + r.verdict + '</b>' + (r.amendments ? ' · ' + r.amendments + ' amendment' + (r.amendments > 1 ? 's' : '') + (r.blockers ? ' (' + r.blockers + ' blocker' + (r.blockers > 1 ? 's' : '') + ')' : '') : '') +
+        ' · $' + r.usd.toFixed(2) + '\nFor the Dev thread and Fable (their call): the Dev thread answers it, Fable decides. Full text: /desk.').catch(() => {});
       return { done: q.id, verdict: r.verdict };
     } catch (e) {
       await db.execute("UPDATE senior_queue SET status = 'failed', done_at = NOW(), error = ? WHERE id = ?", [String(e.message).slice(0, 300), q.id]).catch(() => {});
@@ -8869,12 +8869,13 @@ async function specAnnounceReady(id) {
   const rv = [...s.messages].reverse().find(m => m.kind === 'review');
   const d = rv && rv.data ? rv.data : {};
   const mine = (d.questions || []).slice(0, 3), code = (d.dev_questions || []).length;   // #D5b
-  await sendTelegram('📝 <b>Spec ready: #' + s.id + '</b> ' + escTg(s.title) + '\n' +
+  const fableFirst = s.money_path && !s.messages.some(m => m.author === 'fable' && m.kind === 'verdict');   // #13b whose call it is
+  await sendTelegram((fableFirst ? '📝 <b>Spec ready: #' + s.id + '</b> - <b>Fable\'s call first</b>, no reply needed yet: ' : '📝 <b>YOUR CALL</b> - spec ready to accept: <b>#' + s.id + '</b> ') + escTg(s.title) + '\n' +
     'Dev review: <b>' + escTg(String(d.verdict || '?').replace('_', ' ')) + '</b> · size ' + escTg(s.size || '?') + (s.unresolved ? ' · ⚠️ findings still open after ' + s.rounds + ' rounds' : '') +
     (s.money_path ? '\n💷 Touches a money path' + (d.money_path_hits && d.money_path_hits.length ? ' (' + escTg(d.money_path_hits.join(', ')) + ')' : '') + ': Fable must review before it can be accepted.' : '') +
     (mine.length ? '\n\n❓ <b>For you:</b>\n' + mine.map((q, i) => (i + 1) + '. ' + escTg(String(q).slice(0, 280))).join('\n') + ((d.questions || []).length > 3 ? '\n(more on /desk)' : '') + '\nAnswer with 💬 Needs something first, or ask the PM chat to brief you.' : '') +
     (code ? '\n🛠 ' + code + ' code question' + (code > 1 ? 's' : '') + ' for the Dev thread and Fable (not yours).' : '') +
-    '\nCost so far $' + Number(s.cost_usd || 0).toFixed(2) + '. Full thread: /desk.', specKeyboard(s)).catch(e => console.error('[desk] ready message failed:', e.message));
+    (fableFirst ? '' : '\n\n👉 <b>Reply needed:</b> tap one of the buttons below.') + '\nCost so far $' + Number(s.cost_usd || 0).toFixed(2) + '. Full thread: /desk.', specKeyboard(s)).catch(e => console.error('[desk] ready message failed:', e.message));
 }
 // ── #D5b BRYAN DECIDES SPECS FROM BUTTONS (Bryan 26 Sep 14:48: "you send that I just click a button in Telegram to approve the request.
 // The message explains what it is ... options could say needs something else first ... and the approve button"). Never a money path:
@@ -8889,7 +8890,7 @@ function specKeyboard(s) {
   return { inline_keyboard: [row1, row2].filter(r => r.length) };
 }
 function specNextStep(s) {
-  if (s.status === 'inbox' && s.batch_ref) return '🛠 <b>Already built</b> by the Dev thread (batch ' + escTg(s.batch_ref) + ') and waiting for review' + (s.money_path ? ' - Fable checks it before it reaches the copy page' : '') + '. <b>Nothing for you to do yet</b>; you will get the copy page when it is cleared.';
+  if (s.status === 'inbox' && s.batch_ref) return '🛠 <b>Already built</b> by the Dev thread (batch ' + escTg(s.batch_ref) + ') and waiting for review' + (s.money_path ? ' - Fable checks it before it reaches the copy page' : '') + '. <b>Nothing for you to do</b> - the senior agent and Fable review anything that touches money, and you get the copy page when it is cleared. The buttons are only there if you want to stop it or ask for a change.';
   if (s.status === 'inbox') return '<b>Draft it</b> = the PM assistant writes it up and the Dev assistant checks it against the code (a few minutes, a few cents). Nothing is built until you accept the finished spec.';
   if (s.status === 'ready') return s.money_path ? '💷 It touches a money path, so <b>Accept</b> only works after Fable has cleared it.' : '<b>Accept</b> = it goes to the Dev thread to build.';
   if (s.status === 'accepted' || s.status === 'building') return 'It is ' + s.status + '; the buttons are here if it needs something from you.';
@@ -8901,14 +8902,20 @@ async function specAskBryan(id, from, why, mode = 'decide') {
   const first = s.messages.find(m => m.kind === 'comment' && m.body !== 'draft requested');
   const what = String(why || (first && first.body) || '').replace(/\s+/g, ' ').trim();
   if (mode === 'fyi') {   // #13 information only: no buttons, nothing to decide
-    await sendTelegram('ℹ️ <b>For info from ' + escTg(SPEC_WHO[from] || from) + ': #' + s.id + '</b> ' + escTg(s.title) +
+    await sendTelegram('ℹ️ <b>No reply needed</b> - for info from ' + escTg(SPEC_WHO[from] || from) + ': <b>#' + s.id + '</b> ' + escTg(s.title) +
       (what ? '\n' + escTg(what.slice(0, 600)) + (what.length > 600 ? '…' : '') : '') + '\n\n<b>Nothing to decide</b> - it is kept on the desk as a record. Full thread: /desk.');
     await specNote(s.id, 'Told Bryan in Telegram, for info only (no decision asked)').catch(() => {});
     return { ok: true, id: s.id, status: s.status, fyi: true };
   }
   const next = specNextStep(s);
-  await sendTelegram('📝 <b>' + (from === 'bryan' ? 'Added to the desk' : escTg(SPEC_WHO[from] || from) + ' needs your call') + ': #' + s.id + '</b> ' + escTg(s.title) +
-    (what ? '\n' + escTg(what.slice(0, 600)) + (what.length > 600 ? '…' : '') : '') + (next ? '\n\n' + next : '') + '\n<i>Status: ' + escTg(s.status) + '. Full thread: /desk.</i>', specKeyboard(s));
+  // #13b (Bryan 02:12/02:15): every desk message says up front WHOSE call it is, and says "Reply needed" only when Bryan must answer.
+  const built = s.status === 'inbox' && !!s.batch_ref, who = escTg(SPEC_WHO[from] || from);
+  const head = from === 'bryan' ? '📝 <b>Added to the desk'
+    : built ? '🛠 <b>No reply needed</b> - built by ' + who + ', now the reviewers\' call: <b>'
+    : '📝 <b>YOUR CALL</b> - ' + who + ' asks you to decide: <b>';
+  await sendTelegram(head + (from === 'bryan' ? ': ' : '') + '#' + s.id + '</b> ' + escTg(s.title) +
+    (what ? '\n' + escTg(what.slice(0, 600)) + (what.length > 600 ? '…' : '') : '') + (next ? '\n\n' + next : '') +
+    (from !== 'bryan' && !built ? '\n\n👉 <b>Reply needed:</b> tap one of the buttons below.' : '') + '\n<i>Status: ' + escTg(s.status) + '. Full thread: /desk.</i>', specKeyboard(s));
   if (from !== 'bryan') await specNote(s.id, 'Asked Bryan in Telegram (for ' + (SPEC_WHO[from] || from) + ')' + (why ? ': ' + String(why).slice(0, 500) : '')).catch(() => {});
   return { ok: true, id: s.id, status: s.status };
 }
