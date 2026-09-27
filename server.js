@@ -25951,6 +25951,27 @@ app.get('/api/portfolio/candles', async (req, res) => {
     res.set('Cache-Control', 'no-store').json({ candles, flows: await portfolioValueFlows(t0).catch(() => []) });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
+// #490 the widget's chart: the whole book as a short line of closes (read-only, same data as the Portfolio page)
+const PV_SPARK = { '1d': { span: 86400, step: 900 }, '1w': { span: 7 * 86400, step: 7200 }, '1m': { span: 30 * 86400, step: 28800 } };
+async function portfolioSpark(range, nowMs = Date.now()) {
+  const key = PV_SPARK[range] ? range : '1d', r = PV_SPARK[key];
+  const nowS = Math.floor(nowMs / 1000), since = nowS - r.span;
+  let src;
+  if (r.step < 3600) {
+    const [rows] = await db.execute('SELECT ts, total_usd FROM portfolio_value_1m WHERE ts >= ? ORDER BY ts', [since - 300]);
+    src = pvCandlesFromMinutes(rows, r.step, 'total_usd');
+  } else {
+    src = await portfolioValueCandles('1h', 'total', nowMs);
+  }
+  const m = new Map();   // the last close in each step
+  for (const x of src) { if (!(x.t >= since) || !(x.c > 0)) continue; const b = Math.floor(x.t / r.step) * r.step; m.set(b, Math.round(x.c * 100) / 100); }
+  const points = [...m.entries()].sort((a, b) => a[0] - b[0]);
+  const first = points.length ? points[0][1] : null, last = points.length ? points[points.length - 1][1] : null;
+  const change = first != null && last != null ? Math.round((last - first) * 100) / 100 : null;
+  const pct = change != null && first > 0 ? Math.round(change / first * 10000) / 100 : null;
+  return { range: key, step: r.step, points, first, last, change, pct };
+}
+app.get('/api/portfolio/spark', async (req, res) => { try { res.set('Cache-Control', 'no-store').json(await portfolioSpark(String(req.query.range || '1d'))); } catch (e) { res.status(500).json({ error: e.message }); } });
 app.get('/api/portfolio/state', async (req, res) => { try { res.set('Cache-Control', 'no-store').json(await portfolioValueState()); } catch (e) { res.status(500).json({ error: e.message }); } });
 app.get('/api/desk/state', async (req, res) => { try { res.json(await specDeskState()); } catch (e) { res.status(500).json({ error: e.message }); } });
 app.get('/api/desk/spec/:id', async (req, res) => { try { const s = await specGet(parseInt(req.params.id)); if (!s) return res.status(404).json({ error: 'no such spec' }); res.json(s); } catch (e) { res.status(500).json({ error: e.message }); } });
