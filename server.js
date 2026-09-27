@@ -7192,10 +7192,15 @@ async function startCandlesBackfill(coins, sinceStr, reason, interval) {
   candlesBackfillWorker(st).then(async (fin) => {
     _candlesJob = null;
     const shown = (reason && reason !== 'manual') ? todo : fin.order;   // automatic runs only report the coins they fetched
-    const lines = shown.map(c => { const x = fin.coins[c] || {}; return c + ': ' + (x.status === 'done' ? 'history from ' + (x.history_from || '?') + ' (' + (x.inserted || 0) + ' new hours)' : x.status + (x.note ? ' - ' + x.note.slice(0, 60) : '')); });
+    const notListed = shown.filter(c => (fin.coins[c] || {}).status === 'not_on_revolut_x');   // #C5 one plain line for these, not an HTTP error each
+    const lines = shown.filter(c => !notListed.includes(c)).map(c => { const x = fin.coins[c] || {}; return c + ': ' + (x.status === 'done' ? 'history from ' + (x.history_from || '?') + ' (' + (x.inserted || 0) + ' new hours)' : x.status + (x.note ? ' - ' + x.note.slice(0, 60) : '')); });
+    if (notListed.length) lines.push('Not on Revolut X (skipped, will not retry): ' + notListed.join(', '));
+    if (reason && reason !== 'manual' && lines.length === (notListed.length ? 1 : 0) && notListed.length) { console.log('[candles] #C5 only unlisted coins: ' + notListed.join(', ')); }
+    else
     await sendTelegram('\ud83d\udd6f\ufe0f <b>' + (reason && reason !== 'manual' ? 'Price history ready for new coin' + (shown.length > 1 ? 's' : '') : 'Candle history backfill finished') + (daily ? ' (daily)' : '') + '</b>\n\n' + lines.join('\n')).catch(() => {});
     // #373 a new coin's hourly history is followed by its daily history
-    if (reason === 'new coin' && !daily && todo.length) await startCandlesBackfill(todo, null, 'new coin', '1d').catch(() => {});
+    const todoListed = todo.filter(c => (fin.coins[c] || {}).status !== 'not_on_revolut_x');   // #C5 never chase an unlisted coin for daily history
+    if (reason === 'new coin' && !daily && todoListed.length) await startCandlesBackfill(todoListed, null, 'new coin', '1d').catch(() => {});
   }).catch(async (e) => { _candlesJob = null; st.running = false; st.error = e.message; await candlesSave(st); console.error('[candles] job failed:', e.message); });
   return { ok: true, started: true, coins: st.order.length, to_fetch: todo };
 }
@@ -7209,6 +7214,13 @@ async function candlesTrackedCoins() {
   try { const [cs] = await db.execute('SELECT symbol FROM coin_strategy'); for (const x of cs) set.add(String(x.symbol || '').toUpperCase().replace(/-USD$/, '')); } catch (e) {}
   return [...set].filter(c => c && !/^(USD|USDT|USDC|GBP|EUR)$/.test(c)).sort();
 }
+// #C5 is this coin a Revolut X USD pair? From the cached /configuration/pairs list (#387). Unreadable list = allow all.
+async function candlesListedFilter() {
+  try { await getPairQuoteStep('BTC-USD'); } catch (e) { /* the cache may still be usable */ }
+  const map = _pairSteps && _pairSteps.map;
+  if (!map || typeof map !== 'object' || !Object.keys(map).length) return () => true;
+  return (c) => !!(map[c + '/USD'] || map[c + '-USD']);
+}
 // HOURLY: a tracked coin with NO venue history, not already known to be missing from Revolut X, gets its year of
 // candles fetched in the background - a new position has a real baseline within the hour instead of after 14 days.
 async function candlesAutoBackfillNew() {
@@ -7220,13 +7232,16 @@ async function candlesAutoBackfillNew() {
   const [have] = await db.execute("SELECT DISTINCT symbol FROM price_intraday_hourly WHERE source = 'venue'");
   const withHistory = new Set(have.map(x => String(x.symbol || '').toUpperCase().replace(/-USD$/, '')));
   // skip: already has venue history, or a previous attempt settled it (not listed on Revolut X / done)
-  const need = coins.filter(c => !withHistory.has(c) && !(known[c] && ['done', 'not_on_revolut_x'].includes(known[c].status)));
+  // #C5 (27 Sep: DEAD_BAGS / EXITED are plan labels, GHIBLI / LAPTOP are Kraken coins): only coins listed as a Revolut X
+  // USD pair are fetched automatically. If the pairs list cannot be read, behave exactly as before.
+  const listed = await candlesListedFilter();
+  const need = coins.filter(c => listed(c) && !withHistory.has(c) && !(known[c] && ['done', 'not_on_revolut_x'].includes(known[c].status)));
   if (!need.length) {
     // #373 hourly is complete - is any coin missing its DAILY history?
     const dst = await candlesState(CANDLES_DAILY_KEY); const dknown = dst && dst.coins ? dst.coins : {};
     const [dh] = await db.execute('SELECT DISTINCT symbol FROM price_daily_ohlc');
     const withDaily = new Set(dh.map(x => String(x.symbol || '').toUpperCase().replace(/-USD$/, '')));
-    const needDaily = coins.filter(c => !withDaily.has(c) && !(known[c] && known[c].status === 'not_on_revolut_x') && !(dknown[c] && ['done', 'not_on_revolut_x'].includes(dknown[c].status)));
+    const needDaily = coins.filter(c => listed(c) && !withDaily.has(c) && !(known[c] && known[c].status === 'not_on_revolut_x') && !(dknown[c] && ['done', 'not_on_revolut_x'].includes(dknown[c].status)));
     if (!needDaily.length) return { new_coins: [] };
     return { new_coins_daily: needDaily, started: await startCandlesBackfill(needDaily, null, 'new coin', '1d') };
   }
@@ -8898,6 +8913,51 @@ async function seniorReview(spec, q, cfg) {
   await db.execute('UPDATE spec_threads SET updated_at = NOW() WHERE id = ?', [spec.id]);
   return { verdict: V, usd, msg_id: ins.insertId, amendments: (review.amendments || []).length, blockers: (review.amendments || []).filter(a => a.severity === 'blocker').length };
 }
+// #B30 (27 Sep: 471 waited on a silent cap): when a queued job waits on the daily cap, say so ONCE per job on its desk
+// item and ONCE per UTC day in Telegram, with the command to raise the cap. Never throws into the tick.
+async function seniorCapNotice(spent, cfg) {
+  const day = new Date().toISOString().slice(0, 10);
+  let st = {}; try { const [r] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'senior_cap_notice'"); if (r.length) st = JSON.parse(r[0].config_value) || {}; } catch (e) { st = {}; }
+  if (st.day !== day) st = { day, noted: [], telegram: false };
+  const [qs] = await db.execute("SELECT q.id, q.spec_id, q.job, t.title FROM senior_queue q LEFT JOIN spec_threads t ON t.id = q.spec_id WHERE q.status = 'queued' ORDER BY q.id");
+  const cap = Number(cfg.senior_daily_cap_usd);
+  for (const x of qs) {
+    if (st.noted.includes(x.id)) continue;
+    await specNote(x.spec_id, '⏳ Senior first pass (' + x.job + ', job ' + x.id + ') is WAITING: today\'s senior budget $' + cap.toFixed(2) + ' is used ($' + spent.toFixed(2) + '). It runs after 00:00 UTC (01:00 London) unless Bryan raises the budget (/senior cap 5) or sends the review straight to Fable.').catch(() => {});
+    st.noted.push(x.id);
+  }
+  if (!st.telegram && qs.length) {
+    await sendTelegram('⏳ <b>Senior agent waiting on its daily budget</b> - $' + spent.toFixed(2) + ' of $' + cap.toFixed(2) + ' used today.\nQueued: ' +
+      qs.map(x => '#' + x.spec_id + ' ' + escTg(String(x.title || '').slice(0, 50)) + ' (' + x.job + ')').join('; ') +
+      '\nIt runs after 01:00 London. <b>Your call, no rush:</b> raise it with <code>/senior cap 5</code>, or skip it and send the review to Fable.').catch(() => {});
+    st.telegram = true;
+  }
+  await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('senior_cap_notice', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)", [JSON.stringify(st)]);
+}
+async function handleSeniorCommand(sub, reply) {
+  const cfg = await specAiCfg();
+  const m = sub.match(/^cap\s+\$?(\d+(?:\.\d+)?)$/), c = sub.match(/^cancel\s+(\d+)$/);
+  if (m) {
+    const v = Number(m[1]);
+    if (!(v >= 0.5 && v <= 25)) { await reply('The senior budget must be between $0.50 and $25 a day.'); return; }
+    let cur = {}; try { const [r] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'spec_desk'"); if (r.length) cur = JSON.parse(r[0].config_value) || {}; } catch (e) { cur = {}; }
+    cur.senior_daily_cap_usd = v;
+    await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('spec_desk', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)", [JSON.stringify(cur)]);
+    await reply('✅ Senior agent budget: $' + v.toFixed(2) + ' a day (was $' + Number(cfg.senior_daily_cap_usd).toFixed(2) + '). Spent today: $' + (await seniorSpend()).toFixed(2) + '. Anything waiting runs within 2 minutes if the budget now allows it.');
+    setTimeout(() => seniorTick().catch(() => {}), 3000);
+    return;
+  }
+  if (c) {
+    const [u] = await db.execute("UPDATE senior_queue SET status = 'cancelled', done_at = NOW(), error = 'cancelled by Bryan' WHERE id = ? AND status = 'queued'", [Number(c[1])]);
+    await reply(u && u.affectedRows === 1 ? '✅ Senior job ' + c[1] + ' cancelled - it will not run.' : 'No queued senior job ' + c[1] + ' (already run, running or cancelled).');
+    return;
+  }
+  const [qs] = await db.execute("SELECT q.id, q.spec_id, q.job, q.status, t.title FROM senior_queue q LEFT JOIN spec_threads t ON t.id = q.spec_id WHERE q.status IN ('queued', 'running') ORDER BY q.id");
+  const spent = await seniorSpend();
+  await reply('🧑‍⚖️ <b>Senior agent</b>: ' + (cfg.senior_enabled ? 'ON' : 'OFF') + ' · budget $' + Number(cfg.senior_daily_cap_usd).toFixed(2) + ' a day · spent today $' + spent.toFixed(2) + ' (resets 01:00 London)' +
+    (qs.length ? '\n\nQueue:\n' + qs.map(x => 'job ' + x.id + ': #' + x.spec_id + ' ' + escTg(String(x.title || '').slice(0, 50)) + ' - ' + x.job + ', ' + x.status).join('\n') : '\n\nNothing queued.') +
+    '\n\n<code>/senior cap 5</code> · <code>/senior cancel 10</code>');
+}
 async function seniorTick() {
   if (_seniorBusy) return { skipped: 'busy' };
   _seniorBusy = true;
@@ -8907,7 +8967,10 @@ async function seniorTick() {
     const [rows] = await db.execute("SELECT id, spec_id, job, ref_msg_id, question FROM senior_queue WHERE status = 'queued' ORDER BY id LIMIT 1");
     if (!rows.length) return { idle: true };
     const q = rows[0], spent = await seniorSpend();
-    if (spent >= cfg.senior_daily_cap_usd) return { skipped: 'senior daily cap $' + cfg.senior_daily_cap_usd + ' reached ($' + spent.toFixed(2) + ')' };
+    if (spent >= cfg.senior_daily_cap_usd) {
+      await seniorCapNotice(spent, cfg).catch(e => console.error('[senior] cap notice:', e.message));   // #B30 never silent
+      return { skipped: 'senior daily cap $' + cfg.senior_daily_cap_usd + ' reached ($' + spent.toFixed(2) + ')' };
+    }
     const [claim] = await db.execute("UPDATE senior_queue SET status = 'running', started_at = NOW() WHERE id = ? AND status = 'queued'", [q.id]);
     if (!claim || claim.affectedRows !== 1) return { skipped: 'claimed elsewhere' };
     const spec = await specGet(q.spec_id);
@@ -26638,6 +26701,10 @@ app.post('/telegram-webhook', async (req, res) => {
       return res.status(200).json({ ok: true });
     }
     // #419 /videos - Gemini watches new videos from every YouTube source now; a summary arrives when done. Never trades.
+    if (/^senior(\s|$)/.test(commandText)) {   // #B30 senior agent budget and queue
+      await handleSeniorCommand(commandText.replace(/^senior\s*/, '').trim(), sendReply).catch(async (e) => { await sendReply('\u274c Senior: ' + escTg(e.message)); });
+      return res.status(200).json({ ok: true });
+    }
     if (commandText === 'videos') {
       if (videoScanInProgress) { await sendReply('A video scan is already running (' + ((lastVideoScan && lastVideoScan.sources_done) || 0) + ' of ' + ((lastVideoScan && lastVideoScan.sources_total) || '?') + ' channels done). The summary will arrive when it finishes.'); return res.status(200).json({ ok: true }); }
       await sendReply('🎥 Scanning the YouTube channels - Gemini watches each new video (up to 3 per channel, under an hour long). A summary arrives when it is done, usually within 10 minutes.');
