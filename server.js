@@ -4375,6 +4375,13 @@ async function krakenVolumeStr(pair, volume) {
 
 // Fetch live price for a single coin from Kraken public API
 // Uses explicit pair map first, then falls back to common naming patterns
+// #494 a ticker Kraken answered for a pair with no market at all: ask, bid and last all 0 and no trades today (GHIBLI, 28 Sep)
+function krakenTickerDead(t) {
+  if (!t || typeof t !== 'object') return false;
+  const z = (v) => Array.isArray(v) && v.length > 0 && Number(v[0]) === 0 && String(v[0]).trim() !== '';
+  const noTrades = Array.isArray(t.t) && Number(t.t[0]) === 0;
+  return z(t.a) && z(t.b) && z(t.c) && noTrades;
+}
 const KRAKEN_PRICE_MISS = new Map();   // #493 symbol -> ms until which a coin with no Kraken price is not asked again
 const KRAKEN_PRICE_MISS_MS = 60 * 60 * 1000;
 async function getKrakenPriceForSymbol(symbol) {
@@ -4395,6 +4402,7 @@ async function getKrakenPriceForSymbol(symbol) {
       const res = await fetch(`${KRAKEN_API_URL}/0/public/Ticker?pair=${encodeURIComponent(pair)}`);
       const data = await res.json();
       if (data && Array.isArray(data.error) && data.error.some(e => /Unknown asset pair/i.test(String(e)))) unlisted++;
+      else if (data && data.result && krakenTickerDead(Object.values(data.result)[0])) unlisted++;   // #494 known pair, no market (GHIBLI)
       if (data.result) {
         const entry = Object.values(data.result)[0];
         const price = parseFloat(entry?.c?.[0]);
@@ -4408,7 +4416,7 @@ async function getKrakenPriceForSymbol(symbol) {
   }
   if (unlisted === pairs.length) {   // #493 only when EVERY pair is unknown to Kraken; a blip, rate limit or 5xx is retried next cycle as before
     KRAKEN_PRICE_MISS.set(symbol, Date.now() + KRAKEN_PRICE_MISS_MS);
-    console.warn(`[kraken] No price found for ${symbol}: Kraken lists none of ${pairs.join(', ')} - not asked again for 60 min`);
+    console.warn(`[kraken] No price found for ${symbol}: no Kraken market on ${pairs.join(', ')} (not listed, or listed with no prices and no trades) - not asked again for 60 min`);
   } else console.warn(`[kraken] No price found for ${symbol}`);
   return null;
 }
