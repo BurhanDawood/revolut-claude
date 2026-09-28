@@ -2,7 +2,9 @@ package com.bryan.revolutx;
 
 import android.Manifest;
 import android.app.NotificationChannel;
+import android.app.NotificationChannelGroup;
 import android.app.NotificationManager;
+import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.media.AudioAttributes;
@@ -30,7 +32,7 @@ import java.nio.charset.StandardCharsets;
 
 /**
  * The app is the server's /app shell (capacitor.config.json server.url) plus a few native pieces:
- * the BiometricAuth and WidgetBridge plugins the shell calls, the home-screen widget, push, the Back
+ * the BiometricAuth, WidgetBridge and RxNotify plugins the shell calls, the home-screen widget, push, the Back
  * button, and an offline page when the server cannot be reached.
  */
 public class MainActivity extends BridgeActivity {
@@ -58,6 +60,7 @@ public class MainActivity extends BridgeActivity {
         AppCompatDelegate.setDefaultNightMode(AppCompatDelegate.MODE_NIGHT_YES);   // the shell is dark-only
         registerPlugin(BiometricAuthPlugin.class);
         registerPlugin(WidgetBridgePlugin.class);
+        registerPlugin(RxNotifyPlugin.class);
         bridgeBuilder.addWebViewListener(new WebViewListener() {
             @Override
             public void onPageStarted(WebView webView) {
@@ -225,14 +228,42 @@ public class MainActivity extends BridgeActivity {
 
     // ── push (only when google-services.json was present at build time) ──
     private void createChannels() {
+        ensureChannels(this);
+    }
+
+    /** v10 (batch 503): the category channels, in Push.CATS order: { name, description }. */
+    static final String[][] CAT_CHANNELS = {
+        { "Needs you", "Approvals, anything held for your confirmation, a failed trade" },
+        { "Money moved", "Buys and sells filled, card payments, deposits, swaps" },
+        { "Price moves", "Dips, spikes, pumps, targets and floors hit" },
+        { "Loops & trails", "Loops arming, trails, buy-backs, sales held or skipped" },
+        { "Agent & desk", "The budget agent and spec-desk messages" },
+        { "Reports", "Morning brief, weekly reviews, research" },
+        { "System", "Backups, restarts, connection problems" },
+    };
+    static final String GROUP_CATS = "rx_cats";
+    static final String GROUP_OTHER = "rx_other";
+
+    /**
+     * Creates every channel the app uses. Safe on each start and from RxNotify: for a channel that exists Android only
+     * updates its name and description and keeps whatever sound / vibration the user chose.
+     */
+    static void ensureChannels(Context ctx) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return;
-        NotificationManager nm = getSystemService(NotificationManager.class);
+        NotificationManager nm = ctx.getSystemService(NotificationManager.class);
+        if (nm == null) return;
+        boolean otherGroup = false;
+        try {
+            nm.createNotificationChannelGroup(new NotificationChannelGroup(GROUP_OTHER, "Other"));
+            otherGroup = true;
+        } catch (Exception ignored) {
+            // optional: the older channels simply stay outside a group
+        }
+
         NotificationChannel alerts = new NotificationChannel(Push.CHANNEL_ALERTS, "Alerts", NotificationManager.IMPORTANCE_HIGH);
         alerts.setDescription("Trade and price alerts");
         NotificationChannel info = new NotificationChannel(Push.CHANNEL_INFO, "Info", NotificationManager.IMPORTANCE_DEFAULT);
         info.setDescription("Reports and other news");
-        nm.createNotificationChannel(alerts);
-        nm.createNotificationChannel(info);
 
         // v8: one channel per sound/vibrate choice (batch 498 picks one per alert category). Android fixes a channel's
         // sound and vibration once it exists, so these ids must never be reused with other settings.
@@ -262,10 +293,35 @@ public class MainActivity extends BridgeActivity {
         quiet.setSound(null, null);
         quiet.enableVibration(false);
 
-        nm.createNotificationChannel(loud);
-        nm.createNotificationChannel(soundOnly);
-        nm.createNotificationChannel(buzz);
-        nm.createNotificationChannel(quiet);
+        for (NotificationChannel c : new NotificationChannel[] { alerts, info, loud, soundOnly, buzz, quiet }) {
+            if (otherGroup) c.setGroup(GROUP_OTHER);
+            try {
+                nm.createNotificationChannel(c);
+            } catch (Exception e) {
+                if (!otherGroup) continue;
+                c.setGroup(null);   // Android refused the group: keep the channel as it was
+                try {
+                    nm.createNotificationChannel(c);
+                } catch (Exception ignored) {
+                    // leave it as it is
+                }
+            }
+        }
+
+        // v10: one channel per alert category, each starting on the default sound with vibration. The user picks their
+        // own sound and vibration on Android's page for the channel (RxNotify.openChannel); the app never overrides it.
+        // These ids must never be deleted, re-created or reused with other settings.
+        nm.createNotificationChannelGroup(new NotificationChannelGroup(GROUP_CATS, "Alert categories"));
+        for (int i = 0; i < Push.CATS.length; i++) {
+            NotificationChannel c = new NotificationChannel(
+                Push.CHANNEL_CAT_PREFIX + Push.CATS[i], CAT_CHANNELS[i][0], NotificationManager.IMPORTANCE_HIGH
+            );
+            c.setDescription(CAT_CHANNELS[i][1]);
+            c.setSound(Settings.System.DEFAULT_NOTIFICATION_URI, sound);
+            c.enableVibration(true);
+            c.setGroup(GROUP_CATS);
+            nm.createNotificationChannel(c);
+        }
     }
 
     private void startPush() {

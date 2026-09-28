@@ -57,6 +57,7 @@ public class RxMessagingService extends MessagingService {
             .setPriority(
                 Push.CHANNEL_QUIET.equals(channel) ? NotificationCompat.PRIORITY_LOW
                     : Push.CHANNEL_INFO.equals(channel) ? NotificationCompat.PRIORITY_DEFAULT
+                    : Push.isCatChannel(channel) ? NotificationCompat.PRIORITY_HIGH
                     : NotificationCompat.PRIORITY_HIGH
             )
             .setAutoCancel(true)

@@ -23,12 +23,22 @@ final class Push {
     static final String CHANNEL_SOUND = "rx_sound";
     static final String CHANNEL_BUZZ = "rx_buzz";
     static final String CHANNEL_QUIET = "rx_quiet";
-    /** What this app can show; the server stores it with the token. "ch2" = has the four rx_* channels. */
-    static final String CAPS = "ch2";
+    // v10 (batch 503): one channel per alert category, rx_c_<cat>; the server sends these only to devices with caps "ch3"
+    static final String CHANNEL_CAT_PREFIX = "rx_c_";
+    /** The alert categories, in the order the app and RxNotify.channels() list them. One list: CAT_RE must match it. */
+    static final String[] CATS = { "needs", "money", "price", "loops", "agent", "reports", "system" };
+    static final String CAT_RE = "needs|money|price|loops|agent|reports|system";
+    /** What this app can show; the server stores it with the token. "ch2" = the four rx_* channels, "ch3" = the rx_c_* ones. */
+    static final String CAPS = "ch2,ch3";
+
+    static boolean isCatChannel(String ch) {
+        return ch != null && ch.startsWith(CHANNEL_CAT_PREFIX) && ch.substring(CHANNEL_CAT_PREFIX.length()).matches(CAT_RE);
+    }
 
     /** A channel id from the server, or alerts for anything this app does not have. */
     static String knownChannel(String ch) {
         if (ch == null) return CHANNEL_ALERTS;
+        if (isCatChannel(ch)) return ch;
         switch (ch) {
             case CHANNEL_ALERTS:
             case CHANNEL_INFO:

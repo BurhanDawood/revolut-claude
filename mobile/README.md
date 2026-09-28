@@ -151,11 +151,40 @@ On Android, sound and vibration belong to the notification channel, not to the m
 
 `alerts` and `info` stay for older server messages and older installs. A channel id the app doesn't know is shown on `alerts`.
 
-**Caps contract.** On every start the app registers its token with `POST /api/app/devices`, and the body includes `"caps": "ch2"`. The server sends the `rx_*` channels only to devices registered with `ch2`. Every other device keeps getting `alerts` and `info`. So it doesn't matter whether the app or the server is updated first: opening v8 once is enough. The server also sends `data.cat` (the category id), which the app doesn't use yet.
+**Caps contract.** On every start the app registers its token with `POST /api/app/devices`, and the body includes `"caps": "ch2"`. The server sends the `rx_*` channels only to devices registered with `ch2`. Every other device keeps getting `alerts` and `info`. So it doesn't matter whether the app or the server is updated first: opening v8 once is enough. The server also sends `data.cat` (the category id).
 
 **Channel settings are fixed.**
 - Once Android has created a channel, the app can't change its sound or vibration. Never reuse these ids with different settings: a new behaviour needs a new id (and a new caps value).
 - Changing a channel's sound, vibration or importance in Android's own settings (Settings → Apps → Revolut X → Notifications) overrides the app's choice for that channel. Android keeps that change even when the app updates.
+
+### v10: a channel per alert category (caps `ch3`)
+
+v10 adds one channel per alert category, in the group **Alert categories** (`rx_cats`). The six older channels above go into the group **Other** (`rx_other`) where Android allows it.
+
+| id | name in Android settings | description | importance | sound | vibration |
+|---|---|---|---|---|---|
+| `rx_c_needs` | Needs you | Approvals, anything held for your confirmation, a failed trade | HIGH | default notification sound | on (Android's pattern) |
+| `rx_c_money` | Money moved | Buys and sells filled, card payments, deposits, swaps | HIGH | default notification sound | on (Android's pattern) |
+| `rx_c_price` | Price moves | Dips, spikes, pumps, targets and floors hit | HIGH | default notification sound | on (Android's pattern) |
+| `rx_c_loops` | Loops & trails | Loops arming, trails, buy-backs, sales held or skipped | HIGH | default notification sound | on (Android's pattern) |
+| `rx_c_agent` | Agent & desk | The budget agent and spec-desk messages | HIGH | default notification sound | on (Android's pattern) |
+| `rx_c_reports` | Reports | Morning brief, weekly reviews, research | HIGH | default notification sound | on (Android's pattern) |
+| `rx_c_system` | System | Backups, restarts, connection problems | HIGH | default notification sound | on (Android's pattern) |
+
+The list of categories lives in one place: `Push.CATS` / `Push.CAT_RE` (`needs|money|price|loops|agent|reports|system`).
+
+**Each category's sound and vibration are Bryan's to set**, on Android's page for that channel (Sound picker with every tone on the phone, Vibration switch). The app only creates the channel with the defaults above and never overrides the user's choice. Calling `createNotificationChannel` again on each start only updates the name and description. These ids are never deleted, re-created or reused with other settings.
+
+**ch3 contract.** The app registers with `"caps": "ch2,ch3"`. For devices with `ch3`, the server (batch 503) sends a push on `rx_c_<category>` whenever that category's Sound is on. Sound off still uses `rx_buzz` / `rx_quiet`, and quiet hours are unchanged. Devices without `ch3` keep the v8 behaviour. The app accepts `rx_c_` + one of the seven ids (shown at high priority); any other unknown id still goes to `alerts`.
+
+**RxNotify contract** (`Capacitor.Plugins.RxNotify`, v10+; the shell checks it exists):
+
+| call | result |
+|---|---|
+| `channels()` | `{ app_blocked, channels: [ { cat, id, exists, blocked, sound, vibrate } ] }`: 7 rows in the order above (empty below Android 8). `app_blocked`: the app's notifications are off. `exists`: the channel is there (when not: `blocked` false, `sound` "", `vibrate` false). `blocked`: the channel or its group is turned off. `sound`: the tone's name (max 60 chars), "" for no sound, or "Custom sound" when Android can't name it; never the URI. `vibrate`: the channel vibrates. |
+| `openChannel({ cat })` | Rejects `"unknown category"` unless `cat` is exactly one of the seven. Makes sure the channels exist, then opens Android's settings page for `rx_c_<cat>` (falling back to the app's notification page, or the app details page below Android 8). Resolves once opened. |
+
+The shell's More → Notifications shows "🔔 <sound> · vibrates  Change ›" per category, calls `openChannel` on Change, and calls `channels()` again when the app comes back to the foreground, so a newly picked sound shows up after Back.
 
 ## Push notifications
 
