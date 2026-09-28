@@ -10130,6 +10130,42 @@ async function pv2Run(opt = {}) {
     return st;
   } finally { _pv2Running = false; }
 }
+// #497 live money in and out for the chart's arrows. pv2Run (the one-off history rebuild) was the only writer of portfolio_flows, so a
+// card payment, deposit or withdrawal after it never got a marker (27 Sep: five USDT card payments, ~$478, and no arrow). This reads
+// the last 10 days of Revolut X's record and writes the rows the rebuild would, with the same tx_id keys, so re-runs and a later
+// rebuild overwrite rather than duplicate. Display only: it writes nothing but portfolio_flows and reads no trading table. XRP sent
+// out is skipped while the Tangem wallet is tracked (it stays in the book, as in the rebuild). The $25 floor is applied when read.
+async function pvFlowsRefresh(opt = {}) {
+  const tx = await (opt.fetchTx || fetchTransactions)(opt.days || 10);
+  const legs = pv2Legs(tx.transactions || tx.rows || []);
+  const tangemOn = opt.tangemOn != null ? !!opt.tangemOn : _pvTangem.qty > 0;
+  let added = 0, seen = 0, skipped = 0;
+  const ids = [...new Set(legs.filter(l => l.flow && l.id).map(l => String(l.id) + (l.amt > 0 ? ':in' : ':out')))];
+  const known = new Set();
+  for (let i = 0; i < ids.length; i += 200) { const part = ids.slice(i, i + 200); const [k] = await db.execute('SELECT tx_id FROM portfolio_flows WHERE tx_id IN (' + part.map(() => '?').join(', ') + ')', part); for (const x of k) known.add(x.tx_id); }
+  for (const l of legs) {
+    if (!l.flow || !l.id) continue;
+    if (l.cur === 'XRP' && l.amt < 0 && tangemOn) { skipped++; continue; }
+    const ts = Math.floor(l.ts / 1000);
+    const fiat = !!PV2_STABLE[l.cur] || l.cur === 'GBP' || l.cur === 'EUR';
+    let p = PV2_STABLE[l.cur] || 0;
+    if (!p && fiat) p = (await pvFx(l.cur)) || 0;
+    if (!p) {
+      const [h] = await db.execute('SELECT close_px FROM price_intraday_hourly WHERE symbol = ? AND hour_bucket <= FROM_UNIXTIME(?) AND hour_bucket >= FROM_UNIXTIME(?) ORDER BY hour_bucket DESC LIMIT 1', [l.cur + '-USD', ts, ts - 2 * 86400]);
+      p = h[0] ? Number(h[0].close_px) : 0;
+    }
+    if (!p) { try { p = (await getCurrentPrice(l.cur + '-USD')) || 0; } catch (e) { p = 0; } }
+    if (!(p > 0)) { skipped++; continue; }
+    const kind = l.amt > 0 ? (fiat ? 'deposit' : 'coin_in') : (l.type === 'send' ? 'send' : 'out');
+    const key = String(l.id) + (l.amt > 0 ? ':in' : ':out');
+    await db.execute('INSERT INTO portfolio_flows (tx_id, ts, kind, currency, qty, usd) VALUES (?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE ts = VALUES(ts), kind = VALUES(kind), qty = VALUES(qty), usd = VALUES(usd)', [key, ts, kind, l.cur, l.amt, Number((l.amt * p).toFixed(2))]);
+    if (!known.has(key)) { known.add(key); added++; }
+    seen++;
+  }
+  if (added) console.log('[pv] #497 chart arrows: ' + added + ' new money in/out row(s) from the last ' + (opt.days || 10) + ' days');
+  return { ok: !(tx.errors && tx.errors.length), added, seen, skipped };
+}
+setTimeout(() => { const run = () => pvFlowsRefresh().catch(e => console.error('[pv] #497 flows refresh failed:', e.message)); run(); setInterval(run, 30 * 60 * 1000); }, 6 * 60 * 1000);
 setTimeout(() => { portfolioValueTick(); setInterval(portfolioValueTick, 60 * 1000); console.log('[pv] #PV1 portfolio value sampling every minute'); }, 60 * 1000);
 setTimeout(() => { const roll = () => portfolioValueRollup().catch(e => console.error('[pv] rollup failed:', e.message)); roll(); setInterval(roll, 10 * 60 * 1000); }, 5 * 60 * 1000);
 setTimeout(async () => { try { const st = await pv2Status(); if (!st || st.version !== PV2_VERSION || st.status !== 'done') await pv2Run(); } catch (e) { console.error('[pv] #PV2 start failed:', e.message); } }, 3 * 60 * 1000);   // #PV2 rebuild the history once (and after a failed or interrupted run)
