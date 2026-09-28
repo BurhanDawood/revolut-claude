@@ -575,12 +575,13 @@ function appInboxHtml(text) {
   return out;
 }
 // The buttons as the page may see them: labels only, plus a URL for a link button (https only). Never the callback data.
-function appInboxButtons(kb) {
+function appInboxButtons(kb, canAnswer) {
   let rows = kb; if (typeof rows === 'string') { try { rows = JSON.parse(rows); } catch (e) { rows = null; } }
   if (!Array.isArray(rows)) return [];
-  return rows.slice(0, 8).map(r => (Array.isArray(r) ? r : []).slice(0, 4).map(b => {
-    const o = { t: String((b && b.text) || '').slice(0, 40) };
+  return rows.slice(0, 8).map((r, ri) => (Array.isArray(r) ? r : []).slice(0, 4).map((b, ci) => {
+    const o = { t: String((b && b.text) || '').slice(0, 40), r: ri, c: ci };   // #502 r/c: the button's own position (what the app sends back)
     if (b && typeof b.url === 'string' && /^https:\/\/[^\s"'<>]+$/i.test(b.url)) o.u = b.url;
+    if (canAnswer && b && canAnswer(b.callback_data)) o.a = 1;   // #502 the app may answer this one (desk #30 allow table)
     return o;
   }).filter(b => b.t)).filter(r => r.length);
 }
@@ -626,13 +627,209 @@ async function appInboxList(q = {}) {
   if (after != null) { where.push('id > ?'); args.push(after); order = 'ASC'; }
   else if (before != null) { where.push('id < ?'); args.push(before); }
   const [rows] = await db.execute('SELECT id, ts, cat, text, kb, tab, coin, push FROM app_inbox' + (where.length ? ' WHERE ' + where.join(' AND ') : '') + ' ORDER BY id ' + order + ' LIMIT ' + lim, args);
-  const items = rows.map(r => ({ id: Number(r.id), ts: Number(r.ts), cat: r.cat, html: appInboxHtml(r.text), buttons: appInboxButtons(r.kb), tab: r.tab, coin: r.coin || '', push: r.push || '' }));
+  // #502 which buttons the app may answer (fresh messages only; Trade Detected acts read in one query) and what was answered
+  const nowS = Math.floor(Date.now() / 1000), ids = rows.map(r => Number(r.id));
+  const answers = new Map(), acts = new Map();
+  if (ids.length) {
+    const [ar] = await db.execute('SELECT inbox_id, r, c, label, result FROM app_inbox_answers WHERE inbox_id IN (' + ids.map(() => '?').join(', ') + ')', ids).catch(() => [[]]);
+    for (const a of ar) answers.set(Number(a.inbox_id), { r: Number(a.r), c: Number(a.c), label: a.label, result: a.result });
+    const tjIds = new Set();
+    for (const r of rows) { let k = null; try { k = JSON.parse(r.kb || 'null'); } catch (e) {} if (Array.isArray(k)) for (const row of k) for (const b of (Array.isArray(row) ? row : [])) { const p = telegramButtonParse(b && b.callback_data); if (p && p.kind === 'tj') tjIds.add(parseInt(p.coin, 10)); } }
+    if (tjIds.size) { const L = [...tjIds]; const [tr] = await db.execute('SELECT journal_id, choice, act FROM trade_alert_choices WHERE journal_id IN (' + L.map(() => '?').join(', ') + ')', L).catch(() => [[]]); for (const t of tr) acts.set(t.journal_id + ':' + t.choice, String(t.act)); }
+  }
+  const canAnswerFor = (r) => (nowS - Number(r.ts) <= APP_ANSWER.max_age_s && !answers.has(Number(r.id))) ? (cb) => {
+    const p = telegramButtonParse(cb); const rule = p && APP_ANSWER_ALLOW[p.kind];
+    if (!rule) return false;
+    if (rule === 'act') return APP_ANSWER_TJ_ACTS.includes(acts.get(parseInt(p.coin, 10) + ':' + p.choice));
+    return !!rule[p.choice];
+  } : null;
+  const items = rows.map(r => ({ id: Number(r.id), ts: Number(r.ts), cat: r.cat, html: appInboxHtml(r.text), buttons: appInboxButtons(r.kb, canAnswerFor(r)), tab: r.tab, coin: r.coin || '', push: r.push || '', answer: answers.get(Number(r.id)) || null }));
   if (order === 'DESC') items.reverse();   // always oldest first, as a chat reads
   const [mx] = await db.execute('SELECT MAX(id) AS m FROM app_inbox');
   return { items, more: after == null && rows.length === lim, latest_id: mx[0] && mx[0].m != null ? Number(mx[0].m) : 0,
     bot: await appInboxBotName(), cats: APP_PUSH_CATS.map(c => ({ id: c.id, name: c.name })), keep_days: APP_INBOX.keep_days };
 }
-setInterval(() => { db.execute('DELETE FROM app_inbox WHERE ts < ?', [Math.floor(Date.now() / 1000) - APP_INBOX.keep_days * 86400]).catch(() => {}); }, 6 * 3600 * 1000);
+setInterval(() => { const cut = Math.floor(Date.now() / 1000) - APP_INBOX.keep_days * 86400; db.execute('DELETE FROM app_inbox WHERE ts < ?', [cut]).catch(() => {}); db.execute('DELETE FROM app_inbox_answers WHERE at < ?', [cut]).catch(() => {}); }, 6 * 3600 * 1000);   // #502 answers too
+// #502 THE BUTTON ROUTER, moved out of the Telegram webhook UNCHANGED so the app's feed (desk #30) uses the very same code:
+// the stateless DB-driven types, then the alertContextBySymbol claim-and-delete with its type guard. It returns what happened
+// ('unrecognised' | 'done' | 'failed' | 'superseded' | 'prefix' | 'resolved') instead of answering the webhook itself.
+async function telegramButtonDispatch(cbData, cbReply, ackCb) {
+  // callback_data is capped at 64 BYTES by Telegram, so keep it minimal: a:<coin>:<choice>
+  cbData = String(cbData == null ? '' : cbData).trim();   // #502 the webhook passes (cbq.data || '').trim(); the app route its stored callback
+  const cbMatch = cbData.match(/^a:([a-z0-9]{1,12}):([1-5])(?::([a-z]{1,3}))?$/i)
+    || cbData.match(/^a:(\d{1,12}):([67]):(tj)$/i);   // #L0 sell Trade Detected keyboards have 7 choices - tj ONLY, never a money button
+  if (!cbMatch) {
+    await ackCb('Unrecognised button');
+    return 'unrecognised';
+  }
+  const cbCoin = cbMatch[1].toLowerCase();
+  const cbChoice = parseInt(cbMatch[2], 10);
+  // #336 STATELESS MONEY BUTTONS route here, BEFORE the alertContextBySymbol lookup below.
+  // They carry a database id and read the database, so they keep working after a restart and
+  // can never act on the wrong row. Every other button path below is unchanged.
+  const cbMoneyType = (cbMatch[3] || '').toLowerCase();
+  // #340 COLLISION FIX: 'td' was already the code for fixed-target DOWN alerts, so from #334 until now every
+  // down-target button was sent to the trade handler and refused. A Trade Detected button carries a NUMERIC
+  // journal id, a down-target button carries a COIN, and no coin symbol is all digits - so only a numeric 'td'
+  // is a trade button. Any other 'td' now falls through to the alert handler below, as it did before #334.
+  // New Trade Detected buttons use 'tj'; numeric 'td' keeps already-sent ones working.
+  const cbIsTradeJournal = cbMoneyType === 'tj' || (cbMoneyType === 'td' && /^\d+$/.test(cbCoin));
+  if (cbMoneyType === 'np' || cbMoneyType === 'ip' || cbMoneyType === 'cc' || cbIsTradeJournal || cbMoneyType === 'ta' || cbMoneyType === 'mu' ||
+      cbMoneyType === 'sd' || cbMoneyType === 'sp' || cbMoneyType === 'rp' || cbMoneyType === 'db' || cbMoneyType === 'sk' || cbMoneyType === 'ro' || cbMoneyType === 'rq' || cbMoneyType === 'sx') {
+    await ackCb('Working...');
+    try {
+      if (cbMoneyType === 'ta') await handleTradeApprovalButton(cbCoin, cbChoice, cbReply);
+      else if (cbMoneyType === 'db') await handleDeferredBuyButton(cbCoin, cbChoice, cbReply);   // #413 funded buy
+      else if (cbMoneyType === 'sd' || cbMoneyType === 'sp') await handleSwingButton(cbCoin, cbChoice, cbMoneyType, cbReply);
+      else if (cbMoneyType === 'rp') await handleRebalanceConfirmButton(cbCoin, cbChoice, cbReply);
+      else if (cbMoneyType === 'sk') await handleSpecButton(cbCoin, cbChoice, cbReply);   // #D2 spec desk status buttons (never money)
+      else if (cbMoneyType === 'ro') await handleRotationUntagButton(cbCoin, cbReply);   // #8 records only
+      else if (cbMoneyType === 'rq') await handleRotationAskButton(cbCoin, cbChoice, cbReply);   // #8 records only
+      else if (cbMoneyType === 'sx') await handleSpikeButton(cbCoin, cbChoice, cbReply);   // #B23 S3 keep a coin alerts-only / insure it again / switch on (with confirm); no off button
+      else if (cbMoneyType === 'mu') await handleMuteButton(cbCoin, cbReply);
+      else if (cbIsTradeJournal) await handleTradeButton(cbCoin, cbChoice, cbReply);
+      else await handleMoneyButton(cbMoneyType, cbCoin, cbChoice, cbReply);
+    } catch (e) {
+      console.error('[money-btn] ' + cbMoneyType + ' ' + cbCoin + ' failed:', e.message);
+      await cbReply('\u26a0\ufe0f Button failed: ' + (e.message || '').substring(0, 150));
+      return 'failed';   // #502
+    }
+    return 'done';
+  }
+  // DOUBLE-ACK RACE: the owner may tap AND type for the same alert within
+  // milliseconds. alertContextBySymbol is the authority — whichever handler
+  // deletes the entry first owns the decision; the loser fails safely here
+  // rather than executing a second time. This is the same pop the text path
+  // performs, so the two cannot both proceed.
+  // TYPE GUARD: refuse if the live context is a DIFFERENT alert type from the one
+  // this button was drawn for — the numbers mean different things per type.
+  // 'ca' covers BOTH claude_analysis_trailing and claude_analysis_target: processAlertChoice
+  // handles them in one branch, and choices 3/4 are type-aware inside it, so a tap is valid
+  // against either. Matching on the prefix avoids refusing taps that are actually correct.
+  const CB_TYPES = { tr: 'trailing_stop', pu: 'pump', dr: 'drop', tu: 'fixed_target_up', td: 'fixed_target_down', ca: 'claude_analysis', rc: 'reconciler', hs: 'hold_step' };
+  const cbWantType = CB_TYPES[(cbMatch[3] || '').toLowerCase()] || null;
+  const cbCtx = alertContextBySymbol.get(cbCoin);
+  const cbTypeOk = !cbWantType || (cbWantType === 'claude_analysis'
+    ? String(cbCtx && cbCtx.alertType || '').indexOf('claude_analysis') === 0
+    : cbCtx && cbCtx.alertType === cbWantType);
+  if (cbCtx && cbWantType && !cbTypeOk) {
+    console.warn('[telegram] #316b superseded tap: choice=' + cbChoice + ' button=' + cbWantType + ' live=' + cbCtx.alertType + ' coin=' + cbCoin);
+    await ackCb('That alert was superseded by a newer ' + cbCoin.toUpperCase() + ' alert. Use the latest message.', true);
+    return 'superseded';
+  }
+  if (cbCtx && !cbWantType) {
+    // Pre-fix button (no type stamp) — cannot verify which alert it belongs to.
+    await ackCb('This button predates the routing fix. Please reply by number instead.', true);
+    return 'prefix';
+  }
+  if (!cbCtx) {
+    await ackCb('Already resolved (or no active alert for ' + cbCoin.toUpperCase() + ')', true);
+    return 'resolved';
+  }
+  alertContextBySymbol.delete(cbCoin);
+  if (lastAlertCoin === cbCoin) lastAlertCoin = null;
+  await ackCb(cbCoin.toUpperCase() + ' -> option ' + cbChoice);
+  try {
+    await processAlertChoice(cbCtx, cbChoice, cbReply);
+    console.log('[telegram] #316b callback ' + cbCoin + ' choice ' + cbChoice + ' routed');
+  } catch (e) {
+    console.error('[telegram] #316b callback error:', e.message);
+    await cbReply('\u26a0\ufe0f ' + cbCoin.toUpperCase() + ' option ' + cbChoice + ' failed: ' + (e.message || '').substring(0, 120));
+    return 'failed';   // #502
+  }
+  return 'done';
+}
+// #502 DESK #30 (Bryan 28 Sep 22:36; Fable accepted with C1-C4 at 22:53): answer a HARMLESS button from the app's feed.
+// The Telegram button router is one function, telegramButtonDispatch (moved out of the webhook unchanged), called by the
+// webhook and by POST /api/app/inbox/answer. The app route reads the button's callback data from app_inbox.kb itself (the
+// page only ever sends the message id and the button's position), re-parses it with the webhook's own patterns, and lets it
+// through only if its (type, choice) is in APP_ANSWER_ALLOW - for Trade Detected buttons, only after reading the act from
+// trade_alert_choices. Everything else - trade approval, funded buys, payments and capital, trailing stops, spike insurance,
+// reconciler, analysis, the spec desk - stays Telegram-only.
+const TG_BUTTON_RES = [/^a:([a-z0-9]{1,12}):([1-5])(?::([a-z]{1,3}))?$/i, /^a:(\d{1,12}):([67]):(tj)$/i];   // #L0 7-choice sell keyboards: tj ONLY
+function telegramButtonParse(cbData) {
+  const s = String(cbData == null ? '' : cbData).trim();
+  const m = s.match(TG_BUTTON_RES[0]) || s.match(TG_BUTTON_RES[1]);
+  if (!m) return null;
+  const coin = m[1].toLowerCase(), choice = parseInt(m[2], 10), type = (m[3] || '').toLowerCase();
+  return { coin, choice, type, kind: type === 'tj' || (type === 'td' && /^\d+$/.test(coin)) ? 'tj' : type, m };
+}
+const APP_ANSWER = { per_hour: 20, paid_per_day: 30, max_age_s: 86400 };
+// (type, choice) -> 'free' | 'paid' (a Claude call). Fable 28 Sep: swing choice 1 allowed; sk and ca excluded. Dev, stricter than the
+// ruling on Fable's notes: pump/drop Ignore (a permanent ignored_coins row) and Trade Detected 'transfer' (rewrites the row's kind) stay in Telegram.
+const APP_ANSWER_ALLOW = {
+  tu: { 1: 'paid', 2: 'free', 3: 'paid', 4: 'free' },   // sell advice, hold, analyse, acknowledge
+  td: { 1: 'paid', 2: 'free', 3: 'paid', 4: 'free' },   // buy advice, hold, sell advice, acknowledge
+  pu: { 1: 'free', 2: 'paid', 3: 'paid', 4: 'paid' },   // hold, sell advice, buy advice, analyse (5 ignore: Telegram)
+  dr: { 1: 'free', 2: 'paid', 3: 'paid', 4: 'paid' },   // hold, buy advice, sell advice, analyse (5 ignore: Telegram)
+  hs: { 1: 'free', 2: 'free', 3: 'free', 4: 'free' },   // hold-step: the alert threshold only
+  mu: { 1: 'free', 2: 'free', 3: 'free', 4: 'free', 5: 'free' },   // mute 24 h
+  sd: { 1: 'paid', 2: 'free', 3: 'free', 4: 'free' },   // buy advice + alert, hold, dust, ack
+  sp: { 1: 'paid', 2: 'free', 3: 'free', 4: 'free' },   // sell advice + alert, hold, dust, ack
+  ro: { 1: 'free', 2: 'free', 3: 'free', 4: 'free', 5: 'free' },   // rotation untag (records)
+  rq: { 1: 'free', 2: 'free', 3: 'free' },   // rotation question (records)
+  tj: 'act',
+};
+const APP_ANSWER_TJ_ACTS = ['reason', 'topup', 'thesis', 'funding', 'skip', 'rebalance', 'rebalance_out'];   // never 'payment' (capital) or 'transfer'
+async function appAnswerAllowed(p) {
+  const rule = p && APP_ANSWER_ALLOW[p.kind];
+  if (!rule) return { ok: false, why: (p && (p.kind || 'untyped')) || 'unparsed' };
+  if (rule === 'act') {
+    const [r] = await db.execute('SELECT act FROM trade_alert_choices WHERE journal_id = ? AND choice = ?', [parseInt(p.coin, 10), p.choice]).catch(() => [[]]);
+    const act = r && r[0] ? String(r[0].act) : '';
+    return APP_ANSWER_TJ_ACTS.includes(act) ? { ok: true, paid: false } : { ok: false, why: 'tj ' + (act || 'unknown') };
+  }
+  const k = rule[p.choice];
+  return k ? { ok: true, paid: k === 'paid' } : { ok: false, why: p.kind + ' ' + p.choice };
+}
+let appAnswerTimes = [], appAnswerPaid = { day: '', n: 0 }, appAnswerBlockedAt = 0;
+// C4 (ii): the page never offers a blocked button, so a request for one did not come from it. One Telegram line per hour.
+function appAnswerBlockedAlarm(why, nowMs = Date.now()) {
+  console.warn('[inbox] #502 refused a blocked button from the app: ' + why);
+  if (nowMs - appAnswerBlockedAt < 3600000) return;
+  appAnswerBlockedAt = nowMs;
+  sendTelegram('📱 The app asked for a blocked button (' + escTg(why) + ') - not you? Rotate the dashboard key in Railway.').catch(() => {});
+}
+// POST /api/app/inbox/answer {id, r, c} -> { status, ... }
+async function appInboxAnswer(body, nowMs = Date.now()) {
+  const b = body && typeof body === 'object' ? body : {};
+  const id = /^\d{1,15}$/.test(String(b.id)) ? Number(b.id) : 0;   // C3
+  const r = Number.isInteger(b.r) ? b.r : -1, c = Number.isInteger(b.c) ? b.c : -1;
+  if (!id || r < 0 || c < 0 || r > 20 || c > 10) return { status: 400, error: 'bad request' };
+  const [rows] = await db.execute('SELECT id, ts, text, kb FROM app_inbox WHERE id = ?', [id]);
+  const row = rows[0];
+  if (!row) return { status: 404, error: 'no such message' };
+  if (Math.floor(nowMs / 1000) - Number(row.ts) > APP_ANSWER.max_age_s) return { status: 403, error: 'That message is over 24 h old - answer it in Telegram.' };
+  let kb = null; try { kb = JSON.parse(row.kb || 'null'); } catch (e) { kb = null; }
+  const btn = Array.isArray(kb) && Array.isArray(kb[r]) ? kb[r][c] : null;
+  if (!btn || typeof btn !== 'object') return { status: 400, error: 'no such button' };
+  const label = String(btn.text || '').slice(0, 40);
+  const cb = typeof btn.callback_data === 'string' ? btn.callback_data.trim() : '';
+  const p = telegramButtonParse(cb);
+  const allow = p ? await appAnswerAllowed(p) : { ok: false, why: 'unparsed' };
+  if (!allow.ok) { appAnswerBlockedAlarm(allow.why, nowMs); return { status: 403, error: 'Answer this one in Telegram.' }; }
+  appAnswerTimes = appAnswerTimes.filter(t => nowMs - t < 3600000);   // C4 (iii)
+  if (appAnswerTimes.length >= APP_ANSWER.per_hour) return { status: 429, error: '20 answers an hour from the app - answer this one in Telegram.' };
+  const day = new Date(nowMs).toISOString().slice(0, 10);
+  if (appAnswerPaid.day !== day) appAnswerPaid = { day, n: 0 };
+  if (allow.paid && appAnswerPaid.n >= APP_ANSWER.paid_per_day) return { status: 429, error: '30 advice answers a day from the app - answer this one in Telegram.' };
+  try {   // C2: the claim row first; one answer per message, ever
+    await db.execute('INSERT INTO app_inbox_answers (inbox_id, r, c, label, result, at) VALUES (?, ?, ?, ?, ?, ?)', [id, r, c, label, 'pending', Math.floor(nowMs / 1000)]);
+  } catch (e) {
+    if (/duplicate/i.test(String(e.message || e.code))) return { status: 409, error: 'Already answered.' };
+    throw e;
+  }
+  appAnswerTimes.push(nowMs); if (allow.paid) appAnswerPaid.n++;
+  const n = appPushFromTelegram(row.text);
+  await sendTelegram('📱 Answered from the app: <b>' + escTg(label) + '</b> on ' + escTg(n ? n.title : 'a message')).catch(() => {});   // C4 (i)
+  const acks = [];
+  let result = 'failed';
+  try { result = await telegramButtonDispatch(cb, (text, kb2) => sendTelegram(text, kb2), async (t) => { if (t) acks.push(String(t)); }); }
+  catch (e) { result = 'failed'; console.error('[inbox] #502 answer failed:', e.message); }
+  await db.execute('UPDATE app_inbox_answers SET result = ? WHERE inbox_id = ?', [String(result).slice(0, 64), id]).catch(() => {});
+  const note = acks.filter(a => a !== 'Working...' && !/-> option \d/.test(a))[0] || '';
+  return { status: 200, ok: result === 'done', result, label, note };
+}
 // POST /api/app/devices body check: an FCM token is a long URL-safe string; anything else is refused.
 function appDeviceBody(b) {
   if (!b || typeof b !== 'object') return null;
@@ -1973,6 +2170,7 @@ try {   // #498 what the app supports ('ch2' = one Android channel per sound/vib
   if (Number(cc[0].c) === 0) { await db.execute("ALTER TABLE app_devices ADD COLUMN caps VARCHAR(32) NOT NULL DEFAULT ''"); console.log('[migrate] #498 added app_devices.caps'); }
 } catch (e) { console.warn('[migrate] #498 app_devices.caps:', e.message); }
 await db.execute('CREATE TABLE IF NOT EXISTS app_inbox (id BIGINT AUTO_INCREMENT PRIMARY KEY, ts INT UNSIGNED NOT NULL, cat VARCHAR(12) NOT NULL, text MEDIUMTEXT NOT NULL, kb TEXT NULL, tab VARCHAR(12) NOT NULL DEFAULT \'home\', coin VARCHAR(16) NOT NULL DEFAULT \'\', push VARCHAR(32) NOT NULL DEFAULT \'\', INDEX idx_ts (ts), INDEX idx_cat (cat, id))').catch(e => console.error('[migration] app_inbox:', e.message));   // #500 the app's notifications feed
+await db.execute('CREATE TABLE IF NOT EXISTS app_inbox_answers (id BIGINT AUTO_INCREMENT PRIMARY KEY, inbox_id BIGINT NOT NULL, r TINYINT NOT NULL, c TINYINT NOT NULL, label VARCHAR(40) NOT NULL DEFAULT \'\', result VARCHAR(64) NOT NULL DEFAULT \'\', at INT UNSIGNED NOT NULL, UNIQUE KEY uq_inbox (inbox_id), INDEX idx_at (at))').catch(e => console.error('[migration] app_inbox_answers:', e.message));   // #502 one answer per feed message (Fable C2)
 await db.execute('CREATE TABLE IF NOT EXISTS agent_equity_points (t BIGINT NOT NULL PRIMARY KEY, equity_usd DECIMAL(14,6) NOT NULL, cash_usd DECIMAL(14,6) NOT NULL, bench_btc_usd DECIMAL(14,6) NULL, bench_basket_usd DECIMAL(14,6) NULL)').catch(e => console.error('[migration] agent_equity_points:', e.message));   // #482 hourly points for the page's chart
 await db.execute('CREATE TABLE IF NOT EXISTS agent_equity_daily (d DATE NOT NULL PRIMARY KEY, equity_usd DECIMAL(14,6) NOT NULL, cash_usd DECIMAL(14,6) NOT NULL, bench_btc_usd DECIMAL(14,6) NULL, bench_basket_usd DECIMAL(14,6) NULL, model_cost_usd DECIMAL(14,6) NULL)').catch(e => console.error('[migration] agent_equity_daily:', e.message));
 await db.execute(`CREATE TABLE IF NOT EXISTS agent_alerts (
@@ -20768,7 +20966,9 @@ app.use(express.json());
 // #491 + '/api/app/devices': the app stores its push token (validated, max 10 devices). Nothing else is reachable.
 // #498 + '/api/app/notify': which alerts reach the phone and how loudly. It cannot reach Telegram (which still gets everything),
 // cannot switch "Needs you" off, and every change is reported on Telegram.
-const DASHBOARD_WRITES = ['/api/pause', '/api/resume', '/api/sweep/config', '/api/app/devices', '/api/app/notify'];
+// #502 + '/api/app/inbox/answer' (desk #30, Fable C1-C4): answers a HARMLESS button from the feed - the allow table in appInboxAnswer
+// decides; trade approval, funded buys, payments, capital, trails, spike insurance and the desk stay Telegram-only; every answer is on Telegram.
+const DASHBOARD_WRITES = ['/api/pause', '/api/resume', '/api/sweep/config', '/api/app/devices', '/api/app/notify', '/api/app/inbox/answer'];
 // #351 (from the Dev-342 security review): routes that act or spend even on a GET. They need the FULL key, which is
 // deliberately unset, so they are OFF. /api/test/macro-news resets a rate limit and runs a paid Claude call plus
 // Telegram; /telegram-setup re-registers the webhook. Matched with case and trailing slashes normalised, and for every
@@ -26419,6 +26619,7 @@ async function portfolioSpark(range, nowMs = Date.now()) {
 }
 // #491 the app registers its push token here (dashboard key); GET shows the devices and push stats (never the tokens)
 app.post('/api/app/devices', async (req, res) => { try { const r = await appDeviceRegister(req.body); res.status(r.ok ? 200 : 400).json(r); } catch (e) { res.status(500).json({ error: 'register failed' }); } });
+app.post('/api/app/inbox/answer', async (req, res) => { try { const r = await appInboxAnswer(req.body); res.set('Cache-Control', 'no-store').status(r.status).json(r); } catch (e) { res.status(500).json({ status: 500, error: 'not answered - use Telegram' }); } });   // #502
 app.get('/api/app/inbox', async (req, res) => { try { res.set('Cache-Control', 'no-store').json(await appInboxList(req.query || {})); } catch (e) { res.status(500).json({ error: 'feed unavailable' }); } });   // #500 read-only
 app.get('/api/app/notify', async (req, res) => { try { res.set('Cache-Control', 'no-store').json(await appPushSettingsView()); } catch (e) { res.status(500).json({ error: 'settings unavailable' }); } });   // #498
 app.post('/api/app/notify', async (req, res) => { try { await appPushPrefsSave(req.body); res.set('Cache-Control', 'no-store').json(await appPushSettingsView()); } catch (e) { res.status(500).json({ error: 'not saved' }); } });   // #498
@@ -26525,8 +26726,8 @@ const APP_SHELL_JS = "(function () {\n  'use strict';\n  // #488 the app shell: 
 const APP_ICON_SVG = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 512 512\"><rect width=\"512\" height=\"512\" rx=\"112\" fill=\"#0f1512\"/><rect x=\"24\" y=\"24\" width=\"464\" height=\"464\" rx=\"96\" fill=\"#173a2a\"/><path d=\"M104 360 L200 262 L262 314 L402 170\" fill=\"none\" stroke=\"#6cc497\" stroke-width=\"36\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/><path d=\"M332 166 H406 V240\" fill=\"none\" stroke=\"#6cc497\" stroke-width=\"36\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/><circle cx=\"104\" cy=\"360\" r=\"22\" fill=\"#e6ebe4\"/></svg>";
 const APP_MANIFEST = {"name": "Revolut X", "short_name": "Revolut X", "start_url": "/app", "scope": "/", "display": "standalone", "orientation": "portrait", "background_color": "#0d0d0d", "theme_color": "#0d0d0d", "icons": [{"src": "/app-icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any"}, {"src": "/app-icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "maskable"}]};
 app.get('/app', (req, res) => { res.set('Cache-Control', 'no-store').type('html').send(APP_SHELL_HTML); });
-const INBOX_PAGE_HTML = "<!doctype html>\n<html lang=\"en\"><head>\n<meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">\n<meta name=\"theme-color\" content=\"#0d0d0d\">\n<title>Notifications</title>\n<style>\n:root { --bg:#0d0d0d; --bar:#141414; --card:#1a1a1a; --ink:#e8e8e8; --soft:#8f8f8f; --line:#2a2a2a; --acc:#00ffc8; color-scheme:dark;\n  --c-needs:#ff4d6a; --c-money:#00c896; --c-price:#f5b942; --c-loops:#6aa9ff; --c-agent:#b18cff; --c-reports:#9aa5b6; --c-system:#7c8591; }\n* { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }\nhtml, body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.45 system-ui,-apple-system,\"Segoe UI\",Roboto,sans-serif; }\nheader { position:sticky; top:0; z-index:5; background:var(--bar); border-bottom:1px solid var(--line); padding:calc(8px + env(safe-area-inset-top, 0px)) 12px 8px; }\n.bar { display:flex; align-items:center; gap:10px; }\n.bar h1 { font-size:18px; margin:0; flex:1; }\n.back { border:0; background:none; color:var(--acc); font:600 15px system-ui,sans-serif; padding:6px 2px; }\n.st { font-size:12px; color:var(--soft); }\n.chips { display:flex; gap:6px; overflow-x:auto; padding:8px 0 2px; scrollbar-width:none; }\n.chips::-webkit-scrollbar { display:none; }\n.chip { flex:none; border:1px solid var(--line); background:none; color:var(--soft); border-radius:999px; padding:6px 12px; font:600 13px system-ui,sans-serif; }\n.chip[aria-pressed=\"true\"] { background:var(--acc); border-color:var(--acc); color:var(--bg); }\nmain { padding:10px 12px calc(20px + env(safe-area-inset-bottom, 0px)); max-width:680px; margin:0 auto; }\n.older { display:block; margin:4px auto 12px; border:1px solid var(--line); background:none; color:var(--acc); border-radius:999px; padding:7px 16px; font:600 13px system-ui,sans-serif; }\n.day { text-align:center; margin:16px 0 10px; }\n.day span { font-size:12px; color:var(--soft); background:var(--bar); border:1px solid var(--line); border-radius:999px; padding:3px 10px; }\n.msg { background:var(--card); border:1px solid var(--line); border-left:3px solid var(--c); border-radius:4px 14px 14px 14px; padding:10px 12px; margin:0 0 10px; }\n.msg { transition:box-shadow .3s; } .msg.hl { box-shadow:0 0 0 2px var(--acc); }   /* #501 the message a notification opened */\n.meta { display:flex; align-items:center; gap:8px; font-size:12px; color:var(--soft); margin-bottom:4px; }\n.meta .tag { color:var(--c); font-weight:700; letter-spacing:.02em; }\n.meta time { margin-left:auto; font-variant-numeric:tabular-nums; }\n.body { white-space:pre-wrap; overflow-wrap:anywhere; }\n.body a { color:var(--acc); }\n.body pre, .body code { font:13px/1.4 ui-monospace,Menlo,Consolas,monospace; white-space:pre-wrap; }\n.body blockquote { margin:4px 0; padding-left:8px; border-left:2px solid var(--line); color:var(--soft); }\n.kb { display:flex; flex-direction:column; gap:6px; margin-top:10px; }\n.kbrow { display:flex; gap:6px; }\n.kbrow button { flex:1; min-width:0; border:1px solid var(--line); background:#222; color:var(--ink); border-radius:10px; padding:9px 6px; font:600 13px system-ui,sans-serif; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }\n.foot { display:flex; justify-content:flex-end; margin-top:8px; }\n.open { border:0; background:none; color:var(--acc); font:600 13px system-ui,sans-serif; padding:4px 0; }\n.empty, .err { text-align:center; color:var(--soft); margin:40px 16px; }\n.err { color:var(--c-needs); }\n.newpill { position:fixed; left:50%; transform:translateX(-50%); bottom:calc(16px + env(safe-area-inset-bottom, 0px)); z-index:6; border:0; background:var(--acc); color:var(--bg); border-radius:999px; padding:9px 16px; font:700 13px system-ui,sans-serif; box-shadow:0 4px 16px rgba(0,0,0,.5); }\n.sheet { position:fixed; inset:0; z-index:10; }\n.sheet .shade { position:absolute; inset:0; background:rgba(0,0,0,.6); }\n.sheet .panel { position:absolute; left:0; right:0; bottom:0; background:var(--bar); border-top:1px solid var(--line); border-radius:16px 16px 0 0; padding:18px 16px calc(18px + env(safe-area-inset-bottom, 0px)); }\n.sheet h2 { font-size:17px; margin:0 0 6px; }\n.sheet p { color:var(--soft); margin:0 0 14px; font-size:14px; }\n.sheet .row { display:flex; gap:10px; flex-wrap:wrap; }\n.btn { display:inline-block; text-align:center; text-decoration:none; font:600 15px system-ui,sans-serif; padding:11px 18px; border-radius:12px; border:0; background:var(--acc); color:var(--bg); }\n.btn.ghost { background:none; color:var(--acc); border:1px solid var(--line); }\n</style></head>\n<body>\n<header>\n  <div class=\"bar\"><button class=\"back\" id=\"back\" type=\"button\">&lsaquo; Back</button><h1>Notifications</h1><span class=\"st\" id=\"st\"></span></div>\n  <div class=\"chips\" id=\"chips\" role=\"toolbar\" aria-label=\"Filter by category\"></div>\n</header>\n<main>\n  <button class=\"older\" id=\"older\" type=\"button\" hidden>Show older</button>\n  <div id=\"list\"></div>\n  <p class=\"empty\" id=\"empty\" hidden></p>\n</main>\n<button class=\"newpill\" id=\"newpill\" type=\"button\" hidden>New messages &darr;</button>\n<div class=\"sheet\" id=\"sheet\" hidden><div class=\"shade\" id=\"shade\"></div><div class=\"panel\" role=\"dialog\" aria-modal=\"true\" aria-labelledby=\"shT\">\n  <h2 id=\"shT\"></h2><p id=\"shP\"></p>\n  <div class=\"row\"><a class=\"btn\" id=\"shTg\" href=\"#\" rel=\"noopener noreferrer\">Open Telegram</a><button class=\"btn ghost\" id=\"shX\" type=\"button\">Close</button></div>\n</div></div>\n<script src=\"/inbox-page.js\"></script>\n</body></html>\n";   // #500 the notifications feed
-const INBOX_PAGE_JS = "(function () {\n  'use strict';\n  // #500 the notifications feed: every alert as a chat, oldest at the top, newest at the bottom; filter by category;\n  // each one's buttons (answered in Telegram for now) and a link to where it belongs in the dashboard.\n  var $ = function (id) { return document.getElementById(id); };\n  var SEEN = 'rx_inbox_seen';\n  var inApp = (function () { try { return window.parent !== window && !!(window.parent.rxApp && window.parent.rxApp.show); } catch (e) { return false; } })();\n  var cats = [], catName = {}, cur = '', firstId = null, lastId = 0, bot = '', busy = false, byId = {};\n  function esc(s) { return String(s == null ? '' : s).replace(/[&<>\"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;' }[c]; }); }\n  function get(q) {\n    return fetch('/api/app/inbox?' + q + (cur ? '&cat=' + cur : ''), { cache: 'no-store' }).then(function (r) {\n      if (!r.ok) throw new Error(r.status === 401 ? 'The server did not accept the dashboard key.' : 'The server answered ' + r.status + '.');\n      return r.json();\n    });\n  }\n  var LON = { timeZone: 'Europe/London' };\n  function dayKey(ts) { return new Date(ts * 1000).toLocaleDateString('en-GB', LON); }\n  function dayLabel(ts) {\n    var k = dayKey(ts), now = Math.floor(Date.now() / 1000);\n    if (k === dayKey(now)) return 'Today';\n    if (k === dayKey(now - 86400)) return 'Yesterday';\n    return new Date(ts * 1000).toLocaleDateString('en-GB', { timeZone: 'Europe/London', weekday: 'short', day: 'numeric', month: 'short' });\n  }\n  function hhmm(ts) { return new Date(ts * 1000).toLocaleTimeString('en-GB', { timeZone: 'Europe/London', hour: '2-digit', minute: '2-digit' }); }\n  function openLabel(it) {\n    if (it.coin) return 'Open ' + it.coin + ' ›';\n    return ({ portfolio: 'Open chart ›', agent: 'Open agent ›', desk: 'Open desk ›' })[it.tab] || 'Open dashboard ›';\n  }\n  function card(it) {\n    byId[it.id] = it;\n    var kb = (it.buttons || []).map(function (row, r) {\n      return '<div class=\"kbrow\">' + row.map(function (b, c) { return '<button type=\"button\" data-id=\"' + it.id + '\" data-r=\"' + r + '\" data-c=\"' + c + '\">' + esc(b.t) + '</button>'; }).join('') + '</div>';\n    }).join('');\n    var quiet = /^off/.test(it.push) ? ' · not sent to phone' : '';\n    return '<article class=\"msg\" id=\"m' + it.id + '\" data-day=\"' + esc(dayKey(it.ts)) + '\" style=\"--c:var(--c-' + esc(it.cat) + ', var(--soft))\">' +\n      '<div class=\"meta\"><span class=\"tag\">' + esc(catName[it.cat] || it.cat) + '</span><span>' + quiet + '</span><time>' + hhmm(it.ts) + '</time></div>' +\n      '<div class=\"body\">' + it.html + '</div>' + (kb ? '<div class=\"kb\">' + kb + '</div>' : '') +\n      '<div class=\"foot\"><button class=\"open\" type=\"button\" data-open=\"' + it.id + '\">' + esc(openLabel(it)) + '</button></div></article>';\n  }\n  // day separators are drawn between cards whose London day differs (and above the first one)\n  function withDays(items, prevDay) {\n    var h = '';\n    items.forEach(function (it) { var d = dayKey(it.ts); if (d !== prevDay) { h += '<div class=\"day\" data-sep=\"' + esc(d) + '\"><span>' + esc(dayLabel(it.ts)) + '</span></div>'; prevDay = d; } h += card(it); });\n    return h;\n  }\n  function atBottom() { return window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 80; }\n  function toBottom() { window.scrollTo(0, document.documentElement.scrollHeight); $('newpill').hidden = true; markSeen(); }\n  function markSeen() {\n    if (cur || !lastId) return;   // only the unfiltered feed counts as read\n    try { var s = parseInt(localStorage.getItem(SEEN) || '0', 10) || 0; if (lastId > s) localStorage.setItem(SEEN, String(lastId)); } catch (e) {}\n  }\n  function lastDay() { var a = $('list').querySelectorAll('.msg'); return a.length ? a[a.length - 1].getAttribute('data-day') : null; }\n  function load() {\n    busy = true; $('st').textContent = 'Loading…'; byId = {};\n    get('limit=40').then(function (j) {\n      bot = j.bot || ''; setCats(j.cats || []);\n      $('list').innerHTML = withDays(j.items, null);\n      firstId = j.items.length ? j.items[0].id : null; lastId = j.items.length ? j.items[j.items.length - 1].id : (cur ? 0 : j.latest_id);\n      $('older').hidden = !j.more;\n      $('empty').hidden = !!j.items.length;\n      $('empty').textContent = cur ? 'Nothing in ' + (catName[cur] || cur) + ' yet.' : 'No notifications yet. From now on every alert lands here as well as in Telegram (kept ' + (j.keep_days || 60) + ' days).';\n      $('st').textContent = ''; busy = false; if (focusId) focusOn(); else toBottom();   // #501\n    }).catch(function (e) { busy = false; $('st').textContent = ''; $('list').innerHTML = '<p class=\"err\">' + esc(e.message) + '</p>'; });\n  }\n  // #501 a phone notification opens the feed at its own message: /inbox#m=ID, or the shell calls rxInboxFocus(id)\n  var focusId = (function () { var m = /[#&]m=(\\d{1,15})/.exec(location.hash); return m ? +m[1] : 0; })();\n  function focusOn() {\n    var id = focusId; if (!id) return;\n    var el = document.getElementById('m' + id);\n    if (el) { focusId = 0; el.scrollIntoView({ block: 'center' }); el.classList.add('hl'); setTimeout(function () { el.classList.remove('hl'); }, 2600); markSeen(); return; }\n    if (firstId != null && id < firstId) { around(id); return; }\n    if (id > lastId) { poll(true); return; }   // newer than the page: fetch it, then focus\n    focusId = 0; toBottom();                    // not in the feed any more\n  }\n  function around(id) {   // a message older than the page: load the page that ends with it, then everything after it\n    busy = true; byId = {};\n    get('before=' + (id + 1) + '&limit=40').then(function (j) {\n      $('list').innerHTML = withDays(j.items, null);\n      firstId = j.items.length ? j.items[0].id : null; if (j.items.length) lastId = j.items[j.items.length - 1].id;\n      $('older').hidden = !j.more; $('empty').hidden = true;\n      return get('after=' + lastId + '&limit=100');\n    }).then(function (j) {\n      busy = false;\n      if (j && j.items.length) { $('list').insertAdjacentHTML('beforeend', withDays(j.items, lastDay())); lastId = j.items[j.items.length - 1].id; }\n      if (document.getElementById('m' + id)) focusOn(); else { focusId = 0; toBottom(); }\n    }).catch(function () { busy = false; focusId = 0; });\n  }\n  window.rxInboxFocus = function (id) {\n    id = parseInt(id, 10); if (!(id > 0)) return;\n    focusId = id;\n    if (cur) { cur = ''; [].forEach.call($('chips').querySelectorAll('.chip'), function (x) { x.setAttribute('aria-pressed', x.getAttribute('data-cat') === '' ? 'true' : 'false'); }); load(); return; }\n    if (!busy) focusOn();\n  };\n  function older() {\n    if (busy || firstId == null) return; busy = true; $('older').textContent = 'Loading…';\n    var h0 = document.documentElement.scrollHeight, y0 = window.scrollY;\n    get('before=' + firstId + '&limit=40').then(function (j) {\n      if (j.items.length) {\n        var first = $('list').querySelector('.day');   // the old top separator is redrawn by the new block if it is the same day\n        var html = withDays(j.items, null);\n        if (first && first.getAttribute('data-sep') === dayKey(j.items[j.items.length - 1].ts)) first.remove();\n        $('list').insertAdjacentHTML('afterbegin', html);\n        firstId = j.items[0].id;\n        window.scrollTo(0, y0 + document.documentElement.scrollHeight - h0);\n      }\n      $('older').hidden = !j.more; $('older').textContent = 'Show older'; busy = false;\n    }).catch(function () { $('older').textContent = 'Show older'; busy = false; });\n  }\n  function poll(force) {\n    if (busy || (document.hidden && !force)) return;\n    get('after=' + lastId + '&limit=100').then(function (j) {\n      if (!j.items.length) { if (force && focusId) { focusId = 0; toBottom(); } return; }\n      var stay = atBottom();\n      $('list').insertAdjacentHTML('beforeend', withDays(j.items, lastDay()));\n      lastId = j.items[j.items.length - 1].id; $('empty').hidden = true;\n      if (focusId) { if (document.getElementById('m' + focusId)) focusOn(); else { focusId = 0; toBottom(); } }   // #501\n      else if (stay) toBottom(); else $('newpill').hidden = false;\n    }).catch(function () {});\n  }\n  function setCats(list) {\n    if (cats.length || !list.length) return;\n    cats = list; list.forEach(function (c) { catName[c.id] = c.name; });\n    $('chips').innerHTML = '<button class=\"chip\" type=\"button\" data-cat=\"\" aria-pressed=\"true\">All</button>' +\n      list.map(function (c) { return '<button class=\"chip\" type=\"button\" data-cat=\"' + esc(c.id) + '\" aria-pressed=\"false\">' + esc(c.name) + '</button>'; }).join('');\n  }\n  function openIn(it) {\n    try { if (inApp) { window.parent.rxApp.open({ tab: it.tab || 'home', coin: it.coin || '' }); return; } } catch (e) {}\n    location.href = it.coin ? '/#coin=' + encodeURIComponent(it.coin) : ({ portfolio: '/portfolio', agent: '/agent', desk: '/desk' })[it.tab] || '/';\n  }\n  function sheet(label) {\n    $('shT').textContent = '“' + label + '” is answered in Telegram';\n    $('shP').textContent = bot ? 'For now the buttons work in Telegram: the same message is there with the same buttons. Answering from the app comes later.' : 'For now the buttons work in Telegram: the same message is there with the same buttons.';\n    var a = $('shTg');\n    if (bot) { a.href = 'https://t.me/' + bot; a.target = inApp ? '_top' : '_blank'; a.hidden = false; } else a.hidden = true;\n    $('sheet').hidden = false;\n  }\n  $('chips').addEventListener('click', function (e) {\n    var b = e.target.closest('button[data-cat]'); if (!b) return;\n    cur = b.getAttribute('data-cat');\n    [].forEach.call($('chips').querySelectorAll('.chip'), function (x) { x.setAttribute('aria-pressed', x === b ? 'true' : 'false'); });\n    load();\n  });\n  $('list').addEventListener('click', function (e) {\n    var o = e.target.closest('button[data-open]');\n    if (o) { var it = byId[o.getAttribute('data-open')]; if (it) openIn(it); return; }\n    var b = e.target.closest('button[data-id]'); if (!b) return;\n    var m = byId[b.getAttribute('data-id')], btn = m && m.buttons[+b.getAttribute('data-r')] && m.buttons[+b.getAttribute('data-r')][+b.getAttribute('data-c')];\n    if (!btn) return;\n    if (btn.u) { window.open(btn.u, '_blank', 'noopener'); return; }\n    sheet(btn.t);\n  });\n  $('older').addEventListener('click', older);\n  $('newpill').addEventListener('click', toBottom);\n  $('shX').addEventListener('click', function () { $('sheet').hidden = true; });\n  $('shade').addEventListener('click', function () { $('sheet').hidden = true; });\n  $('back').addEventListener('click', function () {\n    try { if (inApp) { window.parent.rxApp.show('home'); return; } } catch (e) {}\n    if (history.length > 1) history.back(); else location.href = '/';\n  });\n  window.addEventListener('scroll', function () { if (atBottom()) { $('newpill').hidden = true; markSeen(); } }, { passive: true });\n  document.addEventListener('visibilitychange', function () { if (!document.hidden) poll(false); });\n  load();\n  setInterval(function () { poll(false); }, 20000);\n})();\n";
+const INBOX_PAGE_HTML = "<!doctype html>\n<html lang=\"en\"><head>\n<meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">\n<meta name=\"theme-color\" content=\"#0d0d0d\">\n<title>Notifications</title>\n<style>\n:root { --bg:#0d0d0d; --bar:#141414; --card:#1a1a1a; --ink:#e8e8e8; --soft:#8f8f8f; --line:#2a2a2a; --acc:#00ffc8; color-scheme:dark;\n  --c-needs:#ff4d6a; --c-money:#00c896; --c-price:#f5b942; --c-loops:#6aa9ff; --c-agent:#b18cff; --c-reports:#9aa5b6; --c-system:#7c8591; }\n* { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }\nhtml, body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.45 system-ui,-apple-system,\"Segoe UI\",Roboto,sans-serif; }\nheader { position:sticky; top:0; z-index:5; background:var(--bar); border-bottom:1px solid var(--line); padding:calc(8px + env(safe-area-inset-top, 0px)) 12px 8px; }\n.bar { display:flex; align-items:center; gap:10px; }\n.bar h1 { font-size:18px; margin:0; flex:1; }\n.back { border:0; background:none; color:var(--acc); font:600 15px system-ui,sans-serif; padding:6px 2px; }\n.st { font-size:12px; color:var(--soft); }\n.chips { display:flex; gap:6px; overflow-x:auto; padding:8px 0 2px; scrollbar-width:none; }\n.chips::-webkit-scrollbar { display:none; }\n.chip { flex:none; border:1px solid var(--line); background:none; color:var(--soft); border-radius:999px; padding:6px 12px; font:600 13px system-ui,sans-serif; }\n.chip[aria-pressed=\"true\"] { background:var(--acc); border-color:var(--acc); color:var(--bg); }\nmain { padding:10px 12px calc(20px + env(safe-area-inset-bottom, 0px)); max-width:680px; margin:0 auto; }\n.older { display:block; margin:4px auto 12px; border:1px solid var(--line); background:none; color:var(--acc); border-radius:999px; padding:7px 16px; font:600 13px system-ui,sans-serif; }\n.day { text-align:center; margin:16px 0 10px; }\n.day span { font-size:12px; color:var(--soft); background:var(--bar); border:1px solid var(--line); border-radius:999px; padding:3px 10px; }\n.msg { background:var(--card); border:1px solid var(--line); border-left:3px solid var(--c); border-radius:4px 14px 14px 14px; padding:10px 12px; margin:0 0 10px; }\n.msg { transition:box-shadow .3s; } .msg.hl { box-shadow:0 0 0 2px var(--acc); }   /* #501 the message a notification opened */\n.meta { display:flex; align-items:center; gap:8px; font-size:12px; color:var(--soft); margin-bottom:4px; }\n.meta .tag { color:var(--c); font-weight:700; letter-spacing:.02em; }\n.meta time { margin-left:auto; font-variant-numeric:tabular-nums; }\n.body { white-space:pre-wrap; overflow-wrap:anywhere; }\n.body a { color:var(--acc); }\n.body pre, .body code { font:13px/1.4 ui-monospace,Menlo,Consolas,monospace; white-space:pre-wrap; }\n.body blockquote { margin:4px 0; padding-left:8px; border-left:2px solid var(--line); color:var(--soft); }\n.kb { display:flex; flex-direction:column; gap:6px; margin-top:10px; }\n.kbrow { display:flex; gap:6px; }\n.kbrow button { flex:1; min-width:0; border:1px solid var(--line); background:#222; color:var(--ink); border-radius:10px; padding:9px 6px; font:600 13px system-ui,sans-serif; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }\n.kbrow button.ok { border-color:var(--acc); color:var(--acc); }   /* #502 answerable here */\n.kbrow button.tg { color:var(--soft); }\n.kbrow button.sel { background:var(--acc); border-color:var(--acc); color:var(--bg); opacity:1; }\n.kb.done button:not(.sel) { opacity:.4; }\n.ans { margin-top:8px; font-size:13px; color:var(--acc); }\n.ans.bad { color:var(--c-needs); }\n.foot { display:flex; justify-content:flex-end; margin-top:8px; }\n.open { border:0; background:none; color:var(--acc); font:600 13px system-ui,sans-serif; padding:4px 0; }\n.empty, .err { text-align:center; color:var(--soft); margin:40px 16px; }\n.err { color:var(--c-needs); }\n.newpill { position:fixed; left:50%; transform:translateX(-50%); bottom:calc(16px + env(safe-area-inset-bottom, 0px)); z-index:6; border:0; background:var(--acc); color:var(--bg); border-radius:999px; padding:9px 16px; font:700 13px system-ui,sans-serif; box-shadow:0 4px 16px rgba(0,0,0,.5); }\n.sheet { position:fixed; inset:0; z-index:10; }\n.sheet .shade { position:absolute; inset:0; background:rgba(0,0,0,.6); }\n.sheet .panel { position:absolute; left:0; right:0; bottom:0; background:var(--bar); border-top:1px solid var(--line); border-radius:16px 16px 0 0; padding:18px 16px calc(18px + env(safe-area-inset-bottom, 0px)); }\n.sheet h2 { font-size:17px; margin:0 0 6px; }\n.sheet p { color:var(--soft); margin:0 0 14px; font-size:14px; }\n.sheet .row { display:flex; gap:10px; flex-wrap:wrap; }\n.btn { display:inline-block; text-align:center; text-decoration:none; font:600 15px system-ui,sans-serif; padding:11px 18px; border-radius:12px; border:0; background:var(--acc); color:var(--bg); }\n.btn.ghost { background:none; color:var(--acc); border:1px solid var(--line); }\n</style></head>\n<body>\n<header>\n  <div class=\"bar\"><button class=\"back\" id=\"back\" type=\"button\">&lsaquo; Back</button><h1>Notifications</h1><span class=\"st\" id=\"st\"></span></div>\n  <div class=\"chips\" id=\"chips\" role=\"toolbar\" aria-label=\"Filter by category\"></div>\n</header>\n<main>\n  <button class=\"older\" id=\"older\" type=\"button\" hidden>Show older</button>\n  <div id=\"list\"></div>\n  <p class=\"empty\" id=\"empty\" hidden></p>\n</main>\n<button class=\"newpill\" id=\"newpill\" type=\"button\" hidden>New messages &darr;</button>\n<div class=\"sheet\" id=\"sheet\" hidden><div class=\"shade\" id=\"shade\"></div><div class=\"panel\" role=\"dialog\" aria-modal=\"true\" aria-labelledby=\"shT\">\n  <h2 id=\"shT\"></h2><p id=\"shP\"></p>\n  <div class=\"row\"><a class=\"btn\" id=\"shTg\" href=\"#\" rel=\"noopener noreferrer\">Open Telegram</a><button class=\"btn ghost\" id=\"shX\" type=\"button\">Close</button></div>\n</div></div>\n<script src=\"/inbox-page.js\"></script>\n</body></html>\n";   // #500 the notifications feed
+const INBOX_PAGE_JS = "(function () {\n  'use strict';\n  // #500 the notifications feed: every alert as a chat, oldest at the top, newest at the bottom; filter by category;\n  // each one's buttons (answered in Telegram for now) and a link to where it belongs in the dashboard.\n  var $ = function (id) { return document.getElementById(id); };\n  var SEEN = 'rx_inbox_seen';\n  var inApp = (function () { try { return window.parent !== window && !!(window.parent.rxApp && window.parent.rxApp.show); } catch (e) { return false; } })();\n  var cats = [], catName = {}, cur = '', firstId = null, lastId = 0, bot = '', busy = false, byId = {};\n  function esc(s) { return String(s == null ? '' : s).replace(/[&<>\"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;' }[c]; }); }\n  function get(q) {\n    return fetch('/api/app/inbox?' + q + (cur ? '&cat=' + cur : ''), { cache: 'no-store' }).then(function (r) {\n      if (!r.ok) throw new Error(r.status === 401 ? 'The server did not accept the dashboard key.' : 'The server answered ' + r.status + '.');\n      return r.json();\n    });\n  }\n  var LON = { timeZone: 'Europe/London' };\n  function dayKey(ts) { return new Date(ts * 1000).toLocaleDateString('en-GB', LON); }\n  function dayLabel(ts) {\n    var k = dayKey(ts), now = Math.floor(Date.now() / 1000);\n    if (k === dayKey(now)) return 'Today';\n    if (k === dayKey(now - 86400)) return 'Yesterday';\n    return new Date(ts * 1000).toLocaleDateString('en-GB', { timeZone: 'Europe/London', weekday: 'short', day: 'numeric', month: 'short' });\n  }\n  function hhmm(ts) { return new Date(ts * 1000).toLocaleTimeString('en-GB', { timeZone: 'Europe/London', hour: '2-digit', minute: '2-digit' }); }\n  function ansText(a) {\n    if (a.result === 'done' || a.result === 'pending') return '\\u2713 Answered here: ' + a.label;\n    if (a.result === 'resolved') return 'Already resolved \\u2013 nothing changed.';\n    if (a.result === 'superseded') return 'A newer alert replaced this one \\u2013 use that.';\n    return '\\u26a0 Did not go through here \\u2013 answer it in Telegram.';\n  }\n  function openLabel(it) {\n    if (it.coin) return 'Open ' + it.coin + ' ›';\n    return ({ portfolio: 'Open chart ›', agent: 'Open agent ›', desk: 'Open desk ›' })[it.tab] || 'Open dashboard ›';\n  }\n  function card(it) {\n    byId[it.id] = it;\n    var ans = it.answer;   // #502 answered here: that button filled, the rest greyed; answerable ones outlined; the rest open Telegram\n    var kb = (it.buttons || []).map(function (row, r) {\n      return '<div class=\"kbrow\">' + row.map(function (b, c) {\n        var cls = ans ? (ans.r === b.r && ans.c === b.c ? 'sel' : '') : (b.a ? 'ok' : (b.u ? '' : 'tg'));\n        return '<button type=\"button\" class=\"' + cls + '\" data-id=\"' + it.id + '\" data-r=\"' + r + '\" data-c=\"' + c + '\"' + (ans ? ' disabled' : '') + '>' + esc(b.t) + (!ans && !b.a && !b.u ? ' \\u2197' : '') + '</button>';\n      }).join('') + '</div>';\n    }).join('');\n    var ansLine = ans ? '<div class=\"ans' + (ans.result === 'done' || ans.result === 'pending' ? '' : ' bad') + '\">' + esc(ansText(ans)) + '</div>' : '';\n    var quiet = /^off/.test(it.push) ? ' · not sent to phone' : '';\n    return '<article class=\"msg\" id=\"m' + it.id + '\" data-day=\"' + esc(dayKey(it.ts)) + '\" style=\"--c:var(--c-' + esc(it.cat) + ', var(--soft))\">' +\n      '<div class=\"meta\"><span class=\"tag\">' + esc(catName[it.cat] || it.cat) + '</span><span>' + quiet + '</span><time>' + hhmm(it.ts) + '</time></div>' +\n      '<div class=\"body\">' + it.html + '</div>' + (kb ? '<div class=\"kb' + (ans ? ' done' : '') + '\">' + kb + '</div>' : '') + ansLine +\n      '<div class=\"foot\"><button class=\"open\" type=\"button\" data-open=\"' + it.id + '\">' + esc(openLabel(it)) + '</button></div></article>';\n  }\n  // day separators are drawn between cards whose London day differs (and above the first one)\n  function withDays(items, prevDay) {\n    var h = '';\n    items.forEach(function (it) { var d = dayKey(it.ts); if (d !== prevDay) { h += '<div class=\"day\" data-sep=\"' + esc(d) + '\"><span>' + esc(dayLabel(it.ts)) + '</span></div>'; prevDay = d; } h += card(it); });\n    return h;\n  }\n  function atBottom() { return window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 80; }\n  function toBottom() { window.scrollTo(0, document.documentElement.scrollHeight); $('newpill').hidden = true; markSeen(); }\n  function markSeen() {\n    if (cur || !lastId) return;   // only the unfiltered feed counts as read\n    try { var s = parseInt(localStorage.getItem(SEEN) || '0', 10) || 0; if (lastId > s) localStorage.setItem(SEEN, String(lastId)); } catch (e) {}\n  }\n  function lastDay() { var a = $('list').querySelectorAll('.msg'); return a.length ? a[a.length - 1].getAttribute('data-day') : null; }\n  function load() {\n    busy = true; $('st').textContent = 'Loading…'; byId = {};\n    get('limit=40').then(function (j) {\n      bot = j.bot || ''; setCats(j.cats || []);\n      $('list').innerHTML = withDays(j.items, null);\n      firstId = j.items.length ? j.items[0].id : null; lastId = j.items.length ? j.items[j.items.length - 1].id : (cur ? 0 : j.latest_id);\n      $('older').hidden = !j.more;\n      $('empty').hidden = !!j.items.length;\n      $('empty').textContent = cur ? 'Nothing in ' + (catName[cur] || cur) + ' yet.' : 'No notifications yet. From now on every alert lands here as well as in Telegram (kept ' + (j.keep_days || 60) + ' days).';\n      $('st').textContent = ''; busy = false; if (focusId) focusOn(); else toBottom();   // #501\n    }).catch(function (e) { busy = false; $('st').textContent = ''; $('list').innerHTML = '<p class=\"err\">' + esc(e.message) + '</p>'; });\n  }\n  // #501 a phone notification opens the feed at its own message: /inbox#m=ID, or the shell calls rxInboxFocus(id)\n  var focusId = (function () { var m = /[#&]m=(\\d{1,15})/.exec(location.hash); return m ? +m[1] : 0; })();\n  function focusOn() {\n    var id = focusId; if (!id) return;\n    var el = document.getElementById('m' + id);\n    if (el) { focusId = 0; el.scrollIntoView({ block: 'center' }); el.classList.add('hl'); setTimeout(function () { el.classList.remove('hl'); }, 2600); markSeen(); return; }\n    if (firstId != null && id < firstId) { around(id); return; }\n    if (id > lastId) { poll(true); return; }   // newer than the page: fetch it, then focus\n    focusId = 0; toBottom();                    // not in the feed any more\n  }\n  function around(id) {   // a message older than the page: load the page that ends with it, then everything after it\n    busy = true; byId = {};\n    get('before=' + (id + 1) + '&limit=40').then(function (j) {\n      $('list').innerHTML = withDays(j.items, null);\n      firstId = j.items.length ? j.items[0].id : null; if (j.items.length) lastId = j.items[j.items.length - 1].id;\n      $('older').hidden = !j.more; $('empty').hidden = true;\n      return get('after=' + lastId + '&limit=100');\n    }).then(function (j) {\n      busy = false;\n      if (j && j.items.length) { $('list').insertAdjacentHTML('beforeend', withDays(j.items, lastDay())); lastId = j.items[j.items.length - 1].id; }\n      if (document.getElementById('m' + id)) focusOn(); else { focusId = 0; toBottom(); }\n    }).catch(function () { busy = false; focusId = 0; });\n  }\n  window.rxInboxFocus = function (id) {\n    id = parseInt(id, 10); if (!(id > 0)) return;\n    focusId = id;\n    if (cur) { cur = ''; [].forEach.call($('chips').querySelectorAll('.chip'), function (x) { x.setAttribute('aria-pressed', x.getAttribute('data-cat') === '' ? 'true' : 'false'); }); load(); return; }\n    if (!busy) focusOn();\n  };\n  function older() {\n    if (busy || firstId == null) return; busy = true; $('older').textContent = 'Loading…';\n    var h0 = document.documentElement.scrollHeight, y0 = window.scrollY;\n    get('before=' + firstId + '&limit=40').then(function (j) {\n      if (j.items.length) {\n        var first = $('list').querySelector('.day');   // the old top separator is redrawn by the new block if it is the same day\n        var html = withDays(j.items, null);\n        if (first && first.getAttribute('data-sep') === dayKey(j.items[j.items.length - 1].ts)) first.remove();\n        $('list').insertAdjacentHTML('afterbegin', html);\n        firstId = j.items[0].id;\n        window.scrollTo(0, y0 + document.documentElement.scrollHeight - h0);\n      }\n      $('older').hidden = !j.more; $('older').textContent = 'Show older'; busy = false;\n    }).catch(function () { $('older').textContent = 'Show older'; busy = false; });\n  }\n  function poll(force) {\n    if (busy || (document.hidden && !force)) return;\n    get('after=' + lastId + '&limit=100').then(function (j) {\n      if (!j.items.length) { if (force && focusId) { focusId = 0; toBottom(); } return; }\n      var stay = atBottom();\n      $('list').insertAdjacentHTML('beforeend', withDays(j.items, lastDay()));\n      lastId = j.items[j.items.length - 1].id; $('empty').hidden = true;\n      if (focusId) { if (document.getElementById('m' + focusId)) focusOn(); else { focusId = 0; toBottom(); } }   // #501\n      else if (stay) toBottom(); else $('newpill').hidden = false;\n    }).catch(function () {});\n  }\n  function setCats(list) {\n    if (cats.length || !list.length) return;\n    cats = list; list.forEach(function (c) { catName[c.id] = c.name; });\n    $('chips').innerHTML = '<button class=\"chip\" type=\"button\" data-cat=\"\" aria-pressed=\"true\">All</button>' +\n      list.map(function (c) { return '<button class=\"chip\" type=\"button\" data-cat=\"' + esc(c.id) + '\" aria-pressed=\"false\">' + esc(c.name) + '</button>'; }).join('');\n  }\n  function openIn(it) {\n    try { if (inApp) { window.parent.rxApp.open({ tab: it.tab || 'home', coin: it.coin || '' }); return; } } catch (e) {}\n    location.href = it.coin ? '/#coin=' + encodeURIComponent(it.coin) : ({ portfolio: '/portfolio', agent: '/agent', desk: '/desk' })[it.tab] || '/';\n  }\n  // #502 answer a harmless button here: the server checks it again, runs it, and posts the reply (it arrives as a new message)\n  function answer(m, btn, el) {\n    var card = el.closest('.msg'); [].forEach.call(card.querySelectorAll('.kbrow button'), function (x) { x.disabled = true; });\n    el.textContent = btn.t + ' \\u2026';\n    fetch('/api/app/inbox/answer', { method: 'POST', cache: 'no-store', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: m.id, r: btn.r, c: btn.c }) })\n      .then(function (r) { return r.json().catch(function () { return { status: r.status }; }).then(function (j) { j.http = r.status; return j; }); })\n      .then(function (j) {\n        if (j.http === 200) { m.answer = { r: btn.r, c: btn.c, label: btn.t, result: j.result || 'done' }; }\n        else if (j.http === 409) { m.answer = { r: btn.r, c: btn.c, label: btn.t, result: 'resolved' }; }\n        else { rerender(m); sheet(btn.t, j.error || ('The server answered ' + j.http + '.')); return; }\n        rerender(m); setTimeout(function () { poll(false); }, 1500);\n      })\n      .catch(function () { rerender(m); sheet(btn.t, 'No connection to the server.'); });\n  }\n  function rerender(m) { var el = document.getElementById('m' + m.id); if (el) el.outerHTML = card(m); }\n  function sheet(label, why) {\n    $('shT').textContent = '“' + label + '” is answered in Telegram';\n    $('shP').textContent = why || 'This button can move money or change a trade record, so it only works in Telegram. The same message is there with the same buttons.';   // #502\n    var a = $('shTg');\n    if (bot) { a.href = 'https://t.me/' + bot; a.target = inApp ? '_top' : '_blank'; a.hidden = false; } else a.hidden = true;\n    $('sheet').hidden = false;\n  }\n  $('chips').addEventListener('click', function (e) {\n    var b = e.target.closest('button[data-cat]'); if (!b) return;\n    cur = b.getAttribute('data-cat');\n    [].forEach.call($('chips').querySelectorAll('.chip'), function (x) { x.setAttribute('aria-pressed', x === b ? 'true' : 'false'); });\n    load();\n  });\n  $('list').addEventListener('click', function (e) {\n    var o = e.target.closest('button[data-open]');\n    if (o) { var it = byId[o.getAttribute('data-open')]; if (it) openIn(it); return; }\n    var b = e.target.closest('button[data-id]'); if (!b) return;\n    var m = byId[b.getAttribute('data-id')], btn = m && m.buttons[+b.getAttribute('data-r')] && m.buttons[+b.getAttribute('data-r')][+b.getAttribute('data-c')];\n    if (!btn) return;\n    if (btn.u) { window.open(btn.u, '_blank', 'noopener'); return; }\n    if (!btn.a || m.answer) { sheet(btn.t); return; }\n    answer(m, btn, b);   // #502\n  });\n  $('older').addEventListener('click', older);\n  $('newpill').addEventListener('click', toBottom);\n  $('shX').addEventListener('click', function () { $('sheet').hidden = true; });\n  $('shade').addEventListener('click', function () { $('sheet').hidden = true; });\n  $('back').addEventListener('click', function () {\n    try { if (inApp) { window.parent.rxApp.show('home'); return; } } catch (e) {}\n    if (history.length > 1) history.back(); else location.href = '/';\n  });\n  window.addEventListener('scroll', function () { if (atBottom()) { $('newpill').hidden = true; markSeen(); } }, { passive: true });\n  document.addEventListener('visibilitychange', function () { if (!document.hidden) poll(false); });\n  load();\n  setInterval(function () { poll(false); }, 20000);\n})();\n";
 app.get('/inbox', (req, res) => { res.set('Cache-Control', 'no-store').type('html').send(INBOX_PAGE_HTML.replace('<head>', '<head>\n<script src="/dashboard-auth.js"></script>')); });
 app.get('/inbox-page.js', (req, res) => { res.set('Cache-Control', 'no-store').type('application/javascript').send(INBOX_PAGE_JS); });
 app.get('/app-shell.js', (req, res) => { res.set('Cache-Control', 'no-store').type('application/javascript').send(APP_SHELL_JS); });
@@ -27467,87 +27668,7 @@ app.post('/telegram-webhook', async (req, res) => {
         await ackCb('Command expired — that alert is over 24h old. Re-run the analysis if you still want it.', true);
         return res.status(200).json({ ok: true });
       }
-      // callback_data is capped at 64 BYTES by Telegram, so keep it minimal: a:<coin>:<choice>
-      const cbData = (cbq.data || '').trim();
-      const cbMatch = cbData.match(/^a:([a-z0-9]{1,12}):([1-5])(?::([a-z]{1,3}))?$/i)
-        || cbData.match(/^a:(\d{1,12}):([67]):(tj)$/i);   // #L0 sell Trade Detected keyboards have 7 choices - tj ONLY, never a money button
-      if (!cbMatch) {
-        await ackCb('Unrecognised button');
-        return res.status(200).json({ ok: true });
-      }
-      const cbCoin = cbMatch[1].toLowerCase();
-      const cbChoice = parseInt(cbMatch[2], 10);
-      // #336 STATELESS MONEY BUTTONS route here, BEFORE the alertContextBySymbol lookup below.
-      // They carry a database id and read the database, so they keep working after a restart and
-      // can never act on the wrong row. Every other button path below is unchanged.
-      const cbMoneyType = (cbMatch[3] || '').toLowerCase();
-      // #340 COLLISION FIX: 'td' was already the code for fixed-target DOWN alerts, so from #334 until now every
-      // down-target button was sent to the trade handler and refused. A Trade Detected button carries a NUMERIC
-      // journal id, a down-target button carries a COIN, and no coin symbol is all digits - so only a numeric 'td'
-      // is a trade button. Any other 'td' now falls through to the alert handler below, as it did before #334.
-      // New Trade Detected buttons use 'tj'; numeric 'td' keeps already-sent ones working.
-      const cbIsTradeJournal = cbMoneyType === 'tj' || (cbMoneyType === 'td' && /^\d+$/.test(cbCoin));
-      if (cbMoneyType === 'np' || cbMoneyType === 'ip' || cbMoneyType === 'cc' || cbIsTradeJournal || cbMoneyType === 'ta' || cbMoneyType === 'mu' ||
-          cbMoneyType === 'sd' || cbMoneyType === 'sp' || cbMoneyType === 'rp' || cbMoneyType === 'db' || cbMoneyType === 'sk' || cbMoneyType === 'ro' || cbMoneyType === 'rq' || cbMoneyType === 'sx') {
-        await ackCb('Working...');
-        try {
-          if (cbMoneyType === 'ta') await handleTradeApprovalButton(cbCoin, cbChoice, cbReply);
-          else if (cbMoneyType === 'db') await handleDeferredBuyButton(cbCoin, cbChoice, cbReply);   // #413 funded buy
-          else if (cbMoneyType === 'sd' || cbMoneyType === 'sp') await handleSwingButton(cbCoin, cbChoice, cbMoneyType, cbReply);
-          else if (cbMoneyType === 'rp') await handleRebalanceConfirmButton(cbCoin, cbChoice, cbReply);
-          else if (cbMoneyType === 'sk') await handleSpecButton(cbCoin, cbChoice, cbReply);   // #D2 spec desk status buttons (never money)
-          else if (cbMoneyType === 'ro') await handleRotationUntagButton(cbCoin, cbReply);   // #8 records only
-          else if (cbMoneyType === 'rq') await handleRotationAskButton(cbCoin, cbChoice, cbReply);   // #8 records only
-          else if (cbMoneyType === 'sx') await handleSpikeButton(cbCoin, cbChoice, cbReply);   // #B23 S3 keep a coin alerts-only / insure it again / switch on (with confirm); no off button
-          else if (cbMoneyType === 'mu') await handleMuteButton(cbCoin, cbReply);
-          else if (cbIsTradeJournal) await handleTradeButton(cbCoin, cbChoice, cbReply);
-          else await handleMoneyButton(cbMoneyType, cbCoin, cbChoice, cbReply);
-        } catch (e) {
-          console.error('[money-btn] ' + cbMoneyType + ' ' + cbCoin + ' failed:', e.message);
-          await cbReply('\u26a0\ufe0f Button failed: ' + (e.message || '').substring(0, 150));
-        }
-        return res.status(200).json({ ok: true });
-      }
-      // DOUBLE-ACK RACE: the owner may tap AND type for the same alert within
-      // milliseconds. alertContextBySymbol is the authority — whichever handler
-      // deletes the entry first owns the decision; the loser fails safely here
-      // rather than executing a second time. This is the same pop the text path
-      // performs, so the two cannot both proceed.
-      // TYPE GUARD: refuse if the live context is a DIFFERENT alert type from the one
-      // this button was drawn for — the numbers mean different things per type.
-      // 'ca' covers BOTH claude_analysis_trailing and claude_analysis_target: processAlertChoice
-      // handles them in one branch, and choices 3/4 are type-aware inside it, so a tap is valid
-      // against either. Matching on the prefix avoids refusing taps that are actually correct.
-      const CB_TYPES = { tr: 'trailing_stop', pu: 'pump', dr: 'drop', tu: 'fixed_target_up', td: 'fixed_target_down', ca: 'claude_analysis', rc: 'reconciler', hs: 'hold_step' };
-      const cbWantType = CB_TYPES[(cbMatch[3] || '').toLowerCase()] || null;
-      const cbCtx = alertContextBySymbol.get(cbCoin);
-      const cbTypeOk = !cbWantType || (cbWantType === 'claude_analysis'
-        ? String(cbCtx && cbCtx.alertType || '').indexOf('claude_analysis') === 0
-        : cbCtx && cbCtx.alertType === cbWantType);
-      if (cbCtx && cbWantType && !cbTypeOk) {
-        console.warn('[telegram] #316b superseded tap: choice=' + cbChoice + ' button=' + cbWantType + ' live=' + cbCtx.alertType + ' coin=' + cbCoin);
-        await ackCb('That alert was superseded by a newer ' + cbCoin.toUpperCase() + ' alert. Use the latest message.', true);
-        return res.status(200).json({ ok: true });
-      }
-      if (cbCtx && !cbWantType) {
-        // Pre-fix button (no type stamp) — cannot verify which alert it belongs to.
-        await ackCb('This button predates the routing fix. Please reply by number instead.', true);
-        return res.status(200).json({ ok: true });
-      }
-      if (!cbCtx) {
-        await ackCb('Already resolved (or no active alert for ' + cbCoin.toUpperCase() + ')', true);
-        return res.status(200).json({ ok: true });
-      }
-      alertContextBySymbol.delete(cbCoin);
-      if (lastAlertCoin === cbCoin) lastAlertCoin = null;
-      await ackCb(cbCoin.toUpperCase() + ' -> option ' + cbChoice);
-      try {
-        await processAlertChoice(cbCtx, cbChoice, cbReply);
-        console.log('[telegram] #316b callback ' + cbCoin + ' choice ' + cbChoice + ' routed');
-      } catch (e) {
-        console.error('[telegram] #316b callback error:', e.message);
-        await cbReply('\u26a0\ufe0f ' + cbCoin.toUpperCase() + ' option ' + cbChoice + ' failed: ' + (e.message || '').substring(0, 120));
-      }
+      await telegramButtonDispatch((cbq.data || '').trim(), cbReply, ackCb);   // #502 the router, shared with the app's feed (desk #30)
       return res.status(200).json({ ok: true });
     }
 
