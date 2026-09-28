@@ -4375,7 +4375,11 @@ async function krakenVolumeStr(pair, volume) {
 
 // Fetch live price for a single coin from Kraken public API
 // Uses explicit pair map first, then falls back to common naming patterns
+const KRAKEN_PRICE_MISS = new Map();   // #493 symbol -> ms until which a coin with no Kraken price is not asked again
+const KRAKEN_PRICE_MISS_MS = 60 * 60 * 1000;
 async function getKrakenPriceForSymbol(symbol) {
+  const missUntil = KRAKEN_PRICE_MISS.get(symbol);
+  if (missUntil && Date.now() < missUntil) return null;   // #493 no price on any pair an hour ago: do not hammer Kraken every 30 s
   const coinBase = symbol.replace('-USD', '');
   const krakenBase = coinBase === 'BTC' ? 'XBT' : coinBase;
 
@@ -4385,21 +4389,27 @@ async function getKrakenPriceForSymbol(symbol) {
     ? [knownPair, `${krakenBase}USD`, `${krakenBase}ZUSD`]
     : [`${krakenBase}USD`, `${krakenBase}ZUSD`, `X${krakenBase}ZUSD`];
 
+  let unlisted = 0;   // #493 (Fable C1) pairs Kraken answered 'Unknown asset pair' for - a listing fact, not a transport fact
   for (const pair of pairs) {
     try {
       const res = await fetch(`${KRAKEN_API_URL}/0/public/Ticker?pair=${encodeURIComponent(pair)}`);
       const data = await res.json();
+      if (data && Array.isArray(data.error) && data.error.some(e => /Unknown asset pair/i.test(String(e)))) unlisted++;
       if (data.result) {
         const entry = Object.values(data.result)[0];
         const price = parseFloat(entry?.c?.[0]);
         if (price > 0) {
           console.log(`[kraken] ${symbol} = $${price} (pair: ${pair})`);
+          if (missUntil) { KRAKEN_PRICE_MISS.delete(symbol); console.log('[kraken] ' + symbol + ' has a price again'); }   // #493
           return price;
         }
       }
     } catch (_) { /* try next format */ }
   }
-  console.warn(`[kraken] No price found for ${symbol}`);
+  if (unlisted === pairs.length) {   // #493 only when EVERY pair is unknown to Kraken; a blip, rate limit or 5xx is retried next cycle as before
+    KRAKEN_PRICE_MISS.set(symbol, Date.now() + KRAKEN_PRICE_MISS_MS);
+    console.warn(`[kraken] No price found for ${symbol}: Kraken lists none of ${pairs.join(', ')} - not asked again for 60 min`);
+  } else console.warn(`[kraken] No price found for ${symbol}`);
   return null;
 }
 
@@ -23275,7 +23285,7 @@ let rows;
         result = { ok: true, action: 'remove_threshold', symbol: sym, message: hadThreshold ? `Custom threshold removed for ${coinBase} — reverts to default` : `No custom threshold for ${coinBase} — any DB row cleared` };
       } else if (action === 'set_trough') {
         if (!buy_usd || buy_usd <= 0) throw new Error('set_trough requires buy_usd > 0');
-        const stExch = KRAKEN_MONITORED_COINS.includes(coinBase) ? 'kraken' : 'revolut';
+        const stExch = KRAKEN_MONITORED_COINS.includes(sym) ? 'kraken' : 'revolut';   // #493 the list holds 'X-USD' (was checked with the bare coin, so a Kraken coin was tagged revolut)
         // #394 retrace gate: an exact price, or retrace_pct below a reference price
         let stGate = null;
         if (arm_below_price != null) { if (!(Number(arm_below_price) > 0)) throw new Error('arm_below_price must be > 0'); stGate = Number(arm_below_price); }
@@ -23287,13 +23297,13 @@ let rows;
         const stNow = await getCurrentPrice(sym).catch(() => null);
         await armStandaloneTrough(sym, buy_usd, bounce_pct||8, entry_floor||null, stExch, stGate, stNow);   // #T1 price for the message
         const tgWarn = await emitEnableWarnings(sym, { side: 'buy' }, 'set_trough');   // #H1
-        shareStrategyNote('<b>' + escTg(coinBase) + ' dip buy set</b>\nBuys $' + buy_usd + ' on a ' + (bounce_pct || 8) + '% bounce off the low' + (stGate ? ', once the price is below ' + fmtPriceShort(stGate) : ''));   // #S1
+        shareStrategyNote('<b>' + escTg(coinBase) + ' dip buy set</b>\n' + (stExch === 'kraken' ? 'Alerts you (Kraken - buy it yourself)' : 'Buys $' + buy_usd) + ' on a ' + (bounce_pct || 8) + '% bounce off the low' + (stGate ? ', once the price is below ' + fmtPriceShort(stGate) : ''));   // #493 (Fable c)   // #S1
         result = { ok: true, warnings: tgWarn, action: 'set_trough', symbol: sym, buy_usd, bounce_pct: bounce_pct||8,
           entry_floor: entry_floor||null, exchange: stExch,
           retrace_gate: stGate ? { arm_below: Number(stGate.toPrecision(6)), from: retrace_pct != null ? Number(retrace_pct) + '% below ' + reference_price : 'exact price',
             price_now: stNow, distance_pct: stNow ? Number(((stGate / stNow - 1) * 100).toFixed(2)) : null, already_reached: !!(stNow && stNow <= stGate) } : null,
           message: stGate ? ('Trough tracker DORMANT until the price falls to ' + Number(stGate.toPrecision(6)) + ', then buys $' + buy_usd + ' on a ' + (bounce_pct||8) + '% bounce off the low')
-                          : ('Trough tracker armed -- buys $' + buy_usd + ' on ' + (bounce_pct||8) + '% bounce') };
+                          : ('Trough tracker armed -- ' + (stExch === 'kraken' ? 'alerts the bounce (Kraken: buy it yourself)' : 'buys $' + buy_usd) + ' on ' + (bounce_pct||8) + '% bounce') };   // #493 (Fable c)
       } else if (action === 'remove_trough') {
         await clearStandaloneTrough(sym);
         result = { ok: true, action: 'remove_trough', symbol: sym, message: 'Tracker cleared for ' + sym };
@@ -27502,6 +27512,26 @@ app.post('/telegram-webhook', async (req, res) => {
           await sendReply(escTg(c) + ' back to the default (' + cfg.sell_pct + '% of the holding).');
         } else await sendReply(await spikeStatusText());
       } catch (e) { await sendReply('❌ Spike: ' + escTg(e.message)); }
+      return res.status(200).json({ ok: true });
+    }
+    if (/^push(\s|$)/.test(commandText)) {   // #493 (Fable on 491): /push, /push off, /push test
+      const sub = commandText.replace(/^push\s*/, '').trim();
+      try {
+        if (sub === 'off') {
+          const [r] = await db.execute('UPDATE app_devices SET disabled = 1 WHERE disabled = 0');
+          await sendReply('🔕 Phone notifications <b>off</b> - ' + (r.affectedRows || 0) + ' device(s) switched off. They start again when the app registers (it does when you open it). If a device you do not know was registered, rotate the dashboard key in Railway first.');
+        } else if (sub === 'test') {
+          const r = await appPushSend({ title: '🔔 Revolut X test', body: 'Phone notifications are working.', channel: 'info', tab: 'home' });
+          await sendReply(r.sent ? '🔔 Test sent to ' + r.sent + ' device(s).' : '🔕 Nothing sent: ' + escTg(r.skipped || 'every send failed - see /push'));
+        } else {
+          const st = await appDeviceStatus(), on = st.devices.filter(d => d.active);
+          const when = (s) => s ? new Date(s * 1000).toLocaleString('en-GB', { timeZone: 'Europe/London', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) : '-';
+          await sendReply('📱 <b>Phone notifications</b> ' + (st.push_configured ? 'configured' : '<b>not configured</b> (FCM_SERVICE_ACCOUNT)') + '\n' +
+            on.length + ' active device(s)' + (on.length ? ': ' + on.map(d => 'v' + escTg(d.app_version || '?') + ', seen ' + when(d.last_seen)).join('; ') : '') + '\n' +
+            'Since the last restart: ' + st.stats.sent + ' sent, ' + st.stats.failed + ' failed, ' + st.stats.dropped + ' held back by the hourly cap' + (st.stats.last_error ? '\nLast error: ' + escTg(st.stats.last_error) : '') +
+            '\n<code>/push off</code> · <code>/push test</code>');
+        }
+      } catch (e) { await sendReply('❌ Push: ' + escTg(e.message)); }
       return res.status(200).json({ ok: true });
     }
     if (/^agent(\s|$)/.test(commandText)) {   // #B21 A1: /agent, /agent stop, /agent resume [confirm]
