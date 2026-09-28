@@ -18522,7 +18522,10 @@ async function checkPortfolio() {
             clearInterval(activeFixedAlerts.get(symbol));
             activeFixedAlerts.delete(symbol);
           }
-          await sendTelegram(`⚠️ <b>REMINDER: ${symbol} FIXED TARGET STILL ACTIVE!</b>${reminderSuffix}\n\nTarget: ${formatPrice(target.targetPrice)} | Now: ${formatPrice(currentPrice)}\nReply a number or 'acknowledge ${coinBase}'`);
+          const remCtx = alertContextBySymbol.get(coinBase.toLowerCase());   // #499 the buttons need the alert's context
+          if (!remCtx) alertContextBySymbol.set(coinBase.toLowerCase(), { symbol, coinBase, alertType: 'fixed_target_up', timestamp: Date.now() });
+          await sendTelegram(`⚠️ <b>REMINDER: ${symbol} FIXED TARGET STILL ACTIVE!</b>${reminderSuffix}\n\nTarget: ${formatPrice(target.targetPrice)} | Now: ${formatPrice(currentPrice)}\nTap a button, or reply 'acknowledge ${coinBase}'`,
+            buildAlertKeyboard(coinBase, ['Sell', 'Hold', 'Analyse', 'Acknowledge'], 'tu'));   // #499 the same buttons as the alert
         }, ALERT_INTERVAL_MS));
       }
 
@@ -18628,7 +18631,10 @@ async function checkPortfolio() {
             clearInterval(activeFixedAlerts.get(symbol));
             activeFixedAlerts.delete(symbol);
           }
-          await sendTelegram(`⚠️ <b>REMINDER: ${symbol} FIXED FLOOR STILL ACTIVE!</b>${reminderSuffix}\n\nFloor: ${formatPrice(target.targetPrice)} | Now: ${formatPrice(currentPrice)}\nReply a number or 'acknowledge ${coinBase}'`);
+          const remCtx = alertContextBySymbol.get(coinBase.toLowerCase());   // #499 the buttons need the alert's context
+          if (!remCtx) alertContextBySymbol.set(coinBase.toLowerCase(), { symbol, coinBase, alertType: 'fixed_target_down', timestamp: Date.now() });
+          await sendTelegram(`⚠️ <b>REMINDER: ${symbol} FIXED FLOOR STILL ACTIVE!</b>${reminderSuffix}\n\nFloor: ${formatPrice(target.targetPrice)} | Now: ${formatPrice(currentPrice)}\nTap a button, or reply 'acknowledge ${coinBase}'`,
+            buildAlertKeyboard(coinBase, ['Buy more', 'Hold', 'Sell', 'Acknowledge'], 'td'));   // #499 the same buttons as the alert
         }, ALERT_INTERVAL_MS));
       }
       } // end inner target loop — #38 B1
