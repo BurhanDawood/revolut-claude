@@ -840,7 +840,7 @@ function rxAppLayout() {
     return m ? { name: m[1], label: b.textContent.trim() } : null;
   }).filter(Boolean);
   var menu = document.createElement('div'); menu.id = 'rx-menu';
-  menu.innerHTML = '<div class="shade"></div><div class="sheet" role="menu"><h3>Dashboard</h3>' +
+  menu.innerHTML = '<div class="shade"></div><div class="sheet" role="menu"><button type="button" class="rx-inbox" data-inbox="1"><span>\ud83d\udd14 Notifications</span><span class="rx-badge" hidden></span></button><h3>Dashboard</h3>' +   // #500
     tabs.map(function (t) { return '<button type="button" data-tab="' + t.name + '">' + esc(t.label) + '</button>'; }).join('') + '</div>';
   document.body.appendChild(menu);
   var label = $('rx-tab-label'), burger = $('rx-burger');
@@ -851,13 +851,36 @@ function rxAppLayout() {
   }
   var origSwitch = window.switchTab;
   window.switchTab = function (name) { origSwitch(name); mark(name); };
-  if (burger) burger.addEventListener('click', function () { menu.classList.add('on'); });
+  // #500 Notifications: the first menu item opens the feed (the app's inbox tab), with an unread count on it and on the ☰
+  var rxSt = document.createElement('style');
+  rxSt.textContent = '#rx-menu .sheet button.rx-inbox{display:flex;align-items:center;justify-content:space-between;font-weight:600;margin-bottom:6px}' +
+    '.rx-badge{min-width:20px;height:20px;padding:0 6px;border-radius:10px;background:#ff4d6a;color:#fff;font:700 12px/20px system-ui,sans-serif;text-align:center}' +
+    '#rx-burger{position:relative}#rx-burger .rx-dot{position:absolute;left:12px;top:-6px;min-width:16px;height:16px;padding:0 4px;border-radius:8px;background:#ff4d6a;color:#fff;font:700 10px/16px system-ui,sans-serif;text-align:center}';
+  document.head.appendChild(rxSt);
+  function rxInboxOpen() {
+    try { if (window.parent !== window && window.parent.rxApp && window.parent.rxApp.show) { window.parent.rxApp.show('inbox'); return; } } catch (e) {}
+    location.href = '/inbox';
+  }
+  function rxInboxCount() {
+    var seen = 0; try { seen = parseInt(localStorage.getItem('rx_inbox_seen') || '0', 10) || 0; } catch (e) {}
+    fetch('/api/app/inbox?count=1&after=' + seen, { cache: 'no-store' }).then(function (r) { return r.ok ? r.json() : null; }).then(function (j) {
+      var n = j && j.count ? j.count : 0, txt = n > 99 ? '99+' : String(n);
+      var b = menu.querySelector('.rx-badge'); if (b) { b.textContent = txt; b.hidden = !n; }
+      var d = burger && burger.querySelector('.rx-dot');
+      if (burger && !d) { d = document.createElement('span'); d.className = 'rx-dot'; burger.appendChild(d); }
+      if (d) { d.textContent = txt; d.hidden = !n; }
+    }).catch(function () {});
+  }
+  if (burger) burger.addEventListener('click', function () { menu.classList.add('on'); rxInboxCount(); });
   menu.addEventListener('click', function (e) {
+    if (e.target.closest('button[data-inbox]')) { menu.classList.remove('on'); rxInboxOpen(); return; }   // #500
     var b = e.target.closest('button[data-tab]');
     if (b) { window.switchTab(b.getAttribute('data-tab')); window.scrollTo(0, 0); }
     if (b || e.target.classList.contains('shade')) menu.classList.remove('on');
   });
   mark('portfolio');
+  rxInboxCount(); setInterval(rxInboxCount, 60000);   // #500 unread count; the feed marks what you have seen
+  window.addEventListener('storage', function (e) { if (e.key === 'rx_inbox_seen') rxInboxCount(); });
   // (2) the top card: invested / P&L / break-even under the total; the breakdown by account folded
   var pane = $('tab-portfolio'), top = pane && pane.querySelector('.card'), cap = $('capital-bar'), totals = $('portfolio-totals');
   if (top && cap) { var pv = $('portfolio-value'); top.insertBefore(cap, pv ? pv.nextSibling : null); }
