@@ -35,10 +35,16 @@ public class MainActivity extends BridgeActivity {
 
     /** Intent extra naming the shell tab to open: set by the widget and by our own notifications. */
     public static final String EXTRA_TAB = "rx_tab";
+    /** Intent extra naming a coin (e.g. "AST") to open with the tab: set by our own notifications. */
+    public static final String EXTRA_COIN = "rx_coin";
     /** Intent extra set by the widget: a tap also refreshes it. */
     public static final String EXTRA_FROM_WIDGET = "rx_widget";
 
+    static final String TAB_RE = "home|portfolio|agent|desk|more";
+    static final String COIN_RE = "[A-Z0-9]{1,15}";
+
     private String pendingTab = null;
+    private String pendingCoin = null;
     private boolean shellLoaded = false;
 
     @Override
@@ -90,20 +96,33 @@ public class MainActivity extends BridgeActivity {
         String tab = intent.getStringExtra(EXTRA_TAB);
         if (tab == null) tab = intent.getStringExtra("tab");   // FCM puts a notification's data keys on the launch intent
         if (tab == null && intent.hasExtra("google.message_id")) tab = "home";
+        String coin = intent.getStringExtra(EXTRA_COIN);
+        if (coin == null) coin = intent.getStringExtra("coin");   // likewise data.coin of a background notification
+        if (coin != null && !coin.matches(COIN_RE)) coin = null;   // only validated values ever reach the JS below
         if (intent.getBooleanExtra(EXTRA_FROM_WIDGET, false)) WidgetRefreshWorker.refreshNow(this);
-        if (tab != null && tab.matches("home|portfolio|agent|desk|more")) {
+        if (tab != null && tab.matches(TAB_RE)) {
             pendingTab = tab;
+            pendingCoin = coin;
             if (shellLoaded) deliverPendingTab();
         }
     }
 
-    /** window.rxApp.show(tab) once the shell script has run (it defines rxApp at its end). */
+    /**
+     * Once the shell script has run (it defines rxApp at its end): rxApp.open({ tab, coin }) when a notification named a
+     * coin and the shell has open() (shell 492+), otherwise rxApp.show(tab). The coin is cleared once delivered, so a
+     * later plain open of the app does not jump to it. tab and coin are validated against TAB_RE / COIN_RE first.
+     */
     private void deliverPendingTab() {
         if (pendingTab == null || bridge == null) return;
-        String tab = pendingTab;
+        String tab = pendingTab, coin = pendingCoin;
         pendingTab = null;
+        pendingCoin = null;
+        if (!tab.matches(TAB_RE)) return;
+        String call = coin != null && coin.matches(COIN_RE)
+            ? "if(rxApp.open){rxApp.open({tab:'" + tab + "',coin:'" + coin + "'});}else{rxApp.show('" + tab + "');}"
+            : "rxApp.show('" + tab + "');";
         bridge.getWebView().evaluateJavascript(
-            "(function go(n){if(window.rxApp&&rxApp.show){rxApp.show('" + tab + "');}else if(n>0){setTimeout(function(){go(n-1);},250);}})(40);",
+            "(function go(n){if(window.rxApp&&rxApp.show){" + call + "}else if(n>0){setTimeout(function(){go(n-1);},250);}})(40);",
             null
         );
     }

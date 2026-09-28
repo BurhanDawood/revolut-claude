@@ -35,6 +35,7 @@ The shell (`APP_SHELL_JS` in `server.js`) runs inside the app's WebView, and Cap
 | `Capacitor.Plugins.BiometricAuth.authenticate({ reason, cancelTitle, allowDeviceCredential, androidTitle, androidSubtitle })`: resolves on success, rejects on cancel/fail | `BiometricAuthPlugin` (androidx.biometric). If the phone has no fingerprint and no screen lock, it resolves `{ skipped: true }` so the app never locks itself out. |
 | `Capacitor.Plugins.WidgetBridge.setConfig({ key, base })` → Promise | `WidgetBridgePlugin`. It stores both in EncryptedSharedPreferences and refreshes the widget. It accepts only `https://revolut-claude-production.up.railway.app` as `base`, so the key never goes anywhere else. The key is never logged. |
 | `window.rxApp.show('home' \| 'portfolio' \| 'agent' \| 'desk' \| 'more')` | The app calls it after the shell loads, when it was opened by the widget (`portfolio`) or by a notification (`data.tab`, default `home`). |
+| `window.rxApp.open({ tab, coin })` (shell 492+) | Called instead of `show` when a notification carries `data.coin` (validated `^[A-Z0-9]{1,15}$`): opens that coin's card. The coin is cleared once delivered; with an older shell the app falls back to `show(tab)`. |
 
 **Back button.** When the open tab's frame has moved off its start page, Back goes back inside that frame. Otherwise Back minimises the app. It never exits to a blank page.
 
@@ -142,7 +143,7 @@ The app side ships in v1 and stays off until Firebase is set up:
 - It sends `POST {base}/api/app/devices` with `{ token, platform: 'android', app_version }` and header `x-api-token`.
 - A 404 (the route does not exist yet) is ignored quietly; the app tries again on the next start.
 - Channels: **Alerts** (`alerts`, high importance, the default) and **Info** (`info`).
-- Tapping a notification opens the tab in `data.tab` (default `home`).
+- Tapping a notification opens the tab in `data.tab` (default `home`), on the coin in `data.coin` when it is set.
 
 **What the server sends** (FCM HTTP v1), for when the Dev thread builds the server half:
 - `message.notification`: `{ title, body }`;
