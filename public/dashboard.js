@@ -826,8 +826,31 @@ function refreshAll() {
 
 // ── Init ──────────────────────────────────────────────────────────
 
+// #492 open one coin's card - from a notification (the app shell calls rxFocusCoin, or loads /?app=1#coin=AST).
+// Waits for the holdings to render (up to 20 s), switches to Portfolio, expands the card and scrolls it into view.
+function rxFocusCoin(sym, tries) {
+  sym = String(sym || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 15);
+  if (!sym) return;
+  tries = tries || 0;
+  if (tries === 0) switchTab('portfolio');
+  var el = $('card-detail-' + sym);
+  if (!el) {
+    if (tries < 80) { setTimeout(function () { rxFocusCoin(sym, tries + 1); }, 250); return; }
+    showToast(sym + ' is not one of your holdings, so it has no card here.', false); return;
+  }
+  if (el.style.display === 'none' || !el.style.display) toggleCard(sym);
+  var card = el.parentNode;
+  var nav = document.querySelector('.tab-nav'), off = (nav ? nav.getBoundingClientRect().height : 0) + 12;
+  window.scrollTo({ top: Math.max(0, card.getBoundingClientRect().top + window.pageYOffset - off), behavior: 'smooth' });
+  card.style.outline = '2px solid var(--accent)'; card.style.outlineOffset = '2px';
+  setTimeout(function () { card.style.outline = ''; }, 3000);
+}
+function rxFocusFromHash() { var m = /[#&]coin=([A-Za-z0-9]{1,15})/.exec(location.hash); if (m) rxFocusCoin(m[1]); }
+window.addEventListener('hashchange', rxFocusFromHash);
+
 document.addEventListener('DOMContentLoaded', function() {
   console.log('Dashboard v' + DASHBOARD_VERSION + ' initialising');
   refreshAll();
+  rxFocusFromHash();   // #492
   setInterval(refreshAll, 5 * 60 * 1000);
 });
