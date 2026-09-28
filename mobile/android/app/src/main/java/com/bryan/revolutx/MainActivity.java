@@ -5,9 +5,11 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.media.AudioAttributes;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.provider.Settings;
 import android.webkit.WebBackForwardList;
 import android.webkit.WebResourceError;
 import android.webkit.WebResourceRequest;
@@ -213,6 +215,39 @@ public class MainActivity extends BridgeActivity {
         info.setDescription("Reports and other news");
         nm.createNotificationChannel(alerts);
         nm.createNotificationChannel(info);
+
+        // v8: one channel per sound/vibrate choice (batch 498 picks one per alert category). Android fixes a channel's
+        // sound and vibration once it exists, so these ids must never be reused with other settings.
+        AudioAttributes sound = new AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_NOTIFICATION)
+            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+            .build();
+
+        NotificationChannel loud = new NotificationChannel(Push.CHANNEL_LOUD, "Sound and vibrate", NotificationManager.IMPORTANCE_HIGH);
+        loud.setDescription("Revolut X alerts you set to sound and vibrate");
+        loud.setSound(Settings.System.DEFAULT_NOTIFICATION_URI, sound);
+        loud.enableVibration(true);
+
+        NotificationChannel soundOnly = new NotificationChannel(Push.CHANNEL_SOUND, "Sound only", NotificationManager.IMPORTANCE_HIGH);
+        soundOnly.setDescription("Revolut X alerts you set to sound without vibration");
+        soundOnly.setSound(Settings.System.DEFAULT_NOTIFICATION_URI, sound);
+        soundOnly.enableVibration(false);
+
+        NotificationChannel buzz = new NotificationChannel(Push.CHANNEL_BUZZ, "Vibrate only", NotificationManager.IMPORTANCE_HIGH);
+        buzz.setDescription("Revolut X alerts you set to vibrate without sound");
+        buzz.setSound(null, null);
+        buzz.enableVibration(true);
+        buzz.setVibrationPattern(new long[] { 0, 250, 150, 250 });
+
+        NotificationChannel quiet = new NotificationChannel(Push.CHANNEL_QUIET, "Silent", NotificationManager.IMPORTANCE_LOW);
+        quiet.setDescription("Revolut X alerts you set to silent");
+        quiet.setSound(null, null);
+        quiet.enableVibration(false);
+
+        nm.createNotificationChannel(loud);
+        nm.createNotificationChannel(soundOnly);
+        nm.createNotificationChannel(buzz);
+        nm.createNotificationChannel(quiet);
     }
 
     private void startPush() {

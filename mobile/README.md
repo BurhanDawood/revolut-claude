@@ -135,6 +135,27 @@ Steps:
 
 The key exists only inside GitHub secrets, so nobody holds a copy. If the secrets are ever lost, phones must uninstall once and the setup workflow is run again.
 
+## Notification channels
+
+On Android, sound and vibration belong to the notification channel, not to the message. The server (batch 498) sorts every alert into a category. It applies Bryan's on/off, sound, vibrate and quiet-hours choices from More → Notifications, then picks one of these channels for each push:
+
+| id | name in Android settings | importance | sound | vibration |
+|---|---|---|---|---|
+| `rx_loud` | Sound and vibrate | HIGH | default notification sound | on |
+| `rx_sound` | Sound only | HIGH | default notification sound | off |
+| `rx_buzz` | Vibrate only | HIGH | none | on (0, 250, 150, 250 ms) |
+| `rx_quiet` | Silent | LOW | none | off |
+| `alerts` | Alerts | HIGH | Android default | Android default |
+| `info` | Info | DEFAULT | Android default | Android default |
+
+`alerts` and `info` stay for older server messages and older installs. A channel id the app doesn't know is shown on `alerts`.
+
+**Caps contract.** On every start the app registers its token with `POST /api/app/devices`, and the body includes `"caps": "ch2"`. The server sends the `rx_*` channels only to devices registered with `ch2`. Every other device keeps getting `alerts` and `info`. So it doesn't matter whether the app or the server is updated first: opening v8 once is enough. The server also sends `data.cat` (the category id), which the app doesn't use yet.
+
+**Channel settings are fixed.**
+- Once Android has created a channel, the app can't change its sound or vibration. Never reuse these ids with different settings: a new behaviour needs a new id (and a new caps value).
+- Changing a channel's sound, vibration or importance in Android's own settings (Settings → Apps → Revolut X → Notifications) overrides the app's choice for that channel. Android keeps that change even when the app updates.
+
 ## Push notifications
 
 The app side ships in v1 and stays off until Firebase is set up:

@@ -33,7 +33,7 @@ public class RxMessagingService extends MessagingService {
         String body = n != null && n.getBody() != null ? n.getBody() : data.get("body");
         if (title == null && body == null) return;
         String channel = n != null && n.getChannelId() != null ? n.getChannelId() : data.get("channel");
-        if (!Push.CHANNEL_INFO.equals(channel)) channel = Push.CHANNEL_ALERTS;
+        channel = Push.knownChannel(channel);   // data.cat (the alert category) is sent too; not needed here
         String tab = data.get("tab");
         if (tab == null || !tab.matches(MainActivity.TAB_RE)) tab = "home";
         String coin = data.get("coin");   // '' or a symbol like AST
@@ -51,7 +51,11 @@ public class RxMessagingService extends MessagingService {
             .setContentTitle(title != null ? title : "Revolut X")
             .setContentText(body)
             .setStyle(new NotificationCompat.BigTextStyle().bigText(body))
-            .setPriority(Push.CHANNEL_ALERTS.equals(channel) ? NotificationCompat.PRIORITY_HIGH : NotificationCompat.PRIORITY_DEFAULT)
+            .setPriority(
+                Push.CHANNEL_QUIET.equals(channel) ? NotificationCompat.PRIORITY_LOW
+                    : Push.CHANNEL_INFO.equals(channel) ? NotificationCompat.PRIORITY_DEFAULT
+                    : NotificationCompat.PRIORITY_HIGH
+            )
             .setAutoCancel(true)
             .setContentIntent(pi);
         try {

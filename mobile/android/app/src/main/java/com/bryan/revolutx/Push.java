@@ -18,6 +18,29 @@ final class Push {
 
     static final String CHANNEL_ALERTS = "alerts";
     static final String CHANNEL_INFO = "info";
+    // v8 (batch 498): one channel per sound/vibrate choice; the server sends these only to devices registered with caps "ch2"
+    static final String CHANNEL_LOUD = "rx_loud";
+    static final String CHANNEL_SOUND = "rx_sound";
+    static final String CHANNEL_BUZZ = "rx_buzz";
+    static final String CHANNEL_QUIET = "rx_quiet";
+    /** What this app can show; the server stores it with the token. "ch2" = has the four rx_* channels. */
+    static final String CAPS = "ch2";
+
+    /** A channel id from the server, or alerts for anything this app does not have. */
+    static String knownChannel(String ch) {
+        if (ch == null) return CHANNEL_ALERTS;
+        switch (ch) {
+            case CHANNEL_ALERTS:
+            case CHANNEL_INFO:
+            case CHANNEL_LOUD:
+            case CHANNEL_SOUND:
+            case CHANNEL_BUZZ:
+            case CHANNEL_QUIET:
+                return ch;
+            default:
+                return CHANNEL_ALERTS;
+        }
+    }
 
     private static final ExecutorService IO = Executors.newSingleThreadExecutor();
 
@@ -53,7 +76,8 @@ final class Push {
                 JSONObject body = new JSONObject()
                     .put("token", token)
                     .put("platform", "android")
-                    .put("app_version", BuildConfig.VERSION_NAME);
+                    .put("app_version", BuildConfig.VERSION_NAME)
+                    .put("caps", CAPS);
                 HttpURLConnection c = (HttpURLConnection) new URL(SecureStore.base(app) + "/api/app/devices").openConnection();
                 c.setRequestMethod("POST");
                 c.setConnectTimeout(15000);
