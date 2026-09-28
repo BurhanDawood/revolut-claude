@@ -154,7 +154,7 @@ function loadPortfolio() {
     setText('cap-invested', fmtUSD(inv));
     setText('cap-current', fmtUSD(grandTotal));
     setText('cap-pnl',
-      (plUsd >= 0 ? '+' : '') + '$' + Math.abs(plUsd).toFixed(2) + ' (' + fmtPct(plPct) + ')',
+      (plUsd >= 0 ? '+' : '\u2212') + fmtUSD(Math.abs(plUsd)) + ' (' + fmtPct(plPct) + ')',   // #495 the sign and thousands (was "$15807.84")
       plUsd >= 0 ? '#00ff88' : '#ff4444');
     setText('cap-breakeven', '+' + breakEven.toFixed(1) + '% needed', '#ffaa00');
 
@@ -826,6 +826,81 @@ function refreshAll() {
 
 // ── Init ──────────────────────────────────────────────────────────
 
+// #495 the app's Home tab (Bryan 28 Sep 18:58): burger menu for the tabs, invested / P&L / break-even in the top card, the account
+// breakdown folded, and every section below the chart folded into a tappable header (open ones are remembered on this phone).
+function rxAppLayout() {
+  var root = document.documentElement;
+  if (!root.classList.contains('in-app') || root.getAttribute('data-rx-layout')) return;
+  root.setAttribute('data-rx-layout', '1');
+  var store = { get: function (k) { try { return JSON.parse(localStorage.getItem(k) || 'null'); } catch (e) { return null; } },
+                set: function (k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} } };
+  // (1) burger menu
+  var tabs = [].map.call(document.querySelectorAll('.tab-nav .tab-btn'), function (b) {
+    var m = /switchTab\('([a-z]+)'\)/.exec(b.getAttribute('onclick') || '');
+    return m ? { name: m[1], label: b.textContent.trim() } : null;
+  }).filter(Boolean);
+  var menu = document.createElement('div'); menu.id = 'rx-menu';
+  menu.innerHTML = '<div class="shade"></div><div class="sheet" role="menu"><h3>Dashboard</h3>' +
+    tabs.map(function (t) { return '<button type="button" data-tab="' + t.name + '">' + esc(t.label) + '</button>'; }).join('') + '</div>';
+  document.body.appendChild(menu);
+  var label = $('rx-tab-label'), burger = $('rx-burger');
+  function mark(name) {
+    var t = tabs.filter(function (x) { return x.name === name; })[0];
+    if (label && t) label.textContent = t.label.replace(/^[^A-Za-z0-9]+\s*/, '');
+    [].forEach.call(menu.querySelectorAll('button'), function (b) { b.classList.toggle('on', b.getAttribute('data-tab') === name); });
+  }
+  var origSwitch = window.switchTab;
+  window.switchTab = function (name) { origSwitch(name); mark(name); };
+  if (burger) burger.addEventListener('click', function () { menu.classList.add('on'); });
+  menu.addEventListener('click', function (e) {
+    var b = e.target.closest('button[data-tab]');
+    if (b) { window.switchTab(b.getAttribute('data-tab')); window.scrollTo(0, 0); }
+    if (b || e.target.classList.contains('shade')) menu.classList.remove('on');
+  });
+  mark('portfolio');
+  // (2) the top card: invested / P&L / break-even under the total; the breakdown by account folded
+  var pane = $('tab-portfolio'), top = pane && pane.querySelector('.card'), cap = $('capital-bar'), totals = $('portfolio-totals');
+  if (top && cap) { var pv = $('portfolio-value'); top.insertBefore(cap, pv ? pv.nextSibling : null); }
+  if (top && totals) {
+    var fold = document.createElement('details'); fold.className = 'rx-fold';
+    fold.innerHTML = '<summary>Breakdown by account</summary>';
+    fold.open = !!(store.get('rx_open') || {})['__breakdown'];
+    top.insertBefore(fold, totals); fold.appendChild(totals);
+    fold.addEventListener('toggle', function () { var o = store.get('rx_open') || {}; o['__breakdown'] = fold.open; store.set('rx_open', o); });
+  }
+  // (3) everything after the chart: a header you tap to open; closed by default
+  var pvCard = $('pv-card'), pnl = $('pnl-summary-bar'), holdings = null;
+  var after = false, secs = [];
+  [].slice.call(pane.children).forEach(function (el) {
+    if (el === pvCard) { after = true; return; }
+    if (!after || /^(SCRIPT|STYLE)$/.test(el.tagName) || el === cap) return;
+    secs.push(el);
+  });
+  secs.forEach(function (el) {
+    var head = el.querySelector(':scope > .card-title, :scope > .tangem-title, :scope > .trail-summary-title');
+    if (!head) return;
+    if (/^Holdings$/.test(head.textContent.trim())) holdings = el;
+  });
+  if (pnl && holdings) { var ht = holdings.querySelector(':scope > .card-title'); holdings.insertBefore(pnl, ht.nextSibling); secs = secs.filter(function (x) { return x !== pnl; }); }
+  var open = store.get('rx_open') || {};
+  secs.forEach(function (el) {
+    var head = el.querySelector(':scope > .card-title, :scope > .tangem-title, :scope > .trail-summary-title');
+    if (!head) return;
+    var key = head.textContent.replace(/Full view.*$/, '').replace(/[^A-Za-z ]/g, '').trim().slice(0, 40);
+    var body = document.createElement('div'); body.className = 'rx-body';
+    [].slice.call(el.children).forEach(function (c) { if (c !== head) body.appendChild(c); });
+    el.appendChild(body);
+    el.classList.add('rx-sec'); head.classList.add('rx-head');
+    if (!open[key]) el.classList.add('rx-collapsed');
+    head.addEventListener('click', function (e) {
+      if (e.target.closest('a')) return;
+      e.stopPropagation();   // the agent and desk cards open their page on a tap; the header only folds
+      el.classList.toggle('rx-collapsed');
+      var o = store.get('rx_open') || {}; o[key] = !el.classList.contains('rx-collapsed'); store.set('rx_open', o);
+    });
+  });
+}
+
 // #492 open one coin's card - from a notification (the app shell calls rxFocusCoin, or loads /?app=1#coin=AST).
 // Waits for the holdings to render (up to 20 s), switches to Portfolio, expands the card and scrolls it into view.
 function rxFocusCoin(sym, tries) {
@@ -838,6 +913,7 @@ function rxFocusCoin(sym, tries) {
     if (tries < 80) { setTimeout(function () { rxFocusCoin(sym, tries + 1); }, 250); return; }
     showToast(sym + ' is not one of your holdings, so it has no card here.', false); return;
   }
+  var sec = el.closest && el.closest('.rx-sec.rx-collapsed'); if (sec) sec.classList.remove('rx-collapsed');   // #495 a folded Holdings opens
   if (el.style.display === 'none' || !el.style.display) toggleCard(sym);
   var card = el.parentNode;
   var nav = document.querySelector('.tab-nav'), off = (nav ? nav.getBoundingClientRect().height : 0) + 12;
@@ -850,6 +926,7 @@ window.addEventListener('hashchange', rxFocusFromHash);
 
 document.addEventListener('DOMContentLoaded', function() {
   console.log('Dashboard v' + DASHBOARD_VERSION + ' initialising');
+  try { rxAppLayout(); } catch (e) { console.error('rxAppLayout', e); }   // #495
   refreshAll();
   rxFocusFromHash();   // #492
   setInterval(refreshAll, 5 * 60 * 1000);

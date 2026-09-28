@@ -42,6 +42,39 @@
     html.in-app header h1 { display: none; }
     html.in-app header { margin-bottom: 0; padding: 8px 0 2px; justify-content: flex-end; }
     html.in-app .tab-nav { position: sticky; top: 0; z-index: 20; background: var(--bg); padding: 8px 0 10px; margin: 0 0 8px; }
+    /* #495 the app's Home tab: a burger menu instead of the tab row, the capital numbers in the top card, the rest folded away */
+    html.in-app .tab-nav { display: none; }
+    html.in-app header { position: sticky; top: 0; z-index: 30; background: var(--bg); justify-content: space-between; padding: 10px 0 8px; margin: 0 0 6px; flex-wrap: nowrap; }
+    #rx-burger { display: none; }
+    html.in-app #rx-burger { display: inline-flex; align-items: center; gap: 10px; background: none; border: 0; color: var(--text); font: 600 1rem inherit; padding: 4px 2px; cursor: pointer; }
+    #rx-burger .bars { display: inline-flex; flex-direction: column; gap: 4px; }
+    #rx-burger .bars i { display: block; width: 20px; height: 2px; background: var(--text); border-radius: 2px; }
+    #rx-menu { position: fixed; inset: 0; z-index: 50; display: none; }
+    #rx-menu.on { display: block; }
+    #rx-menu .shade { position: absolute; inset: 0; background: rgba(0,0,0,0.55); }
+    #rx-menu .sheet { position: absolute; top: 0; left: 0; bottom: 0; width: min(78vw, 300px); background: var(--surface); padding: 18px 12px; overflow-y: auto; box-shadow: 4px 0 24px rgba(0,0,0,0.5); }
+    #rx-menu .sheet h3 { font-size: 0.72rem; letter-spacing: 0.1em; text-transform: uppercase; color: var(--text-muted); margin: 4px 8px 10px; }
+    #rx-menu .sheet button { display: block; width: 100%; text-align: left; background: none; border: 0; color: var(--text); font: 500 1rem inherit; padding: 12px 10px; border-radius: 8px; cursor: pointer; }
+    #rx-menu .sheet button.on { background: rgba(0,255,200,0.1); color: var(--accent); font-weight: 700; }
+    html.in-app #capital-bar { background: none; padding: 12px 0 0; margin: 12px 0 0; border-top: 1px solid rgba(255,255,255,0.07); border-radius: 0; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+    html.in-app #capital-bar .cap-stat:nth-child(2) { display: none; }   /* Current = the big total above */
+    html.in-app #capital-bar .cap-stat-value { font-size: 0.95rem; }
+    .rx-fold { margin-top: 12px; }
+    .rx-fold > summary { list-style: none; cursor: pointer; color: var(--text-muted); font-size: 0.8rem; display: flex; align-items: center; gap: 6px; }
+    .rx-fold > summary::-webkit-details-marker { display: none; }
+    .rx-fold > summary::after { content: '\25BE'; transition: transform .15s; }
+    .rx-fold[open] > summary::after { transform: rotate(180deg); }
+    .rx-fold .portfolio-totals { margin-top: 8px; }
+    .rx-sec > .rx-head { cursor: pointer; display: flex; align-items: center; gap: 8px; margin-bottom: 0; }
+    .rx-sec > .rx-head::after { content: '\25BE'; margin-left: auto; color: var(--text-muted); transition: transform .15s; }
+    .rx-sec > .rx-head a { margin-left: auto; }
+    .rx-sec > .rx-head a + ::after, .rx-sec > .rx-head:has(a)::after { margin-left: 10px; }
+    .rx-sec:not(.rx-collapsed) > .rx-head { margin-bottom: 10px; }
+    .rx-sec:not(.rx-collapsed) > .rx-head::after { transform: rotate(180deg); }
+    .rx-sec > .rx-body { display: contents; }
+    .rx-sec.rx-collapsed > .rx-body { display: none !important; }
+    .rx-sec.rx-collapsed { padding-top: 14px; padding-bottom: 14px; }
+    .rx-sec .rx-peek { color: var(--text-muted); font-weight: 500; font-size: 0.78rem; text-transform: none; letter-spacing: 0; }
 
     header {
       display: flex;
@@ -667,6 +700,7 @@
 <body>
 
 <header>
+  <button type="button" id="rx-burger" aria-label="Menu" aria-controls="rx-menu"><span class="bars"><i></i><i></i><i></i></span><span id="rx-tab-label">Portfolio</span></button>
   <h1>⚡ Revolut X</h1>
   <div class="status-bar">
     <div class="spinner" id="spinner"></div>
