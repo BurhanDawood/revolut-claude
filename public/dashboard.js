@@ -170,7 +170,7 @@ function loadPortfolio() {
     setText('pnl-tracked', positions.length);
     setText('pnl-winners', winners, '#00ff88');
     setText('pnl-losers', losers, '#ff4444');
-    setText('pnl-total-unreal', (totalUnreal >= 0 ? '+' : '') + '$' + Math.abs(totalUnreal).toFixed(2), totalUnreal >= 0 ? '#00ff88' : '#ff4444');
+    setText('pnl-total-unreal', (totalUnreal >= 0 ? '+' : '\u2212') + fmtUSD(Math.abs(totalUnreal)) /* #496 sign + thousands */, totalUnreal >= 0 ? '#00ff88' : '#ff4444');
 
     hideEl('tangem-loading'); showEl('tangem-content');
     setText('tangem-value-usd', fmtUSD(tangemVal));
@@ -179,7 +179,7 @@ function loadPortfolio() {
     if (tangemEntry > 0 && tangemPrice > 0) {
       var tPlUsd = tangemXRP * (tangemPrice - tangemEntry);
       var tPlPct = ((tangemPrice - tangemEntry) / tangemEntry * 100);
-      setText('tangem-pnl-usd', (tPlUsd >= 0 ? '+' : '') + '$' + Math.abs(tPlUsd).toFixed(2), tPlUsd >= 0 ? '#00ff88' : '#ff4444');
+      setText('tangem-pnl-usd', (tPlUsd >= 0 ? '+' : '\u2212') + fmtUSD(Math.abs(tPlUsd)) /* #496 sign + thousands (was $1154.54 in red) */, tPlUsd >= 0 ? '#00ff88' : '#ff4444');
       setText('tangem-pnl-pct', fmtPct(tPlPct), tPlPct >= 0 ? '#00ff88' : '#ff4444');
       setText('tangem-entry-line', 'Entry: $' + tangemEntry.toFixed(4));
     }
@@ -790,7 +790,7 @@ function loadRotations() {
     if (!data || data.error) { el.innerHTML = '<div class="empty-state">' + ((data && data.error) || 'Unavailable') + '</div>'; return; }
     var rots = data.rotations || [];
     if (!rots.length) { el.innerHTML = '<div class="empty-state">No rotations yet. Use resolve_pending_trades type:rebalance.</div>'; return; }
-    function money(v) { return v == null ? '\u2014' : (v >= 0 ? '+' : '') + '$' + Math.abs(v).toFixed(0); }
+    function money(v) { return v == null ? '\u2014' : (v >= 0 ? '+' : '\u2212') + '$' + Math.abs(v).toLocaleString('en-US', { maximumFractionDigits: 0 }); }   // #496
     function col(v) { return v > 0 ? '#33cc66' : '#ff5555'; }
     el.innerHTML = rots.map(function(r) {
       var dA = r.delta_vs_a, dU = r.delta_vs_usdt;
@@ -891,7 +891,8 @@ function rxAppLayout() {
     [].slice.call(el.children).forEach(function (c) { if (c !== head) body.appendChild(c); });
     el.appendChild(body);
     el.classList.add('rx-sec'); head.classList.add('rx-head');
-    if (!open[key]) el.classList.add('rx-collapsed');
+    var dflt = /Tangem/.test(key);   // #496 the Tangem wallet starts open; everything else starts folded
+    if (!(key in open ? open[key] : dflt)) el.classList.add('rx-collapsed');
     head.addEventListener('click', function (e) {
       if (e.target.closest('a')) return;
       e.stopPropagation();   // the agent and desk cards open their page on a tap; the header only folds

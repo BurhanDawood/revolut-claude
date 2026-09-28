@@ -775,6 +775,29 @@
     <script>window.addEventListener('message', function (e) { if (e.origin === location.origin && e.data && e.data.pvHeight > 200) document.getElementById('pv-frame').style.height = Math.min(e.data.pvHeight, 900) + 'px'; });</script>
   </div>
 
+  <!-- Tangem Self-Custody Wallet (#496: straight under the chart) -->
+  <div class="tangem-card" id="tangem-card">
+    <div class="tangem-title">🔐 Tangem Wallet</div>
+    <div class="tangem-loading" id="tangem-loading">Loading…</div>
+    <div id="tangem-content" style="display:none">
+      <div class="tangem-header">
+        <div>
+          <div class="tangem-amount" id="tangem-value-usd">—</div>
+          <div class="tangem-xrp" id="tangem-xrp-qty">—</div>
+          <div class="tangem-entry" id="tangem-entry-line">—</div>
+        </div>
+        <div class="tangem-pnl">
+          <div class="tangem-pnl-value" id="tangem-pnl-usd">—</div>
+          <div class="tangem-pnl-pct" id="tangem-pnl-pct">—</div>
+        </div>
+      </div>
+      <div class="tangem-footer">
+        <span class="tangem-address" id="tangem-address">—</span>
+        <a class="tangem-link" href="https://xrpscan.com/account/r4E3rtCa4FT4HxTQV2iw3yQHRTrAHMYS3v" target="_blank" rel="noopener">View on XRPScan ↗</a>
+      </div>
+    </div>
+  </div>
+
   <!-- Budget agent + Spec desk at a glance (#W1): tap a card for the full page -->
   <style>
     .mini-card { cursor:pointer; }
@@ -882,28 +905,6 @@
     </div>
   </div>
 
-  <!-- Tangem Self-Custody Wallet -->
-  <div class="tangem-card" id="tangem-card">
-    <div class="tangem-title">🔐 Tangem Wallet</div>
-    <div class="tangem-loading" id="tangem-loading">Loading…</div>
-    <div id="tangem-content" style="display:none">
-      <div class="tangem-header">
-        <div>
-          <div class="tangem-amount" id="tangem-value-usd">—</div>
-          <div class="tangem-xrp" id="tangem-xrp-qty">—</div>
-          <div class="tangem-entry" id="tangem-entry-line">—</div>
-        </div>
-        <div class="tangem-pnl">
-          <div class="tangem-pnl-value" id="tangem-pnl-usd">—</div>
-          <div class="tangem-pnl-pct" id="tangem-pnl-pct">—</div>
-        </div>
-      </div>
-      <div class="tangem-footer">
-        <span class="tangem-address" id="tangem-address">—</span>
-        <a class="tangem-link" href="https://xrpscan.com/account/r4E3rtCa4FT4HxTQV2iw3yQHRTrAHMYS3v" target="_blank" rel="noopener">View on XRPScan ↗</a>
-      </div>
-    </div>
-  </div>
 
   <!-- Capital P&L Bar -->
   <div class="capital-bar" id="capital-bar" style="display:none">
