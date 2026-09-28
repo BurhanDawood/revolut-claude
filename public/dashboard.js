@@ -208,7 +208,7 @@ function roleBadge(role) {
   if (!role) return '';
   var colors = { anchor:'#ffd700', swing:'#4488ff', hodl:'#aa44ff', lotto:'#ff8800', dead_bag:'#777777', watch_entry:'#00bbcc', radar:'#888888' };
   var c = colors[role] || '#888888';
-  return ' <span style="font-size:9px;padding:1px 6px;border-radius:8px;background:' + c + '22;color:' + c + ';border:1px solid ' + c + '55">' + esc(role.replace('_', ' ')) + '</span>';
+  return ' <span class="rx-role" style="font-size:9px;padding:1px 6px;border-radius:8px;background:' + c + '22;color:' + c + ';border:1px solid ' + c + '55">' + esc(role.replace('_', ' ')) + '</span>';
 }
 
 function posPL(pos) {
@@ -218,7 +218,7 @@ function posPL(pos) {
 }
 
 function sectionHeader(label, n) {
-  return '<div style="color:#666;font-size:11px;font-weight:bold;letter-spacing:1px;margin:14px 0 8px;text-transform:uppercase">' + label + ' <span style="color:#444">(' + n + ')</span></div>';
+  return '<div class="rx-sech" style="color:#666;font-size:11px;font-weight:bold;letter-spacing:1px;margin:14px 0 8px;text-transform:uppercase">' + label + ' <span style="color:#444">(' + n + ')</span></div>';
 }
 
 function renderHoldingsGrid(positions) {
@@ -287,23 +287,52 @@ function makeCard(e, isWatch) {
   var right;
   if (isWatch) {
     right = (val >= 0.01)
-      ? '<span style="color:#888;font-size:11px">dust $' + val.toFixed(2) + '</span>'
-      : '<span style="color:#00bbcc;font-size:11px">watching</span>';
+      ? '<span class="rx-sub" style="color:#888;font-size:11px">dust $' + val.toFixed(2) + '</span>'
+      : '<span class="rx-sub" style="color:#00bbcc;font-size:11px">watching</span>';
   } else {
     right = '<span style="color:white;font-weight:bold">$' + val.toFixed(2) + '</span>'
-      + (pl != null ? '<br><span style="color:' + plc + ';font-size:11px">' + fmtPct(pl) + '</span>' : '');
+      + (pl != null ? '<br><span class="rx-sub" style="color:' + plc + ';font-size:11px">' + fmtPct(pl) + '</span>' : '');
   }
   if (overnight !== 0) {
-    right += '<br><span style="font-size:9px;color:' + (overnight >= 0 ? '#00ff88' : '#ff4444') + '">' + (overnight >= 0 ? '+' : '') + overnight.toFixed(1) + '% o/n</span>';
+    right += '<br><span class="rx-sub" style="font-size:9px;color:' + (overnight >= 0 ? '#00ff88' : '#ff4444') + '">' + (overnight >= 0 ? '+' : '') + overnight.toFixed(1) + '% o/n</span>';
   }
 
-  return '<div style="border-left:3px solid ' + border + ';margin-bottom:8px;background:#1a1a1a;border-radius:4px">'
-    + '<div onclick="toggleCard(\'' + sym + '\')" style="cursor:pointer;display:flex;justify-content:space-between;align-items:flex-start;padding:10px 12px">'
-    + '<span style="color:white;font-weight:bold">' + esc(sym) + (cs ? roleBadge(cs.role) : '') + '</span>'
-    + '<div style="text-align:right">' + right + ' <span style="color:#666">\u25BE</span></div>'
+  return '<div class="rx-coin" style="border-left:3px solid ' + border + ';margin-bottom:8px;background:#1a1a1a;border-radius:4px">'   // #505 classes: phone sizes in dashboard.html
+    + '<div class="rx-coin-head" onclick="toggleCard(\'' + sym + '\')" style="cursor:pointer;display:flex;justify-content:space-between;align-items:flex-start;padding:10px 12px">'
+    + '<span class="rx-coin-sym" style="color:white;font-weight:bold">' + esc(sym) + (cs ? roleBadge(cs.role) : '') + '</span>'
+    + '<div class="rx-coin-val" style="text-align:right">' + right + ' <span style="color:#666">\u25BE</span></div>'
     + '</div>'
-    + '<div id="card-detail-' + sym + '" style="display:none;padding:0 12px 12px;border-top:1px solid #2a2a2a"></div>'
+    + '<div class="rx-cd" id="card-detail-' + sym + '" style="display:none;padding:0 12px 12px;border-top:1px solid #2a2a2a"></div>'
     + '</div>';
+}
+
+// #505 (Bryan 29 Sep 00:10: coin cards "actually readable. That's tiny"): a plan reads as paragraphs, a leading label in
+// capitals ("EXITED 16 Aug:", "ACTION:") in bold, and a long plan (over 900 characters) shows its opening with the rest one
+// tap away. The text itself is unchanged and always escaped.
+function rxPlanLine(line) {
+  var m = /^([^:\n]{3,70}):(\s|$)/.exec(line);
+  if (m) {
+    var letters = m[1].replace(/[^A-Za-z]/g, ''), up = m[1].replace(/[^A-Z]/g, '');
+    if (letters.length >= 3 && up.length / letters.length >= 0.6) return '<b class="cd-lbl">' + esc(m[1]) + ':</b>' + esc(line.slice(m[1].length + 1));
+  }
+  return esc(line);
+}
+function rxPlanHtml(md, sym) {
+  var paras = String(md || '').replace(/\r/g, '').split(/\n[ \t]*\n/).map(function (p) { return p.replace(/^\s+|\s+$/g, ''); }).filter(Boolean);
+  var id = String(sym || '').replace(/[^A-Za-z0-9_]/g, ''), cut = paras.length, shown = 0;
+  if (paras.join('').length > 900 && paras.length > 1) { cut = 0; while (cut < paras.length && (cut === 0 || shown < 450)) { shown += paras[cut].length; cut++; } }
+  var P = function (p) { return '<div class="cd-p">' + p.split('\n').map(rxPlanLine).join('\n') + '</div>'; };
+  var h = paras.slice(0, cut).map(P).join('');
+  if (cut < paras.length) {
+    var n = paras.length - cut;
+    h += '<div class="cd-more" id="cd-more-' + id + '" hidden>' + paras.slice(cut).map(P).join('') + '</div>'
+      + '<button type="button" class="cd-morebtn" data-more="Read the full plan (' + n + ' more) \u25BE" onclick="rxPlanMore(\'' + id + '\', this)">Read the full plan (' + n + ' more) \u25BE</button>';
+  }
+  return h;
+}
+function rxPlanMore(id, b) {
+  var m = $('cd-more-' + id); if (!m) return;
+  m.hidden = !m.hidden; b.textContent = m.hidden ? b.getAttribute('data-more') : 'Show less \u25B4';
 }
 
 function toggleDeadbags() {
@@ -326,20 +355,20 @@ function loadCardDetail(sym, el) {
   var cs = csMap[sym];
   var h = '';
   if (cs) {
-    h += '<div style="font-size:10px;color:#9aa0aa;margin:8px 0 6px">'
+    h += '<div class="cd-meta" style="font-size:10px;color:#9aa0aa;margin:8px 0 6px">'
       + (cs.status ? 'STATUS: ' + esc(cs.status) + '  ' : '')
       + (cs.role ? '\u00B7 ROLE: ' + esc(cs.role) + '  ' : '')
       + (cs.theme ? '\u00B7 THEME: ' + esc(cs.theme) : '') + '</div>';
   } else {
-    h += '<div style="font-size:10px;color:#888;margin:8px 0 6px">No saved plan \u2014 dead-bag / untracked holding</div>';
+    h += '<div class="cd-meta" style="font-size:10px;color:#888;margin:8px 0 6px">No saved plan \u2014 dead-bag / untracked holding</div>';
   }
-  h += '<div id="cd-lifetime-' + sym + '" style="font-size:10px;color:#888;margin-bottom:6px">Loading P&L...</div>';
+  h += '<div class="cd-pl" id="cd-lifetime-' + sym + '" style="font-size:10px;color:#888;margin-bottom:6px">Loading P&L...</div>';
   if (cs && cs.strategy_md) {
-    h += '<div style="white-space:pre-wrap;font-size:11px;color:#bbb;line-height:1.45;background:#141414;padding:8px;border-radius:4px;margin-bottom:8px">' + esc(cs.strategy_md) + '</div>';
+    h += '<div class="cd-plan" style="white-space:pre-wrap;font-size:11px;color:#bbb;line-height:1.45;background:#141414;padding:8px;border-radius:4px;margin-bottom:8px">' + rxPlanHtml(cs.strategy_md, sym) + '</div>';   // #505
   }
   if (sym === 'XRP') { h += '<div id="cd-xrp-loc-XRP" style="font-size:11px;color:#888;margin-bottom:8px">Loading XRP locations...</div>'; }
-  h += '<div id="cd-tranches-' + sym + '" style="font-size:11px;color:#888;margin-bottom:8px">Loading lots\u2026</div>';
-  h += '<div id="cd-journal-' + sym + '" style="font-size:11px;color:#888">Loading journal\u2026</div>';
+  h += '<div class="cd-lots" id="cd-tranches-' + sym + '" style="font-size:11px;color:#888;margin-bottom:8px">Loading lots\u2026</div>';
+  h += '<div class="cd-journal" id="cd-journal-' + sym + '" style="font-size:11px;color:#888">Loading journal\u2026</div>';
   el.innerHTML = h;
 
   (function(s) {

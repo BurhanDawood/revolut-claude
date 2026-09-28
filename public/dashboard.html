@@ -73,6 +73,41 @@
     .rx-sec:not(.rx-collapsed) > .rx-head::after { transform: rotate(180deg); }
     .rx-sec > .rx-body { display: contents; }
     .rx-sec.rx-collapsed > .rx-body { display: none !important; }
+    /* #505 coin cards readable on a phone (Bryan 29 Sep 00:10 "That's tiny"): the cards keep their compact desktop sizes; in the
+       app and on narrow screens they take phone sizes. The plan reads as paragraphs with bold labels, a long one folded. */
+    .cd-plan .cd-p + .cd-p, .cd-plan .cd-more { margin-top: .75em; }
+    .cd-plan .cd-lbl { color: #ececec; }
+    .cd-morebtn { display: block; margin-top: 10px; padding: 4px 0; background: none; border: 0; color: var(--accent, #00ffc8); font-weight: 600; font-size: 12px; cursor: pointer; }
+    html.in-app .rx-sech { font-size: 13px !important; }
+    html.in-app .rx-coin-head { padding: 14px !important; }
+    html.in-app .rx-coin-sym { font-size: 18px; }
+    html.in-app .rx-role { font-size: 12px !important; padding: 2px 8px !important; vertical-align: 2px; }
+    html.in-app .rx-coin-val { font-size: 16px; }
+    html.in-app .rx-coin-val .rx-sub { font-size: 13px !important; }
+    html.in-app .rx-cd { padding: 0 14px 16px !important; }
+    html.in-app .cd-meta { font-size: 13px !important; line-height: 1.5; margin: 12px 0 8px !important; }
+    html.in-app .cd-pl { font-size: 15px !important; line-height: 1.4; margin-bottom: 10px !important; }
+    html.in-app .cd-pl > div { gap: 2px 14px !important; }
+    html.in-app .cd-plan { font-size: 16px !important; line-height: 1.6 !important; color: #d4d4d4 !important; padding: 14px !important; border-radius: 8px !important; margin-bottom: 12px !important; }
+    html.in-app .cd-morebtn { font-size: 15px !important; }
+    html.in-app .cd-lots, .cd-journal { font-size: 15px !important; }
+    html.in-app .cd-lots > div, .cd-journal > div { padding: 7px 0 !important; }
+    @media (max-width: 700px) {
+      .rx-sech { font-size: 13px !important; }
+      .rx-coin-head { padding: 14px !important; }
+      .rx-coin-sym { font-size: 18px; }
+      .rx-role { font-size: 12px !important; padding: 2px 8px !important; vertical-align: 2px; }
+      .rx-coin-val { font-size: 16px; }
+      .rx-coin-val .rx-sub { font-size: 13px !important; }
+      .rx-cd { padding: 0 14px 16px !important; }
+      .cd-meta { font-size: 13px !important; line-height: 1.5; margin: 12px 0 8px !important; }
+      .cd-pl { font-size: 15px !important; line-height: 1.4; margin-bottom: 10px !important; }
+      .cd-pl > div { gap: 2px 14px !important; }
+      .cd-plan { font-size: 16px !important; line-height: 1.6 !important; color: #d4d4d4 !important; padding: 14px !important; border-radius: 8px !important; margin-bottom: 12px !important; }
+      .cd-morebtn { font-size: 15px !important; }
+      .cd-lots, .cd-journal { font-size: 15px !important; }
+      .cd-lots > div, .cd-journal > div { padding: 7px 0 !important; }
+    }
     .rx-sec.rx-collapsed { padding-top: 14px; padding-bottom: 14px; }
     .rx-sec .rx-peek { color: var(--text-muted); font-weight: 500; font-size: 0.78rem; text-transform: none; letter-spacing: 0; }
 
