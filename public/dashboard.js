@@ -837,6 +837,61 @@ function loadRotations() {
   });
 }
 
+// #507 the live line under the total. Every minute (while the page is visible) it re-reads /api/portfolio/spark and
+// redraws. The points are resampled to a fixed count, so the browser can slide the old line into the new one.
+var RX_SPARK = { ranges: ['1h', '6h', '1d'], label: { '1h': '1 hour', '6h': '6 hours', '1d': '24 hours' }, n: 90, h: 56 };
+var rxSparkRange = (function () { try { var r = localStorage.getItem('rx_spark_range'); return RX_SPARK.label[r] ? r : '6h'; } catch (e) { return '6h'; } })();
+var rxSparkData = null, rxSparkBusy = false;
+function rxSparkLoad() {
+  var box = $('rx-spark'); if (!box || rxSparkBusy || document.hidden) return;
+  rxSparkBusy = true;
+  fetch('/api/portfolio/spark?range=' + rxSparkRange, { cache: 'no-store' })
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (d) { if (d && d.points && d.points.length >= 2) { rxSparkData = d; rxSparkDraw(); } })
+    .catch(function () { /* quiet: the next minute tries again */ })
+    .then(function () { rxSparkBusy = false; });
+}
+function rxSparkDraw() {
+  var box = $('rx-spark'), d = rxSparkData; if (!box || !d) return;
+  box.hidden = false;
+  var svg = box.querySelector('svg'), w = Math.max(120, svg.clientWidth || box.clientWidth || 300), h = RX_SPARK.h, pad = 5;
+  svg.setAttribute('viewBox', '0 0 ' + w + ' ' + h);
+  var pts = d.points, t0 = pts[0][0], t1 = pts[pts.length - 1][0], n = RX_SPARK.n, ys = [];
+  for (var i = 0; i < n; i++) {   // the value at n evenly spaced times (straight line between recorded points)
+    var t = t0 + (t1 - t0) * i / (n - 1), j = 0;
+    while (j < pts.length - 2 && pts[j + 1][0] < t) j++;
+    var a = pts[j], b = pts[j + 1], f = b[0] > a[0] ? Math.min(1, Math.max(0, (t - a[0]) / (b[0] - a[0]))) : 0;
+    ys.push(a[1] + (b[1] - a[1]) * f);
+  }
+  var lo = Math.min.apply(null, ys), hi = Math.max.apply(null, ys), span = hi - lo || Math.max(1, hi * 0.001);
+  var X = function (i) { return (w * i / (n - 1)).toFixed(1); }, Y = function (v) { return (pad + (h - 2 * pad) * (1 - (v - lo) / span)).toFixed(1); };
+  var line = 'M' + ys.map(function (v, i) { return X(i) + ' ' + Y(v); }).join(' L');
+  var area = line + ' L' + X(n - 1) + ' ' + h + ' L0 ' + h + ' Z';
+  var lp = svg.querySelector('.rx-spark-line'), ap = svg.querySelector('.rx-spark-area');
+  lp.style.d = 'path("' + line + '")'; ap.style.d = 'path("' + area + '")';
+  if (!lp.style.d) { lp.setAttribute('d', line); ap.setAttribute('d', area); }   // browsers without CSS d: draw without the slide
+  var dot = box.querySelector('.rx-spark-dot'); dot.style.left = X(n - 1) + 'px'; dot.style.top = Y(ys[n - 1]) + 'px';
+  var up = !(d.change < 0);
+  box.classList.toggle('down', !up);
+  box.querySelector('.rx-spark-range').textContent = RX_SPARK.label[rxSparkRange];
+  box.querySelector('.rx-spark-chg').textContent = d.change == null ? '' : (up ? '+' : '\u2212') + fmtUSD(Math.abs(d.change)) + (d.pct == null ? '' : ' (' + (up ? '+' : '\u2212') + Math.abs(d.pct).toFixed(2) + '%)');
+  box.setAttribute('aria-label', 'Portfolio value, last ' + RX_SPARK.label[rxSparkRange] + ': ' + box.querySelector('.rx-spark-chg').textContent + '. Tap to change the time span.');
+}
+function rxSparkNext() {
+  rxSparkRange = RX_SPARK.ranges[(RX_SPARK.ranges.indexOf(rxSparkRange) + 1) % RX_SPARK.ranges.length];
+  try { localStorage.setItem('rx_spark_range', rxSparkRange); } catch (e) {}
+  rxSparkLoad();
+}
+document.addEventListener('DOMContentLoaded', function () {
+  var box = $('rx-spark'); if (!box) return;
+  box.addEventListener('click', rxSparkNext);
+  box.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); rxSparkNext(); } });
+  rxSparkLoad();
+  setInterval(rxSparkLoad, 60 * 1000);
+  document.addEventListener('visibilitychange', function () { if (!document.hidden) rxSparkLoad(); });
+  var rt = null; window.addEventListener('resize', function () { clearTimeout(rt); rt = setTimeout(rxSparkDraw, 150); });
+});
+
 function refreshAll() {
   var spinner = $('spinner');
   if (spinner) spinner.classList.add('active');
@@ -912,7 +967,7 @@ function rxAppLayout() {
   window.addEventListener('storage', function (e) { if (e.key === 'rx_inbox_seen') rxInboxCount(); });
   // (2) the top card: invested / P&L / break-even under the total; the breakdown by account folded
   var pane = $('tab-portfolio'), top = pane && pane.querySelector('.card'), cap = $('capital-bar'), totals = $('portfolio-totals');
-  if (top && cap) { var pv = $('portfolio-value'); top.insertBefore(cap, pv ? pv.nextSibling : null); }
+  if (top && cap) { var pv = $('rx-spark') || $('portfolio-value'); top.insertBefore(cap, pv ? pv.nextSibling : null); }   // #507 below the live line
   if (top && totals) {
     var fold = document.createElement('details'); fold.className = 'rx-fold';
     fold.innerHTML = '<summary>Breakdown by account</summary>';

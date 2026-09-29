@@ -189,6 +189,22 @@
       letter-spacing: -0.02em;
     }
 
+    /* #507 the live line under the total (Bryan 29 Sep 18:14: "a line that actually moves"): the last 6 hours of the whole
+       book, one point a minute from the portfolio recorder, redrawn every minute with a smooth slide; tap to switch 1h / 6h / 24h */
+    .rx-spark { position: relative; margin: 10px 0 2px; cursor: pointer; color: var(--accent); -webkit-tap-highlight-color: transparent; }
+    .rx-spark.down { color: var(--danger); }
+    .rx-spark-svg { display: block; width: 100%; height: 56px; overflow: visible; }
+    .rx-spark-line { stroke: currentColor; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+    .rx-spark-line, .rx-spark-area { transition: d .9s ease; }
+    .rx-spark-dot { position: absolute; width: 8px; height: 8px; margin: -4px 0 0 -4px; border-radius: 50%; background: currentColor; transition: left .9s ease, top .9s ease; }
+    .rx-spark-dot::after { content: ''; position: absolute; inset: -5px; border-radius: 50%; border: 2px solid currentColor; opacity: 0; animation: rxSparkPulse 2s ease-out infinite; }
+    @keyframes rxSparkPulse { 0% { transform: scale(.4); opacity: .7; } 100% { transform: scale(1.6); opacity: 0; } }
+    .rx-spark-meta { display: flex; gap: 10px; align-items: baseline; margin-top: 4px; font-size: 0.8rem; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+    .rx-spark-chg { color: inherit; font-weight: 600; }
+    .rx-spark .rx-spark-chg { color: var(--accent); } .rx-spark.down .rx-spark-chg { color: var(--danger); }
+    .rx-spark-live { margin-left: auto; font-size: 0.7rem; letter-spacing: .08em; text-transform: uppercase; }
+    @media (prefers-reduced-motion: reduce) { .rx-spark-line, .rx-spark-area, .rx-spark-dot { transition: none; } .rx-spark-dot::after { animation: none; } }
+
     /* ── Holdings list container ────────────────────────────────────────────── */
     .holdings-list { display: flex; flex-direction: column; gap: 10px; }
 
@@ -763,6 +779,7 @@
   <div class="card">
     <div class="card-title">💼 Total Portfolio</div>
     <div id="portfolio-value">—</div>
+    <div id="rx-spark" class="rx-spark" hidden role="button" tabindex="0" aria-label="Portfolio value, last 6 hours. Tap to change the time span."><svg class="rx-spark-svg" aria-hidden="true"><defs><linearGradient id="rxSparkFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="currentColor" stop-opacity=".28"/><stop offset="1" stop-color="currentColor" stop-opacity="0"/></linearGradient></defs><path class="rx-spark-area" fill="url(#rxSparkFill)"/><path class="rx-spark-line" fill="none"/></svg><span class="rx-spark-dot"></span><div class="rx-spark-meta"><span class="rx-spark-range">6 hours</span><span class="rx-spark-chg"></span><span class="rx-spark-live">live</span></div></div>
     <div class="portfolio-totals" id="portfolio-totals" style="display:none">
       <div class="portfolio-sub-row">
         <span class="sub-label">🔄 Revolut X crypto</span>

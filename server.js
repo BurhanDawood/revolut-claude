@@ -26667,7 +26667,8 @@ app.get('/api/portfolio/candles', async (req, res) => {
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 // #490 the widget's chart: the whole book as a short line of closes (read-only, same data as the Portfolio page)
-const PV_SPARK = { '1d': { span: 86400, step: 900 }, '1w': { span: 7 * 86400, step: 7200 }, '1m': { span: 30 * 86400, step: 28800 } };
+const PV_SPARK = { '1h': { span: 3600, step: 60 }, '6h': { span: 21600, step: 120 },   // #507 the live line under the total
+  '1d': { span: 86400, step: 900 }, '1w': { span: 7 * 86400, step: 7200 }, '1m': { span: 30 * 86400, step: 28800 } };
 async function portfolioSpark(range, nowMs = Date.now()) {
   const key = PV_SPARK[range] ? range : '1d', r = PV_SPARK[key];
   const nowS = Math.floor(nowMs / 1000), since = nowS - r.span;
