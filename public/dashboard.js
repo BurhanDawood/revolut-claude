@@ -249,7 +249,7 @@ function renderHoldingsGrid(positions) {
 
   if (btc) {
     var bp = btc.pos ? fmtPrice(btc.pos.current_price) : '';
-    html += '<div onclick="toggleCard(\'BTC\')" style="cursor:pointer;display:flex;justify-content:space-between;align-items:center;padding:8px 12px;margin-bottom:10px;background:#15171c;border:1px solid #333;border-radius:4px">'
+    html += '<div onclick="rxOpenCoin(\'BTC\')" style="cursor:pointer;display:flex;justify-content:space-between;align-items:center;padding:8px 12px;margin-bottom:10px;background:#15171c;border:1px solid #333;border-radius:4px">'
       + '<span style="color:#9aa0aa;font-weight:bold;font-size:12px">\u{1F4E1} BTC \u00B7 MACRO RADAR</span>'
       + '<span style="color:#aaa;font-size:12px">' + bp + ' \u25BE</span></div>'
       + '<div id="card-detail-BTC" style="display:none;margin:-6px 0 12px;padding:0 12px 10px"></div>';
@@ -298,9 +298,9 @@ function makeCard(e, isWatch) {
   }
 
   return '<div class="rx-coin" style="border-left:3px solid ' + border + ';margin-bottom:8px;background:#1a1a1a;border-radius:4px">'   // #505 classes: phone sizes in dashboard.html
-    + '<div class="rx-coin-head" onclick="toggleCard(\'' + sym + '\')" style="cursor:pointer;display:flex;justify-content:space-between;align-items:flex-start;padding:10px 12px">'
+    + '<div class="rx-coin-head" onclick="rxOpenCoin(\'' + sym + '\')" style="cursor:pointer;display:flex;justify-content:space-between;align-items:flex-start;padding:10px 12px">'
     + '<span class="rx-coin-sym" style="color:white;font-weight:bold">' + esc(sym) + (cs ? roleBadge(cs.role) : '') + '</span>'
-    + '<div class="rx-coin-val" style="text-align:right">' + right + ' <span style="color:#666">\u25BE</span></div>'
+    + '<div class="rx-coin-val" style="text-align:right">' + right + ' <span style="color:#666">\u203A</span></div>'
     + '</div>'
     + '<div class="rx-cd" id="card-detail-' + sym + '" style="display:none;padding:0 12px 12px;border-top:1px solid #2a2a2a"></div>'
     + '</div>';
@@ -1010,26 +1010,20 @@ function rxAppLayout() {
 }
 
 // #492 open one coin's card - from a notification (the app shell calls rxFocusCoin, or loads /?app=1#coin=AST).
-// Waits for the holdings to render (up to 20 s), switches to Portfolio, expands the card and scrolls it into view.
-function rxFocusCoin(sym, tries) {
+// #508 a coin now has its own page (/coin?c=AST: live price, candles, levels and everything the card held), so a card tap,
+// a ticker in a notification and a pushed coin all open that page. The hash is cleared first, so Back returns to the
+// dashboard instead of re-opening the coin.
+function rxOpenCoin(sym) {
   sym = String(sym || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 15);
   if (!sym) return;
-  tries = tries || 0;
-  if (tries === 0) switchTab('portfolio');
-  var el = $('card-detail-' + sym);
-  if (!el) {
-    if (tries < 80) { setTimeout(function () { rxFocusCoin(sym, tries + 1); }, 250); return; }
-    showToast(sym + ' is not one of your holdings, so it has no card here.', false); return;
-  }
-  var sec = el.closest && el.closest('.rx-sec.rx-collapsed'); if (sec) sec.classList.remove('rx-collapsed');   // #495 a folded Holdings opens
-  if (el.style.display === 'none' || !el.style.display) toggleCard(sym);
-  var card = el.parentNode;
-  var nav = document.querySelector('.tab-nav'), off = (nav ? nav.getBoundingClientRect().height : 0) + 12;
-  window.scrollTo({ top: Math.max(0, card.getBoundingClientRect().top + window.pageYOffset - off), behavior: 'smooth' });
-  card.style.outline = '2px solid var(--accent)'; card.style.outlineOffset = '2px';
-  setTimeout(function () { card.style.outline = ''; }, 3000);
+  location.href = '/coin?c=' + sym + (document.documentElement.classList.contains('in-app') ? '&app=1' : '');
 }
-function rxFocusFromHash() { var m = /[#&]coin=([A-Za-z0-9]{1,15})/.exec(location.hash); if (m) rxFocusCoin(m[1]); }
+function rxFocusCoin(sym) { rxOpenCoin(sym); }
+function rxFocusFromHash() {
+  var m = /[#&]coin=([A-Za-z0-9]{1,15})/.exec(location.hash); if (!m) return;
+  try { history.replaceState(null, '', location.pathname + location.search); } catch (e) {}
+  rxOpenCoin(m[1]);
+}
 window.addEventListener('hashchange', rxFocusFromHash);
 
 document.addEventListener('DOMContentLoaded', function() {
