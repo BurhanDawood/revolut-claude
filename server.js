@@ -633,6 +633,36 @@ function appInboxRecord(message, replyMarkup, push, nowMs = Date.now()) {
       .catch(e => { if (!appInboxWarned) { appInboxWarned = true; console.warn('[inbox] #500 not recorded: ' + e.message); } return null; });
   } catch (e) { return null; /* the feed must never break a Telegram send */ }
 }
+// #506 ALERT VOLUME (Bryan 29 Sep 17:31: "an extensive review of all the alerts ... We need to smarten these alerts up so I'm
+// not spammed so much"). Read-only: counts what the feed recorded, grouped by alert TYPE - the first line with numbers, amounts
+// and tracked coins blanked ("🎯 COIN FIXED TARGET HIT!") - with the category, buttons, what reached the phone, and examples.
+// Served inside get_trading_data dev_health (opt-in), so no connector change.
+function appAlertSig(text) {
+  const first = String(text || '').replace(/<br\s*\/?>/gi, '\n').replace(/<[^>]+>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&')
+    .split('\n').map(s => s.trim()).filter(Boolean)[0] || '';
+  return first.replace(/[$£€]?[-+−]?\d[\d.,]*(?:[KkMmBb](?![a-z])|%|x(?![a-z])|×)?/g, '#')
+    .replace(/\b[A-Z][A-Z0-9]{1,11}\b/g, (w) => (appPushCoinWord(w) && appPushKnownCoin(w) ? 'COIN' : w))
+    .replace(/\s+/g, ' ').trim().slice(0, 100);
+}
+async function appAlertVolume(days) {
+  const d = Math.min(Math.max(parseInt(days, 10) || 7, 1), 60), since = Math.floor(Date.now() / 1000) - d * 86400;
+  const [rows] = await db.execute('SELECT id, ts, cat, text, kb, push FROM app_inbox WHERE ts >= ? ORDER BY id DESC LIMIT 6000', [since]);
+  const hr = (ts) => Number(new Date(ts * 1000).toLocaleTimeString('en-GB', { timeZone: 'Europe/London', hour: '2-digit', hour12: false }).slice(0, 2));
+  const day = (ts) => new Date(ts * 1000).toLocaleDateString('en-CA', { timeZone: 'Europe/London' });
+  const types = new Map(), byCat = {}, byDay = {}, byHour = new Array(24).fill(0), byPush = {};
+  for (const r of rows) {
+    const ts = Number(r.ts), sig = appAlertSig(r.text), push = String(r.push || '').replace(/ - .*/, '') || 'none';
+    byCat[r.cat] = (byCat[r.cat] || 0) + 1; byDay[day(ts)] = (byDay[day(ts)] || 0) + 1; byHour[hr(ts)]++; byPush[push] = (byPush[push] || 0) + 1;
+    let t = types.get(sig);
+    if (!t) { t = { type: sig, cat: r.cat, count: 0, with_buttons: 0, first: ts, last: ts, push: {}, examples: [] }; types.set(sig, t); }
+    t.count++; if (r.kb) t.with_buttons++; t.first = Math.min(t.first, ts); t.last = Math.max(t.last, ts); t.push[push] = (t.push[push] || 0) + 1;
+    if (t.examples.length < 2) t.examples.push({ id: Number(r.id), at: new Date(ts * 1000).toISOString(), text: String(r.text || '').replace(/<[^>]+>/g, '').slice(0, 400) });
+  }
+  const span_h = rows.length ? Math.max(1, (Date.now() / 1000 - Math.min(...rows.map(r => Number(r.ts)))) / 3600) : 0;
+  const list = [...types.values()].sort((a, b) => b.count - a.count).map(t => Object.assign(t, { per_day: span_h ? +(t.count / span_h * 24).toFixed(1) : 0, first: new Date(t.first * 1000).toISOString(), last: new Date(t.last * 1000).toISOString() }));
+  return { window_days: d, messages: rows.length, hours_covered: +span_h.toFixed(1), per_day: span_h ? +(rows.length / span_h * 24).toFixed(1) : 0,
+    by_category: byCat, by_day: byDay, by_london_hour: byHour, phone_result: byPush, types: list.slice(0, 120), types_total: list.length };
+}
 // The bot's @name, for the page's "Open Telegram" link (asked once; a failure is asked again after 10 min).
 async function appInboxBotName(nowMs = Date.now()) {
   if (appInboxBot) return appInboxBot;
@@ -22710,6 +22740,7 @@ let rows;
           const up = process.uptime();
           dh.runtime = { booted_at: new Date(Date.now() - up * 1000).toISOString(), uptime_min: Math.round(up / 60) };
         } catch (e) { dh.runtime = { error: e.message }; }
+        try { dh.alert_volume = await appAlertVolume(days); } catch (e) { dh.alert_volume = { error: e.message }; }   // #506 (days: default 7, max 60)
         dh.notes.push('live deploy status: use Railway MCP (not visible server-side)');
         try {
           const [aeR] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'ai_auto_execute'");
