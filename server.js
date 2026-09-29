@@ -198,17 +198,42 @@ async function placeRevolutOrder(symbol, side, orderType, baseSize, price = null
   // hash47a Phase A - record every order placed (additive; no pipeline change).
   // Captures venue order id + initial status so the Phase B fill-confirmation loop can later
   // run side-effects on confirmed fill (via GET /orders/{id}, confirmed to exist) instead of at placement.
+  let placedState = '', placedId = '';   // #511
   try {
     // #47 B1.5: place-order response is { data: { venue_order_id, client_order_id, state } } (docs-confirmed).
     const od = (result && result.data) ? result.data : (result || {});
     const oid = od.venue_order_id || od.id || od.order_id || clientOrderId;
     const initStatus = od.state || od.status || (orderType === 'limit' ? 'pending_new' : 'filled');
+    placedState = String(od.state || od.status || '').toLowerCase(); placedId = String(oid);
     await db.execute(
       'INSERT INTO pending_orders (order_id, client_order_id, symbol, side, order_type, quantity, limit_price, status, last_pipeline_qty) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE status = VALUES(status)',
       [String(oid), clientOrderId, revolutSymbol, side.toUpperCase(), orderType, (sizeStr != null ? Number(sizeStr) : (baseSize != null ? baseSize : null)), (price != null ? price : null), initStatus, Number(pipelinedQty) || 0]
     );
     if (orderType === 'limit') console.log('[orders] Recorded resting LIMIT order ' + oid + ' ' + side + ' ' + revolutSymbol + ' @ ' + price + ' (status ' + initStatus + ')');
   } catch (e) { console.error('[orders] pending_orders capture failed:', e.message); }
+  // #511 (AST 29 Sep 21:54): Revolut X answered HTTP 200 with state "cancelled" for a MARKET sell (its slippage protection on
+  // a thin book) and the caller journaled it as a fill, ringfenced proceeds that never arrived and started a buy-back cycle.
+  // A placement whose state is already dead is checked against the venue's own order record (Fable: a cancel can follow a
+  // PARTIAL fill, and the placement response carries no filled quantity): a confirmed zero fill is a REFUSAL - thrown with
+  // venue_refused, so the #93 path restores the trail and retries and no caller records a sale; a partial fill is returned as
+  // a fill of exactly that size (sent_base_size = filled, as #14), so the caller journals what really sold; an unconfirmable
+  // one is thrown WITHOUT the flag, so it stays "may have reached the venue" (S2-1).
+  if (/cancel|reject|fail|expire/.test(placedState)) {   // the same dead-state test as floorCappedLimitSell (kept inline: the repo's money tests load each function alone)
+    let filled = null, avg = null;
+    try { const rr = await revolutRequest('GET', '/orders/' + placedId); const d = (rr && rr.data) || rr || {}; filled = d.filled_quantity != null ? Number(d.filled_quantity) : 0; avg = d.average_fill_price != null && Number(d.average_fill_price) > 0 ? Number(d.average_fill_price) : null; }
+    catch (e) { filled = null; }
+    if (filled > 0) {
+      console.log('[revolut] #511 ' + revolutSymbol + ' ' + orderType + ' ' + side + ' ' + placedState + ' after a PARTIAL fill of ' + filled + (avg ? ' at ' + avg : '') + ' - returned as a fill of that size');
+      await db.execute('UPDATE pending_orders SET filled_quantity = ?, avg_fill_price = ?, last_pipeline_qty = ? WHERE order_id = ?', [filled, avg, filled, placedId]).catch(() => {});
+      return { ...result, client_order_id: clientOrderId, sent_base_size: String(filled), partial_fill: filled, avg_fill_price: avg };
+    }
+    const re = new Error('Revolut X ' + placedState + ' the ' + orderType + ' ' + side.toUpperCase() + ' ' + revolutSymbol + ' at placement (order ' + placedId + ')' +
+      (orderType === 'market' ? ' - usually its slippage protection on a thin book' : '') +
+      (filled === 0 ? '. Nothing was sold' + (orderType === 'market' ? '; a LIMIT at the bid is the way through' : '') : '. The fill could NOT be confirmed (the order read failed), so it may have partly filled - check Revolut X') + '.');
+    re.venue_status = rs.status; re.venue_state = placedState; if (filled === 0) re.venue_refused = true;
+    console.error('[revolut] #511 ' + re.message);
+    throw re;
+  }
   return { ...result, client_order_id: clientOrderId, sent_base_size: sizeStr };   // #14 the size actually sent (callers journal it)
 }
 
@@ -17321,12 +17346,14 @@ async function autoExecuteSell(symbol, maxPct, analysis, confidence, opts = {}) 
     return { executed: true, qty: sellQty, price: currentPrice, client_order_id: aeOrder && aeOrder.client_order_id, journal_id: aeRevIns && aeRevIns.insertId, chase: opts.chase ? aeLim : undefined }; // #309 #359 #B23
   } catch (e) {
     console.error('[auto-exec] sell error:', e.message);
-    if (aeOrderSent) await sendTelegram(`❌ AUTO-EXEC FAILED — ${coinBase}\nError: ${e.message}\nManual review needed`);
+    if (e.venue_refused) { const lastR = _aeRefusedTold.get(coinBase) || 0; if (Date.now() - lastR > 10 * 60000) { _aeRefusedTold.set(coinBase, Date.now()); await sendTelegram('⚠️ AUTO-EXEC: ' + coinBase + ' sale not placed - ' + String(e.message || '').slice(0, 300) + ' The trailing stop is put back and it retries; nothing was sold.').catch(() => {}); } }   // #511 a venue refusal: no 'manual review', one line per coin per 10 min
+    else if (aeOrderSent) await sendTelegram(`❌ AUTO-EXEC FAILED — ${coinBase}\nError: ${e.message}\nManual review needed`);
     else await sendTelegram(`⚠️ AUTO-EXEC: ${coinBase} sale not placed - the error came before any order was sent (${String(e.message || '').slice(0, 120)}). Nothing was sold.`).catch(() => {});   // #K1
-    return { executed: false, reason: 'error', message: e.message, order_sent: aeOrderSent, venue_status: e.venue_status || null }; // #309 #K1
+    return { executed: false, reason: 'error', message: e.message, order_sent: aeOrderSent, venue_status: e.venue_status || null, venue_refused: !!e.venue_refused }; // #309 #K1 #511
   }
 }
 
+const _aeRefusedTold = new Map();   // #511 coin -> last time a venue refusal was reported
 async function autoResetTrailingStop(symbol) {
   const coinBase = symbol.replace('-USD', '');
   try {
@@ -17362,6 +17389,7 @@ function isDefinitiveVenueRejection(venue, r) {   // a refusal that locks the wh
 }
 function isVenueRefusal(venue, r) {   // the venue answered and refused: nothing was placed, so the trail can be restored
   if (isDefinitiveVenueRejection(venue, r)) return true;
+  if (r && r.venue_refused) return true;   // #511 placement answered with state cancelled/rejected: nothing on the book, nothing filled
   const st = Number(r && r.venue_status);
   return venue !== 'kraken' && st >= 400 && st < 500;   // Revolut X 400/401/403/422...: refused (Fable 20:50) - per-coin retry, no back-off
 }
@@ -20535,7 +20563,7 @@ async function spikeChase(symbol, coin, qty, ch, o = {}) {
     let r;
     if (o.onSend) o.onSend();   // #K1: from the first venue call on, an order may have been sent
     try { r = await sell(symbol, left, lim, bid, ch.cid + '-' + k, { polls: Number(cfg.chase_polls) || 3 }); }
-    catch (e) { if (!out.filled_qty && !out.orders.length) throw e; out.stopped = 'error'; out.error = String(e.message || e).slice(0, 160); break; }
+    catch (e) { if (!out.filled_qty && !out.orders.length) throw e; out.stopped = e.venue_refused ? 'refused' : 'error'; out.error = String(e.message || e).slice(0, 160); break; }   // #511 a refused placement leaves nothing resting
     out.steps++; lastLim = lim;
     out.orders.push({ order_id: r.order_id, limit: r.limit_price, filled: r.filled_qty, avg: r.avg_price, state: r.state, order: r.order });
     if (r.filled_qty > 0) { out.filled_qty += r.filled_qty; out.usd += r.filled_qty * (r.avg_price || r.limit_price); }
@@ -20546,7 +20574,7 @@ async function spikeChase(symbol, coin, qty, ch, o = {}) {
   out.avg_price = out.filled_qty > 0 ? out.usd / out.filled_qty : null;
   return out;
 }
-const SPIKE_STOP_WHY = { done: 'all sold', give_up: 'reached the give-up line', floor: 'reached your cost floor', steps: 'used all its steps', no_price: 'no live price', error: 'an order error', cancel_failed: 'a cancel did not confirm' };
+const SPIKE_STOP_WHY = { done: 'all sold', give_up: 'reached the give-up line', floor: 'reached your cost floor', steps: 'used all its steps', no_price: 'no live price', error: 'an order error', cancel_failed: 'a cancel did not confirm', refused: 'Revolut X refused the next step (nothing resting)' };   // #511
 function spikeChaseText(coin, qty, ch) {
   return '🛡️ <b>' + escTg(coin) + ' chasing-limit sale</b>: filled ' + Number(ch.filled_qty.toPrecision(8)) + ' of ' + Number(Number(qty).toPrecision(8)) + (ch.avg_price ? ' at an average $' + Number(ch.avg_price.toPrecision(6)) : '') +
     ' in ' + ch.steps + ' step' + (ch.steps === 1 ? '' : 's') + ' (bid at the start $' + (ch.start_bid ? Number(ch.start_bid.toPrecision(6)) : '?') + '). Stopped: ' + (SPIKE_STOP_WHY[ch.stopped] || ch.stopped) +
