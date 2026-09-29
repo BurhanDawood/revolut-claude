@@ -28,8 +28,15 @@ final class Push {
     /** The alert categories, in the order the app and RxNotify.channels() list them. One list: CAT_RE must match it. */
     static final String[] CATS = { "needs", "money", "price", "loops", "agent", "reports", "system" };
     static final String CAT_RE = "needs|money|price|loops|agent|reports|system";
-    /** What this app can show; the server stores it with the token. "ch2" = the four rx_* channels, "ch3" = the rx_c_* ones. */
-    static final String CAPS = "ch2,ch3";
+    // v11 (batch 514): the rip alarm. Its own channel, sent only as a data-only message with data.alarm = "1"
+    static final String CHANNEL_ALARM = "rx_alarm";
+    /** RxNotify's name for the rip alarm row; openChannel accepts it besides the categories. */
+    static final String ALARM_CAT = "alarm";
+    /**
+     * What this app can show; the server stores it with the token. "ch2" = the four rx_* channels, "ch3" = the rx_c_*
+     * ones, "alarm" = the rip alarm (data-only, data.alarm = "1", shown on rx_alarm).
+     */
+    static final String CAPS = "ch2,ch3,alarm";
 
     static boolean isCatChannel(String ch) {
         return ch != null && ch.startsWith(CHANNEL_CAT_PREFIX) && ch.substring(CHANNEL_CAT_PREFIX.length()).matches(CAT_RE);

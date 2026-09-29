@@ -27,8 +27,12 @@ public class RxMessagingService extends MessagingService {
 
     @Override
     public void onMessageReceived(@NonNull RemoteMessage msg) {
-        super.onMessageReceived(msg);
         Map<String, String> data = msg.getData();
+        if ("1".equals(data.get("alarm"))) {   // v11: the rip alarm (data-only, high priority), before anything else
+            RipAlarm.show(this, data);
+            return;
+        }
+        super.onMessageReceived(msg);
         RemoteMessage.Notification n = msg.getNotification();
         String title = n != null && n.getTitle() != null ? n.getTitle() : data.get("title");
         String body = n != null && n.getBody() != null ? n.getBody() : data.get("body");

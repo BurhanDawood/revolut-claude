@@ -186,6 +186,37 @@ The list of categories lives in one place: `Push.CATS` / `Push.CAT_RE` (`needs|m
 
 The shell's More → Notifications shows "🔔 <sound> · vibrates  Change ›" per category, calls `openChannel` on Change, and calls `channels()` again when the app comes back to the foreground, so a newly picked sound shows up after Back.
 
+### v11: the rip alarm (caps `alarm`)
+
+When a coin Bryan holds is up 30%+ in 24 h, the server (batch 514) sends **one** alarm per coin per day. The phone rings and vibrates like an alarm clock, through quiet hours and Do Not Disturb.
+
+| id | name in Android settings | description | importance | sound | vibration |
+|---|---|---|---|---|---|
+| `rx_alarm` | Rip alarm | Rings like an alarm when a coin you hold is up 30%+ in a day | HIGH | the phone's alarm tone (else ringtone, else notification sound), `USAGE_ALARM` | its own pattern: three quick taps then a long buzz, twice (`0, 150, 100, 150, 100, 150, 400, 900, 600, 150, 100, 150, 100, 150, 400, 900`) |
+
+The channel also has `setBypassDnd(true)` (Android honours it only if the app has Do Not Disturb access) and public lock-screen visibility. It is created with the others on every start and is outside the two groups. Same rule as every channel: never deleted, re-created or reused, and its tone is Bryan's to change on Android's page for it (the app never overrides it). `USAGE_ALARM` is what plays it at alarm volume and lets it through Do Not Disturb's default "alarms allowed" rule.
+
+**alarm contract.** The app registers with `"caps": "ch2,ch3,alarm"`. To a device with `alarm` the server sends a **data-only** FCM message (no `notification` block), `android.priority = "high"`, so it always reaches `RxMessagingService.onMessageReceived`, even with the app closed:
+
+```json
+{ "alarm": "1", "channel": "rx_alarm", "cat": "needs", "tab": "home", "coin": "AST", "inbox": "12345",
+  "title": "🚨 RIP ALARM - AST +46.8% in 24 h", "body": "Now $0.008 - you hold $148.70 of AST. …" }
+```
+
+Devices without `alarm` get an ordinary loud notification instead. When `data.alarm` is `"1"` the app handles it before anything else (`RipAlarm.show`) and shows nothing else for that message:
+- `coin` must match `^[A-Z0-9]{1,15}$` and `inbox` must be digits, else they are dropped; `title` (max 80 chars) and `body` (max 300) are only ever shown as plain text. Nothing else from the payload reaches an intent.
+- A notification on `rx_alarm`: `CATEGORY_ALARM`, `PRIORITY_MAX`, **`FLAG_INSISTENT`** (sound and vibration repeat until it is tapped, stopped or swiped), `setTimeoutAfter(10 min)` (it stops by itself), auto-cancel, one **Stop** button (a broadcast that cancels it, silencing it at once). Id `9000 + (coin.hashCode() & 0xfff)`, so a repeat for the same coin replaces the alarm.
+- Tapping it opens the same deep link as any notification (`home`, the coin, the feed id).
+- **Full-screen intent** → `AlarmActivity`: over the lock screen, turning the screen on. Dark, big title and body, two buttons: **Open <coin>** (stops the alarm, asks to unlock, then opens the coin's page) and **Stop**. Back is Stop. Native views only: no web content, no network, no JS bridge. It closes itself after 10 minutes.
+- If Android refuses the full-screen intent (Android 14+ can ask the user to allow "full-screen notifications" for the app), the heads-up notification still rings with the insistent sound. `RxNotify.channels()` reports this as `full_screen: false` on the alarm row.
+
+**One new permission:** `USE_FULL_SCREEN_INTENT`, so the alarm can take over the screen like an alarm clock (Bryan asked for that). Nothing else was added.
+
+**RxNotify (v11).** `channels()` adds an 8th row after the seven categories: `{ cat: "alarm", id: "rx_alarm", exists, blocked, sound, vibrate, full_screen }` (same meanings as above). `openChannel({ cat: "alarm" })` opens Android's page for `rx_alarm`; the accepted values are exactly the seven category ids plus `alarm`. The server's More → Notifications shows the 🚨 Rip alarm card with "🔔 <tone> · alarm vibration   Change ›" (batch 515).
+
+**Testing it.** The Firebase console's "test message" cannot send data-only messages. Use the server's test path, or FCM HTTP v1 directly (`POST https://fcm.googleapis.com/v1/projects/<project>/messages:send`, a service-account OAuth token in the `Authorization` header, never pasted anywhere) with
+`{ "message": { "token": "<device token>", "android": { "priority": "high" }, "data": { "alarm": "1", "title": "🚨 RIP ALARM - TEST +31% in 24 h", "body": "test", "coin": "AST", "inbox": "" } } }`.
+
 ## Push notifications
 
 The app side ships in v1 and stays off until Firebase is set up:

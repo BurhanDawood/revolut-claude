@@ -23,6 +23,9 @@ import com.getcapacitor.annotation.CapacitorPlugin;
  * v10 (batch 503). Called by the shell's More → Notifications screen:
  *   Capacitor.Plugins.RxNotify.channels()          → { app_blocked, channels: [ { cat, id, exists, blocked, sound, vibrate } ] }
  *   Capacitor.Plugins.RxNotify.openChannel({ cat }) → opens Android's own settings page for rx_c_<cat>
+ * v11 (batch 514/515): channels() also lists the rip alarm as { cat: "alarm", id: "rx_alarm", ..., full_screen } after the
+ * seven categories (full_screen: false when Android 14+ does not let the app take over the screen), and
+ * openChannel({ cat: "alarm" }) opens Android's page for rx_alarm.
  * Each category's sound and vibration belong to the user (Android's page); the app only reads them. A sound's name is
  * returned, never its URI, and nothing is logged. The only value from JS that reaches an intent is a validated cat.
  */
@@ -51,6 +54,16 @@ public class RxNotifyPlugin extends Plugin {
                 row.put("vibrate", ch != null && ch.shouldVibrate());
                 list.put(row);
             }
+            NotificationChannel alarm = nm != null ? nm.getNotificationChannel(Push.CHANNEL_ALARM) : null;
+            JSObject row = new JSObject();
+            row.put("cat", Push.ALARM_CAT);
+            row.put("id", Push.CHANNEL_ALARM);
+            row.put("exists", alarm != null);
+            row.put("blocked", alarm != null && isBlocked(nm, alarm));
+            row.put("sound", alarm != null ? soundName(ctx, alarm.getSound()) : "");
+            row.put("vibrate", alarm != null && alarm.shouldVibrate());
+            row.put("full_screen", canFullScreen(ctx));
+            list.put(row);
         }
         out.put("channels", list);
         call.resolve(out);
@@ -59,7 +72,10 @@ public class RxNotifyPlugin extends Plugin {
     @PluginMethod
     public void openChannel(PluginCall call) {
         String cat = call.getString("cat");
-        if (cat == null || !cat.matches(Push.CAT_RE)) {
+        String channelId;
+        if (cat != null && cat.matches(Push.CAT_RE)) channelId = Push.CHANNEL_CAT_PREFIX + cat;
+        else if (Push.ALARM_CAT.equals(cat)) channelId = Push.CHANNEL_ALARM;
+        else {
             call.reject("unknown category");
             return;
         }
@@ -70,7 +86,7 @@ public class RxNotifyPlugin extends Plugin {
                 MainActivity.ensureChannels(ctx);
                 Intent channel = new Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS)
                     .putExtra(Settings.EXTRA_APP_PACKAGE, pkg)
-                    .putExtra(Settings.EXTRA_CHANNEL_ID, Push.CHANNEL_CAT_PREFIX + cat);
+                    .putExtra(Settings.EXTRA_CHANNEL_ID, channelId);
                 try {
                     start(channel);
                 } catch (ActivityNotFoundException e) {
@@ -90,6 +106,17 @@ public class RxNotifyPlugin extends Plugin {
             getActivity().startActivity(i);
         } else {
             getContext().startActivity(i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+        }
+    }
+
+    /** Android 14+ lets the user turn off full-screen notifications for an app; before that it is always allowed. */
+    private static boolean canFullScreen(Context ctx) {
+        if (Build.VERSION.SDK_INT < 34) return true;
+        try {
+            NotificationManager nm = ctx.getSystemService(NotificationManager.class);
+            return nm == null || nm.canUseFullScreenIntent();
+        } catch (Exception e) {
+            return true;
         }
     }
 

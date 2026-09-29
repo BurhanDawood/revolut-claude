@@ -7,7 +7,9 @@ import android.app.NotificationManager;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.app.Notification;
 import android.media.AudioAttributes;
+import android.media.RingtoneManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -18,6 +20,7 @@ import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
 import android.webkit.WebView;
 import androidx.activity.OnBackPressedCallback;
+import androidx.annotation.RequiresApi;
 import androidx.appcompat.app.AppCompatDelegate;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
@@ -322,6 +325,43 @@ public class MainActivity extends BridgeActivity {
             c.setGroup(GROUP_CATS);
             nm.createNotificationChannel(c);
         }
+
+        // v11: the rip alarm. Alarm tone at alarm volume (USAGE_ALARM also lets it through Do Not Disturb's default
+        // "alarms allowed"), its own vibration pattern. The user may pick another tone on Android's page for it; the
+        // app never overrides that. This id must never be deleted, re-created or reused with other settings.
+        try {
+            nm.createNotificationChannel(alarmChannel());
+        } catch (Exception ignored) {
+            // leave it as it is
+        }
+    }
+
+    /** Three quick taps then a long buzz, twice: unlike any other notification on the phone. Fixed once rx_alarm exists. */
+    static final long[] ALARM_VIBRATION = { 0, 150, 100, 150, 100, 150, 400, 900, 600, 150, 100, 150, 100, 150, 400, 900 };
+
+    static Uri alarmTone() {
+        Uri u = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM);
+        if (u == null) u = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE);
+        if (u == null) u = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION);
+        return u;
+    }
+
+    @RequiresApi(Build.VERSION_CODES.O)
+    private static NotificationChannel alarmChannel() {
+        NotificationChannel c = new NotificationChannel(Push.CHANNEL_ALARM, "Rip alarm", NotificationManager.IMPORTANCE_HIGH);
+        c.setDescription("Rings like an alarm when a coin you hold is up 30%+ in a day");
+        c.setSound(
+            alarmTone(),
+            new AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_ALARM)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                .build()
+        );
+        c.enableVibration(true);
+        c.setVibrationPattern(ALARM_VIBRATION);
+        c.setBypassDnd(true);   // honoured only if the user gave the app Do Not Disturb access; harmless otherwise
+        c.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
+        return c;
     }
 
     private void startPush() {
