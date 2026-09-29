@@ -1592,6 +1592,7 @@ const alertRecommendations = new Map();      // symbol -> { rec, timestamp } —
 const responseCache = new Map();             // 'type:symbol' -> { response, timestamp } — 30-min cache for sell/buy advice
 const trailingStops = new Map();             // symbol -> { trailPct, peakPrice, stopPrice, entryPrice }
 const mssAlertState = new Map();             // #49B symbol|tf -> { status, lastFiredStatus, lastFiredAt } -- MSS alert flip-detection
+let abnBroadLastAt = 0;   // #513 the last BROAD MARKET MOVE summary (ms)
 const abnAlertState = new Map();             // #50B symbol -> lastFiredAt (ms) -- abnormal-move alert cooldown
 const targetExtremes = new Map();            // symbol -> { high, low } — high-water/low-water per target across polls (resets on fire/ack/remove)
 const trailingStopAlerted = new Map();       // symbol -> timestamp — tracks recently-triggered trailing stops for hold reply
@@ -6747,8 +6748,12 @@ async function evaluateAbnormalAlerts() {
       const dumps = broadCoins.filter(sym => states[sym].direction === 'DUMP').length;
       const msg = 'BROAD MARKET MOVE: ' + broadCoins.length + ' coins >='
         + (abnConfig.broad_floor_pct || 3) + '% abnormal (' + pumps + ' PUMP / ' + dumps + ' DUMP)';
+      // #513 the summary had no cooldown of its own: in a volatile hour it repeated every 2-min cycle. At most one per
+      // broad_cooldown_min (default 120); in between the individual alerts stay held back, as before.
+      if (now - abnBroadLastAt < (Number(abnConfig.broad_cooldown_min) || 120) * 60000) return;
       try {
         await sendTelegram(msg);
+        abnBroadLastAt = now;
         for (const sym of abnCoins) abnAlertState.set(sym, now);
       } catch (err) { console.error('[abn] broad send', err.message); }
       return;
