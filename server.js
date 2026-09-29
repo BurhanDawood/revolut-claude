@@ -439,7 +439,9 @@ async function appPushSend(note, onlyToken = null) {
   for (const d of devices) {
     const ch = note.route ? appPushChannelFor(note.route, d.caps, note.cat) : note.channel;   // #498 the channel carries the sound/vibrate choice; #503 + the category's tone
     const loud = note.route ? (note.cat === 'needs' || note.route.sound || note.route.vibrate) : note.channel === 'alerts';
-    const msg = { message: { token: d.token,
+    const msg = note.alarm && /\balarm\b/.test(String(d.caps || ''))   // #514 app-v11: data-only, the app shows it on its alarm channel
+      ? { message: { token: d.token, data: { alarm: '1', tab: note.tab, coin: note.coin || '', channel: 'rx_alarm', cat: 'needs', inbox: note.inbox ? String(note.inbox) : '', title: note.title, body: note.body || '' }, android: { priority: 'high', ttl: '600s' } } }
+      : { message: { token: d.token,
       notification: { title: note.title, body: note.body || '' },
       data: { tab: note.tab, coin: note.coin || '', channel: ch, cat: note.cat || '', inbox: note.inbox ? String(note.inbox) : '', title: note.title, body: note.body || '' },   // #501 inbox
       android: { priority: loud ? 'high' : 'normal', notification: { channel_id: ch } } } };
@@ -465,9 +467,12 @@ function appPushMirror(message, replyMarkup, inboxP) {
     if (!note) return '';
     const at = alertTreatment(message, note.coin);   // #512 Bryan's family picks: only 'keep' reaches the phone
     if (at.treatment !== 'keep') { const res = at.treatment === 'drop' ? 'dropped (' + at.fam + ')' : at.treatment + ' - feed only'; appPushRecent(note, res); return res; }
+    if (RIP_ALARM_TITLE.test(note.title)) { note.alarm = true; note.cat = 'needs'; note.route = { send: true, sound: true, vibrate: true, result: 'alarm' }; }   // #514 rings through quiet hours, switches and the cap
+    else {
     note.route = appPushRoute(note.cat);   // #498 Bryan's settings: category on/off, sound, vibrate, quiet hours
     if (!note.route.send) { appPushRecent(note, 'off - not sent'); return 'off - not sent'; }
     if (!appPushAllow(note.cat)) { appPushStats.dropped++; appPushRecent(note, 'held back - hourly cap'); return 'held back - hourly cap'; }
+    }
     appPushRecent(note, note.route.result);
     // #501 wait (at most 3 s) for the feed row's id, so tapping the notification opens that message in the app
     const idWait = inboxP ? Promise.race([Promise.resolve(inboxP).catch(() => null), new Promise(r => setTimeout(() => r(null), 3000))]) : Promise.resolve(null);
@@ -681,7 +686,7 @@ const ALERT_FAMILY_DEFAULTS = { approvals: 'keep', failures: 'keep', moneyq: 'ke
   shadow: 'drop', agent: 'digest', deskfyi: 'quiet', brief: 'keep', reviews: 'digest', system: 'drop', resync: 'quiet', echo: 'quiet' };
 const ALERT_FAMILY_NAMES = { broad: 'Broad market moves', insurance: 'Loop insurance', health: 'Loop health', agent: 'Paper agent', reviews: 'Follow-ups and reviews' };
 // Failures and decisions: never quieted by a family pick (they belong to "Needs you").
-const ALERT_LOUD = /APPROVAL NEEDED|YOUR CALL|FAILED|WATCHDOG|CAPITAL INTEGRITY|unaudited|short by \$|could not be cancelled|still refusing|HALTED|[Ff]rozen|→ DEAD|Not you\?|New app device|Device limit|for your confirmation|Possible duplicate|LAST CALL|you can fund/;
+const ALERT_LOUD = /RIP ALARM|APPROVAL NEEDED|YOUR CALL|FAILED|WATCHDOG|CAPITAL INTEGRITY|unaudited|short by \$|could not be cancelled|still refusing|HALTED|[Ff]rozen|→ DEAD|Not you\?|New app device|Device limit|for your confirmation|Possible duplicate|LAST CALL|you can fund/;
 // First match wins. Tested against the text with tags stripped (the whole message, not only the title).
 const ALERT_FAMILY_RULES = [
   ['echo', /^📱 Answered from the app|^HOLD [A-Z0-9]{2,12}\b|^Holding [A-Z0-9]{2,12} @/],
@@ -791,6 +796,48 @@ async function alertDigest(nowMs = Date.now()) {
   return { sent: true, messages: rows.length, families: Object.fromEntries([...by.entries()].map(([f, g]) => [f, g.n])), push: result };
 }
 cron.schedule('0 21 * * *', () => { alertDigest().then(r => console.log('[digest] #512 ' + JSON.stringify(r))).catch(e => console.error('[digest] #512 failed: ' + e.message)); }, { timezone: 'Europe/London' });
+// #514 RIP ALARM (Bryan 30 Sep 00:00 "an app feature that makes my phone ring and vibrate like I have an alarm going when one of my
+// coins is ripping upwards more than say 30%"; his picks: +30% within 24 h, and it rings through quiet hours and Do Not Disturb).
+// A coin he HOLDS (worth MORE than min_usd, $5 - Bryan 00:03 "only ring on an asset worth more than $5") that is up >= pct over the same 24 h measure the DAILY PUMP alert uses rings ONCE per coin per
+// London day (remembered in system_config, so a deploy cannot ring it twice). The message goes through sendTelegram like any other
+// (Telegram record + feed); the phone mirror sees the 🚨 RIP ALARM title and sends it as an alarm: past quiet hours, the category
+// switches and the hourly cap. app-v11 (caps 'alarm') rings it on its alarm channel until tapped; an older app gets a loud
+// Needs-you notification. Alert only: nothing trades. Config: system_config 'rip_alarm' {enabled, pct, min_usd}.
+const RIP_ALARM_DEFAULTS = { enabled: true, pct: 30, min_usd: 5 };
+const RIP_ALARM_TITLE = /^🚨 RIP ALARM\b/;
+let ripAlarmCfg = { ...RIP_ALARM_DEFAULTS }, ripAlarmSent = {}, ripAlarmLoadedAt = 0, ripAlarmBusy = new Set();
+async function ripAlarmLoad(nowMs = Date.now()) {
+  if (nowMs - ripAlarmLoadedAt < 60000) return;
+  ripAlarmLoadedAt = nowMs;
+  try {
+    const [r] = await db.execute("SELECT config_key, config_value FROM system_config WHERE config_key IN ('rip_alarm', 'rip_alarm_sent')");
+    for (const row of r) {
+      const v = JSON.parse(row.config_value) || {};
+      if (row.config_key === 'rip_alarm') ripAlarmCfg = { ...RIP_ALARM_DEFAULTS, ...(typeof v === 'object' && !Array.isArray(v) ? v : {}) };
+      else if (typeof v === 'object' && !Array.isArray(v)) ripAlarmSent = { ...v, ...ripAlarmSent };
+    }
+  } catch (e) { /* keep the last good values */ }
+}
+// Called from the Revolut pump check for every held coin, every cycle. Never throws, never waits on the caller.
+async function ripAlarmCheck(coin, change, price, valueUsd, nowMs = Date.now()) {
+  try {
+    const c = String(coin || '').toUpperCase();
+    if (!/^[A-Z0-9]{1,15}$/.test(c) || !(change > 0) || !(price > 0)) return false;
+    await ripAlarmLoad(nowMs);
+    const cfg = ripAlarmCfg;
+    if (!cfg.enabled || change * 100 < Number(cfg.pct || 30) || !(valueUsd > Number(cfg.min_usd || 5))) return false;
+    const day = new Date(nowMs).toLocaleDateString('en-CA', { timeZone: 'Europe/London' });
+    if (ripAlarmSent[c] === day || ripAlarmBusy.has(c)) return false;
+    ripAlarmBusy.add(c);
+    ripAlarmSent[c] = day;
+    for (const k of Object.keys(ripAlarmSent)) if (ripAlarmSent[k] !== day) delete ripAlarmSent[k];
+    await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('rip_alarm_sent', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)", [JSON.stringify(ripAlarmSent)]).catch(() => {});
+    const pct = (change * 100).toFixed(1);
+    await sendTelegram('🚨 <b>RIP ALARM - ' + c + ' +' + pct + '% in 24 h</b>\nNow ' + formatPrice(price) + ' - you hold $' + valueUsd.toFixed(2) + ' of ' + c + '.\nTap to open ' + c + "'s page. Your loop, trail and targets carry on as set; nothing trades from this alarm.");
+    ripAlarmBusy.delete(c);
+    return true;
+  } catch (e) { ripAlarmBusy.delete(String(coin || '').toUpperCase()); console.warn('[rip-alarm] ' + e.message); return false; }
+}
 // #506 ALERT VOLUME (Bryan 29 Sep 17:31: "an extensive review of all the alerts ... We need to smarten these alerts up so I'm
 // not spammed so much"). Read-only: counts what the feed recorded, grouped by alert TYPE - the first line with numbers, amounts
 // and tracked coins blanked ("🎯 COIN FIXED TARGET HIT!") - with the category, buttons, what reached the phone, and examples.
@@ -18692,6 +18739,7 @@ async function checkPortfolio() {
         console.log(`[dust] Skipping ${symbol} — position value $${positionValueUsd.toFixed(4)} below $1 minimum`);
         continue;
       }
+      if (baseline24hMap[symbol]) ripAlarmCheck(asset.currency, change, currentPrice, positionValueUsd).catch(() => {});   // #514 not awaited: never slows the check
 
       // Entry price context — used in both pump and drop alerts
       const entryPrice = entryPrices.get(symbol);
