@@ -463,6 +463,8 @@ function appPushMirror(message, replyMarkup, inboxP) {
     if (!process.env.FCM_SERVICE_ACCOUNT) return 'push not set up';   // #500 each return says what happened, for the feed
     const note = appPushFromTelegram(message, replyMarkup);
     if (!note) return '';
+    const at = alertTreatment(message, note.coin);   // #512 Bryan's family picks: only 'keep' reaches the phone
+    if (at.treatment !== 'keep') { const res = at.treatment === 'drop' ? 'dropped (' + at.fam + ')' : at.treatment + ' - feed only'; appPushRecent(note, res); return res; }
     note.route = appPushRoute(note.cat);   // #498 Bryan's settings: category on/off, sound, vibrate, quiet hours
     if (!note.route.send) { appPushRecent(note, 'off - not sent'); return 'off - not sent'; }
     if (!appPushAllow(note.cat)) { appPushStats.dropped++; appPushRecent(note, 'held back - hourly cap'); return 'held back - hourly cap'; }
@@ -653,13 +655,142 @@ function appInboxRecord(message, replyMarkup, push, nowMs = Date.now()) {
     if (!raw.trim()) return null;
     const note = appPushFromTelegram(raw, replyMarkup);
     const cat = note ? note.cat : appPushCategory(raw.replace(/<[^>]+>/g, ''));
+    const at = alertTreatment(raw, note && note.coin, nowMs);   // #512
+    if (at.treatment === 'drop') return null;
     const kb = replyMarkup && Array.isArray(replyMarkup.inline_keyboard) ? JSON.stringify(replyMarkup.inline_keyboard).slice(0, 8000) : null;
-    return db.execute('INSERT INTO app_inbox (ts, cat, text, kb, tab, coin, push) VALUES (?, ?, ?, ?, ?, ?, ?)',   // #501 resolves to the row's id
-      [Math.floor(nowMs / 1000), cat, raw.slice(0, APP_INBOX.text_max), kb, (note && note.tab) || 'home', (note && note.coin) || '', String(push || '').slice(0, 32)])
+    return db.execute('INSERT INTO app_inbox (ts, cat, text, kb, tab, coin, push, fam) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',   // #501 resolves to the row's id; #512 fam
+      [Math.floor(nowMs / 1000), cat, raw.slice(0, APP_INBOX.text_max), kb, (note && note.tab) || 'home', (note && note.coin) || '', String(push || '').slice(0, 32), at.fam || ''])
       .then(([r]) => (r && r.insertId ? Number(r.insertId) : null))
       .catch(e => { if (!appInboxWarned) { appInboxWarned = true; console.warn('[inbox] #500 not recorded: ' + e.message); } return null; });
   } catch (e) { return null; /* the feed must never break a Telegram send */ }
 }
+// #512 ALERT FAMILIES (Bryan 29 Sep 17:31 "we need to smarten these alerts up so I'm not spammed so much ... I'll be selective of
+// what I actually get in my app"; his picks on the Alert Clean-up page, "alerts picked" 22:49). Every message is sorted into one
+// FAMILY by its text, and the family's treatment decides what reaches the APP - Telegram is untouched and still gets everything:
+//   keep   - the phone is notified as today (category switches, sound, quiet hours all still apply)
+//   quiet  - kept in the Notifications feed, no phone notification
+//   digest - kept in the feed, no phone notification, and counted in one evening digest (21:00 London)
+//   drop   - not kept in the feed and no phone notification
+// Safety: a message that reads as a failure or a decision (ALERT_LOUD) is always 'keep', whatever family it matched. Big moves
+// ('bigmoves', kept) notify the phone once per coin per London day; the rest of that coin's big moves that day go to the feed.
+// Picks live in system_config 'alert_families' ({family: treatment}); the defaults below are Bryan's 29 Sep choices.
+const ALERT_TREATMENTS = ['keep', 'quiet', 'digest', 'drop'];
+const ALERT_FAMILY_DEFAULTS = { approvals: 'keep', failures: 'keep', moneyq: 'keep', funded: 'keep', deskcall: 'keep', security: 'keep',
+  mytrades: 'keep', autotrades: 'keep', card: 'keep', cash: 'quiet', targets: 'keep', trails: 'keep', rules: 'quiet', secondary: 'drop',
+  bigmoves: 'keep', broad: 'digest', watch: 'quiet', arming: 'quiet', blocked: 'quiet', insurance: 'digest', health: 'digest', away: 'quiet',
+  shadow: 'drop', agent: 'digest', deskfyi: 'quiet', brief: 'keep', reviews: 'digest', system: 'drop', resync: 'quiet', echo: 'quiet' };
+const ALERT_FAMILY_NAMES = { broad: 'Broad market moves', insurance: 'Loop insurance', health: 'Loop health', agent: 'Paper agent', reviews: 'Follow-ups and reviews' };
+// Failures and decisions: never quieted by a family pick (they belong to "Needs you").
+const ALERT_LOUD = /APPROVAL NEEDED|YOUR CALL|FAILED|WATCHDOG|CAPITAL INTEGRITY|unaudited|short by \$|could not be cancelled|still refusing|HALTED|[Ff]rozen|→ DEAD|Not you\?|New app device|Device limit|for your confirmation|Possible duplicate|LAST CALL|you can fund/;
+// First match wins. Tested against the text with tags stripped (the whole message, not only the title).
+const ALERT_FAMILY_RULES = [
+  ['echo', /^📱 Answered from the app|^HOLD [A-Z0-9]{2,12}\b|^Holding [A-Z0-9]{2,12} @/],
+  ['approvals', /SELL REQUEST|BUY REQUEST|LADDER SELL|^⏪ UNDO|APPROVAL NEEDED|TRADE AUTO-CANCELLED|Reminder \d\/5/],
+  ['security', /New app device|Device limit|Phone notification settings changed/],
+  ['deskcall', /^📝 YOUR CALL/],
+  ['deskfyi', /No reply needed|^📝 Spec ready|Senior agent waiting/],
+  ['funded', /FUND IT YOURSELF|buy you can fund|funded-buy offer/],
+  ['moneyq', /CAPITAL CHANGE BLOCKED|RECONCILER PAYMENT|WITHDRAWAL/],
+  ['card', /💳 PAYMENT|PAYMENT with|Card hold|hold RELEASED/],
+  ['cash', /USDT→USD|USD→USDT|was spent on coin buys|matched to your buys/],
+  ['resync', /Nightly ledger re-sync|ledger re-sync/i],
+  ['system', /monitor started|backup (OK|complete|done|saved)|snapshot (OK|saved|done)|[Pp]rice history (is )?ready/],
+  ['shadow', /SHADOW LADDER/],
+  ['secondary', /HIT YOUR PROFIT TARGET/],
+  ['mytrades', /TRADE DETECTED|TRADE OUTCOME|auto-logged without context|Looks like a rotation|^🔄 Rotation /],
+  ['autotrades', /AI EXECUTED|USDT SWEEP EXECUTED|TROUGH ARMED\]|LOOP RE-ARMED|CYCLE COMPLETE|chasing-limit sale|Spike insurance sold/],
+  ['targets', /FIXED (TARGET|FLOOR)|AI ANALYSIS — \S+ (TARGET|FLOOR)/],
+  ['trails', /TRAILING STOP TRIGGERED|STILL BREACHED/],
+  ['rules', /AUTO RULE TRIGGERED|AUTO RULE APPROACHING|BUY-BACK SKIPPED/],
+  ['broad', /BROAD MARKET MOVE/],
+  ['bigmoves', /DAILY (PUMP|DROP|DUMP) ALERT|SWING TRADE SIGNAL|ABNORMAL MOVE - |KRAKEN PUMP|Kraken pump/],
+  ['watch', /DIP ZONE|MSS (CONFIRMED|EARLY WARNING)|BTC KEY LEVEL|key level (broken|reclaimed)/i],
+  ['arming', /PUMP-ARMED|loop armed - how it got here|TROUGH GATE REACHED/],
+  ['blocked', /AUTO-SELL BLOCKED|FLOOR-BLOCKED|held at the floor|sale not placed|held while paused|TROUGH FLOOR BREACH|auto-reset/i],
+  ['insurance', /Loop insurance status|Buy-back cash/],
+  ['health', /PUMP-ARM STUCK|Stuck loops|stored floor of 0|entry_floor = 0/],
+  ['away', /AWAY|Away[- ]mode|held off|analysis on cooldown/],
+  ['agent', /\(paper\)|Agent run|Agent fill|Agent alert|Agent - weekly|Agent tools|Agent - day/],
+  ['brief', /GOOD MORNING|MARKET BRIEFING|[Cc]ascade activity/],
+  ['reviews', /REBALANCING CHECK|FOLLOW-UP|[Ff]ollow-up|down more than 50|[Ss]corecard|untagged|no reason tag|tap its reason|WEEKLY/],
+];
+function alertPlain(message) {
+  return String(message == null ? '' : message).replace(/<br\s*\/?>/gi, '\n').replace(/<[^>]+>/g, '')
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&').trim();
+}
+function alertFamily(message) {
+  const t = alertPlain(message);
+  for (const [f, re] of ALERT_FAMILY_RULES) if (re.test(t)) return f;
+  return '';
+}
+let alertPicks = { ...ALERT_FAMILY_DEFAULTS }, alertPicksAt = 0;
+async function alertPicksLoad(nowMs = Date.now()) {
+  if (nowMs - alertPicksAt < 60000) return alertPicks;
+  alertPicksAt = nowMs;
+  try {
+    const [r] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'alert_families'");
+    const c = r.length ? JSON.parse(r[0].config_value) || {} : {};
+    const next = { ...ALERT_FAMILY_DEFAULTS };
+    for (const [k, v] of Object.entries(c)) if (Object.prototype.hasOwnProperty.call(next, k) && ALERT_TREATMENTS.includes(v)) next[k] = v;
+    alertPicks = next;
+  } catch (e) { /* keep the last good picks */ }
+  return alertPicks;
+}
+setInterval(() => { alertPicksLoad().catch(() => {}); }, 60000);
+const alertBigMoveSeen = new Map();   // 'COIN|YYYY-MM-DD' -> true: the one phone notification per coin per London day
+// -> { fam, treatment } for a Telegram message. Synchronous (uses the picks cached every minute), so a send is never delayed.
+// The phone mirror and the feed recorder both ask about the same message within the same send, so the answer is remembered for
+// 10 s per message text - the one-per-coin-per-day count for big moves must not be spent twice on one message.
+const alertTreatMemo = new Map();
+function alertTreatment(message, coin, nowMs = Date.now()) {
+  const k = String(message == null ? '' : message), m = alertTreatMemo.get(k);
+  if (m && nowMs - m.at < 10000) return m.r;
+  const r = alertTreatmentNew(k, coin, nowMs);
+  alertTreatMemo.set(k, { at: nowMs, r });
+  if (alertTreatMemo.size > 200) { for (const [kk, v] of alertTreatMemo) if (nowMs - v.at >= 10000) alertTreatMemo.delete(kk); if (alertTreatMemo.size > 200) alertTreatMemo.clear(); }
+  return r;
+}
+function alertTreatmentNew(message, coin, nowMs) {
+  const fam = alertFamily(message);
+  if (!fam) return { fam: '', treatment: 'keep' };
+  if (ALERT_LOUD.test(alertPlain(message))) return { fam, treatment: 'keep', loud: true };
+  let treatment = alertPicks[fam] || 'keep';
+  if (fam === 'bigmoves' && treatment === 'keep') {
+    const day = new Date(nowMs).toLocaleDateString('en-CA', { timeZone: 'Europe/London' }), key = String(coin || '?') + '|' + day;
+    if (alertBigMoveSeen.has(key)) treatment = 'quiet';
+    else { alertBigMoveSeen.set(key, true); if (alertBigMoveSeen.size > 500) alertBigMoveSeen.delete(alertBigMoveSeen.keys().next().value); }
+  }
+  return { fam, treatment };
+}
+// The evening digest: one feed message and one phone notification (category Reports, so its switch and sound apply) with a line
+// per digest family - how many, and the latest one's title. Nothing is sent when the day had none.
+async function alertDigest(nowMs = Date.now()) {
+  const picks = await alertPicksLoad(nowMs);
+  const fams = Object.keys(picks).filter(f => picks[f] === 'digest');
+  if (!fams.length) return { sent: false, reason: 'no digest families' };
+  const since = Math.floor(nowMs / 1000) - 86400;
+  const [rows] = await db.execute('SELECT id, fam, text FROM app_inbox WHERE ts >= ? AND fam IN (' + fams.map(() => '?').join(', ') + ') ORDER BY id DESC LIMIT 2000', [since, ...fams]);
+  if (!rows.length) return { sent: false, reason: 'nothing today' };
+  const by = new Map();
+  for (const r of rows) { const g = by.get(r.fam) || { n: 0, last: '' }; g.n++; if (!g.last) g.last = appPushFromTelegram(r.text) ? appPushFromTelegram(r.text).title : ''; by.set(r.fam, g); }
+  const lines = [...by.entries()].sort((a, b) => b[1].n - a[1].n).map(([f, g]) => '• ' + (ALERT_FAMILY_NAMES[f] || f) + ': ' + g.n + (g.last ? ' - latest: ' + escTg(g.last.slice(0, 90)) : ''));
+  const text = '🌙 <b>Evening digest</b> - ' + rows.length + ' quiet message' + (rows.length === 1 ? '' : 's') + ' from the last 24 h\n' + lines.join('\n') + '\nAll of them are in Notifications.';
+  const [ins] = await db.execute('INSERT INTO app_inbox (ts, cat, text, kb, tab, coin, push, fam) VALUES (?, ?, ?, NULL, ?, ?, ?, ?)', [Math.floor(nowMs / 1000), 'reports', text, 'inbox', '', 'digest', '']);
+  let result = 'push not set up';
+  if (process.env.FCM_SERVICE_ACCOUNT) {
+    const route = appPushRoute('reports');
+    if (!route.send) result = 'off - not sent';
+    else {
+      result = route.result;
+      const note = { title: '🌙 Evening digest - ' + rows.length + ' quiet message' + (rows.length === 1 ? '' : 's'), body: lines.slice(0, 5).join('\n').replace(/<[^>]+>/g, '').slice(0, APP_PUSH.body_max), tab: 'inbox', coin: '', cat: 'reports', route, inbox: ins && ins.insertId ? Number(ins.insertId) : null };
+      appPushRecent(note, result, nowMs);
+      appPushSend(note).catch(e => console.warn('[digest] push failed: ' + e.message));
+    }
+    await db.execute('UPDATE app_inbox SET push = ? WHERE id = ?', [String(result).slice(0, 32), ins.insertId]).catch(() => {});
+  }
+  return { sent: true, messages: rows.length, families: Object.fromEntries([...by.entries()].map(([f, g]) => [f, g.n])), push: result };
+}
+cron.schedule('0 21 * * *', () => { alertDigest().then(r => console.log('[digest] #512 ' + JSON.stringify(r))).catch(e => console.error('[digest] #512 failed: ' + e.message)); }, { timezone: 'Europe/London' });
 // #506 ALERT VOLUME (Bryan 29 Sep 17:31: "an extensive review of all the alerts ... We need to smarten these alerts up so I'm
 // not spammed so much"). Read-only: counts what the feed recorded, grouped by alert TYPE - the first line with numbers, amounts
 // and tracked coins blanked ("🎯 COIN FIXED TARGET HIT!") - with the category, buttons, what reached the phone, and examples.
@@ -2266,6 +2397,7 @@ try {   // #498 what the app supports ('ch2' = one Android channel per sound/vib
 } catch (e) { console.warn('[migrate] #498 app_devices.caps:', e.message); }
 await db.execute('CREATE TABLE IF NOT EXISTS app_inbox (id BIGINT AUTO_INCREMENT PRIMARY KEY, ts INT UNSIGNED NOT NULL, cat VARCHAR(12) NOT NULL, text MEDIUMTEXT NOT NULL, kb TEXT NULL, tab VARCHAR(12) NOT NULL DEFAULT \'home\', coin VARCHAR(16) NOT NULL DEFAULT \'\', push VARCHAR(32) NOT NULL DEFAULT \'\', INDEX idx_ts (ts), INDEX idx_cat (cat, id))').catch(e => console.error('[migration] app_inbox:', e.message));   // #500 the app's notifications feed
 await db.execute('CREATE TABLE IF NOT EXISTS app_inbox_answers (id BIGINT AUTO_INCREMENT PRIMARY KEY, inbox_id BIGINT NOT NULL, r TINYINT NOT NULL, c TINYINT NOT NULL, label VARCHAR(40) NOT NULL DEFAULT \'\', result VARCHAR(64) NOT NULL DEFAULT \'\', at INT UNSIGNED NOT NULL, UNIQUE KEY uq_inbox (inbox_id), INDEX idx_at (at))').catch(e => console.error('[migration] app_inbox_answers:', e.message));   // #502 one answer per feed message (Fable C2)
+await safeAddColumn('app_inbox', 'fam', "VARCHAR(16) NOT NULL DEFAULT ''").catch(e => console.error('[migration] app_inbox.fam:', e.message));   // #512 the alert family (the evening digest reads it)
 await db.execute('CREATE TABLE IF NOT EXISTS pm_chat (id BIGINT AUTO_INCREMENT PRIMARY KEY, ts INT UNSIGNED NOT NULL, day CHAR(10) NOT NULL, role VARCHAR(10) NOT NULL, text MEDIUMTEXT NOT NULL, tools TEXT NULL, nav VARCHAR(80) NULL, cost DECIMAL(10,6) NOT NULL DEFAULT 0, INDEX idx_day (day), INDEX idx_ts (ts))').catch(e => console.error('[migration] pm_chat:', e.message));   // #510 the in-app PM chat (pruned at 60 days)
 await db.execute('CREATE TABLE IF NOT EXISTS agent_equity_points (t BIGINT NOT NULL PRIMARY KEY, equity_usd DECIMAL(14,6) NOT NULL, cash_usd DECIMAL(14,6) NOT NULL, bench_btc_usd DECIMAL(14,6) NULL, bench_basket_usd DECIMAL(14,6) NULL)').catch(e => console.error('[migration] agent_equity_points:', e.message));   // #482 hourly points for the page's chart
 await db.execute('CREATE TABLE IF NOT EXISTS agent_equity_daily (d DATE NOT NULL PRIMARY KEY, equity_usd DECIMAL(14,6) NOT NULL, cash_usd DECIMAL(14,6) NOT NULL, bench_btc_usd DECIMAL(14,6) NULL, bench_basket_usd DECIMAL(14,6) NULL, model_cost_usd DECIMAL(14,6) NULL)').catch(e => console.error('[migration] agent_equity_daily:', e.message));
