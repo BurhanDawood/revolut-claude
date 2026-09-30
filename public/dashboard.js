@@ -1389,7 +1389,11 @@ document.addEventListener('DOMContentLoaded', function() {
 });
 
 // #531 the Morning brief widget: the newest brief from GET /api/brief/latest (refreshed every 10 minutes)
-var rxBriefOpen = false;
+var rxBriefOpen = false, rxBriefCur = null;
+function rxBriefHand(line) {   // #535 hand the brief (or one line of it) to the Claude PM thread as the link opens; the server writes the note
+  if (!rxBriefCur || !rxBriefCur.id) return;
+  try { fetch('/api/brief/handover', { method: 'POST', keepalive: true, cache: 'no-store', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: rxBriefCur.id, line: line == null ? null : line }) }).catch(function () {}); } catch (e) {}
+}
 function rxBriefRender(d) {
   var box = document.getElementById('bf-body'); if (!box) return;
   var b = d && d.brief;
@@ -1400,12 +1404,15 @@ function rxBriefRender(d) {
     h += '<a class="bf-vid" href="https://www.youtube.com/watch?v=' + v.id + '" target="_blank" rel="noopener noreferrer"><div class="bf-thumb" style="background-image:url(\'https://i.ytimg.com/vi/' + v.id + '/hqdefault.jpg\')"><span class="bf-play" aria-hidden="true"></span></div>' +
       '<div class="bf-vt"><small>YouTube' + (v.channel ? ' · ' + esc(v.channel) : '') + '</small><b>' + esc(v.title || 'Video') + '</b></div></a>';
   }
-  h += '<div class="bf-txt' + (rxBriefOpen ? '' : ' clip') + '" id="bf-txt">' + (b.market_html || '') + '</div>' +
+  rxBriefCur = { id: b.id, url: d.pm_url || null };   // #535 a line is tappable: Ask the PM / Claude, with that line handed over
+  var lines = String(b.market_html || '').split('\n').map(function (l, i) { return l.replace(/<[^>]*>/g, '').trim() ? '<div class="bf-l" data-i="' + i + '">' + l + '</div>' : '<div class="bf-e"></div>'; }).join('');
+  h += '<div class="bf-txt' + (rxBriefOpen ? '' : ' clip') + '" id="bf-txt">' + lines + '</div>' +
     '<button type="button" class="bf-more" id="bf-more">' + (rxBriefOpen ? 'Show less ▴' : 'Read the whole brief ▾') + '</button>' +
     (b.snapshot_html ? '<details><summary>Portfolio snapshot at the time</summary><div class="bf-txt">' + b.snapshot_html + '</div></details>' : '');
   var app = null; try { app = window.parent !== window && window.parent.rxApp && window.parent.rxApp.pm ? window.parent.rxApp : null; } catch (e) {}
-  var acts = (app ? '<button type="button" class="bf-ask" id="bf-ask">💬 Ask the PM about it</button>' : '') +
-    (d.pm_url ? '<a class="bf-claude" href="' + rxAttr(d.pm_url) + '" target="_blank" rel="noopener noreferrer">Open the PM thread in Claude ↗</a>' : '');
+  var acts = (app ? '<button type="button" class="bf-ask" id="bf-ask">💬 Ask PM</button>' : '') +
+    (d.pm_url ? '<a class="bf-claude" id="bf-claude" href="' + rxAttr(d.pm_url) + '" target="_blank" rel="noopener noreferrer">Claude ↗</a>' : '') +
+    '<span class="bf-tip">or tap a line</span>';
   if (acts) h += '<div class="bf-acts">' + acts + '</div>';
   box.innerHTML = h;
 }
@@ -1417,6 +1424,26 @@ document.addEventListener('click', function (e) {
   var t = e.target;
   if (t && t.id === 'bf-more') { rxBriefOpen = !rxBriefOpen; var x = document.getElementById('bf-txt'); if (x) x.classList.toggle('clip', !rxBriefOpen); t.textContent = rxBriefOpen ? 'Show less ▴' : 'Read the whole brief ▾'; return; }
   if (t && t.id === 'bf-ask') { try { window.parent.rxApp.pm('About this morning\'s brief: '); } catch (e2) {} }
+  if (t && t.closest && t.closest('#bf-claude')) rxBriefHand(null);   // #535 the whole brief goes with him
+  var la = t && t.closest && t.closest('.bf-la [data-a]');
+  if (la) { var ln = la.closest('.bf-la').previousElementSibling, i = ln ? Number(ln.getAttribute('data-i')) : null, txt = ln ? ln.textContent.trim() : '';
+    if (la.getAttribute('data-a') === 'claude') rxBriefHand(i);
+    else { try { window.parent.rxApp.pm('About this line of the morning brief: "' + txt.slice(0, 220) + '" - '); } catch (e3) {} }
+    return; }
+  var l = t && t.closest && t.closest('#bf-txt .bf-l');
+  if (l && !(t.closest && t.closest('a'))) {   // #535 tap a line: two small actions under it
+    var open = l.nextElementSibling && l.nextElementSibling.classList.contains('bf-la');
+    [].forEach.call(document.querySelectorAll('#bf-txt .bf-la'), function (x) { x.remove(); });
+    [].forEach.call(document.querySelectorAll('#bf-txt .bf-l.on'), function (x) { x.classList.remove('on'); });
+    if (open) return;
+    var appOk = false; try { appOk = !!(window.parent !== window && window.parent.rxApp && window.parent.rxApp.pm); } catch (e4) {}
+    if (!appOk && !(rxBriefCur && rxBriefCur.url)) return;
+    l.classList.add('on');
+    var a = document.createElement('div'); a.className = 'bf-la';
+    a.innerHTML = (appOk ? '<button type="button" data-a="ask">💬 Ask PM</button>' : '') + (rxBriefCur && rxBriefCur.url ? '<a data-a="claude" href="' + rxAttr(rxBriefCur.url) + '" target="_blank" rel="noopener noreferrer">Claude ↗</a>' : '');
+    l.parentNode.insertBefore(a, l.nextSibling);
+    if (!rxBriefOpen) { rxBriefOpen = true; var bx = document.getElementById('bf-txt'); if (bx) bx.classList.remove('clip'); var mb = document.getElementById('bf-more'); if (mb) mb.textContent = 'Show less ▴'; }
+  }
 });
 if (document.getElementById('bf-body')) { rxBriefLoad(); setInterval(function () { if (!document.hidden) rxBriefLoad(); }, 10 * 60000); }
 
