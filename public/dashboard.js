@@ -327,7 +327,7 @@ function rxCoinChg(p) {
 function rxCoinIcon(c) {
   var h = 0; for (var i = 0; i < c.coin.length; i++) h = (h * 31 + c.coin.charCodeAt(i)) % 360;
   var letter = '<span style="width:100%;height:100%;display:grid;place-items:center;background:hsl(' + h + ',45%,32%)">' + esc(c.coin.charAt(0)) + '</span>';
-  var lc = c.coin.toLowerCase(), alt = [c.icon, 'https://assets.coincap.io/assets/icons/' + lc + '@2x.png', 'https://cdn.jsdelivr.net/gh/spothq/cryptocurrency-icons@master/128/color/' + lc + '.png'].filter(function (u) { return u && !rxIcDead[u]; });   // #517 by ticker until the server has one; #518 minus any that already failed
+  var alt = [c.icon].filter(function (u) { return u && !rxIcDead[u]; });   // #527 only the server's logo, matched by the coin's name (by ticker alone, HIGH showed a Pepe coin); #518 minus any that already failed
   if (!alt.length) return '<span class="cl-ic">' + letter + '</span>';
   return '<span class="cl-ic"><img alt="" loading="lazy" referrerpolicy="no-referrer" src="' + rxAttr(alt[0]) + '" data-alt="' + rxAttr(alt.slice(1).join('|')) + '" data-l="' + rxAttr(letter) + '" onerror="rxIcNext(this)"></span>';
 }
