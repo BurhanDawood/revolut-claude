@@ -327,8 +327,12 @@ function rxCoinChg(p) {
 function rxCoinIcon(c) {
   var h = 0; for (var i = 0; i < c.coin.length; i++) h = (h * 31 + c.coin.charCodeAt(i)) % 360;
   var letter = '<span style="width:100%;height:100%;display:grid;place-items:center;background:hsl(' + h + ',45%,32%)">' + esc(c.coin.charAt(0)) + '</span>';
-  if (!c.icon) return '<span class="cl-ic">' + letter + '</span>';
-  return '<span class="cl-ic"><img alt="" loading="lazy" referrerpolicy="no-referrer" src="' + rxAttr(c.icon) + '" data-l="' + rxAttr(letter) + '" onerror="this.outerHTML=this.getAttribute(\'data-l\')"></span>';
+  var lc = c.coin.toLowerCase(), alt = [c.icon, 'https://assets.coincap.io/assets/icons/' + lc + '@2x.png', 'https://cdn.jsdelivr.net/gh/spothq/cryptocurrency-icons@master/128/color/' + lc + '.png'].filter(Boolean);   // #517 by ticker until the server has one
+  return '<span class="cl-ic"><img alt="" loading="lazy" referrerpolicy="no-referrer" src="' + rxAttr(alt[0]) + '" data-alt="' + rxAttr(alt.slice(1).join('|')) + '" data-l="' + rxAttr(letter) + '" onerror="rxIcNext(this)"></span>';
+}
+function rxIcNext(im) {   // #517 the next logo source, and the coin's letter when none has one
+  var rest = (im.getAttribute('data-alt') || '').split('|').filter(Boolean);
+  if (rest.length) { im.setAttribute('data-alt', rest.slice(1).join('|')); im.src = rest[0]; } else im.outerHTML = im.getAttribute('data-l');
 }
 function rxCoinRow(c, kind) {
   var chips = [];
@@ -1093,7 +1097,7 @@ function rxAppLayout() {
     [].slice.call(el.children).forEach(function (c) { if (c !== head) body.appendChild(c); });
     el.appendChild(body);
     el.classList.add('rx-sec'); head.classList.add('rx-head');
-    var dflt = /Tangem/.test(key);   // #496 the Tangem wallet starts open; everything else starts folded
+    var dflt = /^Coins$/.test(key);   // #517 the coin list starts open (the Tangem card, #496, is now XRP's row); everything else starts folded
     if (!(key in open ? open[key] : dflt)) el.classList.add('rx-collapsed');
     head.addEventListener('click', function (e) {
       if (e.target.closest('a')) return;

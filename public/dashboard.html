@@ -819,42 +819,6 @@
     </div>
   </div>
 
-  <!-- #516 Coins (Bryan 30 Sep 09:17): every coin in one list like Revolut's home screen - logo, name, amount and price,
-       value and 24 h change. Tap one for its card (chart, alerts, settings, strategy, history). Holdings, the watchlist
-       (top three, the rest folded), dust and sold coins. This replaces Holdings, Active Alerts, Active Trailing Stops, Alert
-       Thresholds, the Lifetime Ledger list, the Tangem card and the Kraken tab; each of those now sits on the coin's card. -->
-  <style>
-    .cl-ledger { font-size: 0.8rem; color: var(--text-muted); margin: -4px 0 10px; line-height: 1.5; }
-    .cl-ledger b { font-weight: 600; }
-    .cl-sec { color: var(--text-muted); font-size: 0.72rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; margin: 14px 2px 4px; display: flex; justify-content: space-between; }
-    .cl-sec:first-child { margin-top: 0; }
-    .cl-row { display: flex; align-items: center; gap: 12px; width: 100%; padding: 11px 2px; background: none; border: 0; border-top: 1px solid rgba(255,255,255,0.06); color: inherit; font: inherit; text-align: left; cursor: pointer; }
-    .cl-sec + .cl-row, .cl-fold > .cl-row:first-child { border-top: 0; }
-    .cl-row:active { background: rgba(255,255,255,0.04); }
-    .cl-ic { width: 40px; height: 40px; flex: none; border-radius: 50%; overflow: hidden; background: #262626; display: grid; place-items: center; color: #fff; font-weight: 700; font-size: 16px; }
-    .cl-ic img { width: 100%; height: 100%; object-fit: cover; display: block; }
-    .cl-nm { flex: 1; min-width: 0; }
-    .cl-nm b { display: block; font-size: 1rem; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .cl-sub { color: var(--text-muted); font-size: 0.82rem; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: block; }
-    .cl-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
-    .cl-chip { font-size: 0.68rem; padding: 1px 7px; border-radius: 9px; background: rgba(255,255,255,0.07); color: #bbb; white-space: nowrap; }
-    .cl-chip.on { background: rgba(0,200,150,0.15); color: #33d6a6; }
-    .cl-chip.warn { background: rgba(255,170,0,0.13); color: #ffb733; }
-    .cl-vl { text-align: right; font-variant-numeric: tabular-nums; flex: none; }
-    .cl-vl b { display: block; font-size: 1rem; font-weight: 600; }
-    .cl-vl span { font-size: 0.82rem; }
-    .cl-up { color: #33d6a6; } .cl-dn { color: #ff5a6e; } .cl-mu { color: var(--text-muted); }
-    .cl-more { width: 100%; background: none; border: 0; border-top: 1px solid rgba(255,255,255,0.06); color: var(--accent); font: 600 0.9rem system-ui, sans-serif; padding: 11px 2px; text-align: left; cursor: pointer; display: flex; justify-content: space-between; }
-    html.in-app .cl-nm b, html.in-app .cl-vl b { font-size: 1.1rem; }
-    html.in-app .cl-sub, html.in-app .cl-vl span { font-size: 0.9rem; }
-    html.in-app .cl-ic { width: 44px; height: 44px; }
-  </style>
-  <div class="card" id="coins-card">
-    <div class="card-title">Coins</div>
-    <div id="coins-ledger" class="cl-ledger"></div>
-    <div id="holdings-list"><div class="empty-state">Loading…</div></div>
-  </div>
-
   <!-- Portfolio value chart (#PV1): the /portfolio page in its compact embed mode -->
   <div class="card" id="pv-card">
     <div class="card-title" style="display:flex;justify-content:space-between;align-items:center">📈 Portfolio value <a href="/portfolio" style="color:var(--accent);text-decoration:none">Full view ↗</a></div>
@@ -1008,6 +972,42 @@
       <div class="pnl-sum-label">Total Unrealised</div>
       <div class="pnl-sum-value" id="pnl-total-unreal">—</div>
     </div>
+  </div>
+
+  <!-- #517 back where Holdings was (Bryan 09:37). #516 Coins (Bryan 30 Sep 09:17): every coin in one list like Revolut's home screen - logo, name, amount and price,
+       value and 24 h change. Tap one for its card (chart, alerts, settings, strategy, history). Holdings, the watchlist
+       (top three, the rest folded), dust and sold coins. This replaces Holdings, Active Alerts, Active Trailing Stops, Alert
+       Thresholds, the Lifetime Ledger list, the Tangem card and the Kraken tab; each of those now sits on the coin's card. -->
+  <style>
+    .cl-ledger { font-size: 0.8rem; color: var(--text-muted); margin: -4px 0 10px; line-height: 1.5; }
+    .cl-ledger b { font-weight: 600; }
+    .cl-sec { color: var(--text-muted); font-size: 0.72rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; margin: 14px 2px 4px; display: flex; justify-content: space-between; }
+    .cl-sec:first-child { margin-top: 0; }
+    .cl-row { display: flex; align-items: center; gap: 12px; width: 100%; padding: 11px 2px; background: none; border: 0; border-top: 1px solid rgba(255,255,255,0.06); color: inherit; font: inherit; text-align: left; cursor: pointer; }
+    .cl-sec + .cl-row, .cl-fold > .cl-row:first-child { border-top: 0; }
+    .cl-row:active { background: rgba(255,255,255,0.04); }
+    .cl-ic { width: 40px; height: 40px; flex: none; border-radius: 50%; overflow: hidden; background: #262626; display: grid; place-items: center; color: #fff; font-weight: 700; font-size: 16px; }
+    .cl-ic img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .cl-nm { flex: 1; min-width: 0; }
+    .cl-nm b { display: block; font-size: 1rem; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .cl-sub { color: var(--text-muted); font-size: 0.82rem; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: block; }
+    .cl-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+    .cl-chip { font-size: 0.68rem; padding: 1px 7px; border-radius: 9px; background: rgba(255,255,255,0.07); color: #bbb; white-space: nowrap; }
+    .cl-chip.on { background: rgba(0,200,150,0.15); color: #33d6a6; }
+    .cl-chip.warn { background: rgba(255,170,0,0.13); color: #ffb733; }
+    .cl-vl { text-align: right; font-variant-numeric: tabular-nums; flex: none; }
+    .cl-vl b { display: block; font-size: 1rem; font-weight: 600; }
+    .cl-vl span { font-size: 0.82rem; }
+    .cl-up { color: #33d6a6; } .cl-dn { color: #ff5a6e; } .cl-mu { color: var(--text-muted); }
+    .cl-more { width: 100%; background: none; border: 0; border-top: 1px solid rgba(255,255,255,0.06); color: var(--accent); font: 600 0.9rem system-ui, sans-serif; padding: 11px 2px; text-align: left; cursor: pointer; display: flex; justify-content: space-between; }
+    html.in-app .cl-nm b, html.in-app .cl-vl b { font-size: 1.1rem; }
+    html.in-app .cl-sub, html.in-app .cl-vl span { font-size: 0.9rem; }
+    html.in-app .cl-ic { width: 44px; height: 44px; }
+  </style>
+  <div class="card" id="coins-card">
+    <div class="card-title">Coins</div>
+    <div id="coins-ledger" class="cl-ledger"></div>
+    <div id="holdings-list"><div class="empty-state">Loading…</div></div>
   </div>
 
   <!-- Monitoring Controls -->
