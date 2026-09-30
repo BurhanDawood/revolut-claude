@@ -312,12 +312,23 @@ function rxCoinChg(p) {
   if (p == null || !isFinite(p)) return '<span class="cl-mu">–</span>';
   return '<span class="' + (p >= 0 ? 'cl-up' : 'cl-dn') + '">' + (p >= 0 ? '▲ ' : '▼ ') + Math.abs(p).toFixed(2) + '%</span>';
 }
-function rxCoinIcon(c) {
-  var h = 0; for (var i = 0; i < c.coin.length; i++) h = (h * 31 + c.coin.charCodeAt(i)) % 360;
-  var letter = '<span style="width:100%;height:100%;display:grid;place-items:center;background:hsl(' + h + ',45%,32%)">' + esc(c.coin.charAt(0)) + '</span>';
-  var alt = [c.icon || 'https://assets.coincap.io/assets/icons/' + String(c.coin || '').toLowerCase() + '@2x.png'].filter(function (u) { return u && !rxIcDead[u]; });   // #527 the server's logo, matched by name; #534 while the server has none, CoinCap's by ticker, then the letter
-  if (!alt.length) return '<span class="cl-ic">' + letter + '</span>';
-  return '<span class="cl-ic"><img alt="" loading="lazy" referrerpolicy="no-referrer" src="' + rxAttr(alt[0]) + '" data-alt="' + rxAttr(alt.slice(1).join('|')) + '" data-l="' + rxAttr(letter) + '" onerror="rxIcNext(this)"></span>';
+function rxCoinIcon(c) {   // #538 the logo from our own server (fetched there once, cached here for a week), else the coin's letter
+  var sym = String(c.coin || ''), h = 0; for (var i = 0; i < sym.length; i++) h = (h * 31 + sym.charCodeAt(i)) % 360;
+  if (rxLogoUrl[sym]) return '<span class="cl-ic"><img alt="" src="' + rxAttr(rxLogoUrl[sym]) + '"></span>';
+  var letter = '<span style="width:100%;height:100%;display:grid;place-items:center;background:hsl(' + h + ',45%,32%)">' + esc(sym.charAt(0)) + '</span>';
+  if (!/^[A-Z0-9]{1,15}$/.test(sym)) return '<span class="cl-ic">' + letter + '</span>';
+  rxLogoLoad(sym);
+  return '<span class="cl-ic" data-logo="' + sym + '">' + letter + '</span>';
+}
+var rxLogoUrl = {}, rxLogoAt = {};
+function rxLogoLoad(sym) {
+  if (rxLogoAt[sym] && Date.now() - rxLogoAt[sym] < 600000) return;   // one ask per coin; a miss is asked again after 10 min
+  rxLogoAt[sym] = Date.now();
+  fetch('/api/coins/logo/' + sym).then(function (r) { return r.ok ? r.blob() : null; }).then(function (b) {
+    if (!b || !b.size) return;
+    var u = URL.createObjectURL(b); rxLogoUrl[sym] = u;
+    [].forEach.call(document.querySelectorAll('.cl-ic[data-logo="' + sym + '"]'), function (el) { el.removeAttribute('data-logo'); el.innerHTML = '<img alt="" src="' + rxAttr(u) + '">'; });
+  }).catch(function () {});
 }
 var rxIcDead = {};   // #518 logo addresses that failed on this page, so the minute refresh does not ask again
 function rxIcNext(im) {   // #517 the next logo source, and the coin's letter when none has one
