@@ -22435,6 +22435,21 @@ function createMcpServer() {
     }
   );
 
+  // ── Tool: send_test_alarm (#523 Bryan 30 Sep 15:17 "can you send me a test rip alert?") ──
+  server.tool('send_test_alarm',
+    '#523 Sends ONE test rip alarm to Bryan (Telegram + the app, which rings it like a real rip alarm on app-v11). Fixed text that says it is a test; no coin, no price, nothing trades. At most one every 2 minutes.',
+    {},
+    async () => {
+      const now = Date.now();
+      if (now - (globalThis.__rxTestAlarmAt || 0) < 120000) return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'A test alarm was sent less than 2 minutes ago.' }) }] };
+      globalThis.__rxTestAlarmAt = now;
+      try {
+        await sendTelegram('🚨 <b>RIP ALARM - TEST (not a real move)</b>\nThis is a test of the rip alarm. Nothing moved and nothing trades. Tap Stop or swipe it away.');
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, sent_at: new Date(now).toISOString() }) }] };
+      } catch (e) { return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: e.message }) }] }; }
+    }
+  );
+
   // ── Tool: get_buy_zone (#520 stage 1: the buy-zone score, and its backtest on stored daily history; read-only) ──
   server.tool('get_buy_zone',
     '#520 BUY ZONE (stage 1, read-only, not shown in the app yet). action=backtest: scores every coin-day of stored daily history with the fixed bz1 formula (BTC/market backdrop 30, 1-4 week trend + nearness to 52-week high 30, calm/low volatility 20, cheapness 10, RSI exhaustion 10; minus 20 falling knife, minus 15 recent pump; bands Buy zone >=70, Getting close 50-70, Not yet <50), enters at the NEXT daily close, and reports 7/30/90-day forward returns, returns vs BTC, hit rates and the median worst dip by band and quintile, against every-day and BTC-above-200d baselines, split by BTC regime and by time block, plus weekly/monthly rank IC and each part alone. universe=mine (default: holdings + planned coins + BTC) or all (every coin with stored history; slower). Cached 6 h; refresh=true recomputes. action=now: the latest score and its parts for Bryan\'s coins (or the given symbols). Nothing is stored, shown or traded.',
