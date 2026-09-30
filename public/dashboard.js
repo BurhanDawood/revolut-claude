@@ -157,19 +157,7 @@ function loadPortfolio() {
       plUsd >= 0 ? '#00ff88' : '#ff4444');
     setText('cap-breakeven', '+' + breakEven.toFixed(1) + '% needed', '#ffaa00');
 
-    showEl('pnl-summary-bar');
-    var positions = data.positions || [];
-    var winners = 0, losers = 0, totalUnreal = 0;
-    positions.forEach(function(p) {
-      var ep = parseFloat(p.entry_price || 0), cp = parseFloat(p.current_price || 0), qty = parseFloat(p.quantity || 0);
-      var pl = (ep && cp && qty) ? (cp - ep) * qty : 0;
-      totalUnreal += pl;
-      if (pl > 0) winners++; else if (pl < 0) losers++;
-    });
-    setText('pnl-tracked', positions.length);
-    setText('pnl-winners', winners, '#00ff88');
-    setText('pnl-losers', losers, '#ff4444');
-    setText('pnl-total-unreal', (totalUnreal >= 0 ? '+' : '\u2212') + fmtUSD(Math.abs(totalUnreal)) /* #496 sign + thousands */, totalUnreal >= 0 ? '#00ff88' : '#ff4444');
+    var positions = data.positions || [];   // #528 the P&L summary bar (tracked / in profit / in loss / unrealised) is removed
 
     hideEl('tangem-loading'); showEl('tangem-content');
     setText('tangem-value-usd', fmtUSD(tangemVal));
@@ -1142,7 +1130,7 @@ function rxAppLayout() {
     [].slice.call(el.children).forEach(function (c) { if (c !== head) body.appendChild(c); });
     el.appendChild(body);
     el.classList.add('rx-sec'); head.classList.add('rx-head');
-    var dflt = /^Coins$/.test(key);   // #517 the coin list starts open (the Tangem card, #496, is now XRP's row); everything else starts folded
+    var dflt = /^Coins$/.test(key) || /^Budget agent/.test(key);   // #517 the coin list starts open (the Tangem card, #496, is now XRP's row); #528 and the agent's equity chart; everything else starts folded
     if (!(key in open ? open[key] : dflt)) el.classList.add('rx-collapsed');
     head.addEventListener('click', function (e) {
       if (e.target.closest('a')) return;
