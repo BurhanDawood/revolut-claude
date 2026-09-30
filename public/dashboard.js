@@ -1140,6 +1140,7 @@ function rxAppLayout() {
     });
   });
   try { rxWidgetsInit(pane); } catch (e) { console.warn('widgets', e); }   // #529
+  try { rxPipInit(pane); } catch (e) { console.warn('pip', e); }   // #530
 }
 
 // #529 Home widgets (Bryan 30 Sep 22:56 "Move [USDT sweep] under portfolio value graph. Default collapsed. Can we make these actually
@@ -1282,6 +1283,56 @@ function rxWidgetsInit(pane) {
   document.addEventListener('mouseup', end);
   pane.addEventListener('contextmenu', function (e) { if (cardOf(e.target)) e.preventDefault(); });
   document.addEventListener('click', function (e) { if (eatClick) { e.stopPropagation(); e.preventDefault(); eatClick = false; } }, true);   // letting go after a hold is not a tap (not even on the menu that just opened under the finger)
+}
+
+// #530 POP OUT (Bryan 30 Sep 22:56 "option to make pop out that stays open above my apps ... like YouTube or Google Maps"; 23:33 desk
+// #37 Option B: a floating window over every app that he can drag and resize from a corner). Inside the app (v13+, which has the
+// RxFloat plugin) a widget's press-and-hold menu offers "Pop out" (23:09: options on a hold, not buttons on the widget). The app opens
+// a floating window over other apps with this page in float mode: /?app=1&float=<widget> shows that one widget, scaled to the window;
+// a coin tile floats its coin's chart (/coin?c=SYM&float=1). A tap in the window brings the app to the front. In a browser, or an
+// older app, there is no Pop out. Read-only: the float pages are the same read routes the app uses.
+var rxPip = { id: null, wasCollapsed: false, w: 0, h: 0 };
+function rxPipApp() { try { return window.parent !== window && window.parent.rxApp && window.parent.rxApp.float ? window.parent.rxApp : null; } catch (e) { return null; } }
+function rxPipScale() {
+  var el = rxPip.id && document.getElementById(rxPip.id); if (!el) return;
+  document.documentElement.style.setProperty('--pipw', rxPip.w + 'px');
+  var s = Math.min(window.innerWidth / rxPip.w, rxPip.h > 0 ? window.innerHeight / rxPip.h : 99);   // the whole widget fits the window
+  document.documentElement.style.setProperty('--pips', String(Math.max(0.1, s)));
+}
+window.rxPipShow = function (id) {   // a widget id to show alone (float mode), or null for the normal page
+  var cur = rxPip.id && document.getElementById(rxPip.id);
+  if (cur) { cur.classList.remove('rx-pip-on'); if (rxPip.wasCollapsed) cur.classList.add('rx-collapsed'); }
+  rxPip.id = null; document.documentElement.classList.remove('rx-pip');
+  var el = id && document.getElementById(id);
+  if (!el || RX_WIDGETS_DEFAULT.indexOf(id) < 0) return;
+  rxPip.wasCollapsed = el.classList.contains('rx-collapsed'); el.classList.remove('rx-collapsed'); el.hidden = false;
+  var r = el.getBoundingClientRect(); rxPip.w = Math.round(r.width) || 380; rxPip.h = Math.round(r.height) || 0;
+  rxPip.id = id; el.classList.add('rx-pip-on'); document.documentElement.classList.add('rx-pip'); rxPipScale();
+};
+window.addEventListener('resize', function () { if (rxPip.id) { var el = document.getElementById(rxPip.id); if (el) rxPip.h = Math.round(el.offsetHeight) || rxPip.h; } rxPipScale(); });
+function rxPopOut(id) {
+  var A = rxPipApp(); if (!A) return;
+  var t = /^tile-([A-Z0-9]{1,15})$/.exec(id || '');
+  var path = t ? '/coin?c=' + t[1] + '&float=1' : '/?app=1&float=' + String(id || '').replace(/[^a-z-]/g, '');
+  Promise.resolve(A.float(path)).then(function (r) {
+    if (r && r.needs_permission) showToast('Allow "Display over other apps" for Revolut X, then tap Pop out again');
+  }).catch(function (e) { showToast('Pop-out did not open: ' + (e && e.message ? e.message : e), true); });
+}
+function rxPipInit(pane) {   // the app says whether it can float; the widget menu (press and hold) then offers "Pop out"
+  var fm = /[?&]float=([a-z-]{1,40})(&|$)/.exec(location.search);
+  if (fm) { rxFloatMode(fm[1]); return; }
+  var A = rxPipApp(); if (!A || !A.floatOk) return;
+  Promise.resolve(A.floatOk()).then(function (ok) { if (ok) document.documentElement.classList.add('rx-pip-ok'); }).catch(function () {});
+}
+function rxFloatMode(id) {   // this page IS the floating window: one widget; a tap opens the app (on a coin when the tap was on one)
+  document.documentElement.classList.add('rx-float');
+  setTimeout(function () { window.rxPipShow(id); }, 300);
+  setTimeout(function () { window.rxPipShow(id); }, 2500);   // again once its data has drawn (the height changes)
+  document.addEventListener('click', function (e) {
+    e.preventDefault(); e.stopPropagation();
+    var c = e.target.closest && e.target.closest('[data-coin]'), coin = c ? String(c.getAttribute('data-coin') || '').toUpperCase() : '';
+    try { if (window.RxFloatHost && window.RxFloatHost.open) window.RxFloatHost.open(/^[A-Z0-9]{1,15}$/.test(coin) ? coin : ''); } catch (e2) {}
+  }, true);
 }
 
 // #492 open one coin's card - from a notification (the app shell calls rxFocusCoin, or loads /?app=1#coin=AST).
