@@ -382,6 +382,53 @@ async function appCardCoins(nowMs = Date.now()) {
 function appInboxCoinLinks(s, coins) {
   return s.replace(/(?<![A-Za-z0-9])[A-Z0-9]{2,12}(?![A-Za-z0-9])/g, (w) => coins.has(w) ? '<a class="coin" href="#coin=' + w + '" data-coin="' + w + '">' + w + '</a>' : w);
 }
+// #522 SHORT PHONE NOTIFICATIONS (Bryan 30 Sep 15:09 "fix notifications so I see most important info just there. ABN move - AST PUMP"):
+// the phone showed the Telegram first line cut off ("ABNORMAL MOVE - AST P..."). For the common alert shapes the PHONE now gets a
+// title that leads with the coin and the move, and a one-line body with the prices; Telegram and the feed keep the full text.
+// Anything this does not recognise, or cannot read cleanly, keeps the old first-line title.
+function appPushPx(s) {   // "0.007240" -> "$0.00724"; keeps an existing $
+  const v = parseFloat(String(s || '').replace(/[$,]/g, ''));
+  if (!(v > 0)) return null;
+  const d = v >= 1000 ? 2 : v >= 1 ? 4 : Math.min(10, Math.max(4, 3 - Math.floor(Math.log10(v))));
+  return '$' + Number(v.toPrecision(v >= 1 ? 8 : 4)).toLocaleString('en-US', { maximumFractionDigits: d });
+}
+function appPushPct(v) { const n = parseFloat(v); return isFinite(n) ? (n >= 0 ? '+' : '−') + Math.abs(n).toFixed(1) + '%' : null; }
+function appPushCompact(lines) {
+  const t = lines[0] || '', all = lines.join('\n');
+  let m;
+  // ABNORMAL MOVE - AST PUMP / +8.011% in 1min | 3.6x normal range / 0.007240 -> 0.007820 | baseline ...
+  if ((m = /^ABNORMAL MOVE - ([A-Z0-9]{1,15}) (PUMP|DUMP)\b/.exec(t))) {
+    const mv = /([+-]?\d+(?:\.\d+)?)% in (\d+)\s*min\s*\|\s*(\d+(?:\.\d+)?)x normal/.exec(all), px = /(\d[\d.]*)\s*->\s*(\d[\d.]*)/.exec(all);
+    if (!mv) return null;
+    const up = m[2] === 'PUMP', pct = appPushPct(up ? Math.abs(mv[1]) : -Math.abs(mv[1]));
+    return { title: (up ? '🚀 ' : '🔻 ') + m[1] + ' ' + pct + ' in ' + mv[2] + ' min',
+      body: (px && appPushPx(px[1]) && appPushPx(px[2]) ? appPushPx(px[1]) + ' → ' + appPushPx(px[2]) + ' · ' : '') + mv[3] + '× its normal move' };
+  }
+  // 📈 CC DAILY PUMP ALERT / 📉 CC DROP ALERT  (24h move: +x% / Current: $y)
+  if ((m = /^(?:\S+\s+)?([A-Z0-9]{1,15}) (?:DAILY )?(PUMP|DROP|DUMP) ALERT\b/.exec(t))) {
+    const mv = /24h move:\s*([+-]?\d+(?:\.\d+)?)%/.exec(all), cur = /Current:\s*\$?([\d.,]+)/.exec(all);
+    if (!mv) return null;
+    return { title: (m[2] === 'PUMP' ? '📈 ' : '📉 ') + m[1] + ' ' + appPushPct(mv[1]) + ' in 24 h', body: (cur && appPushPx(cur[1]) ? 'Now ' + appPushPx(cur[1]) + ' · ' : '') + 'tap to Hold, Sell or Buy more' };
+  }
+  // 🎯 CC FIXED TARGET HIT! / Anchor: $a → Now $p (+x%)
+  if ((m = /^(?:\S+\s+)?([A-Z0-9]{1,15})(?:-USD)? FIXED TARGET HIT/.exec(t))) {
+    const now = /Now \$([\d.,]+)/.exec(all), ch = /\(([+-]\d+(?:\.\d+)?)%\)/.exec(all);
+    if (!now || !appPushPx(now[1])) return null;
+    return { title: '🎯 ' + m[1] + ' hit its target · ' + appPushPx(now[1]), body: (ch ? appPushPct(ch[1]) + ' from the anchor · ' : '') + 'tap to decide' };
+  }
+  // ⚠️ TRAILING STOP TRIGGERED — CC / 📉 Drop: x% from peak / Peak: $a → Current: $b / Trail: t% | Stop: $s
+  if ((m = /^(?:\S+\s+)?TRAILING STOP (TRIGGERED|STILL BREACHED[^—]*)\s*—\s*([A-Z0-9]{1,15})\b/.exec(t))) {
+    const dr = /Drop:\s*(\d+(?:\.\d+)?)% from peak/.exec(all), cur = /Current:\s*\$?([\d.,]+)/.exec(all), st = /Stop:\s*\$?([\d.,]+)/.exec(all);
+    if (!dr) return null;
+    return { title: '⚠️ ' + m[2] + ' trail hit · ' + appPushPct(-dr[1]) + ' from peak' + (/STILL/.test(m[1]) ? ' (reminder)' : ''),
+      body: (cur && appPushPx(cur[1]) ? 'Now ' + appPushPx(cur[1]) : '') + (st && appPushPx(st[1]) ? ' · stop ' + appPushPx(st[1]) : '') };
+  }
+  // BROAD MARKET MOVE: 7 coins >=3% abnormal (5 PUMP / 2 DUMP)
+  if ((m = /^BROAD MARKET MOVE: (\d+) coins >=\s*(\d+(?:\.\d+)?)% abnormal \((\d+) PUMP \/ (\d+) DUMP\)/.exec(t))) {
+    return { title: '🌊 Market move · ' + m[1] + ' coins at once', body: m[3] + ' up, ' + m[4] + ' down, each ' + m[2] + '%+ in minutes' };
+  }
+  return null;
+}
 // Telegram HTML -> a notification: the first line is the title, the rest the body; tags stripped, entities decoded.
 function appPushFromTelegram(message, replyMarkup) {
   const text = String(message == null ? '' : message)
@@ -402,6 +449,8 @@ function appPushFromTelegram(message, replyMarkup) {
     : /PAYMENT|SALE|SOLD|BOUGHT|portfolio|capital/i.test(text) ? 'portfolio' : 'home';
   const coin = tab === 'agent' || tab === 'desk' ? '' : (appPushCoin(title) || appPushBodyCoin(text));   // #504 + the one coin named in the text
   if (coin) tab = 'home';   // #492 a coin opens its card on Home
+  const cp = appPushCompact(lines);   // #522 a short phone title for the common alerts (the coin was read from the full title above)
+  if (cp && cp.title) { title = String(cp.title).slice(0, APP_PUSH.title_max); if (cp.body) body = String(cp.body).slice(0, APP_PUSH.body_max); }
   return { title, body, channel, tab, coin, cat: appPushCategory(text) };   // #498
 }
 // Per-channel hourly caps, so a burst of Telegram messages cannot flood the phone. Alerts get the larger allowance.
