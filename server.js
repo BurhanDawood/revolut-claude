@@ -27964,6 +27964,30 @@ async function briefForPm() {
   return 'Morning brief sent ' + when + ' (London).\n\n--- Portfolio snapshot ---\n' + briefPlain(b.snapshot) + '\n\n--- Market section ---\n' + briefPlain(String(b.market || '').replace(BRIEF_PM_NUDGE, '')) + (v ? '\n\nFeatured video: ' + v.channel + ' - ' + v.title + ' ' + v.url : '');
 }
 app.get('/api/brief/latest', async (req, res) => { try { res.set('Cache-Control', 'no-store').json(await briefLatest()); } catch (e) { res.status(500).json({ error: 'brief unavailable' }); } });   // #531 read-only
+// #533 COIN TILES (Bryan 30 Sep 23:21 "In rev I can get these widgets for coins that I can choose coin and arrange place as I like"):
+// Home's small two-per-row coin tiles, like Revolut X - pair, logo, price, 24 h change and a 24 h line. GET /api/coins/tiles?c=BTC,ETH
+// (read-only, at most 24 coins): the live price from the shared ticker map, the line from the hourly candles (kept 5 minutes per coin).
+const _tileSeries = new Map();
+async function coinTiles(list) {
+  const coins = [...new Set(String(list || '').split(',').map(coinSym).filter(Boolean))].slice(0, 24);
+  const tick = await revolutTickerMap(15000).catch(() => ({}));
+  await coinMetaLoad(); coinMetaWant(coins);
+  const out = [];
+  for (const c of coins) {
+    let s = _tileSeries.get(c);
+    if (!s || Date.now() - s.at > 300000) {
+      try {
+        const d = await coinCandles(c, '1h'); const k = (d.candles || []).filter(x => x.t >= Date.now() / 1000 - 86400);
+        s = { at: Date.now(), pts: k.map(x => Number(x.c)).filter(v => v > 0), open: k.length ? Number(k[0].o) : null };
+      } catch (e) { s = s || { at: Date.now() - 240000, pts: [], open: null }; }   // a failure tries again in about a minute
+      _tileSeries.set(c, s); if (_tileSeries.size > 200) _tileSeries.delete(_tileSeries.keys().next().value);
+    }
+    const t = tick[c], px = t && t.mid > 0 ? t.mid : (s.pts.length ? s.pts[s.pts.length - 1] : null), m = coinMetaOf(c);
+    out.push({ coin: c, name: m.name, icon: m.icon, price: px, change24h: px && s.open > 0 ? (px - s.open) / s.open * 100 : null, spark: s.pts.slice(-48).map(v => Number(v.toPrecision(6))) });
+  }
+  return { at: Date.now(), tiles: out };
+}
+app.get('/api/coins/tiles', async (req, res) => { try { res.set('Cache-Control', 'no-store').json(await coinTiles(req.query.c)); } catch (e) { res.status(500).json({ error: 'tiles unavailable' }); } });   // #533 read-only
 app.get('/app-icon.svg', (req, res) => { res.set('Cache-Control', 'public, max-age=86400').type('image/svg+xml').send(APP_ICON_SVG); });
 app.get('/app.webmanifest', (req, res) => { res.set('Cache-Control', 'no-store').type('application/manifest+json').send(JSON.stringify(APP_MANIFEST)); });
 

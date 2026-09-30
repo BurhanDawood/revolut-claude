@@ -1149,31 +1149,36 @@ function rxAppLayout() {
 // remembered on this phone (localStorage 'rx_widgets'); a new card appears in its default place.
 var RX_WIDGETS_DEFAULT = ['brief-card', 'movers-card', 'pv-card', 'sweep-card', 'agent-card', 'coins-card', 'monitor-card'];
 function rxWidgetEls(pane) {
-  return [].slice.call(pane.children).filter(function (el) { return el.id && RX_WIDGETS_DEFAULT.indexOf(el.id) >= 0; });
+  return [].slice.call(pane.children).filter(function (el) { return el.id && rxIsWidget(el.id); });   // #533 cards and coin tiles
 }
 function rxWidgetName(el) {
+  if (RX_TILE_RE.test(el.id)) return el.id.slice(5) + ' tile';   // #533
   var h = el.querySelector('.card-title'); if (!h) return el.id;
   var t = h.cloneNode(true); [].forEach.call(t.querySelectorAll('a, .mini-badge, .rx-dot'), function (x) { x.remove(); });
   return t.textContent.replace(/\s+/g, ' ').trim() || el.id;
 }
 function rxWidgetsState() {
   var s = (function () { try { return JSON.parse(localStorage.getItem('rx_widgets') || 'null'); } catch (e) { return null; } })() || {};
-  var order = Array.isArray(s.order) ? s.order.filter(function (id) { return RX_WIDGETS_DEFAULT.indexOf(id) >= 0; }) : [];
+  var order = Array.isArray(s.order) ? s.order.filter(function (id, i, a) { return rxIsWidget(id) && a.indexOf(id) === i; }) : [];
   RX_WIDGETS_DEFAULT.forEach(function (id, i) {   // a widget missing from the saved order goes after the one before it by default
     if (order.indexOf(id) >= 0) return;
     var prev = RX_WIDGETS_DEFAULT.slice(0, i).reverse().filter(function (p) { return order.indexOf(p) >= 0; })[0];
     order.splice(prev ? order.indexOf(prev) + 1 : 0, 0, id);
   });
+  if (!s.tiles_v) { var at = order.indexOf('movers-card') + 1; ['tile-BTC', 'tile-ETH'].forEach(function (t, k) { if (order.indexOf(t) < 0) order.splice(at + k, 0, t); }); }   // #533 the first time: BTC and ETH tiles under Top movers
   return { order: order, hidden: s.hidden && typeof s.hidden === 'object' ? s.hidden : {} };
 }
-function rxWidgetsSave(st) { try { localStorage.setItem('rx_widgets', JSON.stringify({ order: st.order, hidden: st.hidden })); } catch (e) {} }
+function rxWidgetsSave(st) { try { localStorage.setItem('rx_widgets', JSON.stringify({ order: st.order, hidden: st.hidden, tiles_v: 1 })); } catch (e) {} }
 function rxWidgetsApply(pane, st) {
+  st.order.forEach(function (id) { if (RX_TILE_RE.test(id)) rxTileEnsure(pane, id); });   // #533 a tile exists while it is in the order
+  [].slice.call(pane.querySelectorAll(':scope > .ct-tile')).forEach(function (el) { if (st.order.indexOf(el.id) < 0) el.remove(); });
   var els = rxWidgetEls(pane); if (!els.length) return;
   var byId = {}; els.forEach(function (el) { byId[el.id] = el; });
   var mark = document.getElementById('rx-w-mark');
   if (!mark) { mark = document.createElement('span'); mark.id = 'rx-w-mark'; mark.hidden = true; pane.insertBefore(mark, els[0]); }
   var ref = mark;
   st.order.forEach(function (id) { var el = byId[id]; if (!el) return; ref.parentNode.insertBefore(el, ref.nextSibling); ref = el; el.hidden = !!st.hidden[id]; });
+  rxTilesLoad();   // #533
 }
 function rxWidgetsInit(pane) {
   if (!pane) return;
@@ -1187,7 +1192,7 @@ function rxWidgetsInit(pane) {
   var sheet = document.createElement('div'); sheet.className = 'rx-w-sheet'; sheet.hidden = true;
   sheet.innerHTML = '<div class="rx-w-panel" role="dialog" aria-label="Edit widgets"><div class="rx-w-top"><b>Widgets</b><button type="button" data-w="close" aria-label="Close">✕</button></div>' +
     '<p class="rx-w-tip">Tick the ones to show. Use the arrows, or press and hold a widget on Home and drag it.</p><div class="rx-w-list"></div>' +
-    '<button type="button" class="rx-w-reset" data-w="reset">Reset to the default order</button></div>';
+    '<button type="button" class="rx-w-reset" data-w="addtile">＋ Add a coin tile</button><button type="button" class="rx-w-reset" data-w="reset">Reset to the default order</button></div>';
   document.body.appendChild(sheet);
   function paint() {
     var byId = {}; rxWidgetEls(pane).forEach(function (el) { byId[el.id] = el; });
@@ -1202,7 +1207,8 @@ function rxWidgetsInit(pane) {
     var b = e.target.closest('[data-w]'); if (!b) return;
     var w = b.getAttribute('data-w'), id = b.getAttribute('data-id');
     if (w === 'close') { sheet.hidden = true; return; }
-    if (w === 'reset') { st = { order: RX_WIDGETS_DEFAULT.slice(), hidden: {} }; }
+    if (w === 'addtile') { sheet.hidden = true; rxCoinPick('Add a coin tile', function (c) { st = rxWidgetsState(); var nid = 'tile-' + c; if (st.order.indexOf(nid) < 0) { var at = st.order.indexOf('movers-card') + 1; st.order.splice(at, 0, nid); } delete st.hidden[nid]; rxWidgetsSave(st); rxWidgetsApply(pane, st); }); return; }   // #533
+    if (w === 'reset') { st = { order: RX_WIDGETS_DEFAULT.slice(), hidden: {} }; st.order.splice(st.order.indexOf('movers-card') + 1, 0, 'tile-BTC', 'tile-ETH'); }   // #533 with the two first tiles
     else if (w === 'show') { if (b.checked) delete st.hidden[id]; else st.hidden[id] = true; }
     else if (w === 'up' || w === 'down') { var i = st.order.indexOf(id), j = w === 'up' ? i - 1 : i + 1; if (i < 0 || j < 0 || j >= st.order.length) return; st.order[i] = st.order[j]; st.order[j] = id; }
     else return;
@@ -1217,14 +1223,17 @@ function rxWidgetsInit(pane) {
   function cardOf(t) {
     if (!t || !t.closest || t.closest('input, textarea, select, .rx-w-menu, .rx-w-sheet')) return null;
     var el = t; while (el && el.parentNode !== pane) el = el.parentNode;
-    return el && RX_WIDGETS_DEFAULT.indexOf(el.id) >= 0 && !el.hidden ? el : null;
+    return el && rxIsWidget(el.id) && !el.hidden ? el : null;
   }
   function menuClose() { menu.hidden = true; if (menuFor) menuFor.classList.remove('rx-w-held'); menuFor = null; }
   function menuOpen(card) {
     menuFor = card; card.classList.add('rx-w-held');
     var pip = typeof window.rxPopOut === 'function' && document.documentElement.classList.contains('rx-pip-ok');
-    menu.innerHTML = (pip ? '<button type="button" role="menuitem" data-m="pop"><span>⧉</span>Pop out</button>' : '') +
-      '<button type="button" role="menuitem" data-m="edit"><span>＋</span>Add or edit widgets</button>' +
+    var tile = RX_TILE_RE.test(card.id);   // #533 a coin tile: Select crypto / Add coin tile / Remove
+    menu.innerHTML = (tile ? '<button type="button" role="menuitem" data-m="pick"><span>✎</span>Select crypto</button>' : '') +
+      (pip ? '<button type="button" role="menuitem" data-m="pop"><span>⧉</span>Pop out</button>' : '') +
+      '<button type="button" role="menuitem" data-m="addtile"><span>＋</span>Add coin tile</button>' +
+      (tile ? '' : '<button type="button" role="menuitem" data-m="edit"><span>☰</span>Edit widgets</button>') +
       '<button type="button" role="menuitem" data-m="remove" class="rx-w-danger"><span>🗑</span>Remove</button>';
     menu.hidden = false;
     var r = card.getBoundingClientRect(), mh = menu.offsetHeight, mw = menu.offsetWidth;
@@ -1234,6 +1243,17 @@ function rxWidgetsInit(pane) {
   menu.addEventListener('click', function (e) {
     var b = e.target.closest('button[data-m]'); if (!b || !menuFor) return;
     var m = b.getAttribute('data-m'), card = menuFor; menuClose();
+    if (m === 'pick' || m === 'addtile') {   // #533
+      rxCoinPick(m === 'pick' ? 'Select crypto' : 'Add a coin tile', function (c) {
+        var nid = 'tile-' + c; st = rxWidgetsState();
+        if (st.order.indexOf(nid) >= 0 && nid !== card.id) { showToast(c + ' already has a tile'); return; }
+        var at = st.order.indexOf(card.id);
+        if (m === 'pick') { st.order[at] = nid; if (card.id !== nid) card.remove(); } else st.order.splice(at + 1, 0, nid);
+        rxWidgetsSave(st); rxWidgetsApply(pane, st);
+      });
+      return;
+    }
+    if (m === 'remove' && RX_TILE_RE.test(card.id)) { st = rxWidgetsState(); st.order = st.order.filter(function (x) { return x !== card.id; }); delete st.hidden[card.id]; rxWidgetsSave(st); rxWidgetsApply(pane, st); return; }   // #533 a tile goes; add it again from any widget's menu
     if (m === 'pop') window.rxPopOut(card.id);
     else if (m === 'edit') btn.click();
     else if (m === 'remove') { st = rxWidgetsState(); st.hidden[card.id] = true; rxWidgetsSave(st); rxWidgetsApply(pane, st); showToast(rxWidgetName(card) + ' removed - add it back with Edit widgets at the bottom'); }
@@ -1248,13 +1268,20 @@ function rxWidgetsInit(pane) {
   function startDrag() {
     menuClose(); drag = held; drag.classList.add('rx-w-drag'); document.documentElement.classList.add('rx-w-dragging');
   }
-  function move(y) {
+  function move(x, y) {
     if (!drag) return;
     var els = rxWidgetEls(pane).filter(function (el) { return !el.hidden && el !== drag; });
-    var before = null, top0 = drag.getBoundingClientRect().top;
-    for (var i = 0; i < els.length; i++) { var r = els[i].getBoundingClientRect(); if (y < r.top + r.height / 2) { before = els[i]; break; } }
-    if (before) { if (drag.nextElementSibling !== before) pane.insertBefore(drag, before); }
-    else { var last = els[els.length - 1]; if (last && last.nextSibling !== drag) pane.insertBefore(drag, last.nextSibling); }
+    var before = null, after = null, top0 = drag.getBoundingClientRect().top;
+    for (var k = 0; k < els.length; k++) {   // #533 over a tile: its left half goes before it, its right half after it (tiles share rows)
+      var q = els[k].getBoundingClientRect();
+      if (x >= q.left && x <= q.right && y >= q.top && y <= q.bottom) { if (els[k].classList.contains('ct-tile') ? x < q.left + q.width / 2 : y < q.top + q.height / 2) before = els[k]; else after = els[k]; break; }
+    }
+    if (after) { if (after.nextElementSibling !== drag) pane.insertBefore(drag, after.nextSibling); }
+    else {
+      if (!before) for (var i = 0; i < els.length; i++) { var r = els[i].getBoundingClientRect(); if (y < r.top + r.height / 2) { before = els[i]; break; } }
+      if (before) { if (drag.nextElementSibling !== before) pane.insertBefore(drag, before); }
+      else { var last = els[els.length - 1]; if (last && last.nextSibling !== drag) pane.insertBefore(drag, last.nextSibling); }
+    }
     var jump = drag.getBoundingClientRect().top - top0; if (jump) window.scrollBy(0, jump);   // keep the card under the finger when it jumps past a tall one
     if (y < 60) window.scrollBy(0, -12); else if (y > window.innerHeight - 60) window.scrollBy(0, 12);   // scrolls while held at an edge
   }
@@ -1273,7 +1300,7 @@ function rxWidgetsInit(pane) {
   function moved(x, y) {
     if (timer && (Math.abs(x - sx) > 8 || Math.abs(y - sy) > 8)) cancel();   // it is a scroll, not a hold
     if (held && !drag && (Math.abs(x - sx) > 10 || Math.abs(y - sy) > 10)) startDrag();
-    if (drag) move(y);
+    if (drag) move(x, y);
   }
   pane.addEventListener('touchstart', function (e) { var card = cardOf(e.target); if (card && e.touches.length === 1) down(card, e.touches[0].clientX, e.touches[0].clientY); else cancel(); }, { passive: true });
   document.addEventListener('touchmove', function (e) { var t = e.touches[0]; if (!t) return; moved(t.clientX, t.clientY); if (held) e.preventDefault(); }, { passive: false });
@@ -1304,7 +1331,7 @@ window.rxPipShow = function (id) {   // a widget id to show alone (float mode), 
   if (cur) { cur.classList.remove('rx-pip-on'); if (rxPip.wasCollapsed) cur.classList.add('rx-collapsed'); }
   rxPip.id = null; document.documentElement.classList.remove('rx-pip');
   var el = id && document.getElementById(id);
-  if (!el || RX_WIDGETS_DEFAULT.indexOf(id) < 0) return;
+  if (!el || !rxIsWidget(id)) return;   // #533 tiles pop out too
   rxPip.wasCollapsed = el.classList.contains('rx-collapsed'); el.classList.remove('rx-collapsed'); el.hidden = false;
   var r = el.getBoundingClientRect(); rxPip.w = Math.round(r.width) || 380; rxPip.h = Math.round(r.height) || 0;
   rxPip.id = id; el.classList.add('rx-pip-on'); document.documentElement.classList.add('rx-pip'); rxPipScale();
@@ -1392,3 +1419,77 @@ document.addEventListener('click', function (e) {
   if (t && t.id === 'bf-ask') { try { window.parent.rxApp.pm('About this morning\'s brief: '); } catch (e2) {} }
 });
 if (document.getElementById('bf-body')) { rxBriefLoad(); setInterval(function () { if (!document.hidden) rxBriefLoad(); }, 10 * 60000); }
+
+// #533 coin tiles on Home (Bryan 30 Sep 23:21, like Revolut X): small two-per-row widgets, one coin each - pair, logo, price, 24 h
+// change and a 24 h line. They are widgets like the cards: press and hold for Select crypto / Add coin tile / Remove, or hold and move
+// to put one anywhere (two tiles side by side share a row). Tap one for its coin page. Kept on this phone with the widget order.
+var RX_TILE_RE = /^tile-[A-Z0-9]{1,15}$/;
+function rxIsWidget(id) { return RX_WIDGETS_DEFAULT.indexOf(id) >= 0 || RX_TILE_RE.test(id || ''); }
+var rxTileData = {};
+function rxTileEnsure(pane, id) {
+  var el = document.getElementById(id); if (el) return el;
+  var c = id.slice(5);
+  el = document.createElement('div'); el.className = 'card ct-tile'; el.id = id; el.setAttribute('data-coin', c); el.setAttribute('role', 'link'); el.tabIndex = 0;
+  el.innerHTML = '<div class="ct-top"><span class="ct-pair">' + esc(c) + '-USD</span><span class="ct-ic"></span></div><div class="ct-px">–</div><div class="ct-ch">&nbsp;</div><div class="ct-sp"></div>';
+  el.addEventListener('click', function () { rxOpenCoin(c); });
+  pane.appendChild(el); rxTileRender(el);
+  return el;
+}
+function rxTilePx(v) { if (v == null || !isFinite(v)) return '–'; var a = Math.abs(v); return '$' + Number(v).toLocaleString('en-US', { minimumFractionDigits: a >= 1000 ? 0 : 2, maximumFractionDigits: a >= 1000 ? 0 : a >= 1 ? 2 : a >= 0.01 ? 4 : 8 }); }
+function rxTileSpark(pts, up) {
+  if (!pts || pts.length < 2) return '';
+  var W = 150, H = 54, lo = Math.min.apply(null, pts), hi = Math.max.apply(null, pts); if (hi - lo <= 0) { hi += 1e-9; lo -= 1e-9; }
+  var x = function (i) { return (i * W / (pts.length - 1)).toFixed(1); }, y = function (v) { return (3 + (hi - v) * (H - 6) / (hi - lo)).toFixed(1); };
+  var line = pts.map(function (v, i) { return x(i) + ',' + y(v); }).join(' '), col = up ? 'var(--ct-up)' : 'var(--ct-dn)', gid = 'ctg' + (up ? 'u' : 'd'), g = '';
+  for (var i = 1; i < 6; i++) g += '<line x1="' + (i * W / 6).toFixed(1) + '" x2="' + (i * W / 6).toFixed(1) + '" y1="0" y2="' + H + '" class="ct-grid"/>';
+  for (var j = 1; j < 4; j++) g += '<line x1="0" x2="' + W + '" y1="' + (j * H / 4).toFixed(1) + '" y2="' + (j * H / 4).toFixed(1) + '" class="ct-grid"/>';
+  return '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none" aria-hidden="true"><defs><linearGradient id="' + gid + '" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="' + col + '" stop-opacity="0.35"/><stop offset="1" stop-color="' + col + '" stop-opacity="0"/></linearGradient></defs>' + g +
+    '<line x1="0" x2="' + W + '" y1="' + y(pts[0]) + '" y2="' + y(pts[0]) + '" class="ct-open"/>' +
+    '<polygon fill="url(#' + gid + ')" points="0,' + H + ' ' + line + ' ' + W + ',' + H + '"/><polyline fill="none" stroke="' + col + '" stroke-width="1.8" stroke-linejoin="round" points="' + line + '"/></svg>';
+}
+function rxTileRender(el) {
+  var d = rxTileData[el.getAttribute('data-coin')]; if (!d) return;
+  var up = d.change24h == null ? true : d.change24h >= 0;
+  el.querySelector('.ct-px').textContent = rxTilePx(d.price);
+  var ch = el.querySelector('.ct-ch'); ch.className = 'ct-ch ' + (d.change24h == null ? '' : up ? 'up' : 'dn'); ch.textContent = d.change24h == null ? ' ' : (up ? '▲ ' : '▼ ') + Math.abs(d.change24h).toFixed(2) + '%';
+  el.querySelector('.ct-sp').innerHTML = rxTileSpark(d.spark, up);
+  var ic = el.querySelector('.ct-ic');
+  if (!ic.getAttribute('data-done')) { ic.setAttribute('data-done', '1'); ic.innerHTML = rxCoinIcon({ coin: d.coin, icon: d.icon }); }
+  el.setAttribute('aria-label', (d.name || d.coin) + ' ' + rxTilePx(d.price));
+}
+function rxTilesLoad() {
+  var els = [].slice.call(document.querySelectorAll('#tab-portfolio > .ct-tile')); if (!els.length) return;
+  var cs = els.map(function (el) { return el.getAttribute('data-coin'); });
+  fetch('/api/coins/tiles?c=' + encodeURIComponent(cs.join(',')), { cache: 'no-store' }).then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); }).then(function (j) {
+    (j.tiles || []).forEach(function (t) { rxTileData[t.coin] = t; });
+    els.forEach(function (el) { var ic = el.querySelector('.ct-ic'); if (ic && ic.getAttribute('data-done') && !ic.querySelector('img') && (rxTileData[el.getAttribute('data-coin')] || {}).icon) ic.removeAttribute('data-done'); rxTileRender(el); });
+  }).catch(function () {});
+}
+setInterval(function () { if (!document.hidden && !document.documentElement.classList.contains('rx-w-dragging')) rxTilesLoad(); }, 60000);
+// the coin picker: his coins first (from the coin list), a search box, and any ticker typed
+function rxCoinPick(title, cb) {
+  var sh = document.getElementById('ct-pick');
+  if (!sh) { sh = document.createElement('div'); sh.id = 'ct-pick'; sh.className = 'rx-w-sheet'; document.body.appendChild(sh); }
+  sh.innerHTML = '<div class="rx-w-panel" role="dialog" aria-label="' + rxAttr(title) + '"><div class="rx-w-top"><b>' + esc(title) + '</b><button type="button" data-p="close" aria-label="Close">✕</button></div>' +
+    '<input class="ct-q" type="search" placeholder="Search or type a ticker, e.g. SOL" autocomplete="off" spellcheck="false"><div class="ct-list"><p class="rx-w-tip">Loading your coins…</p></div></div>';
+  sh.hidden = false;
+  var q = sh.querySelector('.ct-q'), list = sh.querySelector('.ct-list'), all = [];
+  function paint() {
+    var s = String(q.value || '').trim().toUpperCase().replace(/-USD$/, ''), rows = all.filter(function (c) { return !s || c.coin.indexOf(s) === 0 || String(c.name || '').toUpperCase().indexOf(s) >= 0; }).slice(0, 60);
+    var h = rows.map(function (c) { return '<button type="button" class="ct-opt" data-c="' + rxAttr(c.coin) + '">' + rxCoinIcon(c) + '<span><b>' + esc(c.coin) + '</b> ' + esc(c.name || '') + '</span></button>'; }).join('');
+    if (/^[A-Z0-9]{1,15}$/.test(s) && !all.some(function (c) { return c.coin === s; })) h += '<button type="button" class="ct-opt" data-c="' + s + '"><span class="cl-ic"></span><span><b>' + esc(s) + '</b> use this ticker</span></button>';
+    list.innerHTML = h || '<p class="rx-w-tip">No match.</p>';
+  }
+  q.addEventListener('input', paint);
+  sh.onclick = function (e) {
+    if (e.target === sh || e.target.closest('[data-p="close"]')) { sh.hidden = true; return; }
+    var b = e.target.closest('.ct-opt'); if (!b) return;
+    sh.hidden = true; cb(b.getAttribute('data-c'));
+  };
+  fetch('/api/coins', { cache: 'no-store' }).then(function (r) { return r.json(); }).then(function (d) {
+    var seen = {}; ['BTC', 'ETH'].concat((d.coins || []).filter(function (c) { return c.section !== 'dust'; }).map(function (c) { return c.coin; })).forEach(function (c) { seen[c] = seen[c] || { coin: c }; });
+    (d.coins || []).forEach(function (c) { if (seen[c.coin]) { seen[c.coin].name = c.name; seen[c.coin].icon = c.icon; } });
+    all = Object.keys(seen).map(function (k) { return seen[k]; }); paint();
+  }).catch(function () { paint(); });
+  setTimeout(function () { try { q.focus(); } catch (e) {} }, 60);
+}
