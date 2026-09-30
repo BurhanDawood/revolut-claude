@@ -30,6 +30,11 @@ final class Push {
     static final String CAT_RE = "needs|money|price|loops|agent|reports|system";
     // v11 (batch 514): the rip alarm. Its own channel, sent only as a data-only message with data.alarm = "1"
     static final String CHANNEL_ALARM = "rx_alarm";
+    /**
+     * v12: the silent channel RipAlarmService's notification is posted on (the service plays rx_alarm's tone itself, on
+     * the alarm stream, so it rings through silent mode). Never sent by the server; rx_alarm stays the tone picker.
+     */
+    static final String CHANNEL_ALARM_RING = "rx_alarm_ring";
     /** RxNotify's name for the rip alarm row; openChannel accepts it besides the categories. */
     static final String ALARM_CAT = "alarm";
     /**

@@ -23,6 +23,7 @@ mobile/
       SparkChart.java            the widget's line chart, drawn into a Bitmap
       WidgetRefreshWorker.java   WorkManager: GET /api/portfolio/state + /spark every 30 min, on key save, on tap
       Push.java / RxMessagingService.java   FCM token -> POST /api/app/devices; notification display + tab
+      RipAlarm.java / RipAlarmService.java / AlarmActivity.java   the rip alarm (v11; v12 rings it on the alarm stream)
 ```
 
 ## The shell contract
@@ -216,6 +217,35 @@ Devices without `alarm` get an ordinary loud notification instead. When `data.al
 
 **Testing it.** The Firebase console's "test message" cannot send data-only messages. Use the server's test path, or FCM HTTP v1 directly (`POST https://fcm.googleapis.com/v1/projects/<project>/messages:send`, a service-account OAuth token in the `Authorization` header, never pasted anywhere) with
 `{ "message": { "token": "<device token>", "android": { "priority": "high" }, "data": { "alarm": "1", "title": "🚨 RIP ALARM - TEST +31% in 24 h", "body": "test", "coin": "AST", "inbox": "" } } }`.
+
+### v12: the rip alarm rings through silent mode
+
+v11 rang the alarm as a notification, and the notification system obeys the ringer mode: on silent it made no sound and no vibration (Bryan, 30 Sep: *"I need it to ring through silent mode like my alarms do"*). Clock apps ring through silent because they play the sound themselves on the alarm stream, which the ringer mode does not mute. v12 does the same. The server does not change: it still sends the v11 alarm message above.
+
+| id | name in Android settings | description | importance | sound | vibration |
+|---|---|---|---|---|---|
+| `rx_alarm_ring` | Rip alarm (screen) | Shows the rip alarm; its sound comes from the Rip alarm tone | HIGH | none | off |
+
+`rx_alarm_ring` also has `setBypassDnd(true)` and public lock-screen visibility. It is created with the others on every start, and again by the service before it posts (in case the app has not been opened since the update). It has no sound because Android fixes a channel's sound when it is created: posting the ringing alarm on `rx_alarm` would play the tone twice whenever the phone is not on silent.
+
+**`rx_alarm` is now the tone picker.** It stays exactly as it was (nothing renamed or re-created), and More → Notifications → Rip alarm → "Change ›" still opens its Android page. The tone picked there is what the alarm plays. Its on/off is still the alarm's on/off: if `rx_alarm` (or `rx_alarm_ring`) is blocked, or notifications are off for the app, the app does not start the service and shows the v11 notification instead (which Android then hides), so it never rings with no way to stop it.
+
+**`RipAlarmService`** (foreground service, `foregroundServiceType="mediaPlayback"`, not exported). `RxMessagingService` hands every `data.alarm = "1"` message to `RipAlarm.show`, which validates it exactly as v11 did and starts the service (a high-priority FCM message may start a foreground service from the background). The service:
+1. goes foreground at once with the alarm's notification on `rx_alarm_ring`: title and body, `CATEGORY_ALARM`, `PRIORITY_MAX`, the full-screen intent to `AlarmActivity`, **Stop**, the v11 deep link on tap, `setOngoing(true)`; no `FLAG_INSISTENT` and no `setTimeoutAfter` (the service repeats it and stops it);
+2. plays the tone on the **alarm stream** (`MediaPlayer`, `USAGE_ALARM` / `CONTENT_TYPE_SONIFICATION`), looping, at the phone's **alarm volume** (the app never changes a volume). The tone is `rx_alarm`'s sound, else the default alarm, ringtone, then notification sound: the first one that opens. A tone picked from the phone's own files that the app cannot read is played through Android's `Ringtone` (still the alarm stream, looping; Android 9+) before falling back. It holds `AUDIOFOCUS_GAIN_TRANSIENT` with the same attributes while ringing;
+3. vibrates the v11 pattern (three quick taps then a long buzz), repeating, as an **alarm vibration** (`VibrationAttributes.USAGE_ALARM` on Android 13+, alarm `AudioAttributes` below), so silent mode does not block it either;
+4. stops everything (sound, vibration, audio focus, foreground, notification, alarm screen) on **Stop** (notification or alarm screen), **Open <coin>** or a tap on the notification (then opens the deep link), a **swipe** (`setDeleteIntent`), **Back** on the alarm screen, or **10 minutes** after it started;
+5. a new alarm while one rings replaces it: one sound at a time, same notification id per coin as v11.
+
+Every stop goes through `RipAlarm.stop`, which stops the running service directly (same process) and cancels the notification. A tap reaches `MainActivity` with `rx_alarm_stop_id`, which stops the alarm before opening the coin (Android 12+ does not let a receiver or service open an activity after a tap).
+
+**Fallback.** If the service cannot be started (for example `ForegroundServiceStartNotAllowedException`) the app logs the reason (`Log.w`, no payload) and posts the v11 notification on `rx_alarm` (insistent, full-screen, 10-minute timeout). Silent mode then mutes it, as in v11.
+
+**Permissions added in v12:**
+- `FOREGROUND_SERVICE` and `FOREGROUND_SERVICE_MEDIA_PLAYBACK`: the service is a foreground service, and Android 14+ requires a type and its permission; it only plays the alarm sound.
+- `VIBRATE`: in v11 Android vibrated for the channel; now the app vibrates itself, which Android refuses without it (a normal permission, granted at install, no prompt).
+
+`USE_FULL_SCREEN_INTENT` from v11 stays. Nothing is scheduled on the phone (the server sends the alarm), so there is no exact-alarm permission.
 
 ## Push notifications
 

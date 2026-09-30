@@ -23,6 +23,7 @@ import java.lang.ref.WeakReference;
  * v11: the rip alarm's full-screen page, shown over the lock screen by the notification's full-screen intent.
  * Plain native views: no web content, no network, no JS bridge. "Open <coin>" and "Stop" both cancel the notification
  * (which stops the sound at once); Back is Stop. It closes by itself when the alarm times out (10 minutes).
+ * v12: both go through RipAlarm.stop, which stops RipAlarmService (its sound and vibration) as well.
  */
 public class AlarmActivity extends AppCompatActivity {
 

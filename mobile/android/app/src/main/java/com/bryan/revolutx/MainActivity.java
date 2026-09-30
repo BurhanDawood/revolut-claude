@@ -105,6 +105,11 @@ public class MainActivity extends BridgeActivity {
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         if (intent == null) return;
+        // v12: a tap on the ringing rip alarm's notification stops it, then opens its deep link below
+        if (intent.hasExtra(RipAlarm.EXTRA_STOP_ID) && (intent.getFlags() & Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY) == 0) {
+            RipAlarm.stop(this, intent.getIntExtra(RipAlarm.EXTRA_STOP_ID, RipAlarm.notificationId("")));
+            intent.removeExtra(RipAlarm.EXTRA_STOP_ID);   // a later re-delivery of this intent does not stop a newer alarm
+        }
         String tab = intent.getStringExtra(EXTRA_TAB);
         if (tab == null) tab = intent.getStringExtra("tab");   // FCM puts a notification's data keys on the launch intent
         if (tab == null && intent.hasExtra("google.message_id")) tab = "home";
@@ -334,6 +339,27 @@ public class MainActivity extends BridgeActivity {
         } catch (Exception ignored) {
             // leave it as it is
         }
+        // v12: the rip alarm's screen notification, silent (RipAlarmService plays rx_alarm's tone on the alarm stream).
+        try {
+            nm.createNotificationChannel(alarmRingChannel());
+        } catch (Exception ignored) {
+            // leave it as it is
+        }
+    }
+
+    /**
+     * v12: rx_alarm_ring, where RipAlarmService posts its notification. No sound and no vibration of its own: posting on
+     * rx_alarm would play the tone a second time whenever the phone is not on silent. Never deleted or re-created.
+     */
+    @RequiresApi(Build.VERSION_CODES.O)
+    static NotificationChannel alarmRingChannel() {
+        NotificationChannel c = new NotificationChannel(Push.CHANNEL_ALARM_RING, "Rip alarm (screen)", NotificationManager.IMPORTANCE_HIGH);
+        c.setDescription("Shows the rip alarm; its sound comes from the Rip alarm tone");
+        c.setSound(null, null);
+        c.enableVibration(false);
+        c.setBypassDnd(true);
+        c.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
+        return c;
     }
 
     /** Three quick taps then a long buzz, twice: unlike any other notification on the phone. Fixed once rx_alarm exists. */
