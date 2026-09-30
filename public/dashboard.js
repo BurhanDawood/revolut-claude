@@ -327,10 +327,13 @@ function rxCoinChg(p) {
 function rxCoinIcon(c) {
   var h = 0; for (var i = 0; i < c.coin.length; i++) h = (h * 31 + c.coin.charCodeAt(i)) % 360;
   var letter = '<span style="width:100%;height:100%;display:grid;place-items:center;background:hsl(' + h + ',45%,32%)">' + esc(c.coin.charAt(0)) + '</span>';
-  var lc = c.coin.toLowerCase(), alt = [c.icon, 'https://assets.coincap.io/assets/icons/' + lc + '@2x.png', 'https://cdn.jsdelivr.net/gh/spothq/cryptocurrency-icons@master/128/color/' + lc + '.png'].filter(Boolean);   // #517 by ticker until the server has one
+  var lc = c.coin.toLowerCase(), alt = [c.icon, 'https://assets.coincap.io/assets/icons/' + lc + '@2x.png', 'https://cdn.jsdelivr.net/gh/spothq/cryptocurrency-icons@master/128/color/' + lc + '.png'].filter(function (u) { return u && !rxIcDead[u]; });   // #517 by ticker until the server has one; #518 minus any that already failed
+  if (!alt.length) return '<span class="cl-ic">' + letter + '</span>';
   return '<span class="cl-ic"><img alt="" loading="lazy" referrerpolicy="no-referrer" src="' + rxAttr(alt[0]) + '" data-alt="' + rxAttr(alt.slice(1).join('|')) + '" data-l="' + rxAttr(letter) + '" onerror="rxIcNext(this)"></span>';
 }
+var rxIcDead = {};   // #518 logo addresses that failed on this page, so the minute refresh does not ask again
 function rxIcNext(im) {   // #517 the next logo source, and the coin's letter when none has one
+  rxIcDead[im.getAttribute('src')] = 1;
   var rest = (im.getAttribute('data-alt') || '').split('|').filter(Boolean);
   if (rest.length) { im.setAttribute('data-alt', rest.slice(1).join('|')); im.src = rest[0]; } else im.outerHTML = im.getAttribute('data-l');
 }
@@ -400,12 +403,30 @@ function rxCoinsRender(d) {
       (L.partial ? '<br><span class="cl-mu">' + L.partial + ' older sells have no P&amp;L recorded, so realised is partial</span>' : '') : '';
   }
 }
+// #518 Top movers: your holdings and watchlist (not dust or sold) by 24 h change; eight tiles; the chosen side is remembered.
+var rxMvSide = (function () { try { return localStorage.getItem('rx_movers') === 'down' ? 'down' : 'up'; } catch (e) { return 'up'; } })();
+function rxMoversRender(d) {
+  var g = $('mv-grid'); if (!g) return;
+  [].forEach.call(document.querySelectorAll('#movers-card .mv-seg button'), function (b) { var on = b.getAttribute('data-mv') === rxMvSide; b.classList.toggle('on', on); b.setAttribute('aria-selected', on ? 'true' : 'false'); });
+  var mine = ((d && d.coins) || []).filter(function (c) { return (c.section === 'hold' || c.section === 'watch') && c.change24h != null && isFinite(c.change24h); });
+  var up = rxMvSide === 'up';
+  var list = mine.filter(function (c) { return up ? c.change24h > 0 : c.change24h < 0; }).sort(function (a, b) { return up ? b.change24h - a.change24h : a.change24h - b.change24h; }).slice(0, 8);
+  g.innerHTML = list.length ? list.map(function (c) {
+    return '<button type="button" class="mv" onclick="rxOpenCoin(\'' + esc(c.coin) + '\')">' + rxCoinIcon(c) + '<b>' + esc(c.coin) + '</b>' + rxCoinChg(c.change24h) + '</button>';
+  }).join('') : '<div class="mv-empty">' + (mine.length ? 'None of your coins is ' + (up ? 'up' : 'down') + ' over 24 h.' : 'No 24 h changes yet.') + '</div>';
+}
+document.addEventListener('click', function (e) {
+  var b = e.target.closest && e.target.closest('#movers-card .mv-seg button'); if (!b) return;
+  rxMvSide = b.getAttribute('data-mv') === 'down' ? 'down' : 'up';
+  try { localStorage.setItem('rx_movers', rxMvSide); } catch (e2) {}
+  rxMoversRender(rxCoinsData);
+});
 function loadCoins() {
   if (rxCoinsBusy) return; rxCoinsBusy = true;
   fetchData('/api/coins').then(function (d) {
     rxCoinsBusy = false;
     if (!d || d.error) { if (!rxCoinsData) { var el = $('holdings-list'); if (el) el.innerHTML = '<div class="empty-state">' + esc((d && d.error) || 'Coins unavailable') + '</div>'; } return; }
-    rxCoinsData = d; rxCoinsRender(d);
+    rxCoinsData = d; rxCoinsRender(d); rxMoversRender(d);   // #518
   }, function () { rxCoinsBusy = false; });
 }
 

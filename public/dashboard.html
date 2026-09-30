@@ -819,6 +819,26 @@
     </div>
   </div>
 
+  <!-- #518 Top movers (Bryan 30 Sep 10:09 "Under total portfolio I want this top movers feature", 10:10 "from my coins"): your
+       holdings and watchlist by 24 h change, gainers or losers, eight at a time like the Revolut app. Tap one for its card. -->
+  <style>
+    .mv-seg { display: flex; gap: 4px; padding: 4px; border-radius: 999px; background: rgba(255,255,255,0.06); margin-bottom: 14px; }
+    .mv-seg button { flex: 1; border: 0; border-radius: 999px; background: none; color: var(--text-muted); font: 600 0.95rem system-ui, sans-serif; padding: 9px 6px; cursor: pointer; }
+    .mv-seg button.on { background: rgba(255,255,255,0.14); color: #fff; }
+    .mv-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px 6px; }
+    .mv { display: flex; flex-direction: column; align-items: center; gap: 4px; background: none; border: 0; color: inherit; padding: 0; cursor: pointer; font: inherit; min-width: 0; }
+    .mv .cl-ic { width: 54px; height: 54px; font-size: 20px; margin-bottom: 4px; }
+    .mv b { font-size: 0.95rem; font-weight: 600; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .mv span { font-size: 0.85rem; font-variant-numeric: tabular-nums; }
+    .mv-empty { grid-column: 1 / -1; color: var(--text-muted); font-size: 0.88rem; text-align: center; padding: 6px 0; }
+    html.in-app .mv .cl-ic { width: 60px; height: 60px; }
+  </style>
+  <div class="card" id="movers-card">
+    <div class="card-title">Top movers</div>
+    <div class="mv-seg" role="tablist"><button type="button" data-mv="up" role="tab">Top gainers</button><button type="button" data-mv="down" role="tab">Top losers</button></div>
+    <div class="mv-grid" id="mv-grid"><div class="mv-empty">Loading…</div></div>
+  </div>
+
   <!-- Portfolio value chart (#PV1): the /portfolio page in its compact embed mode -->
   <div class="card" id="pv-card">
     <div class="card-title" style="display:flex;justify-content:space-between;align-items:center">📈 Portfolio value <a href="/portfolio" style="color:var(--accent);text-decoration:none">Full view ↗</a></div>
