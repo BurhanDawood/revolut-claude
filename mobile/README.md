@@ -24,6 +24,7 @@ mobile/
       WidgetRefreshWorker.java   WorkManager: GET /api/portfolio/state + /spark every 30 min, on key save, on tap
       Push.java / RxMessagingService.java   FCM token -> POST /api/app/devices; notification display + tab
       RipAlarm.java / RipAlarmService.java / AlarmActivity.java   the rip alarm (v11; v12 rings it on the alarm stream)
+      RxFloatPlugin.java / FloatService.java   pop out: the floating window over other apps (v13)
 ```
 
 ## The shell contract
@@ -38,6 +39,7 @@ The shell (`APP_SHELL_JS` in `server.js`) runs inside the app's WebView, and Cap
 | `window.rxApp.show('home' \| 'portfolio' \| 'agent' \| 'desk' \| 'more')` | The app calls it after the shell loads, when it was opened by the widget (`portfolio`) or by a notification (`data.tab`, default `home`). |
 | `window.rxApp.open({ tab, coin })` (shell 492+) | Called instead of `show` when a notification carries `data.coin` (validated `^[A-Z0-9]{1,15}$`): opens that coin's card. The coin is cleared once delivered; with an older shell the app falls back to `show(tab)`. |
 | `window.rxApp.open({ tab: 'inbox', id })` (shell 501+) | Called when a notification carries `data.inbox`, the message's id in the app's notifications feed (validated `^[0-9]{1,15}$`). It opens the feed on that message. A valid id wins over `tab` and `coin`; with an older shell the app falls back to `show('home')`. `inbox` is not a tab the app accepts from `data.tab`. |
+| `rxApp.float(path)` / `rxApp.floatOk()` (shell 530+) → `Capacitor.Plugins.RxFloat.available()` / `.open({ path })` | `RxFloatPlugin` + `FloatService` (v13): the floating window over other apps. See [Floating window (pop out)](#floating-window-pop-out). |
 
 **Back button.** When the open tab's frame has moved off its start page, Back goes back inside that frame. Otherwise Back minimises the app. It never exits to a blank page.
 
@@ -246,6 +248,51 @@ Every stop goes through `RipAlarm.stop`, which stops the running service directl
 - `VIBRATE`: in v11 Android vibrated for the channel; now the app vibrates itself, which Android refuses without it (a normal permission, granted at install, no prompt).
 
 `USE_FULL_SCREEN_INTENT` from v11 stays. Nothing is scheduled on the phone (the server sends the alarm), so there is no exact-alarm permission.
+
+## Floating window (pop out)
+
+v13 (server batch 530, desk #37 Option B). A window drawn over **every** app: drag it to move it, and drag its bottom-right corner to resize it from a thumbnail to nearly full screen. It shows a coin's candle chart or one Home widget, read-only.
+
+**The two paths.** The float loads nothing else, and only from the app's own server origin (`Config.BASE`, the host in `capacitor.config.json` `server.url`):
+
+| path | shows |
+|---|---|
+| `/coin?c=SYM&float=1` | that coin's chart alone, on black, with interval chips and volume |
+| `/?app=1&float=<widget-id>` | one Home widget, scaled to the window |
+
+The pages offer **Pop out** in a Home widget's press-and-hold menu and in a coin tile's hold menu, and a **⧉** button on the coin page. The shell calls `rxApp.float(path)`, which calls the plugin below.
+
+**Permission: "Display over other apps"** (`SYSTEM_ALERT_WINDOW`). Android only lets an app draw on top of other apps when the user allows it on Android's own settings page (Settings → Apps → Revolut X → Display over other apps). The app cannot grant it itself, and there is no in-app prompt. The float also runs as a foreground service so Android does not kill it while another app is in front: `FOREGROUND_SERVICE_SPECIAL_USE` (Android 14+ needs a type and its permission; the service's `PROPERTY_SPECIAL_USE_FGS_SUBTYPE` says "Floating read-only price chart the user opened"). `FOREGROUND_SERVICE` was already there from v12. These are the only two permissions v13 adds.
+
+**`Capacitor.Plugins.RxFloat`** (`RxFloatPlugin`, v13+):
+
+| call | result |
+|---|---|
+| `available()` | `{ ok: true }` on Android 8+ (API 26), else `{ ok: false }`. It does not check the permission. |
+| `open({ path })` | Rejects `"that cannot be popped out"` unless `path` matches `^/(\?app=1&float=[a-z-]{1,40}\|coin\?c=[A-Z0-9]{1,15}&float=1)$`. Without the permission it opens Android's "Display over other apps" page for the app (`ACTION_MANAGE_OVERLAY_PERMISSION`, `package:com.bryan.revolutx`) and resolves `{ ok: false, needs_permission: true }`; the page then says *Allow "Display over other apps" for Revolut X, then tap Pop out again.* With it, it starts `FloatService` on `Config.BASE + path` and resolves `{ ok: true }`. If a float is already open, it loads the new path in that window: there is never a second one. |
+
+**`FloatService`** (foreground service, `foregroundServiceType="specialUse"`, not exported). One `TYPE_APPLICATION_OVERLAY` window (`FLAG_NOT_FOCUSABLE | FLAG_LAYOUT_NO_LIMITS`, translucent, top-left gravity): taps outside it go to the app underneath. A rounded dark frame with:
+- **a 28 dp top bar**, the drag handle. Dragging it moves the window, kept on screen. **⤢** toggles between the last small size and full; **✕** closes the window and stops the service (its notification goes with it).
+- **the WebView**, filling the rest: JavaScript and DOM storage on, the default WebView profile (so `/dashboard-auth.js` finds the dashboard key the app's pages already saved in localStorage; the key is never put in a URL), no Capacitor bridge, no file or content access, no pop-up windows. `shouldOverrideUrlLoading` allows only `https://` on the server host; any other navigation is blocked and not opened. (The page's own scripts still load, e.g. the chart library from jsdelivr/unpkg; only navigations are locked.)
+- **a 28 dp resize handle** at the bottom right (◢). Dragging it resizes the window; the WebView relayouts and the pages rescale on `resize`.
+
+**Sizes.** Minimum 160 × 120 dp. "Full" is the screen less the status bar, the navigation bar and a cutout, with an 8 dp margin; the window never goes beyond it. The first time: about 60% of the screen width at 4:3, top right.
+
+**Remembered** (SharedPreferences `rx_float`, no secrets): the last path, x, y, width and height, whether it was full, and the last small size (for ⤢). The window reopens at that size and place, clamped to the current screen. Rotating or folding the phone clamps it back on screen (full stays full).
+
+**`window.RxFloatHost.open(coin)`**, the one JS method the float page gets. A tap inside the window calls it with a ticker or `''`. `coin` must match `^[A-Z0-9]{0,15}$`, else it is treated as `''`. It starts `MainActivity` with `FLAG_ACTIVITY_NEW_TASK | FLAG_ACTIVITY_REORDER_TO_FRONT`, `rx_tab = "home"` and `rx_coin = coin` when there is one: the same path a notification takes, so the app comes to the front on that coin (`rxApp.open({ tab: 'home', coin })`). The float stays open.
+
+**Notification** (while it floats):
+
+| id | name in Android settings | importance | sound | vibration |
+|---|---|---|---|---|
+| `rx_float` | Floating chart | LOW | none | off |
+
+Text "Revolut X chart is floating" and one action, **Close**, which stops the service. A tap on it opens the app. Created by the service before it posts. Same rule as every channel: never deleted, re-created or reused with other settings.
+
+**Robustness.** If `addView` fails (the permission was revoked), the service stops without posting anything. It is fine for Android to kill it for memory: it does not restart itself (`START_NOT_STICKY`); Pop out opens it again at the remembered size.
+
+**No money.** The float shows two read-only pages. It has no Trade, Sell, Buy or Approve, and it cannot navigate to any other route or origin. v12's rip alarm, notifications, home-screen widget, biometric lock and deep links are unchanged.
 
 ## Push notifications
 

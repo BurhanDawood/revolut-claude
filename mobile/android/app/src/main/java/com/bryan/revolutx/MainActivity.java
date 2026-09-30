@@ -35,7 +35,7 @@ import java.nio.charset.StandardCharsets;
 
 /**
  * The app is the server's /app shell (capacitor.config.json server.url) plus a few native pieces:
- * the BiometricAuth, WidgetBridge and RxNotify plugins the shell calls, the home-screen widget, push, the Back
+ * the BiometricAuth, WidgetBridge, RxNotify and RxFloat plugins the shell calls, the home-screen widget, push, the Back
  * button, and an offline page when the server cannot be reached.
  */
 public class MainActivity extends BridgeActivity {
@@ -64,6 +64,7 @@ public class MainActivity extends BridgeActivity {
         registerPlugin(BiometricAuthPlugin.class);
         registerPlugin(WidgetBridgePlugin.class);
         registerPlugin(RxNotifyPlugin.class);
+        registerPlugin(RxFloatPlugin.class);
         bridgeBuilder.addWebViewListener(new WebViewListener() {
             @Override
             public void onPageStarted(WebView webView) {

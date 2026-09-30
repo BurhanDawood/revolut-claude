@@ -44,6 +44,15 @@
             android:name=".RipAlarmService"
             android:exported="false"
             android:foregroundServiceType="mediaPlayback" />
+        <!-- v13: the floating window over other apps (pop out): a read-only chart or Home widget the user opened -->
+        <service
+            android:name=".FloatService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Floating read-only price chart the user opened" />
+        </service>
 
         <provider
             android:name="androidx.core.content.FileProvider"
@@ -104,4 +113,8 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <!-- v12: the app now vibrates the alarm pattern itself (as an alarm vibration); Android refuses that without it -->
     <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- v13: pop out. "Display over other apps" (granted by the user on Android's own page) draws the floating window;
+         FloatService keeps it alive as a special-use foreground service (Android 14+ needs its type's permission) -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
 </manifest>
