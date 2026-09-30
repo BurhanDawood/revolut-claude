@@ -1130,7 +1130,7 @@ function rxAppLayout() {
     [].slice.call(el.children).forEach(function (c) { if (c !== head) body.appendChild(c); });
     el.appendChild(body);
     el.classList.add('rx-sec'); head.classList.add('rx-head');
-    var dflt = /^Coins$/.test(key) || /^Budget agent/.test(key);   // #517 the coin list starts open (the Tangem card, #496, is now XRP's row); #528 and the agent's equity chart; everything else starts folded
+    var dflt = /^Coins$/.test(key) || /^Budget agent/.test(key) || /^Morning brief/.test(key);   // #531   // #517 the coin list starts open (the Tangem card, #496, is now XRP's row); #528 and the agent's equity chart; everything else starts folded
     if (!(key in open ? open[key] : dflt)) el.classList.add('rx-collapsed');
     head.addEventListener('click', function (e) {
       if (e.target.closest('a')) return;
@@ -1147,7 +1147,7 @@ function rxAppLayout() {
 // choosable widgets that if I press and hold can move?"). Each card from Top movers down is a widget: press and hold it for a menu, or
 // hold and move to drag it; "Edit widgets" at the bottom shows or hides each one and moves it with arrows. The order and the hidden set are
 // remembered on this phone (localStorage 'rx_widgets'); a new card appears in its default place.
-var RX_WIDGETS_DEFAULT = ['movers-card', 'pv-card', 'sweep-card', 'agent-card', 'coins-card', 'monitor-card'];
+var RX_WIDGETS_DEFAULT = ['brief-card', 'movers-card', 'pv-card', 'sweep-card', 'agent-card', 'coins-card', 'monitor-card'];
 function rxWidgetEls(pane) {
   return [].slice.call(pane.children).filter(function (el) { return el.id && RX_WIDGETS_DEFAULT.indexOf(el.id) >= 0; });
 }
@@ -1360,3 +1360,35 @@ document.addEventListener('DOMContentLoaded', function() {
   setInterval(refreshAll, 5 * 60 * 1000);
   setInterval(function () { if (!document.hidden) loadCoins(); }, 60 * 1000);   // #516 prices and 24 h change every minute
 });
+
+// #531 the Morning brief widget: the newest brief from GET /api/brief/latest (refreshed every 10 minutes)
+var rxBriefOpen = false;
+function rxBriefRender(d) {
+  var box = document.getElementById('bf-body'); if (!box) return;
+  var b = d && d.brief;
+  if (!b) { box.innerHTML = '<span style="color:var(--text-muted);font-size:0.85rem">No brief kept yet. The next one comes at 09:15, or send /brief in Telegram.</span>'; return; }
+  var when = new Date(b.ts * 1000).toLocaleString('en-GB', { timeZone: 'Europe/London', weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+  var v = b.video, h = '<div class="bf-when">' + esc(when) + '</div>';
+  if (v && /^[A-Za-z0-9_-]{6,20}$/.test(v.id || '')) {
+    h += '<a class="bf-vid" href="https://www.youtube.com/watch?v=' + v.id + '" target="_blank" rel="noopener noreferrer"><div class="bf-thumb" style="background-image:url(\'https://i.ytimg.com/vi/' + v.id + '/hqdefault.jpg\')"><span class="bf-play" aria-hidden="true"></span></div>' +
+      '<div class="bf-vt"><small>YouTube' + (v.channel ? ' · ' + esc(v.channel) : '') + '</small><b>' + esc(v.title || 'Video') + '</b></div></a>';
+  }
+  h += '<div class="bf-txt' + (rxBriefOpen ? '' : ' clip') + '" id="bf-txt">' + (b.market_html || '') + '</div>' +
+    '<button type="button" class="bf-more" id="bf-more">' + (rxBriefOpen ? 'Show less ▴' : 'Read the whole brief ▾') + '</button>' +
+    (b.snapshot_html ? '<details><summary>Portfolio snapshot at the time</summary><div class="bf-txt">' + b.snapshot_html + '</div></details>' : '');
+  var app = null; try { app = window.parent !== window && window.parent.rxApp && window.parent.rxApp.pm ? window.parent.rxApp : null; } catch (e) {}
+  var acts = (app ? '<button type="button" class="bf-ask" id="bf-ask">💬 Ask the PM about it</button>' : '') +
+    (d.pm_url ? '<a class="bf-claude" href="' + rxAttr(d.pm_url) + '" target="_blank" rel="noopener noreferrer">Open the PM thread in Claude ↗</a>' : '');
+  if (acts) h += '<div class="bf-acts">' + acts + '</div>';
+  box.innerHTML = h;
+}
+function rxBriefLoad() {
+  fetch('/api/brief/latest', { cache: 'no-store' }).then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+    .then(rxBriefRender).catch(function (e) { var box = document.getElementById('bf-body'); if (box) box.innerHTML = '<span style="color:var(--text-muted);font-size:0.85rem">Brief not loaded: ' + esc(e.message) + '</span>'; });
+}
+document.addEventListener('click', function (e) {
+  var t = e.target;
+  if (t && t.id === 'bf-more') { rxBriefOpen = !rxBriefOpen; var x = document.getElementById('bf-txt'); if (x) x.classList.toggle('clip', !rxBriefOpen); t.textContent = rxBriefOpen ? 'Show less ▴' : 'Read the whole brief ▾'; return; }
+  if (t && t.id === 'bf-ask') { try { window.parent.rxApp.pm('About this morning\'s brief: '); } catch (e2) {} }
+});
+if (document.getElementById('bf-body')) { rxBriefLoad(); setInterval(function () { if (!document.hidden) rxBriefLoad(); }, 10 * 60000); }

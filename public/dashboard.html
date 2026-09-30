@@ -875,6 +875,33 @@
     <script>window.addEventListener('message', function (e) { if (e.origin === location.origin && e.data && e.data.pvHeight > 200) document.getElementById('pv-frame').style.height = Math.min(e.data.pvHeight, 900) + 'px'; });</script>
   </div>
 
+  <!-- #531 Morning brief (Bryan 30 Sep 23:03): the 09:15 brief in its own section - one featured video, the market section (folded
+       after a few lines), the portfolio snapshot folded, and a button to ask the in-app PM (Sonnet) about it. -->
+  <style>
+    #brief-card .bf-when { color: var(--text-muted); font-size: 0.8rem; margin: 2px 0 10px; }
+    #brief-card .bf-vid { display: block; text-decoration: none; color: var(--text); border-radius: 12px; overflow: hidden; background: #111; margin-bottom: 10px; }
+    #brief-card .bf-thumb { position: relative; aspect-ratio: 16 / 9; background: #222 center / cover no-repeat; max-width: 100%; }
+    #brief-card .bf-play { position: absolute; left: 50%; top: 50%; width: 56px; height: 56px; margin: -28px 0 0 -28px; border-radius: 50%; background: rgba(0,0,0,0.65); display: grid; place-items: center; }
+    #brief-card .bf-play::after { content: ''; border-style: solid; border-width: 11px 0 11px 18px; border-color: transparent transparent transparent #fff; margin-left: 4px; }
+    #brief-card .bf-vt { padding: 8px 12px 10px; border-left: 3px solid #b18cff; }
+    #brief-card .bf-vt small { display: block; color: #b18cff; font-weight: 600; font-size: 0.78rem; }
+    #brief-card .bf-vt b { display: block; font-size: 0.95rem; line-height: 1.3; }
+    #brief-card .bf-txt { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 0.9rem; line-height: 1.45; color: var(--text); }
+    #brief-card .bf-txt.clip { max-height: 9.5em; overflow: hidden; -webkit-mask-image: linear-gradient(#000 70%, transparent); mask-image: linear-gradient(#000 70%, transparent); }
+    #brief-card .bf-txt a { color: var(--accent); }
+    #brief-card .bf-more { background: none; border: 0; color: var(--accent); font: 600 0.85rem system-ui, sans-serif; padding: 6px 0; cursor: pointer; }
+    #brief-card details { margin-top: 6px; border-top: 1px solid rgba(255,255,255,0.06); padding-top: 6px; }
+    #brief-card summary { color: var(--text-muted); font-size: 0.85rem; cursor: pointer; }
+    #brief-card .bf-acts { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+    #brief-card .bf-acts button, #brief-card .bf-acts a { flex: 1 1 140px; text-align: center; border-radius: 12px; padding: 10px 12px; font: 600 0.88rem system-ui, sans-serif; cursor: pointer; text-decoration: none; }
+    #brief-card .bf-ask { background: var(--accent); color: #111; border: 0; }
+    #brief-card .bf-claude { background: none; color: var(--text); border: 1px solid rgba(255,255,255,0.18); }
+  </style>
+  <div class="card" id="brief-card">
+    <div class="card-title">🌅 Morning brief</div>
+    <div id="bf-body"><span style="color:var(--text-muted);font-size:0.85rem">Loading…</span></div>
+  </div>
+
   <!-- Budget agent + Spec desk at a glance (#W1): tap a card for the full page -->
   <style>
     .mini-card { cursor:pointer; }
