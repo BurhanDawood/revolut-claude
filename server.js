@@ -24820,6 +24820,13 @@ let rows;
       } else if (action === 'upsert_coin_strategy') {
         const csSym = (symbol || '').toUpperCase().replace('-USD','');
         if (!csSym) return { content: [{ type:'text', text: JSON.stringify({ ok:false, error:'symbol required' }) }] };
+        // #526 (Fable carry on #525): 'draft' is reserved - a plan with status 'draft' is ignored by every advice prompt. So this save
+        // path never writes it, and saving over a draft must say what the agreed plan's status is (that is how a draft is promoted).
+        if (String(cs_status ?? '').trim().toLowerCase() === 'draft') return { content: [{ type:'text', text: JSON.stringify({ ok:false, error:"status 'draft' is reserved for the in-app PM's unagreed drafts (advice prompts ignore it) - use watchlist, radar, active_holding or another real status" }) }] };
+        if (cs_status == null) {
+          const [cur] = await db.execute('SELECT status FROM coin_strategy WHERE symbol = ? LIMIT 1', [csSym]);
+          if (cur.length && String(cur[0].status || '').toLowerCase() === 'draft') return { content: [{ type:'text', text: JSON.stringify({ ok:false, error: csSym + "'s plan is a DRAFT by the in-app PM, which advice ignores. To agree it, save again with a real status (e.g. status: 'watchlist')." }) }] };
+        }
         await db.execute(
           `INSERT INTO coin_strategy (symbol, status, role, theme, strategy_md, updated_by)
            VALUES (?, ?, ?, ?, ?, 'claude_mcp')
