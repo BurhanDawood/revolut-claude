@@ -344,8 +344,9 @@ function rxCoinRow(c, kind) {
   if (c.trail) chips.push('<span class="cl-chip' + (c.trail.auto ? ' warn' : '') + '">🎯 trail ' + c.trail.pct + '%</span>');
   (c.venues || []).forEach(function (v) { if (v !== 'Revolut X') chips.push('<span class="cl-chip">' + esc(v) + '</span>'); });
   if (c.muted) chips.push('<span class="cl-chip">🔇 muted</span>');
+  if (c.buylist && kind !== 'buy') chips.push('<span class="cl-chip on">\u2B50 buy list</span>');   // #521
   var name = c.name || c.coin, sub, right;
-  if (kind === 'watch') {
+  if (kind === 'watch' || kind === 'buy') {
     sub = esc(c.coin) + ' · ' + rxCoinPx(c.price) + (c.buy_at ? ' · buy ' + rxCoinPx(c.buy_at) + ' (' + c.buy_gap_pct.toFixed(1) + '% away)' : c.role ? ' · ' + esc(c.role.replace('_', ' ')) : '');
     right = '<b>' + rxCoinPx(c.price) + '</b>' + rxCoinChg(c.change24h);
   } else if (kind === 'sold') {
@@ -386,12 +387,19 @@ function rxCoinsRender(d) {
     if (x != null) return -1; if (y != null) return 1;
     return (a.name || a.coin).localeCompare(b.name || b.coin);
   });
+  var buy = all.filter(function (c) { return c.buylist; }).sort(function (a, b) {   // #521 every buy-list coin, held or not, nearest a buy level first
+    var x = a.buy_gap_pct, y = b.buy_gap_pct;
+    if (x != null && y != null) return x - y;
+    if (x != null) return -1; if (y != null) return 1;
+    return (a.name || a.coin).localeCompare(b.name || b.coin);
+  });
   var dust = all.filter(function (c) { return c.section === 'dust'; });
   var sold = all.filter(function (c) { return c.section === 'sold'; }).sort(function (a, b) { return Math.abs(b.lifetime || 0) - Math.abs(a.lifetime || 0); });
   var sum = function (l) { return l.reduce(function (s, c) { return s + (c.value || 0); }, 0); };
   var h = '';
   h += '<div class="cl-sec"><span>Holdings (' + hold.length + ')</span><span>' + rxCoinMoney(sum(hold)) + '</span></div>';
   h += hold.length ? hold.map(function (c) { return rxCoinRow(c, 'hold'); }).join('') : '<div class="empty-state">No holdings</div>';
+  if (buy.length) h += '<div class="cl-sec"><span>\u2B50 Buy list (' + buy.length + ')</span></div>' + buy.map(function (c) { return rxCoinRow(c, 'buy'); }).join('');   // #521 all shown
   if (watch.length) h += '<div class="cl-sec"><span>Watchlist (' + watch.length + ')</span></div>' + rxCoinFold('watch', 'Show all ' + watch.length + ' ▾', watch, 'watch', 3);
   if (dust.length) h += '<div class="cl-sec"><span>Dust (' + dust.length + ')</span></div>' + rxCoinFold('dust', 'Show ' + dust.length + (dust.length === 1 ? ' coin' : ' coins') + ' under $' + (d.dust_usd || 1) + ' ▾', dust, 'dust', 0, rxCoinMoney(sum(dust)));
   if (sold.length) h += '<div class="cl-sec"><span>Sold (' + sold.length + ')</span></div>' + rxCoinFold('sold', 'Show ' + sold.length + (sold.length === 1 ? ' coin' : ' coins') + ' you no longer hold ▾', sold, 'sold', 0);
@@ -408,7 +416,7 @@ var rxMvSide = (function () { try { return localStorage.getItem('rx_movers') ===
 function rxMoversRender(d) {
   var g = $('mv-grid'); if (!g) return;
   [].forEach.call(document.querySelectorAll('#movers-card .mv-seg button'), function (b) { var on = b.getAttribute('data-mv') === rxMvSide; b.classList.toggle('on', on); b.setAttribute('aria-selected', on ? 'true' : 'false'); });
-  var mine = ((d && d.coins) || []).filter(function (c) { return (c.section === 'hold' || c.section === 'watch') && c.change24h != null && isFinite(c.change24h); });
+  var mine = ((d && d.coins) || []).filter(function (c) { return (c.section === 'hold' || c.section === 'watch' || c.section === 'buy') && c.change24h != null && isFinite(c.change24h); });
   var up = rxMvSide === 'up';
   var list = mine.filter(function (c) { return up ? c.change24h > 0 : c.change24h < 0; }).sort(function (a, b) { return up ? b.change24h - a.change24h : a.change24h - b.change24h; }).slice(0, 8);
   g.innerHTML = list.length ? list.map(function (c) {
