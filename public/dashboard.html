@@ -73,6 +73,29 @@
     .rx-sec:not(.rx-collapsed) > .rx-head::after { transform: rotate(180deg); }
     .rx-sec > .rx-body { display: contents; }
     .rx-sec.rx-collapsed > .rx-body { display: none !important; }
+    /* #529 widgets: press and hold a title to drag; Edit widgets sheet */
+    #tab-portfolio > .card { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+    .rx-w-held { transform: scale(0.985); transition: transform .12s; }
+    .rx-w-menu { position: fixed; z-index: 70; min-width: 220px; background: #262626; border-radius: 18px; padding: 6px; box-shadow: 0 12px 40px rgba(0,0,0,0.6); }
+    .rx-w-menu[hidden] { display: none !important; }
+    .rx-w-menu button { display: flex; align-items: center; gap: 14px; width: 100%; background: none; border: 0; color: var(--text); font: 500 1rem system-ui, sans-serif; padding: 13px 14px; border-radius: 12px; text-align: left; cursor: pointer; }
+    .rx-w-menu button:active { background: rgba(255,255,255,0.06); }
+    .rx-w-menu button span { width: 22px; text-align: center; font-size: 1.05rem; }
+    .rx-w-menu .rx-w-danger { color: var(--danger); }
+    .rx-w-drag { outline: 2px solid var(--accent); box-shadow: 0 10px 30px rgba(0,0,0,0.55); transform: scale(1.015); position: relative; z-index: 5; transition: transform .12s; }
+    html.rx-w-dragging, html.rx-w-dragging body { overscroll-behavior: none; }
+    .rx-w-edit { display: block; margin: 6px auto 18px; background: none; border: 1px solid rgba(255,255,255,0.16); color: var(--text-muted); border-radius: 99px; padding: 8px 18px; font: 600 0.85rem system-ui, sans-serif; cursor: pointer; }
+    .rx-w-sheet { position: fixed; inset: 0; background: rgba(0,0,0,0.55); z-index: 60; display: flex; align-items: flex-end; justify-content: center; }
+    .rx-w-sheet[hidden] { display: none !important; }
+    .rx-w-panel { background: #1a1a1a; color: var(--text); width: 100%; max-width: 520px; border-radius: 18px 18px 0 0; padding: 14px 16px calc(18px + env(safe-area-inset-bottom, 0px)); max-height: 80vh; overflow-y: auto; }
+    .rx-w-top { display: flex; justify-content: space-between; align-items: center; font-size: 1.05rem; }
+    .rx-w-top button, .rx-w-row button { background: none; border: 1px solid rgba(255,255,255,0.14); color: var(--text); border-radius: 10px; min-width: 40px; min-height: 40px; font-size: 0.9rem; cursor: pointer; }
+    .rx-w-row button:disabled { opacity: 0.3; }
+    .rx-w-tip { color: var(--text-muted); font-size: 0.82rem; margin: 6px 0 10px; }
+    .rx-w-row { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-top: 1px solid rgba(255,255,255,0.06); }
+    .rx-w-row label { flex: 1; min-width: 0; display: flex; align-items: center; gap: 10px; font-size: 0.95rem; }
+    .rx-w-row input { width: 20px; height: 20px; accent-color: var(--accent); }
+    .rx-w-reset { margin-top: 12px; width: 100%; background: none; border: 1px solid rgba(255,255,255,0.14); color: var(--text-muted); border-radius: 12px; padding: 10px; font: 600 0.85rem system-ui, sans-serif; }
     /* #505 coin cards readable on a phone (Bryan 29 Sep 00:10 "That's tiny"): the cards keep their compact desktop sizes; in the
        app and on narrow screens they take phone sizes. The plan reads as paragraphs with bold labels, a long one folded. */
     .cd-plan .cd-p + .cd-p, .cd-plan .cd-more { margin-top: .75em; }

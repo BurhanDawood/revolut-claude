@@ -1139,6 +1139,149 @@ function rxAppLayout() {
       var o = store.get('rx_open') || {}; o[key] = !el.classList.contains('rx-collapsed'); store.set('rx_open', o);
     });
   });
+  try { rxWidgetsInit(pane); } catch (e) { console.warn('widgets', e); }   // #529
+}
+
+// #529 Home widgets (Bryan 30 Sep 22:56 "Move [USDT sweep] under portfolio value graph. Default collapsed. Can we make these actually
+// choosable widgets that if I press and hold can move?"). Each card from Top movers down is a widget: press and hold it for a menu, or
+// hold and move to drag it; "Edit widgets" at the bottom shows or hides each one and moves it with arrows. The order and the hidden set are
+// remembered on this phone (localStorage 'rx_widgets'); a new card appears in its default place.
+var RX_WIDGETS_DEFAULT = ['movers-card', 'pv-card', 'sweep-card', 'agent-card', 'coins-card', 'monitor-card'];
+function rxWidgetEls(pane) {
+  return [].slice.call(pane.children).filter(function (el) { return el.id && RX_WIDGETS_DEFAULT.indexOf(el.id) >= 0; });
+}
+function rxWidgetName(el) {
+  var h = el.querySelector('.card-title'); if (!h) return el.id;
+  var t = h.cloneNode(true); [].forEach.call(t.querySelectorAll('a, .mini-badge, .rx-dot'), function (x) { x.remove(); });
+  return t.textContent.replace(/\s+/g, ' ').trim() || el.id;
+}
+function rxWidgetsState() {
+  var s = (function () { try { return JSON.parse(localStorage.getItem('rx_widgets') || 'null'); } catch (e) { return null; } })() || {};
+  var order = Array.isArray(s.order) ? s.order.filter(function (id) { return RX_WIDGETS_DEFAULT.indexOf(id) >= 0; }) : [];
+  RX_WIDGETS_DEFAULT.forEach(function (id, i) {   // a widget missing from the saved order goes after the one before it by default
+    if (order.indexOf(id) >= 0) return;
+    var prev = RX_WIDGETS_DEFAULT.slice(0, i).reverse().filter(function (p) { return order.indexOf(p) >= 0; })[0];
+    order.splice(prev ? order.indexOf(prev) + 1 : 0, 0, id);
+  });
+  return { order: order, hidden: s.hidden && typeof s.hidden === 'object' ? s.hidden : {} };
+}
+function rxWidgetsSave(st) { try { localStorage.setItem('rx_widgets', JSON.stringify({ order: st.order, hidden: st.hidden })); } catch (e) {} }
+function rxWidgetsApply(pane, st) {
+  var els = rxWidgetEls(pane); if (!els.length) return;
+  var byId = {}; els.forEach(function (el) { byId[el.id] = el; });
+  var mark = document.getElementById('rx-w-mark');
+  if (!mark) { mark = document.createElement('span'); mark.id = 'rx-w-mark'; mark.hidden = true; pane.insertBefore(mark, els[0]); }
+  var ref = mark;
+  st.order.forEach(function (id) { var el = byId[id]; if (!el) return; ref.parentNode.insertBefore(el, ref.nextSibling); ref = el; el.hidden = !!st.hidden[id]; });
+}
+function rxWidgetsInit(pane) {
+  if (!pane) return;
+  var mc = [].slice.call(pane.children).filter(function (el) { var h = el.querySelector && el.querySelector('.card-title'); return h && /Monitoring Controls/.test(h.textContent); })[0];
+  if (mc && !mc.id) mc.id = 'monitor-card';
+  var st = rxWidgetsState();
+  rxWidgetsApply(pane, st);
+  // the Edit widgets button and sheet
+  var btn = document.createElement('button'); btn.type = 'button'; btn.className = 'rx-w-edit'; btn.textContent = '✎ Edit widgets';
+  pane.appendChild(btn);
+  var sheet = document.createElement('div'); sheet.className = 'rx-w-sheet'; sheet.hidden = true;
+  sheet.innerHTML = '<div class="rx-w-panel" role="dialog" aria-label="Edit widgets"><div class="rx-w-top"><b>Widgets</b><button type="button" data-w="close" aria-label="Close">✕</button></div>' +
+    '<p class="rx-w-tip">Tick the ones to show. Use the arrows, or press and hold a widget on Home and drag it.</p><div class="rx-w-list"></div>' +
+    '<button type="button" class="rx-w-reset" data-w="reset">Reset to the default order</button></div>';
+  document.body.appendChild(sheet);
+  function paint() {
+    var byId = {}; rxWidgetEls(pane).forEach(function (el) { byId[el.id] = el; });
+    sheet.querySelector('.rx-w-list').innerHTML = st.order.filter(function (id) { return byId[id]; }).map(function (id, i, a) {
+      return '<div class="rx-w-row"><label><input type="checkbox" data-w="show" data-id="' + id + '"' + (st.hidden[id] ? '' : ' checked') + '> ' + esc(rxWidgetName(byId[id])) + '</label>' +
+        '<button type="button" data-w="up" data-id="' + id + '" aria-label="Move up"' + (i ? '' : ' disabled') + '>▲</button><button type="button" data-w="down" data-id="' + id + '" aria-label="Move down"' + (i < a.length - 1 ? '' : ' disabled') + '>▼</button></div>';
+    }).join('');
+  }
+  btn.addEventListener('click', function () { st = rxWidgetsState(); paint(); sheet.hidden = false; });
+  sheet.addEventListener('click', function (e) {
+    if (e.target === sheet) { sheet.hidden = true; return; }
+    var b = e.target.closest('[data-w]'); if (!b) return;
+    var w = b.getAttribute('data-w'), id = b.getAttribute('data-id');
+    if (w === 'close') { sheet.hidden = true; return; }
+    if (w === 'reset') { st = { order: RX_WIDGETS_DEFAULT.slice(), hidden: {} }; }
+    else if (w === 'show') { if (b.checked) delete st.hidden[id]; else st.hidden[id] = true; }
+    else if (w === 'up' || w === 'down') { var i = st.order.indexOf(id), j = w === 'up' ? i - 1 : i + 1; if (i < 0 || j < 0 || j >= st.order.length) return; st.order[i] = st.order[j]; st.order[j] = id; }
+    else return;
+    rxWidgetsSave(st); rxWidgetsApply(pane, st); paint();
+  });
+  // #529 press and hold a widget (Bryan 23:09, like Revolut X): a menu pops up (Pop out / Add or edit widgets / Remove); move the finger
+  // instead and the menu goes away and the widget follows it until you let go where you want it.
+  var menu = document.createElement('div'); menu.className = 'rx-w-menu'; menu.hidden = true; menu.setAttribute('role', 'menu');
+  document.body.appendChild(menu);
+  var held = null, drag = null, timer = null, sx = 0, sy = 0, eatClick = false, menuFor = null;
+  function cancel() { clearTimeout(timer); timer = null; }
+  function cardOf(t) {
+    if (!t || !t.closest || t.closest('input, textarea, select, .rx-w-menu, .rx-w-sheet')) return null;
+    var el = t; while (el && el.parentNode !== pane) el = el.parentNode;
+    return el && RX_WIDGETS_DEFAULT.indexOf(el.id) >= 0 && !el.hidden ? el : null;
+  }
+  function menuClose() { menu.hidden = true; if (menuFor) menuFor.classList.remove('rx-w-held'); menuFor = null; }
+  function menuOpen(card) {
+    menuFor = card; card.classList.add('rx-w-held');
+    var pip = typeof window.rxPopOut === 'function' && document.documentElement.classList.contains('rx-pip-ok');
+    menu.innerHTML = (pip ? '<button type="button" role="menuitem" data-m="pop"><span>⧉</span>Pop out</button>' : '') +
+      '<button type="button" role="menuitem" data-m="edit"><span>＋</span>Add or edit widgets</button>' +
+      '<button type="button" role="menuitem" data-m="remove" class="rx-w-danger"><span>🗑</span>Remove</button>';
+    menu.hidden = false;
+    var r = card.getBoundingClientRect(), mh = menu.offsetHeight, mw = menu.offsetWidth;
+    var top = Math.min(Math.max(8, sy - mh / 2), window.innerHeight - mh - 8);
+    menu.style.top = top + 'px'; menu.style.left = Math.max(8, Math.min(window.innerWidth - mw - 8, r.right - mw - 8)) + 'px';
+  }
+  menu.addEventListener('click', function (e) {
+    var b = e.target.closest('button[data-m]'); if (!b || !menuFor) return;
+    var m = b.getAttribute('data-m'), card = menuFor; menuClose();
+    if (m === 'pop') window.rxPopOut(card.id);
+    else if (m === 'edit') btn.click();
+    else if (m === 'remove') { st = rxWidgetsState(); st.hidden[card.id] = true; rxWidgetsSave(st); rxWidgetsApply(pane, st); showToast(rxWidgetName(card) + ' removed - add it back with Edit widgets at the bottom'); }
+  });
+  document.addEventListener('pointerdown', function (e) { if (!menu.hidden && !e.target.closest('.rx-w-menu')) { menuClose(); } }, true);
+  window.addEventListener('scroll', function () { if (!menu.hidden && !held) menuClose(); }, { passive: true });
+  function lift(card) {   // the hold completed: menu up, ready to drag
+    held = card; eatClick = true;
+    try { navigator.vibrate && navigator.vibrate(15); } catch (e) {}
+    menuOpen(card);
+  }
+  function startDrag() {
+    menuClose(); drag = held; drag.classList.add('rx-w-drag'); document.documentElement.classList.add('rx-w-dragging');
+  }
+  function move(y) {
+    if (!drag) return;
+    var els = rxWidgetEls(pane).filter(function (el) { return !el.hidden && el !== drag; });
+    var before = null, top0 = drag.getBoundingClientRect().top;
+    for (var i = 0; i < els.length; i++) { var r = els[i].getBoundingClientRect(); if (y < r.top + r.height / 2) { before = els[i]; break; } }
+    if (before) { if (drag.nextElementSibling !== before) pane.insertBefore(drag, before); }
+    else { var last = els[els.length - 1]; if (last && last.nextSibling !== drag) pane.insertBefore(drag, last.nextSibling); }
+    var jump = drag.getBoundingClientRect().top - top0; if (jump) window.scrollBy(0, jump);   // keep the card under the finger when it jumps past a tall one
+    if (y < 60) window.scrollBy(0, -12); else if (y > window.innerHeight - 60) window.scrollBy(0, 12);   // scrolls while held at an edge
+  }
+  function end() {
+    cancel();
+    if (drag) {
+      drag.classList.remove('rx-w-drag'); document.documentElement.classList.remove('rx-w-dragging'); drag = null;
+      st = rxWidgetsState(); var shown = rxWidgetEls(pane).map(function (el) { return el.id; });
+      st.order = shown.concat(st.order.filter(function (id) { return shown.indexOf(id) < 0; }));
+      rxWidgetsSave(st);
+    }
+    held = null;   // a hold without a move leaves the menu open for a tap
+    if (eatClick) setTimeout(function () { eatClick = false; }, 400);
+  }
+  function down(card, x, y) { sx = x; sy = y; cancel(); timer = setTimeout(function () { timer = null; lift(card); }, 450); }
+  function moved(x, y) {
+    if (timer && (Math.abs(x - sx) > 8 || Math.abs(y - sy) > 8)) cancel();   // it is a scroll, not a hold
+    if (held && !drag && (Math.abs(x - sx) > 10 || Math.abs(y - sy) > 10)) startDrag();
+    if (drag) move(y);
+  }
+  pane.addEventListener('touchstart', function (e) { var card = cardOf(e.target); if (card && e.touches.length === 1) down(card, e.touches[0].clientX, e.touches[0].clientY); else cancel(); }, { passive: true });
+  document.addEventListener('touchmove', function (e) { var t = e.touches[0]; if (!t) return; moved(t.clientX, t.clientY); if (held) e.preventDefault(); }, { passive: false });
+  document.addEventListener('touchend', end); document.addEventListener('touchcancel', end);
+  pane.addEventListener('mousedown', function (e) { var card = cardOf(e.target); if (card && !e.button) down(card, e.clientX, e.clientY); });   // the same with a mouse
+  document.addEventListener('mousemove', function (e) { if (timer || held) { moved(e.clientX, e.clientY); if (drag) e.preventDefault(); } });
+  document.addEventListener('mouseup', end);
+  pane.addEventListener('contextmenu', function (e) { if (cardOf(e.target)) e.preventDefault(); });
+  document.addEventListener('click', function (e) { if (eatClick) { e.stopPropagation(); e.preventDefault(); eatClick = false; } }, true);   // letting go after a hold is not a tap (not even on the menu that just opened under the finger)
 }
 
 // #492 open one coin's card - from a notification (the app shell calls rxFocusCoin, or loads /?app=1#coin=AST).
