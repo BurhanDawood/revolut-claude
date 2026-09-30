@@ -22413,6 +22413,41 @@ function createMcpServer() {
     }
   );
 
+  // ── Tool: get_raw_balance (#536, dev #420) — what Revolut itself reports for one coin. Read-only diagnostics. ──
+  server.tool('get_raw_balance',
+    'Diagnostics, read-only: the raw Revolut X /balances row for one coin (every field exactly as Revolut sends it), what this system computes from it (available + reserved), the open lots in position_tranches, and any active Revolut orders on that coin. Use when a quantity looks wrong. Never places or cancels anything.',
+    { symbol: z.string().describe('Coin, e.g. JTO or JTO-USD') },
+    async ({ symbol } = {}) => {
+      const c = String(symbol || '').toUpperCase().replace(/[-/]USDT?$|[-/]USDC$/, '').replace(/[^A-Z0-9]/g, '').slice(0, 15);
+      if (!c) return { content: [{ type: 'text', text: JSON.stringify({ error: 'Provide symbol' }) }] };
+      const out = { coin: c, read_at: new Date().toISOString() };
+      try {
+        const bal = await revolutRequest('GET', '/balances');
+        const rows = Array.isArray(bal) ? bal : (bal && (bal.data || bal.balances)) || [];
+        out.balances_rows_total = rows.length;
+        const mine = rows.filter(b => String(b.currency || b.asset || b.symbol || '').toUpperCase() === c);
+        out.raw_rows = mine;                                   // every field, as sent
+        out.computed_available_plus_reserved = mine.reduce((a, r) => a + (parseFloat(r.available) || 0) + (parseFloat(r.reserved) || 0), 0);
+        if (!Array.isArray(bal)) out.balances_response_keys = Object.keys(bal || {});
+      } catch (e) { out.balances_error = String((e && e.message) || e).slice(0, 300); }
+      try {
+        const [lots] = await db.execute(
+          "SELECT id, exchange, remaining_quantity, entry_price, entry_date FROM position_tranches WHERE symbol IN (?, ?) AND remaining_quantity > 0 ORDER BY entry_date ASC, id ASC",
+          [c, c + '-USD']);
+        out.open_lots = lots.length;
+        out.open_lots_quantity = lots.reduce((a, l) => a + Number(l.remaining_quantity), 0);
+        out.open_lots_by_exchange = lots.reduce((m, l) => { const k = l.exchange || 'revolut'; m[k] = (m[k] || 0) + Number(l.remaining_quantity); return m; }, {});
+      } catch (e) { out.lots_error = String((e && e.message) || e).slice(0, 200); }
+      try {
+        const ao = await revolutRequest('GET', '/orders/active');
+        const list = Array.isArray(ao) ? ao : (ao && (ao.data || ao.orders)) || [];
+        out.active_orders_total = list.length;
+        out.active_orders = list.filter(o => String(o.symbol || o.pair || '').toUpperCase().replace('/', '-').startsWith(c + '-'));
+      } catch (e) { out.active_orders_error = String((e && e.message) || e).slice(0, 300); }
+      return { content: [{ type: 'text', text: JSON.stringify(out) }] };
+    }
+  );
+
   // ── Tool: get_move_shape (#426) — rocket vs steady climb, with history and news. Read-only, advice only. ──
   server.tool('get_move_shape',
     'Is a coin\'s rise a ROCKET (a few big hours did most of it, deep swings - historically usually gives some back: sell-and-buy-back favoured) or a STEADY climb (spread out, shallow dips - more often still higher a week later: hold favoured), or MIXED? Measured on hourly prices from the coin\'s 7-day low, checked against that coin\'s own past rises (or all coins when it has fewer than 5 like it), with the last 72 h of analyst-video notes and headlines that mention it. Use it when a coin is running, when a loop arms, and before advising sell vs hold. Omit symbol for every coin now 10%+ above its 7-day low. track_record = how past calls turned out 7 days later. Read-only: never trades, never changes a loop.',
