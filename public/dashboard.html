@@ -764,7 +764,6 @@
   <button class="tab-btn active" onclick="switchTab('portfolio')">Portfolio</button>
   <button class="tab-btn" onclick="switchTab('activity')">📋 Activity</button>
   <button class="tab-btn" onclick="switchTab('journal')">📓 Journal</button>
-  <button class="tab-btn" onclick="switchTab('kraken')">🦑 Kraken</button>
   <button class="tab-btn" onclick="switchTab('scorecards')">📊 Scorecards</button>
   <button class="tab-btn" onclick="switchTab('concentration')">Conc %</button>
   <button class="tab-btn" onclick="switchTab('rotations')">Rotations</button>
@@ -820,34 +819,47 @@
     </div>
   </div>
 
+  <!-- #516 Coins (Bryan 30 Sep 09:17): every coin in one list like Revolut's home screen - logo, name, amount and price,
+       value and 24 h change. Tap one for its card (chart, alerts, settings, strategy, history). Holdings, the watchlist
+       (top three, the rest folded), dust and sold coins. This replaces Holdings, Active Alerts, Active Trailing Stops, Alert
+       Thresholds, the Lifetime Ledger list, the Tangem card and the Kraken tab; each of those now sits on the coin's card. -->
+  <style>
+    .cl-ledger { font-size: 0.8rem; color: var(--text-muted); margin: -4px 0 10px; line-height: 1.5; }
+    .cl-ledger b { font-weight: 600; }
+    .cl-sec { color: var(--text-muted); font-size: 0.72rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; margin: 14px 2px 4px; display: flex; justify-content: space-between; }
+    .cl-sec:first-child { margin-top: 0; }
+    .cl-row { display: flex; align-items: center; gap: 12px; width: 100%; padding: 11px 2px; background: none; border: 0; border-top: 1px solid rgba(255,255,255,0.06); color: inherit; font: inherit; text-align: left; cursor: pointer; }
+    .cl-sec + .cl-row, .cl-fold > .cl-row:first-child { border-top: 0; }
+    .cl-row:active { background: rgba(255,255,255,0.04); }
+    .cl-ic { width: 40px; height: 40px; flex: none; border-radius: 50%; overflow: hidden; background: #262626; display: grid; place-items: center; color: #fff; font-weight: 700; font-size: 16px; }
+    .cl-ic img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .cl-nm { flex: 1; min-width: 0; }
+    .cl-nm b { display: block; font-size: 1rem; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .cl-sub { color: var(--text-muted); font-size: 0.82rem; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: block; }
+    .cl-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+    .cl-chip { font-size: 0.68rem; padding: 1px 7px; border-radius: 9px; background: rgba(255,255,255,0.07); color: #bbb; white-space: nowrap; }
+    .cl-chip.on { background: rgba(0,200,150,0.15); color: #33d6a6; }
+    .cl-chip.warn { background: rgba(255,170,0,0.13); color: #ffb733; }
+    .cl-vl { text-align: right; font-variant-numeric: tabular-nums; flex: none; }
+    .cl-vl b { display: block; font-size: 1rem; font-weight: 600; }
+    .cl-vl span { font-size: 0.82rem; }
+    .cl-up { color: #33d6a6; } .cl-dn { color: #ff5a6e; } .cl-mu { color: var(--text-muted); }
+    .cl-more { width: 100%; background: none; border: 0; border-top: 1px solid rgba(255,255,255,0.06); color: var(--accent); font: 600 0.9rem system-ui, sans-serif; padding: 11px 2px; text-align: left; cursor: pointer; display: flex; justify-content: space-between; }
+    html.in-app .cl-nm b, html.in-app .cl-vl b { font-size: 1.1rem; }
+    html.in-app .cl-sub, html.in-app .cl-vl span { font-size: 0.9rem; }
+    html.in-app .cl-ic { width: 44px; height: 44px; }
+  </style>
+  <div class="card" id="coins-card">
+    <div class="card-title">Coins</div>
+    <div id="coins-ledger" class="cl-ledger"></div>
+    <div id="holdings-list"><div class="empty-state">Loading…</div></div>
+  </div>
+
   <!-- Portfolio value chart (#PV1): the /portfolio page in its compact embed mode -->
   <div class="card" id="pv-card">
     <div class="card-title" style="display:flex;justify-content:space-between;align-items:center">📈 Portfolio value <a href="/portfolio" style="color:var(--accent);text-decoration:none">Full view ↗</a></div>
     <iframe id="pv-frame" src="/portfolio?embed=1" title="Portfolio value chart" loading="lazy" style="display:block;width:100%;height:470px;border:0;background:transparent"></iframe>
     <script>window.addEventListener('message', function (e) { if (e.origin === location.origin && e.data && e.data.pvHeight > 200) document.getElementById('pv-frame').style.height = Math.min(e.data.pvHeight, 900) + 'px'; });</script>
-  </div>
-
-  <!-- Tangem Self-Custody Wallet (#496: straight under the chart) -->
-  <div class="tangem-card" id="tangem-card">
-    <div class="tangem-title">🔐 Tangem Wallet</div>
-    <div class="tangem-loading" id="tangem-loading">Loading…</div>
-    <div id="tangem-content" style="display:none">
-      <div class="tangem-header">
-        <div>
-          <div class="tangem-amount" id="tangem-value-usd">—</div>
-          <div class="tangem-xrp" id="tangem-xrp-qty">—</div>
-          <div class="tangem-entry" id="tangem-entry-line">—</div>
-        </div>
-        <div class="tangem-pnl">
-          <div class="tangem-pnl-value" id="tangem-pnl-usd">—</div>
-          <div class="tangem-pnl-pct" id="tangem-pnl-pct">—</div>
-        </div>
-      </div>
-      <div class="tangem-footer">
-        <span class="tangem-address" id="tangem-address">—</span>
-        <a class="tangem-link" href="https://xrpscan.com/account/r4E3rtCa4FT4HxTQV2iw3yQHRTrAHMYS3v" target="_blank" rel="noopener">View on XRPScan ↗</a>
-      </div>
-    </div>
   </div>
 
   <!-- Budget agent + Spec desk at a glance (#W1): tap a card for the full page -->
@@ -998,31 +1010,6 @@
     </div>
   </div>
 
-  <!-- Holdings -->
-  <div class="card">
-    <div class="card-title">Holdings</div>
-    <div class="holdings-list" id="holdings-list">
-      <div class="empty-state">Loading…</div>
-    </div>
-  </div>
-
-  <!-- Lifetime Ledger (#8) -->
-  <div class="card">
-    <div class="card-title">📒 Lifetime Ledger</div>
-    <div id="ledger-summary" style="font-size:0.82rem;color:#aaa;margin-bottom:10px"></div>
-    <div id="ledger-list" style="display:flex;flex-direction:column;gap:6px;max-height:440px;overflow-y:auto">
-      <div class="empty-state">Loading…</div>
-    </div>
-  </div>
-
-  <!-- Active Alerts -->
-  <div class="card">
-    <div class="card-title">Active Alerts</div>
-    <div class="alerts-list" id="alerts-list">
-      <div class="empty-state">None</div>
-    </div>
-  </div>
-
   <!-- Monitoring Controls -->
   <div class="card">
     <div class="card-title">Monitoring Controls</div>
@@ -1032,20 +1019,6 @@
         <span id="monitor-status-text">Running</span>
       </div>
       <button class="btn-accent" id="pause-resume-btn" onclick="toggleMonitoring()">Pause</button>
-    </div>
-  </div>
-
-  <!-- Trailing Stops Summary -->
-  <div class="trail-summary" id="trail-summary" style="display:none">
-    <div class="trail-summary-title">🎯 Active Trailing Stops</div>
-    <div id="trail-summary-list"></div>
-  </div>
-
-  <!-- Thresholds -->
-  <div class="card">
-    <div class="card-title">Alert Thresholds</div>
-    <div class="threshold-list" id="threshold-list">
-      <div class="empty-state">Loading…</div>
     </div>
   </div>
 
@@ -1097,24 +1070,6 @@
   </div>
 
 </div><!-- /tab-journal -->
-
-<!-- ════════════════════════════════════ KRAKEN TAB ══════════════════════ -->
-<div id="tab-kraken" class="tab-content">
-
-  <!-- Kraken total -->
-  <div class="card">
-    <div class="card-title">🦑 Kraken Exchange</div>
-    <div id="kraken-total" style="font-size:clamp(1.8rem,6vw,2.8rem);font-weight:700;color:var(--accent)">—</div>
-    <div id="kraken-status" style="font-size:0.8rem;color:var(--text-muted);margin-top:4px">Loading…</div>
-  </div>
-
-  <!-- Kraken holdings list -->
-  <div class="card">
-    <div class="card-title">Holdings</div>
-    <div id="kraken-holdings"><div class="empty-state">Loading…</div></div>
-  </div>
-
-</div><!-- /tab-kraken -->
 
 <!-- ════════════════════════════════════ ACTIVITY TAB ════════════════════ -->
 <div id="tab-activity" class="tab-content">

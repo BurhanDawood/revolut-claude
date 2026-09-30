@@ -99,7 +99,6 @@ function switchTab(name) {
     }
   });
   if (name === 'activity') loadActivity('all');
-  if (name === 'kraken') loadKraken();
   if (name === 'journal') { loadJournalEntries(); loadJournalStats(); }
   if (name === 'scorecards') loadScorecards();
   if (name === 'concentration') loadConcentration();
@@ -184,13 +183,7 @@ function loadPortfolio() {
       setText('tangem-entry-line', 'Entry: $' + tangemEntry.toFixed(4));
     }
 
-    // #57 S4: fetch strategy registry, then render the two-section card grid
-    fetchData('/api/coin-strategy').then(function(csData) {
-      csMap = {};
-      var arr = (csData && csData.strategies) || [];
-      for (var ci = 0; ci < arr.length; ci++) csMap[arr[ci].symbol] = arr[ci];
-      renderHoldingsGrid(positions);
-    });
+    loadCoins();   // #516 the one coin list (was the #57 S4 card grid)
     setText('last-updated', 'Updated ' + new Date().toLocaleTimeString('en-GB'));
   });
 }
@@ -304,6 +297,112 @@ function makeCard(e, isWatch) {
     + '</div>'
     + '<div class="rx-cd" id="card-detail-' + sym + '" style="display:none;padding:0 12px 12px;border-top:1px solid #2a2a2a"></div>'
     + '</div>';
+}
+
+// ── #516 the one coin list ────────────────────────────────────────
+// Bryan 30 Sep 09:17-09:23: one list like Revolut's home screen (logo, name, amount and price, value, 24 h change); a tap opens the
+// coin's card; the watchlist shows its top three (closest to a buy level first) with the rest folded; dust and sold coins folded.
+var rxCoinsBusy = false, rxCoinsData = null;
+function rxAttr(x) { return esc(x).replace(/"/g, '&quot;').replace(/'/g, '&#39;'); }
+var rxCoinFolds = (function () { try { return JSON.parse(localStorage.getItem('rx_coin_folds') || '{}') || {}; } catch (e) { return {}; } })();
+function rxCoinPx(v) {
+  if (v == null || !isFinite(v) || v <= 0) return '–';
+  var a = Math.abs(v), d = a >= 1000 ? 2 : a >= 1 ? 4 : Math.min(10, Math.max(4, 3 - Math.floor(Math.log10(a))));
+  return '$' + Number(v).toLocaleString('en-US', { minimumFractionDigits: a >= 1000 ? 2 : Math.min(d, 2), maximumFractionDigits: d });
+}
+function rxCoinQty(v) {
+  if (v == null || !isFinite(v)) return '';
+  var a = Math.abs(v);
+  return a >= 1e6 ? (v / 1e6).toFixed(2) + 'M' : v.toLocaleString('en-US', { maximumFractionDigits: a >= 1000 ? 0 : a >= 1 ? 2 : 6 });
+}
+function rxCoinMoney(v, signed) {
+  if (v == null || !isFinite(v)) return '–';
+  var s = '$' + Math.abs(v).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return signed ? (v >= 0 ? '+' : '−') + s : (v < 0 ? '−' : '') + s;
+}
+function rxCoinChg(p) {
+  if (p == null || !isFinite(p)) return '<span class="cl-mu">–</span>';
+  return '<span class="' + (p >= 0 ? 'cl-up' : 'cl-dn') + '">' + (p >= 0 ? '▲ ' : '▼ ') + Math.abs(p).toFixed(2) + '%</span>';
+}
+function rxCoinIcon(c) {
+  var h = 0; for (var i = 0; i < c.coin.length; i++) h = (h * 31 + c.coin.charCodeAt(i)) % 360;
+  var letter = '<span style="width:100%;height:100%;display:grid;place-items:center;background:hsl(' + h + ',45%,32%)">' + esc(c.coin.charAt(0)) + '</span>';
+  if (!c.icon) return '<span class="cl-ic">' + letter + '</span>';
+  return '<span class="cl-ic"><img alt="" loading="lazy" referrerpolicy="no-referrer" src="' + rxAttr(c.icon) + '" data-l="' + rxAttr(letter) + '" onerror="this.outerHTML=this.getAttribute(\'data-l\')"></span>';
+}
+function rxCoinRow(c, kind) {
+  var chips = [];
+  if (c.alerts) chips.push('<span class="cl-chip">🔔 ' + c.alerts + '</span>');
+  if (c.loop) chips.push('<span class="cl-chip' + (c.loop.armed ? ' on' : '') + '">🔁 ' + (c.loop.armed ? 'armed' : c.loop.sold ? 'buy-back' : c.loop.enabled ? 'loop' : 'loop off') + '</span>');
+  if (c.trail) chips.push('<span class="cl-chip' + (c.trail.auto ? ' warn' : '') + '">🎯 trail ' + c.trail.pct + '%</span>');
+  (c.venues || []).forEach(function (v) { if (v !== 'Revolut X') chips.push('<span class="cl-chip">' + esc(v) + '</span>'); });
+  if (c.muted) chips.push('<span class="cl-chip">🔇 muted</span>');
+  var name = c.name || c.coin, sub, right;
+  if (kind === 'watch') {
+    sub = esc(c.coin) + ' · ' + rxCoinPx(c.price) + (c.buy_at ? ' · buy ' + rxCoinPx(c.buy_at) + ' (' + c.buy_gap_pct.toFixed(1) + '% away)' : c.role ? ' · ' + esc(c.role.replace('_', ' ')) : '');
+    right = '<b>' + rxCoinPx(c.price) + '</b>' + rxCoinChg(c.change24h);
+  } else if (kind === 'sold') {
+    sub = esc(c.coin) + ' · none held';
+    right = '<b class="' + (c.lifetime >= 0 ? 'cl-up' : 'cl-dn') + '">' + rxCoinMoney(c.lifetime, true) + '</b><span class="cl-mu">lifetime</span>';
+  } else {
+    sub = rxCoinQty(c.qty) + ' ' + esc(c.coin) + ' · ' + rxCoinPx(c.price);
+    right = '<b>' + rxCoinMoney(c.value) + '</b>' + rxCoinChg(c.change24h);
+  }
+  return '<button type="button" class="cl-row" onclick="rxOpenCoin(\'' + esc(c.coin) + '\')">' + rxCoinIcon(c) +
+    '<span class="cl-nm"><b>' + esc(name) + '</b><span class="cl-sub">' + sub + '</span>' + (chips.length ? '<span class="cl-chips">' + chips.join('') + '</span>' : '') + '</span>' +
+    '<span class="cl-vl">' + right + '</span></button>';
+}
+function rxCoinFold(key, label, list, kind, showFirst, totalTxt) {
+  if (!list.length) return '';
+  var open = !!rxCoinFolds[key], h = '';
+  var head = list.slice(0, showFirst), rest = list.slice(showFirst);
+  head.forEach(function (c) { h += rxCoinRow(c, kind); });
+  if (rest.length) {
+    h += '<div class="cl-fold" id="cl-fold-' + key + '"' + (open ? '' : ' hidden') + '>' + rest.map(function (c) { return rxCoinRow(c, kind); }).join('') + '</div>' +
+      '<button type="button" class="cl-more" onclick="rxCoinToggle(\'' + key + '\', this)" data-closed="' + rxAttr(label) + '"><span>' + (open ? 'Show less ▴' : esc(label)) + '</span><span class="cl-mu">' + (totalTxt || '') + '</span></button>';
+  }
+  return h;
+}
+function rxCoinToggle(key, b) {
+  var f = $('cl-fold-' + key); if (!f) return;
+  f.hidden = !f.hidden; rxCoinFolds[key] = !f.hidden;
+  try { localStorage.setItem('rx_coin_folds', JSON.stringify(rxCoinFolds)); } catch (e) {}
+  b.firstChild.textContent = f.hidden ? b.getAttribute('data-closed') : 'Show less ▴';
+}
+function rxCoinsRender(d) {
+  var el = $('holdings-list'); if (!el) return;
+  var all = (d && d.coins) || [];
+  var hold = all.filter(function (c) { return c.section === 'hold'; });
+  var watch = all.filter(function (c) { return c.section === 'watch'; }).sort(function (a, b) {
+    var x = a.buy_gap_pct, y = b.buy_gap_pct;
+    if (x != null && y != null) return x - y;
+    if (x != null) return -1; if (y != null) return 1;
+    return (a.name || a.coin).localeCompare(b.name || b.coin);
+  });
+  var dust = all.filter(function (c) { return c.section === 'dust'; });
+  var sold = all.filter(function (c) { return c.section === 'sold'; }).sort(function (a, b) { return Math.abs(b.lifetime || 0) - Math.abs(a.lifetime || 0); });
+  var sum = function (l) { return l.reduce(function (s, c) { return s + (c.value || 0); }, 0); };
+  var h = '';
+  h += '<div class="cl-sec"><span>Holdings (' + hold.length + ')</span><span>' + rxCoinMoney(sum(hold)) + '</span></div>';
+  h += hold.length ? hold.map(function (c) { return rxCoinRow(c, 'hold'); }).join('') : '<div class="empty-state">No holdings</div>';
+  if (watch.length) h += '<div class="cl-sec"><span>Watchlist (' + watch.length + ')</span></div>' + rxCoinFold('watch', 'Show all ' + watch.length + ' ▾', watch, 'watch', 3);
+  if (dust.length) h += '<div class="cl-sec"><span>Dust (' + dust.length + ')</span></div>' + rxCoinFold('dust', 'Show ' + dust.length + (dust.length === 1 ? ' coin' : ' coins') + ' under $' + (d.dust_usd || 1) + ' ▾', dust, 'dust', 0, rxCoinMoney(sum(dust)));
+  if (sold.length) h += '<div class="cl-sec"><span>Sold (' + sold.length + ')</span></div>' + rxCoinFold('sold', 'Show ' + sold.length + (sold.length === 1 ? ' coin' : ' coins') + ' you no longer hold ▾', sold, 'sold', 0);
+  el.innerHTML = h;
+  var L = d && d.ledger, le = $('coins-ledger');
+  if (le) {
+    var col = function (v) { return v == null ? '' : v < 0 ? 'cl-dn' : 'cl-up'; };
+    le.innerHTML = L ? 'Lifetime P&amp;L <b class="' + col(L.lifetime) + '">' + rxCoinMoney(L.lifetime, true) + '</b> · realised <b class="' + col(L.realized) + '">' + rxCoinMoney(L.realized, true) + '</b> · unrealised <b class="' + col(L.unrealized) + '">' + rxCoinMoney(L.unrealized, true) + '</b>' +
+      (L.partial ? '<br><span class="cl-mu">' + L.partial + ' older sells have no P&amp;L recorded, so realised is partial</span>' : '') : '';
+  }
+}
+function loadCoins() {
+  if (rxCoinsBusy) return; rxCoinsBusy = true;
+  fetchData('/api/coins').then(function (d) {
+    rxCoinsBusy = false;
+    if (!d || d.error) { if (!rxCoinsData) { var el = $('holdings-list'); if (el) el.innerHTML = '<div class="empty-state">' + esc((d && d.error) || 'Coins unavailable') + '</div>'; } return; }
+    rxCoinsData = d; rxCoinsRender(d);
+  }, function () { rxCoinsBusy = false; });
 }
 
 // #505 (Bryan 29 Sep 00:10: coin cards "actually readable. That's tiny"): a plan reads as paragraphs, a leading label in
@@ -897,11 +996,7 @@ function refreshAll() {
   if (spinner) spinner.classList.add('active');
   try { loadPortfolio(); } catch(e){ console.error('loadPortfolio FAILED', e); }
   try { loadSweep(); } catch(e){ console.error('loadSweep FAILED', e); }
-  try { loadThresholds(); } catch(e){ console.error('loadThresholds FAILED', e); }
-  try { loadAlerts(); } catch(e){ console.error('loadAlerts FAILED', e); }
-  try { loadLedger(); } catch(e){ console.error('loadLedger FAILED', e); }
   try { loadMonitorStatus(); } catch(e){ console.error('loadMonitorStatus FAILED', e); }
-  try { loadTrailingStops(); } catch(e){ console.error('loadTrailingStops FAILED', e); }
   try { loadScorecards(); } catch(e){ console.error('loadScorecards FAILED', e); }
   try { loadConcentration(); } catch(e){ console.error('loadConcentration FAILED', e); }
   try { loadRotations(); } catch(e){ console.error('loadRotations FAILED', e); }
@@ -1032,4 +1127,5 @@ document.addEventListener('DOMContentLoaded', function() {
   refreshAll();
   rxFocusFromHash();   // #492
   setInterval(refreshAll, 5 * 60 * 1000);
+  setInterval(function () { if (!document.hidden) loadCoins(); }, 60 * 1000);   // #516 prices and 24 h change every minute
 });
