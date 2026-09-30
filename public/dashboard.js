@@ -399,7 +399,9 @@ function rxCoinsRender(d) {
   var h = '';
   h += '<div class="cl-sec"><span>Holdings (' + hold.length + ')</span><span>' + rxCoinMoney(sum(hold)) + '</span></div>';
   h += hold.length ? hold.map(function (c) { return rxCoinRow(c, 'hold'); }).join('') : '<div class="empty-state">No holdings</div>';
-  if (buy.length) h += '<div class="cl-sec"><span>\u2B50 Buy list (' + buy.length + ')</span></div>' + buy.map(function (c) { return rxCoinRow(c, 'buy'); }).join('');   // #521 all shown
+  // #524 the Buy list group always shows, with an "Add a coin" box at its foot (the same save as the coin-card star)
+  h += '<div class="cl-sec"><span>\u2B50 Buy list (' + buy.length + ')</span></div>' + buy.map(function (c) { return rxCoinRow(c, 'buy'); }).join('') +
+    '<form class="bl-add" onsubmit="return rxBuyAdd(this)"><input name="c" maxlength="15" placeholder="Add a coin, e.g. VVV" autocomplete="off" autocapitalize="characters" spellcheck="false" aria-label="Coin to add to the buy list"><button type="submit">Add</button><span class="bl-msg" role="status">' + esc(rxBlMsg) + '</span></form>';
   if (watch.length) h += '<div class="cl-sec"><span>Watchlist (' + watch.length + ')</span></div>' + rxCoinFold('watch', 'Show all ' + watch.length + ' ▾', watch, 'watch', 3);
   if (dust.length) h += '<div class="cl-sec"><span>Dust (' + dust.length + ')</span></div>' + rxCoinFold('dust', 'Show ' + dust.length + (dust.length === 1 ? ' coin' : ' coins') + ' under $' + (d.dust_usd || 1) + ' ▾', dust, 'dust', 0, rxCoinMoney(sum(dust)));
   if (sold.length) h += '<div class="cl-sec"><span>Sold (' + sold.length + ')</span></div>' + rxCoinFold('sold', 'Show ' + sold.length + (sold.length === 1 ? ' coin' : ' coins') + ' you no longer hold ▾', sold, 'sold', 0);
@@ -429,6 +431,20 @@ document.addEventListener('click', function (e) {
   try { localStorage.setItem('rx_movers', rxMvSide); } catch (e2) {}
   rxMoversRender(rxCoinsData);
 });
+// #524 add a coin to the buy list by its ticker (POST /api/coins/buylist, the #521 route)
+var rxBlMsg = '';   // kept across the list refresh, cleared after 6 s
+function rxBuyAdd(f) {
+  var inp = f.querySelector('input'), msg = f.querySelector('.bl-msg'), btn = f.querySelector('button');
+  var c = String(inp.value || '').toUpperCase().replace(/[-\/]?USDT?$/, '').replace(/[^A-Z0-9]/g, '');
+  if (!/^[A-Z0-9]{1,15}$/.test(c)) { msg.textContent = 'Type a ticker, e.g. VVV'; return false; }
+  btn.disabled = true; msg.textContent = 'Adding ' + c + '\u2026';
+  fetch('/api/coins/buylist', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ coin: c, on: true }), cache: 'no-store' })
+    .then(function (r) { return r.json().catch(function () { return {}; }).then(function (j) { if (!r.ok) throw new Error(j.error || ('the server answered ' + r.status)); return j; }); })
+    .then(function () { inp.value = ''; rxBlMsg = c + ' added to the buy list'; msg.textContent = rxBlMsg; setTimeout(function () { rxBlMsg = ''; }, 6000); rxCoinsBusy = false; loadCoins(); })
+    .catch(function (e) { msg.textContent = 'Not added: ' + e.message; })
+    .then(function () { btn.disabled = false; });
+  return false;
+}
 function loadCoins() {
   if (rxCoinsBusy) return; rxCoinsBusy = true;
   fetchData('/api/coins').then(function (d) {

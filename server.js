@@ -22435,6 +22435,22 @@ function createMcpServer() {
     }
   );
 
+  // ── Tool: manage_buylist (#524 Bryan 30 Sep 16:23 "add VVV to buylist") ──
+  server.tool('manage_buylist',
+    '#524 Bryan\'s BUY LIST (#521): coins he has conviction on and wants to buy or add to. DISPLAY ONLY - no rule, loop, alert or order reads it. action list | add | remove (symbol, a Revolut X pair or a held coin). Max 40 coins. Same rules as the coin-card star.',
+    {
+      action: z.enum(['list', 'add', 'remove']).describe('list, add or remove'),
+      symbol: z.string().optional().describe('Coin for add/remove, e.g. VVV or VVV-USD'),
+    },
+    async ({ action, symbol } = {}) => {
+      try {
+        if (action === 'list') { const L = await buyListRead(); return { content: [{ type: 'text', text: JSON.stringify({ ok: true, count: Object.keys(L).length, coins: L }) }] }; }
+        const r = await buyListSet({ coin: String(symbol || ''), on: action === 'add' });
+        return { content: [{ type: 'text', text: JSON.stringify(r) }] };
+      } catch (e) { return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: e.message }) }] }; }
+    }
+  );
+
   // ── Tool: send_test_alarm (#523 Bryan 30 Sep 15:17 "can you send me a test rip alert?") ──
   server.tool('send_test_alarm',
     '#523 Sends ONE test rip alarm to Bryan (Telegram + the app, which rings it like a real rip alarm on app-v11). Fixed text that says it is a test; no coin, no price, nothing trades. At most one every 2 minutes.',
