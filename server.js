@@ -28110,11 +28110,24 @@ async function coinTiles(list) {
 // Only the addresses the coin lookup chose (COIN_ICON_OK hosts) are fetched, plus CoinCap by ticker while there is none. Images only, 300 KB max.
 const COIN_LOGO_HOSTS = /^https:\/\/(coin-images\.coingecko\.com|assets\.coingecko\.com|static\.coinpaprika\.com|assets\.coincap\.io)\//;
 const _coinLogo = new Map(), _coinLogoWait = new Map();   // SYM -> { buf, type, src, at } | { miss: true, at, why }
-function coinLogoSources(c) {
+function coinLogoSources(c) {   // #539 (Bryan 01:03 'Still missing'): the chosen address, then CoinPaprika's logo for the same coin (found by name), then CoinCap by ticker
   const m = coinMetaOf(c), out = [];
   if (m.icon && COIN_ICON_OK.test(m.icon)) out.push(m.icon);
-  else out.push('https://assets.coincap.io/assets/icons/' + c.toLowerCase() + '@2x.png');   // #534 interim, only while the lookup has no logo
+  out.push('paprika:' + c);
+  out.push('https://assets.coincap.io/assets/icons/' + c.toLowerCase() + '@2x.png');
   return out;
+}
+const _coinPaprikaId = new Map();   // #539 SYM -> CoinPaprika id (or '' when it has no matching coin), per process
+async function coinPaprikaLogo(c) {
+  if (!_coinPaprikaId.has(c)) {
+    const hint = coinNameHint(c);
+    const r = await fetch('https://api.coinpaprika.com/v1/search?c=currencies&limit=20&q=' + encodeURIComponent(hint || c), { headers: COIN_META_UA, signal: AbortSignal.timeout(8000) });
+    if (!r.ok) throw new Error('CoinPaprika search ' + r.status);
+    const d = await r.json(), p = coinMetaPick((d && d.currencies) || [], c, hint, x => x.name, x => Number(x.rank) || 0);
+    _coinPaprikaId.set(c, p && /^[a-z0-9-]{2,80}$/.test(String(p.id || '')) ? String(p.id) : '');
+  }
+  const id = _coinPaprikaId.get(c);
+  return id ? 'https://static.coinpaprika.com/coin/' + id + '/logo.png' : null;
 }
 async function coinLogoGet(c) {
   const hit = _coinLogo.get(c), want = coinLogoSources(c)[0];
@@ -28123,10 +28136,11 @@ async function coinLogoGet(c) {
   if (_coinLogoWait.has(c)) return _coinLogoWait.get(c);
   const p = (async () => {
     let why = [];
-    for (const u of coinLogoSources(c)) {
+    for (let u of coinLogoSources(c)) {
       try {
+        if (u.startsWith('paprika:')) { u = await coinPaprikaLogo(c); if (!u) { why.push('CoinPaprika has no coin named like it'); continue; } }
         const r = await fetch(u, { headers: { 'user-agent': COIN_META_UA['user-agent'], accept: 'image/*' }, redirect: 'follow', signal: AbortSignal.timeout(8000) });
-        if (!r.ok) { why.push(r.status); continue; }
+        if (!r.ok) { why.push(new URL(u).host + ' ' + r.status); continue; }
         if (!COIN_LOGO_HOSTS.test(r.url || u)) { why.push('redirected off the logo hosts'); continue; }
         const type = String(r.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
         if (!/^image\/(png|jpeg|jpg|webp|gif|svg\+xml)$/.test(type)) { why.push('not an image (' + type + ')'); continue; }
@@ -28138,6 +28152,7 @@ async function coinLogoGet(c) {
       } catch (err) { why.push(err.message); }
     }
     const e = { miss: true, src: want, at: Date.now(), why: why.join('; ').slice(0, 200) };
+    console.warn('[coin-logo] ' + c + ': no picture (' + e.why + ') - the letter shows; asked again in 30 min');
     _coinLogo.set(c, e); return e;
   })();
   _coinLogoWait.set(c, p);
@@ -28148,7 +28163,7 @@ app.get('/api/coins/logo/:sym', async (req, res) => {
   if (!/^[A-Z0-9]{1,15}$/.test(c)) return res.status(400).end();
   try {
     const e = await coinLogoGet(c);
-    if (!e || !e.buf) return res.status(404).set('Cache-Control', 'private, max-age=1800').end();
+    if (!e || !e.buf) return res.status(404).set('Cache-Control', 'no-store').end();   // #539 a miss is not kept on the phone
     res.set({ 'Content-Type': e.type, 'Cache-Control': 'private, max-age=604800', 'X-Content-Type-Options': 'nosniff', 'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'" }).send(e.buf);
   } catch (err) { res.status(500).end(); }
 });
