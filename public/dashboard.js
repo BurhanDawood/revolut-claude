@@ -107,6 +107,13 @@ function switchTab(name) {
 
 // ── Portfolio ─────────────────────────────────────────────────────
 
+// #550 the total like the Revolut X app (Bryan 1 Oct 23:32): the whole dollars big, the cents smaller.
+function rxSetTotal(v) {
+  var el = $('portfolio-value'); if (!el) return;
+  var s = fmtUSD(v), i = s.lastIndexOf('.');
+  if (i < 0) { el.textContent = s; return; }
+  el.innerHTML = '<span class="pv-m">' + esc(s.slice(0, i)) + '</span><span class="pv-c">' + esc(s.slice(i)) + '</span>';
+}
 function loadPortfolio() {
   fetchData('/portfolio/summary').then(function(data) {
     if (!data) { setText('portfolio-value', 'Error'); return; }
@@ -134,7 +141,7 @@ function loadPortfolio() {
     var totalCash = revCash + krakenCash;
     var grandTotal = totalCrypto + totalCash;
 
-    setText('portfolio-value', fmtUSD(grandTotal));
+    rxSetTotal(grandTotal);   // #550
     showEl('portfolio-totals');
     setText('revolut-crypto-subtotal', fmtUSD(revCrypto));
     setText('revolut-cash-subtotal', fmtUSD(revCash));

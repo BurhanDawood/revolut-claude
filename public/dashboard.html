@@ -241,13 +241,22 @@
       margin-bottom: 14px;
     }
 
-    /* Portfolio Value */
+    /* Portfolio Value - #550 (Bryan 1 Oct 23:32 "center total portfolio number and make it look more like rev X thicker font and
+       more white"): centred, white, bold geometric digits with the cents smaller, like the Revolut X app. The digits use RxNum, a
+       1.7 KB subset of Geist Bold (only 0-9 $ , . -; (C) 2023 Vercel, SIL Open Font License 1.1) embedded here, so nothing is
+       fetched; any other character (the dash before it loads, "Error") uses the system font. */
+    @font-face { font-family: 'RxNum'; src: url(data:font/woff2;base64,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) format('woff2'); font-weight: 700; font-style: normal; font-display: swap; unicode-range: U+0024, U+002C-002E, U+0030-0039; }
     #portfolio-value {
-      font-size: clamp(2rem, 8vw, 3.5rem);
+      font-family: 'RxNum', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      font-size: clamp(2.6rem, 12.5vw, 3.6rem);
       font-weight: 700;
-      color: var(--accent);
+      color: #fff;
       letter-spacing: -0.02em;
+      line-height: 1.1;
+      text-align: center;
+      margin: 2px 0 4px;
     }
+    #portfolio-value .pv-c { font-size: 0.6em; letter-spacing: -0.01em; }
 
     /* #507 the live line under the total (Bryan 29 Sep 18:14: "a line that actually moves"): the last 6 hours of the whole
        book, one point a minute from the portfolio recorder, redrawn every minute with a smooth slide; tap to switch 1h / 6h / 24h */
