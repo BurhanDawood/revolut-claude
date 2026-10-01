@@ -442,6 +442,7 @@ function rxCoinsRender(d) {
   hold = rxHoldSorted(hold);
   h += '<div class="cl-sec"><span>Holdings (' + hold.length + ')</span><span class="cl-sec-r"><button type="button" class="cl-sort" onclick="rxHoldSortOpen()" aria-label="Sort holdings">' + esc(RX_HOLD_SORT_NAMES[rxHoldSort.k]) + (rxHoldSort.d < 0 ? ' \u2193' : ' \u2191') + '</button>' + rxCoinMoney(sum(hold)) + '</span></div>';
   h += hold.length ? hold.map(function (c) { return rxCoinRow(c, 'hold'); }).join('') : '<div class="empty-state">No holdings</div>';
+  if (rxFloatId === 'coins-card') { el.innerHTML = h; return; }   // #545 popped out: only the holdings over $1, nothing below
   if (dust.length) {
     var dOpen = !!rxCoinFolds.dust;
     h += '<div class="cl-fold" id="cl-fold-dust"' + (dOpen ? '' : ' hidden') + '>' + rxHoldSorted(dust).map(function (c) { return rxCoinRow(c, 'dust'); }).join('') + '</div>' +
@@ -1380,8 +1381,12 @@ function rxWidgetsInit(pane) {
 // older app, there is no Pop out. Read-only: the float pages are the same read routes the app uses.
 var rxPip = { id: null, wasCollapsed: false, w: 0, h: 0 };
 function rxPipApp() { try { return window.parent !== window && window.parent.rxApp && window.parent.rxApp.float ? window.parent.rxApp : null; } catch (e) { return null; } }
+var rxFloatId = null;   // #545 the widget this page shows as the floating window, if any
 function rxPipScale() {
   var el = rxPip.id && document.getElementById(rxPip.id); if (!el) return;
+  var tall = rxPip.id === 'coins-card';   // #545 a list: full width, readable, scrolls - never shrunk to fit its whole height
+  document.documentElement.classList.toggle('rx-pip-scroll', tall);
+  if (tall) { var w = Math.max(window.innerWidth, 300); document.documentElement.style.setProperty('--pipw', w + 'px'); document.documentElement.style.setProperty('--pips', String(window.innerWidth / w)); return; }
   document.documentElement.style.setProperty('--pipw', rxPip.w + 'px');
   var s = Math.min(window.innerWidth / rxPip.w, rxPip.h > 0 ? window.innerHeight / rxPip.h : 99);   // the whole widget fits the window
   document.documentElement.style.setProperty('--pips', String(Math.max(0.1, s)));
@@ -1412,7 +1417,8 @@ function rxPipInit(pane) {   // the app says whether it can float; the widget me
   Promise.resolve(A.floatOk()).then(function (ok) { if (ok) document.documentElement.classList.add('rx-pip-ok'); }).catch(function () {});
 }
 function rxFloatMode(id) {   // this page IS the floating window: one widget; a tap opens the app (on a coin when the tap was on one)
-  document.documentElement.classList.add('rx-float');
+  document.documentElement.classList.add('rx-float'); rxFloatId = id;
+  if (id === 'coins-card' && rxCoinsData) rxCoinsRender(rxCoinsData);   // #545
   setTimeout(function () { window.rxPipShow(id); }, 300);
   setTimeout(function () { window.rxPipShow(id); }, 2500);   // again once its data has drawn (the height changes)
   document.addEventListener('click', function (e) {

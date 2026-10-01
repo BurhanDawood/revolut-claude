@@ -101,6 +101,10 @@
     html.rx-pip .rx-pip-on, html.rx-pip .rx-pip-on * { visibility: visible !important; }
     html.rx-pip .rx-pip-on { position: fixed !important; left: 0; top: 0; margin: 0 !important; width: var(--pipw, 380px) !important; transform-origin: 0 0; transform: scale(var(--pips, 1)); z-index: 2147483000; border-radius: 0; }
     html.rx-pip .rx-pip-on .rx-head::after { display: none !important; }
+    /* #545 the holdings list popped out: full width, scrolls, only the holdings */
+    html.rx-pip.rx-pip-scroll, html.rx-pip.rx-pip-scroll body { overflow-y: auto !important; }
+    html.rx-pip.rx-pip-scroll .rx-pip-on { position: absolute !important; }
+    html.rx-float #coins-card #coins-ledger, html.rx-float #coins-card .cl-sort { display: none !important; }
     /* #533 coin tiles: Home is a two-column grid; cards span both, tiles take one */
     #tab-portfolio.tab-content.active { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 12px; align-items: start; }
     #tab-portfolio > * { grid-column: 1 / -1; min-width: 0; }
