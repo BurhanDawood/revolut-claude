@@ -79,6 +79,14 @@ Inside the 5-min balance loop, when USDT decreases with no offsetting balance in
 
 **Fiat withdrawal auto-log (#63, 2026-06-20).** Parallel detector: when USD (not USDT) decreases >$5 with no USDT-conversion offset and no recent crypto buy, the drop is auto-logged (`source='fiat_withdrawal'`), invested capital decremented, and Telegram notified. Reversible via `skip payment [amount]` (handler now covers both `revolut_card` and `fiat_withdrawal`). A 30-min dupe-guard on `withdrew X` prevents double-decrement if both auto-detect and manual reply fire for the same amount.
 
+### 2.7b Locked balances and the card row's lifecycle (#537, with #486)
+Revolut's `/balances` `reserved` holds two different things: coin held by this account's **own open orders**, and coin held for a **card payment that has not settled** (no order behind it). Every `GET /balances` is normalised in `revolutRequest` (`rxNormaliseBalances`): `reserved` keeps only what active orders hold (sells: coin left to sell; limit buys: USD left to spend, +1%); the rest moves to `locked`; Revolut's figures stay on the row as `reserved_raw` / `total_raw`. Holdings, values and sell sizes read the locked-aware figure. If `/orders/active` cannot be read (error, odd shape, more than one page) the balances are returned unchanged. A coin is first marked locked only after a fresh `/orders/active` read (no cache).
+
+The **trade detector** (`previousBalances`, the 5-min loop and the qty-mismatch refresh) and the **lot sync** (`_syncRevolutLotsDownToBalanceNow`) read the **raw** total, so a hold never looks like a trade and never cuts lots. A coin card payment's life:
+1. **Hold** — coin moves available → reserved; raw total unchanged. The card watch (#486) records the `payment` row (`card_pending`) at the hold. Holdings and sell sizes drop now (`locked`). Detector: no change.
+2. **Settle** — the coin leaves; raw total drops. The detector sees the drop; `cardSpendSettles` consumes the payment row once its send is `completed`, so it is not logged as a sale; lots follow the raw total down. `locked` returns to 0.
+3. **Release** (cancelled/declined) — reserved → available; raw unchanged, detector silent; the card watch reverses the payment row. `locked` returns to 0.
+
 ### 2.8 Reconciliation (#55)
 Nightly at 3 AM: compares Revolut `/balances` (available) + Kraken balances against non-legacy tranche sums per `symbol,exchange`. Tolerance 0.5%; skips untracked/dust; tags `system > available` as possible open-order (a resting limit reserves coin). Telegram only on *new* drift. This institutionalised the manual ground-truth check that originally caught the #47 phantom-tranche bug.
 

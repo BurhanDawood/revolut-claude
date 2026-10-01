@@ -146,8 +146,98 @@ async function revolutRequest(method, path, body = null, signPathOverride = null
   if (!response.ok) {
     console.error('[revolut] ' + method + ' ' + path.split('?')[0] + ' -> HTTP ' + response.status + ': ' + text.substring(0, 200));
   }
+  if (method !== 'GET' && /^\/orders/.test(path)) rxActiveOrdersBust();   // #537 an order placed/cancelled: the next balance read re-reads active orders
   if (opts && opts.withStatus) { let parsed = null; try { parsed = JSON.parse(text); } catch (e) { parsed = { raw: text.substring(0, 200) }; } return { status: response.status, ok: response.ok, body: parsed }; }
+  if (method === 'GET' && path === '/balances' && !(opts && opts.rawBalances)) return rxNormaliseBalances(JSON.parse(text));   // #537
   return JSON.parse(text);
+}
+
+// #537 (dev #420, Bryan 1 Oct: "don't want this confusing us again"). Revolut's /balances `reserved` holds more than our own
+// open orders: a card payment made from a coin (JTO, 30 Sep: Zilch + Snoots Vet = 600.18 JTO) sits in `reserved` until it settles,
+// with no order behind it. Every holdings sum in this file is available + reserved (#71), so that coin read as still owned and
+// sellable. One fix at the source instead of ~50 sites: every GET /balances is normalised here so `reserved` counts only what
+// this account's ACTIVE ORDERS hold (sells: the coin left to sell; limit buys: the USD left to spend, +1% slack). The rest moves
+// to `locked` (not held, not sellable); the venue's figures stay on the row as reserved_raw / total_raw.
+// Safe fallback: if the active-orders read fails, is unreadable, or has another page, the balances are returned UNCHANGED
+// (today's behaviour) - a lock can never make the system think coin vanished because an order read failed.
+// Fable C2 (rev 2): before a coin is FIRST marked locked, the active orders are read fresh (never from the 10 s cache), so an
+// order Bryan has just placed in the Revolut app is not taken for a lock.
+// THE CARD ROW'S LIFECYCLE (Fable C3; also ARCHITECTURE.md 2.7b) - a coin card payment, e.g. JTO 30 Sep:
+//   1. hold:    Revolut moves the coin available -> reserved; the raw total (available + reserved_raw) is unchanged. The card
+//               watch (#486) records the payment row at the hold. Here: reserved -> locked, so holdings and sell sizes drop now.
+//               The trade detector and the lot sync read the RAW total, so they see no change: a hold is never a trade.
+//   2. settle:  the coin leaves; the raw total drops. The detector sees the drop and cardSpendSettles consumes the payment row
+//               (its send completed), so it is not logged as a sale; lots follow the raw total down. locked returns to 0.
+//   3. release: (cancelled / declined) reserved -> available; the raw total is unchanged, so the detector is silent; the card
+//               watch reverses the payment row. locked returns to 0.
+let _rxActiveOrders = { at: 0, list: null, p: null }, _rxOrdersReads = 0;   // reads counts real venue reads (C2 knows if this call read fresh)
+function rxActiveOrdersBust() { _rxActiveOrders = { at: 0, list: null, p: null }; }
+async function rxActiveOrdersFresh(maxAgeMs = 10000) {
+  if (_rxActiveOrders.list && Date.now() - _rxActiveOrders.at < maxAgeMs) return _rxActiveOrders.list;
+  if (_rxActiveOrders.p) return _rxActiveOrders.p;
+  const p = (async () => {
+    const r = await revolutRequest('GET', '/orders/active', null, null, { withStatus: true });
+    const b = r && r.body;
+    const list = Array.isArray(b) ? b : (b && Array.isArray(b.data) ? b.data : null);
+    _rxOrdersReads++;
+    if (!r || !r.ok || !list) throw new Error('active orders unreadable (HTTP ' + (r && r.status) + ')');
+    if (b && !Array.isArray(b) && b.metadata && b.metadata.next_cursor) throw new Error('active orders have more than one page');
+    _rxActiveOrders = { at: Date.now(), list, p: null };
+    return list;
+  })();
+  _rxActiveOrders.p = p;
+  try { return await p; } finally { if (_rxActiveOrders.p === p) _rxActiveOrders.p = null; }
+}
+let _rxLockLogAt = {};
+const _rxLockedNow = new Set();   // coins marked locked on the last normalised read (C2: a coin not in here is checked fresh first)
+async function rxNormaliseBalances(parsed) {
+  const rows = Array.isArray(parsed) ? parsed : (parsed && (parsed.data || parsed.balances));
+  if (!Array.isArray(rows) || !rows.length) return parsed;
+  if (!rows.some(r => (parseFloat(r && r.reserved) || 0) > 0)) return parsed;           // nothing reserved: nothing to decide
+  const n0 = _rxOrdersReads;
+  let orders;
+  try {
+    orders = await rxActiveOrdersFresh();
+    let { held, uncapped } = rxOrdersHeld(orders);
+    const newLock = rows.some(r => { const c = String((r && r.currency) || '').toUpperCase(), raw = parseFloat(r && r.reserved) || 0;
+      return raw > 0 && !uncapped.has(c) && raw - Math.min(raw, held[c] || 0) > Math.max(1e-12, raw * 1e-9) && !_rxLockedNow.has(c); });
+    if (newLock && _rxOrdersReads === n0) { rxActiveOrdersBust(); orders = await rxActiveOrdersFresh(); }   // Fable C2: fresh read before a first lock
+  }
+  catch (e) { const k = '_fail'; if (!_rxLockLogAt[k] || Date.now() - _rxLockLogAt[k] > 600000) { _rxLockLogAt[k] = Date.now(); console.warn('[balances] #537 ' + e.message + ' - reserved counted as before'); } return parsed; }
+  const { held, uncapped } = rxOrdersHeld(orders);
+  const lockedNow = new Set();
+  for (const r of rows) {
+    const c = String((r && r.currency) || '').toUpperCase();
+    const raw = parseFloat(r && r.reserved) || 0;
+    if (!(raw > 0) || uncapped.has(c)) continue;
+    const keep = Math.min(raw, held[c] || 0), locked = raw - keep;
+    if (!(locked > Math.max(1e-12, raw * 1e-9))) continue;
+    const av = parseFloat(r.available) || 0;
+    r.reserved_raw = r.reserved; r.reserved = String(keep); r.locked = String(locked); lockedNow.add(c);
+    if (r.total != null) { r.total_raw = r.total; r.total = String(av + keep); }
+    if (!_rxLockLogAt[c] || Date.now() - _rxLockLogAt[c] > 3600000) { _rxLockLogAt[c] = Date.now(); console.log('[balances] #537 ' + c + ' ' + locked + ' reserved outside any open order (card payment or other hold) - counted as locked, not held'); }
+  }
+  _rxLockedNow.clear(); for (const c of lockedNow) _rxLockedNow.add(c);
+  return parsed;
+}
+function rxOrdersHeld(orders) {   // what this account's active orders hold, per currency
+  const held = {}, uncapped = new Set();
+  for (const o of orders) {
+    const sym = String(o.symbol || o.pair || '').toUpperCase().replace('/', '-');
+    const [base, quote] = sym.split('-'); if (!base || !quote) continue;
+    const q = Number(o.quantity), f = Number(o.filled_quantity) || 0;
+    const left = o.leftover_quantity != null ? Number(o.leftover_quantity) : (Number.isFinite(q) ? q - f : NaN);
+    const side = String(o.side || '').toLowerCase();
+    if (side === 'sell') {
+      if (!Number.isFinite(left)) { uncapped.add(base); continue; }
+      held[base] = (held[base] || 0) + Math.max(0, left);
+    } else if (side === 'buy') {
+      const px = Number(o.price);
+      if (!Number.isFinite(left) || !(px > 0)) { uncapped.add(quote); continue; }
+      held[quote] = (held[quote] || 0) + Math.max(0, left) * px * 1.01;
+    } else { uncapped.add(base); uncapped.add(quote); }
+  }
+  return { held, uncapped };
 }
 
 async function placeRevolutOrder(symbol, side, orderType, baseSize, price = null, valueUsd = null, callerClientOrderId = null, pipelinedQty = 0) {
@@ -3539,8 +3629,8 @@ async function _syncRevolutLotsDownToBalanceNow(c) {
     let total = 0;
     if (row) {
       total = (has(row.available) || has(row.reserved))
-        ? (parseFloat(row.available) || 0) + (parseFloat(row.reserved) || 0)
-        : parseFloat(has(row.total) ? row.total : row.balance);
+        ? (parseFloat(row.available) || 0) + (parseFloat(has(row.reserved_raw) ? row.reserved_raw : row.reserved) || 0)   // #537 raw: a lock never shrinks lots
+        : parseFloat(has(row.total_raw) ? row.total_raw : has(row.total) ? row.total : row.balance);
     }
     if (!Number.isFinite(total) || total < 0) return { skipped: 'balance not a number' };
     const [lots] = await db.execute(
@@ -3918,8 +4008,9 @@ async function cardSpendWatchTick() {
 }
 // #486 at settlement: how much of a coin drop is card spends already recorded at the hold. Consumes those rows (oldest first,
 // compare-and-set) and returns the token quantity to NOT log as a sale. Within 3% of the drop = the whole drop.
-// Fable C1: a pending hold does not move the detector's balance but a real sale does - so a row is consumed only when the venue
-// says ITS send is completed (the watch's last read; if not completed, one fresh read covering the row's age). Pending or
+// Fable C1 (#486), kept true by #537 C1: a pending hold does not move the DETECTOR's balance - the detector reads the raw total
+// (available + Revolut's reserved_raw), which a hold leaves unchanged; #537's 'locked' only changes holdings and sell sizes, never
+// the detector. A real sale moves the raw total - so a row is consumed only when the venue says ITS send is completed (the watch's last read; if not completed, one fresh read covering the row's age). Pending or
 // unreadable = not consumed: the drop is logged as today.
 async function cardSpendSettles(coin, dropQty) {
   const c = String(coin || '').toUpperCase(), drop = Number(dropQty);
@@ -18694,7 +18785,10 @@ async function checkPortfolio() {
 
     for (const asset of balances) {
       if (!asset.currency || SKIP_CURRENCIES.includes(asset.currency)) continue;
-      const available = parseFloat(asset.available || 0) + parseFloat(asset.reserved || 0); // #71: total holdings
+      // #537 Fable C1: the trade detector (and its cache, previousBalances) reads the RAW total - available + Revolut's own
+      // reserved - so a card hold, its release and a lock (available <-> reserved, raw total unchanged) never look like a trade.
+      // Only a settlement moves it, and #486 cardSpendSettles owns that. Holdings and sell sizes elsewhere use the locked-aware figure.
+      const available = parseFloat(asset.available || 0) + parseFloat((asset.reserved_raw != null ? asset.reserved_raw : asset.reserved) || 0); // #71: total holdings (#537 raw)
       if (available <= 0) continue;
 
       const symbol = `${asset.currency}-USD`;
@@ -22425,6 +22519,7 @@ function createMcpServer() {
         const bal = await revolutRequest('GET', '/balances');
         const rows = Array.isArray(bal) ? bal : (bal && (bal.data || bal.balances)) || [];
         out.balances_rows_total = rows.length;
+        out.note = 'rows are as the system reads them (#537): reserved = held by our own open orders; reserved_raw / total_raw = Revolut as sent; locked = held outside any order (e.g. a card payment not yet settled), not counted as held or sellable. The trade detector and lot sync use the raw total.';
         const mine = rows.filter(b => String(b.currency || b.asset || b.symbol || '').toUpperCase() === c);
         out.raw_rows = mine;                                   // every field, as sent
         out.computed_available_plus_reserved = mine.reduce((a, r) => a + (parseFloat(r.available) || 0) + (parseFloat(r.reserved) || 0), 0);
@@ -25331,7 +25426,7 @@ let rows;
       for (const asset of balances) {
         if (!asset.currency || SKIP_CURRENCIES.includes(asset.currency)) continue;
         const symbol = `${asset.currency}-USD`;
-        const liveQty = parseFloat(asset.available || 0) + parseFloat(asset.reserved || 0); // #71: total holdings — must match the detection cache (available+reserved), else resting limit orders desync the cache and trigger phantom buy/sell detection
+        const liveQty = parseFloat(asset.available || 0) + parseFloat((asset.reserved_raw != null ? asset.reserved_raw : asset.reserved) || 0); // #537 raw, like the detector cache it is compared with; #71: total holdings — must match the detection cache (available+reserved), else resting limit orders desync the cache and trigger phantom buy/sell detection
         const cachedQty = previousBalances.get(symbol);
         if (cachedQty !== undefined && liveQty > 0 && Math.abs(liveQty - cachedQty) / Math.max(cachedQty, 0.000001) > 0.05) {
           console.log(`[qty mismatch] ${symbol}: live=${liveQty} cached=${cachedQty} — updating cache`);
