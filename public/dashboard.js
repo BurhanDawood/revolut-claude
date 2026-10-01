@@ -442,7 +442,7 @@ function rxCoinsRender(d) {
   hold = rxHoldSorted(hold);
   h += '<div class="cl-sec"><span>Holdings (' + hold.length + ')</span><span class="cl-sec-r"><button type="button" class="cl-sort" onclick="rxHoldSortOpen()" aria-label="Sort holdings">' + esc(RX_HOLD_SORT_NAMES[rxHoldSort.k]) + (rxHoldSort.d < 0 ? ' \u2193' : ' \u2191') + '</button>' + rxCoinMoney(sum(hold)) + '</span></div>';
   h += hold.length ? hold.map(function (c) { return rxCoinRow(c, 'hold'); }).join('') : '<div class="empty-state">No holdings</div>';
-  if (rxFloatId === 'coins-card') { el.innerHTML = h; return; }   // #545 popped out: only the holdings over $1, nothing below
+  if (rxFloatId === 'coins-card') { el.innerHTML = h; setTimeout(rxPipScale, 50); return; }   // #546 re-fit when the list changes   // #545 popped out: only the holdings over $1, nothing below
   if (dust.length) {
     var dOpen = !!rxCoinFolds.dust;
     h += '<div class="cl-fold" id="cl-fold-dust"' + (dOpen ? '' : ' hidden') + '>' + rxHoldSorted(dust).map(function (c) { return rxCoinRow(c, 'dust'); }).join('') + '</div>' +
@@ -1386,7 +1386,15 @@ function rxPipScale() {
   var el = rxPip.id && document.getElementById(rxPip.id); if (!el) return;
   var tall = rxPip.id === 'coins-card';   // #545 a list: full width, readable, scrolls - never shrunk to fit its whole height
   document.documentElement.classList.toggle('rx-pip-scroll', tall);
-  if (tall) { var w = Math.max(window.innerWidth, 300); document.documentElement.style.setProperty('--pipw', w + 'px'); document.documentElement.style.setProperty('--pips', String(window.innerWidth / w)); return; }
+  if (tall) {   // #546 fit smart: shrink (not below 0.7) or grow (to 1.3) so the whole list fits the window height; past that, scroll
+    var vw = document.documentElement.clientWidth || window.innerWidth, vh = window.innerHeight;
+    document.documentElement.style.setProperty('--pipw', vw + 'px'); document.documentElement.style.setProperty('--pips', '1');
+    var h0 = el.scrollHeight || el.offsetHeight || vh;
+    var s = Math.max(0.7, Math.min(1.3, vh / h0));
+    document.documentElement.style.setProperty('--pipw', Math.floor(vw / s) + 'px'); document.documentElement.style.setProperty('--pips', String(s));
+    document.documentElement.classList.toggle('rx-pip-fit', s > 0.7);   // it all fits: no scrolling
+    return;
+  }
   document.documentElement.style.setProperty('--pipw', rxPip.w + 'px');
   var s = Math.min(window.innerWidth / rxPip.w, rxPip.h > 0 ? window.innerHeight / rxPip.h : 99);   // the whole widget fits the window
   document.documentElement.style.setProperty('--pips', String(Math.max(0.1, s)));

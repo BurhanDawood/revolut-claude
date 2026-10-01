@@ -105,6 +105,17 @@
     html.rx-pip.rx-pip-scroll, html.rx-pip.rx-pip-scroll body { overflow-y: auto !important; }
     html.rx-pip.rx-pip-scroll .rx-pip-on { position: absolute !important; }
     html.rx-float #coins-card #coins-ledger, html.rx-float #coins-card .cl-sort { display: none !important; }
+    /* #546 compact rows in the pop-out: everything fits the width, no clipping */
+    html.rx-pip.rx-pip-scroll.rx-pip-fit, html.rx-pip.rx-pip-scroll.rx-pip-fit body { overflow: hidden !important; }
+    html.rx-pip.rx-pip-scroll .rx-pip-on { box-sizing: border-box !important; padding: 8px 10px !important; overflow: hidden; }
+    html.rx-float #coins-card .card-title, html.rx-float #coins-card .cl-chips { display: none !important; }
+    html.rx-float #coins-card .cl-sec { margin: 0 2px 2px; }
+    html.rx-float #coins-card .cl-row { padding: 6px 0; gap: 9px; }
+    html.rx-float #coins-card .cl-ic { width: 30px; height: 30px; font-size: 12px; }
+    html.rx-float #coins-card .cl-nm b, html.rx-float #coins-card .cl-vl b { font-size: 0.92rem; }
+    html.rx-float #coins-card .cl-sub, html.rx-float #coins-card .cl-vl span { font-size: 0.76rem; }
+    html.rx-float #coins-card .cl-vl { flex: 0 1 auto; min-width: 0; max-width: 46%; }
+    html.rx-float #coins-card .cl-vl b { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     /* #533 coin tiles: Home is a two-column grid; cards span both, tiles take one */
     #tab-portfolio.tab-content.active { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 12px; align-items: start; }
     #tab-portfolio > * { grid-column: 1 / -1; min-width: 0; }
