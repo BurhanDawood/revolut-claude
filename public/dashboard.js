@@ -317,16 +317,19 @@ function rxCoinIcon(c) {   // #538 the logo from our own server (fetched there o
   if (rxLogoUrl[sym]) return '<span class="cl-ic"><img alt="" src="' + rxAttr(rxLogoUrl[sym]) + '"></span>';
   var letter = '<span style="width:100%;height:100%;display:grid;place-items:center;background:hsl(' + h + ',45%,32%)">' + esc(sym.charAt(0)) + '</span>';
   if (!/^[A-Z0-9]{1,15}$/.test(sym)) return '<span class="cl-ic">' + letter + '</span>';
-  rxLogoLoad(sym);
+  rxLogoLoad(sym, c.icon);
   return '<span class="cl-ic" data-logo="' + sym + '">' + letter + '</span>';
 }
 var rxLogoUrl = {}, rxLogoAt = {};
-function rxLogoLoad(sym) {
+function rxLogoLoad(sym, direct) {   // #543 direct: the logo's own address, tried by the phone when the server has no picture
   if (rxLogoAt[sym] && Date.now() - rxLogoAt[sym] < 600000) return;   // one ask per coin; a miss is asked again after 10 min
   rxLogoAt[sym] = Date.now();
   fetch('/api/coins/logo/' + sym).then(function (r) { return r.ok ? r.blob() : null; }).then(function (b) {
-    if (!b || !b.size) return;
-    var u = URL.createObjectURL(b); rxLogoUrl[sym] = u;
+    var u;
+    if (b && b.size) u = URL.createObjectURL(b);
+    else if (direct && /^https:\/\/(coin-images\.coingecko\.com|assets\.coingecko\.com|static\.coinpaprika\.com)\//.test(direct)) u = direct;   // #543
+    else return;
+    rxLogoUrl[sym] = u;
     [].forEach.call(document.querySelectorAll('.cl-ic[data-logo="' + sym + '"]'), function (el) { el.removeAttribute('data-logo'); el.innerHTML = '<img alt="" src="' + rxAttr(u) + '">'; });
   }).catch(function () {});
 }
