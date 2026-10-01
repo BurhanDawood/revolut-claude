@@ -57,6 +57,8 @@ import androidx.core.content.ContextCompat;
  * A foreground service (type specialUse) with a silent notification on rx_float and one action, Close.
  * The WebView has no Capacitor bridge and no file access; it navigates only on the server origin. Its one JS method,
  * RxFloatHost.open(coin), brings the app to the front on that coin, the same way a notification does. Not exported.
+ * v14: lp.x / lp.y are absolute screen coordinates (FLAG_LAYOUT_IN_SCREEN), as screen() and fit() assume; v13 counted
+ * the status bar twice, so the window sat one status-bar height low and its corner ran off the bottom (Bryan 1 Oct).
  */
 @RequiresApi(Build.VERSION_CODES.O)
 public class FloatService extends Service {
@@ -78,6 +80,10 @@ public class FloatService extends Service {
     private static final int MIN_H_DP = 120;
     private static final int MARGIN_DP = 8;
     private static final int CORNER_DP = 12;
+    /** Geometry version in rx_float: below 2 the saved place was measured in v13's shifted coordinates. */
+    private static final int GEOMETRY_VERSION = 2;
+    /** How far (px) the window may sit from where lp asked before it is corrected. */
+    private static final int OFFSET_SLACK_PX = 2;
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private WindowManager wm;
@@ -88,6 +94,13 @@ public class FloatService extends Service {
     private boolean full;
     /** The last small size and place, for ⤢ back from full. */
     private int smallX, smallY, smallW, smallH;
+    /**
+     * Where the window really sits minus lp.y, learned by checkOffset() on a launcher or OEM skin that still offsets
+     * overlays. 0 with FLAG_LAYOUT_IN_SCREEN everywhere it behaves; fit() allows lp.y down to s.top - yShift.
+     */
+    private int yShift;
+    private boolean dragging;
+    private final Runnable offsetCheck = this::checkOffset;
 
     /**
      * Shows the window on url (Config.BASE + a path RxFloatPlugin.PATH_RE accepted), or loads url in the one already
@@ -251,7 +264,9 @@ public class FloatService extends Service {
             1,
             1,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE |
+            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS |
+            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
         );
         lp.gravity = Gravity.TOP | Gravity.START;
@@ -264,6 +279,7 @@ public class FloatService extends Service {
             root = null;
             return false;
         }
+        root.post(this::scheduleOffsetCheck);   // once it is on screen: is it where lp says?
         web.loadUrl(url);
         return true;
     }
@@ -295,6 +311,7 @@ public class FloatService extends Service {
             if (lp == null || root == null) return false;
             switch (e.getActionMasked()) {
                 case MotionEvent.ACTION_DOWN:
+                    dragging = true;
                     downX = e.getRawX();
                     downY = e.getRawY();
                     startX = lp.x;
@@ -307,7 +324,7 @@ public class FloatService extends Service {
                     if (resize) {
                         Rect s = screen();
                         lp.width = clamp(startW + dx, dp(MIN_W_DP), s.right - lp.x);
-                        lp.height = clamp(startH + dy, dp(MIN_H_DP), s.bottom - lp.y);
+                        lp.height = clamp(startH + dy, dp(MIN_H_DP), s.bottom - yShift - lp.y);
                     } else {
                         lp.x = startX + dx;
                         lp.y = startY + dy;
@@ -319,8 +336,10 @@ public class FloatService extends Service {
                 }
                 case MotionEvent.ACTION_UP:
                 case MotionEvent.ACTION_CANCEL:
+                    dragging = false;
                     rememberSmall();
                     saveGeometry();
+                    scheduleOffsetCheck();
                     return true;
                 default:
                     return true;
@@ -339,11 +358,7 @@ public class FloatService extends Service {
         } else {
             rememberSmall();
             full = true;
-            Rect s = screen();
-            lp.x = s.left;
-            lp.y = s.top;
-            lp.width = s.width();
-            lp.height = s.height();
+            setFull(screen());
         }
         fit();
         update();
@@ -361,26 +376,35 @@ public class FloatService extends Service {
     /** After a rotation or fold: full stays full; otherwise the window is clamped back on screen. */
     private void refit() {
         if (lp == null || root == null) return;
-        if (full) {
-            Rect s = screen();
-            lp.x = s.left;
-            lp.y = s.top;
-            lp.width = s.width();
-            lp.height = s.height();
-        }
+        yShift = 0;   // a new display: checkOffset() learns it again
+        if (full) setFull(screen());
         fit();
         rememberSmall();
         update();
         saveGeometry();
     }
 
-    /** Size between the minimum and the usable screen, then position so the whole window is on it. */
+    /** Full: the whole usable screen, its top edge right under the status bar. */
+    private void setFull(Rect s) {
+        lp.x = s.left;
+        lp.y = s.top - yShift;
+        lp.width = s.width();
+        lp.height = s.height();
+    }
+
+    /**
+     * Size between the minimum and the usable screen, then position so the whole window is on it.
+     * After it, on screen (lp.y + yShift is where the window really is):
+     *   s.left <= lp.x  and  lp.x + lp.width <= s.right
+     *   s.top <= lp.y + yShift  and  lp.y + yShift + lp.height <= s.bottom
+     * so the resize corner is always on screen, above the gesture bar.
+     */
     private void fit() {
         Rect s = screen();
         lp.width = clamp(lp.width, Math.min(dp(MIN_W_DP), s.width()), s.width());
         lp.height = clamp(lp.height, Math.min(dp(MIN_H_DP), s.height()), s.height());
         lp.x = clamp(lp.x, s.left, s.right - lp.width);
-        lp.y = clamp(lp.y, s.top, s.bottom - lp.height);
+        lp.y = clamp(lp.y, s.top - yShift, s.bottom - yShift - lp.height);
     }
 
     private void update() {
@@ -389,6 +413,38 @@ public class FloatService extends Service {
         } catch (Exception ignored) {
             // the window went away underneath us
         }
+        if (!dragging) scheduleOffsetCheck();
+    }
+
+    /** One check, once the window has settled after the last layout (a drag checks once, on release). */
+    private void scheduleOffsetCheck() {
+        handler.removeCallbacks(offsetCheck);
+        handler.postDelayed(offsetCheck, 150);
+    }
+
+    /**
+     * Is the window where lp says? With FLAG_LAYOUT_IN_SCREEN it should be. If a launcher or OEM skin still offsets
+     * it by more than OFFSET_SLACK_PX, take the offset into yShift (so fit() lets lp.y go that much higher), re-fit and
+     * update once. Never re-schedules itself, so it cannot loop.
+     */
+    private void checkOffset() {
+        if (lp == null || root == null || dragging || !root.isAttachedToWindow()) return;
+        int[] at = new int[2];
+        root.getLocationOnScreen(at);
+        int d = at[1] - (lp.y + yShift);
+        if (Math.abs(d) <= OFFSET_SLACK_PX) return;
+        yShift += d;
+        if (full) setFull(screen());
+        else lp.y -= d;
+        fit();
+        rememberSmall();
+        try {
+            wm.updateViewLayout(root, lp);
+        } catch (Exception ignored) {
+            return;
+        }
+        saveGeometry();
+        Log.i(TAG, "float offset corrected by " + d + " px");
     }
 
     private static int clamp(int v, int lo, int hi) {
@@ -440,6 +496,15 @@ public class FloatService extends Service {
     private void restoreGeometry() {
         SharedPreferences p = prefs();
         Rect s = screen();
+        if (p.getInt("gv", 0) < GEOMETRY_VERSION) {
+            // saved by v13, measured one status-bar height low (and often too big to reach the corner): start over
+            // at the first-run default, once. The path stays.
+            p.edit()
+                .remove("x").remove("y").remove("w").remove("h").remove("full")
+                .remove("sx").remove("sy").remove("sw").remove("sh")
+                .putInt("gv", GEOMETRY_VERSION)
+                .commit();
+        }
         if (p.contains("w")) {
             lp.x = p.getInt("x", 0);
             lp.y = p.getInt("y", 0);
@@ -450,12 +515,7 @@ public class FloatService extends Service {
             smallY = p.getInt("sy", lp.y);
             smallW = p.getInt("sw", lp.width);
             smallH = p.getInt("sh", lp.height);
-            if (full) {
-                lp.x = s.left;
-                lp.y = s.top;
-                lp.width = s.width();
-                lp.height = s.height();
-            }
+            if (full) setFull(s);
         } else {
             // first time: about 60% of the screen width at 4:3, top right
             lp.width = Math.round(s.width() * 0.6f);
