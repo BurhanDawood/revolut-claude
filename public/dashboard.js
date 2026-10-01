@@ -362,6 +362,45 @@ function rxCoinRow(c, kind) {
     '<span class="cl-nm"><b>' + esc(name) + '</b><span class="cl-sub">' + sub + '</span>' + (chips.length ? '<span class="cl-chips">' + chips.join('') + '</span>' : '') + '</span>' +
     '<span class="cl-vl">' + right + '</span></button>';
 }
+// #544 holdings sort, remembered on this device
+var RX_HOLD_SORT_NAMES = { value: 'Total value', perf: 'Performance', alpha: 'Alphabetical' };
+var rxHoldSort = (function () { try { var v = JSON.parse(localStorage.getItem('rx_hold_sort') || 'null'); if (v && RX_HOLD_SORT_NAMES[v.k] && (v.d === 1 || v.d === -1)) return v; } catch (e) {} return { k: 'value', d: -1 }; })();
+function rxHoldSorted(list) {
+  var k = rxHoldSort.k, d = rxHoldSort.d, nm = function (c) { return String(c.name || c.coin || ''); };
+  return list.slice().sort(function (a, b) {
+    if (k === 'alpha') return d < 0 ? nm(b).localeCompare(nm(a)) : nm(a).localeCompare(nm(b));
+    var x = k === 'perf' ? a.change24h : a.value, y = k === 'perf' ? b.change24h : b.value;
+    var xn = x == null || !isFinite(x), yn = y == null || !isFinite(y);
+    if (xn || yn) return xn && yn ? nm(a).localeCompare(nm(b)) : xn ? 1 : -1;
+    return d < 0 ? y - x : x - y;
+  });
+}
+function rxHoldSortOpen() {
+  var old = $('rx-sort-sheet'); if (old) old.remove();
+  var pend = { k: rxHoldSort.k, d: rxHoldSort.d };
+  var w = document.createElement('div'); w.id = 'rx-sort-sheet'; w.className = 'rx-sheet-bg';
+  var paint = function () {
+    w.innerHTML = '<div class="rx-sheet" role="dialog" aria-label="Sort by"><div class="rx-sheet-h"></div><h3>Sort by</h3><div class="rx-sort-list">' +
+      Object.keys(RX_HOLD_SORT_NAMES).map(function (k) { var on = pend.k === k;
+        var dir = k === 'alpha' ? (pend.d < 0 ? 'Z to A \u2193' : 'A to Z \u2191') : (pend.d < 0 ? 'High to low \u2193' : 'Low to high \u2191');
+        return '<button type="button" data-k="' + k + '" class="' + (on ? 'on' : '') + '"><span>' + RX_HOLD_SORT_NAMES[k] + '</span><span>' + (on ? dir : '') + '</span></button>'; }).join('') +
+      '</div><button type="button" class="rx-sheet-ok">Apply</button></div>';
+  };
+  paint();
+  w.addEventListener('click', function (e) {
+    var b = e.target.closest && e.target.closest('[data-k]');
+    if (b) { var k = b.getAttribute('data-k'); if (pend.k === k) pend.d = -pend.d; else { pend.k = k; pend.d = k === 'alpha' ? 1 : -1; } paint(); return; }
+    if (e.target.closest && e.target.closest('.rx-sheet-ok')) { rxHoldSort = pend; try { localStorage.setItem('rx_hold_sort', JSON.stringify(pend)); } catch (e2) {} w.remove(); if (rxCoinsData) rxCoinsRender(rxCoinsData); return; }
+    if (e.target === w) w.remove();
+  });
+  document.body.appendChild(w);
+}
+function rxDustToggle(b) {
+  var f = $('cl-fold-dust'); if (!f) return;
+  f.hidden = !f.hidden; rxCoinFolds.dust = !f.hidden;
+  try { localStorage.setItem('rx_coin_folds', JSON.stringify(rxCoinFolds)); } catch (e) {}
+  b.setAttribute('aria-expanded', f.hidden ? 'false' : 'true'); b.querySelector('.cl-chev-i').textContent = f.hidden ? '\u2304' : '\u2303';
+}
 function rxCoinFold(key, label, list, kind, showFirst, totalTxt) {
   if (!list.length) return '';
   var open = !!rxCoinFolds[key], h = '';
@@ -399,13 +438,20 @@ function rxCoinsRender(d) {
   var sold = all.filter(function (c) { return c.section === 'sold'; }).sort(function (a, b) { return Math.abs(b.lifetime || 0) - Math.abs(a.lifetime || 0); });
   var sum = function (l) { return l.reduce(function (s, c) { return s + (c.value || 0); }, 0); };
   var h = '';
-  h += '<div class="cl-sec"><span>Holdings (' + hold.length + ')</span><span>' + rxCoinMoney(sum(hold)) + '</span></div>';
+  // #544 (Bryan 1 Oct 21:14, like Revolut): holdings over $1 with a Sort by sheet; everything under $1 folded right below behind a small chevron
+  hold = rxHoldSorted(hold);
+  h += '<div class="cl-sec"><span>Holdings (' + hold.length + ')</span><span class="cl-sec-r"><button type="button" class="cl-sort" onclick="rxHoldSortOpen()" aria-label="Sort holdings">' + esc(RX_HOLD_SORT_NAMES[rxHoldSort.k]) + (rxHoldSort.d < 0 ? ' \u2193' : ' \u2191') + '</button>' + rxCoinMoney(sum(hold)) + '</span></div>';
   h += hold.length ? hold.map(function (c) { return rxCoinRow(c, 'hold'); }).join('') : '<div class="empty-state">No holdings</div>';
+  if (dust.length) {
+    var dOpen = !!rxCoinFolds.dust;
+    h += '<div class="cl-fold" id="cl-fold-dust"' + (dOpen ? '' : ' hidden') + '>' + rxHoldSorted(dust).map(function (c) { return rxCoinRow(c, 'dust'); }).join('') + '</div>' +
+      '<button type="button" class="cl-chev" onclick="rxDustToggle(this)" aria-expanded="' + (dOpen ? 'true' : 'false') + '"><span class="cl-chev-i">' + (dOpen ? '\u2303' : '\u2304') + '</span><span>' + dust.length + ' under $' + (d.dust_usd || 1) + ' \u00b7 ' + rxCoinMoney(sum(dust)) + '</span></button>';
+  }
   // #524 the Buy list group always shows, with an "Add a coin" box at its foot (the same save as the coin-card star)
   h += '<div class="cl-sec"><span>\u2B50 Buy list (' + buy.length + ')</span></div>' + buy.map(function (c) { return rxCoinRow(c, 'buy'); }).join('') +
     '<form class="bl-add" onsubmit="return rxBuyAdd(this)"><input name="c" maxlength="15" placeholder="Add a coin, e.g. VVV" autocomplete="off" autocapitalize="characters" spellcheck="false" aria-label="Coin to add to the buy list"><button type="submit">Add</button><span class="bl-msg" role="status">' + esc(rxBlMsg) + '</span></form>';
   if (watch.length) h += '<div class="cl-sec"><span>Watchlist (' + watch.length + ')</span></div>' + rxCoinFold('watch', 'Show all ' + watch.length + ' ▾', watch, 'watch', 3);
-  if (dust.length) h += '<div class="cl-sec"><span>Dust (' + dust.length + ')</span></div>' + rxCoinFold('dust', 'Show ' + dust.length + (dust.length === 1 ? ' coin' : ' coins') + ' under $' + (d.dust_usd || 1) + ' ▾', dust, 'dust', 0, rxCoinMoney(sum(dust)));
+  if (false) h += rxCoinFold('dust', 'Show ' + dust.length + (dust.length === 1 ? ' coin' : ' coins') + ' under $' + (d.dust_usd || 1) + ' ▾', dust, 'dust', 0, rxCoinMoney(sum(dust)));
   if (sold.length) h += '<div class="cl-sec"><span>Sold (' + sold.length + ')</span></div>' + rxCoinFold('sold', 'Show ' + sold.length + (sold.length === 1 ? ' coin' : ' coins') + ' you no longer hold ▾', sold, 'sold', 0);
   el.innerHTML = h;
   var L = d && d.ledger, le = $('coins-ledger');
