@@ -98,6 +98,15 @@ Its JSON answer can hold four things:
 
 **runs_per_day below 6** is spread over the day. `agentScheduledRun` keeps evenly spaced 4-hourly slots instead of the first N; for example, 3 runs a day happen at 04:05, 12:05 and 20:05.
 
+**Cost routing (#549, paper; Fable C6).** `route_mode: 'screen'` in the `agent` config (not on the PM agent's allowlist; set it to `'sonnet'` to turn routing off).
+- Haiku (`screen_model`) reads a compact copy of a scheduled run's input (`agentScreenInput`: no universe list, tool catalogue, signals or weekly review) and answers only `escalate` true or false, with a kind (entry, exit, both, none), coins and a reason (`agentRouteScreen`). A failed or malformed answer escalates.
+- Sonnet decides when the screen escalates, and always on: a manual run (`manual`), a position or held-coin wake (`wake_held`), alerts that fired unseen (`missed_alerts`), and when Sonnet has not run for `route_heartbeat_h` (20) hours (`heartbeat`), so its 24-hour alerts and notes stay fresh.
+- A held run (`screen_hold`) trades nothing and keeps Sonnet's own alerts, notes and watch list. It re-arms the position alerts (`agentArmPositionAlerts`: stop_price and the drop), which expire after 6 hours.
+- Every `route_shadow_every`-th (2nd) held run, in the first `route_shadow_days` (14) after the clock start, also asks Sonnet (`agentShadowSonnet`). The answer is logged only: never executed, and not charged to the paper cash.
+- Every run writes one row to `agent_route_log`. `agentRouteStats` gives the C6 figures on the scorecard: entry agreement, runs where Sonnet would have traded when the screen held, and cost per day. The routing may be put forward for a live design only after two weeks at about 90% agreement on entries over at least 25 compared runs; otherwise Sonnet decides every run.
+- Every `agent_decisions` row carries `route` and `settings_ver` (the `agent_changes` id in force). The scorecard lists every closed trade against holding BTC over the same hold, with its settings version at entry and exit; under 5 scored trades it says "insufficient".
+- **The go-live clock** (`system_config` `agent_clock`) is written once, 45 s after the first boot of 549 (`agentClockStart`, INSERT IGNORE). The bar is measured from it: 30 days AND 10 closed trades, whichever takes longer (#552).
+
 
 ---
 
