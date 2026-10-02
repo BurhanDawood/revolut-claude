@@ -3932,13 +3932,31 @@ async function ensurePendingCapTable() {
 const CARD_WATCH = { every_ms: 2 * 60 * 1000, window_h: 24, deep_every: 15, deep_days: 10, min_usd: 0.5, settle_tol: 0.03, stale_h: 6 };
 const CARD_DEAD = ['cancelled', 'canceled', 'failed', 'declined', 'rejected', 'reverted', 'reversed'];
 // Revolut's recent transactions, newest first as the venue returns them: one or two pages of the last `hours`.
+// #556 ONE QUEUE FOR GET /transactions. Five readers (the card watch every 2 min, the detector's fill lookup per detected trade,
+// fetchTransactions, the ledger rebuild, get_trading_data's transaction pages) were hitting the venue together and drawing HTTP
+// 429 in bursts (2 Oct 11:37, 20:53, 21:09 London; no 429 on orders, balances or tickers). Now one request at a time, at least
+// 1.5 s apart, and after a 429 none for 60 s. A refused or backed-off read returns the venue's own error shape
+// ({ message }), which every caller already treats as "no data this time" - so no caller's behaviour changes, only the rate.
+let _txQ = Promise.resolve(), _txNextAt = 0, _txBackoffUntil = 0;
+const TX_GAP_MS = 1500, TX_BACKOFF_MS = 60000;
+function revolutTxGet(qs) {
+  const run = async () => {
+    if (Date.now() < _txBackoffUntil) return { message: 'Rate limit exceeded (backing off until ' + new Date(_txBackoffUntil).toISOString().slice(11, 19) + ' UTC)' };
+    const wait = _txNextAt - Date.now(); if (wait > 0) await new Promise(r => setTimeout(r, wait));
+    _txNextAt = Date.now() + TX_GAP_MS;
+    const r = await revolutRequest('GET', '/transactions?' + qs.toString(), null, null, { withStatus: true });
+    if (r.status === 429) { _txBackoffUntil = Date.now() + TX_BACKOFF_MS; return r.body && r.body.message ? r.body : { message: 'Rate limit exceeded' }; }
+    return r.body;
+  };
+  const p = _txQ.then(run, run); _txQ = p.catch(() => {}); return p;
+}
 async function revolutRecentSends(hours = CARD_WATCH.window_h, maxPages = 2) {
   const end = Date.now(), start = end - hours * 3600 * 1000, out = [];
   let cursor = null, pages = 0;
   do {
     const qs = new URLSearchParams({ start_date: String(start), end_date: String(end), limit: '100' });
     if (cursor) qs.set('cursor', cursor);
-    const page = await revolutRequest('GET', '/transactions?' + qs.toString());
+    const page = await revolutTxGet(qs);
     if (page && page.message && !page.data && !Array.isArray(page)) throw new Error('API: ' + page.message);
     const rows = Array.isArray(page) ? page : (page && (page.data || page.items)) || [];
     for (const t of rows) {
@@ -12440,7 +12458,7 @@ async function fetchTransactions(daysBack = 30) {
         if (cursor) qs.set('cursor', cursor);
         let page;
         try {
-          page = await revolutRequest('GET', '/transactions?' + qs.toString());
+          page = await revolutTxGet(qs);
           if (page && page.message && !page.data && !Array.isArray(page)) {
             out.errors.push({ window: new Date(start).toISOString().slice(0, 10), error: 'API: ' + page.message });
             break;
@@ -12514,7 +12532,7 @@ async function fetchAllTransactionsForRebuild(daysBack) {
       for (;;) {
         out.requests++;
         await sleep(120);                                  // pace requests; bursts are what trip the limit
-        try { page = await revolutRequest('GET', '/transactions?' + qs.toString()); }
+        try { page = await revolutTxGet(qs); }
         catch (e) { page = { message: e.message }; }
         const isErr = page && page.message && !page.data && !Array.isArray(page);
         if (!isErr) break;
@@ -14810,7 +14828,7 @@ async function findMatchingIntention(symbol, action) {
 async function findDetectedFill(coin, side, qty, fromMs, toMs) {
   if (!coin || !(qty > 0) || !['buy', 'sell'].includes(side)) return null;
   const qs = new URLSearchParams({ start_date: String(Math.floor(fromMs)), end_date: String(Math.floor(toMs)), limit: '100' });
-  const page = await revolutRequest('GET', '/transactions?' + qs.toString());
+  const page = await revolutTxGet(qs);
   const rows = Array.isArray(page) ? page : (page && (page.data || page.items)) || [];
   const cands = [];
   for (const t of rows) {
@@ -24071,7 +24089,7 @@ let rows;
             do {
               const qs = new URLSearchParams({ start_date: String(start), end_date: String(end), limit: '100' });
               if (cursor) qs.set('cursor', cursor);
-              const page = await revolutRequest('GET', '/transactions?' + qs.toString());
+              const page = await revolutTxGet(qs);
               if (page && page.message && !pageRows(page).length) { rec.error = 'API: ' + page.message; break; }
               rows = rows.concat(pageRows(page)); pages++;
               cursor = (page && page.metadata && page.metadata.next_cursor) || null;
