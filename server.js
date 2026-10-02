@@ -7897,6 +7897,32 @@ async function runLadderSweep(opts) {
   };
 }
 
+// #555 (PM note 4b, notes 21-23): what a backtest result can be used for, said FIRST. PM ran retrace_pct 50 vs 70 and got
+// byte-identical output because retrace_pct (and the other ladder settings) are read only in rule_mode 'ladder' - single and
+// rearm runs sell and buy on the tiers. A start date before the coin's data was silently moved; bars with no range cannot
+// test a trail; and the headline vs_hold was quoted from 0-3 completed cycles. Nothing here changes the simulation.
+const BT_LADDER_ONLY = ['trail_pct', 'sell_pct', 'retrace_pct', 'bounce_pct', 'buy_pct', 'further_drop_pct', 'buyback_ceiling_pct', 'abandon_hours'];
+function btReadFirst(res, a) {
+  if (!res || res.ok === false) return res;
+  const rf = { ok_to_quote: true, notes: [] };
+  const m = res.metrics || {}, n = Number(m.cycles_completed) || 0;
+  rf.sample = n >= 5 ? n + ' completed cycles (the gate is 5)' : 'INSUFFICIENT: ' + n + ' completed cycle' + (n === 1 ? '' : 's') + ' (the gate is 5) - vs_hold and vs_half_cash below are not evidence yet';
+  if (n < 5) rf.ok_to_quote = false;
+  if (m.vs_half_cash_pct != null) rf.honest_headline = 'vs_half_cash ' + m.vs_half_cash_pct + '% (vs_hold ' + m.vs_hold_pct + '% mostly measures the market direction)';
+  if (a.rule_mode !== 'ladder') {
+    const ign = BT_LADDER_ONLY.filter(k => a.given && a.given[k] != null);
+    if (ign.length) { rf.ignored_params = ign; rf.notes.push(ign.join(', ') + ' IGNORED: they are read only in rule_mode "ladder". This ' + (a.rule_mode || 'single') + ' run sells and buys on sell_tiers / buy_tiers, so runs that differ only in these return identical results.'); }
+  }
+  const w = res.window || {};
+  if (a.start && w.start && Date.parse(w.start) - Date.parse(a.start) > 2 * 86400000) { rf.window_clamped = { asked_from: String(a.start), data_from: w.start }; rf.notes.push('Asked from ' + String(a.start).slice(0, 10) + ' but this coin\'s ' + (res.source || a.source || '') + ' data starts ' + String(w.start).slice(0, 10) + ' (its listing or the backfill start) - the window was moved, not extended.'); }
+  if (w.bars > 0 && w.flat_bars != null) {
+    const fp = w.flat_bars / w.bars;
+    if (fp >= 0.5) { rf.ok_to_quote = false; rf.notes.push(w.flat_bars + ' of ' + w.bars + ' bars have no range (open = high = low = close): a trail cannot trigger inside them, so this source cannot test a trailing stop for this coin.'); }
+    else if (fp >= 0.1) rf.notes.push(w.flat_bars + ' of ' + w.bars + ' bars have no range - results lean on the rest.');
+  }
+  if (w.bars > 0 && w.bars < 60) { rf.ok_to_quote = false; rf.notes.push('Only ' + w.bars + ' bars - too short to judge a loop.'); }
+  return { read_first: rf, ...res };
+}
 async function runLadderBacktest(opts) {
   if (opts._profile) {   // #379 profile settings (TIGHT derived for THIS coin as of the window start)
     const pc = await profileCfgFor(opts._profile, opts.symbol, opts.start);
@@ -8019,7 +8045,7 @@ async function runLadderBacktest(opts) {
   }
   return {
     ok: true, symbol: sym, source: src,
-    window: { start: new Date(bars[0].t).toISOString(), end: new Date(bars[bars.length - 1].t).toISOString(), bars: bars.length },
+    window: { start: new Date(bars[0].t).toISOString(), end: new Date(bars[bars.length - 1].t).toISOString(), bars: bars.length, flat_bars: bars.filter(b => !(b.h > b.l)).length },   // #555 bars with no range (o=h=l=c)
     price: { first: bars[0].c, last: bars[bars.length - 1].c,
       change_pct: Number(((bars[bars.length - 1].c / bars[0].c - 1) * 100).toFixed(2)) },
     config: cfg,
@@ -16880,6 +16906,21 @@ function ceilingOverrideErrors(ov, nowMs) {
   return errs;
 }
 
+// #555 (PM note 4 / dev #421a, 1 Oct: "the card misreports the state, in the reassuring direction") - the Auto-sell line on a
+// loop's Telegram cards reads the fire-time predicate (mayAutoTrade, dry run, one exec_decisions row like predicate_check), not
+// a flag: disabled -> OFF; enabled and clear -> ON; enabled but stopped by a check -> ON but BLOCKED, naming the check. The master
+// switch (ai_auto_execute.enabled) does not govern loop sells (see loop_audit), so the cards no longer say it must be on.
+async function loopSellVerdict(sym) {
+  try {
+    const [r] = await db.execute('SELECT loop_enabled FROM pump_armed_rules WHERE symbol = ? AND active = 1 LIMIT 1', [sym]);
+    if (!r.length) return { state: 'none', text: 'no active loop' };
+    if (Number(r[0].loop_enabled) !== 1) return { state: 'off', text: 'OFF - the loop is disabled, so a trail breach only alerts' };
+    const price = await getCurrentPrice(sym).catch(() => null);
+    const pc = await mayAutoTrade({ symbol: sym, side: 'sell', path: 'loop_trail', exchange: KRAKEN_MONITORED_COINS.includes(sym) ? 'kraken' : 'revolut', price, trigger: 'trailing_stop' }, { mode: 'dry_run' });
+    if (pc && pc.ok) return { state: 'on', text: 'ON - a trail breach would sell now (the fire-time check passes)' };
+    return { state: 'blocked', text: 'ON, but BLOCKED right now by check ' + (pc && pc.check_no != null ? pc.check_no + ' ' : '') + '(' + ((pc && pc.reason) || 'unknown') + ') - a breach would not sell until that clears' };
+  } catch (e) { return { state: 'unknown', text: 'could not be checked (' + String(e.message).slice(0, 80) + ') - see manage_auto_rules predicate_check' }; }
+}
 // #P0 THE ONLY FUNCTION THAT MAY SAY AN AUTONOMOUS ORDER CAN FIRE. Fire-time, from the DB and the venue, no in-memory
 // inputs, no notification inputs (see the FORBIDDEN list and its static test). Never throws; unreadable = NO.
 // It never mutates trading state: callers react to a NO (hold / re-anchor / restore / release) per the design §4.
@@ -25823,7 +25864,7 @@ let rows;
         const [rules] = await db.execute('SELECT * FROM auto_trade_rules ORDER BY created_at DESC');
         const active = rules.filter(r => r.active);
         const standalone_troughs = await listStandaloneTroughs().catch(e => ({ error: e.message }));   // #T1
-        return { content: [{ type: 'text', text: JSON.stringify({ execution: 'alert_only', rules, active_count: active.length, total: rules.length,
+        return { content: [{ type: 'text', text: JSON.stringify({ execution: 'alert_only', execution_scope: 'alert_only applies ONLY to the auto_trade_rules listed here. Pump loops, trails, standalone troughs and the paper agent have their own switches - manage_auto_rules predicate_check or loop_audit says whether those can sell or buy now.', rules, active_count: active.length, total: rules.length,
           standalone_troughs_note: 'standalone_troughs are NOT alert-only: on the bounce each one BUYS (Revolut X) if the cash is there, else offers a Buy now button. Remove with manage_alerts remove_trough.',
           standalone_troughs }, null, 2) }] };   // #F2
       } catch (e) {
@@ -25854,7 +25895,7 @@ let rows;
       try {
         if (action === 'list') {
           const [rules] = await db.execute('SELECT * FROM auto_trade_rules ORDER BY created_at DESC');
-          return { content: [{ type: 'text', text: JSON.stringify({ execution: 'alert_only', rules, active: rules.filter(r => r.active) }, null, 2) }] };   // #F2
+          return { content: [{ type: 'text', text: JSON.stringify({ execution: 'alert_only', execution_scope: 'alert_only applies ONLY to the auto_trade_rules listed here. Pump loops, trails, standalone troughs and the paper agent have their own switches - manage_auto_rules predicate_check or loop_audit says whether those can sell or buy now.', rules, active: rules.filter(r => r.active) }, null, 2) }] };   // #F2
         }
         if (action === 'profile_list' || action === 'profile_validate' || action === 'profile_status') {
           // #379 versioned profiles + the validation record (round-trip / cash-parked split REQUIRED)
@@ -26189,10 +26230,11 @@ let rows;
 
           await db.execute('UPDATE pump_armed_rules SET loop_enabled = 1 WHERE symbol = ?', [sym]);
           const [after] = await db.execute('SELECT * FROM pump_armed_rules WHERE symbol = ? LIMIT 1', [sym]);
-          await sendTelegram('LOOP ENABLED -- '+sym+' rinse-repeat ON. Floor $'+Number(leFloor.floor).toPrecision(6)+' ('+leFloor.source+'), sell '+r.sell_pct+'%, max '+r.max_cycles+' cycles. Master must also be ON to fire.'+(leStop.checked ? '' : ' Stop clearance not checked ('+leStop.reason+').')+conflictWarning+leCostWarn+(leCost && !leCost.checked ? ' Cost not compared with Revolut X ('+leCost.reason+').' : '')).catch(()=>{});
+          const leNow = await loopSellVerdict(sym);   // #555 the master switch does not govern loop sells; say what the predicate says
+          await sendTelegram('LOOP ENABLED -- '+sym+' rinse-repeat ON. Floor $'+Number(leFloor.floor).toPrecision(6)+' ('+leFloor.source+'), sell '+r.sell_pct+'%, max '+r.max_cycles+' cycles. Auto-sell: '+leNow.text+'.'+(leStop.checked ? '' : ' Stop clearance not checked ('+leStop.reason+').')+conflictWarning+leCostWarn+(leCost && !leCost.checked ? ' Cost not compared with Revolut X ('+leCost.reason+').' : '')).catch(()=>{});
           const leWarn = await emitEnableWarnings(sym, { side: 'both', trigger: 'trailing_stop' }, 'loop_enable');   // #H1
           shareStrategyNote('<b>' + escTg(sym.replace('-USD', '')) + ' pump loop switched ON</b>\nSells ' + r.sell_pct + '% when up ' + Number(r.arm_pump_pct) + '% then down ' + Number(r.trail_pct) + '% from the peak; buys back on the dip');   // #S1
-          return { content: [{ type: 'text', text: JSON.stringify({ ok: true, loop_enabled: 1, floor: leFloor, stop_check: leStop, cost_check: leCost, cost_warning: leCostWarn || null, row: after[0], conflict_warning: conflictWarning || null, warnings: leWarn }, null, 2) }] };
+          return { content: [{ type: 'text', text: JSON.stringify({ ok: true, loop_enabled: 1, auto_sell_now: leNow, floor: leFloor, stop_check: leStop, cost_check: leCost, cost_warning: leCostWarn || null, row: after[0], conflict_warning: conflictWarning || null, warnings: leWarn }, null, 2) }] };
         }
         if (action === 'reset_cycle') {
           // #278 — clear stale pump-loop RUNTIME state while preserving all config.
@@ -26574,11 +26616,17 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
       min_tier_usd:     z.coerce.number().optional().describe('#282 dust guard — skip and mark-filled any tier below this USD notional (default 2.0)'),
       abandon_hours:    z.coerce.number().optional().describe('#A2 abandon a pending buy-back this many hours after the sale (default 336 = 14 d)'),
       uncovered_abandon_hours: z.coerce.number().optional().describe('#A2 abandon when the buy-back cash has been missing this many hours (default 48)'),
+      loop_enabled:     z.any().optional().describe('#555 NOT a field of this tool - refused with an error. Turn a loop on or off with manage_auto_rules loop_enable / loop_disable'),
+      enabled:          z.any().optional().describe('#555 NOT a field of this tool - refused (use manage_auto_rules loop_enable / loop_disable)'),
+      armed:            z.any().optional().describe('#555 NOT a field of this tool - refused (the loop arms itself on the pump)'),
       ceiling_pct:      z.coerce.number().optional().describe('#P0 buy-back ceiling, %% above the average sale (5-200; unset = the default 50). Read by the fire-time predicate (not enforced until Phase 2)'),
       ceiling_override: zLoose(z.object({ value: z.coerce.number().optional(), reason: z.string().optional(), amount_usd: z.coerce.number().optional(), expires_at: z.string().optional() })).optional().describe('#P0 time-boxed ceiling override {value, reason, amount_usd, expires_at}: ALL four required, value above 0 and below 50, amount_usd > 0, expires_at a future ISO date at most 90 days out, reason 20+ characters - otherwise the call is REFUSED and nothing is written. Reverts to the stored/default ceiling by calculation when it expires'),
     },
-    async ({ symbol, arm_pump_pct, trail_pct, sell_pct, entry_floor, arm_window_min, rebuy_pct, retrace_pct, bounce_pct, buyback_floor_pct, rule_mode, sell_tiers, buy_tiers, tier_cooldown_min, min_tier_usd, abandon_hours, uncovered_abandon_hours, ceiling_pct, ceiling_override }) => {
+    async ({ symbol, arm_pump_pct, trail_pct, sell_pct, entry_floor, arm_window_min, rebuy_pct, retrace_pct, bounce_pct, buyback_floor_pct, rule_mode, sell_tiers, buy_tiers, tier_cooldown_min, min_tier_usd, abandon_hours, uncovered_abandon_hours, ceiling_pct, ceiling_override, loop_enabled, enabled, armed }) => {
       try {
+        // #555 (PM note 4c): a field this tool does not own is an ERROR, before anything is written - not ok:true with changed:[]
+        const notMine = [['loop_enabled', loop_enabled], ['enabled', enabled], ['armed', armed]].filter(([, v]) => v !== undefined).map(([k]) => k);
+        if (notMine.length) return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: notMine.join(', ') + ' cannot be set here - nothing was changed. Turn a loop on or off with manage_auto_rules loop_enable / loop_disable; arming happens on the pump itself.' }) }] };
         const sym = symbol.includes('-USD') ? symbol.toUpperCase() : `${symbol.toUpperCase()}-USD`;
 
         // #282 Phase 2 — validate tier config BEFORE any write. An invalid or over-cap set is
@@ -26713,6 +26761,7 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
         const fin = finRows[0] || {};
         const spWarn = Number(fin.loop_enabled) === 1 ? await emitEnableWarnings(sym, { side: 'both', trigger: 'trailing_stop' }, 'set_pump_armed_rule') : [];   // #H1
         const num = (v) => v == null ? null : Number(v);
+        const sellNow = await loopSellVerdict(sym);   // #555
         await sendTelegram(
           `🎯 <b>PUMP-ARM RULE ${ex ? 'UPDATED' : 'SET'} — ${sym.replace('-USD','')}</b>\n\n` +
           (ex ? `Changed: ${changed.length ? changed.join(', ') : 'nothing'}\n\n` : '') +
@@ -26721,7 +26770,7 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
           `Floor: ${fin.entry_floor != null ? num(fin.entry_floor) : 'none on the rule (sell_floors / entry price apply)'}\n` +
           `Sell on breach: ${num(fin.sell_pct)}%\n` +
           `Trough-arm retrace: ${num(fin.retrace_pct)}%, bounce: ${num(fin.bounce_pct)}%, buyback floor: ${num(fin.buyback_floor_pct)}%\n` +
-          `Auto-sell: ${Number(fin.loop_enabled) === 1 ? 'ON (loop enabled)' : 'OFF (alerts only)'}` +
+          `Auto-sell: ${escTg(sellNow.text)}` +
           `${Number(fin.armed) === 1 ? '\nArmed state kept - this change did not disarm the loop.' : ''}` +
           `${tierInfo ? `\nMode: TIERED — sell ${stJson}, buy ${btJson} (cumulative sell ${tierInfo.cumulative_sell_pct}%, cap ${tierInfo.max_sell_pct}%)` : ''}` + conflictWarning
         ).catch(() => {});
@@ -26729,14 +26778,14 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
           '\nSells ' + num(fin.sell_pct) + '% when it is up ' + num(fin.arm_pump_pct) + '% within ' + num(fin.arm_window_min) + ' min and then falls ' + num(fin.trail_pct) + '% from the peak' +
           '\nBuys back after a ' + num(fin.retrace_pct) + '% retrace and a ' + num(fin.bounce_pct) + '% bounce' +
           '\nNever sells below cost + 0.5%' + (Number(fin.entry_floor) > 0 ? ' (floor $' + num(fin.entry_floor) + ')' : '') +
-          '\nAuto-sell ' + (Number(fin.loop_enabled) === 1 ? 'ON' : 'OFF (alerts only)'));
+          '\nAuto-sell ' + escTg(sellNow.text));
         return { content: [{ type: 'text', text: JSON.stringify({ ok: true, warnings: spWarn, stop_check: _stopCheck, cost_check: _costCheck, mode: ex ? 'updated' : 'created', changed, rule: {
           symbol: sym, arm_pump_pct: num(fin.arm_pump_pct), arm_window_min: num(fin.arm_window_min), trail_pct: num(fin.trail_pct), sell_pct: num(fin.sell_pct),
           entry_floor: num(fin.entry_floor), rebuy_pct: num(fin.rebuy_pct), retrace_pct: num(fin.retrace_pct), bounce_pct: num(fin.bounce_pct),
           buyback_floor_pct: num(fin.buyback_floor_pct), rule_mode: fin.rule_mode, tier_cooldown_min: num(fin.tier_cooldown_min), min_tier_usd: num(fin.min_tier_usd),
           abandon_hours: fin.abandon_hours != null ? num(fin.abandon_hours) : 336, uncovered_abandon_hours: fin.uncovered_abandon_hours != null ? num(fin.uncovered_abandon_hours) : 48,   // #A2
           ceiling: effectiveCeilingPct(fin),   // #P0
-          loop_enabled: num(fin.loop_enabled), armed: num(fin.armed), active: num(fin.active) }, tier_validation: tierInfo, conflict_warning: conflictWarning || null }) }] };
+          loop_enabled: num(fin.loop_enabled), armed: num(fin.armed), active: num(fin.active) }, auto_sell_now: sellNow, tier_validation: tierInfo, conflict_warning: conflictWarning || null }) }] };
       } catch (e) {
         return { content: [{ type: 'text', text: JSON.stringify({ error: e.message }) }] };
       }
@@ -27174,7 +27223,7 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
             trail_pct, sell_pct, retrace_pct, bounce_pct, buy_pct, further_drop_pct, buyback_ceiling_pct, abandon_hours, retention_floor_pct, buyback_cap, arm_on });
           return { content: [{ type: 'text', text: JSON.stringify(sw, null, 2) }] };
         }
-        const res = await runLadderBacktest({ _profile: _prof,
+        const res0 = await runLadderBacktest({ _profile: _prof,
           symbol, start, end, source, initial_qty, initial_usd, arm_pump_pct, arm_window_min,
           sell_tiers, buy_tiers, tier_cooldown_min, min_tier_usd, entry_floor, slippage_pct, fee_pct,
           rule_mode, max_legs, rearm_from, rearm_confirm_pct,
@@ -27182,6 +27231,7 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
           retention_floor_pct,   // #364
           buyback_cap, arm_on   // #382
         });
+        const res = btReadFirst(res0, { start, source, rule_mode: _prof ? 'ladder' : rule_mode, given: { trail_pct, sell_pct, retrace_pct, bounce_pct, buy_pct, further_drop_pct, buyback_ceiling_pct, abandon_hours } });   // #555
         return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
       } catch (e) {
         return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: e.message }) }] };
