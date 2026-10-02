@@ -32,6 +32,73 @@ Development and operation are split across three Claude contexts, by design:
 
 This separation is deliberate: the Dev thread reasons and verifies but cannot push; Cowork executes but does not design. Every change passes through a written prompt + a verified read-back before deploy. The same `cross_thread` principles (auto-exec-off, never-sell-below-entry, etc.) are surfaced in both PM and Dev session briefings (see §3, decision-memory layer).
 
+### 1.2 The company: the paper trader, its boss and the team notebook (#547–#548, October 2026)
+
+Bryan, 1 Oct 2026: the Dev, the PM and the paper trader should work together like a company. The PM agent is the boss. The paper trader proves its worth on paper before it ever trades a real $100.
+
+**Roles** (`TEAM_ROLES`):
+- `claude_pm`, `claude_dev` and `fable` are the Claude threads.
+- `pm_agent` is the PM agent, the paper trader's boss.
+- `dev_agent` is the desk's Dev assistant.
+- `trader` is the paper budget agent.
+- `bryan` is Bryan.
+
+**Team notes (#547)** live in the `pm_handovers` table, which gained an addressee column, `to_role`.
+- The Claude threads write and close notes with the `team_notes` MCP tool. Only `claude_pm`, `claude_dev` and `fable` can write through it.
+- The server writes notes as `system`, for example when the go-live bar flips.
+- From #548 the server also writes as `pm_agent`. This happens only inside the server (`teamWrite(..., { internal: true })`), never through a tool.
+- Notes are data. Nothing trades or changes a rule because of a note.
+- The Desk page shows the notes read-only.
+
+**Go-live scorecard (#547, `agentScorecard`)** checks Bryan's bar in code:
+- 30 days of trading.
+- Beats cash and BTC over the last 30 days, after model costs.
+- Worst drop under 10%.
+- 10 or more closed trades.
+
+From #548 the scorecard also lists the settings changed inside its window (`changes_in_window`) and the PM agent's own cost per day. Meeting the bar changes nothing by itself: the PM proposes, Bryan decides, and Fable reviews the live switch.
+
+**The PM agent (#548, `pmBossReview`)** is one Sonnet call with no tools.
+- **Weekdays at 21:05 London.** It runs only when something has changed since its last review, or when 3 days have passed. A change means a fill, a fired alert, a note to `pm_agent`, a halt, freeze or stop, or a change in the bar.
+- **Sundays at 19:00.** A deep review, after the trader's 18:30 self-review and its 18:45 tools check.
+- **On demand** with `/agent boss run`.
+- **Budget.** $1 a London day, refused before the call. Its spend (`pm_boss_reviews.cost_usd`) is not charged to the paper cash.
+
+Its JSON answer can hold four things:
+- A memo. This becomes a team note to `claude_pm`, replacing its previous memo, plus a Telegram message.
+- Up to 2 setting changes.
+- One tool request a day for the desk (source `pm_agent`). It lands in the inbox; Bryan decides, and it is never drafted automatically.
+- An escalation. This becomes a team note to `fable`, plus a comment on any desk thread it names.
+
+**Fable's conditions C1–C6 (desk #41), as built:**
+- **One writer.** The PM agent changes the trader's settings only through `agentPmApply`. It checks, in this order:
+  1. the mode is paper;
+  2. the field is on the allowlist;
+  3. the value is within bounds;
+  4. the field has not changed in the last 3 days;
+  5. the $1 a day cap.
+
+  It then logs the change to `agent_changes`, writes the setting, and sends a Telegram line with an Undo button.
+- **Bounds** (`PM_BOSS_FIELDS`, a function of mode through `pmBossBounds`):
+  - per_trade_pct 10–25
+  - max_positions 2–5
+  - runs_per_day 2–6
+  - wakes_per_day 0–6
+  - daily_loss_pct 5–10 and drawdown_halt_pct 15–40, which may only move down, and never to a level the trader's current loss already breaches.
+
+  Nothing can be moved outside paper mode, or while Bryan has stopped the trader.
+- **Bryan's controls.** Undo is the `au` button: Telegram only, not in `APP_ANSWER_ALLOW`, and it lasts 24 h. It restores the before-value stored with the change. `/agent boss reset <setting|all>` restores a default. Both are logged with `by_role` bryan, and that row blocks the PM agent from changing the same setting for 3 days.
+- **The playbook** (`pm_playbook` in the `agent` config) is data:
+  - plain text, at most 1,200 characters, no links;
+  - the trader reads it as `input.pm_guidance`, on paper only;
+  - the trader's limits come only from the config fields, never from the playbook.
+
+  The switch to live clears it (`agentPlaybookClearForLive`). Today `/agent resume confirm` calls it when resuming into live. **55x's live switch must call it too, and must decide afresh any setting the PM agent tuned on paper.**
+- **Boot check.** `PM_BOSS_TOOLS` is empty, and it may never name an order, loop, trail, rule or live-config tool.
+
+**runs_per_day below 6** is spread over the day. `agentScheduledRun` keeps evenly spaced 4-hourly slots instead of the first N; for example, 3 runs a day happen at 04:05, 12:05 and 20:05.
+
+
 ---
 
 ## 2. Data-Flow Map
