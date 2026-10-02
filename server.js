@@ -1089,7 +1089,7 @@ async function telegramButtonDispatch(cbData, cbReply, ackCb) {
   // New Trade Detected buttons use 'tj'; numeric 'td' keeps already-sent ones working.
   const cbIsTradeJournal = cbMoneyType === 'tj' || (cbMoneyType === 'td' && /^\d+$/.test(cbCoin));
   if (cbMoneyType === 'np' || cbMoneyType === 'ip' || cbMoneyType === 'cc' || cbIsTradeJournal || cbMoneyType === 'ta' || cbMoneyType === 'mu' ||
-      cbMoneyType === 'sd' || cbMoneyType === 'sp' || cbMoneyType === 'rp' || cbMoneyType === 'db' || cbMoneyType === 'sk' || cbMoneyType === 'ro' || cbMoneyType === 'rq' || cbMoneyType === 'sx' || cbMoneyType === 'au') {
+      cbMoneyType === 'sd' || cbMoneyType === 'sp' || cbMoneyType === 'rp' || cbMoneyType === 'db' || cbMoneyType === 'sk' || cbMoneyType === 'ro' || cbMoneyType === 'rq' || cbMoneyType === 'sx' || cbMoneyType === 'au' || cbMoneyType === 'pf') {
     await ackCb('Working...');
     try {
       if (cbMoneyType === 'ta') await handleTradeApprovalButton(cbCoin, cbChoice, cbReply);
@@ -1098,6 +1098,7 @@ async function telegramButtonDispatch(cbData, cbReply, ackCb) {
       else if (cbMoneyType === 'rp') await handleRebalanceConfirmButton(cbCoin, cbChoice, cbReply);
       else if (cbMoneyType === 'sk') await handleSpecButton(cbCoin, cbChoice, cbReply);   // #D2 spec desk status buttons (never money)
       else if (cbMoneyType === 'au') await handleBossUndoButton(cbCoin, cbReply);   // #548 C3 Undo a PM agent change (paper settings; Telegram only)
+      else if (cbMoneyType === 'pf') await handlePmFollowButton(cbCoin, cbChoice, cbReply);   // #559 followed the PM? records only
       else if (cbMoneyType === 'ro') await handleRotationUntagButton(cbCoin, cbReply);   // #8 records only
       else if (cbMoneyType === 'rq') await handleRotationAskButton(cbCoin, cbChoice, cbReply);   // #8 records only
       else if (cbMoneyType === 'sx') await handleSpikeButton(cbCoin, cbChoice, cbReply);   // #B23 S3 keep a coin alerts-only / insure it again / switch on (with confirm); no off button
@@ -2726,6 +2727,9 @@ await db.execute(`CREATE TABLE IF NOT EXISTS trade_intentions (
   INDEX idx_symbol_action (symbol, action),
   INDEX idx_expires (expires_at)
 )`);
+await safeAddColumn('trade_intentions', 'source', 'VARCHAR(16) NULL').catch(() => {});   // #559 'pm' = logged by the PM through log_intention; NULL = the server's own (auto-exec)
+await safeAddColumn('trade_intentions', 'usd', 'DECIMAL(14,2) NULL').catch(() => {});    // #559 the PM's planned size, when it gave one
+await safeAddColumn('trading_journal', 'follow_match', 'VARCHAR(12) NULL').catch(() => {});   // #559 strong | loose | confirmed | denied
 
 await db.execute(`CREATE TABLE IF NOT EXISTS system_config (
   id INT AUTO_INCREMENT PRIMARY KEY,
@@ -4650,7 +4654,8 @@ async function executeApprovedRevolut(t) {
       await queueFillEnrichment(rJrnIns && rJrnIns.insertId, (result && result.data ? (result.data.venue_order_id || result.data.id) : null) || (result && result.client_order_id), t.symbol, t.side, executedPrice, qtyForJournal, 'claude_mcp');   // #362
 
             if (matchedIntention) {
-              await db.execute('UPDATE trade_intentions SET matched_at = NOW() WHERE id = ?', [matchedIntention.id]).catch(() => {});
+              await db.execute('UPDATE trade_intentions SET matched_at = NOW(), matched_journal_id = ? WHERE id = ?', [rJrnIns && rJrnIns.insertId ? rJrnIns.insertId : null, matchedIntention.id]).catch(() => {});
+              if (rJrnIns && rJrnIns.insertId) await pmFollowMark(rJrnIns.insertId, matchedIntention, { coin: coinBase, side: t.side, usd: valueUSD });   // #559
             }
 
             // Update avg entry price on buy (respecting cost basis)
@@ -6708,6 +6713,7 @@ async function runLimitFillPipeline(order, filledQty, avgPrice) {
     await stampVenueOrderId(journalId, { venue_order_id: order.order_id });   // #J1 the pending row's order id
     if (matchedIntention) {
       await db.execute('UPDATE trade_intentions SET matched_at = NOW(), matched_journal_id = ? WHERE id = ?', [journalId, matchedIntention.id]).catch(() => {});
+      await pmFollowMark(journalId, matchedIntention, { coin: coinBase, side, usd: valueUSD });   // #559
     }
     if (side === 'buy') {
       const prevQty = previousBalances.get(symbol) || 0;
@@ -14791,6 +14797,55 @@ async function checkForRebalancePair(newSymbol, newAction, newJournalId, newPric
   }
 }
 
+// #559 DID BRYAN FOLLOW THE PM? (PM note 9a/b, desk #43; Bryan 2 Oct 22:19 "Option 1. With confirmation message that gives me option
+// to say otherwise"). When a trade is matched to an intention the PM logged (log_intention -> source 'pm'), the journal row records the
+// PM's call (claude_recommendation / claude_reasoning) and how good the match is: STRONG = logged within 24 h and, when the PM gave a
+// size, within 10% of it; LOOSE = older or a different size. Both count as followed unless Bryan says otherwise (22:20 "Loose ones same"). One Telegram line with Yes / Not the PM's call. Records only: nothing trades, and no emotion is ever written for him.
+async function pmFollowMark(journalId, intention, fill) {
+  try {
+    if (!journalId || !intention || intention.source !== 'pm') return null;
+    const ageH = Math.max(0, (Date.now() - new Date(intention.stated_at).getTime()) / 3600000);
+    const iu = Number(intention.usd), fu = Math.abs(Number(fill && fill.usd) || 0);
+    const sizeOk = !(iu > 0) || (fu > 0 && Math.abs(fu - iu) / iu <= 0.10);
+    const strength = ageH <= 24 && sizeOk ? 'strong' : 'loose';
+    const rec = (String(intention.action) + (iu > 0 ? ' $' + Math.round(iu) : '')).slice(0, 20);
+    await db.execute('UPDATE trading_journal SET claude_recommendation = ?, claude_reasoning = ?, followed_recommendation = ?, follow_match = ? WHERE id = ?',
+      [rec, String(intention.reasoning || '').slice(0, 2000), 1, strength, journalId]);   // Bryan 22:20 "Loose ones same": both count unless he says otherwise
+    const ago = ageH < 1 ? Math.max(1, Math.round(ageH * 60)) + ' min' : (ageH < 10 ? ageH.toFixed(1) : Math.round(ageH)) + ' h';
+    await sendTelegram('🎯 <b>' + escTg(fill.coin) + ' ' + escTg(fill.side) + (fu > 0 ? ' $' + fu.toFixed(2) : '') + '</b> matched the PM\'s call from ' + ago + ' ago' + (iu > 0 ? ' (' + escTg(intention.action) + ' about $' + Math.round(iu) + ')' : '') + ': "' + escTg(String(intention.reasoning || '').slice(0, 160)) + '"\n' +
+      'Counted as following the PM' + (strength === 'loose' ? ' (a looser match: ' + (ageH > 24 ? 'the call is over a day old' : 'the size is different') + ')' : '') + '. Not right? Tap below.',
+      { inline_keyboard: [[{ text: '✓ Yes, the PM\'s call', callback_data: 'a:' + journalId + ':1:pf' }, { text: '✗ Not the PM\'s call', callback_data: 'a:' + journalId + ':2:pf' }]] }).catch(() => {});
+    return strength;
+  } catch (e) { console.error('[pm-follow] #559 mark failed:', e.message); return null; }
+}
+async function handlePmFollowButton(jidStr, choice, reply) {   // records only; Telegram only
+  const jid = parseInt(jidStr, 10);
+  const [r] = await db.execute('SELECT id, follow_match FROM trading_journal WHERE id = ?', [jid]);
+  if (!r.length || !r[0].follow_match) return reply('Nothing to confirm on that trade.');
+  if (r[0].follow_match === 'confirmed' || r[0].follow_match === 'denied') return reply('Already answered (' + r[0].follow_match + ').');
+  if (choice === 1) {
+    await db.execute("UPDATE trading_journal SET followed_recommendation = 1, follow_match = 'confirmed' WHERE id = ? AND follow_match IN ('strong', 'loose')", [jid]);
+    return reply('✓ Counted as following the PM.');
+  }
+  await db.execute("UPDATE trading_journal SET followed_recommendation = NULL, follow_match = 'denied', claude_recommendation = NULL, claude_reasoning = NULL WHERE id = ? AND follow_match IN ('strong', 'loose')", [jid]);
+  await db.execute('UPDATE trade_intentions SET matched_at = NULL, matched_journal_id = NULL WHERE matched_journal_id = ?', [jid]).catch(() => {});
+  return reply('✗ Noted - not counted as following the PM. The PM\'s call is open again for a later trade.');
+}
+// #559 (PM note 9b "tell me when I have not logged one"): Sunday 18:10, a team note to the PM thread on the last 7 days.
+async function pmFollowWeekly() {
+  const since = new Date(Date.now() - 7 * 86400000);
+  const [t] = await db.execute("SELECT follow_match, COUNT(*) AS n FROM trading_journal WHERE created_at >= ? AND action IN ('buy', 'sell') AND source IN ('auto_detected', 'manual', 'claude_mcp', 'limit_fill') GROUP BY follow_match", [since]);
+  const by = {}; let all = 0; for (const r of t) { by[r.follow_match || 'none'] = Number(r.n); all += Number(r.n); }
+  const [x] = await db.execute("SELECT COUNT(*) AS n FROM trade_intentions WHERE source = 'pm' AND matched_at IS NULL AND expires_at >= ? AND expires_at < NOW()", [since]);
+  const [o] = await db.execute("SELECT COUNT(*) AS n FROM trade_intentions WHERE source = 'pm' AND matched_at IS NULL AND expires_at >= NOW()");
+  const counted = (by.strong || 0) + (by.loose || 0) + (by.confirmed || 0);
+  const note = 'The last 7 days of Bryan\'s own trades (buys and sells; automatic loop, ladder and agent trades not included): ' + all + '.\n' +
+    '- Matched to a call you logged with log_intention: ' + counted + ' counted as followed (' + (by.strong || 0) + ' strong, ' + (by.loose || 0) + ' loose, ' + (by.confirmed || 0) + ' confirmed by Bryan), ' + (by.denied || 0) + ' he said were not your call.\n' +
+    '- With NO call logged beforehand: ' + (by.none || 0) + '. Each of these is a trade nothing can score you on.\n' +
+    '- Calls you logged that expired with no trade: ' + Number(x[0].n) + ' (not followed). Still open: ' + Number(o[0].n) + '.\n' +
+    'Log a call with log_intention BEFORE Bryan trades, with amount (USD) when you know the size - a size makes the match strong.';
+  return teamWrite({ as: 'system', to: 'claude_pm', title: 'Your week in calls: ' + counted + ' followed, ' + (by.none || 0) + ' trades with no call logged', note });
+}
 async function findMatchingIntention(symbol, action) {
   try {
     // Strict action mapping — never cross-match sell↔buy or transfer↔buy
@@ -15303,13 +15358,14 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
     if (matchedIntention) {
       // Auto-log with stored reasoning — no questions needed
       await db.execute(
-        'UPDATE trading_journal SET reasoning = ?, emotion = ? WHERE id = ?',
-        [matchedIntention.reasoning, matchedIntention.emotion, journalId]
+        'UPDATE trading_journal SET reasoning = ? WHERE id = ?',   // #559 the intention's reasoning only - an emotion is Bryan's to give (552), never copied from a logged call
+        [matchedIntention.reasoning, journalId]
       );
       await db.execute(
         'UPDATE trade_intentions SET matched_journal_id = ?, matched_at = NOW() WHERE id = ?',
         [journalId, matchedIntention.id]
       );
+      await pmFollowMark(journalId, matchedIntention, { coin: coinBase, side: action, usd: valueUsd });   // #559
 
       await sendTelegram(`${action === 'sell' ? '✅' : '🟢'} ${action.toUpperCase()} ${formatTradeQty(absQty)} ${coinBase} @ ${formatPrice(price)} = $${valueUsd.toFixed(2)} 🎯`);
       await updateLearningModel().catch(() => {});
@@ -21525,6 +21581,7 @@ cron.schedule('45 18 * * 0', () => { agentToolsmith('weekly').catch(e => { conso
 setInterval(() => { agentAlertTick().catch(() => {}); }, 2 * 60 * 1000);   // #A2e the agent's alert watcher (no AI; cached tickers)
 setTimeout(() => { agentBootCleanup().catch(e => console.error('[agent] boot cleanup failed:', e.message)); }, 40 * 1000);
 setTimeout(() => { agentClockStart().catch(e => console.error('[agent] #549 clock start failed:', e.message)); }, 45 * 1000);
+cron.schedule('10 18 * * 0', () => { pmFollowWeekly().catch(e => console.error('[pm-follow] #559 weekly note failed:', e.message)); }, { timezone: 'Europe/London' });   // #559 Sunday 18:10
 setTimeout(() => { cardSpendWatchTick().catch(() => {}); setInterval(() => { cardSpendWatchTick().catch(() => {}); }, CARD_WATCH.every_ms); }, 90 * 1000);   // #486 coin card spends at the hold
 cron.schedule('15 9 * * *', async () => {   // #416 daily brief (Bryan 24 Sep): snapshot + Gemini news; replaces the 'open Claude PM' reminder (now the brief's last line)
   try { await sendMorningBriefing(); }
@@ -24714,7 +24771,7 @@ let rows;
       expires_hours:          z.coerce.number().optional().describe('Hours until intention expires, default 24'),
       key:                    z.string().optional().describe('Preference key for save_preference'),
       value:                  z.string().optional().describe('Preference value for save_preference'),
-      amount:                 z.coerce.number().optional().describe('Amount in USD for update_capital or set_away_buy (fallback)'),
+      amount:                 z.coerce.number().optional().describe('Amount in USD for update_capital or set_away_buy (fallback). #559 log_intention: the planned trade size in USD - a size within 10% makes the match with Bryan\'s trade strong'),
       away_buy_usd:           z.coerce.number().optional().describe('#145 configure_away_mode set_away_buy: dedicated USD amount to auto-buy per down-target trigger'),
       away_sell_pct:          z.coerce.number().optional().describe('#145 configure_away_mode set_away_sell: per-coin sell %% override for Away Mode up-targets; 100=full exit'),
       capital_type:           z.enum(['deposit', 'withdrawal', 'set']).optional().describe('Capital update type'),
@@ -24879,8 +24936,8 @@ let rows;
         const sym         = symbol?.includes('-USD') ? symbol.toUpperCase() : `${symbol?.toUpperCase()}-USD`;
         const expiresHours = expires_hours || 168; // hash41: 7d default was 24h - limit orders fill days after intention; expires_at is the sole match-validity gate
         await db.execute(
-          'INSERT INTO trade_intentions (symbol, action, reasoning, emotion, expires_at) VALUES (?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL ? HOUR))',
-          [sym, trade_action, reasoning ?? null, emotion || 'confident', expiresHours]
+          'INSERT INTO trade_intentions (symbol, action, reasoning, emotion, expires_at, source, usd) VALUES (?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL ? HOUR), \'pm\', ?)',   // #559 a PM call; amount = its planned size in USD
+          [sym, trade_action, reasoning ?? null, emotion || 'confident', expiresHours, Number(amount) > 0 ? Number(amount) : null]
         );
         await sendTelegram(
           `🎯 <b>TRADE INTENTION LOGGED — ${sym.replace('-USD', '')}</b>\n\n` +
