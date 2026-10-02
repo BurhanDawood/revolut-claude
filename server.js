@@ -17780,7 +17780,7 @@ async function autoExecuteSell(symbol, maxPct, analysis, confidence, opts = {}) 
     ).catch(() => {});
 
     // #387 EDGE -> a LIMIT at the floor (can never fill below it); PASS -> market as before.
-    let aeOrder = null, aeEdge = null, aeLoopOff = false, aeLim = null;
+    let aeOrder = null, aeEdge = null, aeLoopOff = false, aeLim = null, aeRefusedChase = false;   // #558
     try { aeEdge = await edgeSellCheck(symbol, coinBase, currentPrice); }
     catch (e) {   // fail SAFE, like the floor guard: an unverifiable sale is not placed
       await sendTelegram('\ud83d\uded1 AUTO-SELL BLOCKED - ' + coinBase + ': the slippage-margin check errored (' + e.message + '), so a fill below the floor could not be ruled out. Failing safe - no sale, loop stays armed.').catch(() => {});
@@ -17841,8 +17841,31 @@ async function autoExecuteSell(symbol, maxPct, analysis, confidence, opts = {}) 
         (lim.remainder_resting ? '\n\u26a0\ufe0f The unfilled remainder could not be cancelled and may still be resting at ' + lim.limit_price + ' (at or above the floor only). Please check Revolut X. The loop is switched OFF: no buy-back is armed and the proceeds are simply cash - nothing is reserved.' : '')).catch(() => {});
     } else {
       aeOrderSent = true;   // #K1
-      aeOrder = await placeRevolutOrder(symbol, 'sell', 'market', sellQty, null, null, opts.clientOrderId || null);
-      { const sq = aeOrder ? Number(aeOrder.sent_base_size) : NaN; if (sq > 0 && sq < sellQty) { sellQty = sq; valueUSD = sellQty * currentPrice; } }   // #14 journal what was sold, not what was asked
+      try {
+        aeOrder = await placeRevolutOrder(symbol, 'sell', 'market', sellQty, null, null, opts.clientOrderId || null);
+      } catch (mkErr) {
+        // #558 (desk #33, Bryan 29 Sep 22:25 "Option 2"; Fable's carries 1-3): Revolut X CANCELLED the market sell at placement
+        // (slippage protection on a thin book: #511 venue_refused = state cancelled/rejected, zero filled). On a #93 trail sale
+        // (opts.refusedFallback) fall straight to the reviewed spike chase: limits from the BID at this moment, the bid re-read
+        // every step, never under max(cost floor, give-up line). Any other error - or the 'retry' setting - is today's path.
+        if (!(mkErr && mkErr.venue_refused) || !opts.refusedFallback || (await refusedMarketFallback()) !== 'chase') throw mkErr;
+        const wanted = sellQty, peak = Math.max(Number(opts.trail_peak) || 0, currentPrice);
+        await sendTelegram('⚠️ <b>Revolut X cancelled the market sell of ' + coinBase + '</b> (' + escTg(String(mkErr.message || 'slippage protection').slice(0, 100)) + ') - nothing sold. Chasing with limits from the bid instead (never below the cost floor or ' + ((await spikeCfg()).give_up_pct || 25) + '% under the peak).').catch(() => {});
+        const ch = await spikeChase(symbol, coinBase, sellQty, { peak, cid: 'rf-' + coinBase.toLowerCase() + '-' + Date.now().toString(36) }, { startAtBid: true });   // step 1 refused with nothing filled -> throws venue_refused -> the K1 restore, as #511
+        aeLim = ch; aeRefusedChase = true;
+        await sendTelegram(spikeChaseText(coinBase, wanted, ch)).catch(() => {});
+        if (ch.stopped === 'cancel_failed' || ch.stopped === 'error') {   // as the spike branch (A3 / S2-1): an order may be resting - loop state can no longer be trusted
+          aeLoopOff = true;
+          await db.execute('UPDATE pump_armed_rules SET loop_enabled = 0, armed = 0, sale_price = NULL, sale_proceeds_usd = NULL, retrace_gate = NULL, trough_low = NULL, trough_armed = 0 WHERE symbol = ? AND active = 1', [symbol]).catch(() => {});
+          troughTrackers.delete(symbol);
+          if (!(ch.filled_qty > 0)) return { executed: false, reason: 'chase_resting', price: currentPrice, chase: ch };
+        }
+        if (!(ch.filled_qty > 0)) return { executed: false, reason: 'chase_unfilled', floor: ch.line, price: currentPrice, chase: ch };   // the #93 caller re-anchors the trail (as a floor block)
+        const chFilled = ch.orders.filter(x => x.filled > 0);
+        aeOrder = chFilled.length === 1 ? chFilled[0].order : null;
+        sellQty = ch.filled_qty; currentPrice = ch.avg_price; valueUSD = sellQty * currentPrice;
+      }
+      if (!aeRefusedChase) { const sq = aeOrder ? Number(aeOrder.sent_base_size) : NaN; if (sq > 0 && sq < sellQty) { sellQty = sq; valueUSD = sellQty * currentPrice; } }   // #14 journal what was sold, not what was asked
     }
 
     const [aeRevIns] = await db.execute(
@@ -17852,7 +17875,7 @@ async function autoExecuteSell(symbol, maxPct, analysis, confidence, opts = {}) 
        'confident', opts.source || 'ai_auto', opts.tool_key || 'ai_auto', opts.cycle_id || await pumpCycleId(symbol), await regimeTagFor(coinBase)]
     ).catch(e => { console.error('[auto-exec] journal insert:', e.message); return [{}]; });
     if (aeRevIns && aeRevIns.insertId) await recordRealisedPnl(aeRevIns.insertId, symbol, currentPrice, sellQty).catch(() => {});
-    if (opts.chase && aeLim && aeRevIns && aeRevIns.insertId) {   // #B23 S2-3: the aggregate row names every filled order, so D1 and the detector can match the fills
+    if ((opts.chase || aeRefusedChase) && aeLim && aeRevIns && aeRevIns.insertId) {   // #B23 S2-3 / #558: the aggregate row names every filled order, so D1 and the detector can match the fills
       const chF = (aeLim.orders || []).filter(x => x.filled > 0);
       if (chF.length) await db.execute('UPDATE trading_journal SET venue_order_id = COALESCE(venue_order_id, ?), reasoning = CONCAT(COALESCE(reasoning, \'\'), ?) WHERE id = ?',
         [String(chF[0].order_id), ' | chase fills ' + JSON.stringify(chF.map(x => ({ id: x.order_id, qty: x.filled, avg: x.avg }))), aeRevIns.insertId]).catch(e => console.error('[spike] fills record:', e.message));
@@ -17908,7 +17931,7 @@ async function autoExecuteSell(symbol, maxPct, analysis, confidence, opts = {}) 
         console.log(`[auto-exec] Stage 3 single-rebuy cascade spawned for pump-armed ${coinBase} after sell`);
       }
     } catch (e) { console.error('[auto-exec] Stage 3 cascade error (non-fatal):', e.message); }
-    return { executed: true, qty: sellQty, price: currentPrice, client_order_id: aeOrder && aeOrder.client_order_id, journal_id: aeRevIns && aeRevIns.insertId, chase: opts.chase ? aeLim : undefined }; // #309 #359 #B23
+    return { executed: true, qty: sellQty, price: currentPrice, client_order_id: aeOrder && aeOrder.client_order_id, journal_id: aeRevIns && aeRevIns.insertId, chase: opts.chase || aeRefusedChase ? aeLim : undefined, refused_market_chase: aeRefusedChase || undefined }; // #309 #359 #B23 #558
   } catch (e) {
     console.error('[auto-exec] sell error:', e.message);
     if (e.venue_refused) { const lastR = _aeRefusedTold.get(coinBase) || 0; if (Date.now() - lastR > 10 * 60000) { _aeRefusedTold.set(coinBase, Date.now()); await sendTelegram('⚠️ AUTO-EXEC: ' + coinBase + ' sale not placed - ' + String(e.message || '').slice(0, 300) + ' The trailing stop is put back and it retries; nothing was sold.').catch(() => {}); } }   // #511 a venue refusal: no 'manual review', one line per coin per 10 min
@@ -17919,6 +17942,11 @@ async function autoExecuteSell(symbol, maxPct, analysis, confidence, opts = {}) 
 }
 
 const _aeRefusedTold = new Map();   // #511 coin -> last time a venue refusal was reported
+// #558 ai_auto_execute.refused_market_fallback: 'chase' (default, Bryan 29 Sep) | 'retry' (before #558: restore the trail, retry in 2 min)
+async function refusedMarketFallback() {
+  try { const [r] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'ai_auto_execute'"); const c = r.length ? JSON.parse(r[0].config_value) || {} : {}; return c.refused_market_fallback === 'retry' ? 'retry' : 'chase'; }
+  catch (e) { return 'retry'; }   // unreadable config: today's behaviour
+}
 async function autoResetTrailingStop(symbol) {
   const coinBase = symbol.replace('-USD', '');
   try {
@@ -18045,7 +18073,7 @@ async function handleTrailingStopAlert(symbol, currentPrice, ts, exchange = 'rev
             ae93Result = await autoExecuteKrakenSell(symbol, ae93SellPct, ae93Analysis, 'High', { tool_key: ae93ToolKey });
           } else {
             const ae93Sx = await spikeSaleContext(symbol, ae93Saved).catch(e => { console.error('[spike] sale context:', e.message); return null; });   // #B23 S2 spike mode -> the chase
-            ae93Result = await autoExecuteSell(symbol, ae93SellPct, ae93Analysis, 'High', ae93Sx ? ae93Sx.opts(ae93ToolKey) : { tool_key: ae93ToolKey });
+            ae93Result = await autoExecuteSell(symbol, ae93SellPct, ae93Analysis, 'High', ae93Sx ? ae93Sx.opts(ae93ToolKey) : { tool_key: ae93ToolKey, refusedFallback: true, trail_peak: ae93Saved && ae93Saved.peakPrice });   // #558
             if (ae93Sx) await spikeAfterSale(symbol, ae93Sx, ae93Result).catch(e => console.error('[spike] after-sale:', e.message));
           }
         } catch (ae93Err) {
@@ -21127,7 +21155,7 @@ async function spikeChase(symbol, coin, qty, ch, o = {}) {
     if (!(bid > 0)) { out.stopped = 'no_price'; break; }
     if (out.start_bid == null) out.start_bid = bid;
     if (!(left > 0) || left * bid < 1) { out.stopped = 'done'; break; }
-    const want = bid * (1 - k * stepPct / 100), lim = Math.max(want, line);
+    const want = bid * (1 - (o.startAtBid ? k - 1 : k) * stepPct / 100), lim = Math.max(want, line);   // #558 a refused-market fallback offers at the bid first
     if (lastLim != null && want < line && lim >= lastLim - 1e-12) { out.stopped = giveUp >= floor ? 'give_up' : 'floor'; break; }   // already offered at the line
     let r;
     if (o.onSend) o.onSend();   // #K1: from the first venue call on, an order may have been sent
