@@ -27974,7 +27974,11 @@ async function agentScorecard() {
   const [daily] = await db.execute("SELECT DATE_FORMAT(d, '%Y-%m-%d') AS d, equity_usd, bench_btc_usd, model_cost_usd FROM agent_equity_daily ORDER BY d");
   const winDay = new Date(winStart).toLocaleDateString('en-CA', { timeZone: 'Europe/London' });
   let startEq = budget, startBtc = budget;
-  if (winStart > started + 86400000) {   // a window that starts after day one: the close of the day before it
+  // #554 a clock that starts mid-day measures from the first equity point at or after it (one is written a minute after boot, then
+  // hourly), not from the previous day's close - otherwise the hours before the clock count against it (live 2 Oct 16:36: -1.24% at 0 days).
+  const [p0] = clock ? await db.execute('SELECT t, equity_usd, bench_btc_usd FROM agent_equity_points WHERE t >= ? AND t <= ? ORDER BY t LIMIT 1', [Math.floor(winStart), Math.floor(winStart) + 3 * 3600000]).catch(() => [[]]) : [[]];
+  if (p0 && p0.length && Number(p0[0].equity_usd) > 0) { startEq = Number(p0[0].equity_usd); if (p0[0].bench_btc_usd != null && Number(p0[0].bench_btc_usd) > 0) startBtc = Number(p0[0].bench_btc_usd); }
+  else if (winStart > started + 86400000) {   // a window that starts after day one: the close of the day before it
     const before = daily.filter(r => r.d < winDay); const b = before[before.length - 1];
     if (b) { startEq = Number(b.equity_usd); if (b.bench_btc_usd != null) startBtc = Number(b.bench_btc_usd); }
   }
@@ -28007,7 +28011,7 @@ async function agentScorecard() {
   const vers = {}; for (const t of trades) { const k = t.exit_ver == null ? 'before 549' : String(t.exit_ver); (vers[k] = vers[k] || { settings_ver: k, trades: 0, sum: 0 }).trades++; vers[k].sum += t.return_pct || 0; }
   const routing = await agentRouteStats(winStart).catch(e => { console.error('[agent] #549 routing stats:', e.message); return null; });
   return {
-    mode: led.mode, window: { from: new Date(winStart).toISOString(), days: f1((now - winStart) / 86400000), rolling_days: AGENT_BAR.days }, days_running: f1(daysRunning),
+    mode: led.mode, window: { from: new Date(winStart).toISOString(), days: f1((now - winStart) / 86400000) }, days_running: f1(daysRunning),
     equity_start: f1(startEq), equity_now: f1(nowEq), return_pct: f1(ret), btc_return_pct: f1(btcRet), vs_btc_pts: ret != null && btcRet != null ? f1(ret - btcRet) : null,
     max_drawdown_pct: f1(dd), closed_trades: closed, model_cost_per_day_usd: costDay == null ? null : Math.round(costDay * 1000) / 1000,
     cost_on_100_pct_per_month: costDay == null ? null : f1(costDay * 30),   // the same bill on a $100 budget, as % of it per month
