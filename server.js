@@ -5927,6 +5927,23 @@ async function restoreBuyRung(row) {
   } catch (e) { console.error('[away] #413b rung restore failed (' + row.symbol + ' ' + row.target_price + '):', e.message); }
 }
 
+// #560 (PM note #33): set_target stores the unrounded anchor x (1 - pct) (0.006997980000000001) and every message shows it
+// rounded (0.006998), so the exact-equality match could never remove what the user can see. Pick the ONE stored target
+// within 0.02% of the price given (or by id); none or several = ok:false and the list, nothing removed. Never throws.
+async function pickTargetRung(symbol, price, id) {
+  let rows = [];
+  try { [rows] = await db.execute('SELECT id, target_price, direction, description FROM price_targets WHERE symbol = ? ORDER BY target_price', [symbol]); } catch (e) { rows = []; }
+  const mem = (priceTargets.get(symbol) || []).filter(t => !rows.some(r => Math.abs(Number(r.target_price) - t.targetPrice) < 1e-9));
+  const all = rows.map(r => ({ id: r.id, price: Number(r.target_price), direction: r.direction || null, note: r.description || null }))
+    .concat(mem.map(t => ({ id: t.id != null ? t.id : null, price: t.targetPrice, direction: t.direction || null, note: null })));
+  const targets = all.map(t => ({ id: t.id, target_price: t.price, shown_as: fmtPriceShort(t.price), direction: t.direction, note: t.note ? String(t.note).slice(0, 80) : null }));
+  const want = Number(price), byId = id !== undefined && id !== null;
+  const hits = byId ? all.filter(t => t.id != null && Number(t.id) === Number(id))
+                    : all.filter(t => Number.isFinite(want) && Math.abs(t.price - want) <= Math.max(1e-12, Math.abs(want) * 2e-4));
+  if (hits.length === 1) return { ok: true, price: hits[0].price, id: hits[0].id };
+  const what = byId ? 'id ' + id : String(price);
+  return { ok: false, targets, message: hits.length ? `${hits.length} ${symbol.replace('-USD', '')} targets are within 0.02% of ${what} - nothing removed; pass target_id` : `No ${symbol.replace('-USD', '')} target matches ${what} - nothing removed. ${targets.length ? 'Its targets are listed; pass target_id or the price as shown.' : 'It has no targets.'}` };
+}
 async function removeFixedTarget(symbol, targetPrice = null) {
   // #38 B3 — if targetPrice given, remove only that rung; else whole symbol
   if (targetPrice !== null && targetPrice !== undefined) {
@@ -6117,7 +6134,7 @@ async function listStandaloneTroughs() {
     out.push({ coin: String(r.symbol).replace('-USD', ''), exchange: ex, buy_usd: buy, bounce_pct: b, gate: gate, gate_reached: gate != null ? hit : null,
       low, buys_at: buyAt != null ? Number(buyAt.toPrecision(6)) : null, price: p, floor: Number(r.entry_floor) > 0 ? Number(r.entry_floor) : null,
       loaded_in_memory: !!mem, armed_at: r.created_at || null, updated_at: r.updated_at || null, state,
-      on_bounce: ex === 'kraken' ? 'alert only (Kraken)' : cash == null ? 'cash unreadable' : cash >= buy ? 'buys by itself ($' + cash.toFixed(2) + ' available)' : 'Buy now offer - $' + (buy - cash).toFixed(2) + ' short' });
+      on_bounce: !(buy > 0) ? 'alert only - never buys (#560)' : ex === 'kraken' ? 'alert only (Kraken)' : cash == null ? 'cash unreadable' : cash >= buy ? 'buys by itself ($' + cash.toFixed(2) + ' available)' : 'Buy now offer - $' + (buy - cash).toFixed(2) + ' short' });
   }
   return out;
 }
@@ -6229,10 +6246,11 @@ async function armStandaloneTrough(symbol, buyUsd, bouncePct, entryFloor, exchan
     const gateLine = gate == null ? '\nWatching for the low now'
       : (pNow != null && pNow <= gate ? '\nPrice ' + fmtPriceShort(pNow) + ' is ALREADY below the gate ' + fmtPriceShort(gate) + ' - it starts watching the low on the next check (no waiting)'
                                       : '\nDORMANT until the price falls to ' + fmtPriceShort(gate) + (pNow != null ? ' (' + ((gate / pNow - 1) * 100).toFixed(1) + '% from ' + fmtPriceShort(pNow) + ')' : '') + ' - only then does it start watching for a bounce');
-    await sendTelegram('<b>[TROUGH ARMED]</b> ' + b + gateLine +
-      '\nBuy $' + buyUsd + ' on a ' + (bouncePct||8) + '% bounce off the low' +
+    const alertOnly = !(Number(buyUsd) > 0);   // #560
+    await sendTelegram('<b>[TROUGH ARMED' + (alertOnly ? ' - ALERT ONLY' : '') + ']</b> ' + b + gateLine +
+      (alertOnly ? '\nTells you on a ' + (bouncePct||8) + '% bounce off the low - never buys' : '\nBuy $' + buyUsd + ' on a ' + (bouncePct||8) + '% bounce off the low') +
       (entryFloor ? '\nFloor: $' + entryFloor : '') +
-      await troughCashLine(exchange || 'revolut', buyUsd) +
+      (alertOnly ? '' : await troughCashLine(exchange || 'revolut', buyUsd)) +
       '\nExchange: ' + (exchange||'revolut')).catch(() => {});
   } catch (e) { console.error('[trough-st] arm error:', e.message); }
 }
@@ -11722,7 +11740,8 @@ async function runFastScan() {
             standaloneTroughTrackers.set(stSym, st);
             await db.execute('UPDATE standalone_trough_trackers SET gate_hit=1, updated_at=NOW() WHERE symbol=?', [stSym]).catch(() => {});
             await sendTelegram('<b>[TROUGH GATE REACHED] ' + stB + '</b>\nPrice ' + fmtPriceShort(stP) + ' reached the retrace gate ' + fmtPriceShort(st.armBelow) +
-              '.\nNow tracking the low; buys $' + st.buyUsd + ' on a ' + (st.bouncePct || 8) + '% bounce off it.' + await troughCashLine(stEx, st.buyUsd)).catch(() => {});   // #T1
+              (Number(st.buyUsd) > 0 ? '.\nNow tracking the low; buys $' + st.buyUsd + ' on a ' + (st.bouncePct || 8) + '% bounce off it.' + await troughCashLine(stEx, st.buyUsd)
+                                     : '.\nNow tracking the low; tells you on a ' + (st.bouncePct || 8) + '% bounce off it (alert only - never buys).')).catch(() => {});   // #T1 #560
             console.log('[trough-st] ' + stB + ' retrace gate reached at ' + fmtPriceShort(stP));
           }
           if (st.troughPrice === null || stP < st.troughPrice) {
@@ -11734,6 +11753,11 @@ async function runFastScan() {
           if (st.troughPrice !== null) {
             const stBT = st.troughPrice * (1 + (st.bouncePct || 8) / 100);
             if (stP >= stBT) {
+              if (!(Number(st.buyUsd) > 0)) {   // #560 ALERT-ONLY: decided before every buy path - no cash read, no predicate, no order
+                await sendTelegram('<b>[TROUGH BOUNCE - ALERT ONLY] ' + stB + '</b>\nLow ' + fmtPriceShort(st.troughPrice) + ', now ' + fmtPriceShort(stP) + ' (+' + ((stP / st.troughPrice - 1) * 100).toFixed(1) + '%): the ' + (st.bouncePct || 8) + '% bounce you asked to hear about.' +
+                  (st.entryFloor && st.troughPrice < st.entryFloor ? '\nThe low went under your floor ' + fmtPriceShort(st.entryFloor) + '.' : '') + '\nNothing was bought - your call. Tracker cleared.').catch(() => {});
+                await clearStandaloneTrough(stSym); continue;
+              }
               let stMasterOn = false;
               try {
                 const [stCfgR] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'ai_auto_execute'");
@@ -12520,15 +12544,17 @@ async function fetchTransactions(daysBack = 30) {
 // window, allows far more pages per window (a busy month exceeds 2,000 records), keeps each record WHOLE (so a
 // fee field, if the venue sends one, is not discarded), de-duplicates the boundary millisecond two windows share,
 // and reports any window it could not complete - a rebuild from partial history must never look complete.
-async function fetchAllTransactionsForRebuild(daysBack) {
+async function fetchAllTransactionsForRebuild(daysBack, o = {}) {
   const out = { rows: [], windows: [], incomplete: [], requests: 0, retries: 0 };
   const DAY = 86400000, WIN = 30;                       // the venue caps a transactions range at 30 days
-  const now = Date.now();
-  const total = Math.max(1, Math.min(Number(daysBack) || 370, 1100));
+  // #560 optional bounds { endMs, startMs } (the venue cost snapshot reads old and recent history apart); without them, as before
+  const now = Number(o.endMs) > 0 ? Number(o.endMs) : Date.now();
+  const total = Number(o.startMs) > 0 ? Math.max(1, Math.ceil((now - Number(o.startMs)) / DAY)) : Math.max(1, Math.min(Number(daysBack) || 370, 1100));
+  const floorMs = Number(o.startMs) > 0 ? Number(o.startMs) : now - total * DAY;
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
   for (let offset = 0; offset < total; offset += WIN) {
     const end = now - offset * DAY;
-    const start = Math.max(now - total * DAY, end - WIN * DAY);
+    const start = Math.max(floorMs, end - WIN * DAY);
     if (start >= end) break;
     let cursor = null, pages = 0, got = 0, failed = null;
     do {
@@ -13465,7 +13491,7 @@ async function buildShareWeekly() {
     const [st] = await db.execute('SELECT symbol, buy_usd, bounce_pct, arm_below, gate_hit FROM standalone_trough_trackers ORDER BY symbol');
     if (st.length) {
       L.push('\n<b>Dip buys waiting (' + st.length + '):</b>');
-      for (const r of st) L.push('• ' + escTg(String(r.symbol).replace('-USD', '')) + ': $' + Number(r.buy_usd).toFixed(0) + ' on a ' + Number(r.bounce_pct) + '% bounce' +
+      for (const r of st) L.push('• ' + escTg(String(r.symbol).replace('-USD', '')) + ': ' + (Number(r.buy_usd) > 0 ? '$' + Number(r.buy_usd).toFixed(0) : 'alert only') + ' on a ' + Number(r.bounce_pct) + '% bounce' +   // #560
         (Number(r.arm_below) > 0 && Number(r.gate_hit) !== 1 ? ' once below ' + fmtPriceShort(Number(r.arm_below)) : ' (watching the low)'));
     }
   } catch (e) { L.push('Strategies: not available (' + e.message + ')'); }
@@ -17595,11 +17621,45 @@ function stopClearanceCheck(price, armPct, trailPct, floor, slip) {
 
 // #474a (PM #411c, Fable 27 Sep) the Revolut X record, read ONCE and kept 30 min, so loop_audit can compare each loop's
 // stored cost with the cost the venue's own transactions give. Read-only. Incomplete history = no comparison, said so.
+// #560 (PM note #29, 3 Oct: set_pump_armed_rule and loop_enable "timed out after 180s" on HIGH, and the write HAD landed).
+// Cause: since #556 every GET /transactions goes through one queue, 1.5 s apart, 60 s of silence after a 429. This snapshot
+// read the WHOLE 1,100-day history - 37 thirty-day windows, so at least ~55 s on an empty queue, and far longer behind the
+// reconciler (07:07 that morning) or a 429. The caller gave up at 180 s; the server carried on and saved the rule.
+// Now: history older than 35 days (which does not change) is read once and kept 12 h, refreshed in the background every
+// 6 h; a snapshot reads only the last ~36 days (2 windows) fresh; concurrent callers share one read. Callers that answer a
+// person put a time budget on it (vcBudget) and say "not compared this time" instead of hanging.
+const VC_SPLIT_DAYS = 35, VC_OLD_MAX_AGE = 12 * 3600 * 1000;
+let _vcOld = null, _vcOldP = null, _vcP = null;
+async function venueOldHistory() {
+  if (_vcOld && Date.now() - _vcOld.at < VC_OLD_MAX_AGE) return _vcOld;
+  if (!_vcOldP) _vcOldP = (async () => {
+    const at = Date.now(), endMs = at - VC_SPLIT_DAYS * 86400000;
+    const tx = await fetchAllTransactionsForRebuild(1100, { endMs, startMs: at - 1100 * 86400000 });
+    if (tx.incomplete.length) throw new Error('the older Revolut X history came back incomplete (' + tx.incomplete.length + ' window(s))');
+    _vcOld = { at, endMs, rows: tx.rows };
+    return _vcOld;
+  })().finally(() => { _vcOldP = null; });
+  return _vcOldP;
+}
+function vcBudget(p, ms) {   // #560 a definite answer within ms: the read carries on in the background and fills the cache
+  let t;
+  return Promise.race([p, new Promise(r => { t = setTimeout(() => r({ ok: false, at: Date.now(), error: 'the Revolut X history is still loading (other reads are queued ahead of it) - cost not compared this time; it is ready within a few minutes, ask again or run loop_audit' }), ms); })])
+    .finally(() => clearTimeout(t));
+}
 async function venueCostSnapshot(maxAgeMs) {
   const c = venueCostSnapshot.cache;
   if (c && Date.now() - c.at < maxAgeMs) return c;
-  const tx = await fetchAllTransactionsForRebuild(1100);
-  if (tx.incomplete.length) return { ok: false, at: Date.now(), error: 'the Revolut X history came back incomplete (' + tx.incomplete.length + ' window(s)) - costs not compared' };
+  if (!_vcP) _vcP = venueCostBuild().finally(() => { _vcP = null; });
+  return _vcP;
+}
+async function venueCostBuild() {
+  let old;
+  try { old = await venueOldHistory(); } catch (e) { return { ok: false, at: Date.now(), error: e.message + ' - costs not compared' }; }
+  const recent = await fetchAllTransactionsForRebuild(1100, { startMs: old.endMs - 86400000 });   // a day of overlap with the old part; rows dedupe by id, the fresh copy wins
+  if (recent.incomplete.length) return { ok: false, at: Date.now(), error: 'the recent Revolut X history came back incomplete (' + recent.incomplete.length + ' window(s)) - costs not compared' };
+  const vcSeen = new Set(), vcRows = [];
+  for (const t of recent.rows.concat(old.rows)) { const k = t.id || JSON.stringify(t); if (vcSeen.has(k)) continue; vcSeen.add(k); vcRows.push(t); }
+  const tx = { rows: vcRows };
   const base = (x) => String(x || '').toUpperCase().replace('/', '-').replace(/-(USD|USDT|USDC|EUR|GBP)$/, '');
   const bal = await revolutRequest('GET', '/balances');
   const brows = Array.isArray(bal) ? bal : (bal && (bal.data || bal.balances)) || [];
@@ -17607,10 +17667,12 @@ async function venueCostSnapshot(maxAgeMs) {
   const held = {}, pendingOut = {};
   for (const b of brows) { const k = base(b.currency || b.symbol); const q = Number(b.balance != null ? b.balance : (b.available != null ? b.available : 0)); if (k) held[k] = (held[k] || 0) + q; }
   for (const t of tx.rows) if (t.status === 'pending' && t.source && t.source.currency) { const k = String(t.source.currency).toUpperCase(); pendingOut[k] = (pendingOut[k] || 0) + (parseFloat(t.source.amount) || 0); }
-  const snap = { ok: true, at: Date.now(), rows: tx.rows, held, pendingOut, records: tx.rows.length };
+  const snap = { ok: true, at: Date.now(), rows: tx.rows, held, pendingOut, records: tx.rows.length, older_history_as_of: new Date(old.at).toISOString() };
   venueCostSnapshot.cache = snap;
   return snap;
 }
+setTimeout(() => { venueOldHistory().catch(e => console.error('[venue-cost] older history:', e.message)); }, 3 * 60 * 1000);   // #560 warm after boot
+setInterval(() => { venueOldHistory().catch(e => console.error('[venue-cost] older history:', e.message)); }, 6 * 3600 * 1000);
 const r6x = (v) => v == null || !Number.isFinite(Number(v)) ? null : Number(Number(v).toPrecision(6));
 // Pure: one loop's cost line. storedCost = entry_prices; dd = derivedFloorFrom(...) for the loop.
 function loopCostCheck(snap, coin, storedCost, dd) {
@@ -24575,11 +24637,12 @@ let rows;
       anchor_price:  z.coerce.number().optional().describe('Anchor price for set_target'),
       trail_pct:     z.coerce.number().optional().describe('Trailing percentage e.g. 10 for 10%'),
       current_price: z.coerce.number().optional().describe('Manual price override for set_trailing — useful for Kraken-only coins if auto-fetch fails'),
-      target_price:  z.coerce.number().optional().describe('For remove_target — remove only the rung at this exact target price; omit to remove ALL targets for the symbol'),
+      target_price:  z.coerce.number().optional().describe('For remove_target — remove only the rung at this price (#560: matched within 0.02%, so the price as displayed works); omit both this and target_id to remove ALL targets for the symbol'),
+      target_id:     z.coerce.number().optional().describe('#560 remove_target: the target\'s id (a failed match lists them) - exact, whatever the rounding'),
       description:   z.string().optional().describe('For set_target -- human note stored on the rung, surfaced when the alert fires'),
       auto_execute:  zLoose(z.boolean()).optional().describe('#93 set_trailing: if true, on breach auto-sells sell_pct of position without Telegram approval'),
       sell_pct:      z.coerce.number().optional().describe('#93/#144 set_trailing/set_target: %% of position to sell; 100=full exit. Away Mode uses per-rung value if set, else global max_sell_pct (default 25)'),
-      buy_usd:       z.coerce.number().optional().describe('set_trough: USD to auto-buy on bounce'),
+      buy_usd:       z.coerce.number().optional().describe('set_trough: USD to auto-buy on bounce. #560 OMIT it (or 0) for an ALERT-ONLY tracker: same gate, same tracked low, and on the bounce it tells you - it never places an order'),
       bounce_pct:    z.coerce.number().optional().describe('set_trough: %% bounce off trough (default 8)'),
       arm_below_price: z.coerce.number().optional().describe('#394 set_trough: RETRACE GATE as an exact price - the tracker stays dormant until the price falls to this level, then starts hunting the bounce'),
       retrace_pct:   z.coerce.number().optional().describe('#394 set_trough: RETRACE GATE as a percentage below reference_price (e.g. 30 = dormant until 30% below it). Needs reference_price'),
@@ -24587,7 +24650,7 @@ let rows;
       entry_floor:   z.coerce.number().optional().describe('set_trough: never buy below this price'),
       resolutions:   z.preprocess(v => { if (typeof v === 'string') { try { return JSON.parse(v); } catch(e) { return v; } } return v; }, z.array(z.object({ symbol: z.string(), choice: z.coerce.number() }))).optional().describe('#148 batch_resolve: [{symbol,choice}] to resolve pending alerts from PM thread'),
     },
-    async ({ action, symbol, direction, threshold_pct, anchor_price, trail_pct, current_price, target_price, description, auto_execute, sell_pct, buy_usd, bounce_pct, entry_floor, resolutions, arm_below_price, retrace_pct, reference_price }) => {
+    async ({ action, symbol, direction, threshold_pct, anchor_price, trail_pct, current_price, target_price, target_id, description, auto_execute, sell_pct, buy_usd, bounce_pct, entry_floor, resolutions, arm_below_price, retrace_pct, reference_price }) => {
       const sym      = symbol ? (symbol.includes('-USD') ? symbol.toUpperCase() : `${symbol.toUpperCase()}-USD`) : 'UNKNOWN-USD';
       const coinBase = sym.replace('-USD', '');
       let result = {};
@@ -24660,21 +24723,28 @@ let rows;
 
       } else if (action === 'remove_target') {
         const hadTarget = priceTargets.has(sym);
-        const removedOne = await removeFixedTarget(sym, target_price);
-        let msg;
-        if (target_price !== undefined && target_price !== null) {
-          msg = removedOne ? `Removed ${coinBase} target at ${target_price}` : `No ${coinBase} target found at ${target_price} — nothing removed`;
+        const rtOne = (target_price !== undefined && target_price !== null) || (target_id !== undefined && target_id !== null);
+        const rtPick = rtOne ? await pickTargetRung(sym, target_price, target_id) : null;   // #560 (PM note #33)
+        if (rtPick && !rtPick.ok) {
+          result = { ok: false, action: 'remove_target', symbol: sym, removed: false, message: rtPick.message, targets: rtPick.targets };
         } else {
-          msg = hadTarget ? `All price targets removed for ${coinBase}` : `No active target for ${coinBase} — any DB row cleared`;
+          const removedOne = await removeFixedTarget(sym, rtPick ? rtPick.price : target_price);
+          let msg;
+          if (rtOne) {
+            msg = removedOne ? `Removed ${coinBase} target at ${fmtPriceShort(rtPick.price)} (stored ${rtPick.price}${rtPick.id != null ? ', id ' + rtPick.id : ''})` : `No ${coinBase} target found at ${rtPick.price} — nothing removed`;
+          } else {
+            msg = hadTarget ? `All price targets removed for ${coinBase}` : `No active target for ${coinBase} — any DB row cleared`;
+          }
+          result = { ok: rtOne ? !!removedOne : true, action: 'remove_target', symbol: sym, removed: rtOne ? !!removedOne : undefined, message: msg };
         }
-        result = { ok: true, action: 'remove_target', symbol: sym, message: msg };
 
       } else if (action === 'remove_threshold') {
         const hadThreshold = customThresholds[sym] !== undefined;
         await removeThreshold(sym);
         result = { ok: true, action: 'remove_threshold', symbol: sym, message: hadThreshold ? `Custom threshold removed for ${coinBase} — reverts to default` : `No custom threshold for ${coinBase} — any DB row cleared` };
       } else if (action === 'set_trough') {
-        if (!buy_usd || buy_usd <= 0) throw new Error('set_trough requires buy_usd > 0');
+        if (buy_usd != null && Number(buy_usd) < 0) throw new Error('buy_usd cannot be negative');
+        const stAlertOnly = !(Number(buy_usd) > 0);   // #560 (PM note #30, Bryan 3 Oct "Set trough detect to alert me"): no buy_usd = tell him on the bounce, never order
         const stExch = KRAKEN_MONITORED_COINS.includes(sym) ? 'kraken' : 'revolut';   // #493 the list holds 'X-USD' (was checked with the bare coin, so a Kraken coin was tagged revolut)
         // #394 retrace gate: an exact price, or retrace_pct below a reference price
         let stGate = null;
@@ -24685,14 +24755,15 @@ let rows;
           stGate = Number(reference_price) * (1 - Number(retrace_pct) / 100);
         }
         const stNow = await getCurrentPrice(sym).catch(() => null);
-        await armStandaloneTrough(sym, buy_usd, bounce_pct||8, entry_floor||null, stExch, stGate, stNow);   // #T1 price for the message
-        const tgWarn = await emitEnableWarnings(sym, { side: 'buy' }, 'set_trough');   // #H1
-        shareStrategyNote('<b>' + escTg(coinBase) + ' dip buy set</b>\n' + (stExch === 'kraken' ? 'Alerts you (Kraken - buy it yourself)' : 'Buys $' + buy_usd) + ' on a ' + (bounce_pct || 8) + '% bounce off the low' + (stGate ? ', once the price is below ' + fmtPriceShort(stGate) : ''));   // #493 (Fable c)   // #S1
-        result = { ok: true, warnings: tgWarn, action: 'set_trough', symbol: sym, buy_usd, bounce_pct: bounce_pct||8,
+        await armStandaloneTrough(sym, stAlertOnly ? 0 : buy_usd, bounce_pct||8, entry_floor||null, stExch, stGate, stNow);   // #T1 price for the message
+        const tgWarn = stAlertOnly ? [] : await emitEnableWarnings(sym, { side: 'buy' }, 'set_trough');   // #H1 (an alert-only tracker never buys)
+        shareStrategyNote('<b>' + escTg(coinBase) + (stAlertOnly ? ' bottom alert set' : ' dip buy set') + '</b>\n' + (stAlertOnly ? 'Tells you (never buys)' : stExch === 'kraken' ? 'Alerts you (Kraken - buy it yourself)' : 'Buys $' + buy_usd) + ' on a ' + (bounce_pct || 8) + '% bounce off the low' + (stGate ? ', once the price is below ' + fmtPriceShort(stGate) : ''));   // #493 (Fable c)   // #S1
+        result = { ok: true, warnings: tgWarn, action: 'set_trough', symbol: sym, alert_only: stAlertOnly, buy_usd: stAlertOnly ? 0 : buy_usd, bounce_pct: bounce_pct||8,
           entry_floor: entry_floor||null, exchange: stExch,
           retrace_gate: stGate ? { arm_below: Number(stGate.toPrecision(6)), from: retrace_pct != null ? Number(retrace_pct) + '% below ' + reference_price : 'exact price',
             price_now: stNow, distance_pct: stNow ? Number(((stGate / stNow - 1) * 100).toFixed(2)) : null, already_reached: !!(stNow && stNow <= stGate) } : null,
-          message: stGate ? ('Trough tracker DORMANT until the price falls to ' + Number(stGate.toPrecision(6)) + ', then buys $' + buy_usd + ' on a ' + (bounce_pct||8) + '% bounce off the low')
+          message: stAlertOnly ? ('ALERT-ONLY trough tracker' + (stGate ? ' DORMANT until the price falls to ' + Number(stGate.toPrecision(6)) + ', then' : ' armed -') + ' tells you on a ' + (bounce_pct||8) + '% bounce off the low. It never places an order.')
+                 : stGate ? ('Trough tracker DORMANT until the price falls to ' + Number(stGate.toPrecision(6)) + ', then buys $' + buy_usd + ' on a ' + (bounce_pct||8) + '% bounce off the low')
                           : ('Trough tracker armed -- ' + (stExch === 'kraken' ? 'alerts the bounce (Kraken: buy it yourself)' : 'buys $' + buy_usd) + ' on ' + (bounce_pct||8) + '% bounce') };   // #493 (Fable c)
       } else if (action === 'remove_trough') {
         await clearStandaloneTrough(sym);
@@ -24761,10 +24832,10 @@ let rows;
     {
       action:                 z.enum(['log_journal', 'log_intention', 'save_preference', 'update_capital', 'configure_sweep', 'configure_auto_execute', 'log_dev_issue', 'update_session_state', 'upsert_coin_strategy', 'export_dev_log', 'log_research', 'log_pm_decision', 'log_dev_decision', 'void_journal', 'configure_away_mode', 'delete_tax_lot', 'log_catalyst', 'log_thesis', 'configure_abnormal', 'configure_dnd', 'configure_thesis_nudge', 'upsert_catalogue', 'ledger_rebuild_apply', 'ledger_rebuild_undo', 'ledger_resync_now', 'reconciler_switch', 'candles_backfill']).describe('What trading action to perform'),
       symbol:                 z.string().optional().describe('Coin e.g. NEAR-USD or NEAR'),
-      trade_action:           z.enum(['buy', 'sell', 'hold', 'add', 'reduce', 'payment', 'transfer', 'pass']).optional().describe('Trade action for log_journal or log_intention — use pass to log a skipped trade for shadow grading at +7d/+30d'),
+      trade_action:           z.enum(['buy', 'sell', 'hold', 'add', 'reduce', 'payment', 'transfer', 'pass']).optional().describe('Trade action for log_journal or log_intention (REQUIRED for both; not "direction") — use pass to log a skipped trade for shadow grading at +7d/+30d'),
       price:                  z.coerce.number().optional().describe('Price for log_journal'),
       quantity:               z.coerce.number().optional().describe('Quantity for log_journal'),
-      reasoning:              z.string().optional().describe('Why the trade was or will be made'),
+      reasoning:              z.string().optional().describe('Why the trade was or will be made (REQUIRED for log_intention)'),
       emotion:                z.enum(['confident', 'uncertain', 'fomo', 'fearful', 'neutral']).optional().describe('Emotional state'),
       followed_recommendation: zLoose(z.boolean()).optional().describe('Whether Claude recommendation was followed'),
       reason_tag:             z.string().optional().describe('#L0 log_journal: structured why - took_profit | cut_loss | dip_buy | rebalance_in | rebalance_out | rotation_in | rotation_out | topup | payment | thesis_change | funding | other. Anything else is stored as NULL (never coerced).'),
@@ -24932,7 +25003,8 @@ let rows;
         // #228: mirror log_journal #115 guard + #213 null-coalesce. trade_action was bound raw, so an
         // omitted action (e.g. caller passed direction= instead of trade_action=) threw
         // "Bind parameters must not contain undefined". Guard it, and coalesce reasoning to null.
-        if (!trade_action) return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'trade_action is required for log_intention (e.g. buy, sell, hold, add, reduce, pass). Use trade_action, not direction.' }) }] };
+        if (!trade_action) return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'trade_action is required for log_intention (e.g. buy, sell, hold, add, reduce, pass). Use trade_action, not direction.' + (!reasoning ? ' reasoning (why) is required too.' : '') }) }] };
+        if (!reasoning || !String(reasoning).trim()) return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'reasoning is required for log_intention - one line on why (it is what the PM-follow match shows Bryan). Nothing was written.' }) }] };   // #560 (PM note #36: it failed as "Column reasoning cannot be null", one error at a time)
         const sym         = symbol?.includes('-USD') ? symbol.toUpperCase() : `${symbol?.toUpperCase()}-USD`;
         const expiresHours = expires_hours || 168; // hash41: 7d default was 24h - limit orders fill days after intention; expires_at is the sole match-validity gate
         await db.execute(
@@ -26219,7 +26291,7 @@ let rows;
           const slipMap = {};   // #384 each loop's p90 sell slippage, for the stop-clearance column
           for (const r of rules) { const cc = r.symbol.replace('-USD', ''); slipMap[cc] = await coinSellSlipP90(cc).catch(() => ({ p90: BOOK_SELL_SLIP_P90, source: 'fallback' })); }
           let vcSnap = null;   // #474a
-          if (venue_cost !== false) vcSnap = await venueCostSnapshot(30 * 60 * 1000).catch(e => ({ ok: false, at: Date.now(), error: 'venue read failed: ' + e.message }));
+          if (venue_cost !== false) vcSnap = await vcBudget(venueCostSnapshot(30 * 60 * 1000), 20000).catch(e => ({ ok: false, at: Date.now(), error: 'venue read failed: ' + e.message }));   // #560 budget
           const loops = coins.map(c => {
             const rule = rules.find(r => r.symbol === c + '-USD') || null;
             const cost = entryPrices.has(c + '-USD') ? Number(entryPrices.get(c + '-USD')) : null;
@@ -26277,8 +26349,8 @@ let rows;
             triggers: (ae.allowed_triggers || []).join(', ') || 'none',   // #H1 the live policy, where the loops are
             note: '/pause (ai_auto_execute.enabled=false) HOLDS every loop sell and buy-back since #F1; loop_disable stops a single loop. Floor (#377): the HIGHEST of real cost + 0.5% and any stored override - an override can raise it, never lower it; no cost and no override = sale blocked.',
             dnd_coins: dndCoins, loops,
-            cost_check_summary: !vcSnap ? 'not requested' : !vcSnap.ok ? vcSnap.error : {   // #474a
-              read_at: new Date(vcSnap.at).toISOString(), records: vcSnap.records,
+            cost_check_summary: !vcSnap ? 'not requested' : !vcSnap.ok ? { not_compared: vcSnap.error, older_history_as_of: _vcOld ? new Date(_vcOld.at).toISOString() : 'not loaded yet' } : {   // #474a #560 (Fable: show how old the cached part is)
+              read_at: new Date(vcSnap.at).toISOString(), records: vcSnap.records, older_history_as_of: vcSnap.older_history_as_of || null,
               stored_cost_off_by_more_than_1pct: loops.filter(l => l.cost_check && l.cost_check.checked && l.cost_check.gap_pct != null && Math.abs(l.cost_check.gap_pct) > 1).map(l => l.coin + ' ' + l.cost_check.gap_pct + '%'),
               floor_under_true_cost: loops.filter(l => l.cost_check && l.cost_check.checked && l.cost_check.floor_vs_venue_cost_pct != null && l.cost_check.floor_vs_venue_cost_pct < 0).map(l => l.coin),
               not_checked: loops.filter(l => l.cost_check && !l.cost_check.checked).map(l => l.coin + ': ' + l.cost_check.reason) },
@@ -26309,7 +26381,7 @@ let rows;
           if (!(Number(lePx) > 0)) return { content: [{ type: 'text', text: JSON.stringify({ ok: false, refused: true, reason: 'loop NOT enabled: could not read the ' + leCoin + ' price, so the stop-to-floor clearance cannot be checked. Try again in a minute. Nothing was written.', floor: leFloor }) }] };   // #480 (Fable on 474)
           // #480 (PM #411 ask e) the floor is only as good as the stored cost under it: compare it with the Revolut X record, read fresh.
           let leCost = null;
-          try { leCost = loopCostCheck(await venueCostSnapshot(60 * 1000), leCoin, leFloor.cost, leFloor); } catch (e) { leCost = { checked: false, reason: 'venue read failed: ' + e.message }; }
+          try { leCost = loopCostCheck(await vcBudget(venueCostSnapshot(60 * 1000), 15000), leCoin, leFloor.cost, leFloor); } catch (e) { leCost = { checked: false, reason: 'venue read failed: ' + e.message }; }   // #560 budget: not compared = as a failed read before
           if (leCost && leCost.checked && leCost.gap_pct != null && leCost.gap_pct < -1)
             return { content: [{ type: 'text', text: JSON.stringify({ ok: false, refused: true, reason: 'loop NOT enabled: the stored cost ' + leCost.stored_cost + ' is ' + (-leCost.gap_pct) + '% BELOW the Revolut X cost ' + leCost.venue_cost + ', so the floor would sit under the true cost and a sale could lose money. Run ledger_resync_now (manage_trading), then enable again. Nothing was written.', cost_check: leCost, floor: leFloor }) }] };
           const leCostWarn = leCost && leCost.checked && leCost.gap_pct != null && leCost.gap_pct > 1
@@ -26334,10 +26406,10 @@ let rows;
           await db.execute('UPDATE pump_armed_rules SET loop_enabled = 1 WHERE symbol = ?', [sym]);
           const [after] = await db.execute('SELECT * FROM pump_armed_rules WHERE symbol = ? LIMIT 1', [sym]);
           const leNow = await loopSellVerdict(sym);   // #555 the master switch does not govern loop sells; say what the predicate says
-          await sendTelegram('LOOP ENABLED -- '+sym+' rinse-repeat ON. Floor $'+Number(leFloor.floor).toPrecision(6)+' ('+leFloor.source+'), sell '+r.sell_pct+'%, max '+r.max_cycles+' cycles. Auto-sell: '+leNow.text+'.'+(leStop.checked ? '' : ' Stop clearance not checked ('+leStop.reason+').')+conflictWarning+leCostWarn+(leCost && !leCost.checked ? ' Cost not compared with Revolut X ('+leCost.reason+').' : '')).catch(()=>{});
+          await sendTelegram('LOOP ENABLED -- '+sym+' rinse-repeat ON. Floor $'+Number(leFloor.floor).toPrecision(6)+' ('+leFloor.source+'), sell '+r.sell_pct+'%, max '+r.max_cycles+' cycles. Auto-sell: '+leNow.text+'.'+(leStop.checked ? '' : ' Stop clearance not checked ('+leStop.reason+').')+conflictWarning+leCostWarn+(leCost && !leCost.checked ? ' Cost not compared with Revolut X this time ('+leCost.reason+') - floor from the stored cost; loop_audit in a minute will show the gap.' : '')).catch(()=>{});   // #560 Fable wording
           const leWarn = await emitEnableWarnings(sym, { side: 'both', trigger: 'trailing_stop' }, 'loop_enable');   // #H1
           shareStrategyNote('<b>' + escTg(sym.replace('-USD', '')) + ' pump loop switched ON</b>\nSells ' + r.sell_pct + '% when up ' + Number(r.arm_pump_pct) + '% then down ' + Number(r.trail_pct) + '% from the peak; buys back on the dip');   // #S1
-          return { content: [{ type: 'text', text: JSON.stringify({ ok: true, loop_enabled: 1, auto_sell_now: leNow, floor: leFloor, stop_check: leStop, cost_check: leCost, cost_warning: leCostWarn || null, row: after[0], conflict_warning: conflictWarning || null, warnings: leWarn }, null, 2) }] };
+          return { content: [{ type: 'text', text: JSON.stringify({ ok: true, written: true, saved_at: (after[0] && after[0].updated_at) || null, loop_enabled: 1, auto_sell_now: leNow, /* #560 PM note #36 */ floor: leFloor, stop_check: leStop, cost_check: leCost, cost_warning: leCostWarn || null, row: after[0], conflict_warning: conflictWarning || null, warnings: leWarn }, null, 2) }] };
         }
         if (action === 'reset_cycle') {
           // #278 — clear stale pump-loop RUNTIME state while preserving all config.
@@ -26821,7 +26893,7 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
         let _costCheck = null;   // #480 (PM #411) informational: the stored cost under the floor against the Revolut X record (never refuses here)
         try {
           const coinC = sym.replace('-USD', ''), dC = await computeDerivedFloor(sym, coinC);
-          _costCheck = loopCostCheck(await venueCostSnapshot(60 * 1000), coinC, dC.cost, dC);
+          _costCheck = loopCostCheck(await vcBudget(venueCostSnapshot(60 * 1000), 15000), coinC, dC.cost, dC);   // #560 budget
           if (_costCheck.checked && _costCheck.gap_pct != null && Math.abs(_costCheck.gap_pct) > 1) _costCheck.warning = _costCheck.flag + ' - the floor and the clearance above are computed on the stored cost. Run ledger_resync_now (manage_trading) to correct it' + (_costCheck.gap_pct < 0 ? '; loop_enable refuses until then.' : '.');
         } catch (e) { _costCheck = { checked: false, reason: 'venue read failed: ' + e.message }; }
         const changed = [];
@@ -26882,7 +26954,7 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
           '\nBuys back after a ' + num(fin.retrace_pct) + '% retrace and a ' + num(fin.bounce_pct) + '% bounce' +
           '\nNever sells below cost + 0.5%' + (Number(fin.entry_floor) > 0 ? ' (floor $' + num(fin.entry_floor) + ')' : '') +
           '\nAuto-sell ' + escTg(sellNow.text));
-        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, warnings: spWarn, stop_check: _stopCheck, cost_check: _costCheck, mode: ex ? 'updated' : 'created', changed, rule: {
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, written: true, saved_at: fin.updated_at || null, warnings: spWarn, stop_check: _stopCheck, cost_check: _costCheck, mode: ex ? 'updated' : 'created', changed, rule: {   // #560 (PM note #36) the reply says the row was written, with its updated_at
           symbol: sym, arm_pump_pct: num(fin.arm_pump_pct), arm_window_min: num(fin.arm_window_min), trail_pct: num(fin.trail_pct), sell_pct: num(fin.sell_pct),
           entry_floor: num(fin.entry_floor), rebuy_pct: num(fin.rebuy_pct), retrace_pct: num(fin.retrace_pct), bounce_pct: num(fin.bounce_pct),
           buyback_floor_pct: num(fin.buyback_floor_pct), rule_mode: fin.rule_mode, tier_cooldown_min: num(fin.tier_cooldown_min), min_tier_usd: num(fin.min_tier_usd),
