@@ -1480,7 +1480,7 @@ function rxBriefRender(d) {
   var b = d && d.brief;
   if (!b) { box.innerHTML = '<span style="color:var(--text-muted);font-size:0.85rem">No brief kept yet. The next one comes at 09:15, or send /brief in Telegram.</span>'; return; }
   var when = new Date(b.ts * 1000).toLocaleString('en-GB', { timeZone: 'Europe/London', weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
-  var v = b.video, h = '<div class="bf-when">' + esc(when) + '</div>';
+  var v = b.video, h = '<div class="bf-when">' + esc(when) + '</div>' + rxBriefSince(b.since);   // #561
   if (v && /^[A-Za-z0-9_-]{6,20}$/.test(v.id || '')) {
     h += '<a class="bf-vid" href="https://www.youtube.com/watch?v=' + v.id + '" target="_blank" rel="noopener noreferrer"><div class="bf-thumb" style="background-image:url(\'https://i.ytimg.com/vi/' + v.id + '/hqdefault.jpg\')"><span class="bf-play" aria-hidden="true"></span></div>' +
       '<div class="bf-vt"><small>YouTube' + (v.channel ? ' · ' + esc(v.channel) : '') + '</small><b>' + esc(v.title || 'Video') + '</b></div></a>';
@@ -1496,6 +1496,17 @@ function rxBriefRender(d) {
     '<span class="bf-tip">or tap a line</span>';
   if (acts) h += '<div class="bf-acts">' + acts + '</div>';
   box.innerHTML = h;
+}
+function rxBriefSince(s) {   // #561 the brief is fixed when sent; this shows what has moved since, at live prices
+  if (!s) return '';
+  var box = 'margin:6px 0 8px;padding:8px 10px;border-radius:8px;background:rgba(127,127,127,.10);font-size:0.85rem;line-height:1.45';
+  if (s.error) return '<div style="' + box + '">Live prices unavailable - the figures below are from when it was written.</div>';
+  var at = new Date(s.as_of * 1000).toLocaleTimeString('en-GB', { timeZone: 'Europe/London', hour: '2-digit', minute: '2-digit' });
+  var row = function (m, tag) { var up = m.change_pct >= 0; return '<div>' + (tag ? '<b>' + tag + '</b> ' : '') + esc(m.coin) + ' ' + rxTilePx(m.then) + ' → ' + rxTilePx(m.now) +
+    ' <span style="color:var(--ct-' + (up ? 'up' : 'dn') + ');font-weight:600">' + (up ? '▲ ' : '▼ ') + Math.abs(m.change_pct).toFixed(1) + '%</span></div>'; };
+  var rows = (s.focus || []).map(function (m) { return row(m, 'Focus'); }).concat((s.moved || []).map(function (m) { return row(m); }));
+  return '<div style="' + box + '"><div style="font-weight:600">Since this was written <span style="font-weight:400;color:var(--text-muted)">· live at ' + esc(at) + '</span></div>' +
+    (rows.length ? rows.join('') : '<div style="color:var(--text-muted)">Nothing you hold has moved 3% or more since.</div>') + '</div>';
 }
 function rxBriefLoad() {
   fetch('/api/brief/latest', { cache: 'no-store' }).then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })

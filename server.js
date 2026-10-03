@@ -974,7 +974,8 @@ async function ripAlarmCheck(coin, change, price, valueUsd, nowMs = Date.now()) 
     for (const k of Object.keys(ripAlarmSent)) if (ripAlarmSent[k] !== day) delete ripAlarmSent[k];
     await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('rip_alarm_sent', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)", [JSON.stringify(ripAlarmSent)]).catch(() => {});
     const pct = (change * 100).toFixed(1);
-    await sendTelegram('🚨 <b>RIP ALARM - ' + c + ' +' + pct + '% in 24 h</b>\nNow ' + formatPrice(price) + ' - you hold $' + valueUsd.toFixed(2) + ' of ' + c + '.\nTap to open ' + c + "'s page. Your loop, trail and targets carry on as set; nothing trades from this alarm.");
+    const raLoop = await loopArmFacts(c + '-USD', price).catch(() => null);   // #561 the 24 h figure and the loop's own arm are different anchors
+    await sendTelegram('🚨 <b>RIP ALARM - ' + c + ' +' + pct + '% in 24 h</b>\nNow ' + formatPrice(price) + ' - you hold $' + valueUsd.toFixed(2) + ' of ' + c + '.' + (raLoop ? '\nIts loop: ' + escTg(raLoop.text.replace(/^its loop /, '')) + '.' : '') + '\nTap to open ' + c + "'s page. Your loop, trail and targets carry on as set; nothing trades from this alarm.");
     ripAlarmBusy.delete(c);
     return true;
   } catch (e) { ripAlarmBusy.delete(String(coin || '').toUpperCase()); console.warn('[rip-alarm] ' + e.message); return false; }
@@ -13599,9 +13600,13 @@ RULES
 
 DATA
 Portfolio (Revolut X): ${ctx.total}. Top holdings (change since midnight, P&L vs cost): ${ctx.holdings}
+Every coin Bryan holds (worth $10 or more), with its 7-day move shape, pace, lean and its OWN loop's arm distance:
+${ctx.facts || '(not available)'}
+FOCUS candidates (held AND really moving - shape not "no big move"): ${ctx.focus || 'none'}
+His book is ${ctx.altShare || 'mostly'} altcoins and stablecoins, not BTC or ETH.
 Market: ${ctx.market}
-Alerts close to firing: ${ctx.alerts}
-Abnormal moves of 3% or more in one check, last 24 h (held coins): ${ctx.moves}
+Alerts close to firing (measured against each alert's own baseline - NOT a move today): ${ctx.alerts}
+Count of 3%+ swings in one check, last 24 h (held coins; this is NOISE, not a direction - never a reason for FOCUS): ${ctx.moves}
 Analyst videos, last 24 h (channel: title - notes; [Not watched] means only the title/description was available):
 ${ctx.videos || '(none)'}
 Headlines from the last 24 h (source, age: title):
@@ -13620,13 +13625,13 @@ FORMAT (exactly this layout)
 - [third]
 
 🎥 ANALYST VIDEOS:
-- [up to three lines: which analyst said what about Bryan's coins or the market, from the video notes above, each ending with that video's tag, e.g. [v2]; when the notes give a time like [12:34] for the point you describe, put it in the tag: [v2 12:34]; write "No new analyst videos." if there are none]
+- [up to three lines: which analyst said what about Bryan's coins or the market, from the video notes above, each ending with that video's tag, e.g. [v2]; when the notes give a time like [12:34] for the point you describe, put it in the tag: [v2 12:34]; before the tag, mark each line (touches: COIN) when the claim is about one of his held coins (same project), (book-wide) when it bears on altcoins as a whole - altcoin vs BTC ratios, dominance, alt season - or (not your coins); put book-wide and touches lines first; write "No new analyst videos." if there are none]
 
 👀 WATCH TODAY:
-1. [a level, event or coin to watch, from the data above]
+1. [a level, event or coin to watch, from the data above. A coin must be one Bryan holds (listed above); if it has a loop, give the distance to its arm from the list]
 2. [another]
 
-🎯 FOCUS: [one of Bryan's holdings and why it deserves attention today - two sentences at most, from the data above]`;
+🎯 FOCUS: [ONLY a coin from FOCUS candidates, and why - two sentences at most, from the data above. If FOCUS candidates is none, write exactly: nothing in your book is making a real move today.]`;
   const body = { contents: [{ role: 'user', parts: [{ text: prompt }] }], generationConfig: { temperature: 0.4, maxOutputTokens: 8192 } };
   if (search) body.tools = [{ google_search: {} }];
   const ctl = new AbortController(); const to = setTimeout(() => ctl.abort(), 60000);
@@ -13656,6 +13661,70 @@ function formatBriefForTelegram(text) {
   return escTg(t);
 }
 const BRIEF_PM_NUDGE = '\n\n📋 For decisions, open Claude PM and say "morning brief".';
+// #561 (PM note #32 / pm #423, Bryan 3 Oct "put on the board fixes to the morning brief ... to get it right"). Brief #4 made IDEX the
+// FOCUS on "a 30.1% move ... 159 abnormal swings" while its 7-day shape was NONE (+3.2% off the low, pace 0.4x) - a threshold measures
+// range and a swing count measures noise, neither is a direction - and on 1 Oct it focused on IDEX after he had sold it. Now every held
+// coin (worth $10+) goes in with its 7-day move shape, pace, lean and its OWN loop's arm distance (from the loop baseline, not the rolling
+// 24 h anchor); only a held coin whose shape is not NONE may be FOCUS, and the system checks the line after the model writes it.
+async function loopArmFacts(sym, price) {   // read-only: where a coin's own pump loop arms, measured from the loop's baseline
+  try {
+    const [r] = await db.execute('SELECT arm_pump_pct, baseline_price, armed, loop_enabled, sale_price FROM pump_armed_rules WHERE symbol = ? AND active = 1 LIMIT 1', [sym]);
+    if (!r.length) return null;
+    const x = r[0], arm = Number(x.arm_pump_pct), base = Number(x.baseline_price), p = Number(price), on = Number(x.loop_enabled) === 1;
+    if (Number(x.sale_price) > 0) return { on, state: 'sold', text: 'its loop has sold and waits to buy back' };
+    if (Number(x.armed) === 1) return { on, state: 'armed', text: 'its loop is ARMED (trailing the peak)' };
+    if (!(base > 0) || !(arm > 0)) return { on, state: 'unanchored', text: 'its loop (arm +' + arm + '%) has no baseline yet' };
+    const armPx = base * (1 + arm / 100), dist = p > 0 ? (armPx / p - 1) * 100 : null;
+    return { on, state: 'waiting', arm_pct: arm, baseline: base, arm_price: armPx, dist_pct: dist == null ? null : Number(dist.toFixed(1)),
+      text: 'its loop arms at ' + fmtPriceShort(armPx) + ' (+' + arm + '% from its own baseline ' + fmtPriceShort(base) + ')' +
+        (dist != null ? (dist > 0 ? ', ' + dist.toFixed(1) + '% above now' : ', already above it') : '') + (on ? '' : ' - the loop is OFF') };
+  } catch (e) { return null; }
+}
+async function briefCoinFacts(holdings) {
+  const out = [];
+  for (const h of holdings) {
+    if (!(h.valueUSD >= 10)) continue;
+    let ms = null; try { ms = await moveShape(h.symbol); } catch (e) { ms = null; }
+    const ok = !!(ms && ms.ok);
+    out.push({ coin: h.coin, symbol: h.symbol, price: h.price, value: h.valueUSD, overnight: h.overnightChange, pl: h.plPct,
+      shape: ok ? ms.shape : null, gain: ok ? ms.move.gain_pct : null, pace: ok ? ms.move.pace_vs_normal_x : null, lean: ok ? ms.lean : null,
+      loop: await loopArmFacts(h.symbol, h.price) });
+  }
+  return out;
+}
+function briefFactLine(f) {
+  const n1 = (v) => (v >= 0 ? '+' : '') + Number(v).toFixed(1) + '%';
+  return f.coin + ' $' + Number(f.value).toFixed(0) + ' held: ' + (f.shape ? 'shape ' + (MOVE_SHAPE_WORD[f.shape] || f.shape) + (f.gain != null ? ' (' + n1(f.gain) + ' from its 7-day low' + (f.pace != null ? ', pace ' + f.pace + 'x normal' : '') + ')' : '') + (MOVE_SHAPE_LEAN_WORD[f.lean] ? ', lean ' + MOVE_SHAPE_LEAN_WORD[f.lean] : '') : 'shape unknown (too little history)') +
+    (f.overnight != null ? '; since midnight ' + n1(f.overnight) : '') + (f.pl != null ? '; P&L vs cost ' + n1(f.pl) : '') + (f.loop ? '; ' + f.loop.text : '; no loop');
+}
+function briefFocusSuffix(f) {
+  return ' [' + (MOVE_SHAPE_WORD[f.shape] || 'no read') + (f.gain != null ? ', ' + (f.gain >= 0 ? '+' : '') + f.gain + '% off the 7-day low' : '') + (f.pace != null ? ', pace ' + f.pace + 'x normal' : '') +
+    (MOVE_SHAPE_LEAN_WORD[f.lean] ? ', lean ' + MOVE_SHAPE_LEAN_WORD[f.lean] : '') +
+    (f.loop ? (f.loop.state === 'waiting' && f.loop.dist_pct != null ? '; loop arm ' + (f.loop.dist_pct > 0 ? f.loop.dist_pct + '% away' : 'price reached') : '; loop ' + f.loop.state) : '') + ']';
+}
+const BRIEF_FOCUS_NONE = '🎯 FOCUS: nothing in your book is making a real move today (every coin you hold reads "no big move" on its 7-day shape).';
+function briefFocusCandidates(facts) { return (facts || []).filter(f => f.shape && f.shape !== 'NONE').sort((a, b) => (b.gain || 0) - (a.gain || 0)); }
+function briefFocusFix(text, facts) {   // the FOCUS line must name a candidate; otherwise the system writes it. Returns { text, fixed }
+  const cands = briefFocusCandidates(facts), lines = String(text || '').split('\n');
+  const i = lines.findIndex(l => /^\s*🎯\s*FOCUS/i.test(l));
+  const mine = (f) => '🎯 FOCUS: ' + f.coin + ' is the biggest real move in your book' + briefFocusSuffix(f) + '.';
+  if (i < 0) { lines.push('', cands.length ? mine(cands[0]) : BRIEF_FOCUS_NONE); return { text: lines.join('\n'), fixed: 'added' }; }
+  if (!cands.length) { const said = /nothing in your book/i.test(lines[i]); lines[i] = BRIEF_FOCUS_NONE; return { text: lines.join('\n'), fixed: said ? 'none' : 'replaced' }; }
+  const named = cands.find(f => new RegExp('(^|[^A-Z0-9])' + f.coin + '([^A-Z0-9]|$)').test(lines[i]));
+  if (named) { lines[i] = lines[i].replace(/\s+$/, '') + briefFocusSuffix(named); return { text: lines.join('\n'), fixed: null }; }
+  lines[i] = mine(cands[0]) + ' (The system replaced a FOCUS on a coin that is not moving or not held.)';
+  return { text: lines.join('\n'), fixed: 'replaced' };
+}
+function briefFlagUnheld(text, held, known) {   // a WATCH line naming a coin he does not hold says so (BTC/ETH are the market, not a holding)
+  let inWatch = false;
+  return String(text || '').split('\n').map(l => {
+    if (/^\s*👀/.test(l)) { inWatch = true; return l; }
+    if (/^\s*🎯/.test(l)) inWatch = false;
+    if (!inWatch || /not held/i.test(l)) return l;
+    const un = [...new Set((l.match(/\b[A-Z][A-Z0-9]{1,9}\b/g) || []).filter(t => known.has(t) && !held.has(t) && !['BTC', 'ETH', 'USD', 'USDT', 'USDC'].includes(t)))];
+    return un.length ? l.replace(/\s+$/, '') + ' (not held: ' + un.join(', ') + ')' : l;
+  }).join('\n');
+}
 
 async function sendMorningBriefing() {
   if (briefingInProgress) {
@@ -13893,7 +13962,7 @@ async function sendMorningBriefing() {
       }
       let movesTxt = 'none';
       try {
-        const held = holdings.map(h => h.symbol);
+        const held = holdings.filter(h => h.valueUSD >= 10).map(h => h.symbol);   // #561 dust is not a holding (the 1 Oct IDEX focus came after the sale)
         if (held.length) {
           const [mv] = await db.execute('SELECT symbol, SUM(move_pct > 0) AS ups, SUM(move_pct < 0) AS downs, MAX(abs_move_pct) AS mx FROM abnormal_events WHERE event_at > DATE_SUB(NOW(), INTERVAL 24 HOUR) AND abs_move_pct >= 3 AND symbol IN (' + held.map(() => '?').join(',') + ') GROUP BY symbol ORDER BY mx DESC LIMIT 6', held);
           if (mv.length) movesTxt = mv.map(m => String(m.symbol).replace('-USD', '') + ' ' + Number(m.ups) + ' up / ' + Number(m.downs) + ' down, largest ' + Number(m.mx).toFixed(1) + '%').join('; ');
@@ -13912,13 +13981,24 @@ async function sendMorningBriefing() {
       } catch (e) { videoStatus = '\n\n\ud83c\udfa5 Videos: could not be read - ' + escTg(e.message); }
       if (lastVideoScan && Date.now() - lastVideoScan.at < 26 * 3600000 && lastVideoScan.errors.length) videoStatus += '\n\u26a0\ufe0f Video scan errors: ' + escTg(lastVideoScan.errors.join(' | ').slice(0, 400));
       else if (!lastVideoScan) videoStatus += ' - no video scan since the last restart';
+      const briefFacts = await briefCoinFacts(holdings).catch(e => { console.warn('[brief] #561 facts:', e.message); return []; });
+      const bfCands = briefFocusCandidates(briefFacts), bfVal = holdings.reduce((a, h) => a + h.valueUSD, 0);
+      const bfAlt = bfVal > 0 ? holdings.filter(h => !['BTC', 'ETH'].includes(h.coin)).reduce((a, h) => a + h.valueUSD, 0) / bfVal * 100 : null;
       const gb = await geminiMarketBrief({
+        facts: briefFacts.map(briefFactLine).join('\n'), focus: bfCands.length ? bfCands.map(f => f.coin + ' (' + (MOVE_SHAPE_WORD[f.shape] || f.shape) + ')').join(', ') : 'none',
+        altShare: bfAlt == null ? null : 'about ' + Math.round(bfAlt) + '%',
         dateStr, total: fmtAmt(totalUSD), holdings: portfolioContext || 'none', videos: videosTxt,
         market: marketTxt.join(', ') || 'no BTC/ETH price available',
         alerts: alertsToWatch.length ? alertsToWatch.join('; ') : 'none', moves: movesTxt
       });
       console.log('[brief] #416 Gemini ok: model ' + gb.model + ', ' + gb.headlines + ' headlines, search ' + (gb.search ? 'on' : 'off') + (gb.feedsFailed.length ? ', feeds down: ' + gb.feedsFailed.join(', ') : ''));
       // #430 [v2 12:34] -> a link that starts at that point; the time is used only if that video's notes contain it (never an invented time)
+      {   // #561 the system checks the model: FOCUS only on a held coin that is really moving (with its shape and arm distance); WATCH flags coins not held
+        const known = new Set(Object.keys(priceMap).filter(k => /-USD$/.test(k)).map(k => k.replace('-USD', '')));
+        const fx = briefFocusFix(briefFlagUnheld(gb.text, new Set(briefFacts.map(f => f.coin)), known), briefFacts);
+        if (fx.fixed) console.log('[brief] #561 FOCUS ' + fx.fixed + ' by the system');
+        gb.text = fx.text;
+      }
       msg2 = formatBriefForTelegram(gb.text).replace(/ ?\[v(\d{1,2})(?:[ @,]+(\d{1,2}:\d{2}(?::\d{2})?))?\]/g, (m, n, ts) => {
         const v = briefVideos[Number(n) - 1]; if (!v || !v.url) return '';
         const secs = ts && String(v.transcript || '').includes('[' + ts + ']') ? tsToSecs(ts) : null;
@@ -20362,7 +20442,7 @@ async function analyseSourceFeedItem(item, source) {
     const [[row]] = await db.execute('SELECT strategy_md FROM coin_strategy WHERE symbol=? AND (status IS NULL OR status <> \'draft\')',[coin]).catch(()=>[[]]);   // #525 C1: a PM draft is not a plan
     if (row?.strategy_md) plans.push('=== '+coin+' PLAN ===\n'+row.strategy_md);
   }
-  const prompt = `Analyse this content from "${source.name}" against the trader's saved coin plans.\n\nCOIN PLANS:\n${plans.join('\n\n')||'No saved plans.'}\n\nCONTENT:\nTitle: ${item.title}\n\n${item.transcript.slice(0,9000)}\n\nRespond JSON only (no markdown): {"thesis_status":"intact|drifting|broken|neutral","takeaways":["bullet1","bullet2","bullet3"],"implication":"one sentence"}`;
+  const prompt = `Analyse this content from "${source.name}" against the trader's saved coin plans.\n\nCOIN PLANS:\n${plans.join('\n\n')||'No saved plans.'}\n\nCONTENT:\nTitle: ${item.title}\n\n${item.transcript.slice(0,9000)}\n\nRULES (#561): "takeaways" are ONLY what the CONTENT says - never a price level, zone or target taken from the COIN PLANS; a level appears in a takeaway only if the speaker said it. Plan levels belong in "implication", always called "your plan's ...".\n\nRespond JSON only (no markdown): {"thesis_status":"intact|drifting|broken|neutral","takeaways":["what the content says 1","2","3"],"implication":"one sentence: how it bears on the plans"}`;
   try {   // #417 Gemini, not Claude Haiku (Bryan chose B, 24 Sep: free). thesis_status is checked - the column is an ENUM.
     const text = await geminiGenerateText(prompt, { json: true, maxOutputTokens: 4096, timeoutMs: 60000 });
     const a = JSON.parse(text.replace(/```json|```/g,'').trim());
@@ -29131,12 +29211,54 @@ async function briefStore(snapshot, market, video) {
   await db.execute('INSERT INTO morning_briefs (ts, snapshot, market, video) VALUES (?, ?, ?, ?)', [Math.floor(Date.now() / 1000), String(snapshot || '').slice(0, 60000), String(market || '').slice(0, 60000), video ? JSON.stringify(video) : null]);
   await db.execute('DELETE FROM morning_briefs WHERE ts < ?', [Math.floor(Date.now() / 1000) - 60 * 86400]).catch(() => {});
 }
+// #561 (c)+(d): written 09:15, read 12:12 - IDEX quoted at $0.0009560 / +0.6% against a live $0.000911 / -4.10%, and HIGH's +11.1% that
+// morning missing. The brief cannot change once sent, so what it says is shown beside what has happened SINCE: each held coin's price
+// at the brief's time (the 2-min captures) against now, the coins the FOCUS line names, and every holding that moved 3%+ since. Read-only.
+let _briefSinceC = { id: 0, at: 0, v: null };
+async function briefHeldNow() {
+  const bal = await revolutRequest('GET', '/balances');
+  const rows = Array.isArray(bal) ? bal : (bal && (bal.data || bal.balances)) || [], out = [];
+  const tk = await revolutRequest('GET', '/tickers').catch(() => []), px = {};   // one ticker read for every coin
+  for (const t of (Array.isArray(tk) ? tk : (tk && tk.data) || [])) { if (!t.symbol) continue; const v = parseFloat(t.last_price || t.mid || t.ask || t.bid); if (v) px[t.symbol.replace('/', '-')] = v; }
+  for (const a of rows) {
+    const c = String(a.currency || '').toUpperCase();
+    if (!c || SKIP_CURRENCIES.includes(c)) continue;
+    const q = parseFloat(a.available || 0) + parseFloat(a.reserved || 0); if (!(q > 0)) continue;
+    const sym = c + '-USD', p = Number(px[sym]) > 0 ? Number(px[sym]) : Number(await getKrakenPriceForSymbol(sym).catch(() => null));
+    if (p > 0 && q * p >= 10) out.push({ coin: c, symbol: sym, price: p, value: q * p });
+  }
+  return out;
+}
+async function briefSince(b) {
+  if (_briefSinceC.id === Number(b.id) && Date.now() - _briefSinceC.at < 60000) return _briefSinceC.v;
+  const ts = Number(b.ts), out = { written_at: ts, as_of: Math.floor(Date.now() / 1000), moved: [], focus: [] };
+  const focusLine = briefPlain(String(b.market || '')).split('\n').find(l => /FOCUS/.test(l)) || '';
+  for (const h of await briefHeldNow()) {
+    const [r] = await db.execute('SELECT price FROM price_intraday WHERE symbol = ? AND recorded_at <= FROM_UNIXTIME(?) AND recorded_at > FROM_UNIXTIME(?) ORDER BY recorded_at DESC LIMIT 1', [h.symbol, ts, ts - 1800]);
+    const then = r.length ? Number(r[0].price) : null;
+    if (!(then > 0)) continue;
+    const row = { coin: h.coin, then, now: h.price, change_pct: Number(((h.price / then - 1) * 100).toFixed(1)), value_usd: Number(h.value.toFixed(2)) };
+    if (new RegExp('(^|[^A-Z0-9])' + h.coin + '([^A-Z0-9]|$)').test(focusLine)) out.focus.push(row);
+    else if (Math.abs(row.change_pct) >= 3) out.moved.push(row);
+  }
+  out.moved.sort((a, b2) => Math.abs(b2.change_pct) - Math.abs(a.change_pct)); out.moved = out.moved.slice(0, 8);
+  _briefSinceC = { id: Number(b.id), at: Date.now(), v: out };
+  return out;
+}
+function briefSinceText(s) {
+  if (!s) return '';
+  const at = new Date(s.as_of * 1000).toLocaleTimeString('en-GB', { timeZone: 'Europe/London', hour: '2-digit', minute: '2-digit' });
+  const row = (m) => m.coin + ' ' + fmtPriceShort(m.then) + ' -> ' + fmtPriceShort(m.now) + ' (' + (m.change_pct >= 0 ? '+' : '') + m.change_pct + '% since written)';
+  const rows = s.focus.map(m => 'FOCUS ' + row(m)).concat(s.moved.map(row));
+  return '\n\n--- Since the brief was written (live prices as of ' + at + ' London) ---\n' + (rows.length ? rows.join('\n') : 'Nothing held has moved 3% or more since it was written.');
+}
 async function briefLatest() {
   const [r] = await db.execute('SELECT id, ts, snapshot, market, video FROM morning_briefs ORDER BY id DESC LIMIT 1');
   const b = r[0];
   if (!b) return { brief: null, pm_url: briefPmUrl() };
   let video = null; try { video = b.video ? JSON.parse(b.video) : null; } catch (e) {}
-  return { brief: { id: Number(b.id), ts: Number(b.ts), snapshot_html: briefHtml(b.snapshot), market_html: briefHtml(String(b.market || '').replace(BRIEF_PM_NUDGE, '')), video }, pm_url: briefPmUrl() };
+  let since = null; try { since = await briefSince(b); } catch (e) { since = { error: 'live prices unavailable' }; }   // #561
+  return { brief: { id: Number(b.id), ts: Number(b.ts), snapshot_html: briefHtml(b.snapshot), market_html: briefHtml(String(b.market || '').replace(BRIEF_PM_NUDGE, '')), video, since }, pm_url: briefPmUrl() };
 }
 async function briefForPm() {
   const [r] = await db.execute('SELECT ts, snapshot, market, video FROM morning_briefs ORDER BY id DESC LIMIT 1');
@@ -29302,7 +29424,7 @@ async function briefHandover(body) {
   const full = briefPlain(String(br.market || '').split(BRIEF_PM_NUDGE)[0]).replace(/\n{3,}/g, '\n\n').trim();
   const note = 'WRITTEN AUTOMATICALLY when Bryan left the app\'s Morning brief for this thread' + (picked ? ' by tapping one line of it' : '') + '. It records what he was LOOKING AT, not anything he decided or asked for - ask him what he wants to do about it.\n\n' +
     'Brief #' + id + ', sent ' + when + ' (London).' + (picked ? '\nThe line he tapped: "' + picked.slice(0, 600) + '"' : '') + (v ? '\nFeatured video: ' + v.channel + ' - ' + v.title + ' ' + v.url : '') +
-    '\n\n--- The brief\'s market section ---\n' + full;
+    '\n\n--- The brief\'s market section ---\n' + full + await briefSince(br).then(briefSinceText).catch(() => '\n\n(Live re-pricing unavailable - re-price before acting.)');   // #561
   const title = (picked ? 'Brief line: ' + picked.replace(/\s+/g, ' ').slice(0, 70) : 'Opened the morning brief of ' + when) + ' [' + key + ']';
   const w = await handoverWrite({ title, note, coins, src: 'brief_tap' });
   if (!w.ok) return { status: 409, error: w.error, pm_url: briefPmUrl() };
