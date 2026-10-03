@@ -7947,7 +7947,7 @@ async function runLadderSweep(opts) {
 const BT_LADDER_ONLY = ['trail_pct', 'sell_pct', 'retrace_pct', 'bounce_pct', 'buy_pct', 'further_drop_pct', 'buyback_ceiling_pct', 'abandon_hours'];
 function btReadFirst(res, a) {
   if (!res || res.ok === false) return res;
-  const rf = { ok_to_quote: true, notes: [] };
+  const rf = { ok_to_quote: true, notes: [] };   // #562 btVsLive adds live_rule / transfers / differs_from_live
   const m = res.metrics || {}, n = Number(m.cycles_completed) || 0;
   rf.sample = n >= 5 ? n + ' completed cycles (the gate is 5)' : 'INSUFFICIENT: ' + n + ' completed cycle' + (n === 1 ? '' : 's') + ' (the gate is 5) - vs_hold and vs_half_cash below are not evidence yet';
   if (n < 5) rf.ok_to_quote = false;
@@ -7965,6 +7965,34 @@ function btReadFirst(res, a) {
   }
   if (w.bars > 0 && w.bars < 60) { rf.ok_to_quote = false; rf.notes.push('Only ' + w.bars + ' bars - too short to judge a loop.'); }
   return { read_first: rf, ...res };
+}
+// #562 (PM note #40, 3 Oct): a backtest quoted for a LIVE loop may not be simulating that loop. Every live pump loop is rule_mode
+// 'single' (pm #28: no live ladder), and the live single loop is: one sale of sell_pct on a trail_pct breach after an arm_pump_pct
+// pump, then (#130) trough-detect armed when the price gives back retrace_pct of the pump (sale minus retrace% of sale-minus-base),
+// and ONE buy-back with all the proceeds on a bounce_pct bounce off the low, refused under the #463 safety line (buyback_floor_pct).
+// The backtest has no such mode: 'ladder' adds sell legs, a 70/30 two-tier buy-back and a give-up clock; 'single'/'rearm' run
+// sell_tiers/buy_tiers, which no live loop runs. read_first now names the coin's live rule, says which parts transfer, and lists
+// every setting that differs from it. Nothing in the simulation changes. (Correction to the note: retrace_pct IS read live - by the
+// #130 trough gate; it is the backtest's single/rearm modes that ignore it.)
+async function btVsLive(rf, symbol, a) {
+  try {
+    const sym = String(symbol || '').toUpperCase().replace(/-USD$/, '') + '-USD';
+    const [r] = await db.execute('SELECT arm_pump_pct, arm_window_min, trail_pct, sell_pct, retrace_pct, bounce_pct, buyback_floor_pct, rule_mode, loop_enabled FROM pump_armed_rules WHERE symbol = ? AND active = 1 LIMIT 1', [sym]);
+    if (!r.length) { rf.live_rule = null; rf.notes.push('No live loop on ' + sym.replace('-USD', '') + ' - nothing to compare this run with.'); return rf; }
+    const L = r[0], n = (v) => v == null ? null : Number(v), mode = a.rule_mode || 'single';
+    rf.live_rule = { rule_mode: L.rule_mode || 'single', loop_enabled: Number(L.loop_enabled) === 1, arm_pump_pct: n(L.arm_pump_pct), arm_window_min: n(L.arm_window_min), trail_pct: n(L.trail_pct), sell_pct: n(L.sell_pct),
+      retrace_pct: n(L.retrace_pct), bounce_pct: n(L.bounce_pct), buyback_floor_pct: n(L.buyback_floor_pct) };
+    rf.mode_matches_live = false;   // no backtest mode is the live single loop
+    rf.transfers = mode === 'ladder'
+      ? 'arm_pump_pct, arm_window_min, trail_pct and sell_pct transfer to the live loop. The BUY-BACK does not exactly: ladder can sell more than once (max_legs), buys back 70% then the rest in two tiers, and gives up after abandon_hours; the live loop sells once and buys back once with all the proceeds on a bounce_pct bounce after a retrace_pct giveback, under the buyback_floor_pct safety line. Treat buy-back figures as an approximation.'
+      : 'Only arm_pump_pct and arm_window_min transfer: this ' + mode + ' run sells and buys on sell_tiers / buy_tiers, which NO live loop runs. Use rule_mode ladder with trail_pct / sell_pct / retrace_pct / bounce_pct for a live-like run.';
+    const want = { arm_pump_pct: a.arm_pump_pct, arm_window_min: a.arm_window_min != null ? a.arm_window_min : 1440 };
+    if (mode === 'ladder') Object.assign(want, { trail_pct: a.trail_pct != null ? a.trail_pct : 7, sell_pct: a.sell_pct != null ? a.sell_pct : 50, retrace_pct: a.retrace_pct != null ? a.retrace_pct : 50, bounce_pct: a.bounce_pct != null ? a.bounce_pct : 5 });
+    const diff = Object.keys(want).filter(k => want[k] != null && rf.live_rule[k] != null && Math.abs(Number(want[k]) - rf.live_rule[k]) > 1e-9).map(k => k + ' ' + Number(want[k]) + ' (live ' + rf.live_rule[k] + ')');
+    if (diff.length) { rf.differs_from_live = diff; rf.notes.push('This run is NOT the live ' + sym.replace('-USD', '') + ' loop\'s settings: ' + diff.join(', ') + '.'); }
+    rf.notes.push('MODE: ' + rf.transfers);
+  } catch (e) { rf.notes.push('Live rule not compared (' + e.message + ').'); }
+  return rf;
 }
 async function runLadderBacktest(opts) {
   if (opts._profile) {   // #379 profile settings (TIGHT derived for THIS coin as of the window start)
@@ -27487,6 +27515,7 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
           buyback_cap, arm_on   // #382
         });
         const res = btReadFirst(res0, { start, source, rule_mode: _prof ? 'ladder' : rule_mode, given: { trail_pct, sell_pct, retrace_pct, bounce_pct, buy_pct, further_drop_pct, buyback_ceiling_pct, abandon_hours } });   // #555
+        if (res && res.read_first && !_prof) await btVsLive(res.read_first, symbol, { rule_mode, arm_pump_pct, arm_window_min, trail_pct, sell_pct, retrace_pct, bounce_pct });   // #562 (a profile sets its own arm/trail)
         return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
       } catch (e) {
         return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: e.message }) }] };
