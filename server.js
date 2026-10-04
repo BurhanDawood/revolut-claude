@@ -1731,6 +1731,19 @@ async function sendTelegramChunked(text) {
 }
 
 const basePrices = {};
+// #566 (PM #430, Bryan 4 Oct "No alerts under $5"): position-based pump / drop / swing / rip alerts skip a holding worth less than
+// this (was $1; HONEY alerted on $1.24 left after the sale). Price targets are not position-based and fire at any size.
+const DUST_ALERT_USD = 5, _dustLogged = new Set();
+// #566 (PM #429): muting a coin hides its ALERTS, not its loop. Said every time a coin with an auto-selling path is muted.
+async function ackLoopWarning(symbol) {
+  try {
+    const ts = trailingStops.get(symbol);
+    const [r] = await db.execute('SELECT loop_enabled FROM pump_armed_rules WHERE symbol = ? AND active = 1 LIMIT 1', [symbol]);
+    const loop = r.length && Number(r[0].loop_enabled) === 1, trail = !!(ts && ts.autoExecute);
+    if (!loop && !trail) return '';
+    return '\n\u26a0\ufe0f ' + symbol.replace('-USD', '') + ' still has ' + (loop ? 'a live pump loop' : 'an auto-selling trailing stop') + ': muting hides alerts only - it can still ' + (loop ? 'arm and ' : '') + 'sell automatically.';
+  } catch (e) { return ''; }
+}
 // Single source of truth for alert state
 const alertState = {
   active: new Map(),       // symbol -> intervalId (daily pump alerts)
@@ -19024,6 +19037,18 @@ async function checkPortfolio() {
         if (r.price) baseline24hMap[r.symbol] = parseFloat(r.price);
       }
       console.log(`[baseline24h] Loaded ${Object.keys(baseline24hMap).length} 24h prices from price_history (rolling 24h)`);
+      // #566 (PM #430): a coin bought after the last midnight snapshot has no price_history row 12-36 h old, so it fell back to
+      // basePrices - possibly a previous holding's baseline (RSC read -46% for days off its last cycle's 0.1003551). Use the
+      // 2-min capture nearest 24 h ago instead (within 3 h); only if there is none does the old fallback apply.
+      for (const a of balances) {
+        const s = a && a.currency ? a.currency + '-USD' : null;
+        if (!s || baseline24hMap[s] || SKIP_CURRENCIES.includes(a.currency)) continue;
+        if (!(parseFloat(a.available || 0) + parseFloat(a.reserved || 0) > 0)) continue;
+        try {
+          const [ir] = await db.execute("SELECT price FROM price_intraday WHERE symbol = ? AND recorded_at BETWEEN DATE_SUB(NOW(), INTERVAL 27 HOUR) AND DATE_SUB(NOW(), INTERVAL 21 HOUR) ORDER BY ABS(TIMESTAMPDIFF(SECOND, recorded_at, DATE_SUB(NOW(), INTERVAL 24 HOUR))) LIMIT 1", [s]);
+          if (ir.length && Number(ir[0].price) > 0) baseline24hMap[s] = Number(ir[0].price);
+        } catch (e) { /* the old fallback applies */ }
+      }
     } catch (e) {
       console.warn('[baseline24h] Failed to load 24h prices:', e.message);
     }
@@ -19583,8 +19608,8 @@ async function checkPortfolio() {
 
       // Dust position check — suppress pump/drop alerts for positions worth less than $1
       const positionValueUsd = available * currentPrice;
-      if (positionValueUsd > 0 && positionValueUsd < 1.00) {
-        console.log(`[dust] Skipping ${symbol} — position value $${positionValueUsd.toFixed(4)} below $1 minimum`);
+      if (positionValueUsd > 0 && positionValueUsd < DUST_ALERT_USD) {   // #566 was $1
+        if (!_dustLogged.has(symbol)) { _dustLogged.add(symbol); console.log(`[dust] #566 ${symbol} — position $${positionValueUsd.toFixed(2)} under $${DUST_ALERT_USD}: no pump/drop alerts (price targets still fire)`); }
         continue;
       }
       if (baseline24hMap[symbol]) ripAlarmCheck(asset.currency, change, currentPrice, positionValueUsd).catch(() => {});   // #514 not awaited: never slows the check
@@ -20148,7 +20173,7 @@ async function checkPortfolio() {
 
         // Dust check — skip swing signals for positions < $1
         const swingPositionValue = (parseFloat(asset.available || 0) + parseFloat(asset.reserved || 0)) * currentPrice; // #71
-        if (swingPositionValue > 0 && swingPositionValue < 1.00) {
+        if (swingPositionValue > 0 && swingPositionValue < DUST_ALERT_USD) {   // #566 was $1
           console.log(`[dust] Skipping swing signal for ${symbol} — $${swingPositionValue.toFixed(4)} below $1`);
           continue;
         }
@@ -25065,7 +25090,8 @@ let rows;
 
       } else if (action === 'acknowledge') {
         await acknowledgeAlert(sym);
-        result = { ok: true, action: 'acknowledge', symbol: sym, message: `All alerts stopped for ${coinBase} this session` };
+        const ackW = await ackLoopWarning(sym);   // #566
+        result = { ok: true, action: 'acknowledge', symbol: sym, message: `All alerts stopped for ${coinBase} for 24 h` + (ackW ? ' -' + ackW.replace(/^\n\u26a0\ufe0f/, '') : ''), still_sells: !!ackW || undefined };
 
       } else if (action === 'ignore') {
         await ignoreCoin(sym);
@@ -30560,9 +30586,17 @@ async function processAlertChoice(ctx, choice, sendReply) {
     await sendReply(`🔕 ${coinBase} permanently ignored.`);
     return;
   }
+  if (action === 'acknowledge' && (alertType === 'fixed_target_up' || alertType === 'fixed_target_down')) {
+    // #566 (PM #429, Bryan 4 Oct "Just that target"): acknowledging a target alert silences THAT target, not the coin. Since #563
+    // the target is already quiet until the price crosses back 2%; this stops its reminders. Other alerts and the loop carry on.
+    if (activeFixedAlerts.has(symbol)) { clearInterval(activeFixedAlerts.get(symbol)); activeFixedAlerts.delete(symbol); }
+    targetReminderCount.delete(symbol);
+    await sendReply(`✅ ${coinBase} target alert stopped. That target stays quiet until the price crosses back 2% (or you set it again); ${coinBase}'s other alerts still work.`);
+    return;
+  }
   if (action === 'acknowledge') {
     await acknowledgeAlert(symbol);
-    await sendReply(`✅ ${coinBase} alerts stopped.`);
+    await sendReply(`✅ ${coinBase} alerts stopped for 24 h.` + await ackLoopWarning(symbol));   // #566
     return;
   }
   if (action === 'hold' && alertType === 'trailing_stop') {
