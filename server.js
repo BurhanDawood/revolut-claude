@@ -5964,6 +5964,33 @@ async function pickTargetRung(symbol, price, id) {
   const what = byId ? 'id ' + id : String(price);
   return { ok: false, targets, message: hits.length ? `${hits.length} ${symbol.replace('-USD', '')} targets are within 0.02% of ${what} - nothing removed; pass target_id` : `No ${symbol.replace('-USD', '')} target matches ${what} - nothing removed. ${targets.length ? 'Its targets are listed; pass target_id or the price as shown.' : 'It has no targets.'}` };
 }
+// #565 (PM #428, 4 Oct): remove_target with a misspelt selector ('target' instead of target_price) deleted ALL of a coin's targets
+// and said ok:true; 11 rungs went, 3 were meant, and only a dump from two minutes earlier brought them back. Every manage_alerts
+// deletion now keeps the rows it deleted (system_config 'targets_deleted', the last 30 per coin, 30 days) and restore_targets puts
+// them back exactly. Never throws: a failed snapshot only warns (the deletion itself is the caller's decision).
+async function targetsTrashPut(symbol, rows) {
+  if (!rows || !rows.length) return 0;
+  try {
+    const [r] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'targets_deleted'");
+    let all = {}; try { all = r.length ? JSON.parse(r[0].config_value || '{}') || {} : {}; } catch (e) { all = {}; }
+    const now = Date.now(), keep = 30 * 86400000;
+    const add = rows.map(x => ({ symbol, anchor_price: x.anchor_price != null ? String(x.anchor_price) : null, threshold_pct: x.threshold_pct != null ? String(x.threshold_pct) : null,
+      target_price: String(x.target_price), entry_price: x.entry_price != null ? String(x.entry_price) : null, direction: x.direction || 'up', note: x.note ?? null,
+      sell_pct: x.sell_pct != null ? String(x.sell_pct) : null, deleted_at: new Date(now).toISOString() }));
+    all[symbol] = [...(all[symbol] || []), ...add].filter(x => now - Date.parse(x.deleted_at) < keep).slice(-30);
+    await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('targets_deleted', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)", [JSON.stringify(all)]);
+    return add.length;
+  } catch (e) { console.warn('[targets] #565 deleted rows not kept:', e.message); return 0; }
+}
+async function targetsTrashTake(symbol, price) {   // returns the kept rows (all, or the one at price within 0.02%) and drops them from the trash
+  const [r] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'targets_deleted'");
+  let all = {}; try { all = r.length ? JSON.parse(r[0].config_value || '{}') || {} : {}; } catch (e) { all = {}; }
+  const list = all[symbol] || [];
+  const hit = (x) => price == null || Math.abs(Number(x.target_price) / Number(price) - 1) <= 0.0002;
+  const take = list.filter(hit), left = list.filter(x => !hit(x));
+  return { take, left, all, save: async () => { all[symbol] = left; if (!left.length) delete all[symbol];
+    await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('targets_deleted', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)", [JSON.stringify(all)]); } };
+}
 async function removeFixedTarget(symbol, targetPrice = null) {
   // #38 B3 — if targetPrice given, remove only that rung; else whole symbol
   if (targetPrice !== null && targetPrice !== undefined) {
@@ -19642,7 +19669,7 @@ async function checkPortfolio() {
       if (targetFired.has(tfK)) {
         const back = direction === 'up' ? currentPrice < target.targetPrice * 0.98 : currentPrice > target.targetPrice * 1.02;
         if (back) { targetFired.delete(tfK); targetFiredSave(); console.log('[targets] #563 ' + symbol + ' ' + direction + ' ' + target.targetPrice + ' re-armed (price crossed back)'); }
-        else tgtQuiet = !(await isAwayActionable(symbol.replace('-USD', '')).catch(() => false));
+        else tgtQuiet = !(await isAwayActionable(symbol.replace('-USD', '')).catch(() => true));   // #565 (Fable on 563): unreadable = not quiet (fail open, as before 563)
       }
 
       if (direction === 'up' && !tgtQuiet && effHigh >= target.targetPrice && !activeFixedAlerts.has(symbol) && !alertState.acknowledged.has(symbol) && !ignoredCoins.has(symbol)) {
@@ -24769,14 +24796,18 @@ let rows;
   server.tool('manage_alerts',
     'Set or manage all alert types — fixed price targets, daily thresholds, trailing stops, acknowledge, ignore or unignore coins',
     {
-      action:        z.enum(['set_target','set_threshold','set_trailing','acknowledge','ignore','unignore','remove_trailing','remove_target','remove_threshold','clear_cooldown','set_trough','remove_trough','list_pending','batch_resolve']).describe('What alert action to perform'),
+      action:        z.enum(['set_target','set_threshold','set_trailing','acknowledge','ignore','unignore','remove_trailing','remove_target','remove_threshold','clear_cooldown','set_trough','remove_trough','list_pending','batch_resolve','restore_targets']).describe('What alert action to perform. restore_targets (#565): put back targets this tool deleted (the last 30 per coin, 30 days) - all of the coin\'s, or only the one at target_price'),
       symbol:        z.string().optional().describe('Trading pair e.g. NEAR-USD or NEAR (omit for list_pending and batch_resolve)'),
       direction:     z.enum(['up', 'down']).optional().describe('Alert direction for set_target'),
       threshold_pct: z.coerce.number().optional().describe('Percentage for set_target or set_threshold'),
       anchor_price:  z.coerce.number().optional().describe('Anchor price for set_target'),
       trail_pct:     z.coerce.number().optional().describe('Trailing percentage e.g. 10 for 10%'),
       current_price: z.coerce.number().optional().describe('Manual price override for set_trailing — useful for Kraken-only coins if auto-fetch fails'),
-      target_price:  z.coerce.number().optional().describe('For remove_target — remove only the rung at this price (#560: matched within 0.02%, so the price as displayed works); omit both this and target_id to remove ALL targets for the symbol'),
+      target_price:  z.coerce.number().optional().describe('set_target (#565): the EXACT trigger price - stored as given; threshold_pct is then worked out from anchor_price (or the live price). remove_target: remove only the rung at this price (#560: matched within 0.02%, so the price as displayed works). restore_targets: restore only this one'),
+      target:        z.coerce.number().optional().describe('#565 same as target_price (an alias - a misspelt name used to be dropped silently)'),
+      anchor:        z.coerce.number().optional().describe('#565 same as anchor_price (alias)'),
+      all:           zLoose(z.boolean()).optional().describe('#565 remove_target: true to remove EVERY target of the coin. Without target_price / target_id / all:true a coin with targets is refused and its targets are listed'),
+      restore_sell:  zLoose(z.boolean()).optional().describe('#565 restore_targets: true to restore a deleted target WITH its sell_pct (an Away-Mode auto-sell trigger). Default: it comes back alert-only (sell_pct cleared)'),
       target_id:     z.coerce.number().optional().describe('#560 remove_target: the target\'s id (a failed match lists them) - exact, whatever the rounding'),
       description:   z.string().optional().describe('For set_target -- human note stored on the rung, surfaced when the alert fires'),
       auto_execute:  zLoose(z.boolean()).optional().describe('#93 set_trailing: if true, on breach auto-sells sell_pct of position without Telegram approval'),
@@ -24789,7 +24820,9 @@ let rows;
       entry_floor:   z.coerce.number().optional().describe('set_trough: never buy below this price'),
       resolutions:   z.preprocess(v => { if (typeof v === 'string') { try { return JSON.parse(v); } catch(e) { return v; } } return v; }, z.array(z.object({ symbol: z.string(), choice: z.coerce.number() }))).optional().describe('#148 batch_resolve: [{symbol,choice}] to resolve pending alerts from PM thread'),
     },
-    async ({ action, symbol, direction, threshold_pct, anchor_price, trail_pct, current_price, target_price, target_id, description, auto_execute, sell_pct, buy_usd, bounce_pct, entry_floor, resolutions, arm_below_price, retrace_pct, reference_price }) => {
+    async ({ action, symbol, direction, threshold_pct, anchor_price, trail_pct, current_price, target_price, target_id, description, auto_execute, sell_pct, buy_usd, bounce_pct, entry_floor, resolutions, arm_below_price, retrace_pct, reference_price, target, anchor, all, restore_sell }) => {
+      if ((target_price === undefined || target_price === null) && target != null) target_price = target;   // #565 aliases
+      if ((anchor_price === undefined || anchor_price === null) && anchor != null) anchor_price = anchor;
       const sym      = symbol ? (symbol.includes('-USD') ? symbol.toUpperCase() : `${symbol.toUpperCase()}-USD`) : 'UNKNOWN-USD';
       const coinBase = sym.replace('-USD', '');
       let result = {};
@@ -24798,7 +24831,26 @@ let rows;
         let dir = direction || 'up';
         let r;
         let dirCorrected = false;
-        if (anchor_price) {
+        const stAbs = Number(target_price) > 0;   // #565 an exact trigger price
+        if (!stAbs && !Number.isFinite(Number(threshold_pct))) {
+          return { content: [{ type: 'text', text: JSON.stringify({ ok: false, action: 'set_target', symbol: sym, error: 'set_target needs target_price (the exact trigger) or threshold_pct (from anchor_price, else the live price). Nothing was set.' }) }] };
+        }
+        if (stAbs) {
+          const anc = Number(anchor_price) > 0 ? Number(anchor_price) : Number(await getCurrentPrice(sym).catch(() => null));
+          if (!(anc > 0)) return { content: [{ type: 'text', text: JSON.stringify({ ok: false, action: 'set_target', symbol: sym, error: 'no anchor: pass anchor_price (no live price for ' + sym + '). Nothing was set.' }) }] };
+          const tp = Number(target_price), impl = tp >= anc ? 'up' : 'down';
+          if (direction && direction !== impl && Number(sell_pct) > 0)   // #565 C2 (Fable): never flip a sell rung's side silently
+            return { content: [{ type: 'text', text: JSON.stringify({ ok: false, action: 'set_target', symbol: sym, error: 'target ' + tp + ' is ' + (impl === 'up' ? 'above' : 'below') + ' the anchor ' + anc + ' but direction ' + direction + ' was given with sell_pct ' + sell_pct + ' - give the price you meant. Nothing was set.' }) }] };
+          if (direction && direction !== impl) dirCorrected = true;
+          dir = impl;
+          const thr = Number((Math.abs(tp / anc - 1) * 100).toFixed(4));
+          await db.execute(
+            'INSERT INTO price_targets (symbol, anchor_price, threshold_pct, target_price, direction, note, sell_pct) VALUES (?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE anchor_price=VALUES(anchor_price), threshold_pct=VALUES(threshold_pct), target_price=VALUES(target_price), direction=VALUES(direction), note=VALUES(note), sell_pct=VALUES(sell_pct), updated_at=CURRENT_TIMESTAMP',
+            [sym, anc, thr, tp, dir, description ?? null, sell_pct ?? null]);
+          upsertPriceTarget(sym, { anchorPrice: anc, thresholdPct: thr, targetPrice: tp, direction: dir, note: description ?? null, sellPct: sell_pct ?? null });
+          alertState.acknowledged.delete(sym);
+          r = { anchorPrice: anc, targetPrice: tp, direction: dir, threshold_pct: thr, anchor_from: Number(anchor_price) > 0 ? 'given' : 'live price' };
+        } else if (anchor_price) {
           const targetPrice = dir === 'down'
             ? anchor_price * (1 - threshold_pct / 100)
             : anchor_price * (1 + threshold_pct / 100);
@@ -24864,17 +24916,53 @@ let rows;
         const hadTarget = priceTargets.has(sym);
         const rtOne = (target_price !== undefined && target_price !== null) || (target_id !== undefined && target_id !== null);
         const rtPick = rtOne ? await pickTargetRung(sym, target_price, target_id) : null;   // #560 (PM note #33)
+        const [rtRows] = await db.execute('SELECT id, anchor_price, threshold_pct, target_price, entry_price, direction, note, sell_pct FROM price_targets WHERE symbol = ?', [sym]);   // #565
         if (rtPick && !rtPick.ok) {
           result = { ok: false, action: 'remove_target', symbol: sym, removed: false, message: rtPick.message, targets: rtPick.targets };
+        } else if (!rtOne && all !== true && rtRows.length) {   // #565 never delete-all by omission
+          result = { ok: false, action: 'remove_target', symbol: sym, removed: false,
+            message: coinBase + ' has ' + rtRows.length + ' target' + (rtRows.length === 1 ? '' : 's') + '. Nothing removed: pass target_price (or target_id) for one, or all: true to remove all ' + rtRows.length + '.',
+            targets: rtRows.map(x => ({ id: x.id, price: Number(x.target_price), direction: x.direction, description: x.note || null })) };
         } else {
+          const rtGone = rtOne ? rtRows.filter(x => (rtPick.id != null && x.id === rtPick.id) || (rtPick.id == null && Math.abs(Number(x.target_price) - rtPick.price) < 1e-9)) : rtRows;
+          const rtKept = await targetsTrashPut(sym, rtGone);   // #565 restore_targets can put these back
           const removedOne = await removeFixedTarget(sym, rtPick ? rtPick.price : target_price);
           let msg;
           if (rtOne) {
             msg = removedOne ? `Removed ${coinBase} target at ${fmtPriceShort(rtPick.price)} (stored ${rtPick.price}${rtPick.id != null ? ', id ' + rtPick.id : ''})` : `No ${coinBase} target found at ${rtPick.price} — nothing removed`;
           } else {
-            msg = hadTarget ? `All price targets removed for ${coinBase}` : `No active target for ${coinBase} — any DB row cleared`;
+            msg = hadTarget || rtRows.length ? `All ${rtRows.length} price target${rtRows.length === 1 ? '' : 's'} removed for ${coinBase}` : `No active target for ${coinBase} — any DB row cleared`;
           }
-          result = { ok: rtOne ? !!removedOne : true, action: 'remove_target', symbol: sym, removed: rtOne ? !!removedOne : undefined, message: msg };
+          if (rtKept) msg += ` (kept: restore_targets ${coinBase}${rtOne ? ' target_price ' + rtPick.price : ''} puts ${rtKept === 1 ? 'it' : 'them'} back)`;
+          result = { ok: rtOne ? !!removedOne : true, action: 'remove_target', symbol: sym, removed: rtOne ? !!removedOne : undefined, removed_count: rtOne ? (removedOne ? 1 : 0) : rtRows.length, kept_for_restore: rtKept, message: msg };
+        }
+
+      } else if (action === 'restore_targets') {   // #565
+        const tk = await targetsTrashTake(sym, target_price != null ? Number(target_price) : null);
+        if (!tk.take.length) {
+          result = { ok: false, action: 'restore_targets', symbol: sym, restored: 0, message: 'Nothing kept for ' + coinBase + (target_price != null ? ' at ' + target_price : '') + ' (deletions are kept 30 days, the last 30 per coin).',
+            kept: (tk.all[sym] || []).map(x => ({ price: Number(x.target_price), direction: x.direction, deleted_at: x.deleted_at })) };
+        } else {
+          const back = [];
+          for (const x0 of tk.take) {
+            const sellKept = Number(x0.sell_pct) > 0 && restore_sell === true;   // #565 C1 (Fable): a sell trigger comes back only when asked
+            const x = Object.assign({}, x0, { sell_pct: sellKept ? x0.sell_pct : null });
+            await db.execute('INSERT INTO price_targets (symbol, anchor_price, threshold_pct, target_price, entry_price, direction, note, sell_pct) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE anchor_price=VALUES(anchor_price), threshold_pct=VALUES(threshold_pct), entry_price=VALUES(entry_price), note=VALUES(note), sell_pct=VALUES(sell_pct), updated_at=CURRENT_TIMESTAMP',
+              [sym, x.anchor_price ?? x.target_price, x.threshold_pct ?? 0, x.target_price, x.entry_price ?? null, x.direction || 'up', x.note ?? null, x.sell_pct ?? null]);
+            const [idr] = await db.execute('SELECT id FROM price_targets WHERE symbol = ? AND direction = ? AND target_price = ? LIMIT 1', [sym, x.direction || 'up', x.target_price]);
+            upsertPriceTarget(sym, { id: idr.length ? idr[0].id : undefined, anchorPrice: parseFloat(x.anchor_price ?? x.target_price), thresholdPct: parseFloat(x.threshold_pct ?? 0), targetPrice: parseFloat(x.target_price),
+              entryPrice: x.entry_price != null ? parseFloat(x.entry_price) : null, direction: x.direction || 'up', note: x.note ?? null, sellPct: x.sell_pct != null ? parseFloat(x.sell_pct) : null });
+            back.push({ price: Number(x.target_price), direction: x.direction || 'up', description: x.note ?? null, sell_pct: sellKept ? Number(x0.sell_pct) : null,
+              sell_pct_dropped: Number(x0.sell_pct) > 0 && !sellKept ? Number(x0.sell_pct) : undefined });
+          }
+          await tk.save();
+          alertState.acknowledged.delete(sym);
+          const sells = back.filter(b => b.sell_pct > 0), dropped = back.filter(b => b.sell_pct_dropped > 0);
+          let rmsg = 'Restored ' + back.length + ' ' + coinBase + ' target' + (back.length === 1 ? '' : 's') + ' as deleted';
+          if (dropped.length) rmsg += '; ' + dropped.length + ' came back ALERT-ONLY (their sell_pct was ' + dropped.map(b => b.sell_pct_dropped + '% at ' + fmtPriceShort(b.price)).join(', ') + ') - pass restore_sell: true to restore the auto-sell';
+          if (sells.length) rmsg += '; ' + sells.length + ' CAN SELL in Away Mode: ' + sells.map(b => b.sell_pct + '% at ' + fmtPriceShort(b.price)).join(', ');
+          sendTelegram('\u267b\ufe0f <b>' + coinBase + ' targets restored</b> (' + back.length + ')\n' + back.map(b => (b.direction === 'down' ? '\u2193 ' : '\u2191 ') + fmtPriceShort(b.price) + (b.sell_pct > 0 ? ' - <b>CAN SELL ' + b.sell_pct + '%</b> in Away Mode' : (b.sell_pct_dropped ? ' - alert only (sell ' + b.sell_pct_dropped + '% not restored)' : '')) + (b.description ? ' - ' + String(b.description).slice(0, 60) : '')).join('\n')).catch(() => {});
+          result = { ok: true, action: 'restore_targets', symbol: sym, restored: back.length, can_sell: sells.length, alert_only_from_sell: dropped.length, targets: back, message: rmsg + '.' };
         }
 
       } else if (action === 'remove_threshold') {
