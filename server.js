@@ -7998,7 +7998,7 @@ function btReadFirst(res, a) {
   rf.sample = n >= 5 ? n + ' completed cycles (the gate is 5)' : 'INSUFFICIENT: ' + n + ' completed cycle' + (n === 1 ? '' : 's') + ' (the gate is 5) - vs_hold and vs_half_cash below are not evidence yet';
   if (n < 5) rf.ok_to_quote = false;
   if (m.vs_half_cash_pct != null) rf.honest_headline = 'vs_half_cash ' + m.vs_half_cash_pct + '% (vs_hold ' + m.vs_hold_pct + '% mostly measures the market direction)';
-  if (a.rule_mode !== 'ladder') {
+  if (a.rule_mode !== 'ladder' && a.rule_mode !== 'live') {   // #564 live reads them too
     const ign = BT_LADDER_ONLY.filter(k => a.given && a.given[k] != null);
     if (ign.length) { rf.ignored_params = ign; rf.notes.push(ign.join(', ') + ' IGNORED: they are read only in rule_mode "ladder". This ' + (a.rule_mode || 'single') + ' run sells and buys on sell_tiers / buy_tiers, so runs that differ only in these return identical results.'); }
   }
@@ -8028,7 +8028,16 @@ async function btVsLive(rf, symbol, a) {
     const L = r[0], n = (v) => v == null ? null : Number(v), mode = a.rule_mode || 'single';
     rf.live_rule = { rule_mode: L.rule_mode || 'single', loop_enabled: Number(L.loop_enabled) === 1, arm_pump_pct: n(L.arm_pump_pct), arm_window_min: n(L.arm_window_min), trail_pct: n(L.trail_pct), sell_pct: n(L.sell_pct),
       retrace_pct: n(L.retrace_pct), bounce_pct: n(L.bounce_pct), buyback_floor_pct: n(L.buyback_floor_pct) };
-    rf.mode_matches_live = false;   // no backtest mode is the live single loop
+    rf.mode_matches_live = mode === 'live';   // #564 rule_mode live replays the live single loop
+    if (mode === 'live') {
+      rf.transfers = 'LIVE LOOP REPLAY (#564): the live single loop, tick for tick - arm on the tumbling window, one sale on the trail breach (floor-blocked = re-anchor), the retrace gate, one buy-back of all the proceeds on the bounce, alert only under the safety line, the ceiling and time abandons. Settings not given came from this live rule (settings_from). Not modelled: see not_modelled.';
+      const c = a.cfg || {}, diff = ['arm_pump_pct', 'arm_window_min', 'trail_pct', 'sell_pct', 'retrace_pct', 'bounce_pct', 'buyback_floor_pct']
+        .filter(k => c[k] != null && rf.live_rule[k] != null && Math.abs(Number(c[k]) - rf.live_rule[k]) > 1e-9).map(k => k + ' ' + Number(c[k]) + ' (live ' + rf.live_rule[k] + ')');
+      if (diff.length) { rf.differs_from_live = diff; rf.notes.push('This run is NOT the live ' + sym.replace('-USD', '') + ' loop\'s settings: ' + diff.join(', ') + '.'); }
+      rf.notes.push('MODE: ' + rf.transfers);
+      rf.notes.push('BUY-BACK figures are UNVALIDATED against a live fill: no automatic loop buy-back has happened yet, so every buy-back number from this mode is a model until the first real one. Sale timing is validated (HIGH, AST, HFT, IDEX) within one 2-min capture; on fast coins the 30 s scan sees peaks the captures miss.');   // Fable 4 Oct
+      return rf;
+    }
     rf.transfers = mode === 'ladder'
       ? 'arm_pump_pct, arm_window_min, trail_pct and sell_pct transfer to the live loop. The BUY-BACK does not exactly: ladder can sell more than once (max_legs), buys back 70% then the rest in two tiers, and gives up after abandon_hours; the live loop sells once and buys back once with all the proceeds on a bounce_pct bounce after a retrace_pct giveback, under the buyback_floor_pct safety line. Treat buy-back figures as an approximation.'
       : 'Only arm_pump_pct and arm_window_min transfer: this ' + mode + ' run sells and buys on sell_tiers / buy_tiers, which NO live loop runs. Use rule_mode ladder with trail_pct / sell_pct / retrace_pct / bounce_pct for a live-like run.';
@@ -8039,6 +8048,162 @@ async function btVsLive(rf, symbol, a) {
     rf.notes.push('MODE: ' + rf.transfers);
   } catch (e) { rf.notes.push('Live rule not compared (' + e.message + ').'); }
   return rf;
+}
+// #564 (desk #45; Fable D1-D4 cleared 4 Oct) THE LIVE LOOP, REPLAYED. run_backtest rule_mode 'live'. PURE: no I/O, no DB, no orders.
+// A tick-for-tick copy of the single pump loop as production runs it, so a backtest of a live loop simulates THAT loop:
+//   arm      checkPumpArm: tumbling arm_window_min baseline (a reset tick sets the baseline and checks nothing); arm when the price
+//            is arm_pump_pct over it and $5+ is held; the trail starts at peak = the arm price (setTrailingStop).
+//   sell     updateTrailingStop + the #93 path: new high lifts the peak; price <= peak x (1 - trail_pct) = breach. autoExecuteSell's
+//            floor guard: derivedFloorFrom(cost, sell_floor, entry_floor) - none = no_floor, price <= floor = floor_blocked; either
+//            re-anchors the trail at this price (#309). Otherwise sell sell_pct of the position (one sale per cycle).
+//   tracker  armReboundTracker: base = pumpRefBase (entry_floor, else cost, else the arm baseline), FROZEN at the sale (D3), used
+//            only when 0 < base < sale (D1); gate = sale - retrace% of (sale - base), or sale x (1 - retrace%) without one;
+//            reserved = sale value - $1. updateTroughTracker: waits for the gate, tracks the low; a bounce of bounce_pct off the
+//            low buys back ALL of reserved - unless the (sticky) low is under pumpRebuyLine (D2: anchor = the valid base, else
+//            the sale; line = anchor x (1 - buyback_floor_pct%)), which is alert only and the tracker stays.
+//   rebuy    rearmPumpLoopAfterBuyback: cycle_count + 1; max_cycles pauses the loop; else the baseline clears and it re-arms.
+//            Its loop P&L adds reserved minus (price x reserved/price) = 0, so its circuit breaker can never trip; not modelled.
+//   abandon  evaluateAbandons at :12 and :42 (D4): price > sale x (1 + ceiling%) first, then abandon_hours since the sale.
+//            The ceiling is ONLY this give-up rule: the live buy-back does not call mayAutoTrade (P0, no callers).
+// NOT modelled: the cash gate (a backtest's cash always covers reserved), venue refusals / back-off, EDGE limit and spike-mode
+// chase fills (a sale fills at the tick price less slippage) and the spike-mode arm takeover, the DND arm path, the uncovered-cash
+// abandon (48 h), 30 s scans (ticks are the stored captures). Arm window default 60 min, as checkPumpArm (Fable C1).
+function liveLoopPath(b, nextT) {   // the price path inside one bar: a point, or O-L-H-C up / O-H-L-C down
+  if (!(b.h > b.l)) return [{ t: b.t, p: b.c }];
+  const span = Math.max(4, (nextT || b.t + 3600000) - b.t), o = b.o != null ? b.o : b.c, up = b.c >= o;
+  return [{ t: b.t, p: o }, { t: b.t + span / 4, p: up ? b.l : b.h }, { t: b.t + span / 2, p: up ? b.h : b.l }, { t: b.t + span * 3 / 4, p: b.c }];
+}
+function liveLoopReplay(bars, cfg) {
+  const C = Object.assign({ arm_window_min: 60, sell_pct: 50, retrace_pct: 50, bounce_pct: 8, buyback_floor_pct: 5, ceiling_pct: 50, abandon_hours: 336,
+    max_cycles: 10, fee_pct: 0.09, slippage_pct: 0, initial_usd: 0, min_held_usd: 5 }, cfg || {});
+  const pos = (x) => Number(x) > 0 ? Number(x) : null;
+  const fee = Number(C.fee_pct) / 100, slip = Number(C.slippage_pct) / 100;
+  const fp = Number.isFinite(parseFloat(C.buyback_floor_pct)) && parseFloat(C.buyback_floor_pct) >= 0 ? parseFloat(C.buyback_floor_pct) : 5;
+  const ceil = Number(C.ceiling_pct) > 0 ? Number(C.ceiling_pct) : 50;
+  const cost = pos(C.cost_price), entryFloor = pos(C.entry_floor);
+  const floor = derivedFloorFrom(cost, C.sell_floor, entryFloor);   // the live sell path's floor (#377)
+  let qty = Number(C.initial_qty) || 0, cash = Number(C.initial_usd) || 0;
+  let phase = 'watch', baseline = null, baselineAt = null, peak = null, cyc = null, cycles = 0;
+  const events = [], cyclesOut = [];
+  const iso = (t) => new Date(t).toISOString().slice(0, 16);
+  let nextCheck = null;   // evaluateAbandons: minutes 12 and 42 of every hour
+  const checkAfter = (t) => { const h = Math.floor(t / 3600000) * 3600000; for (const m of [12, 42, 72])   /* 72 = the next hour's :12 */ { const x = h + m * 60000; if (x > t) return x; } };
+  for (let i = 0; i < bars.length; i++) {
+    for (const k of liveLoopPath(bars[i], bars[i + 1] && bars[i + 1].t)) {
+      const t = k.t, p = k.p;
+      if (!(p > 0)) continue;
+      if (phase === 'sold') {   // the cron runs on its own clock; a check whose time has passed uses this tick's price
+        if (nextCheck == null) nextCheck = checkAfter(cyc.sale_t);
+        while (phase === 'sold' && t >= nextCheck) {
+          if (p > cyc.sale * (1 + ceil / 100)) { cyc.outcome = 'abandoned_ceiling'; cyc.closed = iso(t); cyc.close_price = p; }
+          else if ((t - cyc.sale_t) / 3600000 > Number(C.abandon_hours)) { cyc.outcome = 'abandoned_time'; cyc.closed = iso(t); cyc.close_price = p; }
+          if (cyc.outcome) { events.push({ t: iso(t), ev: cyc.outcome, price: p }); phase = 'watch'; baseline = null; nextCheck = null; break; }
+          nextCheck = checkAfter(nextCheck);
+        }
+        if (phase !== 'sold') continue;
+      }
+      if (phase === 'watch') {   // Part A: checkPumpArm
+        if (baseline == null || t - baselineAt > Number(C.arm_window_min) * 60000) { baseline = p; baselineAt = t; continue; }
+        if ((p - baseline) / baseline * 100 >= Number(C.arm_pump_pct)) {
+          if (qty * p < Number(C.min_held_usd)) continue;   // #11 not held: stays quiet, keeps watching
+          phase = 'armed'; peak = p;
+          cyc = { n: cyclesOut.length + 1, armed: iso(t), arm_price: p, baseline, qty_before: qty, blocks: 0, alerts: 0 };
+          cyclesOut.push(cyc); events.push({ t: iso(t), ev: 'arm', price: p, baseline });
+        }
+        continue;   // the arm tick sets the trail; the breach test starts on the next scan
+      }
+      if (phase === 'armed') {   // Part B: the trail, then the #93 sale
+        if (p > peak) peak = p;
+        if (p <= peak * (1 - Number(C.trail_pct) / 100)) {
+          const why = floor.floor == null ? 'no_floor' : (p <= floor.floor ? 'floor_blocked' : null);
+          if (why) { cyc.blocks++; if (cyc.blocks <= 5) events.push({ t: iso(t), ev: why, price: p, floor: floor.floor }); peak = p; continue; }
+          const sq = qty * Number(C.sell_pct) / 100, px = p * (1 - slip);
+          const reserved = Math.max(0, px * sq - 1);
+          qty -= sq; cash += px * sq * (1 - fee);
+          const b0 = pos(entryFloor) ?? pos(cost) ?? pos(cyc.baseline), base = b0 != null && b0 < px ? b0 : null;   // D1, D3
+          const gate = base != null ? px - (px - base) * Number(C.retrace_pct) / 100 : px * (1 - Number(C.retrace_pct) / 100);
+          const line = (base ?? px) * (1 - fp / 100);
+          Object.assign(cyc, { peak, sold_at: iso(t), sale_t: t, trigger: p, sale: px, sold_qty: sq, reserved, base, base_from: base == null ? 'none (sale)' : (pos(entryFloor) ? 'entry_floor' : pos(cost) ? 'cost' : 'baseline'), gate, line, low: null, gate_hit: false });
+          events.push({ t: iso(t), ev: 'sell', price: px, peak, qty: sq, reserved: Number(reserved.toFixed(2)), gate, line });
+          phase = 'sold'; nextCheck = null;
+        }
+        continue;
+      }
+      if (phase === 'sold') {   // Part C: updateTroughTracker, then the buy
+        if (!cyc.gate_hit) { if (p > cyc.gate) continue; cyc.gate_hit = true; cyc.low = p; events.push({ t: iso(t), ev: 'gate', price: p }); continue; }
+        if (p < cyc.low) { cyc.low = p; if (p < cyc.line && !cyc.alerts++) events.push({ t: iso(t), ev: 'alert_below_line', price: p, line: cyc.line }); continue; }
+        if (p >= cyc.low * (1 + Number(C.bounce_pct) / 100)) {
+          if (cyc.low < cyc.line) { if (!cyc.bounce_alert) { cyc.bounce_alert = iso(t); events.push({ t: iso(t), ev: 'alert_bounce_under_line', price: p, low: cyc.low, line: cyc.line }); } continue; }   // D2 sticky
+          const usd = cyc.reserved, bq = usd * (1 - fee) / (p * (1 + slip));
+          cash -= usd; qty += bq; cycles++;
+          Object.assign(cyc, { outcome: 'bought_back', closed: iso(t), close_price: p, buy_price: p * (1 + slip), bought_qty: bq, buy_usd: usd });
+          events.push({ t: iso(t), ev: 'buy', price: p, low: cyc.low, usd: Number(usd.toFixed(2)) });
+          if (cycles >= Number(C.max_cycles)) { phase = 'stopped'; events.push({ t: iso(t), ev: 'max_cycles_paused' }); }
+          else { phase = 'watch'; baseline = null; }
+        }
+      }
+    }
+  }
+  const last = bars.length ? bars[bars.length - 1].c : null;
+  for (const c of cyclesOut) {
+    if (!c.outcome) c.outcome = c.sold_at ? 'open_after_sale' : 'open_armed';
+    c.retained_pct = c.sold_qty != null ? Number(((c.qty_before - c.sold_qty + (c.bought_qty || 0)) / c.qty_before * 100).toFixed(2)) : 100;
+    if (c.bought_qty != null) c.coins_gained = Number((c.bought_qty - c.sold_qty).toFixed(8));
+  }
+  const start = bars.length ? bars[0].c : null, v0 = (Number(C.initial_qty) || 0) * start + (Number(C.initial_usd) || 0);
+  const v1 = qty * last + cash, hold = (Number(C.initial_qty) || 0) * last + (Number(C.initial_usd) || 0);
+  return { phase_at_end: phase, cycles: cyclesOut, events, end: { qty, cash: Number(cash.toFixed(4)), value: Number(v1.toFixed(4)), hold_value: Number(hold.toFixed(4)),
+    vs_hold_pct: hold > 0 ? Number(((v1 / hold - 1) * 100).toFixed(2)) : null, start_value: Number(v0.toFixed(4)) }, floor: floor.floor, floor_source: floor.source };
+}
+
+// #564 run_backtest rule_mode 'live': the coin's live rule fills every setting not given (settings_from says which); the cost is
+// the run's cost_price, else TODAY's stored cost (labelled - D3 freezes whichever it is at each sale). Read-only.
+async function runLiveLoopBacktest(sym, src, bars, opts, feePct, slipPct) {
+  let L = null;
+  try { const [r] = await db.execute('SELECT * FROM pump_armed_rules WHERE symbol = ? AND active = 1 LIMIT 1', [sym]); L = r.length ? r[0] : null; } catch (e) { L = null; }
+  const DEF = { arm_window_min: 60, sell_pct: 50, retrace_pct: 50, bounce_pct: 8, buyback_floor_pct: 5, ceiling_pct: CEILING_DEFAULT_PCT, abandon_hours: 336, max_cycles: 10 };
+  const cfg = {}, from = {};
+  const pick = (k, ruleV) => {
+    if (opts[k] != null && opts[k] !== '') { cfg[k] = Number(opts[k]); from[k] = 'given'; }
+    else if (ruleV != null && ruleV !== '' && Number.isFinite(Number(ruleV))) { cfg[k] = Number(ruleV); from[k] = 'live rule'; }
+    else if (DEF[k] != null) { cfg[k] = DEF[k]; from[k] = 'default'; }
+  };
+  for (const k of ['arm_pump_pct', 'arm_window_min', 'trail_pct', 'sell_pct', 'retrace_pct', 'bounce_pct', 'buyback_floor_pct', 'abandon_hours', 'max_cycles']) pick(k, L ? L[k] : null);
+  pick('ceiling_pct', L ? effectiveCeilingPct(L, Date.now()).pct : null);
+  if (opts.entry_floor != null) { cfg.entry_floor = Number(opts.entry_floor); from.entry_floor = 'given'; }
+  else if (L && pumpPos(L.entry_floor)) { cfg.entry_floor = pumpPos(L.entry_floor); from.entry_floor = 'live rule'; }
+  else { cfg.entry_floor = null; from.entry_floor = 'none'; }
+  if (opts.cost_price != null) { cfg.cost_price = Number(opts.cost_price); from.cost_price = 'given'; }
+  else { const c = pumpPos(entryPrices.get(sym)); cfg.cost_price = c; from.cost_price = c != null ? 'today\'s stored cost (not the cost at the time - pass cost_price for a past window)' : 'none'; }
+  if (!(cfg.arm_pump_pct > 0) || !(cfg.trail_pct > 0)) return { ok: false, error: 'rule_mode live needs arm_pump_pct and trail_pct - given, or from a live pump rule on ' + sym + (L ? '' : ' (there is none)') };
+  Object.assign(cfg, { initial_qty: Number(opts.initial_qty) || 0, initial_usd: opts.initial_usd != null ? Number(opts.initial_usd) : 0, fee_pct: feePct, slippage_pct: slipPct });
+  const out = liveLoopReplay(bars, cfg);
+  const cy = out.cycles, done = cy.filter(c => c.outcome === 'bought_back');
+  const p0 = bars[0].c, pN = bars[bars.length - 1].c, q0 = cfg.initial_qty, u0 = cfg.initial_usd;
+  const half = q0 * 0.5 * pN + q0 * 0.5 * p0 * (1 - slipPct / 100) * (1 - feePct / 100) + u0;
+  const metrics = { cycles_completed: done.length, cycles_armed: cy.length, sales: cy.filter(c => c.sold_at).length, buy_backs: done.length,
+    abandoned_ceiling: cy.filter(c => c.outcome === 'abandoned_ceiling').length, abandoned_time: cy.filter(c => c.outcome === 'abandoned_time').length,
+    alert_only_cycles: cy.filter(c => c.bounce_alert || c.alerts).length, floor_blocks: cy.reduce((s, c) => s + (c.blocks || 0), 0),
+    end_qty: Number(out.end.qty.toFixed(8)), end_cash: out.end.cash, terminal_value: out.end.value, hold_value: out.end.hold_value, vs_hold_pct: out.end.vs_hold_pct,
+    static_half_cash_value: Number(half.toFixed(4)), vs_half_cash_pct: half > 0 ? Number(((out.end.value / half - 1) * 100).toFixed(2)) : null,
+    coins_gained_per_completed_cycle: done.map(c => c.coins_gained), phase_at_end: out.phase_at_end };
+  return {
+    ok: true, symbol: sym, source: src, rule_mode: 'live',
+    window: { start: new Date(bars[0].t).toISOString(), end: new Date(bars[bars.length - 1].t).toISOString(), bars: bars.length, flat_bars: src === 'intraday' ? 0 : bars.filter(b => !(b.h > b.l)).length },
+    price: { first: p0, last: pN, change_pct: Number(((pN / p0 - 1) * 100).toFixed(2)) },
+    config: cfg, settings_from: from, live_rule_found: !!L, sell_floor: { price: out.floor, source: out.floor_source },
+    costs: { fee_pct_per_leg: feePct, slippage_pct_per_leg: slipPct }, metrics, cycles: cy, events: out.events.slice(0, 200),
+    not_modelled: ['the cash gate at the buy-back (here the sale proceeds always cover it; live abandons when USD is short)',
+      'the third abandon: buy-back cash uncovered for uncovered_abandon_hours (48 h) - why live HIGH 3549 was abandoned where this replay buys', 'venue refusals, back-off and retries',
+      'EDGE limit and spike-mode chase fills (a sale fills at the tick price less slippage)', 'the spike-mode arm takeover (spikeLoopArmOver): it changes the peak the trail anchors on, not only the fill',
+      'the DND arm path', 'a hand-set sell_floors override (pass sell_floor)'],
+    caveats: [
+      'Validated 4 Oct on the real loop sales: with the ticks the live scan logged, the replay reproduces HIGH 26 Sep, AST 29 Sep and HFT 27 Sep to the minute and price; IDEX 9 Sep matches on the stored captures alone.',
+      'Stored 2-min captures miss peaks and dips the 30 s scan sees: HIGH (live peak 0.0458, captures 0.0456) sells 9 min later; AST (live peak 0.0095, captures 0.00895) sells 28 min later on a higher peak. Read sale times and prices as within a capture or two.',
+      src === 'hourly' ? 'Hourly bars: each bar is walked open-low-high-close (up) or open-high-low-close (down), so an arm, sale and buy-back inside one hour are approximations.' : 'Intraday: each 2-min capture is one tick.',
+      'The ceiling is tested at the stored price nearest each :12 / :42 check - up to one capture from what the live cron saw.',
+      'Slippage is an INPUT, not a measurement. Sweep it.']
+  };
 }
 async function runLadderBacktest(opts) {
   if (opts._profile) {   // #379 profile settings (TIGHT derived for THIS coin as of the window start)
@@ -8068,6 +8233,8 @@ async function runLadderBacktest(opts) {
     bars = r.map(x => { const p = parseFloat(x.price); return { t: new Date(x.t).getTime(), h: p, l: p, c: p }; });
   }
   if (bars.length < 24) return { ok: false, error: 'insufficient bars: ' + bars.length + ' (need >= 24)', symbol: sym, source: src };
+  if (opts.rule_mode === 'live') return await runLiveLoopBacktest(sym, src, bars, opts, feePct, slipPct);   // #564
+  if (!Number.isFinite(Number(opts.arm_pump_pct))) return { ok: false, error: 'arm_pump_pct is required' };   // #564 optional in the schema now (live mode reads the rule)
   const cfg = {
     arm_pump_pct: Number(opts.arm_pump_pct),
     arm_window_min: opts.arm_window_min != null ? Number(opts.arm_window_min) : 1440,
@@ -27582,7 +27749,7 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
       source:            z.enum(['hourly','intraday','daily']).optional().describe("hourly = OHLC rollup + Revolut candles (~1 year, default). intraday = 2-min captures, ~30d. daily = Revolut daily candles, 2.5+ years incl. the 2024-25 bull run (#373) - use for wide profiles (multi-day arm windows); too coarse for tight trails"),
       initial_qty:       z.coerce.number().describe('Starting position size in tokens'),
       initial_usd:       z.coerce.number().optional().describe('Starting USD. Default 0. Simulated sale proceeds are credited during replay, so the ladder can self-fund even from 0'),
-      arm_pump_pct:      z.coerce.number().describe('Pump %% that arms a cycle, e.g. 20'),
+      arm_pump_pct:      z.coerce.number().optional().describe('Pump %% that arms a cycle, e.g. 20. Required except in rule_mode live (which takes the coin\'s live rule when omitted)'),
       arm_window_min:    z.coerce.number().optional().describe('Window in minutes for the arming pump (default 1440)'),
       sell_tiers:        z.preprocess(v => { if (typeof v === 'string') { try { return JSON.parse(v); } catch(e) { return v; } } return v; }, z.array(z.array(z.number()))).optional().describe('[[retrace_pct, sell_pct], ...] e.g. [[3,50],[7,50]] — sell_pct is %% of the CURRENT position'),
       buy_tiers:         z.preprocess(v => { if (typeof v === 'string') { try { return JSON.parse(v); } catch(e) { return v; } } return v; }, z.array(z.array(z.number()))).optional().describe('[[drop_pct, buy_pct], ...] e.g. [[10,50],[16,50]] — buy_pct is %% of REMAINING reserved cash'),
@@ -27591,7 +27758,7 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
       entry_floor:       z.coerce.number().optional().describe('Never sell at or below this price. Omit for no floor. Setting it to the real cost basis shows how often the floor blocks the strategy'),
       slippage_pct:      z.coerce.number().optional().describe('REQUIRED IN PRACTICE: assumed slippage per leg, e.g. 0.5. Defaults to 0, which is optimistic and should not be trusted alone — sweep 0 / 0.5 / 1.0 / 2.0'),
       fee_pct:           z.coerce.number().optional().describe('Fee per leg (default 0.09, the observed live Revolut rate)'),
-      rule_mode:         z.enum(['single','rearm','ladder']).optional().describe("'single' (default) and 'rearm' (#315) use sell_tiers/buy_tiers. 'ladder' (#356, Bryan's design, PM #24): sell sell_pct of the position on a trail_pct breach after an arm_pump_pct pump; re-arm when price regains the leg peak + rearm_confirm_pct (up to max_legs, default 2); after a retrace_pct giveback of the pump, buy buy_pct of the proceeds on a bounce_pct bounce off the low, then the rest after a further further_drop_pct fall and another bounce. Abandons buy-back above sale*(1+buyback_ceiling_pct) with no legs left, or after abandon_hours."),
+      rule_mode:         z.enum(['single','rearm','ladder','live']).optional().describe("'live' (#564): THE LIVE SINGLE LOOP, replayed tick for tick - the one to quote for a live loop. Every setting not given (arm_pump_pct, arm_window_min, trail_pct, sell_pct, retrace_pct, bounce_pct, buyback_floor_pct, entry_floor, ceiling_pct, abandon_hours, max_cycles) comes from the coin's live pump rule; cost_price defaults to today's stored cost. One coin per run; no tiers. 'single' (default) and 'rearm' (#315) use sell_tiers/buy_tiers. 'ladder' (#356, Bryan's design, PM #24): sell sell_pct of the position on a trail_pct breach after an arm_pump_pct pump; re-arm when price regains the leg peak + rearm_confirm_pct (up to max_legs, default 2); after a retrace_pct giveback of the pump, buy buy_pct of the proceeds on a bounce_pct bounce off the low, then the rest after a further further_drop_pct fall and another bounce. Abandons buy-back above sale*(1+buyback_ceiling_pct) with no legs left, or after abandon_hours."),
       trail_pct:         z.coerce.number().optional().describe('#356 ladder: trail %% below the peak that triggers a sell leg (default 7)'),
       sell_pct:          z.coerce.number().optional().describe('#356 ladder: %% of the CURRENT position sold per leg (default 50)'),
       retrace_pct:       z.coerce.number().optional().describe('#356 ladder: giveback %% of the whole pump that starts trough tracking (default 50)'),
@@ -27607,13 +27774,20 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
       max_legs:          z.coerce.number().optional().describe('#315 rearm only: cap on sell legs in one continuous move (default 5)'),
       rearm_from:        z.enum(['sale','peak']).optional().describe("#315 rearm only. 'sale' (default) re-arms at sale_price*(1+arm) - MEASURED ON COTI THIS NEVER FIRES: the sell happens on a trail breach, so the buy tier at -10% from the sale price is ~3x nearer than a +30% re-arm, the buy always wins the race, and the result is identical to 'single'. 'peak' re-arms on regaining the peak just retraced from, which is close enough to compete."),
       rearm_confirm_pct: z.coerce.number().optional().describe("#315 rearm_from='peak' only: percent above the prior peak needed to confirm the run continues (default 1)"),
+      cost_price:        z.coerce.number().optional().describe('#564 live only: the cost per coin for the run (the sell floor is cost + 0.5%; the buy-back base). Default: today\'s stored cost - pass the cost AT THE TIME for a past window'),
+      buyback_floor_pct: z.coerce.number().optional().describe('#564 live only: the buy-back safety line, %% under the base (0 allowed). Default: the live rule'),
+      ceiling_pct:       z.coerce.number().optional().describe('#564 live only: give the buy-back up when the price is this %% above the sale. Default: the live rule\'s effective ceiling (50)'),
+      max_cycles:        z.coerce.number().optional().describe('#564 live only: completed cycles before the loop pauses. Default: the live rule (10)'),
+      sell_floor:        z.coerce.number().optional().describe('#564 live only: a sell_floors override price (the floor is the highest of cost + 0.5%, this and entry_floor)'),
     },
-    async ({ symbol, start, end, source, initial_qty, initial_usd, arm_pump_pct, arm_window_min, sell_tiers, buy_tiers, tier_cooldown_min, min_tier_usd, entry_floor, slippage_pct, fee_pct, rule_mode, max_legs, rearm_from, rearm_confirm_pct, trail_pct, sell_pct, retrace_pct, bounce_pct, buy_pct, further_drop_pct, buyback_ceiling_pct, abandon_hours, retention_floor_pct, profile, buyback_cap, arm_on }) => {
+    async ({ symbol, start, end, source, initial_qty, initial_usd, arm_pump_pct, arm_window_min, sell_tiers, buy_tiers, tier_cooldown_min, min_tier_usd, entry_floor, slippage_pct, fee_pct, rule_mode, max_legs, rearm_from, rearm_confirm_pct, trail_pct, sell_pct, retrace_pct, bounce_pct, buy_pct, further_drop_pct, buyback_ceiling_pct, abandon_hours, retention_floor_pct, profile, buyback_cap, arm_on, cost_price, buyback_floor_pct, ceiling_pct, max_cycles, sell_floor }) => {
       // #379 a stored profile replaces the hand-set ladder settings (slippage / floor / window / source still apply)
       let _prof = null;
       if (profile) { _prof = await getProfile(profile); if (!_prof) return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'no such profile: ' + profile }) }] }; }
       try {
-        if (rule_mode !== 'ladder' && (!Array.isArray(sell_tiers) || !Array.isArray(buy_tiers) || !sell_tiers.length || !buy_tiers.length)) {   // #356: ladder does not use tiers
+        if (rule_mode === 'live' && (profile || String(symbol || '').includes(',') || String(symbol || '').trim().toUpperCase() === 'ALL'))   // #564
+          return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'rule_mode live runs one coin against its own live rule: no profile, no ALL or comma list' }) }] };
+        if (rule_mode !== 'ladder' && rule_mode !== 'live' && (!Array.isArray(sell_tiers) || !Array.isArray(buy_tiers) || !sell_tiers.length || !buy_tiers.length)) {   // #356: ladder does not use tiers
           return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'sell_tiers and buy_tiers must both be non-empty arrays of [pct, pct] pairs' }) }] };
         }
         // #374 symbol 'ALL' (every coin with enough history) or a comma list runs a SWEEP of this one profile.
@@ -27631,10 +27805,11 @@ function validateTierConfig(sellTiers, buyTiers, maxSellPct) {
           rule_mode, max_legs, rearm_from, rearm_confirm_pct,
           trail_pct, sell_pct, retrace_pct, bounce_pct, buy_pct, further_drop_pct, buyback_ceiling_pct, abandon_hours,   // #356
           retention_floor_pct,   // #364
-          buyback_cap, arm_on   // #382
+          buyback_cap, arm_on,   // #382
+          cost_price, buyback_floor_pct, ceiling_pct, max_cycles, sell_floor   // #564 live
         });
         const res = btReadFirst(res0, { start, source, rule_mode: _prof ? 'ladder' : rule_mode, given: { trail_pct, sell_pct, retrace_pct, bounce_pct, buy_pct, further_drop_pct, buyback_ceiling_pct, abandon_hours } });   // #555
-        if (res && res.read_first && !_prof) await btVsLive(res.read_first, symbol, { rule_mode, arm_pump_pct, arm_window_min, trail_pct, sell_pct, retrace_pct, bounce_pct });   // #562 (a profile sets its own arm/trail)
+        if (res && res.read_first && !_prof) await btVsLive(res.read_first, symbol, { rule_mode, arm_pump_pct, arm_window_min, trail_pct, sell_pct, retrace_pct, bounce_pct, cfg: res0 && res0.config });   // #564 cfg: the live run's resolved settings   // #562 (a profile sets its own arm/trail)
         return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
       } catch (e) {
         return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: e.message }) }] };
