@@ -11747,6 +11747,26 @@ async function runExecutionWatchdog(priceOf) {
   for (const [sym, w] of _watchdog) if (!seen.has(sym)) { if (w.alerted) await sendTelegram('\u2705 Execution watchdog: ' + sym.replace('-USD', '') + (w.kind === 'ORPHAN' ? ' - the orphan trail is gone - resolved.' : ' is no longer armed - resolved.')).catch(() => {}); _watchdog.delete(sym); }
 }
 
+// #567 (desk #49, Fable 4 Oct; Bryan 4 Oct "shadow week first"): the loop's trough BUY-BACK - the one automatic order that spends
+// cash - was placed without the fire-time predicate (mayAutoTrade had no buy-side caller). It is now asked immediately before the
+// order. 'shadow' = the exec_decisions row is written and the verdict is reported, NOTHING changes (the buy goes ahead as today);
+// 'enforce' = a NO holds the cycle (tracker kept, one Telegram line per reason, asked again at most every 5 min), and the buy is
+// capped at the predicate's size_cap. Flip to 'enforce' after the shadow week, by its own batch.
+const TROUGH_P0_MODE = 'shadow';
+const _troughP0 = new Map();   // symbol -> { at, reason } of the last NO (enforce: throttle + one line per reason)
+async function troughP0Check(symbol, price, usd, cycleId) {
+  let pc;
+  try {
+    pc = await mayAutoTrade({ symbol, side: 'buy', path: 'trough', exchange: 'revolut', price, usd, ref: { cycle_id: cycleId || undefined } }, { mode: TROUGH_P0_MODE });
+  } catch (e) { pc = { ok: false, reason: 'config_unreadable', check_no: null, decision_id: null, size_cap: null }; }   // mayAutoTrade never throws; belt and braces
+  if (!pc || typeof pc !== 'object') pc = { ok: false, reason: 'config_unreadable', check_no: null, decision_id: null, size_cap: null };
+  console.log('[trough] #567 P0 ' + TROUGH_P0_MODE + ' ' + symbol + ': ' + (pc.ok ? 'ok' : 'NO - check ' + pc.check_no + ' ' + pc.reason) + (pc.decision_id ? ' (decision ' + pc.decision_id + ')' : ''));
+  return pc;
+}
+async function troughP0Mark(decisionId, action) {   // what the caller did with the verdict, on its exec_decisions row
+  if (!decisionId) return;
+  await db.execute('UPDATE exec_decisions SET caller_action = ? WHERE id = ?', [String(action).slice(0, 24), decisionId]).catch(() => {});
+}
 async function runFastScan() {
   try {
     // Part A: pump-arm detector -- dynamic over ALL active, unarmed pump_armed_rules (#215 fix;
@@ -11915,7 +11935,7 @@ async function runFastScan() {
             await abandonCycle(ttSymbol, 'no rebuy size stored (legacy tracker)', 'Bounce confirmed @ $' + ttPrice + ' - manual rebuy if wanted.');   // #A1
             continue;
           }
-          const buyUsd = t.saleProceedsUsd;
+          let buyUsd = t.saleProceedsUsd;   // #567 let: enforce may cap it at the predicate's size_cap
 
           // GATE 1: master auto-exec ON
           let masterOn = false;
@@ -11950,6 +11970,26 @@ async function runFastScan() {
             continue;
           }
 
+          // #567 the fire-time predicate, BEFORE the tracker is cleared (it reads the cycle's sale_price from the rule row)
+          let ttP0 = null;
+          if (TROUGH_P0_MODE === 'enforce') {
+            const lastNo = _troughP0.get(ttSymbol);
+            if (lastNo && Date.now() - lastNo.at < 5 * 60000) continue;   // held: ask again at most every 5 min
+          }
+          ttP0 = await troughP0Check(ttSymbol, ttPrice, buyUsd, ttCycleId);
+          if (TROUGH_P0_MODE === 'enforce') {
+            if (!ttP0.ok) {
+              const prevNo = _troughP0.get(ttSymbol);
+              _troughP0.set(ttSymbol, { at: Date.now(), reason: ttP0.reason });
+              await troughP0Mark(ttP0.decision_id, 'held');
+              if (!prevNo || prevNo.reason !== ttP0.reason)
+                await sendTelegram('<b>[#130 TROUGH BUY held - fire-time check] ' + ttBase + '</b>\nBounce confirmed @ $' + ttPrice + ', but check ' + ttP0.check_no + ' said NO (' + ttP0.reason + '). Not bought; the tracker and the $' + buyUsd.toFixed(2) + ' stay. Checked again every 5 min while the bounce holds.').catch(() => {});
+              continue;
+            }
+            _troughP0.delete(ttSymbol);
+            if (Number(ttP0.size_cap) > 0 && ttP0.size_cap < buyUsd) { console.log('[trough] #567 ' + ttBase + ' buy capped at the predicate size_cap $' + Number(ttP0.size_cap).toFixed(2) + ' (was $' + buyUsd.toFixed(2) + ')'); buyUsd = Number(ttP0.size_cap); }
+          }
+
           // ALL GATES PASS -- clear tracker BEFORE placeRevolutOrder (Map.delete is sync; prevents double-fire on race/crash)
           await clearTroughTracker(ttSymbol);
 
@@ -11969,6 +12009,7 @@ async function runFastScan() {
             continue;
           }
 
+          if (ttP0) await troughP0Mark(ttP0.decision_id, TROUGH_P0_MODE === 'enforce' ? 'bought' : (ttP0.ok ? 'bought_shadow_ok' : 'bought_shadow_no'));   // #567
           // Journal the buy (best-effort -- not awaited on failure path)
           try {
             const [ttJ] = await db.execute(
@@ -11995,7 +12036,8 @@ async function runFastScan() {
             '<b>[#130 AUTO-BOUGHT] ' + ttBase + '</b>\n\n' +
             '$' + buyUsd.toFixed(2) + ' @ ~$' + ttPrice + ' (~' + buyQty.toFixed(6) + ' ' + ttBase + ')\n' +
             'Trough was $' + ttResult.trough.toFixed(8) + ', bounced +' + t.bouncePct + '%.\n' +
-            'Sell was $' + t.salePrice + '. Round-trip complete.'
+            'Sell was $' + t.salePrice + '. Round-trip complete.' +
+            (ttP0 && TROUGH_P0_MODE === 'shadow' ? '\nFire-time check (shadow week, #567): ' + (ttP0.ok ? 'would have allowed this buy.' : '<b>would have BLOCKED it</b> - check ' + ttP0.check_no + ' (' + ttP0.reason + ').') : '')
           ).catch(() => {});
         } else if (ttResult.action === 'alert') {
           console.log('[trough] ' + ttBase + ' FLOOR BREACH: trough ' + ttResult.trough + ' below rebuyFloor ' + ttResult.rebuyFloor);
