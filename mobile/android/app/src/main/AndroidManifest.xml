@@ -25,6 +25,35 @@
 
         </activity>
 
+        <!-- v11: the rip alarm's full-screen page (over the lock screen) and its notification's Stop button -->
+        <activity
+            android:name=".AlarmActivity"
+            android:theme="@style/AppTheme.NoActionBar"
+            android:exported="false"
+            android:launchMode="singleTask"
+            android:taskAffinity="com.bryan.revolutx.alarm"
+            android:excludeFromRecents="true"
+            android:showWhenLocked="true"
+            android:turnScreenOn="true"
+            tools:targetApi="27" />
+        <receiver
+            android:name=".RipAlarm$Stop"
+            android:exported="false" />
+        <!-- v12: rings the rip alarm on the alarm stream (through silent mode); it only plays that sound -->
+        <service
+            android:name=".RipAlarmService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback" />
+        <!-- v13: the floating window over other apps (pop out): a read-only chart or Home widget the user opened -->
+        <service
+            android:name=".FloatService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Floating read-only price chart the user opened" />
+        </service>
+
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.fileprovider"
@@ -77,4 +106,15 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+    <!-- v11: the rip alarm takes over the screen (AlarmActivity), like an alarm clock -->
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+    <!-- v12: RipAlarmService, a foreground service that plays the alarm tone (Android 14+ needs its type's permission) -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <!-- v12: the app now vibrates the alarm pattern itself (as an alarm vibration); Android refuses that without it -->
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- v13: pop out. "Display over other apps" (granted by the user on Android's own page) draws the floating window;
+         FloatService keeps it alive as a special-use foreground service (Android 14+ needs its type's permission) -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
 </manifest>
