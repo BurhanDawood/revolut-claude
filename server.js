@@ -3015,6 +3015,17 @@ for (const row of thresholdRows) {
 }
 console.log(`Loaded ${thresholdRows.length} custom thresholds from database`);
 
+// #563 (Bryan 4 Oct 00:3x, alert noise: "Once, then re-cross" + "Held coins only"). A target the price STAYS past re-fired every 24 h
+// (the #70 window), each time with 3 loud reminders 3 min apart - 12 messages at 00:03 on 4 Oct for BTC/AVAX/SQD/SOL, three of them
+// coins he does not hold. Now a target alerts ONCE, then stays quiet until the price goes back to the other side by 2% (re-cross);
+// re-setting the target (any setter, through upsertPriceTarget) re-arms it. Reminders only for coins held ($5+; Kraken as before).
+// Away Mode is untouched: an away-actionable coin's targets behave exactly as before #563.
+const targetFired = new Map();   // 'SYM|up|price' -> ms the alert went out
+const tfKey = (sym, dir, p) => sym + '|' + (dir || 'up') + '|' + Number(p).toPrecision(10);
+async function targetFiredSave() {
+  try { await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('targets_fired', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)", [JSON.stringify(Object.fromEntries(targetFired))]); }
+  catch (e) { console.warn('[targets] #563 fired state not saved:', e.message); }
+}
 const [ptRows] = await db.execute('SELECT id, symbol, anchor_price, threshold_pct, target_price, entry_price, direction, note, sell_pct FROM price_targets');
 for (const row of ptRows) {
   const t = {
@@ -3031,6 +3042,13 @@ for (const row of ptRows) {
   arr.push(t);
   priceTargets.set(row.symbol, arr);
 }
+try {   // #563 restore which targets already alerted (only keys of targets that still exist)
+  const [tfr] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'targets_fired'");
+  const tfv = tfr.length ? JSON.parse(tfr[0].config_value || '{}') || {} : {};
+  const live = new Set(ptRows.map(r => tfKey(r.symbol, r.direction || 'up', r.target_price)));
+  for (const [k, v] of Object.entries(tfv)) if (live.has(k)) targetFired.set(k, Number(v) || Date.now());
+  if (targetFired.size) console.log('[targets] #563 ' + targetFired.size + ' target(s) already alerted - quiet until the price crosses back');
+} catch (e) { console.warn('[targets] #563 fired state not loaded:', e.message); }
 const totalTargets = [...priceTargets.values()].reduce((s, arr) => s + arr.length, 0);
 console.log(`Loaded ${totalTargets} price targets from database (${priceTargets.size} symbol(s))`);
 
@@ -5641,6 +5659,7 @@ async function batchGetRecommendations(alerts) {
 // Match key mirrors DB uq_target: direction + targetPrice. If found, update in-place (preserving id).
 // If not found, append. All 6 setters call this instead of priceTargets.set(symbol, {...}).
 function upsertPriceTarget(symbol, newTarget) {
+  if (targetFired.delete(tfKey(symbol, newTarget.direction, newTarget.targetPrice))) targetFiredSave();   // #563 a (re)set target alerts afresh
   const arr = priceTargets.get(symbol) || [];
   const idx = arr.findIndex(function(t) {
     return t.direction === newTarget.direction &&
@@ -19617,7 +19636,16 @@ async function checkPortfolio() {
       const effHigh = Math.max(currentPrice, ex.high);
       const effLow  = Math.min(currentPrice, ex.low);
 
-      if (direction === 'up' && effHigh >= target.targetPrice && !activeFixedAlerts.has(symbol) && !alertState.acknowledged.has(symbol) && !ignoredCoins.has(symbol)) {
+      // #563 alerted already: quiet until the price is back on the other side by 2% (then re-armed); Away Mode coins as before
+      const tfK = tfKey(symbol, direction, target.targetPrice);
+      let tgtQuiet = false;
+      if (targetFired.has(tfK)) {
+        const back = direction === 'up' ? currentPrice < target.targetPrice * 0.98 : currentPrice > target.targetPrice * 1.02;
+        if (back) { targetFired.delete(tfK); targetFiredSave(); console.log('[targets] #563 ' + symbol + ' ' + direction + ' ' + target.targetPrice + ' re-armed (price crossed back)'); }
+        else tgtQuiet = !(await isAwayActionable(symbol.replace('-USD', '')).catch(() => false));
+      }
+
+      if (direction === 'up' && !tgtQuiet && effHigh >= target.targetPrice && !activeFixedAlerts.has(symbol) && !alertState.acknowledged.has(symbol) && !ignoredCoins.has(symbol)) {
         const changePct = ((currentPrice - target.anchorPrice) / target.anchorPrice) * 100;
         const coinBase = symbol.replace('-USD', '');
 
@@ -19700,6 +19728,7 @@ async function checkPortfolio() {
           alertMessage = `🎯 <b>${symbol} FIXED TARGET HIT!</b>\n\nAnchor: $${anchorStr} → Now $${priceStr} (+${changePct.toFixed(1)}%)${entryLine}${upDescLine}${upWickLine}\n\n⚡ RECOMMENDATION: ${aiRec}${replyMenu}${autoLine}`;
         }
         await sendTelegram(alertMessage, buildAlertKeyboard(coinBase, ['Sell', 'Hold', 'Analyse', 'Acknowledge'], 'tu'));
+        targetFired.set(tfK, Date.now()); targetFiredSave();   // #563 once, until it crosses back
         targetExtremes.delete(symbol); // reset accumulator — target fired
         // Log send to macro_alerts_sent for cooldown tracking across restarts
         await db.execute(
@@ -19715,7 +19744,8 @@ async function checkPortfolio() {
         }
 
         targetReminderCount.set(symbol, 0); // reset counter when first alert fires
-        activeFixedAlerts.set(symbol, setInterval(async () => {
+        // #563 reminders only for a coin he holds ($5+); Kraken coins are not in these balances, so they keep them as before
+        if (KRAKEN_MONITORED_COINS.includes(symbol) || ftHeldQtyUp * currentPrice >= 5) activeFixedAlerts.set(symbol, setInterval(async () => {
           // #116: self-heal — if the rung was removed (remove_target) the closure's `target` is stale; stop firing.
           const stillExistsUp = (priceTargets.get(symbol) || []).some(t => Math.abs(t.targetPrice - target.targetPrice) < 1e-9);
           if (!stillExistsUp) {
@@ -19746,7 +19776,7 @@ async function checkPortfolio() {
         }, ALERT_INTERVAL_MS));
       }
 
-      if (direction === 'down' && effLow <= target.targetPrice && !activeFixedAlerts.has(symbol) && !alertState.acknowledged.has(symbol) && !ignoredCoins.has(symbol)) {
+      if (direction === 'down' && !tgtQuiet && effLow <= target.targetPrice && !activeFixedAlerts.has(symbol) && !alertState.acknowledged.has(symbol) && !ignoredCoins.has(symbol)) {
         const changePct = ((currentPrice - target.anchorPrice) / target.anchorPrice) * 100;
         const coinBase = symbol.replace('-USD', '');
 
@@ -19814,6 +19844,7 @@ async function checkPortfolio() {
           alertMessage = `📉 <b>${symbol} FIXED FLOOR HIT!</b>\n\nAnchor: ${formatPrice(target.anchorPrice)} → Now ${formatPrice(currentPrice)} (${changePct.toFixed(1)}%)${entryLine}${dnDescLine}${dnWickLine}\n\n⚡ RECOMMENDATION: ${aiRec}${replyMenu}${autoLine}`;
         }
         await sendTelegram(alertMessage, buildAlertKeyboard(coinBase, ['Buy more', 'Hold', 'Sell', 'Acknowledge'], 'td'));
+        targetFired.set(tfK, Date.now()); targetFiredSave();   // #563 once, until it crosses back
         targetExtremes.delete(symbol); // reset accumulator — floor fired
         // Log send for cooldown tracking across restarts
         await db.execute(
@@ -19824,7 +19855,7 @@ async function checkPortfolio() {
         lastAlertCoin = coinBase.toLowerCase();
 
         targetReminderCount.set(symbol, 0); // reset counter when first alert fires
-        activeFixedAlerts.set(symbol, setInterval(async () => {
+        if (KRAKEN_MONITORED_COINS.includes(symbol) || dnHeldQty * currentPrice >= 5) activeFixedAlerts.set(symbol, setInterval(async () => {   // #563 held coins only
           // #116: self-heal — if the rung was removed (remove_target) the closure's `target` is stale; stop firing.
           const stillExistsDown = (priceTargets.get(symbol) || []).some(t => Math.abs(t.targetPrice - target.targetPrice) < 1e-9);
           if (!stillExistsDown) {
