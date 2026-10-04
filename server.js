@@ -1090,7 +1090,7 @@ async function telegramButtonDispatch(cbData, cbReply, ackCb) {
   // New Trade Detected buttons use 'tj'; numeric 'td' keeps already-sent ones working.
   const cbIsTradeJournal = cbMoneyType === 'tj' || (cbMoneyType === 'td' && /^\d+$/.test(cbCoin));
   if (cbMoneyType === 'np' || cbMoneyType === 'ip' || cbMoneyType === 'cc' || cbIsTradeJournal || cbMoneyType === 'ta' || cbMoneyType === 'mu' ||
-      cbMoneyType === 'sd' || cbMoneyType === 'sp' || cbMoneyType === 'rp' || cbMoneyType === 'db' || cbMoneyType === 'sk' || cbMoneyType === 'ro' || cbMoneyType === 'rq' || cbMoneyType === 'sx' || cbMoneyType === 'au' || cbMoneyType === 'pf') {
+      cbMoneyType === 'sd' || cbMoneyType === 'sp' || cbMoneyType === 'rp' || cbMoneyType === 'db' || cbMoneyType === 'sk' || cbMoneyType === 'ro' || cbMoneyType === 'rq' || cbMoneyType === 'ru' || cbMoneyType === 'sx' || cbMoneyType === 'au' || cbMoneyType === 'pf') {
     await ackCb('Working...');
     try {
       if (cbMoneyType === 'ta') await handleTradeApprovalButton(cbCoin, cbChoice, cbReply);
@@ -1102,6 +1102,7 @@ async function telegramButtonDispatch(cbData, cbReply, ackCb) {
       else if (cbMoneyType === 'pf') await handlePmFollowButton(cbCoin, cbChoice, cbReply);   // #559 followed the PM? records only
       else if (cbMoneyType === 'ro') await handleRotationUntagButton(cbCoin, cbReply);   // #8 records only
       else if (cbMoneyType === 'rq') await handleRotationAskButton(cbCoin, cbChoice, cbReply);   // #8 records only
+      else if (cbMoneyType === 'ru') await handleRotationUndoButton(cbCoin, cbChoice, cbReply);   // #568 records only
       else if (cbMoneyType === 'sx') await handleSpikeButton(cbCoin, cbChoice, cbReply);   // #B23 S3 keep a coin alerts-only / insure it again / switch on (with confirm); no off button
       else if (cbMoneyType === 'mu') await handleMuteButton(cbCoin, cbReply);
       else if (cbIsTradeJournal) await handleTradeButton(cbCoin, cbChoice, cbReply);
@@ -1185,6 +1186,7 @@ const APP_ANSWER_ALLOW = {
   sp: { 1: 'paid', 2: 'free', 3: 'free', 4: 'free' },   // sell advice + alert, hold, dust, ack
   ro: { 1: 'free', 2: 'free', 3: 'free', 4: 'free', 5: 'free' },   // rotation untag (records)
   rq: { 1: 'free', 2: 'free', 3: 'free' },   // rotation question (records)
+  ru: { 2: 'free', 3: 'free' },   // #568 undo an automatic rotation (records)
   tj: 'act',
 };
 const APP_ANSWER_TJ_ACTS = ['reason', 'topup', 'thesis', 'funding', 'skip', 'rebalance', 'rebalance_out'];   // never 'payment' (capital) or 'transfer'
@@ -4319,7 +4321,7 @@ function clearPendingTradeFor(coin, journalId) {
 // within 30 min bring ONE question instead of the second prompt: tag them all as one rotation? Only rows the detector wrote for Bryan's
 // own trades (tool_key 'manual', source 'auto_detected') are ever tagged: loops, the agent, funded buys, the reconciler, payments,
 // top-ups and transfers never are. Nothing here places, sizes or cancels anything.
-const ROT_DEFAULTS = { emoji: '🔄', emojis: ['🔄', '🔁', '🔃', '♻'], minutes: 60, lookback_min: 30, auto_detect: true };   // Bryan 15:28: his keyboard finds 🔁 ("repeat") and ♻️ ("recycle"), not 🔄
+const ROT_DEFAULTS = { emoji: '🔄', emojis: ['🔄', '🔁', '🔃', '♻'], minutes: 60, lookback_min: 30, auto_detect: true, auto_accept: true };   // #568 auto_accept (Bryan 4 Oct "Want obvious rotations auto logged")   // Bryan 15:28: his keyboard finds 🔁 ("repeat") and ♻️ ("recycle"), not 🔄
 async function rotationCfg() {
   let c = {};
   try { const [r] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'rotation'"); if (r.length) c = JSON.parse(r[0].config_value) || {}; } catch (e) {}
@@ -4415,11 +4417,45 @@ async function rotationOnDetected(journalId, coinBase, action) {
   const [asked] = await db.execute("SELECT id FROM rotation_sessions WHERE trigger_kind = 'ask' AND opened_at >= DATE_SUB(NOW(), INTERVAL ? MINUTE) LIMIT 1", [cfg.lookback_min]);
   if (asked.length) return null;   // one question per cluster
   const [cl] = await db.execute("SELECT id, symbol, action, value_usd FROM trading_journal WHERE " + ROT_ELIGIBLE + " AND created_at >= DATE_SUB(NOW(), INTERVAL ? MINUTE) ORDER BY id", [cfg.lookback_min]);
-  await db.execute("INSERT INTO rotation_sessions (id, opened_at, expires_at, status, trigger_kind, anchor_journal_id) VALUES (?, NOW(), NOW(), 'asked', 'ask', ?)", ['Q' + journalId, journalId]);
   const line = (r) => (['sell', 'reduce'].includes(r.action) ? '↓ ' : '↑ ') + String(r.symbol).replace('-USD', '') + ' $' + Math.abs(Number(r.value_usd) || 0).toFixed(2);
+  // #568 (Bryan 4 Oct "Want obvious rotations auto logged"): money out of one coin and into a DIFFERENT coin inside the window is
+  // a rotation - log it as one at once, no question. Undo buttons put it back to "tag individually" or "leave untagged". A sell
+  // and a buy of only the same coin is not obvious: that still asks, as before. rotation.auto_accept false = always ask.
+  if (cfg.auto_accept !== false && rotationIsObvious(cl)) {
+    const r = await rotationStart('obvious', null, cl.map(x => x.id));
+    await sendTelegram('🔄 <b>Rotation ' + escTg(r.id) + ' logged</b>: ' + cl.map(line).join(', ') + ' in the last ' + cfg.lookback_min + ' min - out of one coin, into another, so tagged as one rotation without asking. Trades in the next ' + r.minutes + ' min join it; one summary at the end (any row can be untagged there).',
+      { inline_keyboard: [[{ text: 'Undo - tag individually', callback_data: 'a:' + r.id.toLowerCase() + ':2:ru' }, { text: 'Undo - leave untagged', callback_data: 'a:' + r.id.toLowerCase() + ':3:ru' }]] }).catch(() => {});
+    return { handled: true, auto: true, rotation_id: r.id };
+  }
+  await db.execute("INSERT INTO rotation_sessions (id, opened_at, expires_at, status, trigger_kind, anchor_journal_id) VALUES (?, NOW(), NOW(), 'asked', 'ask', ?)", ['Q' + journalId, journalId]);
   await sendTelegram('🔄 <b>Looks like a rotation</b>: ' + cl.map(line).join(', ') + ' in the last ' + cfg.lookback_min + ' min.\nTag all ' + cl.length + ' as one rotation? (Send ' + escTg(cfg.emoji) + ' before you start next time and I will not need to ask.)',
     { inline_keyboard: [[{ text: '✅ Yes, one rotation', callback_data: 'a:' + journalId + ':1:rq' }], [{ text: 'Tag individually', callback_data: 'a:' + journalId + ':2:rq' }, { text: 'Skip', callback_data: 'a:' + journalId + ':3:rq' }]] });
   return { handled: true, asked: true };
+}
+// #568 obvious = at least one sell and one buy in the window, and some coin bought is not a coin sold (a same-coin round trip
+// is a re-entry, not a rotation).
+function rotationIsObvious(cl) {
+  const c = (r) => String(r.symbol || '').replace(/-USD$/, '').toUpperCase(), isOut = (r) => ['sell', 'reduce'].includes(r.action);
+  const outs = new Set((cl || []).filter(isOut).map(c)), ins = new Set((cl || []).filter(r => ['buy', 'add'].includes(r.action)).map(c));
+  if (!outs.size || !ins.size) return false;
+  for (const x of ins) if (!outs.has(x)) return true;
+  for (const x of outs) if (!ins.has(x)) return true;
+  return false;
+}
+async function handleRotationUndoButton(ridStr, choice, reply) {   // #568 undo an automatic rotation: 2 = tag individually, 3 = leave untagged
+  const rid = String(ridStr || '').toUpperCase();
+  if (!/^R[A-Z0-9]{4,11}$/.test(rid)) return reply('Unknown rotation.');
+  const [s] = await db.execute("SELECT status, trigger_kind FROM rotation_sessions WHERE id = ?", [rid]);
+  if (!s.length || s[0].trigger_kind !== 'obvious') return reply('Unknown rotation.');
+  if (s[0].status === 'undone') return reply('Already undone.');
+  const rows = await rotationRows(rid);
+  await db.execute("UPDATE trading_journal SET rotation_id = NULL, reason_tag = IF(reason_tag LIKE 'rotation%', NULL, reason_tag), reasoning = IF(reasoning LIKE 'Rotation R%', 'no reason provided', reasoning) WHERE rotation_id = ?", [rid]);
+  await db.execute("UPDATE rotation_sessions SET status = 'undone', closed_at = NOW() WHERE id = ?", [rid]);
+  if (choice === 2) {
+    for (const r of rows) { let kb; try { kb = await buildTradeKeyboard(r.id, String(r.symbol).replace('-USD', ''), r.action); } catch (e) { kb = undefined; } await sendTelegram(String(r.symbol).replace('-USD', '') + ' ' + String(r.action).toUpperCase() + ' (j' + r.id + ') - tap its reason:', kb).catch(() => {}); }
+    return reply('Undone: ' + rows.length + ' trade' + (rows.length === 1 ? '' : 's') + ' out of the rotation, each one on its own.');
+  }
+  return reply('Undone: ' + rows.length + ' trade' + (rows.length === 1 ? '' : 's') + ' left untagged (the Sunday digest re-offers them).');
 }
 async function handleRotationAskButton(jidStr, choice, reply) {
   const jid = parseInt(jidStr, 10), cfg = await rotationCfg();
