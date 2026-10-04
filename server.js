@@ -4321,7 +4321,9 @@ function clearPendingTradeFor(coin, journalId) {
 // within 30 min bring ONE question instead of the second prompt: tag them all as one rotation? Only rows the detector wrote for Bryan's
 // own trades (tool_key 'manual', source 'auto_detected') are ever tagged: loops, the agent, funded buys, the reconciler, payments,
 // top-ups and transfers never are. Nothing here places, sizes or cancels anything.
-const ROT_DEFAULTS = { emoji: '🔄', emojis: ['🔄', '🔁', '🔃', '♻'], minutes: 60, lookback_min: 30, auto_detect: true, auto_accept: true };   // #568 auto_accept (Bryan 4 Oct "Want obvious rotations auto logged")   // Bryan 15:28: his keyboard finds 🔁 ("repeat") and ♻️ ("recycle"), not 🔄
+const ROT_DEFAULTS = { emoji: '🔄', emojis: ['🔄', '🔁', '🔃', '♻'], minutes: 60, lookback_min: 30, auto_detect: true, auto_accept: true, prompt_hold_sec: 180 };   // #569 prompt_hold_sec
+const _rotPrompted = new Set();   // #569 journal ids whose own TRADE DETECTED question went out (named when a rotation covers them)
+async function rotationPromptHoldMs() { try { const c = await rotationCfg(); const s = Number(c.prompt_hold_sec); return Number.isFinite(s) && s > 0 ? Math.min(s, 900) * 1000 : 0; } catch (e) { return 180000; } }   // #568 auto_accept (Bryan 4 Oct "Want obvious rotations auto logged")   // Bryan 15:28: his keyboard finds 🔁 ("repeat") and ♻️ ("recycle"), not 🔄
 async function rotationCfg() {
   let c = {};
   try { const [r] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'rotation'"); if (r.length) c = JSON.parse(r[0].config_value) || {}; } catch (e) {}
@@ -4401,10 +4403,25 @@ async function rotationClaimText(rawText) {
     (r.swept ? ' ' + r.swept + ' sell' + (r.swept > 1 ? 's' : '') + ' from the last ' + cfg.lookback_min + ' min ' + (r.swept > 1 ? 'are' : 'is') + ' included.' : '') + ' Send 🔄, 🔁, ♻️ or "rotate" again to close it early.';
 }
 // Called by autoLogTrade for a detector row it is about to ask about. { handled: true } = the rotation took it (no individual prompt).
+// #569 (Bryan 5 Oct 00:01 "Still getting spam ... should get one message naming all together"): trades found in the same scan run
+// autoLogTrade side by side, so two rows could each decide the rotation question at once, and a row the rotation had JUST tagged
+// failed its own tag (already tagged) and fell through to a TRADE DETECTED prompt (MOG 23:53). One at a time now, and a row that
+// is already in a rotation is handled.
+let _rotChain = Promise.resolve();
+function rotationOnDetectedSerial(journalId, coinBase, action) {
+  const p = _rotChain.then(() => rotationOnDetected(journalId, coinBase, action));
+  _rotChain = p.catch(() => {});
+  return p;
+}
+async function rotationRowTagged(journalId) {
+  try { const [r] = await db.execute('SELECT rotation_id FROM trading_journal WHERE id = ?', [journalId]); return r.length && r[0].rotation_id ? r[0].rotation_id : null; } catch (e) { return null; }
+}
 async function rotationOnDetected(journalId, coinBase, action) {
   if (!['buy', 'sell', 'add', 'reduce'].includes(action)) return null;
+  const already = await rotationRowTagged(journalId);   // #569
+  if (already) return { handled: true, rotation_id: already };
   const open = await rotationOpenSession();
-  if (open) return { handled: await rotationTag(open.id, journalId), rotation_id: open.id };
+  if (open) { const tagged = await rotationTag(open.id, journalId); if (tagged) return { handled: true, rotation_id: open.id }; const t2 = await rotationRowTagged(journalId); return { handled: !!t2, rotation_id: t2 || open.id }; }
   const cfg = await rotationCfg();
   if (!cfg.auto_detect) return null;
   // #12 (Bryan 26 Sep 21:51): while "one rotation?" is waiting for his answer, every further trade JOINS that question - no
@@ -4423,7 +4440,9 @@ async function rotationOnDetected(journalId, coinBase, action) {
   // and a buy of only the same coin is not obvious: that still asks, as before. rotation.auto_accept false = always ask.
   if (cfg.auto_accept !== false && rotationIsObvious(cl)) {
     const r = await rotationStart('obvious', null, cl.map(x => x.id));
-    await sendTelegram('🔄 <b>Rotation ' + escTg(r.id) + ' logged</b>: ' + cl.map(line).join(', ') + ' in the last ' + cfg.lookback_min + ' min - out of one coin, into another, so tagged as one rotation without asking. Trades in the next ' + r.minutes + ' min join it; one summary at the end (any row can be untagged there).',
+    const asked569 = cl.filter(x => x.id !== journalId && _rotPrompted.has(x.id));   // #569 rows whose own question already went out
+    await sendTelegram('🔄 <b>Rotation ' + escTg(r.id) + ' logged</b>: ' + cl.map(line).join(', ') + ' in the last ' + cfg.lookback_min + ' min - out of one coin, into another, so tagged as one rotation without asking. Trades in the next ' + r.minutes + ' min join it; one summary at the end (any row can be untagged there).' +
+      (asked569.length ? '\nThis covers the earlier question' + (asked569.length > 1 ? 's' : '') + ' about ' + asked569.map(x => String(x.symbol).replace('-USD', '')).join(', ') + ' - no need to answer ' + (asked569.length > 1 ? 'them' : 'it') + '.' : ''),
       { inline_keyboard: [[{ text: 'Undo - tag individually', callback_data: 'a:' + r.id.toLowerCase() + ':2:ru' }, { text: 'Undo - leave untagged', callback_data: 'a:' + r.id.toLowerCase() + ':3:ru' }]] }).catch(() => {});
     return { handled: true, auto: true, rotation_id: r.id };
   }
@@ -15862,70 +15881,89 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
     // ──────────────────────────────────────────────────────────────────────────
 
     // #8 a rotation session takes the row (tag, no individual prompt), or a sell + buy within 30 min asks once "one rotation?"
-    const rotHit = await rotationOnDetected(journalId, coinBase, action).catch(e => { console.error('[rotation] detect failed (prompt sent as usual):', e.message); return null; });
+    const rotHit = await rotationOnDetectedSerial(journalId, coinBase, action).catch(e => { console.error('[rotation] detect failed (prompt sent as usual):', e.message); return null; });   // #569 one at a time
     if (rotHit && rotHit.handled) { console.log('[rotation] ' + coinBase + ' ' + action + ' j' + journalId + (rotHit.asked ? ' - asked "one rotation?"' : rotHit.joined ? ' - joined the waiting question ' + rotHit.joined : ' - tagged into ' + rotHit.rotation_id)); return; }
-    const actionLabel = action === 'buy' ? 'BOUGHT' : action === 'sell' ? 'SOLD' : action.toUpperCase();
+    // #569 the TRADE DETECTED question waits ROT_PROMPT_HOLD_MS: a rotation is usually a sell and a buy a minute or two apart, so
+    // the first trade's question is held; if the next trade turns them into a rotation, this row is tagged and no question is sent.
+    const sendTradePrompt569 = async () => {
+      const actionLabel = action === 'buy' ? 'BOUGHT' : action === 'sell' ? 'SOLD' : action.toUpperCase();
 
-    // Check if a trailing stop recently triggered for this symbol (within 2 hours)
-    const recentTrailAlert = trailingStopAlerted.get(symbol);
-    const trailTriggered = recentTrailAlert && (Date.now() - recentTrailAlert) < 2 * 60 * 60 * 1000;
+      // Check if a trailing stop recently triggered for this symbol (within 2 hours)
+      const recentTrailAlert = trailingStopAlerted.get(symbol);
+      const trailTriggered = recentTrailAlert && (Date.now() - recentTrailAlert) < 2 * 60 * 60 * 1000;
 
-    // Check journal for recent trailing stop / MSS context
-    let recentJournalContext = null;
-    try {
-      const [recentJournal] = await db.execute(
-        `SELECT reasoning FROM trading_journal
-         WHERE symbol = ?
-         AND created_at > DATE_SUB(NOW(), INTERVAL 2 HOUR)
-         AND (reasoning LIKE '%trailing stop%' OR reasoning LIKE '%MSS%' OR reasoning LIKE '%market structure%')
-         ORDER BY created_at DESC LIMIT 1`,
-        [coinBase]
-      );
-      if (recentJournal.length > 0) recentJournalContext = recentJournal[0].reasoning;
-    } catch (e) { /* ignore */ }
-
-    // Build recommendation line — trailing stop context takes priority over stale rec
-    let recLine = '';
-    if (trailTriggered && action === 'sell') {
-      recLine = `\n📊 Last Claude rec: SELL — trailing stop triggered`;
-    } else if (recentJournalContext && action === 'sell') {
-      recLine = `\n📊 Context: ${recentJournalContext.substring(0, 80)}...`;
-    } else if (claudeRec) {
-      recLine = `\n📊 Last Claude rec: ${claudeRec}`;
-    }
-
-    const reentryLine = reentryNote || '';
-    const msg =
-      `💰 <b>TRADE DETECTED — ${symbol}</b>\n` +
-      `<b>⏰ REPLY NOW — auto-logs in 30 min</b>\n\n` +
-      `Action: ${actionLabel} ~${formatTradeQty(absQty)} tokens at ${formatPrice(price)} ($${valueUsd.toFixed(2)})${pnlLine}${avgEntryLine}${recLine}${reentryLine}\n\n` +
-      `Tap a reason below - it still works after the 30-min timer.\n` +
-      `Or reply '<b>taking profits</b>', '<b>rebalance [coin]</b>', '<b>payment</b>', '<b>transfer</b>' or '<b>skip</b>'.`;
-    // #337: stateless buttons bound to this journal row. If building them fails, the alert still
-    // goes out without buttons and the typed replies above keep working.
-    let tradeKb;
-    try { tradeKb = await buildTradeKeyboard(journalId, coinBase, action); }
-    catch (e) { console.error('[trade-btn] keyboard build failed:', e.message); }
-    await sendTelegram(msg, tradeKb);
-
-    // Set 30-minute timeout to auto-complete
-    const timeoutHandle = setTimeout(async () => {
+      // Check journal for recent trailing stop / MSS context
+      let recentJournalContext = null;
       try {
-        await db.execute(
-          'UPDATE trading_journal SET reasoning = ?, emotion = ? WHERE id = ? AND reasoning = ?',
-          ['no reason provided', null, journalId, 'auto-detected']
+        const [recentJournal] = await db.execute(
+          `SELECT reasoning FROM trading_journal
+           WHERE symbol = ?
+           AND created_at > DATE_SUB(NOW(), INTERVAL 2 HOUR)
+           AND (reasoning LIKE '%trailing stop%' OR reasoning LIKE '%MSS%' OR reasoning LIKE '%market structure%')
+           ORDER BY created_at DESC LIMIT 1`,
+          [coinBase]
         );
-        if (!pendingTradeContext.has(symbol) || pendingTradeContext.get(symbol).journalId === journalId) pendingTradeContext.delete(symbol);   // #R1 only its own context
-        await sendTelegram(`⏰ <b>${symbol}</b> trade auto-logged without context.`);
-        await updateLearningModel().catch(() => {});
+        if (recentJournal.length > 0) recentJournalContext = recentJournal[0].reasoning;
       } catch (e) { /* ignore */ }
-    }, 30 * 60 * 1000);
 
-    pendingTradeContext.set(symbol, { journalId, detectedAt: Date.now(), timeoutHandle, action, price, valueUsd, qty: absQty, exchange: 'revolut' });
-    console.log(`Auto-logged trade: ${symbol} ${action} ${absQty.toFixed(4)} @ $${price.toFixed(4)}`);
+      // Build recommendation line — trailing stop context takes priority over stale rec
+      let recLine = '';
+      if (trailTriggered && action === 'sell') {
+        recLine = `\n📊 Last Claude rec: SELL — trailing stop triggered`;
+      } else if (recentJournalContext && action === 'sell') {
+        recLine = `\n📊 Context: ${recentJournalContext.substring(0, 80)}...`;
+      } else if (claudeRec) {
+        recLine = `\n📊 Last Claude rec: ${claudeRec}`;
+      }
 
-    // Check if this forms a rebalancing pair with another recent trade
-    await checkForRebalancePair(symbol, action, journalId, price, absQty, valueUsd, 'revolut', null);
+      const reentryLine = reentryNote || '';
+      const msg =
+        `💰 <b>TRADE DETECTED — ${symbol}</b>\n` +
+        `<b>⏰ REPLY NOW — auto-logs in 30 min</b>\n\n` +
+        `Action: ${actionLabel} ~${formatTradeQty(absQty)} tokens at ${formatPrice(price)} ($${valueUsd.toFixed(2)})${pnlLine}${avgEntryLine}${recLine}${reentryLine}\n\n` +
+        `Tap a reason below - it still works after the 30-min timer.\n` +
+        `Or reply '<b>taking profits</b>', '<b>rebalance [coin]</b>', '<b>payment</b>', '<b>transfer</b>' or '<b>skip</b>'.`;
+      // #337: stateless buttons bound to this journal row. If building them fails, the alert still
+      // goes out without buttons and the typed replies above keep working.
+      let tradeKb;
+      try { tradeKb = await buildTradeKeyboard(journalId, coinBase, action); }
+      catch (e) { console.error('[trade-btn] keyboard build failed:', e.message); }
+      await sendTelegram(msg, tradeKb);
+
+      // Set 30-minute timeout to auto-complete
+      const timeoutHandle = setTimeout(async () => {
+        try {
+          await db.execute(
+            'UPDATE trading_journal SET reasoning = ?, emotion = ? WHERE id = ? AND reasoning = ?',
+            ['no reason provided', null, journalId, 'auto-detected']
+          );
+          if (!pendingTradeContext.has(symbol) || pendingTradeContext.get(symbol).journalId === journalId) pendingTradeContext.delete(symbol);   // #R1 only its own context
+          await sendTelegram(`⏰ <b>${symbol}</b> trade auto-logged without context.`);
+          await updateLearningModel().catch(() => {});
+        } catch (e) { /* ignore */ }
+      }, 30 * 60 * 1000);
+
+      pendingTradeContext.set(symbol, { journalId, detectedAt: Date.now(), timeoutHandle, action, price, valueUsd, qty: absQty, exchange: 'revolut' });
+      console.log(`Auto-logged trade: ${symbol} ${action} ${absQty.toFixed(4)} @ $${price.toFixed(4)}`);
+
+      // Check if this forms a rebalancing pair with another recent trade
+      await checkForRebalancePair(symbol, action, journalId, price, absQty, valueUsd, 'revolut', null);
+    };
+    const hold569 = await rotationPromptHoldMs();
+    if (hold569 > 0) {
+      console.log('[rotation] #569 ' + coinBase + ' ' + action + ' j' + journalId + ' - question held ' + Math.round(hold569 / 1000) + ' s for a rotation');
+      setTimeout(async () => {
+        try {
+          const tagged569 = await rotationRowTagged(journalId);
+          if (tagged569) { console.log('[rotation] #569 j' + journalId + ' joined ' + tagged569 + ' while held - no question'); return; }
+          _rotPrompted.add(journalId); if (_rotPrompted.size > 500) _rotPrompted.delete(_rotPrompted.values().next().value);
+          await sendTradePrompt569();
+        } catch (e) { console.error('[rotation] #569 held question failed:', e.message); }
+      }, hold569);
+      return;
+    }
+    _rotPrompted.add(journalId);
+    await sendTradePrompt569();
   } catch (e) {
     console.error('autoLogTrade error:', e.message);
   }
@@ -19365,7 +19403,9 @@ async function checkPortfolio() {
             // #395 the journal can miss buys (manual, during a restart) - ask Revolut which buys actually filled
             let v159 = null; try { v159 = await venueBuysUsdInWindow(30 * 60 * 1000, ['USDT', 'USD']); } catch (e) { console.warn('[usdt] #395 venue check failed:', e.message); }   // #487 N7 a USD->USDT conversion is what masks the payment here - never count it as a coin buy
             const funded159 = !!(v159 && v159.usd >= hidden159 * 0.9);
-            if (funded159) {
+            const rot159 = funded159 ? await rotationOpenSession().catch(() => null) : null;   // #569
+            if (funded159 && rot159) console.log('[usdt] #569 USD -$' + hidden159.toFixed(2) + ' = buys in rotation ' + rot159.id + ' - no separate notice');
+            if (funded159 && !rot159) {
               console.log('[usdt] #395 USD -$' + hidden159.toFixed(2) + ' matched by $' + v159.usd + ' of filled buys on Revolut X (' + v159.coins.join(', ') + ') - trade-funding, not a payment');
               await sendTelegram('\u2139\ufe0f $' + hidden159.toFixed(2) + ' of USD was spent on coin buys (' + v159.n + ' filled order(s) on Revolut X: ' + v159.coins.join(', ') + ') - not a payment. Capital unchanged.' +
                 (recentTrade159.length === 0 ? '\nThese buys are not in the journal yet (placed by hand) - the nightly re-sync records them and updates cost prices.' : '')).catch(() => {});
