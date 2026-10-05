@@ -4321,9 +4321,9 @@ function clearPendingTradeFor(coin, journalId) {
 // within 30 min bring ONE question instead of the second prompt: tag them all as one rotation? Only rows the detector wrote for Bryan's
 // own trades (tool_key 'manual', source 'auto_detected') are ever tagged: loops, the agent, funded buys, the reconciler, payments,
 // top-ups and transfers never are. Nothing here places, sizes or cancels anything.
-const ROT_DEFAULTS = { emoji: '🔄', emojis: ['🔄', '🔁', '🔃', '♻'], minutes: 60, lookback_min: 30, auto_detect: true, auto_accept: true, prompt_hold_sec: 180 };   // #569 prompt_hold_sec
+const ROT_DEFAULTS = { emoji: '🔄', emojis: ['🔄', '🔁', '🔃', '♻'], minutes: 60, lookback_min: 30, auto_detect: true, auto_accept: true, prompt_hold_sec: 660 };   // #569 prompt_hold_sec; #570 660 s = two trade scans (Bryan 5 Oct 08:38: JTO+CC sells 07:32, HFT buy found at the next scan 07:37, 3-min hold too short)
 const _rotPrompted = new Set();   // #569 journal ids whose own TRADE DETECTED question went out (named when a rotation covers them)
-async function rotationPromptHoldMs() { try { const c = await rotationCfg(); const s = Number(c.prompt_hold_sec); return Number.isFinite(s) && s > 0 ? Math.min(s, 900) * 1000 : 0; } catch (e) { return 180000; } }   // #568 auto_accept (Bryan 4 Oct "Want obvious rotations auto logged")   // Bryan 15:28: his keyboard finds 🔁 ("repeat") and ♻️ ("recycle"), not 🔄
+async function rotationPromptHoldMs() { try { const c = await rotationCfg(); const s = Number(c.prompt_hold_sec); return Number.isFinite(s) && s > 0 ? Math.min(s, 900) * 1000 : 0; } catch (e) { return 660000; } }   // #568 auto_accept (Bryan 4 Oct "Want obvious rotations auto logged")   // Bryan 15:28: his keyboard finds 🔁 ("repeat") and ♻️ ("recycle"), not 🔄
 async function rotationCfg() {
   let c = {};
   try { const [r] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'rotation'"); if (r.length) c = JSON.parse(r[0].config_value) || {}; } catch (e) {}
@@ -19403,7 +19403,11 @@ async function checkPortfolio() {
             // #395 the journal can miss buys (manual, during a restart) - ask Revolut which buys actually filled
             let v159 = null; try { v159 = await venueBuysUsdInWindow(30 * 60 * 1000, ['USDT', 'USD']); } catch (e) { console.warn('[usdt] #395 venue check failed:', e.message); }   // #487 N7 a USD->USDT conversion is what masks the payment here - never count it as a coin buy
             const funded159 = !!(v159 && v159.usd >= hidden159 * 0.9);
-            const rot159 = funded159 ? await rotationOpenSession().catch(() => null) : null;   // #569
+            let rot159 = funded159 ? await rotationOpenSession().catch(() => null) : null;   // #569
+            if (funded159 && !rot159) {   // #570 a sell in the last 30 min = these buys are the other half of a rotation (it is tagged seconds later)
+              const [s570] = await db.execute("SELECT id FROM trading_journal WHERE action IN ('sell', 'reduce') AND created_at > DATE_SUB(NOW(), INTERVAL 30 MINUTE) LIMIT 1").catch(() => [[]]);
+              if (s570.length) rot159 = { id: 'pending (sell j' + s570[0].id + ')' };
+            }
             if (funded159 && rot159) console.log('[usdt] #569 USD -$' + hidden159.toFixed(2) + ' = buys in rotation ' + rot159.id + ' - no separate notice');
             if (funded159 && !rot159) {
               console.log('[usdt] #395 USD -$' + hidden159.toFixed(2) + ' matched by $' + v159.usd + ' of filled buys on Revolut X (' + v159.coins.join(', ') + ') - trade-funding, not a payment');
