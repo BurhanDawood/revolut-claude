@@ -4083,7 +4083,7 @@ async function cardSpendSettles(coin, dropQty) {
   if (!c || !(drop > 0)) return 0;
   const [rows] = await db.execute("SELECT id, quantity, venue_tx_id, created_at FROM trading_journal WHERE symbol = ? AND action = 'payment' AND reason_tag = 'card_pending' ORDER BY id", [c]);
   const cand = rows.filter(r => Number(r.quantity) > 0 && Number(r.quantity) <= drop * (1 + CARD_WATCH.settle_tol));
-  if (!cand.length) return 0;
+  if (!cand.length) return await cardSettleBelowHold(c, drop, rows);   // #571
   if (cand.some(r => _cardTxStatus.get(String(r.venue_tx_id)) !== 'completed')) {
     const oldest = Math.min(...cand.map(r => new Date(r.created_at).getTime() || Date.now()));
     const hours = Math.min(14 * 24, Math.ceil((Date.now() - oldest) / 3600000) + 2);
@@ -4101,7 +4101,39 @@ async function cardSpendSettles(coin, dropQty) {
     if (left <= drop * 1e-9) break;
   }
   if (used > 0 && left <= drop * CARD_WATCH.settle_tol) used = drop;   // a settlement a little off the hold is still the payment
-  return used;
+  return used > 0 ? used : await cardSettleBelowHold(c, drop, rows);   // #571
+}
+// #571 (Bryan 5 Oct 16:20, HIGH): a card payment can SETTLE for fewer tokens than its hold (hold 1,386.64 HIGH $49.85 for a
+// GBP 32 order on 4 Oct 21:22; settled 1,205.77 on 5 Oct 16:05). The size match above wants hold <= drop, so the settlement was
+// logged as a SALE and a TRADE DETECTED went out. Now: ONE pending hold on this coin, its send completed at the venue, and the
+// drop between 70% of the hold and the hold = that payment settling. The row is corrected to the settled quantity (USD at the
+// row's own hold price), the difference goes back on capital, and one line says so. Two or more such holds = ambiguous, as before.
+const CARD_BELOW_HOLD_MIN = 0.7;
+async function cardSettleBelowHold(c, drop, rows) {
+  const big = rows.filter(r => Number(r.quantity) > drop * (1 + CARD_WATCH.settle_tol) && drop >= Number(r.quantity) * CARD_BELOW_HOLD_MIN);
+  if (big.length !== 1) { if (big.length > 1) console.log('[card] #571 ' + c + ' drop ' + drop + ' fits ' + big.length + ' larger holds - ambiguous, logged as usual'); return 0; }
+  const r = big[0], tx = String(r.venue_tx_id), holdQty = Number(r.quantity);
+  if (_cardTxStatus.get(tx) !== 'completed') {
+    const hours = Math.min(14 * 24, Math.ceil((Date.now() - (new Date(r.created_at).getTime() || Date.now())) / 3600000) + 2);
+    try { cardNoteStatuses(await revolutRecentSends(hours, 6)); } catch (e) { console.error('[card] #571 status refresh failed - not settling:', e.message); return 0; }
+  }
+  if (_cardTxStatus.get(tx) !== 'completed') { console.log('[card] #571 ' + c + ' j' + r.id + ' (hold ' + r.quantity + ') could be settling below its hold, but its send is ' + (_cardTxStatus.get(tx) || 'unread') + ' - not settled here'); return 0; }
+  const [full] = await db.execute('SELECT price, value_usd FROM trading_journal WHERE id = ?', [r.id]);
+  const px = Number(full && full[0] && full[0].price) || 0, oldUsd = Number(full && full[0] && full[0].value_usd) || 0;
+  const newUsd = px > 0 ? Number((drop * px).toFixed(2)) : oldUsd, back = Number((oldUsd - newUsd).toFixed(2));
+  const [u] = await db.execute("UPDATE trading_journal SET reason_tag = 'card_settled', quantity = ?, value_usd = ?, reasoning = CONCAT(LEFT(COALESCE(reasoning, ''), 380), ?) WHERE id = ? AND reason_tag = 'card_pending'",
+    [drop, newUsd, ' | #571 settled for ' + drop + ' (hold ' + holdQty + ')', r.id]);
+  if (!(u && u.affectedRows === 1)) return 0;
+  let capTxt = '';
+  if (back > 0) {
+    const before = totalInvestedCapital;
+    try { await updateInvestedCapital(before + back, 'Card payment j' + r.id + ' (' + c + ') settled below its hold: +$' + back.toFixed(2)); capTxt = '\nCapital: $' + before.toFixed(2) + ' \u2192 $' + totalInvestedCapital.toFixed(2); }
+    catch (e) { capTxt = '\n\u26a0\ufe0f The capital update failed (' + e.message + ') - $' + back.toFixed(2) + ' should go back on capital.'; }
+  }
+  const f = (q) => Number(q).toLocaleString('en-GB', { maximumFractionDigits: Number(q) >= 100 ? 2 : 6 });
+  await sendTelegram('\ud83d\udcb3 ' + escTg(c) + ' card payment settled for LESS than its hold: ' + f(drop) + ' ' + escTg(c) + ' (hold was ' + f(holdQty) + '). Payment j' + r.id + ' corrected to $' + newUsd.toFixed(2) + ' (was $' + oldUsd.toFixed(2) + ') - not a sale, nothing to answer.' + capTxt).catch(() => {});
+  console.log('[card] #571 ' + c + ' j' + r.id + ' settled below its hold: ' + holdQty + ' -> ' + drop + ', $' + oldUsd + ' -> $' + newUsd + ' (+$' + back + ' capital)');
+  return drop;
 }
 // ── #395 WAS THE MISSING CASH SPENT ON COINS? ASK THE VENUE ─────────────────────────
 // The payment detectors decided 'trade-funding or payment?' from the JOURNAL alone. Buys the journal missed (placed
