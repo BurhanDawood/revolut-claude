@@ -18481,9 +18481,15 @@ async function autoExecuteSell(symbol, maxPct, analysis, confidence, opts = {}) 
         // (opts.refusedFallback) fall straight to the reviewed spike chase: limits from the BID at this moment, the bid re-read
         // every step, never under max(cost floor, give-up line). Any other error - or the 'retry' setting - is today's path.
         if (!(mkErr && mkErr.venue_refused) || !opts.refusedFallback || (await refusedMarketFallback()) !== 'chase') throw mkErr;
-        const wanted = sellQty, peak = Math.max(Number(opts.trail_peak) || 0, currentPrice);
-        await sendTelegram('⚠️ <b>Revolut X cancelled the market sell of ' + coinBase + '</b> (' + escTg(String(mkErr.message || 'slippage protection').slice(0, 100)) + ') - nothing sold. Chasing with limits from the bid instead (never below the cost floor or ' + ((await spikeCfg()).give_up_pct || 25) + '% under the peak).').catch(() => {});
-        const ch = await spikeChase(symbol, coinBase, sellQty, { peak, cid: 'rf-' + coinBase.toLowerCase() + '-' + Date.now().toString(36) }, { startAtBid: true });   // step 1 refused with nothing filled -> throws venue_refused -> the K1 restore, as #511
+        // #573 (senior first pass on 558, desk #33 msg 382; Bryan 6 Oct): (A) #511 confirmed zero fill and a dead order, so nothing
+        // is on the book: aeOrderSent goes back to false and onSend sets it again just before the chase's first order - a throw
+        // before that (no cost floor, a DB error) now restores the trail (K1) instead of leaving the position unprotected.
+        // (B) the chase's only line is the COST FLOOR (Bryan: "Cost floor only"): peak 0 means no give-up line, so a trail of 25%
+        // or wider can still sell at the bid. (C) the message is not awaited before the first limit.
+        aeOrderSent = false;
+        const wanted = sellQty;
+        sendTelegram('⚠️ <b>Revolut X cancelled the market sell of ' + coinBase + '</b> (' + escTg(String(mkErr.message || 'slippage protection').slice(0, 100)) + ') - nothing sold. Chasing with limits from the bid instead (never below your cost floor).').catch(() => {});
+        const ch = await spikeChase(symbol, coinBase, sellQty, { peak: 0, cid: 'rf-' + coinBase.toLowerCase() + '-' + Date.now().toString(36) }, { startAtBid: true, onSend: () => { aeOrderSent = true; } });   // step 1 refused with nothing filled -> throws venue_refused -> the K1 restore, as #511
         aeLim = ch; aeRefusedChase = true;
         await sendTelegram(spikeChaseText(coinBase, wanted, ch)).catch(() => {});
         if (ch.stopped === 'cancel_failed' || ch.stopped === 'error') {   // as the spike branch (A3 / S2-1): an order may be resting - loop state can no longer be trusted
@@ -18727,6 +18733,28 @@ async function handleTrailingStopAlert(symbol, currentPrice, ts, exchange = 'rev
         // dust / no_position), so a floor-blocked Kraken trail re-anchors here too instead of being removed.
         if (ae93Result && ae93Result.reason === 'paused') { analysisRateLimit.delete(symbol + '_executed'); await restoreTrailingStop(symbol, ae93Saved).catch(() => {}); return; }   // #F1 hold / #F4 restore as-is
         if (ae93Result && ae93Result.executed === true) { venueBackoffClear(ae93Exchange); _presendRetry.delete(symbol); }   // #K1
+        // #573 (Bryan 6 Oct "Yes, re-trail the rest"): a refused-market chase that sold only part of a HAND-SET trail's sale puts the
+        // same trail back on the coin from here, so the rest is not left unprotected. Not after cancel_failed/error (an order may be
+        // resting - a second sale could double-sell) and not on a pump-loop coin (the loop is in its buy-back phase; Fable 558).
+        if (ae93Result && ae93Result.executed === true && ae93Result.refused_market_chase && ae93Result.chase && Number(ae93Result.chase.left) > 0
+            && ['floor', 'give_up', 'steps', 'no_price', 'refused'].includes(ae93Result.chase.stopped)) {
+          // Fable C1: an unreadable loop check fails safe (no second trail on a possible loop coin) but SAYS so; C2: anchor at the lower
+          // of the breach price and the chase's average fill - the chase walked the bid down, so a stop from the breach price could sit
+          // above the market and re-fire at once.
+          const loopRead = await db.execute('SELECT 1 FROM pump_armed_rules WHERE symbol = ? AND active = 1 LIMIT 1', [symbol]).then(([r]) => (r.length > 0 ? 'loop' : 'hand')).catch(() => 'unreadable');
+          const leftTxt = Number(Number(ae93Result.chase.left).toPrecision(8));
+          if (loopRead === 'unreadable') {
+            console.error('[trailing] #573 ' + coinBase + ' partial refused-market chase - loop check unreadable, no re-trail');
+            await sendTelegram('⚠️ ' + coinBase + ': ' + leftTxt + ' did not sell in the chase and the check for a pump loop could not be read, so NO trailing stop was put back on the rest - set one by hand.').catch(() => {});
+          } else if (loopRead === 'hand') {
+            const anchor = Math.min(currentPrice, Number(ae93Result.price) > 0 ? Number(ae93Result.price) : currentPrice);
+            try {
+              await setTrailingStop(symbol, ts.trailPct, anchor, ts.entryPrice, ts.autoExecute, ts.sellPct, ts.exchange, ts.source || null);
+              await sendTelegram('🛡️ <b>' + coinBase + '</b>: ' + leftTxt + ' did not sell in the chase - the ' + ts.trailPct + '% trailing stop is back on, anchored at $' + fmtPriceShort(anchor) + ' (the lower of the breach price and the chase average fill).').catch(() => {});
+              console.log('[trailing] #573 ' + coinBase + ' partial refused-market chase - trail re-set from ' + anchor + ' for the remainder');
+            } catch (e) { console.error('[trailing] #573 re-trail failed:', e.message); await sendTelegram('⚠️ ' + coinBase + ': part of the sale did not fill and the trailing stop could NOT be put back (' + escTg(e.message) + ') - set one by hand.').catch(() => {}); }
+          }
+        }
         if (ae93Result && ae93Result.reason === 'error') {   // #K1 (b)
           const k1Definitive = isDefinitiveVenueRejection(ae93Exchange, ae93Result);
           if (!ae93Result.order_sent || k1Definitive || isVenueRefusal(ae93Exchange, ae93Result)) {
