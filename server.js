@@ -2658,6 +2658,7 @@ await db.execute(`CREATE TABLE IF NOT EXISTS spec_messages (
   id INT AUTO_INCREMENT PRIMARY KEY, spec_id INT NOT NULL, author VARCHAR(16) NOT NULL, kind VARCHAR(12) NOT NULL, body MEDIUMTEXT NOT NULL, data JSON NULL,
   model VARCHAR(40) NULL, tokens_in INT NULL, tokens_out INT NULL, cost_usd DECIMAL(10,6) NULL, at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, INDEX idx_spec (spec_id, id), INDEX idx_at (at)
 )`).catch(e => console.error('[migration] spec_messages:', e.message));
+await safeAddColumn('senior_queue', 'task_id', 'INT NULL').catch(e => console.error('[migration] senior_queue.task_id:', e.message));   // #578 desk #52 batch D: an opinion that answers a task
 await db.execute("CREATE TABLE IF NOT EXISTS senior_queue (id INT AUTO_INCREMENT PRIMARY KEY, spec_id INT NOT NULL, job VARCHAR(8) NOT NULL, ref_msg_id INT NULL, question TEXT NULL, status VARCHAR(8) NOT NULL DEFAULT 'queued', cost_usd DECIMAL(10,6) NULL, msg_id INT NULL, error VARCHAR(300) NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, started_at DATETIME NULL, done_at DATETIME NULL, INDEX idx_status (status, id))").catch(e => console.error('[migration] senior_queue:', e.message));   // #D5 the senior agent's work queue
 setTimeout(() => { specImportAgentRequests().then(n => { if (n) console.log('[desk] #D1 imported ' + n + ' agent request(s) into the inbox'); }).catch(e => console.error('[desk] import failed:', e.message)); }, 45 * 1000);
 await db.execute('CREATE TABLE IF NOT EXISTS portfolio_value_1m (ts INT UNSIGNED NOT NULL PRIMARY KEY, total_usd DECIMAL(16,4) NOT NULL, coins_usd DECIMAL(16,4) NOT NULL, cash_usd DECIMAL(16,4) NOT NULL, rx_usd DECIMAL(16,4) NULL, kraken_usd DECIMAL(16,4) NULL, tangem_usd DECIMAL(16,4) NULL, partial TINYINT(1) NOT NULL DEFAULT 0)').catch(e => console.error('[migration] portfolio_value_1m:', e.message));   // #PV1 whole-book value, one row a minute
@@ -11087,14 +11088,48 @@ async function handleSeniorCommand(sub, reply) {
     (qs.length ? '\n\nQueue:\n' + qs.map(x => 'job ' + x.id + ': #' + x.spec_id + ' ' + escTg(String(x.title || '').slice(0, 50)) + ' - ' + x.job + ', ' + x.status).join('\n') : '\n\nNothing queued.') +
     '\n\n<code>/senior cap 5</code> · <code>/senior cancel 10</code>');
 }
+// ── #578 THE SENIOR AGENT TAKES TASKS (desk #52 batch D; Bryan 6 Oct D1) ────────────────────────────────────────────────────────────
+// A task with owner fable_agent, from a Claude thread, is a SECOND OPINION on a desk spec: the task must name the spec (#NN or desk NN).
+// It is queued as an 'opinion' job (the same advisory first pass as spec_desk second_opinion - never a verdict, never Fable's messages)
+// when no other senior job is waiting, and the senior message is written to the task as its result, with its cost. The senior agent's
+// own $2 a day and per-review cap apply as now; the team cap refuses the task (blocked, one line a day); /team off parks it; the
+// senior switch off (/senior off) answers it 'blocked'. The trader takes no tasks; nothing here places, cancels or sizes an order.
+const FABLE_TASK = { from: ['claude_pm', 'claude_dev', 'fable'] };
+async function fableAgentTaskTick(cfg) {
+  const [t] = await db.execute("SELECT id, ts, created_by, title, note FROM pm_handovers WHERE kind = 'task' AND owner = 'fable_agent' AND state = 'open' ORDER BY id ASC LIMIT 1").catch(() => [[]]);
+  if (!t.length) return { idle: true };
+  const task = t[0], end = (state, result) => teamResult({ as: 'fable_agent', id: task.id, state, result }, { internal: true });
+  if (!FABLE_TASK.from.includes(task.created_by)) { await end('declined', 'The senior agent takes tasks from the PM thread, the Dev thread and Fable only (desk #52).'); return { task: task.id, declined: 'from ' + task.created_by }; }
+  const tc = await teamCfg();
+  if (!tc.tasks) return { task: task.id, parked: tc.unreadable ? 'team settings unreadable' : '/team off' };   // stays open
+  if (!cfg.senior_enabled) { await end('blocked', 'Not answered: the senior agent is switched off (/senior on) and takes no tasks while it is off.'); return { task: task.id, blocked: 'senior off' }; }
+  const m = /(?:desk\s*#?\s*|#)(\d{1,6})\b/i.exec(String(task.title) + '\n' + String(task.note));   // the spec the opinion is about
+  const spec = m ? await specGet(Number(m[1])).catch(() => null) : null;
+  if (!spec) { await end('declined', 'A second opinion is given on a desk spec: name it in the task (#NN or desk NN)' + (m ? ' - there is no spec #' + m[1] : '') + '.'); return { task: task.id, declined: 'no spec' }; }
+  const cap = await teamCapCheck(Number(cfg.senior_per_review_cap_usd) || 1, tc);
+  if (!cap.ok) { await end('blocked', 'Not answered: ' + cap.why + '. Set it again after midnight London, or Bryan can raise it (/team cap).'); await teamCapTell(cap.why); return { task: task.id, blocked: 'team cap' }; }
+  const cl = await teamClaim({ as: 'fable_agent', id: task.id }, { internal: true });
+  if (!cl.ok) return { task: task.id, skipped: cl.error };
+  const q = ('Task ' + task.id + ' from ' + (TEAM_NAMES[task.created_by] || task.created_by) + ': ' + String(task.title) + '\n' + String(task.note)).slice(0, 4000);
+  const [r] = await db.execute("INSERT INTO senior_queue (spec_id, job, ref_msg_id, question, task_id, status) VALUES (?, 'opinion', NULL, ?, ?, 'queued')", [spec.id, q, task.id]);
+  setTimeout(() => seniorTick().catch(e => console.error('[senior] tick:', e.message)), 3000);
+  console.log('[senior] #578 task ' + task.id + ' queued as opinion job ' + r.insertId + ' on spec #' + spec.id);
+  return { task: task.id, queued: Number(r.insertId), spec: spec.id };
+}
+async function fableAgentTaskAnswer(taskId, specId, r) {   // the senior message, trimmed, becomes the task's result
+  const [m] = await db.execute('SELECT body FROM spec_messages WHERE id = ?', [r.msg_id]);
+  const body = m.length ? String(m[0].body) : '(the senior message could not be read back)';
+  const text = (body.length > 3600 ? body.slice(0, 3600) + '\n…(cut)' : body) + '\n\nAdvisory first pass (' + r.verdict + ') on desk #' + specId + ' - not a verdict; Fable decides. Full text: /desk.';
+  await teamResult({ as: 'fable_agent', id: taskId, state: 'done', result: text, cost_usd: r.usd }, { internal: true });
+}
 async function seniorTick() {
   if (_seniorBusy) return { skipped: 'busy' };
   _seniorBusy = true;
   try {
     const cfg = await specAiCfg();
-    if (!cfg.senior_enabled) return { skipped: 'disabled' };
-    const [rows] = await db.execute("SELECT id, spec_id, job, ref_msg_id, question FROM senior_queue WHERE status = 'queued' ORDER BY id LIMIT 1");
-    if (!rows.length) return { idle: true };
+    if (!cfg.senior_enabled) { await fableAgentTaskTick(cfg).catch(e => console.error('[senior] #578 task tick:', e.message)); return { skipped: 'disabled' }; }   // #578 a task for an off agent is answered 'blocked', not left forever
+    const [rows] = await db.execute("SELECT id, spec_id, job, ref_msg_id, question, task_id FROM senior_queue WHERE status = 'queued' ORDER BY id LIMIT 1");
+    if (!rows.length) return await fableAgentTaskTick(cfg);   // #578 no job waiting: one task
     const q = rows[0], spent = await seniorSpend();
     if (spent >= cfg.senior_daily_cap_usd) {
       await seniorCapNotice(spent, cfg).catch(e => console.error('[senior] cap notice:', e.message));   // #B30 never silent
@@ -11108,11 +11143,13 @@ async function seniorTick() {
       const r = await seniorReview(spec, q, cfg);
       await db.execute("UPDATE senior_queue SET status = 'done', done_at = NOW(), cost_usd = ?, msg_id = ? WHERE id = ?", [r.usd.toFixed(6), r.msg_id, q.id]);
       await sendTelegram('🧑‍⚖️ <b>No reply needed</b> - senior first pass on <b>#' + spec.id + '</b> ' + escTg(spec.title) + '\n' + escTg(q.job) + ': <b>' + r.verdict + '</b>' + (r.amendments ? ' · ' + r.amendments + ' amendment' + (r.amendments > 1 ? 's' : '') + (r.blockers ? ' (' + r.blockers + ' blocker' + (r.blockers > 1 ? 's' : '') + ')' : '') : '') +
-        ' · $' + r.usd.toFixed(2) + '\nFor the Dev thread and Fable (their call): the Dev thread answers it, Fable decides. Full text: /desk.').catch(() => {});
-      return { done: q.id, verdict: r.verdict };
+        ' · $' + r.usd.toFixed(2) + '\nFor the Dev thread and Fable (their call): the Dev thread answers it, Fable decides. Full text: /desk.' + (q.task_id ? '\nAnswers task ' + q.task_id + '.' : '')).catch(() => {});
+      if (q.task_id) await fableAgentTaskAnswer(q.task_id, spec.id, r).catch(e => console.error('[senior] #578 task result:', e.message));   // #578
+      return { done: q.id, verdict: r.verdict, task: q.task_id || undefined };
     } catch (e) {
       await db.execute("UPDATE senior_queue SET status = 'failed', done_at = NOW(), error = ? WHERE id = ?", [String(e.message).slice(0, 300), q.id]).catch(() => {});
       if (spec) await specNote(spec.id, 'Senior first pass (' + q.job + ') failed: ' + String(e.message).slice(0, 200)).catch(() => {});
+      if (q.task_id) await teamResult({ as: 'fable_agent', id: q.task_id, state: 'blocked', result: 'Not answered: the senior agent\'s run failed (' + String(e.message).slice(0, 200) + ').' }, { internal: true }).catch(() => {});   // #578
       return { failed: q.id, error: e.message };
     }
   } finally { _seniorBusy = false; }
@@ -11251,6 +11288,7 @@ setTimeout(() => { db.execute("UPDATE pm_handovers SET state = 'open' WHERE kind
   specWorkerTick().catch(e => console.error('[desk] worker:', e.message)); setInterval(() => specWorkerTick().catch(e => console.error('[desk] worker:', e.message)), 2 * 60 * 1000); console.log('[desk] #D2/#D3 spec assistants on (one step every 2 min)'); }, 90 * 1000);
 setTimeout(async () => {   // #D5 a job left 'running' by a restart goes back in the queue, then one job every 2 min
   await db.execute("UPDATE senior_queue SET status = 'queued' WHERE status = 'running'").catch(() => {});
+  await db.execute("UPDATE pm_handovers h SET h.state = 'open' WHERE h.kind = 'task' AND h.owner = 'fable_agent' AND h.state = 'claimed' AND NOT EXISTS (SELECT 1 FROM senior_queue q WHERE q.task_id = h.id AND q.status IN ('queued', 'running'))").catch(() => {});   // #578
   const t = () => seniorTick().then(r => { if (r && (r.done || r.failed)) console.log('[senior] #D5 ' + JSON.stringify(r)); }).catch(e => console.error('[senior] tick:', e.message));
   t(); setInterval(t, 2 * 60 * 1000); console.log('[senior] #D5 senior agent on (advisory first pass; one job every 2 min)');
 }, 100 * 1000);
