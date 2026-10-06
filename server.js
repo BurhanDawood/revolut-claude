@@ -18569,7 +18569,7 @@ async function autoExecuteSell(symbol, maxPct, analysis, confidence, opts = {}) 
         console.log(`[auto-exec] Stage 3 single-rebuy cascade spawned for pump-armed ${coinBase} after sell`);
       }
     } catch (e) { console.error('[auto-exec] Stage 3 cascade error (non-fatal):', e.message); }
-    return { executed: true, qty: sellQty, price: currentPrice, client_order_id: aeOrder && aeOrder.client_order_id, journal_id: aeRevIns && aeRevIns.insertId, chase: opts.chase || aeRefusedChase ? aeLim : undefined, refused_market_chase: aeRefusedChase || undefined }; // #309 #359 #B23 #558
+    return { executed: true, qty: sellQty, price: currentPrice, client_order_id: aeOrder && aeOrder.client_order_id, journal_id: aeRevIns && aeRevIns.insertId, chase: opts.chase || aeRefusedChase ? aeLim : undefined, refused_market_chase: aeRefusedChase || undefined, position_before: aeRefusedChase ? currentQty : undefined };   // #574 position_before // #309 #359 #B23 #558
   } catch (e) {
     console.error('[auto-exec] sell error:', e.message);
     if (e.venue_refused) { const lastR = _aeRefusedTold.get(coinBase) || 0; if (Date.now() - lastR > 10 * 60000) { _aeRefusedTold.set(coinBase, Date.now()); await sendTelegram('⚠️ AUTO-EXEC: ' + coinBase + ' sale not placed - ' + String(e.message || '').slice(0, 300) + ' The trailing stop is put back and it retries; nothing was sold.').catch(() => {}); } }   // #511 a venue refusal: no 'manual review', one line per coin per 10 min
@@ -18748,9 +18748,15 @@ async function handleTrailingStopAlert(symbol, currentPrice, ts, exchange = 'rev
             await sendTelegram('⚠️ ' + coinBase + ': ' + leftTxt + ' did not sell in the chase and the check for a pump loop could not be read, so NO trailing stop was put back on the rest - set one by hand.').catch(() => {});
           } else if (loopRead === 'hand') {
             const anchor = Math.min(currentPrice, Number(ae93Result.price) > 0 ? Number(ae93Result.price) : currentPrice);
+            // #574 (Bryan 6 Oct 18:13, Fable's 573 question): the new trail sells exactly what did NOT sell - the unfilled part of the
+            // sale the trail was set for - not the original % of the smaller balance (too much) and not the whole rest (sells what was
+            // meant to be kept). As a % of the balance after the sale; a 100% trail stays 100%. An unknown balance
+            // keeps the original %.
+            const posAfter = Number(ae93Result.position_before) - Number(ae93Result.chase.filled_qty || 0);
+            const rePct = posAfter > 0 ? Math.min(100, Math.max(0.01, Number((Number(ae93Result.chase.left) / posAfter * 100).toFixed(4)))) : ts.sellPct;
             try {
-              await setTrailingStop(symbol, ts.trailPct, anchor, ts.entryPrice, ts.autoExecute, ts.sellPct, ts.exchange, ts.source || null);
-              await sendTelegram('🛡️ <b>' + coinBase + '</b>: ' + leftTxt + ' did not sell in the chase - the ' + ts.trailPct + '% trailing stop is back on, anchored at $' + fmtPriceShort(anchor) + ' (the lower of the breach price and the chase average fill).').catch(() => {});
+              await setTrailingStop(symbol, ts.trailPct, anchor, ts.entryPrice, ts.autoExecute, rePct, ts.exchange, ts.source || null);
+              await sendTelegram('🛡️ <b>' + coinBase + '</b>: ' + leftTxt + ' did not sell in the chase - the ' + ts.trailPct + '% trailing stop is back on for that amount only (' + Number(rePct.toFixed(2)) + '% of what you now hold), anchored at $' + fmtPriceShort(anchor) + ' (the lower of the breach price and the chase average fill).').catch(() => {});
               console.log('[trailing] #573 ' + coinBase + ' partial refused-market chase - trail re-set from ' + anchor + ' for the remainder');
             } catch (e) { console.error('[trailing] #573 re-trail failed:', e.message); await sendTelegram('⚠️ ' + coinBase + ': part of the sale did not fill and the trailing stop could NOT be put back (' + escTg(e.message) + ') - set one by hand.').catch(() => {}); }
           }
