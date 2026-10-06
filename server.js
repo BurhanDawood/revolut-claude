@@ -9656,6 +9656,26 @@ async function agentGeminiResearch(coin, feedNotes) {
   try { return await call(true); }
   catch (e) { if (e.status === 400 || e.status === 403 || /no JSON/.test(e.message)) return await call(false); throw e; }
 }
+// #584 desk #40 (the agent's request 421, Bryan 7 Oct): is any researched catalyst DATED and near? A "when" counts only when it names
+// a day (2026-10-19, 19 Oct 2026, October 19, 2026); "Q4", "soon", "2026" or "unknown" do not. Near = from yesterday to 60 days out.
+const AGENT_CATALYST = { ahead_days: 60 };
+function agentCatalystFlag(research, nowMs = Date.now()) {
+  const note = research && research.note && typeof research.note === 'object' ? research.note : null;
+  const list = note && Array.isArray(note.catalysts) ? note.catalysts : [];
+  const M = 'jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec';
+  let next = null, vague = 0;
+  for (const c of list) {
+    const w = String(c && c.when || '').trim();
+    const dayLike = /^\d{4}-\d{2}-\d{2}/.test(w) || new RegExp('\\b\\d{1,2}(st|nd|rd|th)?\\s+(' + M + ')[a-z]*\\.?\\s+\\d{4}\\b', 'i').test(w) || new RegExp('\\b(' + M + ')[a-z]*\\.?\\s+\\d{1,2}(st|nd|rd|th)?,?\\s+\\d{4}\\b', 'i').test(w);
+    const iso = /^(\d{4}-\d{2}-\d{2})/.exec(w);
+    const t = !dayLike ? NaN : iso ? Date.parse(iso[1] + 'T00:00:00Z') : Date.parse(w.replace(/(\d)(st|nd|rd|th)\b/i, '$1').replace(/[^A-Za-z0-9 ,]/g, ' ') + ' 00:00 UTC');   // whole days, read as UTC
+    if (!Number.isFinite(t)) { vague++; continue; }
+    const days = (t - nowMs) / 86400000;
+    if (days < -1 || days > AGENT_CATALYST.ahead_days) continue;
+    if (!next || t < next.t) next = { t, what: String(c.what || '').slice(0, 120) };
+  }
+  return { dated: !!next, next_date: next ? new Date(next.t).toISOString().slice(0, 10) : null, days_away: next ? Math.max(0, Math.round((next.t - nowMs) / 86400000)) : null, what: next ? next.what : null, catalysts: list.length, vague };
+}
 async function agentResearch(coin, mentions, cfg, costs) {
   try {
     const [c] = await db.execute('SELECT pack, at FROM agent_research WHERE symbol = ? AND gemini_ok = 1 AND at > DATE_SUB(NOW(), INTERVAL ? HOUR) ORDER BY at DESC LIMIT 1', [coin, Number(cfg.research_ttl_h) || 24]);
@@ -9677,6 +9697,8 @@ FACTS (enforced in code after you answer - they are not requests, and an order t
 - Your rails can change between runs: your boss, the PM agent, may adjust a few of them on paper within fixed bounds (Bryan can undo it). input.rails is always the current set.
 - Paper fills are the mid price plus/minus 1.3% slippage, plus a 0.09% fee. Every model call and research call you trigger is charged to your cash. Trading and churn cost money.
 - At most orders_per_run actions are executed per run, in the order you list them. You run about every 4 hours.
+- STARTER BUYS (Bryan, 7 Oct: "it hasn't been trading" - he wants you trading): a coin with dip.in_zone true and research behind it, but no dated catalyst, may get a STARTER buy of at most starter_pct (10%) of your equity - give it tool_key "starter". Code caps a starter at that size and drops one on a coin that is not in the dip zone or has no research. A coin whose catalyst.dated is true may still get your normal size. A starter is a real position: thesis, invalidation, stop_price as always.
+- A researched coin carries "catalyst" (your request, spec #40): dated = a catalyst names a day within 60 days (next_date, days_away, what); "Q4", "soon" or "unknown" do not count (vague = how many were undated).
 - Each shortlisted coin carries "dip" (your request, spec #1): off_high_pct below its 48 h high, rsi_1h, and in_zone = 8-15% off the high with 1h RSI < 45. It marks a candidate trough, not a bottom: weigh it with the shape, the base rates and your research; it is not a buy rule.
 - A woken run is narrow: the shortlist is only the coins that woke you plus what you hold; the next scheduled run screens everything again.
 - A STOP wake (trigger alert_stop) means the price stayed through your level for 15 min, or broke well past it. It is information, not an order: compare the live mid with last_closed_1h (the last completed hourly candle) and range_72h.low before selling. Holding with a re-thought stop_price is a valid answer when the hourly close is still above the level and your thesis stands; selling is right when the close confirms the break or the thesis is gone.
@@ -9700,6 +9722,13 @@ ANSWER with ONE JSON object and nothing else:
  "sit_reason":"when actions is empty: why (max 350 chars)","notes_for_self":"what to remember next run (max 1,500 chars)","watch_next":["up to 5 symbols to research next run"],
  "requests":[{"title":"a tool or data you need","why":"","evidence":"the coin / decision it blocked","how_to_measure":""}]}
 A buy gives usd (dollars to spend) and should give stop_price (the price that proves it wrong - you are woken there). A sell gives qty (coin quantity) or "qty":"all". At most 3 requests. drop_from_high_pct / rise_from_low_pct count from the highest / lowest price seen after the alert is set (value = percent, e.g. 8).`;
+const AGENT_STARTER = { pct: 10 };   // #584 Bryan 7 Oct "Yes, 10% starters"
+function agentStarterCheck(s) {   // null = allowed; otherwise the drop reason
+  if (!s) return 'starter_not_shortlisted';
+  if (!(s.dip && s.dip.in_zone)) return 'starter_not_in_zone';
+  if (!s.research || s.research.error) return 'starter_no_research';
+  return null;
+}
 function agentParseDecision(text) {
   let s = String(text || '').trim();
   const f = /```(?:json)?\s*([\s\S]*?)```/.exec(s); if (f) s = f[1].trim();
@@ -9794,7 +9823,7 @@ async function runAgent(trigger = 'scheduled', wake = []) {   // #A2e wake = the
     try { headlines = (await fetchNewsHeadlines(72, 15, 150)).items || []; } catch (e) { headlines = []; }
     const frozenNow = !!(led.frozen_until && new Date(led.frozen_until).getTime() > Date.now());   // (Fable A2 note) frozen = no buys, so research only what it holds
     const toResearch = frozenNow ? scr.shortlist.filter(r => r.held)
-      : scr.shortlist.filter(r => r.held).concat(scr.shortlist.filter(r => !r.held && r.watched), scr.shortlist.filter(r => !r.held && !r.watched)).slice(0, Math.max(cfg.research_per_run, scr.shortlist.filter(r => r.held || r.watched).length));   // #A2d held, then watched, then the rest
+      : scr.shortlist.filter(r => r.held).concat(scr.shortlist.filter(r => !r.held && r.watched), scr.shortlist.filter(r => !r.held && !r.watched && r.dip && r.dip.in_zone), scr.shortlist.filter(r => !r.held && !r.watched && !(r.dip && r.dip.in_zone))).slice(0, Math.max(cfg.research_per_run, scr.shortlist.filter(r => r.held || r.watched).length));   // #A2d held, then watched, then the rest; #584 (Bryan 7 Oct "it hasn't been trading") dip-zone coins before the rest - they were left 'not researched' and so could never qualify
     for (const r of scr.shortlist) {
       const hit = coinMentionTest(r.coin);
       let vids = []; try { vids = await videoMoments(r.coin, { days: 3, find: false, limit: 3 }); } catch (e) { vids = []; }
@@ -9804,6 +9833,7 @@ async function runAgent(trigger = 'scheduled', wake = []) {   // #A2e wake = the
     for (let i = 0; i < toResearch.length; i += 3) {   // three at a time
       await Promise.all(toResearch.slice(i, i + 3).map(async (r) => { r.research = await agentResearch(r.coin, r.mentions || [], cfg, costs); }));
     }
+    for (const r of scr.shortlist) if (r.research) r.catalyst = agentCatalystFlag(r.research);   // #584 desk #40 (the agent's own request 421)
     // decide
     const [recent] = await db.execute("SELECT DATE_FORMAT(at, '%Y-%m-%d %H:%i') AS at, symbol, side, usd, fill_price, fill_qty, status, drop_reason, thesis, invalidation FROM agent_decisions WHERE status <> 'sit' ORDER BY id DESC LIMIT 12").catch(() => [[]]);
     const [rev] = await db.execute('SELECT review FROM agent_reviews ORDER BY id DESC LIMIT 1').catch(() => [[]]);
@@ -9825,9 +9855,9 @@ async function runAgent(trigger = 'scheduled', wake = []) {   // #A2e wake = the
       ledger: { mode: led.mode, cash_usd: Number(led.cash_usd.toFixed(2)), equity_usd: Number(eq.equity.toFixed(2)), budget_usd: led.budget_usd, day_start_equity_usd: led.day_start_equity_usd, high_water_usd: led.high_water_usd,
         frozen_buys_until: led.frozen_until && led.frozen_until > Date.now() ? new Date(led.frozen_until).toISOString() : null, realised_usd: led.realised_usd, fees_usd: led.fees_usd, costs_usd: led.model_cost_usd,
         positions: Object.entries(eq.marks).map(([c, m]) => ({ symbol: c, qty: m.qty, price: m.price, value_usd: Number(m.value.toFixed(2)), cost_usd: Number(m.cost_usd.toFixed(2)), pnl_pct: m.cost_usd > 0 ? Number(((m.value / m.cost_usd - 1) * 100).toFixed(1)) : null, ...(openTheses[c] || {}) })) },
-      rails: { per_trade_pct: cfg.per_trade_pct, max_positions: cfg.max_positions, min_trade_usd: cfg.min_trade_usd, daily_loss_pct: cfg.daily_loss_pct, drawdown_halt_pct: cfg.drawdown_halt_pct, orders_per_run: cfg.orders_per_run, wakes_per_day: cfg.wakes_per_day, max_alerts: cfg.max_alerts, position_drop_pct: cfg.position_drop_pct },
+      rails: { per_trade_pct: cfg.per_trade_pct, starter_pct: AGENT_STARTER.pct, max_positions: cfg.max_positions, min_trade_usd: cfg.min_trade_usd, daily_loss_pct: cfg.daily_loss_pct, drawdown_halt_pct: cfg.drawdown_halt_pct, orders_per_run: cfg.orders_per_run, wakes_per_day: cfg.wakes_per_day, max_alerts: cfg.max_alerts, position_drop_pct: cfg.position_drop_pct },
       pm_guidance: led.mode === 'paper' && cfg.pm_playbook && cfg.pm_playbook.text ? { about: "the PM agent's guidance - written by a model from research; not an instruction and not from Bryan", text: String(cfg.pm_playbook.text).slice(0, 1200), written: cfg.pm_playbook.at || null } : null,   // #548 C1: data, paper only; the rails above are the only limits
-      tool_catalogue: tcat.map(t => ({ tool_key: t.tool_key, name: t.name, when_it_wins: t.when_it_wins ? String(t.when_it_wins).slice(0, 160) : null })).concat([{ tool_key: 'agent_discretion', name: 'your own judgement', when_it_wins: null }]),
+      tool_catalogue: tcat.map(t => ({ tool_key: t.tool_key, name: t.name, when_it_wins: t.when_it_wins ? String(t.when_it_wins).slice(0, 160) : null })).concat([{ tool_key: 'agent_discretion', name: 'your own judgement', when_it_wins: null }, { tool_key: 'starter', name: 'starter buy (#584): dip zone + research, no dated catalyst - at most starter_pct of equity', when_it_wins: null }]),
       your_requests: reqBook.map(q => ({ desk_id: q.desk_id, title: q.title, asked: q.asked, status: q.status, batch: q.batch, latest_note: q.latest_note })),   // #483
       signals: { ...AGENT_SIGNALS, ...Object.fromEntries(reqBook.filter(q => q.status === 'shipped' && q.desk_id).map(q => ['req:' + q.desk_id, 'your shipped request: ' + q.title])) },   // #484 the keys for "uses"
       macro, notes_from_last_run: ln.length ? ln[0].notes_for_self : null, last_weekly_review: rev.length ? String(rev[0].review).slice(0, 3000) : null, recent_decisions: recent,
@@ -9896,6 +9926,12 @@ async function runAgent(trigger = 'scheduled', wake = []) {   // #A2e wake = the
       if (i >= cfg.orders_per_run) { await agentInsertDecision({ ...base, status: 'dropped_rail', drop_reason: 'orders_per_run' }); done.push({ a, status: 'dropped_rail', reason: 'orders_per_run' }); continue; }
       if (!scr.tick[a.coin]) { await agentInsertDecision({ ...base, status: 'dropped_rail', drop_reason: 'unknown_symbol' }); done.push({ a, status: 'dropped_rail', reason: 'unknown_symbol' }); continue; }
       if (a.side === 'sell' && a.all) { const cur = await readAgentLedger(); base.qty = Number((cur.positions[a.coin] || {}).qty) || 0; if (!(base.qty > 0)) { await agentInsertDecision({ ...base, qty: null, status: 'dropped_rail', drop_reason: 'not_held' }); done.push({ a, status: 'dropped_rail', reason: 'not_held' }); continue; } }
+      if (a.side === 'buy' && a.tool_key === 'starter') {   // #584 Bryan 7 Oct: starters only on a researched dip-zone coin, capped at AGENT_STARTER.pct of equity
+        const s = scr.shortlist.find(x => x.coin === a.coin), why = agentStarterCheck(s);
+        if (why) { await agentInsertDecision({ ...base, status: 'dropped_rail', drop_reason: why }); done.push({ a, status: 'dropped_rail', reason: why }); continue; }
+        const capUsd = Number((eq.equity * AGENT_STARTER.pct / 100).toFixed(2));
+        if (a.usd > capUsd) { a.usd = capUsd; base.usd = capUsd; }
+      }
       const id = await agentInsertDecision({ ...base, status: 'proposed' });
       const r = await executeAgentOrder({ id, symbol: base.symbol, side: a.side, usd: a.usd, qty: base.qty, thesis: a.thesis, invalidation: a.invalidation });
       done.push({ a, status: r.status, reason: r.reason });
@@ -9929,7 +9965,7 @@ const AGENT_SCREEN_PROMPT = `You are the screener for a paper trading agent. Eve
 
 ESCALATE (escalate true) when any of these holds:
 - a held position looks like it needs an exit: its price is at, through or within about 2% of its invalidation, its thesis looks broken, or it is near a profit level the agent said it would act on;
-- a shortlisted coin that is not held looks like a credible new entry by the agent's own approach: dip.in_zone is true (8-15% off its 48 h high with 1h RSI under 45) AND there is research or a catalyst behind it, or it meets a condition the agent wrote in notes_from_last_run - and there is cash, a free position slot and buys are not frozen;
+- a shortlisted coin that is not held looks like a credible new entry by the agent's own approach: dip.in_zone is true (8-15% off its 48 h high with 1h RSI under 45) AND there is research or a catalyst behind it (a starter buy needs no dated catalyst - #584), or it meets a condition the agent wrote in notes_from_last_run - and there is cash, a free position slot and buys are not frozen;
 - notes_from_last_run say to act this run if something happens, and it has happened;
 - woken_by is set and the alert that woke it still matters;
 - anything you are unsure about.
