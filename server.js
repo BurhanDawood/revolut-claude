@@ -20,6 +20,25 @@ import { gzipSync, gzip } from 'zlib';
 const zLoose = (schema) => z.preprocess((v) => { if (typeof v === 'string') { try { return JSON.parse(v); } catch (e) { return v; } } return v; }, schema);
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY, defaultHeaders: { 'Accept-Encoding': 'identity' } });
+// #572 (Fable 6 Oct, desk #51 side finding; Bryan 6 Oct "Yes, add it"): the API credit ran out 4-5 Oct for ~4 h with no word - an
+// agent run was skipped and a desk review died. Every call is watched (the returned promise is untouched): the first
+// "credit balance is too low" sends one Telegram line; the next successful call sends one "back" line.
+let _anthCreditOut = null;
+{
+  const _anthCreate = anthropic.messages.create.bind(anthropic.messages);
+  anthropic.messages.create = function (...args) {
+    const p = _anthCreate(...args);
+    p.then(() => {
+      if (_anthCreditOut) { const mins = Math.round((Date.now() - _anthCreditOut) / 60000); _anthCreditOut = null; console.log('[anthropic] #572 credit back after ' + mins + ' min'); sendTelegram('\u2705 Anthropic API credit is working again (out for about ' + mins + ' min).').catch(() => {}); }
+    }, (e) => {
+      if (!_anthCreditOut && /credit balance is too low/i.test(String(e && e.message))) {
+        _anthCreditOut = Date.now(); console.error('[anthropic] #572 credit balance too low');
+        sendTelegram('\u26a0\ufe0f <b>Anthropic API credit has run out.</b> Claude calls are failing (the paper agent, reviews, analysis) until credit is added at console.anthropic.com > Plans &amp; Billing. One message until it works again.').catch(() => {});
+      }
+    });
+    return p;
+  };
+}
 
 // FIX 3: Verify API key present at startup
 if (!process.env.ANTHROPIC_API_KEY) {
@@ -9474,7 +9493,7 @@ async function agentStatusText() {
 // Paper only: runAgent refuses any mode but 'paper', and executeAgentOrder (A1) is its only route to a fill. Every run is
 // recorded in agent_decisions (a 'sit' row when it does nothing); model and research costs are charged to the agent's cash.
 const AGENT_SKIP = new Set(['USD', 'USDT', 'USDC', 'EUR', 'GBP', 'DAI', 'TUSD', 'PYUSD', 'FDUSD', 'USDE', 'EURC', 'USDP', 'BUSD', 'USDS', 'RLUSD', 'EURT', 'XAUT', 'PAXG']);
-const AGENT_A2_DEFAULTS = { daily_fetch_per_run: 40, research_per_run: 8, gemini_call_usd: 0.035, candle_pace_ms: 350, model_timeout_ms: 150000, max_tokens: 9000, gemini_plain_usd: 0.003, wakes_per_day: 6, wake_cooldown_min: 30, max_alerts: 8, position_drop_pct: 8 };   // #A2e wake-ups: Bryan 25 Sep, 6 a day   // #A2c: live runs wrote 2,322 and 3,219 tokens; billed on what it writes
+const AGENT_A2_DEFAULTS = { daily_fetch_per_run: 40, research_per_run: 8, gemini_call_usd: 0.035, candle_pace_ms: 350, model_timeout_ms: 150000, max_tokens: 9000, gemini_plain_usd: 0.003, wakes_per_day: 6, wake_cooldown_min: 30, max_alerts: 8, position_drop_pct: 8, stop_confirm_min: 15, stop_breach_pct: 3 };   // #572 stop_confirm_min (Bryan 6 Oct: 15), stop_breach_pct (Fable: 3)   // #A2e wake-ups: Bryan 25 Sep, 6 a day   // #A2c: live runs wrote 2,322 and 3,219 tokens; billed on what it writes
 const agentSleep = (ms) => new Promise(r => setTimeout(r, ms));
 let _agentRunning = false;
 
@@ -9583,6 +9602,7 @@ async function agentScreen(cfg, led, watch = [], only = null) {   // #A2d watch 
         r.indicators = moveIndicators(bars);
         r.dip = dipConfirmFromBars(bars, r.px);   // #DIP1 spec #1 (the agent asked for it): candidate trough 8-15% off the 48h high with 1h RSI < 45
         r.ch24h = bars.length > 24 ? Number(((bars[bars.length - 1].c / bars[bars.length - 25].c - 1) * 100).toFixed(1)) : null;
+        { const lc = bars.filter(b => b.t + 3600000 <= Date.now()).pop(); if (lc) r.last_closed_1h = { at: new Date(lc.t).toISOString().slice(0, 16), o: lc.o, h: lc.h, l: lc.l, c: lc.c }; }   // #572 desk #51
         for (const [k, n] of [['range_24h', 24], ['range_72h', 72]]) {   // #A2c agent request 25 Sep: recent high / low and where the price sits
           const w = bars.slice(-n), hi = Math.max(...w.map(b => b.h)), lo = Math.min(...w.map(b => b.l));
           r[k] = { high: Number(hi.toPrecision(6)), low: Number(lo.toPrecision(6)), off_high_pct: Number(((r.px / hi - 1) * 100).toFixed(1)), above_low_pct: Number(((r.px / lo - 1) * 100).toFixed(1)) };
@@ -9655,6 +9675,7 @@ FACTS (enforced in code after you answer - they are not requests, and an order t
 - At most orders_per_run actions are executed per run, in the order you list them. You run about every 4 hours.
 - Each shortlisted coin carries "dip" (your request, spec #1): off_high_pct below its 48 h high, rsi_1h, and in_zone = 8-15% off the high with 1h RSI < 45. It marks a candidate trough, not a bottom: weigh it with the shape, the base rates and your research; it is not a buy rule.
 - A woken run is narrow: the shortlist is only the coins that woke you plus what you hold; the next scheduled run screens everything again.
+- A STOP wake (trigger alert_stop) means the price stayed through your level for 15 min, or broke well past it. It is information, not an order: compare the live mid with last_closed_1h (the last completed hourly candle) and range_72h.low before selling. Holding with a re-thought stop_price is a valid answer when the hourly close is still above the level and your thesis stands; selling is right when the close confirms the break or the thesis is gone.
 - Between runs you can be WOKEN by your own alerts. Every run replaces all your alerts with the "alerts" list you return (at most max_alerts; each lasts "hours", 1-72, default 24) - restate any you still want. Your held positions also wake you automatically: at the stop_price you gave when buying, and on a position_drop_pct fall since the run. At most wakes_per_day wake-ups a day, 30 min apart, for your own alerts (position alerts always wake you); an alert that fires past that cap is shown to your next run as alerts_fired_while_you_could_not_be_woken. If input.woken_by is set, this run exists because those alerts fired: deal with them first. A wake-up costs the same as a run, so set alerts that would change your decision, not curiosities.
 
 HOW TO THINK
@@ -10442,6 +10463,8 @@ async function agentAlertTick() {
     if (!live.length) return { armed: 0 };
     const tick = await revolutTickerMap();
     const fired = [];
+    const scfg = { ...AGENT_A2_DEFAULTS, ...(await readAgentConfig().catch(() => ({}))) };   // #572
+    const confirmMs = Math.max(0, Math.min(60, Number(scfg.stop_confirm_min) || 0)) * 60000, breachPct = Math.max(0, Math.min(20, Number(scfg.stop_breach_pct) || 0));
     for (const a of live) {
       const t = tick[a.symbol]; if (!t) continue;
       const hi = Math.max(Number(a.ref_high) || 0, t.mid), lo = Math.min(Number(a.ref_low) || Infinity, t.mid);
@@ -10451,7 +10474,16 @@ async function agentAlertTick() {
         if (!a.hit_at) await db.execute('UPDATE agent_alerts SET hit_at = NOW() WHERE id = ?', [a.id]);
         continue;
       }
-      if (!hit && a.hit_at) { await db.execute('UPDATE agent_alerts SET hit_at = NULL WHERE id = ?', [a.id]); continue; }   // a wick: reset
+      // #572 (desk #51, Fable 6 Oct): a position stop counts only if still hit on a check >= stop_confirm_min after the first touch -
+      // GRT, EDGE and BCH were each sold on one mid touch and bounced. Far enough past (stop_breach_pct below the level) wakes at once:
+      // the flash-crash fail-safe. A confirmed stop still ALWAYS wakes (#A2f) - only the touch rule changes.
+      if (hit && a.source !== 'agent' && confirmMs > 0) {
+        const deep = a.kind === 'price_below' && breachPct > 0 && t.mid <= Number(a.value) * (1 - breachPct / 100);
+        const held = a.hit_at && now - new Date(a.hit_at).getTime() >= confirmMs;
+        if (!deep && !held) { if (!a.hit_at) { await db.execute('UPDATE agent_alerts SET hit_at = NOW() WHERE id = ?', [a.id]); console.log('[agent] #572 ' + agentAlertText(a) + ' touched at ' + t.mid + ' - confirming for ' + (confirmMs / 60000) + ' min'); } continue; }
+        if (deep && !held) console.log('[agent] #572 ' + agentAlertText(a) + ' broken ' + breachPct + '%+ at ' + t.mid + ' - waking at once');
+      }
+      if (!hit && a.hit_at) { if (a.source !== 'agent') console.log('[agent] #572 ' + agentAlertText(a) + ' recovered to ' + t.mid + ' before confirming - no wake'); await db.execute('UPDATE agent_alerts SET hit_at = NULL WHERE id = ?', [a.id]); continue; }   // a wick: reset
       if (hit) fired.push({ ...a, price_now: t.mid });
     }
     if (!fired.length) return { armed: live.length, fired: 0 };
