@@ -29955,6 +29955,105 @@ function pmArgs(def, input) {
   return Object.assign(out, def.fixed || {});
 }
 let _pmClient = null, _pmClientP = null;
+// #581 desk #54a (Bryan 6 Oct 23:20 accepted #54; Fable R1: "ship 54a first - a code-only system-health watcher over loop_audit
+// ... pages Dev; read-only"). Every 30 min it reads the SAME loop_audit the PM thread uses (in-process MCP client, venue_cost off)
+// plus each live loop's arm baseline, and looks for the quiet failures that have bitten before: a loop that can still auto-sell
+// while its alerts are muted (#429/#431), a live loop with no floor or a floor under cost, a stop that cannot clear its floor
+// (a breach would be refused), a loop left on with nothing held, a buy-back leg that can only alert, and a loop whose arm
+// watcher has stopped seeing prices (stale baseline). A finding is reported only once it has held for two runs in a row
+// (no flicker), then again at most every 24 h while it lasts, and once more when it clears. It reports to the Dev thread
+// (a team note from 'system') and as one Telegram line. No model call, no write outside its own state row and the note.
+const SYS_HEALTH = { every_min: 30, repeat_h: 24, stale_grace_min: 30 };
+function sysHealthFindings(a, rules, nowMs = Date.now()) {
+  const out = [], add = (key, coin, text) => out.push({ key, coin, text });
+  if (!a || typeof a !== 'object') return out;
+  if (a.balances_read === false) add('audit:balances', null, 'loop_audit could not read the Revolut X balances');
+  if (a.prices_read === false) add('audit:prices', null, 'loop_audit could not read the Revolut X prices');
+  for (const m of Array.isArray(a.muted_but_armed) ? a.muted_but_armed : []) {
+    if (m && m.error) { add('audit:muted', null, 'the muted-but-armed check failed: ' + String(m.error).slice(0, 80)); continue; }
+    const c = String((m && (m.coin || m.symbol)) || m || '').toUpperCase().replace(/-USD$/, '');
+    if (/^[A-Z0-9]{1,15}$/.test(c)) add('muted:' + c, c, c + ': alerts are muted' + (m && m.reason ? ' (' + String(m.reason).slice(0, 30) + ')' : '') + ' but its loop can still auto-sell');
+  }
+  for (const l of Array.isArray(a.loops) ? a.loops : []) {
+    const c = String(l && l.coin || '').toUpperCase(); if (!/^[A-Z0-9]{1,15}$/.test(c) || Number(l.loop_enabled) !== 1) continue;
+    const bl = Array.isArray(l.blocked_by) ? l.blocked_by : [];
+    if (bl.includes('no floor (fails safe)')) add('nofloor:' + c, c, c + ': loop is on but has no floor (no real cost, no override) - it cannot sell');
+    if (/^BELOW COST/.test(String(l.floor_vs_cost || ''))) add('belowcost:' + c, c, c + ': floor is ' + String(l.floor_vs_cost).toLowerCase());
+    if (l.stop_clearance && l.stop_clearance.pass === false) add('clearance:' + c, c, c + ': the lowest stop cannot clear the floor (' + l.stop_clearance.clearance_pct + '% vs ' + l.stop_clearance.required_pct + '% needed) - a breach would be refused');
+    const live = (Array.isArray(rules) ? rules : []).some(r => String(r.symbol || '').toUpperCase() === c + '-USD' && Number(r.sale_price) > 0);   // mid-cycle: sold, waiting to buy back - empty is expected
+    if (!live && (bl.includes('dust (< $1)') || l.held_usd === 0)) add('orphan:' + c, c, c + ': loop is on but nothing is held ($' + (l.held_usd == null ? '?' : l.held_usd) + ') and no cycle is running');
+  }
+  for (const c0 of Array.isArray(a.buy_side_alert_only) ? a.buy_side_alert_only : []) { const c = String(c0).toUpperCase(); if (/^[A-Z0-9]{1,15}$/.test(c)) add('buyside:' + c, c, c + ': its buy-back leg can only alert (it cannot buy)'); }
+  for (const r of Array.isArray(rules) ? rules : []) {
+    if (Number(r.loop_enabled) !== 1 || Number(r.armed) === 1) continue;
+    const c = String(r.symbol || '').toUpperCase().replace(/-USD$/, ''); if (!/^[A-Z0-9]{1,15}$/.test(c)) continue;
+    const winMs = (Number(r.arm_window_min) || 60) * 60000, at = Number(r.baseline_at) || 0;
+    if (!at || nowMs - at > winMs + SYS_HEALTH.stale_grace_min * 60000) add('stale:' + c, c, c + ': the arm watcher has not seen a price ' + (at ? 'for ' + Math.round((nowMs - at) / 60000) + ' min' : 'since the loop was set') + ' - it cannot arm');
+  }
+  const seen = new Set(); return out.filter(f => !seen.has(f.key) && seen.add(f.key));
+}
+// state: { [key]: { first, last, runs, sent } }. Pure: returns what to report now and the next state.
+function sysHealthStep(prev, findings, nowMs = Date.now()) {
+  const st = {}, raise = [], cleared = [];
+  for (const f of findings) {
+    const p = prev && prev[f.key];
+    const s = { first: p ? p.first : nowMs, last: nowMs, runs: (p ? p.runs : 0) + 1, sent: p ? p.sent || 0 : 0, text: f.text };
+    if (s.runs >= 2 && (!s.sent || nowMs - s.sent >= SYS_HEALTH.repeat_h * 3600000)) { raise.push({ ...f, again: !!s.sent }); s.sent = nowMs; }
+    st[f.key] = s;
+  }
+  for (const k of Object.keys(prev || {})) if (!st[k] && prev[k].sent) cleared.push({ key: k, text: prev[k].text });
+  return { state: st, raise, cleared };
+}
+const SYS_HEALTH_KINDS = { muted: 'Muted but can still auto-sell', nofloor: 'Loop on with no floor', belowcost: 'Floor under cost', clearance: 'Stop cannot clear its floor', orphan: 'Loop on, nothing held', buyside: 'Buy-back can only alert', stale: 'Loop not seeing prices', audit: 'Audit read failed' };
+function sysHealthGroup(raise, cleared) {   // one short line per kind for Telegram; the Dev note keeps every line
+  const g = new Map(), out = [];
+  for (const f of raise) { const k = String(f.key).split(':')[0]; if (!g.has(k)) g.set(k, []); g.get(k).push(f); }
+  for (const [k, fs] of g) out.push('• ' + (SYS_HEALTH_KINDS[k] || k) + ': ' + (k === 'audit' ? fs.map(f => f.text).join('; ') : fs.map(f => f.coin).join(', ')));
+  if (cleared.length) out.push('✓ Cleared: ' + cleared.map(f => String(f.key).split(':').slice(1).join(':') || String(f.key)).join(', '));
+  return out;
+}
+let _sysHealthRunning = false;
+async function systemHealthTick(opts = {}) {
+  if (_sysHealthRunning) return { ok: false, reason: 'running' };
+  _sysHealthRunning = true;
+  try {
+    const [cr] = await db.execute("SELECT config_key, config_value FROM system_config WHERE config_key IN ('sys_health', 'sys_health_state')");
+    const get = (k) => { const r = cr.find(x => x.config_key === k); try { return r ? JSON.parse(r.config_value) : null; } catch (e) { return null; } };
+    const cfg = get('sys_health') || { on: true }, prev = get('sys_health_state') || {};
+    if (cfg.on === false && !opts.manual) return { ok: true, off: true };
+    let a = null, why = null;
+    try {
+      const c = await pmMcpClient();
+      const r = await c.callTool({ name: 'manage_auto_rules', arguments: { action: 'loop_audit', venue_cost: false } });
+      a = JSON.parse(r && r.content && r.content[0] && r.content[0].text || 'null');
+      if (!a || a.error || a.read_only !== true) { why = 'loop_audit answered without a result' + (a && a.error ? ': ' + String(a.error).slice(0, 100) : ''); a = null; }
+    } catch (e) { why = 'loop_audit failed: ' + String(e.message || e).slice(0, 100); }
+    const [rules] = await db.execute('SELECT symbol, loop_enabled, armed, arm_window_min, baseline_at, sale_price FROM pump_armed_rules WHERE active = 1');
+    const findings = a ? sysHealthFindings(a, rules) : [{ key: 'audit:failed', coin: null, text: why }];
+    const step = sysHealthStep(prev, findings);
+    await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('sys_health_state', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)", [JSON.stringify(step.state)]);
+    if (opts.manual) return { ok: true, findings, raise: step.raise, cleared: step.cleared };
+    if (step.raise.length || step.cleared.length) {
+      const lines = step.raise.map(f => '• ' + f.text + (f.again ? ' (still)' : '')).concat(step.cleared.map(f => '✓ cleared: ' + f.text));
+      await teamWrite({ as: 'system', to: 'claude_dev', title: '🩺 System health: ' + (step.raise.length ? step.raise.length + ' problem' + (step.raise.length > 1 ? 's' : '') : '') + (step.raise.length && step.cleared.length ? ', ' : '') + (step.cleared.length ? step.cleared.length + ' cleared' : ''),
+        note: lines.join('\n') + '\n\nFrom loop_audit (#581, every ' + SYS_HEALTH.every_min + ' min; a finding holds for two runs before it is reported). Read-only: nothing was changed.',
+        coins: step.raise.map(f => f.coin).filter(Boolean) }).catch(e => console.error('[health] #581 note:', e.message));
+      await sendTelegram('🩺 <b>System health</b> (sent to Dev)\n' + sysHealthGroup(step.raise, step.cleared).map(escTg).join('\n') + '\n<i>Read-only check - nothing was changed. /health shows the detail, /health off stops it.</i>').catch(() => {});
+    }
+    return { ok: true, findings: findings.length, raised: step.raise.length, cleared: step.cleared.length };
+  } finally { _sysHealthRunning = false; }
+}
+async function healthCommand(sub) {   // Telegram /health [on|off] - Bryan's chat only (the webhook's gate)
+  const s = String(sub || '').trim().toLowerCase();
+  if (s === 'on' || s === 'off') {
+    await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('sys_health', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)", [JSON.stringify({ on: s === 'on' })]);
+    return '🩺 System health check <b>' + s.toUpperCase() + '</b>.' + (s === 'off' ? ' /health on starts it again.' : '');
+  }
+  const r = await systemHealthTick({ manual: true });
+  if (!r.ok) return '🩺 A check is already running - try again in a minute.';
+  return '🩺 <b>System health now</b>\n' + (r.findings.length ? r.findings.map(f => '• ' + escTg(f.text)).join('\n') : 'Nothing wrong found.') + '\n<i>Every ' + SYS_HEALTH.every_min + ' min; a problem is sent to Dev once it holds for two runs. /health off stops it.</i>';
+}
+cron.schedule('7,37 * * * *', () => { systemHealthTick().then(r => { if (r && (r.raised || r.cleared)) console.log('[health] #581 ' + JSON.stringify(r)); }).catch(e => console.error('[health] #581 failed:', e.message)); }, { timezone: 'Europe/London' });
 async function pmMcpClient() {   // one in-process client for the life of the process: the server's own handlers, no HTTP, no secret path
   if (_pmClient) return _pmClient;
   if (!_pmClientP) _pmClientP = (async () => {
@@ -31537,6 +31636,10 @@ app.post('/telegram-webhook', async (req, res) => {
       return res.status(200).json({ ok: true });
     }
     // #419 /videos - Gemini watches new videos from every YouTube source now; a summary arrives when done. Never trades.
+    if (/^health(\s|$)/.test(commandText)) {   // #581 desk #54a: the system-health check (read-only)
+      try { await sendReply(await healthCommand(commandText.replace(/^health\s*/, '').trim())); } catch (e) { await sendReply('\u274c Health: ' + escTg(e.message)); }
+      return res.status(200).json({ ok: true });
+    }
     if (/^team(\s|$)/.test(commandText)) {   // #577 desk #52: the team's day, its cap and the task switch
       try { await sendReply(await teamCommand(commandText.replace(/^team\s*/, '').trim())); } catch (e) { await sendReply('\u274c Team: ' + escTg(e.message)); }
       return res.status(200).json({ ok: true });
