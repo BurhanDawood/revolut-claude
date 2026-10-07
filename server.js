@@ -2556,6 +2556,7 @@ await safeAddColumn('trading_journal',  'rotation_id', 'VARCHAR(20) NULL');   //
 await db.execute('CREATE INDEX idx_rotation ON trading_journal (rotation_id)').catch(() => {});   // exists after the first boot
 await db.execute("CREATE TABLE IF NOT EXISTS rotation_sessions (id VARCHAR(20) NOT NULL PRIMARY KEY, opened_at DATETIME NOT NULL, expires_at DATETIME NOT NULL, closed_at DATETIME NULL, status VARCHAR(10) NOT NULL, trigger_kind VARCHAR(10) NOT NULL, anchor_journal_id INT NULL, INDEX idx_status (status, expires_at))").catch(e => console.error('[migration] rotation_sessions:', e.message));   // #8
 await safeAddColumn('pump_armed_rules', 'cycle_id',   'VARCHAR(40) NULL');    // #L1 stamped at the sale, read by the buy-back
+await safeAddColumn('pump_armed_rules', 'auto_off_at', 'DATETIME NULL');   // #586 C2: the health check switched this loop off (cleared when Bryan re-enters)
 // #426 move shape: every call the system makes (loop armed / morning brief / asked) and, 7 days later, what happened.
 await db.execute(`CREATE TABLE IF NOT EXISTS move_shape_log (
   id INT AUTO_INCREMENT PRIMARY KEY,
@@ -16010,6 +16011,7 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
 
     // If buy: detect re-entry (previous sell with outcome exists)
     let reentryNote = '';
+    if (action === 'buy') loopAutoOffReentry(symbol).catch(e => console.error('[health] #586 re-entry line:', e.message));   // #586 C2, never awaited
     if (action === 'buy') {
       try {
         const [prevSell] = await db.execute(
@@ -27278,7 +27280,7 @@ let rows;
             conflictWarning = ' WARNING: an existing trailing stop was found for this symbol that is not from the pump-loop\'s own arm cycle (peak '+existingTs.peakPrice+', auto_execute='+existingTs.autoExecute+') -- likely a leftover manual set_trailing. Recommend remove_trailing before relying on this loop.';
           }
 
-          await db.execute('UPDATE pump_armed_rules SET loop_enabled = 1 WHERE symbol = ?', [sym]);
+          await db.execute('UPDATE pump_armed_rules SET loop_enabled = 1, auto_off_at = NULL WHERE symbol = ?', [sym]);   // #586 F2 a re-enabled loop is no longer marked as switched off by the health check
           const [after] = await db.execute('SELECT * FROM pump_armed_rules WHERE symbol = ? LIMIT 1', [sym]);
           const leNow = await loopSellVerdict(sym);   // #555 the master switch does not govern loop sells; say what the predicate says
           await sendTelegram('LOOP ENABLED -- '+sym+' rinse-repeat ON. Floor $'+Number(leFloor.floor).toPrecision(6)+' ('+leFloor.source+'), sell '+r.sell_pct+'%, max '+r.max_cycles+' cycles. Auto-sell: '+leNow.text+'.'+(leStop.checked ? '' : ' Stop clearance not checked ('+leStop.reason+').')+conflictWarning+leCostWarn+(leCost && !leCost.checked ? ' Cost not compared with Revolut X this time ('+leCost.reason+') - floor from the stored cost; loop_audit in a minute will show the gap.' : '')).catch(()=>{});   // #560 Fable wording
@@ -27334,7 +27336,7 @@ let rows;
           const wasArmed = before.length && parseInt(before[0].armed) === 1, hadBuyback = before.length && before[0].sale_price != null;
           if (wasArmed) await removeTrailingStop(sym).catch(() => {});
           troughTrackers.delete(sym);
-          await db.execute('UPDATE pump_armed_rules SET loop_enabled = 0, armed = 0, armed_since = NULL, sale_price = NULL, sale_proceeds_usd = NULL, reference_base = NULL, retrace_gate = NULL, trough_low = NULL, trough_armed = 0 WHERE symbol = ?', [sym]);
+          await db.execute('UPDATE pump_armed_rules SET loop_enabled = 0, armed = 0, armed_since = NULL, sale_price = NULL, sale_proceeds_usd = NULL, reference_base = NULL, retrace_gate = NULL, trough_low = NULL, trough_armed = 0, auto_off_at = NULL WHERE symbol = ?', [sym]);
           const [after] = await db.execute('SELECT * FROM pump_armed_rules WHERE symbol = ? LIMIT 1', [sym]);
           await sendTelegram('LOOP DISABLED -- ' + sym + ' rinse-repeat OFF.' + (wasArmed ? ' It was ARMED: its trail is removed, so it will not sell.' : '') +
             (hadBuyback ? ' A pending buy-back was cancelled and its reserved cash released.' : '')).catch(() => {});
@@ -30017,7 +30019,7 @@ let _pmClient = null, _pmClientP = null;
 // watcher has stopped seeing prices (stale baseline). A finding is reported only once it has held for two runs in a row
 // (no flicker), then again at most every 24 h while it lasts, and once more when it clears. It reports to the Dev thread
 // (a team note from 'system') and as one Telegram line. No model call, no write outside its own state row and the note.
-const SYS_HEALTH = { every_min: 30, repeat_h: 24, stale_grace_min: 30 };
+const SYS_HEALTH = { every_min: 30, repeat_h: 24, stale_grace_min: 30, auto_off_h: 72, auto_off_per_run: 2 };   // #586 Bryan "72 hours"; PM #541 "suggest 2" a run
 function sysHealthFindings(a, rules, nowMs = Date.now()) {
   const out = [], add = (key, coin, text) => out.push({ key, coin, text });
   if (!a || typeof a !== 'object') return out;
@@ -30035,7 +30037,7 @@ function sysHealthFindings(a, rules, nowMs = Date.now()) {
     if (/^BELOW COST/.test(String(l.floor_vs_cost || ''))) add('belowcost:' + c, c, c + ': floor is ' + String(l.floor_vs_cost).toLowerCase());
     if (l.stop_clearance && l.stop_clearance.pass === false) add('clearance:' + c, c, c + ': the lowest stop cannot clear the floor (' + l.stop_clearance.clearance_pct + '% vs ' + l.stop_clearance.required_pct + '% needed) - a breach would be refused');
     const live = (Array.isArray(rules) ? rules : []).some(r => String(r.symbol || '').toUpperCase() === c + '-USD' && Number(r.sale_price) > 0);   // mid-cycle: sold, waiting to buy back - empty is expected
-    if (!live && a.balances_read === true && !(typeof KRAKEN_MONITORED_COINS !== 'undefined' && KRAKEN_MONITORED_COINS.includes(c + '-USD')) && (bl.includes('dust (< $1)') || l.held_usd === 0)) add('orphan:' + c, c, c + ': loop is on but nothing is held ($' + (l.held_usd == null ? '?' : l.held_usd) + ') and no cycle is running');   // #585 only on a real balance read (a failed read shows every coin as 0), never a Kraken-held coin
+    if (!live && a.balances_read === true && !(typeof KRAKEN_MONITORED_COINS !== 'undefined' && KRAKEN_MONITORED_COINS.includes(c + '-USD')) && (bl.includes('dust (< $1)') || l.held_usd === 0)) { if (!(Array.isArray(a.tangem_held) && a.tangem_held.includes(c))) { add('orphan:' + c, c, c + ': loop is on but nothing is held ($' + (l.held_usd == null ? '?' : l.held_usd) + ') and no cycle is running'); out[out.length - 1].held = l.held_usd == null ? null : Number(l.held_usd); } }   // #586 C4 a coin held on Tangem is not an orphan   // #585 only on a real balance read (a failed read shows every coin as 0), never a Kraken-held coin
   }
   for (const c0 of Array.isArray(a.buy_side_alert_only) ? a.buy_side_alert_only : []) { const c = String(c0).toUpperCase(); if (/^[A-Z0-9]{1,15}$/.test(c)) add('buyside:' + c, c, c + ': its buy-back leg can only alert (it cannot buy)'); }
   for (const r of Array.isArray(rules) ? rules : []) {
@@ -30080,33 +30082,87 @@ async function systemHealthTick(opts = {}) {
       const c = await pmMcpClient();
       const r = await c.callTool({ name: 'manage_auto_rules', arguments: { action: 'loop_audit', venue_cost: false } });
       a = JSON.parse(r && r.content && r.content[0] && r.content[0].text || 'null');
+      if (a && typeof a === 'object') {   // #586 C4: the Tangem wallet holds XRP; a known balance there means XRP is not "nothing held"
+        const [tg] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'tangem_last_balance'").catch(() => [[]]);
+        let tb = null; try { tb = tg.length ? JSON.parse(tg[0].config_value) : null; } catch (e) { tb = null; }
+        a.tangem_held = tb && Number(tb.balance) > 0 ? ['XRP'] : [];   // the Tangem wallet is XRP-only today; if another coin moves there, add it here
+      }
       if (!a || a.error || a.read_only !== true) { why = 'loop_audit answered without a result' + (a && a.error ? ': ' + String(a.error).slice(0, 100) : ''); a = null; }
     } catch (e) { why = 'loop_audit failed: ' + String(e.message || e).slice(0, 100); }
-    const [rules] = await db.execute('SELECT symbol, loop_enabled, armed, arm_window_min, baseline_at, sale_price FROM pump_armed_rules WHERE active = 1');
+    const [rules] = await db.execute("SELECT symbol, loop_enabled, armed, arm_window_min, baseline_at, sale_price, DATE_FORMAT(auto_off_at, '%e %b') AS auto_off_d FROM pump_armed_rules WHERE active = 1");   // #586 F3
     const findings = a ? sysHealthFindings(a, rules) : [{ key: 'audit:failed', coin: null, text: why }];
     const step = sysHealthStep(prev, findings);
     await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('sys_health_state', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)", [JSON.stringify(step.state)]);
-    if (opts.manual) return { ok: true, findings, raise: step.raise, cleared: step.cleared };
+    if (opts.manual) return { ok: true, findings, raise: step.raise, cleared: step.cleared, autooff: rules.filter(r => Number(r.loop_enabled) !== 1 && r.auto_off_d).map(r => String(r.symbol).replace('-USD', '') + ' (' + r.auto_off_d + ')') };
+    // #586 (Bryan 7 Oct "Yes, switch off automatically", "72 hours"; Fable C1-C4; PM #541): an orphan EMPTY FOR 72 h straight (its key's
+    // first-seen in sys_health_state; any run without it resets the clock) has its loop switched off by loopAutoOff - at most 2 a run.
+    const offs = cfg.auto_off === false ? [] : await sysHealthAutoOff(findings, step.state);
+    if (offs.length) {   // #586 F3: an auto-off coin leaves the state now, so the next run never says "cleared ... loop is on" for it
+      for (const o of offs) delete step.state['orphan:' + o.coin];
+      await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('sys_health_state', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)", [JSON.stringify(step.state)]).catch(() => {});
+    }
+    if (offs.length) for (const o of offs) step.raise.push({ key: 'autooff:' + o.coin, coin: o.coin, text: o.coin + ': empty for ' + o.hours + ' h (balance read $' + o.held + ') - loop SWITCHED OFF by the health check; settings kept' });
     if (step.raise.length || step.cleared.length) {
       const lines = step.raise.map(f => '• ' + f.text + (f.again ? ' (still)' : '')).concat(step.cleared.map(f => '✓ cleared: ' + f.text));
       const hw = await teamWrite({ as: 'system', to: 'all', title: '🩺 System health: ' + (step.raise.length ? step.raise.length + ' problem' + (step.raise.length > 1 ? 's' : '') : '') + (step.raise.length && step.cleared.length ? ', ' : '') + (step.cleared.length ? step.cleared.length + ' cleared' : ''),
-        note: lines.join('\n') + '\n\nFrom loop_audit (#581, every ' + SYS_HEALTH.every_min + ' min; a finding holds for two runs before it is reported). Read-only: nothing was changed.',
+        note: lines.join('\n') + '\n\nFrom loop_audit (#581, every ' + SYS_HEALTH.every_min + ' min; a finding holds for two runs before it is reported). ' + (offs.length ? offs.length + ' loop' + (offs.length > 1 ? 's' : '') + ' switched off automatically (#586: empty ' + SYS_HEALTH.auto_off_h + ' h; /health auto off stops this); nothing else was changed.' : 'Read-only: nothing was changed.'),
         coins: step.raise.map(f => f.coin).filter(Boolean) }).catch(e => { console.error('[health] #581 note:', e.message); return null; });
       if (hw && hw.ok) await db.execute("UPDATE pm_handovers SET status = 'done', done_ts = ?, outcome = ? WHERE created_by = 'system' AND kind = 'note' AND status = 'open' AND title LIKE '%System health%' AND id < ?", [Math.floor(Date.now() / 1000), 'superseded by note ' + hw.id, hw.id]).catch(() => {});   // #585 the latest report stands; old ones stop filling the open-note cap
-      await sendTelegram('🩺 <b>System health</b> (sent to Dev)\n' + sysHealthGroup(step.raise, step.cleared).map(escTg).join('\n') + '\n<i>Read-only check - nothing was changed. /health shows the detail, /health off stops it.</i>').catch(() => {});
+      await sendTelegram('🩺 <b>System health</b> (sent to Dev)\n' + sysHealthGroup(step.raise, step.cleared).map(escTg).join('\n') + '\n<i>' + (offs.length ? offs.length + ' empty loop' + (offs.length > 1 ? 's' : '') + ' switched off (empty ' + SYS_HEALTH.auto_off_h + ' h) - /health auto off stops this.' : 'Read-only check - nothing was changed.') + ' /health shows the detail, /health off stops it.</i>').catch(() => {});
     }
     return { ok: true, findings: findings.length, raised: step.raise.length, cleared: step.cleared.length };
   } finally { _sysHealthRunning = false; }
 }
+// #586 C3 (Fable): one atomic writer, not the MCP client. Compare-and-set: only an active, enabled, UNARMED loop with NO sale_price
+// is switched off, in the same statement - affectedRows 1 or nothing happened. Nothing else on the row is touched (no trail work,
+// no cycle fields). Its own Telegram line names the health check.
+async function loopAutoOff(sym, why) {
+  const [u] = await db.execute('UPDATE pump_armed_rules SET loop_enabled = 0, auto_off_at = NOW() WHERE symbol = ? AND active = 1 AND loop_enabled = 1 AND armed = 0 AND sale_price IS NULL', [sym]);
+  if (!u || u.affectedRows !== 1) return false;
+  console.log('[health] #586 ' + sym + ' loop switched off by the health check: ' + why);
+  await sendTelegram('🩺 <b>' + escTg(sym.replace('-USD', '')) + '</b>: loop switched OFF by the health check - ' + escTg(why) + '. Settings kept. To switch it back on, ask the PM thread (loop_enable checks the floor and clearance).').catch(() => {});
+  return true;
+}
+// C1: an orphan qualifies only once its key has been seen continuously for auto_off_h. Each coin in its own try (senior note 2).
+async function sysHealthAutoOff(findings, state, nowMs = Date.now()) {
+  const due = (findings || []).filter(f => f && typeof f.key === 'string' && f.key === 'orphan:' + f.coin && /^[A-Z0-9]{1,15}$/.test(f.coin)
+    && state && state[f.key] && nowMs - Number(state[f.key].first) >= SYS_HEALTH.auto_off_h * 3600000).slice(0, SYS_HEALTH.auto_off_per_run);
+  const done = [];
+  for (const f of due) {
+    const hours = Math.floor((nowMs - Number(state[f.key].first)) / 3600000), held = f.held == null ? '?' : f.held;
+    try { if (await loopAutoOff(f.coin + '-USD', 'nothing held for ' + hours + ' h (balance read $' + held + '), no cycle running')) done.push({ coin: f.coin, hours, held }); }
+    catch (e) { console.error('[health] #586 ' + f.coin + ' auto-off failed (tried again next run):', e.message); }
+  }
+  return done;
+}
+// C2: when Bryan buys back into a coin whose loop the health check switched off, say so once.
+async function loopAutoOffReentry(coin) {
+  const c = String(coin || '').toUpperCase().replace(/[\/-]USD$/, ''), sym = c + '-USD';   // #586 F1: 'JTO' and 'JTO-USD' alike
+  if (!/^[A-Z0-9]{1,15}$/.test(c)) return false;
+  const [r] = await db.execute("SELECT DATE_FORMAT(auto_off_at, '%e %b') AS d FROM pump_armed_rules WHERE symbol = ? AND active = 1 AND loop_enabled = 0 AND auto_off_at IS NOT NULL LIMIT 1", [sym]);
+  if (!r.length) return false;
+  await sendTelegram('🩺 <b>' + escTg(c) + '</b>: you bought back in - its loop was switched off by the health check on ' + escTg(r[0].d) + ' and is still OFF. Ask the PM thread to switch it back on (loop_enable checks the floor and clearance).').catch(() => {});
+  await db.execute('UPDATE pump_armed_rules SET auto_off_at = NULL WHERE symbol = ?', [sym]);   // after the line (Fable's note)
+  return true;
+}
 async function healthCommand(sub) {   // Telegram /health [on|off] - Bryan's chat only (the webhook's gate)
   const s = String(sub || '').trim().toLowerCase();
+  if (s === 'auto on' || s === 'auto off') {   // #586
+    const [cr] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'sys_health'");
+    let c = {}; try { c = cr.length ? JSON.parse(cr[0].config_value) || {} : {}; } catch (e) { c = {}; }
+    c.auto_off = s === 'auto on';
+    await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('sys_health', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)", [JSON.stringify(c)]);
+    return '🩺 Switching off loops empty for ' + SYS_HEALTH.auto_off_h + ' h: <b>' + (c.auto_off ? 'ON' : 'OFF') + '</b>.';
+  }
   if (s === 'on' || s === 'off') {
-    await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('sys_health', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)", [JSON.stringify({ on: s === 'on' })]);
+    const [cr0] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'sys_health'");
+    let c0 = {}; try { c0 = cr0.length ? JSON.parse(cr0[0].config_value) || {} : {}; } catch (e) { c0 = {}; }
+    await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('sys_health', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)", [JSON.stringify({ ...c0, on: s === 'on' })]);   // #586 keeps auto_off
     return '🩺 System health check <b>' + s.toUpperCase() + '</b>.' + (s === 'off' ? ' /health on starts it again.' : '');
   }
   const r = await systemHealthTick({ manual: true });
   if (!r.ok) return '🩺 A check is already running - try again in a minute.';
-  return '🩺 <b>System health now</b>\n' + (r.findings.length ? r.findings.map(f => '• ' + escTg(f.text)).join('\n') : 'Nothing wrong found.') + '\n<i>Every ' + SYS_HEALTH.every_min + ' min; a problem is sent to Dev once it holds for two runs. /health off stops it.</i>';
+  return '🩺 <b>System health now</b>\n' + (r.findings.length ? r.findings.map(f => '• ' + escTg(f.text)).join('\n') : 'Nothing wrong found.') + (r.autooff && r.autooff.length ? '\nLoops OFF (switched off by the health check): ' + escTg(r.autooff.join(', ')) + ' - ask the PM thread to switch one back on.' : '') + '\n<i>Every ' + SYS_HEALTH.every_min + ' min; a problem is reported once it holds for two runs. A loop empty for ' + SYS_HEALTH.auto_off_h + ' h is switched off (on by default; /health auto off stops that). /health off stops the check.</i>';
 }
 cron.schedule('7,37 * * * *', () => { systemHealthTick().then(r => { if (r && (r.raised || r.cleared)) console.log('[health] #581 ' + JSON.stringify(r)); }).catch(e => console.error('[health] #581 failed:', e.message)); }, { timezone: 'Europe/London' });
 async function pmMcpClient() {   // one in-process client for the life of the process: the server's own handlers, no HTTP, no secret path
