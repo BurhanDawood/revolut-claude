@@ -9698,6 +9698,7 @@ FACTS (enforced in code after you answer - they are not requests, and an order t
 - Paper fills are the mid price plus/minus 1.3% slippage, plus a 0.09% fee. Every model call and research call you trigger is charged to your cash. Trading and churn cost money.
 - At most orders_per_run actions are executed per run, in the order you list them. You run about every 4 hours.
 - STARTER BUYS (Bryan, 7 Oct: "it hasn't been trading" - he wants you trading): a coin with dip.in_zone true and research behind it, but no dated catalyst, may get a STARTER buy of at most starter_pct (10%) of your equity - give it tool_key "starter". Code caps a starter at that size and drops one on a coin that is not in the dip zone or has no research. A coin whose catalyst.dated is true may still get your normal size. A starter is a real position: thesis, invalidation, stop_price as always.
+- Your own notes or the PM guidance written before 7 Oct that say every entry needs a dated catalyst predate Bryan's starter permission: they do not rule out a starter. Judge each starter setup on its research (a real reason it fell, like a token unlock, is a fine reason to pass; the lack of a dated catalyst is not).
 - A researched coin carries "catalyst" (your request, spec #40): dated = a catalyst names a day within 60 days (next_date, days_away, what); "Q4", "soon" or "unknown" do not count (vague = how many were undated).
 - Each shortlisted coin carries "dip" (your request, spec #1): off_high_pct below its 48 h high, rsi_1h, and in_zone = 8-15% off the high with 1h RSI < 45. It marks a candidate trough, not a bottom: weigh it with the shape, the base rates and your research; it is not a buy rule.
 - A woken run is narrow: the shortlist is only the coins that woke you plus what you hold; the next scheduled run screens everything again.
@@ -9723,6 +9724,12 @@ ANSWER with ONE JSON object and nothing else:
  "requests":[{"title":"a tool or data you need","why":"","evidence":"the coin / decision it blocked","how_to_measure":""}]}
 A buy gives usd (dollars to spend) and should give stop_price (the price that proves it wrong - you are woken there). A sell gives qty (coin quantity) or "qty":"all". At most 3 requests. drop_from_high_pct / rise_from_low_pct count from the highest / lowest price seen after the alert is set (value = percent, e.g. 8).`;
 const AGENT_STARTER = { pct: 10 };   // #584 Bryan 7 Oct "Yes, 10% starters"
+const _starterSeen = new Map();   // #585 coin -> when a starter setup last went to the decision model (12 h, so one stuck coin cannot buy Sonnet every run)
+function agentStarterFresh(shortlist, nowMs = Date.now()) {
+  const c = (Array.isArray(shortlist) ? shortlist : []).filter(s => s && !s.held && agentStarterCheck(s) === null).map(s => s.coin).filter(x => !(nowMs - (_starterSeen.get(x) || 0) < 12 * 3600000));
+  for (const x of c) _starterSeen.set(x, nowMs);
+  return c.length > 0;
+}
 function agentStarterCheck(s) {   // null = allowed; otherwise the drop reason
   if (!s) return 'starter_not_shortlisted';
   if (!(s.dip && s.dip.in_zone)) return 'starter_not_in_zone';
@@ -9879,6 +9886,7 @@ async function runAgent(trigger = 'scheduled', wake = []) {   // #A2e wake = the
       else if (kind === 'alert_stop' || heldWake) tag.route = 'wake_held';
       else if (missed.length) tag.route = 'missed_alerts';
       else if (Date.now() - lastSonnet > (Number(cfg.route_heartbeat_h) || 20) * 3600000) tag.route = 'heartbeat';
+      else if (agentStarterFresh(scr.shortlist)) tag.route = 'starter_setup';   // #585 (Bryan 7 Oct: it still was not trading - the screen held researched dip coins as 'no catalyst')
       else {
         tag.screen = await agentRouteScreen(input, cfg);
         costs.screen = tag.screen.cost || 0;
@@ -30027,7 +30035,7 @@ function sysHealthFindings(a, rules, nowMs = Date.now()) {
     if (/^BELOW COST/.test(String(l.floor_vs_cost || ''))) add('belowcost:' + c, c, c + ': floor is ' + String(l.floor_vs_cost).toLowerCase());
     if (l.stop_clearance && l.stop_clearance.pass === false) add('clearance:' + c, c, c + ': the lowest stop cannot clear the floor (' + l.stop_clearance.clearance_pct + '% vs ' + l.stop_clearance.required_pct + '% needed) - a breach would be refused');
     const live = (Array.isArray(rules) ? rules : []).some(r => String(r.symbol || '').toUpperCase() === c + '-USD' && Number(r.sale_price) > 0);   // mid-cycle: sold, waiting to buy back - empty is expected
-    if (!live && (bl.includes('dust (< $1)') || l.held_usd === 0)) add('orphan:' + c, c, c + ': loop is on but nothing is held ($' + (l.held_usd == null ? '?' : l.held_usd) + ') and no cycle is running');
+    if (!live && a.balances_read === true && !(typeof KRAKEN_MONITORED_COINS !== 'undefined' && KRAKEN_MONITORED_COINS.includes(c + '-USD')) && (bl.includes('dust (< $1)') || l.held_usd === 0)) add('orphan:' + c, c, c + ': loop is on but nothing is held ($' + (l.held_usd == null ? '?' : l.held_usd) + ') and no cycle is running');   // #585 only on a real balance read (a failed read shows every coin as 0), never a Kraken-held coin
   }
   for (const c0 of Array.isArray(a.buy_side_alert_only) ? a.buy_side_alert_only : []) { const c = String(c0).toUpperCase(); if (/^[A-Z0-9]{1,15}$/.test(c)) add('buyside:' + c, c, c + ': its buy-back leg can only alert (it cannot buy)'); }
   for (const r of Array.isArray(rules) ? rules : []) {
@@ -30081,9 +30089,10 @@ async function systemHealthTick(opts = {}) {
     if (opts.manual) return { ok: true, findings, raise: step.raise, cleared: step.cleared };
     if (step.raise.length || step.cleared.length) {
       const lines = step.raise.map(f => '• ' + f.text + (f.again ? ' (still)' : '')).concat(step.cleared.map(f => '✓ cleared: ' + f.text));
-      await teamWrite({ as: 'system', to: 'claude_dev', title: '🩺 System health: ' + (step.raise.length ? step.raise.length + ' problem' + (step.raise.length > 1 ? 's' : '') : '') + (step.raise.length && step.cleared.length ? ', ' : '') + (step.cleared.length ? step.cleared.length + ' cleared' : ''),
+      const hw = await teamWrite({ as: 'system', to: 'all', title: '🩺 System health: ' + (step.raise.length ? step.raise.length + ' problem' + (step.raise.length > 1 ? 's' : '') : '') + (step.raise.length && step.cleared.length ? ', ' : '') + (step.cleared.length ? step.cleared.length + ' cleared' : ''),
         note: lines.join('\n') + '\n\nFrom loop_audit (#581, every ' + SYS_HEALTH.every_min + ' min; a finding holds for two runs before it is reported). Read-only: nothing was changed.',
-        coins: step.raise.map(f => f.coin).filter(Boolean) }).catch(e => console.error('[health] #581 note:', e.message));
+        coins: step.raise.map(f => f.coin).filter(Boolean) }).catch(e => { console.error('[health] #581 note:', e.message); return null; });
+      if (hw && hw.ok) await db.execute("UPDATE pm_handovers SET status = 'done', done_ts = ?, outcome = ? WHERE created_by = 'system' AND kind = 'note' AND status = 'open' AND title LIKE '%System health%' AND id < ?", [Math.floor(Date.now() / 1000), 'superseded by note ' + hw.id, hw.id]).catch(() => {});   // #585 the latest report stands; old ones stop filling the open-note cap
       await sendTelegram('🩺 <b>System health</b> (sent to Dev)\n' + sysHealthGroup(step.raise, step.cleared).map(escTg).join('\n') + '\n<i>Read-only check - nothing was changed. /health shows the detail, /health off stops it.</i>').catch(() => {});
     }
     return { ok: true, findings: findings.length, raised: step.raise.length, cleared: step.cleared.length };
