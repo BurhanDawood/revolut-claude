@@ -9635,7 +9635,7 @@ async function agentGeminiResearch(coin, feedNotes) {
     '"bull_case":"", "bear_case":"", "liquidity_note":"", "confidence":"low|medium|high", "as_of":"YYYY-MM-DD"}. Never invent dates or sources - write "unknown". ' +
     'Notes from our own feeds (may be wrong, weigh them): ' + (feedNotes || 'none');
   const call = async (grounded) => {
-    const body = { contents: [{ role: 'user', parts: [{ text: prompt }] }], generationConfig: { temperature: 0.2, maxOutputTokens: 4096 } };   // #A2c room for thinking + the note
+    const body = { contents: [{ role: 'user', parts: [{ text: prompt }] }], generationConfig: { maxOutputTokens: 4096 } };   // #A2c room for thinking + the note   // #587 Google 8 Oct: temperature/top_p/top_k are retired on new Gemini models (ignored now) - the model default is used
     if (grounded) body.tools = [{ google_search: {} }]; else body.generationConfig.responseMimeType = 'application/json';
     const ctl = new AbortController(); const to = setTimeout(() => ctl.abort(), 60000);
     let r, raw;
@@ -10807,7 +10807,7 @@ async function specGeminiCall(system, user, cfg) {
   const key = process.env.GEMINI_API_KEY;
   if (!key) throw new Error('GEMINI_API_KEY is not set on Railway');
   const model = String(cfg.pm_model || process.env.GEMINI_MODEL || 'gemini-3.8-flash').trim().replace(/^models\//, '');
-  const body = { systemInstruction: { parts: [{ text: system }] }, contents: [{ role: 'user', parts: [{ text: user }] }], generationConfig: { temperature: 0.3, maxOutputTokens: 8192 } };
+  const body = { systemInstruction: { parts: [{ text: system }] }, contents: [{ role: 'user', parts: [{ text: user }] }], generationConfig: { maxOutputTokens: 8192 } };   // #587 Google 8 Oct: temperature/top_p/top_k are retired on new Gemini models (ignored now) - the model default is used
   const ctl = new AbortController(); const to = setTimeout(() => ctl.abort(), 90000);
   let r, raw;
   try { r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent', { method: 'POST', signal: ctl.signal, headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key }, body: JSON.stringify(body) }); raw = await r.text(); }
@@ -14275,7 +14275,7 @@ FORMAT (exactly this layout)
 2. [another]
 
 🎯 FOCUS: [ONLY a coin from FOCUS candidates, and why - two sentences at most, from the data above. If FOCUS candidates is none, write exactly: nothing in your book is making a real move today.]`;
-  const body = { contents: [{ role: 'user', parts: [{ text: prompt }] }], generationConfig: { temperature: 0.4, maxOutputTokens: 8192 } };
+  const body = { contents: [{ role: 'user', parts: [{ text: prompt }] }], generationConfig: { maxOutputTokens: 8192 } };   // #587 Google 8 Oct: temperature/top_p/top_k are retired on new Gemini models (ignored now) - the model default is used
   if (search) body.tools = [{ google_search: {} }];
   const ctl = new AbortController(); const to = setTimeout(() => ctl.abort(), 60000);
   let r, raw;
@@ -21215,7 +21215,7 @@ async function geminiVideoNotes(videoId) {
   if (!key) throw new Error('GEMINI_API_KEY is not set on Railway');
   const model = String(process.env.GEMINI_VIDEO_MODEL || process.env.GEMINI_MODEL || 'gemini-3.8-flash').trim().replace(/^models\//, '');
   const body = { contents: [{ role: 'user', parts: [{ file_data: { file_uri: 'https://www.youtube.com/watch?v=' + videoId } }, { text: VIDEO_NOTES_PROMPT }] }],
-    generationConfig: { temperature: 0.2, maxOutputTokens: 8192 } };
+    generationConfig: { maxOutputTokens: 8192 } };   // #587 Google 8 Oct: temperature/top_p/top_k are retired on new Gemini models (ignored now) - the model default is used
   const ctl = new AbortController(); const to = setTimeout(() => ctl.abort(), 180000);
   let r, raw;
   try {
@@ -21319,7 +21319,7 @@ async function geminiVideoTranscript(videoId) {
   if (!key) throw new Error('GEMINI_API_KEY is not set on Railway');
   const model = String(process.env.GEMINI_VIDEO_MODEL || process.env.GEMINI_MODEL || 'gemini-3.8-flash').trim().replace(/^models\//, '');
   const body = { contents: [{ role: 'user', parts: [{ file_data: { file_uri: 'https://www.youtube.com/watch?v=' + videoId } }, { text: 'Transcribe the spoken audio of this video verbatim as plain text, in order, from start to finish. Output only the transcript - no summary, no commentary. Start a new paragraph when the speaker or topic changes, and begin every paragraph with its start time in the video as [m:ss] or [h:mm:ss].' }] }],
-    generationConfig: { temperature: 0, maxOutputTokens: 32768 } };
+    generationConfig: { maxOutputTokens: 32768 } };   // #587 Google 8 Oct: temperature/top_p/top_k are retired on new Gemini models (ignored now) - the model default is used
   const ctl = new AbortController(); const to = setTimeout(() => ctl.abort(), 300000);
   let r, raw;
   try {
@@ -21443,7 +21443,7 @@ async function geminiFindMoment(videoId, label) {
   if (!key) throw new Error('GEMINI_API_KEY is not set on Railway');
   const model = String(process.env.GEMINI_VIDEO_MODEL || process.env.GEMINI_MODEL || 'gemini-3.8-flash').trim().replace(/^models\//, '');
   const q = 'At what time in this video does the presenter START talking about ' + label + '? Reply with only the start time as m:ss or h:mm:ss (for example 12:34). If it is never discussed, reply NONE.';
-  const body = { contents: [{ role: 'user', parts: [{ file_data: { file_uri: 'https://www.youtube.com/watch?v=' + videoId } }, { text: q }] }], generationConfig: { temperature: 0, maxOutputTokens: 2048 } };
+  const body = { contents: [{ role: 'user', parts: [{ file_data: { file_uri: 'https://www.youtube.com/watch?v=' + videoId } }, { text: q }] }], generationConfig: { maxOutputTokens: 2048 } };   // #587 Google 8 Oct: temperature/top_p/top_k are retired on new Gemini models (ignored now) - the model default is used
   const ctl = new AbortController(); const to = setTimeout(() => ctl.abort(), 180000);
   let r, raw;
   try {
@@ -21510,7 +21510,7 @@ async function geminiGenerateText(prompt, opts = {}) {
   const key = process.env.GEMINI_API_KEY;
   if (!key) throw new Error('GEMINI_API_KEY is not set on Railway');
   const model = String(process.env.GEMINI_MODEL || 'gemini-3.8-flash').trim().replace(/^models\//, '');
-  const body = { contents: [{ role: 'user', parts: [{ text: prompt }] }], generationConfig: { temperature: opts.temperature != null ? opts.temperature : 0.2, maxOutputTokens: opts.maxOutputTokens || 4096 } };
+  const body = { contents: [{ role: 'user', parts: [{ text: prompt }] }], generationConfig: { maxOutputTokens: opts.maxOutputTokens || 4096 } };   // #587 Google 8 Oct: temperature/top_p/top_k are retired on new Gemini models (ignored now) - the model default is used
   if (opts.json) body.generationConfig.responseMimeType = 'application/json';
   const ms = opts.timeoutMs || 60000;
   const ctl = new AbortController(); const to = setTimeout(() => ctl.abort(), ms);
