@@ -105,12 +105,24 @@ function switchTab(name) {
   if (name === 'rotations') loadRotations();
   if (name === 'family') loadFamily();   // #589
 }
-// #589 her coin: /family-view (her page in owner mode) framed; it reports its height so the tab scrolls as one page
-function loadFamily() { var f = $('family-frame'); if (f && !f.getAttribute('src')) f.setAttribute('src', '/family-view'); }
-window.addEventListener('message', function (e) {
-  if (e.origin !== location.origin || !e.data || typeof e.data.famH !== 'number') return;
-  var f = $('family-frame'); if (f) f.style.height = Math.max(400, Math.min(8000, e.data.famH)) + 'px';
-});
+// #589 her coin: /family-view (her page in owner mode) framed, sized to its content so the tab scrolls as one page.
+// #590 (Bryan 10 Oct 16:07 "never ending scroll"): the frame's own scrollHeight is never smaller than the frame, so sizing by it could only
+// grow. The dashboard now measures the bottom of the page's content itself (same origin), once a second while the tab is open.
+var famSizer = null;
+function famSize() {
+  var f = $('family-frame'), pane = $('tab-family');
+  if (!f || !pane || !pane.classList.contains('active')) { clearInterval(famSizer); famSizer = null; return; }
+  try { var d = f.contentDocument, m = d && d.querySelector('main'); if (!m) return;
+    var h = Math.ceil(m.getBoundingClientRect().bottom + (d.defaultView.scrollY || 0) + 40);
+    if (h > 200 && Math.abs(parseInt(f.style.height || '0', 10) - h) > 2) f.style.height = Math.min(8000, h) + 'px';
+  } catch (e) {}
+}
+function loadFamily() {
+  var f = $('family-frame'); if (!f) return;
+  if (!f.getAttribute('src')) { f.setAttribute('scrolling', 'no'); f.addEventListener('load', famSize); f.setAttribute('src', '/family-view'); }
+  if (!famSizer) famSizer = setInterval(famSize, 1000);
+  famSize();
+}
 
 // ── Portfolio ─────────────────────────────────────────────────────
 
