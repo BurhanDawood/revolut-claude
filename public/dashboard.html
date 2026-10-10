@@ -836,6 +836,7 @@
   <button class="tab-btn" onclick="switchTab('scorecards')">📊 Scorecards</button>
   <button class="tab-btn" onclick="switchTab('concentration')">Conc %</button>
   <button class="tab-btn" onclick="switchTab('rotations')">Rotations</button>
+  <button class="tab-btn" onclick="switchTab('family')">👛 Her coin</button>
 </nav>
 
 <div class="error-banner" id="error-banner"></div>
@@ -1257,6 +1258,11 @@
     <div id="concentration-content"><div class="empty-state">Loading...</div></div>
   </div>
 </div><!-- /tab-concentration -->
+
+<!-- #589 her coin: her page in owner mode (coin picker, make it hers, activity) -->
+<div id="tab-family" class="tab-content">
+  <iframe id="family-frame" title="Her coin" style="width:100%;height:900px;border:0;display:block;border-radius:12px"></iframe>
+</div><!-- /tab-family -->
 
 <div class="toast" id="toast"></div>
   </div>

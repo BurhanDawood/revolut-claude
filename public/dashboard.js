@@ -103,7 +103,14 @@ function switchTab(name) {
   if (name === 'scorecards') loadScorecards();
   if (name === 'concentration') loadConcentration();
   if (name === 'rotations') loadRotations();
+  if (name === 'family') loadFamily();   // #589
 }
+// #589 her coin: /family-view (her page in owner mode) framed; it reports its height so the tab scrolls as one page
+function loadFamily() { var f = $('family-frame'); if (f && !f.getAttribute('src')) f.setAttribute('src', '/family-view'); }
+window.addEventListener('message', function (e) {
+  if (e.origin !== location.origin || !e.data || typeof e.data.famH !== 'number') return;
+  var f = $('family-frame'); if (f) f.style.height = Math.max(400, Math.min(8000, e.data.famH)) + 'px';
+});
 
 // ── Portfolio ─────────────────────────────────────────────────────
 
