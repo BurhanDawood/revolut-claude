@@ -23,6 +23,8 @@ mobile/
       SparkChart.java            the widget's line chart, drawn into a Bitmap
       WidgetRefreshWorker.java   WorkManager: GET /api/portfolio/state + /spark every 30 min, on key save, on tap
       Push.java / RxMessagingService.java   FCM token -> POST /api/app/devices; notification display + tab
+      RipAlarm.java / RipAlarmService.java / AlarmActivity.java   the rip alarm (v11; v12 rings it on the alarm stream)
+      RxFloatPlugin.java / FloatService.java   pop out: the floating window over other apps (v13)
 ```
 
 ## The shell contract
@@ -35,6 +37,9 @@ The shell (`APP_SHELL_JS` in `server.js`) runs inside the app's WebView, and Cap
 | `Capacitor.Plugins.BiometricAuth.authenticate({ reason, cancelTitle, allowDeviceCredential, androidTitle, androidSubtitle })`: resolves on success, rejects on cancel/fail | `BiometricAuthPlugin` (androidx.biometric). If the phone has no fingerprint and no screen lock, it resolves `{ skipped: true }` so the app never locks itself out. |
 | `Capacitor.Plugins.WidgetBridge.setConfig({ key, base })` → Promise | `WidgetBridgePlugin`. It stores both in EncryptedSharedPreferences and refreshes the widget. It accepts only `https://revolut-claude-production.up.railway.app` as `base`, so the key never goes anywhere else. The key is never logged. |
 | `window.rxApp.show('home' \| 'portfolio' \| 'agent' \| 'desk' \| 'more')` | The app calls it after the shell loads, when it was opened by the widget (`portfolio`) or by a notification (`data.tab`, default `home`). |
+| `window.rxApp.open({ tab, coin })` (shell 492+) | Called instead of `show` when a notification carries `data.coin` (validated `^[A-Z0-9]{1,15}$`): opens that coin's card. The coin is cleared once delivered; with an older shell the app falls back to `show(tab)`. |
+| `window.rxApp.open({ tab: 'inbox', id })` (shell 501+) | Called when a notification carries `data.inbox`, the message's id in the app's notifications feed (validated `^[0-9]{1,15}$`). It opens the feed on that message. A valid id wins over `tab` and `coin`; with an older shell the app falls back to `show('home')`. `inbox` is not a tab the app accepts from `data.tab`. |
+| `rxApp.float(path)` / `rxApp.floatOk()` (shell 530+) → `Capacitor.Plugins.RxFloat.available()` / `.open({ path })` | `RxFloatPlugin` + `FloatService` (v13): the floating window over other apps. See [Floating window (pop out)](#floating-window-pop-out). |
 
 **Back button.** When the open tab's frame has moved off its start page, Back goes back inside that frame. Otherwise Back minimises the app. It never exits to a blank page.
 
@@ -134,6 +139,163 @@ Steps:
 
 The key exists only inside GitHub secrets, so nobody holds a copy. If the secrets are ever lost, phones must uninstall once and the setup workflow is run again.
 
+## Notification channels
+
+On Android, sound and vibration belong to the notification channel, not to the message. The server (batch 498) sorts every alert into a category. It applies Bryan's on/off, sound, vibrate and quiet-hours choices from More → Notifications, then picks one of these channels for each push:
+
+| id | name in Android settings | importance | sound | vibration |
+|---|---|---|---|---|
+| `rx_loud` | Sound and vibrate | HIGH | default notification sound | on |
+| `rx_sound` | Sound only | HIGH | default notification sound | off |
+| `rx_buzz` | Vibrate only | HIGH | none | on (0, 250, 150, 250 ms) |
+| `rx_quiet` | Silent | LOW | none | off |
+| `alerts` | Alerts | HIGH | Android default | Android default |
+| `info` | Info | DEFAULT | Android default | Android default |
+
+`alerts` and `info` stay for older server messages and older installs. A channel id the app doesn't know is shown on `alerts`.
+
+**Caps contract.** On every start the app registers its token with `POST /api/app/devices`, and the body includes `"caps": "ch2"`. The server sends the `rx_*` channels only to devices registered with `ch2`. Every other device keeps getting `alerts` and `info`. So it doesn't matter whether the app or the server is updated first: opening v8 once is enough. The server also sends `data.cat` (the category id).
+
+**Channel settings are fixed.**
+- Once Android has created a channel, the app can't change its sound or vibration. Never reuse these ids with different settings: a new behaviour needs a new id (and a new caps value).
+- Changing a channel's sound, vibration or importance in Android's own settings (Settings → Apps → Revolut X → Notifications) overrides the app's choice for that channel. Android keeps that change even when the app updates.
+
+### v10: a channel per alert category (caps `ch3`)
+
+v10 adds one channel per alert category, in the group **Alert categories** (`rx_cats`). The six older channels above go into the group **Other** (`rx_other`) where Android allows it.
+
+| id | name in Android settings | description | importance | sound | vibration |
+|---|---|---|---|---|---|
+| `rx_c_needs` | Needs you | Approvals, anything held for your confirmation, a failed trade | HIGH | default notification sound | on (Android's pattern) |
+| `rx_c_money` | Money moved | Buys and sells filled, card payments, deposits, swaps | HIGH | default notification sound | on (Android's pattern) |
+| `rx_c_price` | Price moves | Dips, spikes, pumps, targets and floors hit | HIGH | default notification sound | on (Android's pattern) |
+| `rx_c_loops` | Loops & trails | Loops arming, trails, buy-backs, sales held or skipped | HIGH | default notification sound | on (Android's pattern) |
+| `rx_c_agent` | Agent & desk | The budget agent and spec-desk messages | HIGH | default notification sound | on (Android's pattern) |
+| `rx_c_reports` | Reports | Morning brief, weekly reviews, research | HIGH | default notification sound | on (Android's pattern) |
+| `rx_c_system` | System | Backups, restarts, connection problems | HIGH | default notification sound | on (Android's pattern) |
+
+The list of categories lives in one place: `Push.CATS` / `Push.CAT_RE` (`needs|money|price|loops|agent|reports|system`).
+
+**Each category's sound and vibration are Bryan's to set**, on Android's page for that channel (Sound picker with every tone on the phone, Vibration switch). The app only creates the channel with the defaults above and never overrides the user's choice. Calling `createNotificationChannel` again on each start only updates the name and description. These ids are never deleted, re-created or reused with other settings.
+
+**ch3 contract.** The app registers with `"caps": "ch2,ch3"`. For devices with `ch3`, the server (batch 503) sends a push on `rx_c_<category>` whenever that category's Sound is on. Sound off still uses `rx_buzz` / `rx_quiet`, and quiet hours are unchanged. Devices without `ch3` keep the v8 behaviour. The app accepts `rx_c_` + one of the seven ids (shown at high priority); any other unknown id still goes to `alerts`.
+
+**RxNotify contract** (`Capacitor.Plugins.RxNotify`, v10+; the shell checks it exists):
+
+| call | result |
+|---|---|
+| `channels()` | `{ app_blocked, channels: [ { cat, id, exists, blocked, sound, vibrate } ] }`: 7 rows in the order above (empty below Android 8). `app_blocked`: the app's notifications are off. `exists`: the channel is there (when not: `blocked` false, `sound` "", `vibrate` false). `blocked`: the channel or its group is turned off. `sound`: the tone's name (max 60 chars), "" for no sound, or "Custom sound" when Android can't name it; never the URI. `vibrate`: the channel vibrates. |
+| `openChannel({ cat })` | Rejects `"unknown category"` unless `cat` is exactly one of the seven. Makes sure the channels exist, then opens Android's settings page for `rx_c_<cat>` (falling back to the app's notification page, or the app details page below Android 8). Resolves once opened. |
+
+The shell's More → Notifications shows "🔔 <sound> · vibrates  Change ›" per category, calls `openChannel` on Change, and calls `channels()` again when the app comes back to the foreground, so a newly picked sound shows up after Back.
+
+### v11: the rip alarm (caps `alarm`)
+
+When a coin Bryan holds is up 30%+ in 24 h, the server (batch 514) sends **one** alarm per coin per day. The phone rings and vibrates like an alarm clock, through quiet hours and Do Not Disturb.
+
+| id | name in Android settings | description | importance | sound | vibration |
+|---|---|---|---|---|---|
+| `rx_alarm` | Rip alarm | Rings like an alarm when a coin you hold is up 30%+ in a day | HIGH | the phone's alarm tone (else ringtone, else notification sound), `USAGE_ALARM` | its own pattern: three quick taps then a long buzz, twice (`0, 150, 100, 150, 100, 150, 400, 900, 600, 150, 100, 150, 100, 150, 400, 900`) |
+
+The channel also has `setBypassDnd(true)` (Android honours it only if the app has Do Not Disturb access) and public lock-screen visibility. It is created with the others on every start and is outside the two groups. Same rule as every channel: never deleted, re-created or reused, and its tone is Bryan's to change on Android's page for it (the app never overrides it). `USAGE_ALARM` is what plays it at alarm volume and lets it through Do Not Disturb's default "alarms allowed" rule.
+
+**alarm contract.** The app registers with `"caps": "ch2,ch3,alarm"`. To a device with `alarm` the server sends a **data-only** FCM message (no `notification` block), `android.priority = "high"`, so it always reaches `RxMessagingService.onMessageReceived`, even with the app closed:
+
+```json
+{ "alarm": "1", "channel": "rx_alarm", "cat": "needs", "tab": "home", "coin": "AST", "inbox": "12345",
+  "title": "🚨 RIP ALARM - AST +46.8% in 24 h", "body": "Now $0.008 - you hold $148.70 of AST. …" }
+```
+
+Devices without `alarm` get an ordinary loud notification instead. When `data.alarm` is `"1"` the app handles it before anything else (`RipAlarm.show`) and shows nothing else for that message:
+- `coin` must match `^[A-Z0-9]{1,15}$` and `inbox` must be digits, else they are dropped; `title` (max 80 chars) and `body` (max 300) are only ever shown as plain text. Nothing else from the payload reaches an intent.
+- A notification on `rx_alarm`: `CATEGORY_ALARM`, `PRIORITY_MAX`, **`FLAG_INSISTENT`** (sound and vibration repeat until it is tapped, stopped or swiped), `setTimeoutAfter(10 min)` (it stops by itself), auto-cancel, one **Stop** button (a broadcast that cancels it, silencing it at once). Id `9000 + (coin.hashCode() & 0xfff)`, so a repeat for the same coin replaces the alarm.
+- Tapping it opens the same deep link as any notification (`home`, the coin, the feed id).
+- **Full-screen intent** → `AlarmActivity`: over the lock screen, turning the screen on. Dark, big title and body, two buttons: **Open <coin>** (stops the alarm, asks to unlock, then opens the coin's page) and **Stop**. Back is Stop. Native views only: no web content, no network, no JS bridge. It closes itself after 10 minutes.
+- If Android refuses the full-screen intent (Android 14+ can ask the user to allow "full-screen notifications" for the app), the heads-up notification still rings with the insistent sound. `RxNotify.channels()` reports this as `full_screen: false` on the alarm row.
+
+**One new permission:** `USE_FULL_SCREEN_INTENT`, so the alarm can take over the screen like an alarm clock (Bryan asked for that). Nothing else was added.
+
+**RxNotify (v11).** `channels()` adds an 8th row after the seven categories: `{ cat: "alarm", id: "rx_alarm", exists, blocked, sound, vibrate, full_screen }` (same meanings as above). `openChannel({ cat: "alarm" })` opens Android's page for `rx_alarm`; the accepted values are exactly the seven category ids plus `alarm`. The server's More → Notifications shows the 🚨 Rip alarm card with "🔔 <tone> · alarm vibration   Change ›" (batch 515).
+
+**Testing it.** The Firebase console's "test message" cannot send data-only messages. Use the server's test path, or FCM HTTP v1 directly (`POST https://fcm.googleapis.com/v1/projects/<project>/messages:send`, a service-account OAuth token in the `Authorization` header, never pasted anywhere) with
+`{ "message": { "token": "<device token>", "android": { "priority": "high" }, "data": { "alarm": "1", "title": "🚨 RIP ALARM - TEST +31% in 24 h", "body": "test", "coin": "AST", "inbox": "" } } }`.
+
+### v12: the rip alarm rings through silent mode
+
+v11 rang the alarm as a notification, and the notification system obeys the ringer mode: on silent it made no sound and no vibration (Bryan, 30 Sep: *"I need it to ring through silent mode like my alarms do"*). Clock apps ring through silent because they play the sound themselves on the alarm stream, which the ringer mode does not mute. v12 does the same. The server does not change: it still sends the v11 alarm message above.
+
+| id | name in Android settings | description | importance | sound | vibration |
+|---|---|---|---|---|---|
+| `rx_alarm_ring` | Rip alarm (screen) | Shows the rip alarm; its sound comes from the Rip alarm tone | HIGH | none | off |
+
+`rx_alarm_ring` also has `setBypassDnd(true)` and public lock-screen visibility. It is created with the others on every start, and again by the service before it posts (in case the app has not been opened since the update). It has no sound because Android fixes a channel's sound when it is created: posting the ringing alarm on `rx_alarm` would play the tone twice whenever the phone is not on silent.
+
+**`rx_alarm` is now the tone picker.** It stays exactly as it was (nothing renamed or re-created), and More → Notifications → Rip alarm → "Change ›" still opens its Android page. The tone picked there is what the alarm plays. Its on/off is still the alarm's on/off: if `rx_alarm` (or `rx_alarm_ring`) is blocked, or notifications are off for the app, the app does not start the service and shows the v11 notification instead (which Android then hides), so it never rings with no way to stop it.
+
+**`RipAlarmService`** (foreground service, `foregroundServiceType="mediaPlayback"`, not exported). `RxMessagingService` hands every `data.alarm = "1"` message to `RipAlarm.show`, which validates it exactly as v11 did and starts the service (a high-priority FCM message may start a foreground service from the background). The service:
+1. goes foreground at once with the alarm's notification on `rx_alarm_ring`: title and body, `CATEGORY_ALARM`, `PRIORITY_MAX`, the full-screen intent to `AlarmActivity`, **Stop**, the v11 deep link on tap, `setOngoing(true)`; no `FLAG_INSISTENT` and no `setTimeoutAfter` (the service repeats it and stops it);
+2. plays the tone on the **alarm stream** (`MediaPlayer`, `USAGE_ALARM` / `CONTENT_TYPE_SONIFICATION`), looping, at the phone's **alarm volume** (the app never changes a volume). The tone is `rx_alarm`'s sound, else the default alarm, ringtone, then notification sound: the first one that opens. A tone picked from the phone's own files that the app cannot read is played through Android's `Ringtone` (still the alarm stream, looping; Android 9+) before falling back. It holds `AUDIOFOCUS_GAIN_TRANSIENT` with the same attributes while ringing;
+3. vibrates the v11 pattern (three quick taps then a long buzz), repeating, as an **alarm vibration** (`VibrationAttributes.USAGE_ALARM` on Android 13+, alarm `AudioAttributes` below), so silent mode does not block it either;
+4. stops everything (sound, vibration, audio focus, foreground, notification, alarm screen) on **Stop** (notification or alarm screen), **Open <coin>** or a tap on the notification (then opens the deep link), a **swipe** (`setDeleteIntent`), **Back** on the alarm screen, or **10 minutes** after it started;
+5. a new alarm while one rings replaces it: one sound at a time, same notification id per coin as v11.
+
+Every stop goes through `RipAlarm.stop`, which stops the running service directly (same process) and cancels the notification. A tap reaches `MainActivity` with `rx_alarm_stop_id`, which stops the alarm before opening the coin (Android 12+ does not let a receiver or service open an activity after a tap).
+
+**Fallback.** If the service cannot be started (for example `ForegroundServiceStartNotAllowedException`) the app logs the reason (`Log.w`, no payload) and posts the v11 notification on `rx_alarm` (insistent, full-screen, 10-minute timeout). Silent mode then mutes it, as in v11.
+
+**Permissions added in v12:**
+- `FOREGROUND_SERVICE` and `FOREGROUND_SERVICE_MEDIA_PLAYBACK`: the service is a foreground service, and Android 14+ requires a type and its permission; it only plays the alarm sound.
+- `VIBRATE`: in v11 Android vibrated for the channel; now the app vibrates itself, which Android refuses without it (a normal permission, granted at install, no prompt).
+
+`USE_FULL_SCREEN_INTENT` from v11 stays. Nothing is scheduled on the phone (the server sends the alarm), so there is no exact-alarm permission.
+
+## Floating window (pop out)
+
+v13 (server batch 530, desk #37 Option B). A window drawn over **every** app: drag it to move it, and drag its bottom-right corner to resize it from a thumbnail to nearly full screen. It shows a coin's candle chart or one Home widget, read-only.
+
+**The two paths.** The float loads nothing else, and only from the app's own server origin (`Config.BASE`, the host in `capacitor.config.json` `server.url`):
+
+| path | shows |
+|---|---|
+| `/coin?c=SYM&float=1` | that coin's chart alone, on black, with interval chips and volume |
+| `/?app=1&float=<widget-id>` | one Home widget, scaled to the window |
+
+The pages offer **Pop out** in a Home widget's press-and-hold menu and in a coin tile's hold menu, and a **⧉** button on the coin page. The shell calls `rxApp.float(path)`, which calls the plugin below.
+
+**Permission: "Display over other apps"** (`SYSTEM_ALERT_WINDOW`). Android only lets an app draw on top of other apps when the user allows it on Android's own settings page (Settings → Apps → Revolut X → Display over other apps). The app cannot grant it itself, and there is no in-app prompt. The float also runs as a foreground service so Android does not kill it while another app is in front: `FOREGROUND_SERVICE_SPECIAL_USE` (Android 14+ needs a type and its permission; the service's `PROPERTY_SPECIAL_USE_FGS_SUBTYPE` says "Floating read-only price chart the user opened"). `FOREGROUND_SERVICE` was already there from v12. These are the only two permissions v13 adds.
+
+**`Capacitor.Plugins.RxFloat`** (`RxFloatPlugin`, v13+):
+
+| call | result |
+|---|---|
+| `available()` | `{ ok: true }` on Android 8+ (API 26), else `{ ok: false }`. It does not check the permission. |
+| `open({ path })` | Rejects `"that cannot be popped out"` unless `path` matches `^/(\?app=1&float=[a-z-]{1,40}\|coin\?c=[A-Z0-9]{1,15}&float=1)$`. Without the permission it opens Android's "Display over other apps" page for the app (`ACTION_MANAGE_OVERLAY_PERMISSION`, `package:com.bryan.revolutx`) and resolves `{ ok: false, needs_permission: true }`; the page then says *Allow "Display over other apps" for Revolut X, then tap Pop out again.* With it, it starts `FloatService` on `Config.BASE + path` and resolves `{ ok: true }`. If a float is already open, it loads the new path in that window: there is never a second one. |
+
+**`FloatService`** (foreground service, `foregroundServiceType="specialUse"`, not exported). One `TYPE_APPLICATION_OVERLAY` window (`FLAG_NOT_FOCUSABLE | FLAG_LAYOUT_NO_LIMITS | FLAG_LAYOUT_IN_SCREEN` since v14, translucent, top-left gravity): taps outside it go to the app underneath. A rounded dark frame with:
+- **a 28 dp top bar**, the drag handle. Dragging it moves the window, kept on screen. **⤢** toggles between the last small size and full; **✕** closes the window and stops the service (its notification goes with it).
+- **the WebView**, filling the rest: JavaScript and DOM storage on, the default WebView profile (so `/dashboard-auth.js` finds the dashboard key the app's pages already saved in localStorage; the key is never put in a URL), no Capacitor bridge, no file or content access, no pop-up windows. `shouldOverrideUrlLoading` allows only `https://` on the server host; any other navigation is blocked and not opened. (The page's own scripts still load, e.g. the chart library from jsdelivr/unpkg; only navigations are locked.)
+- **a 28 dp resize handle** at the bottom right (◢). Dragging it resizes the window; the WebView relayouts and the pages rescale on `resize`.
+
+**Sizes.** Minimum 160 × 120 dp. "Full" is the screen less the status bar, the navigation bar and a cutout, with an 8 dp margin; the window never goes beyond it. The first time: about 60% of the screen width at 4:3, top right.
+
+**Remembered** (SharedPreferences `rx_float`, no secrets): the last path, x, y, width and height, whether it was full, and the last small size (for ⤢). The window reopens at that size and place, clamped to the current screen. Rotating or folding the phone clamps it back on screen (full stays full).
+
+**v14 (Bryan 1 Oct: the window sat too low and its corner ran off the bottom).** v13's window lacked `FLAG_LAYOUT_IN_SCREEN`, so Android measured `y` from below the status bar while the code already added the status bar: it was counted twice. With the flag, `x`/`y` are absolute screen coordinates: dragging up stops right under the status bar, and full ends just above the gesture bar. After the window appears and after each layout change (a drag: once, on release), it checks where it really is (`getLocationOnScreen`); if a launcher still offsets it by more than 2 px it corrects once and logs `float offset corrected by N px`. On the first open after the update, a place saved by v13 (`rx_float` without `gv`, or `gv < 2`) is dropped once for the first-run default (the path stays) and `gv = 2` is written.
+
+**`window.RxFloatHost.open(coin)`**, the one JS method the float page gets. A tap inside the window calls it with a ticker or `''`. `coin` must match `^[A-Z0-9]{0,15}$`, else it is treated as `''`. It starts `MainActivity` with `FLAG_ACTIVITY_NEW_TASK | FLAG_ACTIVITY_REORDER_TO_FRONT`, `rx_tab = "home"` and `rx_coin = coin` when there is one: the same path a notification takes, so the app comes to the front on that coin (`rxApp.open({ tab: 'home', coin })`). The float stays open.
+
+**Notification** (while it floats):
+
+| id | name in Android settings | importance | sound | vibration |
+|---|---|---|---|---|
+| `rx_float` | Floating chart | LOW | none | off |
+
+Text "Revolut X chart is floating" and one action, **Close**, which stops the service. A tap on it opens the app. Created by the service before it posts. Same rule as every channel: never deleted, re-created or reused with other settings.
+
+**Robustness.** If `addView` fails (the permission was revoked), the service stops without posting anything. It is fine for Android to kill it for memory: it does not restart itself (`START_NOT_STICKY`); Pop out opens it again at the remembered size.
+
+**No money.** The float shows two read-only pages. It has no Trade, Sell, Buy or Approve, and it cannot navigate to any other route or origin. v12's rip alarm, notifications, home-screen widget, biometric lock and deep links are unchanged.
+
 ## Push notifications
 
 The app side ships in v1 and stays off until Firebase is set up:
@@ -142,7 +304,7 @@ The app side ships in v1 and stays off until Firebase is set up:
 - It sends `POST {base}/api/app/devices` with `{ token, platform: 'android', app_version }` and header `x-api-token`.
 - A 404 (the route does not exist yet) is ignored quietly; the app tries again on the next start.
 - Channels: **Alerts** (`alerts`, high importance, the default) and **Info** (`info`).
-- Tapping a notification opens the tab in `data.tab` (default `home`).
+- Tapping a notification opens that message in the app's feed (`data.inbox`, digits). Without one, it opens the tab in `data.tab` (default `home`), on the coin in `data.coin` when it is set.
 
 **What the server sends** (FCM HTTP v1), for when the Dev thread builds the server half:
 - `message.notification`: `{ title, body }`;
