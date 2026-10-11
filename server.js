@@ -8189,7 +8189,7 @@ async function btVsLive(rf, symbol, a) {
 //   rebuy    rearmPumpLoopAfterBuyback: cycle_count + 1; max_cycles pauses the loop; else the baseline clears and it re-arms.
 //            Its loop P&L adds reserved minus (price x reserved/price) = 0, so its circuit breaker can never trip; not modelled.
 //   abandon  evaluateAbandons at :12 and :42 (D4): price > sale x (1 + ceiling%) first, then abandon_hours since the sale.
-//            The ceiling is ONLY this give-up rule: the live buy-back does not call mayAutoTrade (P0, no callers).
+//            The live buy-back also asks mayAutoTrade at fire time (#567 shadow, #604 enforce); the backtest does not model that.
 // NOT modelled: the cash gate (a backtest's cash always covers reserved), venue refusals / back-off, EDGE limit and spike-mode
 // chase fills (a sale fills at the tick price less slippage) and the spike-mode arm takeover, the DND arm path, the uncovered-cash
 // abandon (48 h), 30 s scans (ticks are the stored captures). Arm window default 60 min, as checkPumpArm (Fable C1).
@@ -12064,7 +12064,7 @@ async function runExecutionWatchdog(priceOf) {
 // order. 'shadow' = the exec_decisions row is written and the verdict is reported, NOTHING changes (the buy goes ahead as today);
 // 'enforce' = a NO holds the cycle (tracker kept, one Telegram line per reason, asked again at most every 5 min), and the buy is
 // capped at the predicate's size_cap. Flip to 'enforce' after the shadow week, by its own batch.
-const TROUGH_P0_MODE = 'shadow';
+const TROUGH_P0_MODE = 'enforce';   // #604 (11 Oct, after the shadow week 4-11 Oct; Fable pre-ship on desk #49): a NO holds the cycle - tracker and ring-fenced proceeds kept, asked again every 5 min, one line per reason; config_unreadable is a NO. The single-mode loop's trough buy-back only (troughP0Check has one caller).
 const _troughP0 = new Map();   // symbol -> { at, reason } of the last NO (enforce: throttle + one line per reason)
 async function troughP0Check(symbol, price, usd, cycleId) {
   let pc;
@@ -12283,7 +12283,7 @@ async function runFastScan() {
           }
 
           // #567 the fire-time predicate, BEFORE the tracker is cleared (it reads the cycle's sale_price from the rule row)
-          let ttP0 = null;
+          let ttP0 = null, ttCapFrom = null;   // #604 ttCapFrom: the buy before a size_cap, for the AUTO-BOUGHT line
           if (TROUGH_P0_MODE === 'enforce') {
             const lastNo = _troughP0.get(ttSymbol);
             if (lastNo && Date.now() - lastNo.at < 5 * 60000) continue;   // held: ask again at most every 5 min
@@ -12299,7 +12299,7 @@ async function runFastScan() {
               continue;
             }
             _troughP0.delete(ttSymbol);
-            if (Number(ttP0.size_cap) > 0 && ttP0.size_cap < buyUsd) { console.log('[trough] #567 ' + ttBase + ' buy capped at the predicate size_cap $' + Number(ttP0.size_cap).toFixed(2) + ' (was $' + buyUsd.toFixed(2) + ')'); buyUsd = Number(ttP0.size_cap); }
+            if (Number(ttP0.size_cap) > 0 && ttP0.size_cap < buyUsd) { ttCapFrom = buyUsd; console.log('[trough] #567 ' + ttBase + ' buy capped at the predicate size_cap $' + Number(ttP0.size_cap).toFixed(2) + ' (was $' + buyUsd.toFixed(2) + ')'); buyUsd = Number(ttP0.size_cap); }
           }
 
           // ALL GATES PASS -- clear tracker BEFORE placeRevolutOrder (Map.delete is sync; prevents double-fire on race/crash)
@@ -12347,6 +12347,7 @@ async function runFastScan() {
           await sendTelegram(
             '<b>[#130 AUTO-BOUGHT] ' + ttBase + '</b>\n\n' +
             '$' + buyUsd.toFixed(2) + ' @ ~$' + ttPrice + ' (~' + buyQty.toFixed(6) + ' ' + ttBase + ')\n' +
+            (ttCapFrom ? 'Capped by the fire-time check from $' + ttCapFrom.toFixed(2) + ' (cash fell after the check); the other $' + (ttCapFrom - buyUsd).toFixed(2) + ' is free cash again.\n' : '') +   // #604
             'Trough was $' + ttResult.trough.toFixed(8) + ', bounced +' + t.bouncePct + '%.\n' +
             'Sell was $' + t.salePrice + '. Round-trip complete.' +
             (ttP0 && TROUGH_P0_MODE === 'shadow' ? '\nFire-time check (shadow week, #567): ' + (ttP0.ok ? 'would have allowed this buy.' : '<b>would have BLOCKED it</b> - check ' + ttP0.check_no + ' (' + ttP0.reason + ').') : '')
@@ -17721,8 +17722,8 @@ async function computeDerivedFloor(symbol, coinBase) {
 }
 
 // ── #P0 FIRE-TIME PREDICATE, PHASE 0 (spec P0 rev 3) ─────────────────────────────────────
-// Table + function + vectors, NO CALLERS: nothing on an order path calls mayAutoTrade. The only ways to run it are the
-// unit tests (tests/p0) and the read-only manage_auto_rules predicate_check dry run. Live behaviour is unchanged.
+// Table + function + vectors. CALLERS (#604): the single-mode loop's trough buy-back (troughP0Check, enforce), the paper agent's
+// executeAgentOrder, the loop cards' dry runs and manage_auto_rules predicate_check (read-only).
 // #P0 effective ceiling is COMPUTED, never stored: an override reverts to the default by calculation when it expires (pm #36).
 const CEILING_DEFAULT_PCT = 50;
 function effectiveCeilingPct(row, nowMs) {
@@ -18008,7 +18009,7 @@ async function mayAutoTrade(intent, opts = {}) {
     // 12. Open-order conflict
     at = 12;
     try {
-      const [r] = await db.execute("SELECT 1 FROM pending_orders WHERE symbol = ? AND status NOT IN ('filled','cancelled','rejected','replaced') LIMIT 1", [symbol]);
+      const [r] = await db.execute("SELECT 1 FROM pending_orders WHERE symbol = ? AND status NOT IN ('filled','cancelled','rejected','replaced') AND status NOT IN ('completed','canceled','expired') LIMIT 1", [symbol]);   // #604 senior C1: done-states other code also writes ('completed', floorCappedLimitSell) never count as open
       inputs.open_order = r.length > 0;
     } catch (e) { return unreadable('pending_orders', e); }
     if (inputs.open_order) return no('open_order');
