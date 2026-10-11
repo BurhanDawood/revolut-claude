@@ -24248,7 +24248,7 @@ let rows;
   server.tool('get_trading_data',
     'Get trading journal entries, active alerts, trader context/profile, rebalancing history, and dev_bridge messages',
     {
-      include: zLoose(z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'dev_bridge', 'coin_strategy', 'reconciliation', 'ledger', 'tax_lots', 'catalysts', 'thesis', 'nudges', 'dev_health', 'dev_recommendations', 'volatility_baseline', 'shadow_fills', 'abnormal_events', 'strategy_catalogue', 'exchange_orders', 'transactions', 'reconcile_transactions', 'ledger_rebuild', 'slippage_audit', 'regime_frequency', 'order_journal_gap', 'venue_probe', 'all']))).optional()
+      include: zLoose(z.array(z.enum(['journal', 'alerts', 'context', 'rebalancing', 'dev_log', 'dev_bridge', 'coin_strategy', 'reconciliation', 'ledger', 'tax_lots', 'catalysts', 'thesis', 'nudges', 'dev_health', 'dev_recommendations', 'volatility_baseline', 'shadow_fills', 'abnormal_events', 'strategy_catalogue', 'exchange_orders', 'transactions', 'reconcile_transactions', 'ledger_rebuild', 'slippage_audit', 'regime_frequency', 'order_journal_gap', 'venue_probe', 'tx_details', 'all']))).optional()
         .describe('What data to fetch — defaults to all. dev_bridge, coin_strategy and reconciliation are never included in all; request them explicitly'),
       symbol:           z.string().optional().describe('Filter journal by coin e.g. NEAR'),
       limit:            z.coerce.number().optional().describe('Max journal entries to return, default 10'),
@@ -25014,6 +25014,31 @@ let rows;
       //  (1) are total_fee / fee_currency populated on OLD filled orders (GET /orders/{id} ~12 / ~6 / ~1 months back)?
       //  (2) does GET /transactions return records before the 370-day cap - how far back does the venue retain/paginate?
       // Same request shapes as fetchExchangeOrders / fetchTransactions (epoch-ms dates, windows <= 30 days).
+      // #605 tx_details (Bryan 11 Oct 12:50 "does Rev X provide who the card payments were to"; READ-ONLY, explicit only, never in 'all'):
+      // the newest card-payment-shaped transactions (send, coin -> GBP, last 3 days, up to 5) read through GET /transactions/{id}, the
+      // details endpoint whose docs list an optional free-text description and account.display_name. Returned raw so we can see what
+      // Revolut X really puts there for a card payment. GETs only, nothing written.
+      if (fetch.includes('tx_details')) {
+        const TD = { generated_at: new Date().toISOString(), read_only: true, rows: [] };
+        try {
+          const list = await fetchTransactions(3);
+          const sends = (list.transactions || []).filter(t => t && t.type === 'send' && t.destination && String(t.destination.currency || '').toUpperCase() === 'GBP' && t.status !== 'cancelled')
+            .sort((a, b) => Number(b.created_date || 0) - Number(a.created_date || 0)).slice(0, 5);
+          for (const t of sends) {
+            const rec = { id: t.id, created: t.created_date ? new Date(Number(t.created_date)).toISOString() : null, status: t.status, from: (t.source || {}).currency, amount: (t.source || {}).amount, gbp: (t.destination || {}).amount };
+            try {
+              const r = await revolutRequest('GET', '/transactions/' + encodeURIComponent(t.id));
+              const d = (r && r.data) || r || {};
+              rec.keys = Object.keys(d); rec.description = d.description !== undefined ? d.description : '(absent)';
+              rec.source_account = d.source && d.source.account ? d.source.account : null; rec.destination_account = d.destination && d.destination.account ? d.destination.account : null;
+              rec.raw = JSON.stringify(d).slice(0, 1200);
+            } catch (e) { rec.error = e.message; }
+            TD.rows.push(rec);
+          }
+          if (!sends.length) TD.note = 'no card-payment-shaped send (coin -> GBP) in the last 3 days';
+        } catch (e) { TD.error = e.message; }
+        result.tx_details = TD;
+      }
       if (fetch.includes('venue_probe')) {
         const VP = { generated_at: new Date().toISOString(), read_only: true };
         const DAY = 86400000, now = Date.now();
