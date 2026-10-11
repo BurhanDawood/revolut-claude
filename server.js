@@ -28512,7 +28512,7 @@ function familyBase() { const d = process.env.RAILWAY_PUBLIC_DOMAIN; return 'htt
 async function familyCfg() {
   const [r] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'family_page'").catch(() => [[]]);
   let c = {}; try { c = r.length ? JSON.parse(r[0].config_value) || {} : {}; } catch (e) { c = {}; }
-  const D = /^\d{4}-\d{2}-\d{2}$/, past = (Array.isArray(c.past) ? c.past : []).filter(p => p && /^[A-Z0-9]{1,15}$/.test(String(p.coin || '')) && D.test(String(p.since || '')) && D.test(String(p.until || ''))).slice(-FAMILY_PAST_MAX).map(p => ({ coin: String(p.coin), since: String(p.since), until: String(p.until) }));
+  const D = /^\d{4}-\d{2}-\d{2}$/, past = (Array.isArray(c.past) ? c.past : []).filter(p => p && /^[A-Z0-9]{1,15}$/.test(String(p.coin || '')) && D.test(String(p.since || '')) && D.test(String(p.until || ''))).slice(-FAMILY_PAST_MAX).map(p => ({ coin: String(p.coin), since: String(p.since), until: String(p.until), last_id: Number.isSafeInteger(p.last_id) && p.last_id > 0 ? p.last_id : null }));
   return { coin: /^[A-Z0-9]{1,15}$/.test(String(c.coin || '')) ? String(c.coin) : null, since: D.test(String(c.since || '')) ? String(c.since) : null, past };
 }
 // #612 (Bryan 11 Oct 22:30 "if I sell all the high and change coins ... I would want the activity section to remain. Showing the high
@@ -28525,13 +28525,18 @@ async function familyCfgSave(c) {
   await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('family_page', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)", [JSON.stringify({ coin: c.coin || null, since: c.since || null, past: past.slice(-FAMILY_PAST_MAX) })]);
   _famCache.clear();
 }
-function familyPastWith(cfg, today) {   // the list with the current coin filed as ended today (no change if there is none)
-  return cfg.coin && cfg.since ? cfg.past.concat([{ coin: cfg.coin, since: cfg.since, until: today }]).slice(-FAMILY_PAST_MAX) : cfg.past;
+// #613 (Bryan 11 Oct 22:35 "if I decided to buy more high after I switched ... It shouldn't show up"): an earlier coin also keeps the last
+// journal id at the moment of the switch, so a buy of that coin later the SAME day stays off her page too (the date alone covered later days).
+async function familyPastWith(cfg, today) {   // the list with the current coin filed as ended now (no change if there is none)
+  if (!(cfg.coin && cfg.since)) return cfg.past;
+  const [r] = await db.execute('SELECT MAX(id) AS m FROM trading_journal').catch(() => [[{}]]);
+  const lastId = Number(r && r[0] && r[0].m) || null;
+  return cfg.past.concat([{ coin: cfg.coin, since: cfg.since, until: today, last_id: lastId }]).slice(-FAMILY_PAST_MAX);
 }
 function familyFirstSince(cfg) { return [cfg.since].concat(cfg.past.map(p => p.since)).filter(Boolean).sort()[0] || null; }
 async function familyHerActivity(cfg, nowMs = Date.now()) {
   const parts = [cfg.coin ? await familyActivity(cfg.coin, cfg.since, nowMs) : []];
-  for (const p of cfg.past) parts.push(await familyActivity(p.coin, p.since, nowMs, p.until).catch(() => []));
+  for (const p of cfg.past) parts.push(await familyActivity(p.coin, p.since, nowMs, p.until, p.last_id).catch(() => []));
   const seen = new Set(), rows = [];
   for (const r of parts.flat()) { if (seen.has(r.id)) continue; seen.add(r.id); rows.push(r); }
   return familyMergeCash(rows, familyFirstSince(cfg), nowMs);
@@ -28616,7 +28621,7 @@ async function familyCommand(sub) {   // Telegram /family - Bryan's chat only (t
     const tm = await revolutTickerMap(15000).catch(() => ({}));
     if (!tm[coin]) return '👛 ' + escTg(coin) + ' has no Revolut X price right now - pick a coin Revolut X lists.';
     const since = cfg.coin === coin && cfg.since ? cfg.since : today;
-    await familyCfgSave({ coin, since, past: cfg.coin && cfg.coin !== coin ? familyPastWith(cfg, today) : cfg.past });   // #612 the old coin's activity stays
+    await familyCfgSave({ coin, since, past: cfg.coin && cfg.coin !== coin ? await familyPastWith(cfg, today) : cfg.past });   // #612 the old coin's activity stays
     const warn = await familyBotTouches(coin);
     return '👛 Her page now shows <b>' + escTg(coin) + '</b>, counting buys from ' + since + ' for "since bought".' + (warn.length ? '\n⚠️ The bot also sells this coin (' + escTg(warn.join(', ')) + '): her balance would move with those sales. Pick a coin only she uses, or switch those off.' : '') + linkLine();
   }
@@ -28626,7 +28631,7 @@ async function familyCommand(sub) {   // Telegram /family - Bryan's chat only (t
     await familyCfgSave({ coin: cfg.coin, since: m[1] });
     return '👛 "Since bought" now counts your ' + escTg(cfg.coin) + ' buys from ' + m[1] + '.';
   }
-  if (s === 'off') { await familyCfgSave({ coin: null, since: null, past: familyPastWith(cfg, today) }); return '👛 Her page is paused (it says "not set up yet"). /family coin SYMBOL turns it back on.'; }
+  if (s === 'off') { await familyCfgSave({ coin: null, since: null, past: await familyPastWith(cfg, today) }); return '👛 Her page is paused (it says "not set up yet"). /family coin SYMBOL turns it back on.'; }
   if (s) return '👛 /family - her page and link\n/family coin SYMBOL - the coin it shows\n/family since YYYY-MM-DD - count buys from this date\n/family off - pause the page';
   if (!cfg.coin) return '👛 Her page has no coin yet: /family coin SYMBOL' + linkLine();
   const d = await familyPageData('day');
@@ -28678,11 +28683,12 @@ app.get('/h/:key/logo', async (req, res) => {   // only her coin's logo
 // hour. Neither shows her link or key.
 const FAMILY_OWNER = { set_per_hour: 10, activity: 50 };
 let familySetTimes = [];
-async function familyActivity(coin, since, nowMs = Date.now(), until = null) {
+async function familyActivity(coin, since, nowMs = Date.now(), until = null, lastId = null) {
   const fx = await pvFx('GBP', nowMs);
   const args = [coin, coin + '-USD']; let w = '';
   if (since) { w = ' AND created_at >= ?'; args.push(since + ' 00:00:00'); }
   if (until) { w += ' AND created_at < DATE_ADD(?, INTERVAL 1 DAY)'; args.push(until + ' 00:00:00'); }   // #612 an earlier coin: to the day it was changed
+  if (lastId) { w += ' AND id <= ?'; args.push(lastId); }   // #613 ... and nothing logged after the switch
   const [rows] = await db.execute('SELECT id, action, price, quantity, value_usd, created_at FROM trading_journal WHERE symbol IN (?, ?)' + w + ' ORDER BY id DESC LIMIT ' + FAMILY_OWNER.activity, args).catch(() => [[]]);
   return rows.map(r => {
     const px = Number(r.price), q = Number(r.quantity), usd = Number(r.value_usd) || (px > 0 && q > 0 ? px * q : 0);
@@ -28888,7 +28894,7 @@ async function familySetCoinFromApp(body, nowMs = Date.now()) {
   if (familySetTimes.length >= FAMILY_OWNER.set_per_hour) return { status: 429, error: 'Too many changes this hour - use /family in Telegram.' };
   familySetTimes.push(nowMs);
   const since = new Date(nowMs).toLocaleDateString('en-CA', { timeZone: 'Europe/London' });
-  await familyCfgSave({ coin: want, since, past: familyPastWith(cfg, since) });   // #612 the old coin's activity stays on her page
+  await familyCfgSave({ coin: want, since, past: await familyPastWith(cfg, since) });   // #612 the old coin's activity stays on her page
   const warn = await familyBotTouches(want);
   sendTelegram('👛 Her page now shows <b>' + escTg(want) + '</b> (set from the app' + (cfg.coin ? ', was ' + escTg(cfg.coin) : '') + '), counting buys from ' + since + '.' + (warn.length ? '\n⚠️ The bot also sells this coin (' + escTg(warn.join(', ')) + ').' : '') + ' Not you? Rotate the dashboard key in Railway.').catch(() => {});
   return { status: 200, ok: true, coin: want, since, warn };
