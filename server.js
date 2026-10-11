@@ -4067,7 +4067,8 @@ async function cardSpendWatchTick() {
         await updateInvestedCapital(before - usd, 'Card payment with ' + s.currency + ' (j' + jid + ', tx ' + s.id + '): -$' + usd.toFixed(2), { payment: true });
         const applied = Math.abs(totalInvestedCapital - (before - usd)) < 0.005;
         const qtyTxt = s.amount.toLocaleString('en-GB', { maximumFractionDigits: s.amount >= 100 ? 2 : 6 });
-        await sendTelegram('💳 PAYMENT with ' + escTg(s.currency) + ' - ' + qtyTxt + ' ' + escTg(s.currency) + ' ≈ $' + usd.toFixed(2) + ' (card payment or transfer out)\n' +
+        const shop = await cardMerchantName(s.id);   // #607 the shop's name, when Revolut X has it
+        await sendTelegram('💳 PAYMENT with ' + escTg(s.currency) + (shop ? ' at <b>' + escTg(shop) + '</b>' : '') + ' - ' + qtyTxt + ' ' + escTg(s.currency) + ' ≈ $' + usd.toFixed(2) + ' (card payment or transfer out)\n' +
           (applied ? 'Capital: $' + before.toFixed(2) + ' \u2192 $' + totalInvestedCapital.toFixed(2) + '\n' : 'Capital change HELD for your confirmation - see the capital alert.\n') +
           'Still pending at Revolut. When it settles nothing more happens: it will not show as a sale.\n\nTap <b>Not a payment</b> if it wasn\'t one.',
           buildAlertKeyboard(String(jid), ['Not a payment'], 'np')).catch(() => {});
@@ -23490,7 +23491,7 @@ app.get('/api/activity', async (req, res) => {
       query = `
         SELECT id, symbol, action, price, quantity, value_usd,
                reasoning, emotion, claude_recommendation,
-               outcome_pnl, outcome_notes, source, created_at
+               outcome_pnl, outcome_notes, source, created_at, venue_tx_id
         FROM trading_journal
         WHERE action = ?
         ORDER BY created_at DESC
@@ -23501,7 +23502,7 @@ app.get('/api/activity', async (req, res) => {
       query = `
         SELECT id, symbol, action, price, quantity, value_usd,
                reasoning, emotion, claude_recommendation,
-               outcome_pnl, outcome_notes, source, created_at
+               outcome_pnl, outcome_notes, source, created_at, venue_tx_id
         FROM trading_journal
         ORDER BY created_at DESC
         LIMIT ${limit}
@@ -23509,6 +23510,7 @@ app.get('/api/activity', async (req, res) => {
     }
 
     const [trades] = await db.execute(query, params);
+    familyMerchantTag(trades);   // #607 card payments carry the shop's name
     console.log(`[activity] Returning ${trades.length} trades (filter=${filter})`);
     res.json({ ok: true, trades: trades || [], total: trades?.length || 0 });
   } catch (e) {
@@ -28730,6 +28732,32 @@ function familyMerchantFor(row, cards) {
     if (dt < bd) { bd = dt; best = t; }
   }
   return best ? (_famMerchant.get(best.id) || null) : null;
+}
+// #607 (Bryan 11 Oct 13:23 "I need that in my activity in my dashboard app as well"): the dashboard's Activity feed (/api/activity) names
+// the shop on card payments too. A journal 'payment' row carries its Revolut X transaction id (venue_tx_id); the name comes from the same
+// cache as #606, and names not read yet are fetched in the background (at most 6 at a time), so they appear on the next load. The id
+// itself is not sent. Read-only, display only.
+let _famMerchantBusy = null;
+function familyMerchantTag(rows) {
+  const want = [];
+  for (const r of rows || []) {
+    const id = r && r.venue_tx_id ? String(r.venue_tx_id) : '';
+    if (r) delete r.venue_tx_id;
+    if (!id || String(r.action || '') !== 'payment' || !/^[0-9a-f-]{20,64}$/i.test(id)) continue;
+    if (_famMerchant.has(id)) { const m = _famMerchant.get(id); if (m) r.merchant = m; } else want.push({ id });
+  }
+  if (want.length && !_famMerchantBusy) _famMerchantBusy = familyMerchantFetch(want).catch(() => {}).finally(() => { _famMerchantBusy = null; });
+}
+// #607 (Bryan 11 Oct 13:24 "in my alerts payments should show it also"): the card watch's PAYMENT alert names the shop. One read of the
+// transaction's details, at most 5 s, after the payment is already recorded; no name (or an error) and the alert goes out as before.
+async function cardMerchantName(id) {
+  id = String(id || ''); if (!id) return null;
+  if (_famMerchant.has(id)) return _famMerchant.get(id) || null;
+  try {
+    const r = await Promise.race([revolutRequest('GET', '/transactions/' + encodeURIComponent(id)), new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 5000))]);
+    const d = (r && r.data) || r || {}, m = typeof d.description === 'string' ? d.description.trim().slice(0, 60) : '';
+    _famMerchant.set(id, m); return m || null;
+  } catch (e) { return null; }
 }
 async function familyMergeCash(activity, since, nowMs = Date.now()) {
   if (nowMs - _famCashTx.at > 5 * 60000 || _famCashTx.since !== since) familyCashTxRefresh(since, nowMs);   // background; the next read shows it

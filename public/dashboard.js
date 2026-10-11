@@ -834,6 +834,7 @@ function loadActivity(filter) {
         + '<div class="activity-header"><div><span class="activity-action" style="color:' + color + '">' + t.action.toUpperCase() + '</span>'
         + '<span class="activity-symbol">' + t.symbol + '</span>' + pnlStr + '</div>'
         + '<span class="activity-time">' + ds + '</span></div>'
+        + (t.merchant ? '<div class="activity-merchant" style="color:#eee;font-weight:600;font-size:0.86rem;margin-bottom:4px">🛒 ' + esc(t.merchant) + '</div>' : '')   // #607 the shop's name
         + '<div class="activity-details">' + qs + ' @ ' + fmtPrice(t.price) + (val ? ' = ' + val : '') + '</div>'
         + '<div class="activity-reason"><span class="activity-reason-text">' + (t.reasoning || 'No reason logged') + '</span></div></div>';
     });
