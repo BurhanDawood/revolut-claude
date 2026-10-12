@@ -28773,15 +28773,18 @@ let _famMerchantBusy = null;
 // #614 (Bryan 12 Oct 08:26 "Other payments even if not her coin payments need to show who payment was to in my activity and alerts ... any
 // payment usdt or from any coin"): a payment row with no venue id (the USDT balance detector logs by balance) is matched to the Revolut X
 // send of the same coin and amount (within 2%) and time (within 36 h); the sends are read in the background every 10 minutes.
+// #615 (Bryan 12 Oct 13:27 "Detected properly but not showing up in activity feed"): the 30-day read stops at 20 pages a window and a busy
+// month runs past that, so the newest sends could be missing - the feed now reads only back to its oldest unnamed payment (up to 10
+// pages), refreshes at once when a payment is newer than the last read, and keeps any send an alert has just matched.
 const _paySends = { at: 0, list: [], busy: null };
-function paySendsRefresh() {
+const paySendShape = s => ({ id: s.id, status: s.status, created_date: s.ms, source: { currency: s.currency, amount: s.amount } });
+function paySendsRefresh(hours = 72) {
   if (_paySends.busy) return _paySends.busy;
-  _paySends.busy = fetchTransactions(30).then(r => {
-    if (r && Array.isArray(r.transactions) && (r.ok || r.transactions.length)) {
-      _paySends.list = r.transactions.filter(t => t && t.id && String(t.type || '').toLowerCase() === 'send' && String(t.status || '').toLowerCase() !== 'cancelled' && parseFloat((t.source || {}).amount) > 0);
-      _paySends.at = Date.now();
-    }
-  }).catch(e => console.error('[pay] #614 sends read:', e.message)).finally(() => { _paySends.busy = null; });
+  _paySends.busy = revolutRecentSends(Math.max(6, Math.min(24 * 14, hours)), 10).then(sends => {
+    const fresh = sends.filter(s => s.status !== 'cancelled').map(paySendShape), ids = new Set(fresh.map(t => t.id));
+    _paySends.list = fresh.concat(_paySends.list.filter(t => !ids.has(t.id))).slice(0, 2000);
+    _paySends.at = Date.now();
+  }).catch(e => console.error('[pay] #615 sends read:', e.message)).finally(() => { _paySends.busy = null; });
   return _paySends.busy;
 }
 function paySendMatch(currencies, qty, atMs, list) {
@@ -28800,8 +28803,9 @@ async function paymentShopByAmount(currencies, amount) {
   try {
     const find = (async () => {
       const sends = await revolutRecentSends(6);
-      const list = sends.map(s => ({ id: s.id, created_date: s.ms, source: { currency: s.currency, amount: s.amount } })).filter((s, i) => sends[i].status !== 'cancelled');
+      const list = sends.filter(s => s.status !== 'cancelled').map(paySendShape);
       const t = paySendMatch(currencies, amount, Date.now(), list);
+      if (t && !_paySends.list.some(x => x.id === t.id)) _paySends.list.unshift(t);   // #615 the feed can name it straight away
       return t ? await cardMerchantName(t.id) : null;
     })();
     return await Promise.race([find, new Promise(res => setTimeout(() => res(null), 8000))]);
@@ -28809,7 +28813,9 @@ async function paymentShopByAmount(currencies, amount) {
 }
 function familyMerchantTag(rows) {
   const want = [];
-  if (Date.now() - _paySends.at > 10 * 60000) paySendsRefresh();   // #614 background; the next load shows it
+  let oldest = Infinity, newest = 0;   // #615 the unnamed payments this load shows (no venue id)
+  for (const r of rows || []) if (r && String(r.action || '') === 'payment' && !r.venue_tx_id) { const ms = new Date(r.created_at).getTime(); if (ms > 0) { oldest = Math.min(oldest, ms); newest = Math.max(newest, ms); } }
+  if (newest && (Date.now() - _paySends.at > 10 * 60000 || newest > _paySends.at - 60000)) paySendsRefresh(Math.ceil((Date.now() - oldest) / 3600000) + 2);   // background; the next load shows it
   for (const r of rows || []) {
     let id = r && r.venue_tx_id ? String(r.venue_tx_id) : '';
     if (r) delete r.venue_tx_id;
