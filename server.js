@@ -2114,9 +2114,11 @@ await db.execute(`CREATE TABLE IF NOT EXISTS trading_journal (
 
 // #48 v1: forward-outcome columns (idempotent)
 for (const [col, ddl] of [
-  ['outcome_7d_pct', 'ADD COLUMN outcome_7d_pct DECIMAL(10,4) NULL'],
-  ['outcome_30d_pct', 'ADD COLUMN outcome_30d_pct DECIMAL(10,4) NULL'],
+  ['outcome_7d_pct', 'ADD COLUMN outcome_7d_pct DECIMAL(10,4) NULL'],      // TRADE QUALITY: the price move after the row, SIGN-FLIPPED on sell/reduce (a sell whose coin then rose reads negative) - see gradeRow
+  ['outcome_30d_pct', 'ADD COLUMN outcome_30d_pct DECIMAL(10,4) NULL'],    // same convention
   ['outcome_grade_source', "ADD COLUMN outcome_grade_source VARCHAR(20) NULL"],
+  ['move_7d_pct', 'ADD COLUMN move_7d_pct DECIMAL(10,4) NULL'],            // #618 (PM note #142): the COIN's own move after the row, never flipped - for the regret ledger
+  ['move_30d_pct', 'ADD COLUMN move_30d_pct DECIMAL(10,4) NULL'],
 ]) {
   try {
     const [rows] = await db.execute(
@@ -16511,10 +16513,11 @@ async function gradeTradeOutcomes() {
       if (priceMap[sym]) return priceMap[sym];
       return await getCurrentPrice(sym).catch(() => null);
     };
+    const rawMoveOf = (entry, now) => ((now - entry) / entry) * 100;   // #618 the coin's move, no sign flip
     const gradeRow = (action, entry, now) => {
-      const rawMove = ((now - entry) / entry) * 100;
+      const rawMove = rawMoveOf(entry, now);
       const a = (action || '').toLowerCase();
-      return (a === 'sell' || a === 'reduce') ? -rawMove : rawMove; // sells inverse: price down after = good exit
+      return (a === 'sell' || a === 'reduce') ? -rawMove : rawMove; // sells inverse: price down after = good exit (outcome_* = trade quality; move_* = the coin)
     };
 
     const [d7] = await db.execute(
@@ -16527,8 +16530,8 @@ async function gradeTradeOutcomes() {
       const now = await priceFor(r.symbol); const entry = parseFloat(r.price);
       if (!now || !entry) continue;
       await db.execute(
-        `UPDATE trading_journal SET outcome_7d_pct = ?, outcome_grade_source = 'forward_live' WHERE id = ?`,
-        [gradeRow(r.action, entry, now).toFixed(4), r.id]); g7++;
+        `UPDATE trading_journal SET outcome_7d_pct = ?, move_7d_pct = ?, outcome_grade_source = 'forward_live' WHERE id = ?`,
+        [gradeRow(r.action, entry, now).toFixed(4), rawMoveOf(entry, now).toFixed(4), r.id]); g7++;   // #618
     }
 
     const [d30] = await db.execute(
@@ -16541,8 +16544,8 @@ async function gradeTradeOutcomes() {
       const now = await priceFor(r.symbol); const entry = parseFloat(r.price);
       if (!now || !entry) continue;
       await db.execute(
-        `UPDATE trading_journal SET outcome_30d_pct = ?, outcome_grade_source = COALESCE(outcome_grade_source,'forward_live') WHERE id = ?`,
-        [gradeRow(r.action, entry, now).toFixed(4), r.id]); g30++;
+        `UPDATE trading_journal SET outcome_30d_pct = ?, move_30d_pct = ?, outcome_grade_source = COALESCE(outcome_grade_source,'forward_live') WHERE id = ?`,
+        [gradeRow(r.action, entry, now).toFixed(4), rawMoveOf(entry, now).toFixed(4), r.id]); g30++;   // #618
     }
     console.log(`[grade] #48 forward grader: ${g7} @7d, ${g30} @30d`);
   } catch (e) { console.error('[grade] gradeTradeOutcomes error:', e.message); }
@@ -23959,7 +23962,7 @@ function createMcpServer() {
 
   // ── Tool: get_price_series (#259 Phase 1 — read-only historical price series for backtesting) ──
   server.tool('get_price_series',
-    'Read-only historical price series for one symbol from stored captures, for analysis/backtesting. source=intraday reads 2-min price_intraday (last ~30d; pruned nightly), source=hourly reads the long-retained price_intraday_hourly rollup (OHLC, survives the 30d prune), source=daily reads price_history daily closes. Optionally resample to OHLC bars (5m/1h/4h/1d) to keep payloads small; resample=raw returns raw points (capped). All timestamps UTC. Read-only: fires no alerts, mutates no state.',
+    'Read-only historical price series for one symbol from stored captures, for analysis/backtesting. source=intraday reads 2-min price_intraday (last ~30d; pruned nightly), source=hourly reads the long-retained price_intraday_hourly rollup (OHLC, survives the 30d prune), source=daily reads the venue daily candles (price_daily_ohlc, 2.5+ years for tracked coins; #618), falling back to price_history (nightly closes of held coins only). Optionally resample to OHLC bars (5m/1h/4h/1d) to keep payloads small; resample=raw returns raw points (capped). All timestamps UTC. Read-only: fires no alerts, mutates no state.',
     {
       symbol:   z.string().describe('Coin symbol e.g. CC or CC-USD'),
       source:   z.enum(['intraday', 'daily', 'hourly']).optional().describe('intraday = 2-min captures (default, ~30d); hourly = long-retained OHLC rollup; daily = daily closes'),
@@ -23973,7 +23976,7 @@ function createMcpServer() {
         if (!symbol) return { content: [{ type: 'text', text: JSON.stringify({ error: 'symbol required' }) }] };
         const sym = symbol.toUpperCase().includes('-USD') ? symbol.toUpperCase() : symbol.toUpperCase() + '-USD';
         const src = source === 'daily' ? 'daily' : (source === 'hourly' ? 'hourly' : 'intraday');
-        const table = src === 'daily' ? 'price_history' : 'price_intraday';
+        const table = src === 'daily' ? 'price_history' : 'price_intraday';   // #618 daily: price_daily_ohlc first (below); this table is the fallback
         const rs = resample || (src === 'daily' ? 'raw' : '1h');
         const HARD = 6000;
         let cap = parseInt(limit) || 3000;
@@ -24015,9 +24018,17 @@ function createMcpServer() {
           out.series = bars;
           return { content: [{ type: 'text', text: JSON.stringify(out) }] };
         }
-let rows;
+let rows, dailyFrom = null;
         try {
-          [rows] = await db.execute(
+          if (src === 'daily') {   // #618 (PM note #142: "daily holds only 8 days of BTC"): price_history is the held coins' nightly closes (BTC last held in May);
+            // the venue's daily candles (#373, price_daily_ohlc, topped up nightly) are the real daily series. Read those first; fall back to the legacy table.
+            const [drows] = await db.execute('SELECT day, open_px, high_px, low_px, close_px FROM price_daily_ohlc WHERE symbol = ? AND day BETWEEN DATE(?) AND DATE(?) ORDER BY day ASC', [sym, startIso, endIso]);
+            if (drows.length) {
+              dailyFrom = 'price_daily_ohlc';
+              rows = drows.map(r => ({ price: r.close_px, recorded_at: String(r.day instanceof Date ? r.day.toISOString().slice(0, 10) : String(r.day).slice(0, 10)) + 'T00:00:00Z', o: parseFloat(r.open_px), h: parseFloat(r.high_px), l: parseFloat(r.low_px) }));
+            }
+          }
+          if (!rows) [rows] = await db.execute(
             'SELECT price, recorded_at FROM ' + table + ' WHERE symbol = ? AND recorded_at BETWEEN ? AND ? ORDER BY recorded_at ASC',
             [sym, startIso, endIso]
           );
@@ -24025,13 +24036,14 @@ let rows;
           return { content: [{ type: 'text', text: JSON.stringify({ error: 'query failed: ' + e.message }) }] };
         }
         const out = { symbol: sym, source: src, resample: rs, start_utc: startIso, end_utc: endIso, points_in_window: rows.length };
+        if (src === 'daily') out.table = dailyFrom || 'price_history (legacy: the held coins\' nightly closes - no venue daily candles stored for this coin in the window)';   // #618
         if (!rows.length) { out.note = 'no captures in window (intraday is pruned at 30d)'; out.series = []; return { content: [{ type: 'text', text: JSON.stringify(out) }] }; }
         let mn = Infinity, mx = -Infinity;
         const firstP = parseFloat(rows[0].price), lastP = parseFloat(rows[rows.length - 1].price);
         for (const r of rows) { const p = parseFloat(r.price); if (p < mn) mn = p; if (p > mx) mx = p; }
         out.summary = { first: firstP, last: lastP, min: mn, max: mx, change_pct: firstP > 0 ? Number(((lastP - firstP) / firstP * 100).toFixed(2)) : null };
         if (rs === 'raw') {
-          let pts = rows.map(r => ({ t: new Date(r.recorded_at).toISOString(), p: parseFloat(r.price) }));
+          let pts = rows.map(r => dailyFrom ? { t: new Date(r.recorded_at).toISOString(), p: parseFloat(r.price), o: r.o, h: r.h, l: r.l } : { t: new Date(r.recorded_at).toISOString(), p: parseFloat(r.price) });   // #618 daily candles carry o/h/l
           if (pts.length > cap) { out.truncated = { of: pts.length, returned: cap, note: 'most recent ' + cap + ' points; use resample for the full window' }; pts = pts.slice(-cap); }
           out.series = pts;
         } else {
