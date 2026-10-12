@@ -13889,7 +13889,9 @@ async function reconcileTransactions(daysBack = 30, dryRun = null) {
             ? `\nCapital: $${capBefore.toFixed(2)} (unchanged)\n⚠️ Drop over $200 HELD: it goes to $${capTarget.toFixed(2)} only if you tap Confirm on the capital alert.\n`
             : `\nCapital: $${capBefore.toFixed(2)} \u2192 $${totalInvestedCapital.toFixed(2)}\n`;
           const priceDisplay = (currency !== 'USD' && currency !== 'USDT') ? ` @ $${priceUsed.toFixed(4)}` : '';
+          const shopRc = action === 'payment' ? await cardMerchantName(tx.id) : null;   // #614 who it was to
           const alertMsg = `${actionHeader} — ${currency}</b>\n\n` +
+            (shopRc ? `To: <b>${escTg(shopRc)}</b>\n` : '') +
             `Amount: ${txAmt} ${currency}${priceDisplay}\n` +
             `Value: $${valueUsd.toFixed(2)}\n` +
             `Transaction ID: ${tx.id}\n` +
@@ -13925,7 +13927,9 @@ async function reconcileTransactions(daysBack = 30, dryRun = null) {
           const journalId = ins.insertId;
 
           const actionHeader = action === 'payment' ? '💳 <b>RECONCILER PAYMENT' : '📥 <b>RECONCILER DEPOSIT';
+          const shopRc2 = action === 'payment' ? await cardMerchantName(tx.id) : null;   // #614
           const alertMsg = `${actionHeader} — ${currency}</b>\n\n` +
+            (shopRc2 ? `To: <b>${escTg(shopRc2)}</b>\n` : '') +
             `Amount: ${txAmt} ${currency}\n` +
             `Value: UNKNOWN\n` +
             `Transaction ID: ${tx.id}\n\n` +
@@ -19697,8 +19701,9 @@ async function checkPortfolio() {
                 await updateInvestedCapital(newCap, `Card payment auto-logged: -$${netPaymentAmt.toFixed(2)}`, { payment: true });
                 // Report what capital ACTUALLY did - a payment over $200 is HELD by the guard.
                 const applied146 = Math.abs(totalInvestedCapital - newCap) < 0.005;
+                const shop146 = await paymentShopByAmount(['USDT'], netPaymentAmt);   // #614 who it was to
                 await sendTelegram(
-                  `💳 PAYMENT $${netPaymentAmt.toFixed(2)} USDT\n` +
+                  `💳 PAYMENT $${netPaymentAmt.toFixed(2)} USDT${shop146 ? ' at <b>' + escTg(shop146) + '</b>' : ''}\n` +
                   (applied146
                     ? `Capital: $${prevCap.toFixed(2)} \u2192 $${totalInvestedCapital.toFixed(2)}\n\n`
                     : `Capital change HELD for your confirmation - see the capital alert.\n\n`) +
@@ -19761,8 +19766,9 @@ async function checkPortfolio() {
                 const newCap159  = totalInvestedCapital - hidden159;
                 await updateInvestedCapital(newCap159, `#159 Hidden card payment auto-logged: -$${hidden159.toFixed(2)}`, { payment: true });
                 const applied159 = Math.abs(totalInvestedCapital - newCap159) < 0.005;
+                const shop159 = await paymentShopByAmount(['USDT', 'USD'], hidden159);   // #614
                 await sendTelegram(
-                  `\ud83d\udcb3 PAYMENT $${hidden159.toFixed(2)} USDT\n` +
+                  `\ud83d\udcb3 PAYMENT $${hidden159.toFixed(2)} USDT${shop159 ? ' at <b>' + escTg(shop159) + '</b>' : ''}\n` +
                   (usdtIn159 > 0 ? `(#159: masked by USD\u2192USDT conversion in same window)\n` : `(USD left the account with no matching USDT, and no coin buys found on Revolut X)\n`) +
                   (applied159
                     ? `Capital: $${prevCap159.toFixed(2)} \u2192 $${totalInvestedCapital.toFixed(2)}\n\n`
@@ -28764,12 +28770,52 @@ function familyMerchantFor(row, cards) {
 // cache as #606, and names not read yet are fetched in the background (at most 6 at a time), so they appear on the next load. The id
 // itself is not sent. Read-only, display only.
 let _famMerchantBusy = null;
+// #614 (Bryan 12 Oct 08:26 "Other payments even if not her coin payments need to show who payment was to in my activity and alerts ... any
+// payment usdt or from any coin"): a payment row with no venue id (the USDT balance detector logs by balance) is matched to the Revolut X
+// send of the same coin and amount (within 2%) and time (within 36 h); the sends are read in the background every 10 minutes.
+const _paySends = { at: 0, list: [], busy: null };
+function paySendsRefresh() {
+  if (_paySends.busy) return _paySends.busy;
+  _paySends.busy = fetchTransactions(30).then(r => {
+    if (r && Array.isArray(r.transactions) && (r.ok || r.transactions.length)) {
+      _paySends.list = r.transactions.filter(t => t && t.id && String(t.type || '').toLowerCase() === 'send' && String(t.status || '').toLowerCase() !== 'cancelled' && parseFloat((t.source || {}).amount) > 0);
+      _paySends.at = Date.now();
+    }
+  }).catch(e => console.error('[pay] #614 sends read:', e.message)).finally(() => { _paySends.busy = null; });
+  return _paySends.busy;
+}
+function paySendMatch(currencies, qty, atMs, list) {
+  const cs = currencies.map(c => String(c || '').toUpperCase().replace(/[-/]USD$/, ''));
+  let best = null, bd = Infinity;
+  for (const t of list || []) {
+    const s = t.source || {}, q = parseFloat(s.amount), ms = Number(t.created_date) || Date.parse(t.created_date) || 0;
+    if (!cs.includes(String(s.currency || '').toUpperCase()) || !(q > 0) || Math.abs(q - qty) / qty > 0.02) continue;
+    const dt = Math.abs(ms - atMs); if (dt > 36 * 3600000) continue;
+    if (dt < bd) { bd = dt; best = t; }
+  }
+  return best;
+}
+// #614 an alert for a payment logged by balance: find its send in the last 6 h and read the shop (8 s at most; none = the alert as before)
+async function paymentShopByAmount(currencies, amount) {
+  try {
+    const find = (async () => {
+      const sends = await revolutRecentSends(6);
+      const list = sends.map(s => ({ id: s.id, created_date: s.ms, source: { currency: s.currency, amount: s.amount } })).filter((s, i) => sends[i].status !== 'cancelled');
+      const t = paySendMatch(currencies, amount, Date.now(), list);
+      return t ? await cardMerchantName(t.id) : null;
+    })();
+    return await Promise.race([find, new Promise(res => setTimeout(() => res(null), 8000))]);
+  } catch (e) { return null; }
+}
 function familyMerchantTag(rows) {
   const want = [];
+  if (Date.now() - _paySends.at > 10 * 60000) paySendsRefresh();   // #614 background; the next load shows it
   for (const r of rows || []) {
-    const id = r && r.venue_tx_id ? String(r.venue_tx_id) : '';
+    let id = r && r.venue_tx_id ? String(r.venue_tx_id) : '';
     if (r) delete r.venue_tx_id;
-    if (!id || String(r.action || '') !== 'payment' || !/^[0-9a-f-]{20,64}$/i.test(id)) continue;
+    if (!r || String(r.action || '') !== 'payment') continue;
+    if (!/^[0-9a-f-]{20,64}$/i.test(id)) { const t = paySendMatch([r.symbol], Number(r.quantity), new Date(r.created_at).getTime(), _paySends.list); id = t ? String(t.id) : ''; }   // #614
+    if (!id || !/^[0-9a-f-]{20,64}$/i.test(id)) continue;
     if (_famMerchant.has(id)) { const m = _famMerchant.get(id); if (m) r.merchant = m; } else want.push({ id });
   }
   if (want.length && !_famMerchantBusy) _famMerchantBusy = familyMerchantFetch(want).catch(() => {}).finally(() => { _famMerchantBusy = null; });
