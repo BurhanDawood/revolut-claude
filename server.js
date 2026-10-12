@@ -29791,7 +29791,11 @@ async function agentScoreFlip(sc) {   // a team note for the Claude PM thread wh
 //     decides); a team note to Fable (+ a comment on a desk thread it names). The memo is a team note to the PM thread.
 // Its spend is its own (pm_boss_reviews.cost_usd, $1 a London day, refused before the call), not charged to the paper cash; the
 // scorecard shows it next to the trader's bill so the whole team's cost is visible.
-const PM_BOSS = { daily_usd: 1, max_changes: 2, field_days: 3, undo_hours: 24, weekday_tokens: 1500, deep_tokens: 3000, playbook_max: 1200, quiet_days: 3, timeout_ms: 120000 };
+// #617 (Bryan 12 Oct "fix pm agent answer problem"): 5 of 8 reviews and task #85 came back unreadable - the weekday reviews and tasks had
+// 1,500 output tokens for a memo of up to 1,500 characters, a playbook of up to 1,200 and the changes as JSON, so a review that wrote a
+// playbook ran out of room mid-JSON (the deep reviews, with 3,000, all read). Now 4,000 / 6,000 / 4,000; the stop reason is kept; a
+// retry after running out of room asks for a SHORTER answer instead of the same one again.
+const PM_BOSS = { daily_usd: 1, max_changes: 2, field_days: 3, undo_hours: 24, weekday_tokens: 4000, deep_tokens: 6000, playbook_max: 1200, quiet_days: 3, timeout_ms: 120000 };
 const PM_BOSS_FIELDS = {   // C2: the paper bounds
   per_trade_pct: { min: 10, max: 25, label: 'per-trade size (% of equity)' },
   max_positions: { min: 2, max: 5, int: true, label: 'positions at once' },
@@ -30009,6 +30013,28 @@ async function pmBossInput(kind, led, sc) {
   };
 }
 let _pmBossRunning = false;
+// #617 (Bryan 12 Oct 16:20 "Apply directly"): the starter-size playbook he approved on 7 Oct (PM note #104, condensed to the 1,200-character
+// limit) never landed because the PM agent's answers could not be read. Written once at start-up as BRYAN's change: paper only, logged in
+// agent_changes (so the PM agent leaves the playbook alone for 3 days), one Telegram line; /agent boss reset playbook clears it.
+const PB_617 = "Lessons from early paper trades: BCH, EDGE and GRT were stopped out on single wick-touches at tight invalidation levels and each reversed 8-24% within hours. Treat a touch as noise; prefer a closed-candle confirmation before calling a thesis invalidated.\n\nENTRY SIZING, NOT ENTRY BANS. A borderline setup is a reason to size small, not to stand down.\n- STARTER, 10% per trade: a setup that meets your criteria marginally (7-8% off the high, RSI 44-46, a sound thesis without a dated catalyst). Take it at starter size.\n- FULL, up to 25%: only for an unambiguous signal - a clean dip with RSI well inside the zone AND a dated catalyst or real fundamentals (revenue, listings, investor backing).\nUse your max_positions; do not self-impose a lower cap. \"No clean setup elsewhere\" is not a reason to hold one position when starter size exists.\n\nKeep sitting out hot ROCKET/MIXED chases just because an alert fires: across all coins (n=293) 82% pull back 8%+ and only 32% are higher a week later.\n\nRound-trip costs run near 1.6% plus model cost. Apply the 2x cost hurdle to FULL size only; at starter size the hurdle is the round-trip cost itself.";
+async function agentPlaybookBryan617() {
+  const [done] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'pb_617'");
+  if (done.length) return;
+  const led = await readAgentLedger(), mark = (v) => db.execute("INSERT IGNORE INTO system_config (config_key, config_value) VALUES ('pb_617', ?)", [String(v)]);
+  if (led.mode !== 'paper') { await mark('skipped: ' + led.mode); return; }
+  const p = pmPlaybookClean(PB_617); if (!p.ok) throw new Error(p.error);
+  const stored = await agentConfigStored(), before = String((stored.pm_playbook && stored.pm_playbook.text) || '');
+  if (before === p.text) { await mark('already'); return; }
+  const eq = await agentEquity(led).catch(() => null);
+  const [ins] = await db.execute('INSERT INTO agent_changes (at, by_role, field, before_v, after_v, reason, review_id, equity_at, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    [Date.now(), 'bryan', 'playbook', JSON.stringify(before), JSON.stringify(p.text), 'Bryan 12 Oct: apply the 7 Oct starter-size playbook (PM note #104) directly', null, eq ? Number(eq.equity.toFixed(6)) : null, 'applied']);
+  stored.pm_playbook = { text: p.text, at: new Date().toISOString(), review_id: null };
+  try { await agentConfigStore(stored); } catch (e) { await db.execute("UPDATE agent_changes SET status = 'failed' WHERE id = ?", [ins.insertId]).catch(() => {}); throw e; }
+  await mark(ins.insertId);
+  await sendTelegram('🧭 <b>Paper trader playbook replaced</b> as you asked (change ' + ins.insertId + '): borderline setups now get a 10% STARTER buy instead of a pass; full size (up to 25%) stays for clean signals; no self-imposed cap below max_positions; the 2x cost hurdle applies to full size only. Paper only. <code>/agent boss reset playbook</code> clears it.').catch(() => {});
+  console.log('[agent] #617 playbook applied for Bryan (change ' + ins.insertId + ')');
+}
+{ const t617 = setTimeout(() => { agentPlaybookBryan617().catch(e => console.error('[agent] #617 playbook:', e.message)); }, 45000); if (t617.unref) t617.unref(); }
 async function pmBossReview(kind = 'weekday') {   // weekday (21:05, only when something changed) | sunday (19:00, deep) | manual (/agent boss run, deep)
   if (_pmBossRunning) return { ok: false, reason: 'a review is already running' };
   _pmBossRunning = true;
@@ -30047,8 +30073,8 @@ async function pmBossReview(kind = 'weekday') {   // weekday (21:05, only when s
     const [ins] = await db.execute('INSERT INTO pm_boss_reviews (at, kind, model, cost_usd, headline, memo, output, sig) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', [Date.now(), kind, String(call.model || model).slice(0, 40), Number(cost.toFixed(6)), headline, memo, text.slice(0, 20000), sig]);
     const reviewId = Number(ins.insertId), result = { changes: [], spec: null, escalate: null, notes_read: 0 };
     if (!memo) {
-      await db.execute('UPDATE pm_boss_reviews SET result = ? WHERE id = ?', [JSON.stringify({ error: 'the answer could not be read', retried: call.retried }), reviewId]);
-      await sendTelegram('⚠️ PM agent review #' + reviewId + ': its answer could not be read' + (call.retried ? ', even after one retry asking for the JSON only' : '') + ' (cost $' + cost.toFixed(3) + '). Nothing changed.').catch(() => {});
+      await db.execute('UPDATE pm_boss_reviews SET result = ? WHERE id = ?', [JSON.stringify({ error: 'the answer could not be read', retried: call.retried, stop: call.stop }), reviewId]);   // #617 why
+      await sendTelegram('⚠️ PM agent review #' + reviewId + ': its answer could not be read' + (call.retried ? ', even after one retry asking for the JSON only' : '') + (call.stop ? ' (stopped: ' + escTg(String(call.stop)) + ')' : '') + ' (cost $' + cost.toFixed(3) + '). Nothing changed.').catch(() => {});
       return { ok: false, reason: 'bad_json', review_id: reviewId, cost };
     }
     for (const [i, c] of (Array.isArray(out.changes) ? out.changes.slice(0, 6) : []).entries()) {
@@ -30210,14 +30236,15 @@ async function pmBossCall({ model, maxOut, system, content, price, label, spentB
   const first = [{ role: 'user', content }];
   const m1 = await once(first);   // a failure here is the caller's to report
   await logClaudeCall(label, m1.model || model, m1.usage || {}).catch(() => {});
-  let cost = costOf(m1.usage || {}), text = textOf(m1), out = pmBossParse(text), retried = false;
+  let cost = costOf(m1.usage || {}), text = textOf(m1), out = pmBossParse(text), retried = false, stop = m1.stop_reason || null;   // #617
   if (!(out && validate(out))) {
     out = null;
     const est2 = (content.length + system.length + text.length) / 3 * price[0] / 1e6 + maxOut * price[1] / 1e6;
     if ((Number(spentBefore) || 0) + cost + est2 <= PM_BOSS.daily_usd) {
       retried = true;
       try {
-        const m2 = await once(first.concat([{ role: 'assistant', content: text || '(no text)' }, { role: 'user', content: 'That answer could not be read as JSON. Reply with the ONE JSON object only, exactly as specified - no prose before or after it, no code fence.' }]));
+        const m2 = await once(first.concat([{ role: 'assistant', content: text || '(no text)' }, { role: 'user', content: (stop === 'max_tokens' ? 'That answer ran out of room before the JSON was complete. Reply again, SHORTER: memo under 900 characters, and leave the playbook out unless you are changing it. ' : 'That answer could not be read as JSON. ') + 'Reply with the ONE JSON object only, exactly as specified - no prose before or after it, no code fence.' }]));   // #617
+        stop = (stop || '') + ' / ' + (m2.stop_reason || '?');
         await logClaudeCall(label + ' (JSON retry)', m2.model || model, m2.usage || {}).catch(() => {});
         cost += costOf(m2.usage || {});
         const t2 = textOf(m2), o2 = pmBossParse(t2);
@@ -30226,13 +30253,13 @@ async function pmBossCall({ model, maxOut, system, content, price, label, spentB
       } catch (e) { out = null; }
     }
   }
-  return { model: m1.model || model, text, out, cost, retried };
+  return { model: m1.model || model, text, out, cost, retried, stop };
 }
 // THE PM AGENT TAKES TASKS (D5): a task with owner pm_agent, from the PM thread, the Dev thread or Fable, gets one task run within about
 // 5 minutes: the review's input (plus the task) and ONE model call with no tools. A task run ANSWERS and PROPOSES - it never applies a
 // setting or a playbook, files no spec and escalates nothing (those stay in its scheduled reviews, which see the answers it gave). It
 // counts against the PM agent's $1 a day and the team's day; /agent boss off or /team off stop it.
-const PM_TASK = { tokens: 1500, from: ['claude_pm', 'claude_dev', 'fable'], every_ms: 5 * 60 * 1000 };
+const PM_TASK = { tokens: 4000, from: ['claude_pm', 'claude_dev', 'fable'], every_ms: 5 * 60 * 1000 };
 const PM_BOSS_TASK_PROMPT = `You are the PM agent: the boss of Bryan's paper budget agent ("the trader") in his Revolut X system. A colleague - Bryan's PM thread, Dev thread or Fable (all Claude) - has given you a TASK. Answer it from the input: your usual review data (the trader, its scorecard, decisions, settings and your changes) and, read-only, bryans_side (his PM thread's standing decisions and checkpoint, his own last trades).
 RULES (enforced in code after you answer)
 - A task run ANSWERS and PROPOSES. It changes nothing: no setting, no playbook, no tool request, no escalation, no trade. Setting changes happen only in your scheduled reviews, within their bounds (Bryan's rule). If the task asks for a change, say what you would do and why in proposals - your next review sees this answer and can make it if the evidence holds.
