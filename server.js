@@ -13115,6 +13115,8 @@ async function fetchOrderFills(orderId) {
 }
 
 // Dev-331: read-only Revolut X transactions fetcher (GET /1.0/transactions)
+const TX_MAX_PAGES = 100;   // #620 per 30-day window (10,000 rows); was 20 (2,000) - a busy month at 2.5x turnover came within reach of it
+let _txOrderLogged = false;
 async function fetchTransactions(daysBack = 30) {
   const out = { ok: false, windows: [], transactions: [], errors: [] };
   const DAY = 86400000;
@@ -13177,8 +13179,13 @@ async function fetchTransactions(daysBack = 30) {
         const nextCursor = page && page.metadata && page.metadata.next_cursor;
         cursor = (nextCursor && typeof nextCursor === 'string' && nextCursor.trim() !== '') ? nextCursor : null;
         pages++;
-      } while (cursor && pages < 20);
-      out.windows.push({ from: new Date(start).toISOString().slice(0, 10), to: new Date(end).toISOString().slice(0, 10), transactions: got, pages });
+        if (pages === 1 && rowsAll.length > 1 && !_txOrderLogged) { _txOrderLogged = true; const a = tsOf(rowsAll[0]), b = tsOf(rowsAll[rowsAll.length - 1]); console.log('[tx] #620 page order: first row ' + new Date(a).toISOString() + ', last row ' + new Date(b).toISOString() + ' -> ' + (a > b ? 'newest first' : a < b ? 'OLDEST first' : 'same stamp')); }   // the venue docs do not say
+      } while (cursor && pages < TX_MAX_PAGES);
+      if (cursor) {   // #620 (Fable 12 Oct: the 20-page cap could drop the newest rows of a busy month, unseen): now 100 pages a window, and a cut is never silent
+        out.errors.push({ window: new Date(start).toISOString().slice(0, 10), error: 'window cut at ' + TX_MAX_PAGES + ' pages (' + got + ' rows) - more exist' });
+        console.error('[tx] #620 ' + new Date(start).toISOString().slice(0, 10) + ' window cut at ' + TX_MAX_PAGES + ' pages (' + got + ' rows) - callers see errors[], not a complete read');
+      }
+      out.windows.push({ from: new Date(start).toISOString().slice(0, 10), to: new Date(end).toISOString().slice(0, 10), transactions: got, pages, cut: !!cursor });
     }
     out.ok = out.errors.length === 0 || out.transactions.length > 0;
   } catch (e) {
