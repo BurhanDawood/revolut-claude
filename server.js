@@ -14317,6 +14317,19 @@ const BRIEF_PM_NUDGE = '\n\n📋 For decisions, open Claude PM and say "morning 
 // range and a swing count measures noise, neither is a direction - and on 1 Oct it focused on IDEX after he had sold it. Now every held
 // coin (worth $10+) goes in with its 7-day move shape, pace, lean and its OWN loop's arm distance (from the loop baseline, not the rolling
 // 24 h anchor); only a held coin whose shape is not NONE may be FOCUS, and the system checks the line after the model writes it.
+// #618 (#433, Bryan 12 Oct 21:31): the arm baseline is the price at the start of the current window, by design (reset when the window
+// ends, never a rolling low). So after a dip the arm % in effect from LIVE price is larger than the rule's - this says by how much, and
+// how old the anchor is, so a reader never has to compare baseline against live by hand.
+function loopArmNow(rule, price) {
+  const arm = Number(rule.arm_pump_pct), base = Number(rule.baseline_price), at = Number(rule.baseline_at) || 0, win = Number(rule.arm_window_min) || 60, p = Number(price);
+  if (Number(rule.armed) === 1) return { state: 'armed' };
+  if (!(base > 0) || !(arm > 0)) return { state: 'no_baseline', note: 'set on the next scan' };
+  const ageMin = at > 0 ? Math.max(0, Math.round((Date.now() - at) / 60000)) : null, armPx = base * (1 + arm / 100);
+  const o = { state: 'waiting', baseline: base, baseline_age_min: ageMin, window_min: win, resets_in_min: ageMin != null ? Math.max(0, win - ageMin) : null, arm_price: Number(armPx.toPrecision(8)) };
+  if (p > 0) { o.live = p; o.from_live_pct = Number(((armPx / p - 1) * 100).toFixed(1)); o.baseline_vs_live_pct = Number(((base / p - 1) * 100).toFixed(1)); }
+  o.note = 'the baseline is the price at the start of this window (Bryan 12 Oct); it resets to the live price when the window ends';
+  return o;
+}
 async function loopArmFacts(sym, price) {   // read-only: where a coin's own pump loop arms, measured from the loop's baseline
   try {
     const [r] = await db.execute('SELECT arm_pump_pct, baseline_price, armed, loop_enabled, sale_price FROM pump_armed_rules WHERE symbol = ? AND active = 1 LIMIT 1', [sym]);
@@ -27270,6 +27283,7 @@ let rows, dailyFrom = null;
                                   : { pass: null, reason: sc.reason }; })() : null,
               loop_enabled: rule ? Number(rule.loop_enabled) : null, armed: rule ? Number(rule.armed) : null,
               arm: rule ? `+${Number(rule.arm_pump_pct)}% in ${Number(rule.arm_window_min)}min, trail ${Number(rule.trail_pct)}%, sell ${Number(rule.sell_pct)}%` : null,
+              arm_now: rule ? loopArmNow(rule, price) : null,   // #619 (#433) the arm measured from LIVE price, and the anchor's age
               ceiling: rule ? (() => { const c = effectiveCeilingPct(rule); const sp = Number(rule.sale_price); return c.pct + '% (' + c.source + ')' + (sp > 0 ? ' - gives up above ' + fmtPriceShort(sp * (1 + c.pct / 100)) : ' - no live cycle'); })() : null,   // #P0 buy-back ceiling; #A3 the give-up price
               blocked_by: blocks,
               verdict: !canSell ? 'CANNOT auto-sell' : (price != null && eff != null && price <= eff ? `can auto-sell only above ${r6(eff)} (price is at/below the floor)` : 'CAN auto-sell on a trail breach'),
@@ -27294,7 +27308,8 @@ let rows, dailyFrom = null;
         }
         if (action === 'pump_status') {
           const [prules] = await db.execute('SELECT * FROM pump_armed_rules ORDER BY symbol');
-          return { content: [{ type: 'text', text: JSON.stringify({ pump_armed_rules: prules, count: prules.length }, null, 2) }] };
+          for (const r of prules) r.arm_now = loopArmNow(r, null);   // #619 (#433) the anchor's age and the arm price, without a live read
+          return { content: [{ type: 'text', text: JSON.stringify({ pump_armed_rules: prules, count: prules.length, arm_now_about: 'the baseline is the price at the START of the current arm_window_min window (reset when the window ends; Bryan 12 Oct) - after a dip it sits above live, so the arm % from live is what is in effect' }, null, 2) }] };
         }
         if (action === 'loop_enable') {
           if (!symbol) throw new Error('symbol required for loop_enable');
