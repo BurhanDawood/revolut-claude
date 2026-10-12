@@ -21172,17 +21172,27 @@ function parseRssXml(xml) {
 async function analyseSourceFeedItem(item, source) {
   if (!item.transcript || item.transcript.length < 100) return null;
   let coinTags = []; if (Array.isArray(source.coin_tags)) { coinTags = source.coin_tags; } else if (typeof source.coin_tags === 'string' && source.coin_tags) { try { const ct = JSON.parse(source.coin_tags); coinTags = Array.isArray(ct) ? ct : String(ct).split(',').map(s=>s.trim()).filter(Boolean); } catch(e) { coinTags = source.coin_tags.split(',').map(s=>s.trim()).filter(Boolean); } }
+  // #616 (PM note #137 / dev #435, 12 Oct): plans go in ONLY for coins this item actually names (coinsInNotes - the same kind of match
+  // 'mentions' uses), never for every coin the SOURCE is tagged with; each plan carries its coin's live price so a level already passed
+  // reads as passed; with no coin of the plans named, the implication says so instead of inventing relevance.
+  const named = new Set((await coinsInNotes(String(item.title || '') + '\n' + String(item.transcript || '')).catch(() => [])).map(c => String(c).toUpperCase()));
+  const tm = await revolutTickerMap(60000).catch(() => ({}));
   const plans = [];
   for (const coin of coinTags) {
+    if (!named.has(String(coin).toUpperCase())) continue;   // #616
     const [[row]] = await db.execute('SELECT strategy_md FROM coin_strategy WHERE symbol=? AND (status IS NULL OR status <> \'draft\')',[coin]).catch(()=>[[]]);   // #525 C1: a PM draft is not a plan
-    if (row?.strategy_md) plans.push('=== '+coin+' PLAN ===\n'+row.strategy_md);
+    const px = tm[String(coin).toUpperCase()] && tm[String(coin).toUpperCase()].mid;
+    if (row?.strategy_md) plans.push('=== '+coin+' PLAN' + (px > 0 ? ' (LIVE PRICE NOW: $' + Number(px).toLocaleString('en-US', { maximumSignificantDigits: 8 }) + ')' : '') + ' ===\n'+row.strategy_md);
   }
-  const prompt = `Analyse this content from "${source.name}" against the trader's saved coin plans.\n\nCOIN PLANS:\n${plans.join('\n\n')||'No saved plans.'}\n\nCONTENT:\nTitle: ${item.title}\n\n${item.transcript.slice(0,9000)}\n\nRULES (#561): "takeaways" are ONLY what the CONTENT says - never a price level, zone or target taken from the COIN PLANS; a level appears in a takeaway only if the speaker said it. Plan levels belong in "implication", always called "your plan's ...".\n\nRespond JSON only (no markdown): {"thesis_status":"intact|drifting|broken|neutral","takeaways":["what the content says 1","2","3"],"implication":"one sentence: how it bears on the plans"}`;
+  const NONE_TXT = 'None of the coins in your plans were discussed in this video.';
+  const prompt = `Analyse this content from "${source.name}" against the trader's saved coin plans.\n\nCOIN PLANS:\n${plans.join('\n\n')||'No saved plans.'}\n\nCONTENT:\nTitle: ${item.title}\n\n${item.transcript.slice(0,9000)}\n\nRULES (#561): "takeaways" are ONLY what the CONTENT says - never a price level, zone or target taken from the COIN PLANS; a level appears in a takeaway only if the speaker said it. Plan levels belong in "implication", always called "your plan's ...".\nRULES (#616): the COIN PLANS above are only the plans for coins this content names. The implication may speak about those coins only; never say the content supports, validates or weakens a plan for a coin it does not discuss. Each plan shows its coin's LIVE PRICE NOW: a plan level the live price has already moved past has been reached - say so (for example "your plan's $68,507 reclaim has already been cleared, price is $82,600"), and never tell the trader to wait for, or hold back until, a level price is already beyond.${plans.length ? '' : ' There are no plans for the coins discussed, so "implication" must be exactly: "' + NONE_TXT + '" and thesis_status "neutral".'}\n\nRespond JSON only (no markdown): {"thesis_status":"intact|drifting|broken|neutral","takeaways":["what the content says 1","2","3"],"implication":"one sentence: how it bears on the plans"}`;
   try {   // #417 Gemini, not Claude Haiku (Bryan chose B, 24 Sep: free). thesis_status is checked - the column is an ENUM.
     const text = await geminiGenerateText(prompt, { json: true, maxOutputTokens: 4096, timeoutMs: 60000 });
     const a = JSON.parse(text.replace(/```json|```/g,'').trim());
     if (!a || typeof a !== 'object') throw new Error('analysis was not a JSON object');
     if (!['intact','drifting','broken','neutral'].includes(a.thesis_status)) a.thesis_status = 'neutral';
+    if (!plans.length) { a.implication = NONE_TXT; a.thesis_status = 'neutral'; }   // #616 enforced, not just asked for
+    a.coins = [...named];   // #616 the coins this item names
     return a;
   } catch(e) { lastFeedAnalysisError = e.message; console.error('[feeds] analysis err:',e.message); return null; }
 }
@@ -21398,7 +21408,7 @@ async function watchVideoLink(link, opts = {}) {
     itemId = ins.insertId || null;
   }
   lastFeedAnalysisError = null;
-  const analysis = await analyseSourceFeedItem({ title, transcript: text }, { name: channel || LINKS_SOURCE_NAME, coin_tags: coins.length ? coins : ['BTC'] });
+  const analysis = await analyseSourceFeedItem({ title, transcript: text }, { name: channel || LINKS_SOURCE_NAME, coin_tags: coins });   // #616 no BTC plan unless BTC is discussed
   if (itemId) {
     if (analysis) await db.execute('UPDATE feed_items SET analysis = ?, thesis_status = ? WHERE id = ?', [JSON.stringify(analysis), analysis.thesis_status, itemId]);
     else await db.execute('UPDATE feed_items SET analysis = ?, thesis_status = ? WHERE id = ?', [JSON.stringify({ skipped: 'analysis unavailable' + (lastFeedAnalysisError ? ': ' + String(lastFeedAnalysisError).slice(0, 200) : '') }), 'neutral', itemId]);
@@ -21589,7 +21599,8 @@ async function fetchAllSources(sourceId) {
         newItems = await fetchRssItems(source);
       }
       for (const item of newItems) {
-        const [ins] = await db.execute('INSERT IGNORE INTO feed_items (source_id,item_id,title,published_at,url,transcript,coin_tags,thesis_status) VALUES (?,?,?,?,?,?,?,?)',[source.id,item.item_id,item.title,item.published_at,item.url,item.transcript,source.coin_tags,'pending']);
+        const itemCoins = await coinsInNotes(String(item.title || '') + '\n' + String(item.transcript || '')).catch(() => null);   // #616 the coins THIS item names, not the source's list
+        const [ins] = await db.execute('INSERT IGNORE INTO feed_items (source_id,item_id,title,published_at,url,transcript,coin_tags,thesis_status) VALUES (?,?,?,?,?,?,?,?)',[source.id,item.item_id,item.title,item.published_at,item.url,item.transcript,itemCoins ? JSON.stringify(itemCoins) : source.coin_tags,'pending']);
         if (ins.affectedRows>0) {
           totalFetched++;
           lastFeedAnalysisError = null;
