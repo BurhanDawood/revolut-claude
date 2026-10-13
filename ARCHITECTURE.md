@@ -1,9 +1,11 @@
-<!-- last-updated: 2026-09-24 -->
+<!-- last-updated: 2026-10-13 -->
 # ARCHITECTURE.md — Revolut X AI Portfolio Manager
 
-> **Purpose of this document.** This is the single durable reference for how the system is built, how data flows through it, what each subsystem does, and *why* the major design decisions were made. It exists because the build history was previously fragmented across 100+ dev_log tickets, git commits, Claude's cross-session memory, and conversation logs — making "how does X work / why is it this way" a reconstruction job. Maintain this file: when a major subsystem ships or a load-bearing decision changes, update the relevant section. The live ticket board remains the `dev_log` (see §7); this document is the map, not the changelog.
+> **Purpose of this document.** This is the single durable reference for how the system is built, how data flows through it, what each subsystem does, and *why* the major design decisions were made. The desk's Dev agent and the senior reviewer agent read it through their `read_architecture` tool, so a stale section misleads them: keep it true.
 >
-> **Owner:** Bryan. **Last updated:** 2026-09-24. (Batches #377–#405: the **execution-safety layer** (§3.1) — derived floors, ring-fence and stop-clearance monitors, floor-capped EDGE sells, the execution watchdog, a true `/pause` emergency stop, alert-only auto-rules, clear-first sells, abandon clocks; the senior-review thread (§1.1); delivery by **Apply Batch Patch** (§5). Previously 2026-09-20: #327 connection pool; #326 Build 1 authoritative order reads; #319 hourly backtest source fix; #316 two-way Telegram; #315 re-arming ladder (backtest only); #314 buyback floor anchor and pause-not-clear; #312 strategy engine and backtest harness; #259 read-only backtest surface -- `get_price_series`, `get_abnormal_events`, `volatility_baseline`, `price_intraday_hourly` rollup; #261 Parts B+C `dev_recommendations` + friction aggregator; #279 `retrace_pct`/`bounce_pct` setters; #281 config merge-not-replace; #282 step 2 tier config schema + cumulative-cap validator; #278 `reset_cycle`. Earlier 2026-07-22: #262 cross-asset synthesis + conviction + thesis-nudge layer -- `get_asset_synthesis`, `asset_thesis`/`log_thesis` bear-case gate, nudge detector + passive Telegram push deliberately enabled 2026-07-19; #261 Part A Dev health snapshot `dev_health`; earlier 2026-07-01: #61 source-feeds subsystem -- YouTube/RSS content intelligence, `manage_sources` MCP tool; hardening chain #177/#180 coin_tags, #181 get_items binding, #184 YouTube transcript, #182/#183 pending-status, #185 tool retrieval; #47 B2b partial-fill pipeline; earlier 2026-06-25: #32 DND mode; #155/#156 Away Mode rung lifecycle; #150/#157 alert reminder fix; #149 batch alert reply; #159/#160 DND trough-rebuy + payment mask; #158 trade-detect prominence; #153 DND master check; #148 batch alert resolution; #161 Away Mode dust-guard exemption; #147 Away Mode cooldown notify; earlier 2026-06-23: #50C correlation guard; #144 per-rung sell_pct; #145 away_buy_usd + set_away_sell; #146 payment partial-offset; #53 concentration; #54 emotion x outcome; #51 pre-trade checklist.)
+> **Owner:** Bryan. **Last updated:** 2026-10-13 (batch #626, the catch-up after the 13 Oct system check: §1.3–§1.7, §3.2–§3.6, §2.4 schedule, §5 doc rule, §7 open issues and §8 changelog are new; batches #406–#625 had not been written up).
+>
+> **Keeping it current (from #626).** Every batch that changes behaviour carries its own edit to this file in the same batch: a row at the top of §8 and a fix to the section it touches. Display-only batches add a §8 row only. Fable reviews the doc edit with the code. A weekly Gemini drift check (analysis only, `docs/gemini/`) lists places where this file and the code disagree; the Dev thread fixes them in the next batch. Gemini never writes this file.
 
 ---
 
@@ -12,18 +14,18 @@
 A personal, single-user automated crypto portfolio manager. It monitors holdings across Revolut X and Kraken, tracks tax lots, fires price/structure/macro alerts to Telegram, executes trades through a Telegram-gated approval flow, and surfaces AI analysis and live web research. The owner is the sole decision-maker; the system is an assistant and a safety net, not an autonomous trader.
 
 **Stack**
-- **Runtime:** Node.js (v22) / Express, single `server.js` (~23,500 lines).
+- **Runtime:** Node.js (v22) / Express, single `server.js` (35,412 lines at #625; 2.8 MB). The app shell, the family page and the agent/desk pages are served from HTML/JS strings inside it.
 - **Database:** MySQL on Railway (`mysql.createPool` with `connectionLimit: 10`, `waitForConnections: true`, `enableKeepAlive: true`, `keepAliveInitialDelay: 10000`).
 - **Hosting:** Railway (service `revolut-claude-production.up.railway.app`), 1 replica, US-West, deploys from GitHub on push.
-- **Interfaces:** Telegram bot (alerts + trade approval), a web dashboard (`public/dashboard.js`), and an MCP server (`/mcp`) exposing tools to Claude.
-- **External APIs:** Revolut X (primary exchange), Kraken (secondary), Tangem (XRP cold-storage balance), Anthropic (AI analysis + web research), Telegram Bot API, Google Drive (backups + code/read-back sync).
+- **Interfaces:** Telegram bot (alerts, trade approval, every money button), a web dashboard (`public/dashboard.js`), the phone app shell (`/app`, §1.4), the Android app and its Galaxy Watch companion (`mobile/`, §1.4), the family page (`/h/<key>/`, §1.6), and an MCP server (`/mcp-<MCP_PATH_SECRET>`, 32 tools) for the Claude threads.
+- **External APIs:** Revolut X (primary exchange), Kraken (secondary: GHIBLI, ZK, XPL, TAO), Tangem (XRP cold-storage balance), Anthropic (Sonnet 4.6 alert paths, Sonnet 5 agents, Haiku screens, Fable 5.1 senior diff review), Google Gemini (morning brief, video notes, feed analysis, desk drafts, agent research), Firebase Cloud Messaging (app push), YouTube Data API, Telegram Bot API, Google Drive (nightly backups).
 - **Repo:** `github.com/BurhanDawood/revolut-claude` (public). **Local:** `C:\Users\owner\revolut-claude\server.js`.
 
-**Secrets (Railway env vars):** `REVOLUTX_API_KEY` / `REVOLUTX_PRIVATE_KEY`, `KRAKEN_API_KEY` / `KRAKEN_PRIVATE_KEY`, `ANTHROPIC_API_KEY`, Telegram bot token, `API_TOKEN` (dashboard/API auth), `BRIDGE_TOKEN`, and the Google OAuth set for backups (`GOOGLE_OAUTH_CLIENT_ID` / `_SECRET` / `_REFRESH_TOKEN` + `GDRIVE_BACKUP_FOLDER_ID`). Secrets are never pasted into chat or Cowork prompts — credential bugs are diagnosed via length/char-code checks, never by echoing values.
+**Secrets (Railway env vars only, never chat, notes, the desk or the APK):** venue keys (`REVOLUTX_*`, `KRAKEN_*`), `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `YOUTUBE_API_KEY`, `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` / `TELEGRAM_WEBHOOK_SECRET`, `FCM_SERVICE_ACCOUNT`, the Google OAuth set for backups, and the access keys of §1.7 (`DASHBOARD_TOKEN`, `WATCH_TOKEN`, `FAMILY_PAGE_TOKEN`, `MCP_PATH_SECRET`, `DEV_LOG_TOKEN`, `EXPORT_TOKEN`, `BRIDGE_TOKEN`; `API_TOKEN` deliberately unset). Credential bugs are diagnosed via length/char-code checks, never by echoing values.
 
-### 1.1 The three working threads
+### 1.1 The working threads
 
-Development and operation are split across three Claude contexts, by design:
+Development and operation are split across Claude contexts, by design (today: the PM thread, the Dev thread and Fable in claude.ai, plus Claude Code sessions with the repo attached for the Android/watch app, which push to the `mobile-app` branch only):
 
 - **PM thread** — portfolio manager. Handles analysis, alerts, trade logging, strategy reviews, morning briefings. Reads/writes the database via MCP tools. Never edits code.
 - **Dev thread** — lead developer / diagnostician. Diagnoses read-only against the live code (pulled from GitHub raw / Drive sync), writes Cowork prompts, verifies read-backs, manages the `dev_log`. Never edits live code directly.
@@ -108,6 +110,42 @@ Its JSON answer can hold four things:
 - **The go-live clock** (`system_config` `agent_clock`) is written once, 45 s after the first boot of 549 (`agentClockStart`, INSERT IGNORE). The bar is measured from it: 30 days AND 10 closed trades, whichever takes longer (#552).
 
 
+### 1.3 The spec desk and its agents (#458, #579–#583, desk numbering)
+
+The desk is a shared queue of build ideas and specs (`spec_threads`, `spec_messages`, `senior_queue`), reached by every thread through the `spec_desk` MCP tool and by Bryan on the Desk page.
+- **Statuses:** inbox, drafting, review, ready, accepted, parked, rejected, building, shipped. Accept / park / reject are Bryan's, the PM thread's or Fable's; building and shipped are the Dev thread's. A money-path spec cannot be accepted without a Fable verdict, and only Fable clears the money-path flag (enforced in code).
+- **Draft and review:** on "Draft it", the PM assistant (Gemini) drafts and the Dev assistant (Sonnet 5, read-only code tools: grep, read a function, `read_architecture`, the dev_log) reviews, up to two rounds. Caps: $3 a day, $1.50 a spec (`SPEC_AI_DEFAULTS`).
+- **Senior agent (D5, advisory):** `submit_diff`, `senior_review` and `second_opinion` queue a first pass by the senior agent (Fable 5.1 for diffs, Sonnet 5 for specs and opinions) against a fixed checklist (`SENIOR_CHECKLIST`: callee semantics, anchors, second gates, dedupe on quantity, stops never loosened, cancel confirmed before re-offer, restart mid-action, journal integrity). $2 a day. It is never a verdict: money-path batches still need the Fable thread.
+- **Waiting on you (#579–#583):** the Desk page and the app open with the items waiting on Bryan, with Accept / Park / Reject / Draft buttons (`POST /api/desk/answer`, DASHBOARD_WRITES, re-checked server-side; a money-path accept stays in Telegram).
+- **Tasks (#575–#578):** team notes can carry a task with an owner (`claude_pm`, `claude_dev`, `fable`, `pm_agent`, `dev_agent`, `fable_agent`) and a state (open, claimed, done, blocked, declined). The in-app agents answer theirs within the team cap ($6 a day), read-only.
+
+### 1.4 The phone app, push and the watch (#488–#546, #591–#625)
+
+- **App shell** (`/app`, `APP_SHELL_HTML` / `APP_SHELL_JS` in server.js): the dashboard, Desk, Agent, coin pages and Activity in one phone UI. The dashboard key is entered once and stays on the device; the APK is key-free (CI fails a build that contains a key).
+- **Android app** (`mobile/`, Capacitor, branch `mobile-app`): `android.yml` builds every push to that branch and publishes a prerelease `app-vN` with `revolutx-PHONE.apk`, `revolutx-WATCH-adb-only.apk` and `revolutx-WATCHFACE-adb-only.apk` (one release key; the phone and watch apps share the applicationId so the Wearable Data Layer pairs them). Native plugins: WidgetBridge (home-screen widget and the watch-key handover), push (`RxMessagingService`), biometric unlock, the floating chart window (`RxFloat`, #530), the rip alarm (`RipAlarmService`, rings through silent, #514).
+- **Push (#491–#503, #522):** the app registers its FCM token (`POST /api/app/devices`, max 10 devices, Telegram notice on a new one). `sendTelegram` mirrors every message to the devices and to `app_inbox`; categories and quiet hours are per device (`/api/app/notify`; "Needs you" cannot be switched off). Harmless alert buttons can be answered from the app (`/api/app/inbox/answer`, positive allow table `APP_ANSWER_ALLOW`); trade approval, funded buys, payments, capital, trails and spike insurance stay Telegram-only.
+- **In-app PM (#510, #525, #532, #535):** `POST /api/pm/chat` (Sonnet 5, $2 a day, 30 messages an hour). It reads through an allow-list of MCP tools (`PM_TOOLS`), answers with a navigation the shell performs, and has three capped writes: the buy list, a draft coin plan (status `draft`, §3), and a handover note to the PM thread (10 writes a day, each reported on Telegram).
+- **Galaxy Watch companion (desk #59, #623–#625):** a watch face, a Tile and a small app. The watch reads only `GET /api/watch` (`watchSummary`, cached 30 s: total, today's P&L, top 3 movers, holdings, unread PM notes; never USDC) with `WATCH_TOKEN`, which opens that one path and nothing else. The phone app reads the watch key from `GET /api/watch/key` (dashboard key) and hands only that key to the watch; it never forwards the dashboard key. No writes from the watch.
+
+### 1.5 The PM agent's watch (#621–#622, desk #57 Phase 1)
+
+Every 4 h at :15 London (`PM_WATCH`, after the paper trader) the PM agent (Sonnet 5, one call, no tools, `PM_BOSS_TOOLS = []`) reads one server-made snapshot of Bryan's book: held coins with price and moves, the loop audit, the feed takeaways, PM decisions, its own checkpoint and earlier notes. It writes at most 3 notes (`pm_notes`) and a checkpoint. Caps: $3 a day, 6,000 output tokens. A note may carry ONE proposal on an alert-only object (an approach alert, removing a sell_pct-free target, an acknowledge); it acts only when Bryan taps it in the app (`/api/pm/notes`, DASHBOARD_WRITES), and `pmNoteAct` re-checks it: strict `setAbsolutePriceTarget`, deletes by id AND `sell_pct IS NULL`, never her coin, never USDC. Fable R4: 20 clean runs (parsed first time); the count restarts on any prompt, shape or max_tokens change. Seen with `get_agent view notes`.
+
+### 1.6 The family page and her money (#588–#615)
+
+- **Standing rules:** every USDC on Revolut X is Bryan's wife's cash; nothing automated may use or count it (the sweeps use USDT). Her coin (today HIGH, `system_config.family_page.coin`, with past coins kept) is hers; the HIGH pump loop is Bryan's own choice.
+- **Her page** (`/h/<FAMILY_PAGE_TOKEN>/`, read-only apart from notes): her coin and USDC "savings pot" in pounds, % since bought, a plain-words signal, candles (5 s live tick), Plan and About tabs, and her activity (top-ups, card payments with the shop's name from Revolut X transaction details #605–#607, savings-pot moves). Notes per entry (`POST /h/<key>/note`, 200 characters, rate-limited). CSP, no-referrer, noindex. The key is never written in notes, on the desk or in the dashboard.
+- **Owner view:** the dashboard's Her coin tab (`/family-view`, `/api/family/*` behind the dashboard key; `/api/family/coin` and `/api/family/note` are DASHBOARD_WRITES).
+
+### 1.7 Access keys and the auth gate (#349–#352, #491–#625)
+
+One middleware guards every `/api/*` and `/portfolio/*` path (lower-cased, `//` refused, constant-time compare, 24+ characters, fail-closed):
+- `DASHBOARD_TOKEN`: every read, plus the `DASHBOARD_WRITES` list (pause, resume refusal, sweep config, app devices / notify / inbox answer, PM chat, buy list, brief handover, desk answer, family coin / note, PM notes). Every new DASHBOARD_WRITES route goes to Fable pre-ship.
+- `WATCH_TOKEN`: `GET /api/watch` only; treated as unset if it equals another key (#625 C1).
+- `API_TOKEN`: everything; deliberately unset, so every other write route is off.
+- Outside the gate, each with its own secret: `/mcp-<MCP_PATH_SECRET>` (the Claude threads' tools), `/telegram-webhook` (secret header + chat id), `/h/<FAMILY_PAGE_TOKEN>/…`, `/dev-log/context` (`DEV_LOG_TOKEN`), `/export/prices` (`EXPORT_TOKEN`), `/api/bridge` (`BRIDGE_TOKEN`). `/api/health` is open and liveness-only.
+- Money buttons are Telegram-only: no app or dashboard route places, cancels or sizes an order.
+
 ---
 
 ## 2. Data-Flow Map
@@ -121,34 +159,27 @@ Its JSON answer can hold four things:
 ### 2.3 Fast-cadence scan (#94 / #95 Stage 1)
 `runFastScan()` runs on a tight cadence (30–60s) over a small set of flagged symbols. It checks pump-arm rules first (`checkPumpArm` — dormant detectors that arm a trailing stop on a qualifying pump, see §3 pump-loop) and then services any armed trailing stops. **Part C** services pump-loop trough-rebuy trackers (`troughTrackers.keys()`). **Part D** services standalone inverse trough-buy trackers (`standaloneTroughTrackers.keys()`). Decoupled from the 5-min loop so fast meme/volatile moves aren't missed between cycles. **#99 shipped 2026-06-20:** fast-scan is now fully dynamic — Part B evaluates `trailingStops.keys()` with a single batched `/tickers` call per 30s cycle; all armed trailing stops covered. `FAST_SCAN_SYMBOLS` retained for Part A pump-arm checks only.
 
-### 2.4 Cron schedule (Europe/London)
-- `0 0 * * *` — `recordDailyPrices` (writes daily close to `price_history`; resets daily alert tracking).
-- `0 2 * * *` — prune (intraday housekeeping).
-- `15 2 * * *` — prune `price_intraday` rows >30 days.
-- `0 3 * * *` — `backupServerJsToDrive` (#102: nightly dated server.js snapshot → Google Drive `revolut-claude-backups`, 14-folder retention).
-- `0 3 * * *` — `runReconciliation` (#55: system positions vs exchange balances vs tranche sums; flags drift).
-- `30 3 * * *` — `backupDatabaseToDrive` (#12: nightly DB dump → Google Drive).
-- `*/5 * * * *` — `checkMacroNews` (RSS macro/news scan).
-- `5 9 * * 1` — Monday rebalancing check.
-- `10 9 * * 1` — Monday weekly snapshot.
-- `15 9 * * 1` — Monday rebalancing/snapshot follow-on. (**#40, 2026-06-22:** the paid `weeklyResearchSweep()` Monday cron was *removed* — research is now in-chat-first and free; see §3 Research layer. The server-side paid path stays parked for a possible future unattended refresh.)
-- `15 9 * * *` — daily brief-reminder Telegram nudge (9:15 AM London): prompts Bryan to open the PM thread and say "morning brief" (the free in-chat morning-brief routine; #40).
-- `0 10 * * *` — `checkIntentionOutcomes`.
-- `5 10 * * *` — `checkRebalancingOutcomes`.
-- `10 10 * * *` — `gradeTradeOutcomes` (#48: forward +7d/+30d grading).
-- `0 8,10,12,14,16,18,20,22 * * *` — `evaluateThesisNudges` (#262 Part C: passive thesis-nudge digest, 2-hourly 08:00–22:00; gated by `thesis_nudge.enabled` — **live since 2026-07-19**).
-- `5 2 * * *` — `rollupIntradayHourlyRange` (#259 Phase 3: rolls the last 72h of `price_intraday` into the long-retained `price_intraday_hourly` OHLC table. Deliberately scheduled **before** the 2:15 prune. Idempotent upsert, so overlapping runs are safe).
-- Morning briefing (`5 9 * * *`) is currently **disabled** (commented), kept for manual use.
+### 2.4 Schedule (as of #625)
+
+Timers (`setInterval`): fast scan 30 s (`runFastScan`), order poller 60 s, portfolio value 60 s, rotation tick 60 s, intraday capture + abnormal detector 2 min, agent alert tick 2 min, card-spend watch 2 min, desk spec worker and senior worker 2 min (only when work is queued), spike tick 3 min, share trades 3 min, portfolio check 5 min (`checkPortfolio`), PM task tick 5 min (only when a task is open), MSS 15 min, dip alerts 15 min, inbox and PM-chat prunes 6 h.
+
+Crons (Europe/London unless noted):
+- Nightly: 00:00 `recordDailyPrices`; 02:00 expired intentions prune; 02:05 72 h hourly rollup; 02:15 `price_intraday` prune (30 d); 02:20 `exec_decisions` prune (180 d); 02:40 nightly ledger resync + move-shape stats; 02:55 server.js backup to Drive; 03:00 reconciliation; 03:20 candles top-up; 03:30 database backup to Drive; 03:45 capital integrity check; 03:50 pump-arm staleness check.
+- Hourly (UTC minutes): :07/:37 reconciler (if enabled) and system-health watcher (#581); :10 agent equity snapshot; :12/:42 ring-fence coverage + abandons; :17/:47 stop-clearance states; :23 new-coin candle backfill; every 10 min move-shape arm check; every 5 min deferred-buy reminders.
+- Daily: 07:20 daily and 23:20 weekdays macro refresh; 07:30 YouTube scan (Gemini video notes); 09:15 morning brief (Gemini); 10:00 intention outcomes; 10:05 rebalancing outcomes; 10:10 trade grading (+7 d / +30 d); 08:00–22:00 every 2 h thesis nudges; 21:00 alert digest and agent daily summary; 21:05 weekdays PM boss review.
+- Agents: paper trader `5 */4` (from its config); PM watch `15 */4`.
+- Weekly: Monday 09:05 rebalancing reminder and 09:10 snapshot; Sunday 18:00 untagged-trades digest, 18:05 rotation weekly, 18:10 PM-follow weekly, 18:30 agent weekly review, 18:45 agent toolsmith and share weekly, 19:00 PM boss deep review.
+- Off: the 5-min macro-news cron and the old 09:05 morning briefing are commented out.
 
 ### 2.5 Alert pipeline
-Conditions evaluated in the 5-min loop → if fired and not in cooldown / not acknowledged → Telegram notify. Acknowledged-alert state persists to `macro_alerts_sent` (so redeploys don't re-fire — #70). Fixed-target cooldowns are 24h. Alerts are **notify-only** for held positions; nothing auto-executes while auto-exec is disabled (current default).
+Conditions evaluated in the 5-min loop → if fired and not in cooldown / not acknowledged → Telegram notify. Acknowledged-alert state persists to `macro_alerts_sent` (so redeploys don't re-fire — #70). Fixed-target cooldowns are 24h. Alerts are **notify-only**; automatic orders come only from the paths in §2.6 and §3.1–§3.3, each behind the master switch and its own gates.
 
 ### 2.6 Trade execution + approval path
 A trade (from MCP `execute_kraken_trade` or the Revolut path) creates a *pending* trade → Telegram "approval needed" → owner replies 👍 / approve → execution → journal write + tranche update. **All `/api/*` write routes require `x-api-token`** (#43, fail-closed); the critical trade endpoints reject unauthenticated calls with 401 before reaching the handler. Known limitation: the approval handler tracks only the most-recent pending trade, so laddered multi-rung approvals clobber each other (#44, open).
 
 **Two-way Telegram interface (#316).** Alerts sent to Telegram feature inline-keyboard buttons generated by `buildAlertKeyboard` attached to `sendTelegram` messages. Taps arrive at `/telegram-webhook` as `callback_query` payloads and route through `processAlertChoice`. Button `callback_data` incorporates a compact alert-type guard (`a:<coin>:<choice>:<typeCode>`) that is verified against `alertContextBySymbol` to ensure taps on older messages do not execute against a superseded alert type. The interface also supports control commands: `/status` displays available USD cash, auto-exec state, cost basis, armed loops, and symbol constraints; `/pause` disarms `ai_auto_execute.enabled` in `system_config` (failing safe while in-flight cycles finish cleanly); and `/resume` requires explicit `/resume confirm` confirmation before re-enabling auto-execution.
 
-**Auto-exec paths (multiple, all double-gated).** Several autonomous execution paths exist; each requires the global `ai_auto_execute` master ON plus a per-coin gate. (1) **Pump-loop** (#95): pump-arm → armed trailing stop → `autoExecuteSell`/`autoExecuteKrakenSell` → trough-rebuy (#130). (2) **Auto-exec trailing stop** (#93): trailing stops with `auto_execute:true` bypass Telegram approval on breach. (3) **Away Mode** (#125): fixed down-targets on away-active coins trigger AI analysis and buy if High confidence. (4) **Standalone trough-buy** (#143): `manage_alerts set_trough` arms an independent bounce-watcher. All paths carry hard entry-floor guards. The master (`ai_auto_execute.enabled`) is currently **ON**; blast-radius is controlled by `per_coin_enabled` (currently BOBA=true) for the 5-min auto-rule path — other auto-exec paths (#93, #125, #143) each have their own per-activation gates independent of `per_coin_enabled`.
+**Auto-exec paths (multiple, all double-gated).** Several autonomous execution paths exist; each requires the global `ai_auto_execute` master ON plus a per-coin gate. (1) **Pump-loop** (#95): pump-arm → armed trailing stop → `autoExecuteSell`/`autoExecuteKrakenSell` → trough-rebuy (#130). (2) **Auto-exec trailing stop** (#93): trailing stops with `auto_execute:true` bypass Telegram approval on breach. (3) **Away Mode** (#125): fixed down-targets on away-active coins trigger AI analysis and buy if High confidence. (4) **Standalone trough-buy** (#143): `manage_alerts set_trough` arms an independent bounce-watcher. All paths carry hard entry-floor guards. The master (`ai_auto_execute.enabled`) is **ON** (13 Oct: `max_sell_pct` 100, `allowed_triggers` [trailing_stop], `per_coin_enabled` empty, `hodl_symbols` empty); the 5-min auto-rule path is alert-only since F2 (#397) — other auto-exec paths (#93, #125, #143) each have their own per-activation gates independent of `per_coin_enabled`.
 
 ### 2.7 Card-payment auto-log (#107)
 Inside the 5-min balance loop, when USDT decreases with no offsetting balance increase (not a USD conversion, not a crypto buy, not recent trade-funding), the decrease is treated as a card payment: auto-logged to `trading_journal` (`source='revolut_card'`), invested capital decremented, and a one-way Telegram notice sent. A 15-minute dupe-guard prevents double-logging. Reversible anytime via `skip payment [amount]` (re-credits capital + deletes the row). This satisfies the #82 rule — capital is never *silently* mutated: every auto-log notifies and is reversible. Proven live 2026-06-17 (a real card payment auto-logged outside a redeploy window).
@@ -176,7 +207,7 @@ Nightly at 3 AM: compares Revolut `/balances` (available) + Kraken balances agai
 - **#312 — Strategy engine and backtest harness.** `runLadderBacktest` and the `run_backtest` MCP tool replay the exact same evaluator used by the live shadow engine (`shadowEvalTier`) over historical price bars and score the results against buy-and-hold benchmarks via `btComputeMetrics`. The engine operates strictly read-only: it places no venue orders and mutates no live state. It supports two storage backends: 2-minute `price_intraday` captures (high fidelity for fine trigger detection, pruned at 30 days) and the `price_intraday_hourly` OHLC rollup (retained indefinitely to eliminate the 30-day backtest window ceiling). **Data source fix (#319):** `source=hourly` queries `price_intraday_hourly` using columns `open_px`, `high_px`, `low_px`, and `close_px` (previously queried `open_price` etc., which do not exist, causing every hourly backtest to fail and silently confining analysis to the ~4-week intraday window). **Known live/backtest divergence (#309):** the LIVE path re-anchors the trailing stop on a floor-blocked sale and keeps the rule armed, whereas the BACKTEST evaluator consumes the tier on `below_entry_floor`; as a result, backtests currently understate performance for floor-limited positions until aligned. The subsystem also establishes a formal strategy catalogue in MySQL (`strategy_scenarios` and `strategy_tools` tables, seeded via `seedStrategyCatalogue` and managed via `manage_trading action='upsert_catalogue'`) mapping market regimes to mechanism applicability.
 - **#315 — Re-arming ladder (backtest only).** An extension to the backtest evaluator adding `rule_mode 'rearm'` and the `rearm_watch` phase inside `shadowEvalTier`. When all sell tiers fill in a cycle, rather than transitioning directly to `sold`, the evaluator enters `rearm_watch` and monitors both directions simultaneously: upward for another `arm_pump_pct` leg to sell, and downward for `buy_tiers` retrace fills. Controlled by `rearm_from` (`'sale'` or `'peak'`), `max_legs` (default 5), and `rearm_confirm_pct` (default 1%). CRITICAL CONSTRAINT: this mode is reachable ONLY from `run_backtest` (`runLadderBacktest`). Nothing in the live execution path or live shadow engine reads or executes `rule_mode 'rearm'`.
 - **MCP tools (20 active):** `get_portfolio_summary`, `get_portfolio_data`, `get_trading_data`, `get_context`, `manage_alerts`, `manage_trading`, `set_entry_price`, `execute_kraken_trade`, `set_auto_trade_rule`, `get_auto_rules`, `manage_auto_rules`, `get_prices`, `get_tranches`, `research_asset`, `set_pump_armed_rule`, `resolve_pending_trades`, `manage_sources`, `get_asset_synthesis`, `get_price_series`, `get_abnormal_events`. The tool list/count is seeded into `system_capabilities` config at boot; `project_description` roadmap updated 2026-06-20 (#2).
-- **Auto-rules engine:** per-coin rules (moon-bag 25% sells at a $999 sentinel, buy-dip, etc.). 21 clean moon-bag rules currently armed. Master `ai_auto_execute` config is **disabled**; even when enabled it is railed (caps, floors, manual-only symbols) and is the rare exception, not the norm.
+- **Auto-rules engine:** per-coin rules (moon-bag 25% sells at a $999 sentinel, buy-dip, etc.). Alert-only since F2 (#397): `checkAutoTradeRules` never places an order. The master `ai_auto_execute` switch (ON, see §2.6) governs the loops, trails and buy-backs instead.
 - **#95 pump-loop (built end-to-end, OFF by default).** A four-stage autonomous swing loop for designated coins (e.g. GHIBLI), each stage guarded:
   - **Stage 1 — pump-arm detector** (`checkPumpArm`, `pump_armed_rules` table, `set_pump_armed_rule` tool). A dormant rule arms a trailing stop when the coin pumps `arm_pump_pct` within `arm_window_min`. Arm-only; no sell.
   - **Stage 2 — entry-floor guard.** When an armed trail breaches and routes to `autoExecuteSell`/`autoExecuteKrakenSell`, a hard guard reads `entry_floor` fresh from `pump_armed_rules` and blocks the sell if `currentPrice <= floor`. Fails safe (blocks) if the lookup errors. Implements *never-sell-below-entry*.
@@ -243,7 +274,33 @@ Every automatic order path now sits behind layered controls. Preventive controls
 - **Notification state never gates execution (#391–#393).** Acknowledgement and the Telegram "ignore" mute silence alerts only; they can never blind an auto-selling trail.
 - **Money accounting (#395).** The payment detectors ask Revolut's own order history whether filled buys explain missing cash before calling it a payment; "Not a payment" cancels a still-held capital change instead of adding money back.
 - **Stand-alone trough retrace gate (#394).** `set_trough` can stay dormant until a chosen price (`arm_below_price`, or `retrace_pct` + `reference_price`).
-- **Next:** the fire-time predicate `mayAutoTrade` (design v2.4) — one function every automatic order must pass, Phase 0 inert first.
+- **Fire-time predicate `mayAutoTrade` (#567, #604).** One fail-closed function (17810–18010) that reads the master switch, the rule, balances and the venue fresh, applies the derived floor, and writes an `exec_decisions` row for every verdict. In ENFORCE today for the single-mode loop's trough buy-back (a NO holds the cycle, re-asked every 5 min) and the paper agent; other callers run it as a dry run (the loop cards' Auto-sell line, #555).
+
+### 3.2 Sell execution: chases, spikes and loop lifecycle (#454–#455, #558–#586)
+
+- **Refused market sell → chase (#558, #573, #574).** When Revolut X cancels a trail's market sale at placement (thin-book slippage protection, #511 `venue_refused`), the sale falls back to a limit chase from the bid, re-read each step, never below the cost floor; the unfilled part re-trails as a % of the balance left.
+- **Spike insurance (B23, #454–#455; `spike_exit` config, defaults `SPIKE_DEFAULTS`).** Every 3 min `spikeTick` checks held Revolut X coins for a 2×-in-24 h pump; when insurance is on (`insure`) it sets a 15% auto-executing trail (sell % per coin, skipped for manual-only and hold-list coins, Kraken coins and coins that already have a trail), sold through the chase.
+- **Empty loops switch themselves off (#586).** A loop with nothing held for 72 h straight (real balance read; not Kraken, not Tangem XRP) is disabled by a compare-and-set writer.
+- **System-health watcher (#581).** Every 30 min it reads `loop_audit` and each arm baseline and reports muted-but-armed loops, missing floors, floors under cost, stops that cannot clear their floor, loops with nothing held, alert-only buy-backs and stale baselines, to both threads.
+- **Arm baseline (#433, #619).** The pump-arm % is measured from a fixed anchor reset every `arm_window_min` (Bryan's rule, by design); `loop_audit` shows the live arm price and minutes to the reset.
+
+### 3.3 The paper trader (§1.2) since #549
+
+Starter buys of 10% on researched dip-zone coins without a dated catalyst (#584); research slots go to dip-zone coins first; a position stop wakes it only if still hit 15 min later or 3% past (#572); Bryan's playbook (#617, 1,143 characters, paper only). Its `executeAgentOrder` contains a live branch for the future A4 switch that is unreachable while the ledger mode is paper (§7).
+
+### 3.4 Rotations, payments and transactions (#457, #486, #537, #556, #568–#571, #605–#620)
+
+- **Rotations:** trades in one 30-min window that move money out of one coin into another are tagged as one rotation (`rotation_sessions`) and reported in one message with Undo (#568–#570; the TRADE DETECTED question waits 11 min so a later buy folds in).
+- **Card payments:** the card watch records a coin card payment at the hold (#486), settles it against the raw total drop (§2.7b), and matches a settlement smaller than its hold (#571). Every payment is named with the shop from Revolut X transaction details (#605–#615).
+- **Transactions:** one queue for `GET /transactions` (1.5 s apart, 60 s pause after a 429, #556); a 30-day window reads up to 100 pages and reports an incomplete window instead of passing it (#620).
+
+### 3.5 Alerts since #505
+
+Alert families and a separate BROAD MARKET MOVE cooldown (#512, #513); fixed targets alert once and re-arm on a 2% re-cross, fired state persisted (#563); acknowledging a target silences that target only; no position alerts under $5 (#566); deleted targets are kept 30 days and restorable (#565); buy zone stage 1 (#520); the buy list (#521, #524). Volume on 13 Oct: about 172 Telegram messages a day.
+
+### 3.6 Model and cost controls
+
+Capped before every call: PM watch $3/day, PM boss $1/day, team tasks $6/day, PM chat $2/day, desk $3/day ($1.50/spec), senior $2/day. Paper trader: run and wake counts (no $ cap). Alert analyses (Sonnet 4.6) are limited per coin per hour in memory only, and Telegram free-text chat has no cap (§7). Spend is recorded in several tables (`claude_api_calls`, `agent_decisions`, `pm_boss_reviews`, `pm_chat`, `spec_messages`, …); there is no single daily total yet (desk #55).
 
 ## 4. Key Design Decisions (and why)
 
@@ -270,6 +327,8 @@ Every automatic order path now sits behind layered controls. Preventive controls
 
 ## 5. Conventions (development workflow)
 
+- **Doc rule (from #626).** A batch that changes behaviour edits this file in the same batch (a §8 row plus the affected section); display-only batches add a §8 row. ARCHITECTURE.md is outside Railway's watch patterns, so a docs-only batch never restarts the server.
+- **Copy page and pre-ship (October 2026).** Bryan applies each batch from the Dev thread's copy page. Money-path batches, every new DASHBOARD_WRITES route, every new write keyed by the family page key, and any edit to the key gate go to Fable pre-ship on the desk first; display and records batches go straight to the copy page. Mobile work happens in a Claude Code session with the repo attached and pushes to `mobile-app` only.
 - **Batch delivery (current, September 2026).** Changes ship as *batches*: gzip + base64 JSON of exact search/replace edits (anchored by text, never line numbers) with a `base` → `after` SHA-256 guard. Bryan pastes the batch into the **Apply Batch Patch** GitHub Action from a copy page; it refuses a batch built for a different version ("already applied, or out of order"), and may only change `server.js`, `ARCHITECTURE.md` and `public/*.js|html|css`. Every batch is built on the live file, tested (behavioural tests + regression suites), dry-run through a local copy of the Action, then verified live via Railway (deploy SUCCESS + startup log). One fix per batch; trade-path changes ship alone. GitHub's raw file cache can lag a few minutes — check the Railway deployment before concluding a run failed. The Cowork-era bullets below are historical.
 - **Canonical build loop (`build_workflow_canonical`).** The standing 11-step process: startup ritual → state model → pull live code (GitHub raw = code-truth) → diagnose read-only → one single-box Cowork prompt → Cowork executes + writes read-back to Drive → Claude verifies the read-back against actual file content → Bryan pushes (`PUSH_NOW.bat`) → Claude verifies boot via Railway MCP → live functional test → log + checkpoint.
 - **Read-back-to-Drive workflow.** Cowork writes its read-back to a text file in the `revolut-claude-readbacks` Drive folder; the Dev thread reads it directly (no copy-paste). Bryan only says "done". Read-backs are verified against actual file content — narrative claims ("all edits landed") are never trusted.
@@ -371,23 +430,27 @@ Reconstructed from git history and the dev_log. Not exhaustive — the `dev_log`
 
 ## 7. Open-Issues Index
 
-The **`dev_log`** (queried via `get_trading_data include=['dev_log']`) is the live ticket board and the authoritative source for open work. High-level priority tiers (see the `dev_priority_queue` preference for the maintained ordering):
+The **`dev_log`** and the spec desk are the live boards. Open after the 13 Oct system check (server.js f09b564; line numbers as of then):
 
-- **Tier 1 — resilience/safety:** #43 done, #12 done, #55 done, #71 done, #102 done.
-- **Tier 1.5 — data cleanup:** #47 Part 2 B2a shipped 2026-06-19 (limit-order fill pipeline) — awaiting live-fill confirmation; #3 Part B AVAX tax-lot reconstruction still open. #8 lifetime ledger resolved 2026-06-20.
-- **Tier 2 — core quality / intelligence layer:** #72 done; #36 plan-aware alerts done (A1/A2/A3 + #87 trailing-stop path, 2026-06-20); #90 parser done 2026-06-19; **#49 MSS tracker done 2026-06-22; #50 Build 2 abnormal-move detector done 2026-06-22; #40 catalyst calendar done 2026-06-22** (intelligence layer now substantially complete). Remaining sources: #61 YouTube, #69 X/social (both validation-first, deferred); umbrella framing #68/#39.
-- **Tier 2.5 — learning loop:** #48 gradeTradeOutcomes done. #52 shadow tracker done. #54 emotion×outcome forward grading done. #51 pre-trade checklist gate done. #53 concentration dashboard done. **Learning loop cluster fully shipped 2026-06-23.**
-- **Auto-exec / pump-loop:** #95 built, BOBA live cycles running. #93 auto-exec trailing stop done. #24 per-coin opt-in done. #45 per-coin sell-floor done. #125 Away Mode done (Phase 2c proven live). #144/#145 per-rung sell_pct + away_buy_usd + set_away_sell done. #130 trough-rebuy done. #143 standalone trough-buy done. **#32 DND mode done** (32a/32b/32c + #152/#154, 2026-06-25). **#155/#156 Away Mode rung lifecycle done.** Remaining: upgrade #130 rebuy to trailing trough tracker (needs PC/Cowork, spec in `rebound_tracker_spec` pref); #46 availability-gated; #33 emergency liquidation; #34 pump-capture mode.
-- **Intelligence layer:** #262 cross-asset synthesis + conviction + thesis-nudge shipped 2026-07-17→19; passive push deliberately enabled 2026-07-19. #261 Part A `dev_health` shipped 2026-07-21/22 (Parts B/C open by design).
-- **#263 — auto-sell polling gap + realised-P&L fill price** (open; diagnosis complete, build paused). Diagnosis found effective armed-trail sampling stretches to 90s–2.5min because of the `/tickers` price-dedup (not the 30s interval itself), and that `recordRealisedPnl` books the *scan* price rather than `average_fill_price` — market auto-sells create no `pending_orders` row, so the fill poller never corrects it. Execution-path change: design sign-off required before any build.
-- **Backtest + analysis surface:** #259 shipped in full 2026-07-25/26. PM can replay the #50 detector over history and sweep thresholds; the hourly rollup means the window grows rather than capping at 30 days.
-- **#282 — tiered pump loop:** steps 1 (#281 config integrity) and 2 (tier schema + validator) shipped; steps 3 (shadow) and 4 (auto-exec) **not started**. **Open question gating step 3:** the case for tiering rests on "the single-shot rebuy fired twice in 30 days". If those non-fires were mostly GATE 3 (ringfenced cash already spent) rather than the trigger being too tight, tiering the BUY leg fixes nothing — `buy_tiers` deploy a share of reserved cash that routinely is not there. Sell-side tiering stands on its own merits regardless. Resolve with evidence first. Standing cautions: ~9 free parameters fitted to 26 days of one asset, 75% cumulative sits exactly at the cap with zero headroom, four legs per cycle doubles thin-book slippage, and n=2 completed cycles is the whole evidence base.
-- **Recently resolved:** #278 `reset_cycle`, #281 config merge, #279 trough setters, #270 `*.md` eol, #261 all parts, #37 build-plan meta-ticket.
-- **Open, small:** #287 (`set_pump_armed_rule` response echoes params not the stored row, so COALESCE-preserved tier fields report null — cosmetic but misleading), #286 (`price_intraday` query references a non-existent `captured_at` column — silent failure in a try/catch), #268 (partial config update that does not reset the baseline every call), #269 (auto-disarm on zero position — unblocked, can call `reset_cycle`).
-- **Known bugs to watch:** #76 (macro alert guardrails partial — Haiku can still produce stale narratives), #74 (context-blind ladder rec), #44 (multi-trade approval clobber — Opus, own session). #75 dashboard alerts resolved 2026-06-19. #99 dynamic fast-scan resolved 2026-06-20.
-- **Cosmetic:** cron log line omits server-backup entry. project_description roadmap and tool count updated 2026-06-20 (#2).
-- **Documentation:** #73 (this file). The `dev_log` export to a dated CHANGELOG (#79) guards against detail-replacement on ticket updates.
+- **Money path / standing rules:** her coin is checked only in PM proposals (`pmProposalCheck`), not in `mayAutoTrade` or spike insurance; the USDT sweep places a buy without reading the pause switch and its settings route takes unvalidated numbers; a trade during a restart is not detected (the first portfolio check after boot is skipped, then the snapshot is overwritten); the trough tracker clear swallows a DB error and the buy-back proceeds; a chase step counts a cancel on the DELETE answer, not a closed-order read; Kraken auto-sells are market-only with no fill reconciliation; Away Mode removes an up-target rung when the sale was refused; free Telegram text can attach to a pending trade as its reason (PM note #166); USDC is counted as cash in the portfolio history, the watch total and `get_portfolio_data`; the paper trader's live branch is pre-wired (for Fable).
+- **Reliability:** no SIGTERM handling; no DB health check or Railway healthcheck, pool without timeouts or queue limit; no busy guard on the 30 s scan, 2-min capture, 5-min check and 60 s poller; `revolutRequest` has no timeout; the abnormal detector re-reads 14 days per coin every 2 min; `abn_config` boot load reads the wrong column; pending approvals live in memory only; ~6,000 pump-arm log lines an hour.
+- **Security:** the MCP path secret alone unlocks the autonomy switches (`configure_auto_execute`, `set_entry_price`, auto-executing trails); the in-app PM has three writes; no CSP on the shell pages; registered devices survive a key rotation; inbound Telegram text logged before the chat check; the Apply Surgical Patch and Deploy Approved Spec workflows can still write server.js without the base/after fingerprint.
+- **Data:** the nightly DB dump is built in memory and is not restorable for JSON and binary columns (never restore-tested); the 30-day prune is one unbatched DELETE without a date index; several tables grow without retention.
+- **Older open items still valid:** #263 (Kraken scan-price journal), #44 (single-slot approvals on the analysis and undo paths), #282 steps 3–4 (tiered loop), #286, #287.
 
 ---
 
-*This document is maintained by hand. It is a map and a rationale, not a substitute for the `dev_log` (live tickets) or git history (exact diffs). When a major subsystem ships or a load-bearing decision changes, update the affected section and the "Last updated" date.*
+## 8. Changelog (newest first)
+
+| Batch | Date | What changed |
+| --- | --- | --- |
+| #626 | 2026-10-13 | This catch-up: §1.3–§1.7, §2.4, §3.2–§3.6, §5 doc rule, §7, §8. Docs only. |
+| #623–#625 | 2026-10-13 | Watch companion: `GET /api/watch` (+ holdings), `WATCH_TOKEN` one-path key, `GET /api/watch/key`, shell hands the watch key over. |
+| #621–#622 | 2026-10-13 | PM agent watch: notes inbox, one tap-only proposal, R4 clean-run count; 6,000-token output. |
+| #616–#620 | 2026-10-12 | Video analysis per named coin; paper playbook; grader stores the coin's own move; loop_audit arm_now; 100-page transaction windows. |
+| #605–#615 | 2026-10-11/12 | Shop names on card payments (her page, Activity, every payment); her page notes, past coins kept. |
+| #604 | 2026-10-11 | Trough buy-back ENFORCES `mayAutoTrade` (Fable pre-ship). |
+| #588–#603 | 2026-10-10 | Family page and the Her coin tab; USDC is hers. |
+| #575–#587 | 2026-10-06/08 | Team tasks; Waiting on you; system-health watcher; paper starters; empty loops switch off after 72 h; Gemini temperature removed. |
+| #553–#574 | 2026-10-02/06 | Truthful control surface; transactions queue; refused-market chase; PM-follow tracking; once-then-re-cross targets; restorable targets; backtest live mode; rotations as one message; card hold settlement; paper stop confirm. |
+| #549 and earlier | to 2026-10-02 | See §1.2, §2.7b, §3.1 and §6. |
