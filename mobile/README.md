@@ -96,10 +96,12 @@ A Galaxy Watch 8 (Wear OS) companion. Two more APKs, built by the same workflow 
 android/wear/        revolutx-WATCH-adb-only.apk      applicationId com.bryan.revolutx (the phone app's own), Java
   KeyListener        receives the key from the phone (below)
   WatchStore         the key in EncryptedSharedPreferences; the last numbers in plain private prefs
-  Repo               GET /api/watch, the watch's only server call
-  RxTileService      the Tile
-  *Complication      data sources: total, today's P&L, unread PM notes, top mover
-  MainActivity       the app: the Tile's numbers + holdings; a tap opens the phone dashboard
+  Repo               GET /api/watch, the watch's only server call (?coins= for the Tile coins, ?choices=1 for the picker)
+  *Tile*, BaseTile   the Tiles: Portfolio (RxTileService), Coin 1-3, Top movers, PM notes
+  *Complication      data sources: total, today's P&L, unread PM notes, top mover; the face's card, dot, always-on total
+  SparkCard          the one drawing routine for every line: the face's card, the app, the Tiles, the coin screen
+  MainActivity       the app: the live card, movers, notes, holdings; a coin opens CoinActivity
+  CoinActivity       one coin, live; TileCoinsActivity: the Coin Tiles' picks
 android/watchface/   revolutx-WATCHFACE-adb-only.apk  com.bryan.revolutx.watchface, a Watch Face Format v1 face (resources only)
 ```
 
@@ -108,7 +110,13 @@ android/watchface/   revolutx-WATCHFACE-adb-only.apk  com.bryan.revolutx.watchfa
 **Size.** The watch app's release build is shrunk with R8 (`minifyEnabled`, `shrinkResources`); v15 without it was 13.0 MB, too big for a reliable Wi-Fi ADB push. `wear/proguard-rules.pro` keeps every class the system binds by name (the activities, the Data Layer listener, the Tile and the four complication sources) and what EncryptedSharedPreferences / Tink read by reflection. CI checks each run that those classes are in the merged manifest, kept by name in the R8 mapping and present in the dex, and it uploads the mapping (`watch-mapping.txt`) with the build artifact.
 
 **What it shows.**
-- **Tile:** the total, today's P&L in green or red, the top 3 movers (the biggest 24 h moves either way), the unread PM notes count and "updated HH:MM". Tap the numbers to refresh. "Open on phone" opens Portfolio on the phone.
+- **Tiles** (13 Oct 23:45), each its own - add, remove and order them on the watch:
+  - **Portfolio:** the total (cents smaller), the 6-hour line with the dot (still: a Tile cannot animate) and "6 hours −$133.89 (−2.68%)", green or red. No series: today's P&L, no line. Tap: the watch app.
+  - **Coin 1, Coin 2, Coin 3:** one coin each - ticker and 24 h %, price, its 24 h line, "held $…", green or red by the 24 h move. Tap: the coin in the watch app. An empty slot says "Tap to choose a coin" and opens the picker for it.
+  - **Top movers:** the 5 biggest 24 h moves either way from movers[] and holdings[]. Tap a coin: the coin in the watch app.
+  - **PM notes:** the unread count. Tap: the notes on the phone.
+  - **Tile coins** (the app's last button, or an empty Coin Tile): three slots, each a list from `GET /api/watch?choices=1` (held coins first, then A-Z). Saved only in the watch app's own prefs; change them any time.
+  - **Data:** one read serves every Tile: `GET /api/watch?coins=<the three Tile coins>` adds `coins[]` (batch 630: `price`, `pct_24h`, `usd_held`, a 24 h `spark` of up to 49 prices). A server without it: the coin's numbers from holdings[] / movers[], no line.
 - **App:** on top the app's total card (below), then today's P&L, the movers, the PM notes count and a holdings list from `/api/watch`'s `holdings: [{coin, usd, pct}]` (batch 624, numbers only). A missing field counts as no holdings. Tapping a coin opens it on the phone.
 - **Face** (13 Oct 23:20): the unread PM notes count (small), the time, then the card. Always-on: only the time and the total, in outline, no line, no pulse.
 - **The card** (face and app, drawn by one routine, `SparkCard`): the total with the cents smaller; the dashboard's live 6-hour line (#507) from `/api/watch`'s `spark` (batch 628: up to 61 values, oldest first, with `change_usd` / `change_pct`) - 90 resampled points, a 2 px line, a fill fading from 28%, green `#00ffc8` when the 6 h change is ≥ 0 and red `#ff4d6a` when down, a pulsing dot on the last point (the app's ring: 2 s, ease-out); then "6 hours −$133.89 (−2.68%)" in the line's colour and "LIVE" on the right (the last answer's time instead when it is over 15 minutes old or the last fetch failed). `spark: null` (or an older server): no line, and today's P&L instead.
@@ -117,7 +125,7 @@ android/watchface/   revolutx-WATCHFACE-adb-only.apk  com.bryan.revolutx.watchfa
 **Data.** The watch calls one path: `GET https://revolut-claude-production.up.railway.app/api/watch`, with `x-api-token` set to the **watch-only token**. The server accepts that token for this one path and nothing else (desk #59 W6, batch 625). The dashboard key never leaves the phone. Wear OS routes the call through the phone over Bluetooth, or over Wi-Fi. It follows no redirects. When it fails (offline, 5xx), the last numbers stay with "updated HH:MM" and the reason.
 
 **Refresh.**
-- **Tile:** every minute while it is on screen.
+- **Tiles:** on every swipe to a Tile (a fresh read if the last is over 30 s old - the server's cache), and Wear OS's own schedule (5 min) in between.
 - **App:** every 30 s while it is on screen (the server caches 30 s); nothing while the screen is off. A new line slides in over 0.9 s.
 - **Face:** every 5 min. That is the floor Wear OS sets for complications; nothing faster is possible without server push. The dot's pulse runs on the watch, continuously, in between.
 - **On tap:** at once.
@@ -158,7 +166,7 @@ android/watchface/   revolutx-WATCHFACE-adb-only.apk  com.bryan.revolutx.watchfa
    - `adb install -r revolutx-WATCH-adb-only.apk`
    - `adb install -r revolutx-WATCHFACE-adb-only.apk`
 5. **Connect:** the server needs the watch token first. In Railway, set it on the server service: random, at least 24 printable characters, different from every other key, never pasted in chat. Then redeploy. Open Revolut X on the phone once: it fetches the watch token and sends it, and the watch app shows the numbers.
-6. **Tile:** swipe left from the face → + → Revolut X.
+6. **Tiles:** swipe left from the face → + → the Revolut X Tile you want (Portfolio, Coin 1-3, Top movers, PM notes). Pick the coins in the app → Tile coins, or tap an empty Coin Tile.
 7. **Face:** long-press the face → + → Revolut X face. If a slot is empty, Edit → tap the slot → Revolut X → the matching item: the card is "Revolut X face: total card", the dot "Revolut X face: live dot", the always-on total "Revolut X face: always-on total", the top line "Revolut X: unread PM notes". Wear OS may also ask to allow the face to show Revolut X data.
 8. **Turn off Wireless debugging** afterwards; it drains the battery.
 
