@@ -63,7 +63,7 @@ adb uninstall com.bryan.revolutx >/dev/null
 echo "== 2. the debug watch app, with a sample answer saved (no key)"
 adb install -r "$WEAR_DBG" && adb install -r "$WEAR_TEST" || { echo "::error::the debug watch app did not install"; exit 1; }
 adb shell am instrument -w -e class com.bryan.revolutx.wear.FaceRenderTest com.bryan.revolutx.test/androidx.test.runner.AndroidJUnitRunner
-for f in card-face-up card-face-down card-face-nospark card-face-nokey card-app-down tile-line-sol; do
+for f in card-face-up card-face-down card-face-nospark card-face-nokey card-face-ambient card-app-down tile-line-sol; do
   adb exec-out run-as com.bryan.revolutx cat "files/ci/$f.png" > "$OUT/$f.png" 2>/dev/null
   convert "$OUT/$f.png" -background black -flatten -quality 80 "$OUT/$f.jpg" 2>/dev/null || cp "$OUT/$f.png" "$OUT/$f.jpg"
   echo "IMG $f $(base64 -w0 "$OUT/$f.jpg")"
@@ -116,7 +116,7 @@ for t in RxTileService CoinTile1 CoinTile2 CoinTile3 MoversTileService NotesTile
   idx=$(echo "$r" | grep -oE 'Index=\[[0-9]+\]' | grep -oE '[0-9]+' | head -1)
   [ -z "$idx" ] && idx=$n
   n=$((n + 1))
-  echo "show $t: $(adb shell am broadcast -a com.google.android.wearable.app.DEBUG_SURFACE --es operation show-tile --ei index "$idx" 2>&1 | tail -1)"
+  echo "show $t: $(adb shell am broadcast -a com.google.android.wearable.app.DEBUG_SYSUI --es operation show-tile --ei index "$idx" 2>&1 | tail -1)"
   sleep 6
   shot "tile-$t"
   adb shell am broadcast -a com.google.android.wearable.app.DEBUG_SURFACE --es operation remove-tile \

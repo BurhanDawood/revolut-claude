@@ -24,7 +24,8 @@ public class DotComplication extends ComplicationBase {
         if (y < 0) return null;
         y = Math.max(0f, Math.min(1f, y));
         float v = m.up ? y : -1f - y;
-        RangedValueComplicationData.Builder b = new RangedValueComplicationData.Builder(v, -2f, 1f, text(m.describe()));
+        RangedValueComplicationData.Builder b = new RangedValueComplicationData.Builder(v, -2f, 1f, text(m.describe()))
+            .setText(text(m.change.isEmpty() ? m.dollars : m.change));   // androidx needs a text; the face does not show it
         if (tap != null) b.setTapAction(tap);
         return b.build();
     }

@@ -298,23 +298,31 @@ final class SparkCard {
         return true;
     }
 
-    /** The face's image: the band without a dot (the face pulses its own on top), as a PNG. */
-    static byte[] png(Model m, float sc) {
+    /**
+     * The face's image: the band without a dot (the face pulses its own on top). A bitmap: Wear OS's face runtime cannot keep an
+     * image sent as PNG bytes ("Failed to serialize icon of type 3" on the emulator).
+     */
+    static Bitmap band(Model m, float sc) {
         Bitmap b = Bitmap.createBitmap(Math.round(W * sc), Math.round(H * sc), Bitmap.Config.ARGB_8888);
         draw(new Canvas(b), sc, m, null, -1f);
-        return png(b);
+        return b;
     }
 
     /** Always-on: the total in outline and the line as a thin grey outline - no fill, no dot, no colour, no caption. */
-    static byte[] ambientPng(Model m, float sc) {
+    static Bitmap ambientBand(Model m, float sc) {
         Bitmap b = Bitmap.createBitmap(Math.round(W * sc), Math.round(H * sc), Bitmap.Config.ARGB_8888);
         Canvas c = new Canvas(b);
         if (m.ys != null) drawLine(c, 0, BOX_TOP * sc, LINE_RIGHT * sc, BOX_H * sc, PAD * sc, sc, 1.6f, m.ys, 0xFFBBBBBB, false, -1f);
         if (m.message == null) drawTotal(c, sc, m, true);
-        return png(b);
+        return b;
     }
 
-    private static byte[] png(Bitmap b) {
+    /** The band as a PNG (CI's render test). */
+    static byte[] png(Model m, float sc) {
+        return png(band(m, sc));
+    }
+
+    static byte[] png(Bitmap b) {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         b.compress(Bitmap.CompressFormat.PNG, 100, out);
         b.recycle();

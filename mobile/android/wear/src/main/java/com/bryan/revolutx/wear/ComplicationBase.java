@@ -63,6 +63,13 @@ public abstract class ComplicationBase extends ComplicationDataSourceService {
                 listener.onComplicationData(d != null ? d : new NoDataComplicationData());
             } catch (RemoteException ignored) {
                 // the face went away
+            } catch (RuntimeException bad) {   // androidx rejected the data: say so, never take the app down
+                Log.w("RxWatch", getClass().getSimpleName() + " " + type + ": " + bad.getClass().getSimpleName() + " " + bad.getMessage());
+                try {
+                    listener.onComplicationData(new NoDataComplicationData());
+                } catch (Exception ignored) {
+                    // nothing more to do
+                }
             }
         });
     }

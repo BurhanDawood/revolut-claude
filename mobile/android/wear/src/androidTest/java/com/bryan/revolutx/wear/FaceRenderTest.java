@@ -37,6 +37,7 @@ public class FaceRenderTest {
         write(new File(dir, "card-face-nospark.png"), SparkCard.png(SparkCard.model(ctx, today), sc));
         write(new File(dir, "card-face-nokey.png"), SparkCard.png(SparkCard.model(ctx, null), sc));
         write(new File(dir, "card-app-down.png"), withDot(SparkCard.model(ctx, down), sc, 0.35f));
+        write(new File(dir, "card-face-ambient.png"), SparkCard.png(SparkCard.ambientBand(SparkCard.model(ctx, down), sc)));
 
         down.movers.add(new Snapshot.Coin("SOL", 8.1, 182.4));
         down.movers.add(new Snapshot.Coin("PEPE", -11.4, 0.00000912));
