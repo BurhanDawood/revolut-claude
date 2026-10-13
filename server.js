@@ -30876,6 +30876,16 @@ let _watchCache = { at: 0, body: null };
 async function watchSummary() {
   if (_watchCache.body && Date.now() - _watchCache.at < 30000) return _watchCache.body;
   const st = await portfolioValueState(), sp = await portfolioSpark('1d');
+  // #628 (Bryan 13 Oct 23:20: the watch face should look like the app's total card - the live 6-hour line and its change, with the time):
+  // the same 6 h series the app draws under the total (#507), thinned to at most 60 values for the watch. Numbers only, same one path.
+  const sp6 = await portfolioSpark('6h').catch(() => null);
+  let spark = null;
+  if (sp6 && sp6.points && sp6.points.length >= 2) {
+    const vals = sp6.points.map(p => p[1]), n = vals.length, step = Math.max(1, Math.ceil(n / 60)), pts = [];
+    for (let i = 0; i < n; i += step) pts.push(vals[i]);
+    if (pts[pts.length - 1] !== vals[n - 1]) pts.push(vals[n - 1]);
+    spark = { range: '6h', from_ts: sp6.points[0][0], to_ts: sp6.points[n - 1][0], points: pts.slice(-61), change_usd: sp6.change, change_pct: sp6.pct };
+  }
   const [mv] = await db.execute("SELECT symbol, SUBSTRING_INDEX(GROUP_CONCAT(price ORDER BY recorded_at ASC), ',', 1) AS p0, SUBSTRING_INDEX(GROUP_CONCAT(price ORDER BY recorded_at DESC), ',', 1) AS p1 FROM price_intraday WHERE recorded_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR) GROUP BY symbol");
   const movers = [];
   for (const r of mv) {
@@ -30888,7 +30898,7 @@ async function watchSummary() {
   const [[u]] = await db.execute('SELECT COUNT(*) AS n FROM pm_notes WHERE read_at IS NULL');
   const L = st.latest || {};
   const body = { v: 1, at: new Date().toISOString(), updated_ts: L.ts || null, partial: !!L.partial, total_usd: L.total != null ? Math.round(L.total * 100) / 100 : null,
-    pnl_day_usd: sp.change, pnl_day_pct: sp.pct, movers: movers.slice(0, 3).map(m => ({ coin: m.coin, pct: m.pct, price: m.price })), holdings, unread_pm_notes: Number(u.n) || 0 };
+    pnl_day_usd: sp.change, pnl_day_pct: sp.pct, movers: movers.slice(0, 3).map(m => ({ coin: m.coin, pct: m.pct, price: m.price })), holdings, unread_pm_notes: Number(u.n) || 0, spark };   // #628 spark: { range '6h', points[], change_usd, change_pct } or null
   _watchCache = { at: Date.now(), body };
   return body;
 }
