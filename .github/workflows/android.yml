@@ -111,6 +111,11 @@ jobs:
             echo "::error::a key or token name/value is in mobile/ - the APKs must stay key-free"
             exit 1
           fi
+          # any bare token-shaped literal (32+ letters, digits, _ or -) in the Java sources
+          if grep -rnE '"[A-Za-z0-9_-]{32,}"' mobile/android/app/src mobile/android/wear/src --include=*.java; then
+            echo "::error::a token-shaped string literal is in the app or watch sources - the APKs must stay key-free"
+            exit 1
+          fi
           echo "Key-free: no dashboard key or token in mobile/"
 
       - name: Build release APK

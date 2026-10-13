@@ -57,6 +57,7 @@ public class MainActivity extends BridgeActivity {
     private String pendingCoin = null;
     private String pendingInbox = null;
     private boolean shellLoaded = false;
+    private Intent handledIntent = null;   // desk #59 C2: the launch intent is handled once, cold or warm
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -94,6 +95,7 @@ public class MainActivity extends BridgeActivity {
         });
         createChannels();
         if (BuildConfig.HAS_FCM) startPush();
+        if (getIntent() != handledIntent) onNewIntent(getIntent());   // C2: a cold launch (e.g. from the watch) keeps its tab and coin
         WatchBridge.sync(this);   // desk #59: the watch gets the current key, or a clear when there is none
     }
 
@@ -107,6 +109,7 @@ public class MainActivity extends BridgeActivity {
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         if (intent == null) return;
+        handledIntent = intent;
         // v12: a tap on the ringing rip alarm's notification stops it, then opens its deep link below
         if (intent.hasExtra(RipAlarm.EXTRA_STOP_ID) && (intent.getFlags() & Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY) == 0) {
             RipAlarm.stop(this, intent.getIntExtra(RipAlarm.EXTRA_STOP_ID, RipAlarm.notificationId("")));
@@ -117,10 +120,10 @@ public class MainActivity extends BridgeActivity {
         if (tab == null && intent.hasExtra("google.message_id")) tab = "home";
         String coin = intent.getStringExtra(EXTRA_COIN);
         if (coin == null) coin = intent.getStringExtra("coin");   // likewise data.coin of a background notification
-        Uri link = intent.getData();   // desk #59: the watch's "open on phone", revolutx://open/<tab>[?coin=X]
-        if (link != null && "revolutx".equals(link.getScheme()) && "open".equals(link.getHost())) {
-            tab = link.getPathSegments().isEmpty() ? "home" : link.getPathSegments().get(0);
-            coin = link.getQueryParameter("coin");
+        String[] link = watchLink(intent.getData());
+        if (link != null) {
+            tab = link[0];
+            coin = link[1];
         }
         if (coin != null && !coin.matches(COIN_RE)) coin = null;   // only validated values ever reach the JS below
         String inbox = intent.getStringExtra(EXTRA_INBOX);
@@ -135,6 +138,19 @@ public class MainActivity extends BridgeActivity {
             pendingInbox = inbox;
             if (shellLoaded) deliverPendingTab();
         }
+    }
+
+    /**
+     * Desk #59: the watch's "open on phone", revolutx://open/<tab>[?coin=X], as { tab, coin } (coin may be null), or null when
+     * the intent is not one. Both are validated (TAB_RE / COIN_RE); anything else falls back to Portfolio with no coin.
+     */
+    static String[] watchLink(Uri u) {
+        if (u == null || !"revolutx".equals(u.getScheme()) || !"open".equals(u.getHost())) return null;
+        String tab = u.getPathSegments().isEmpty() ? "portfolio" : u.getPathSegments().get(0);
+        if (tab == null || !tab.matches(TAB_RE)) tab = "portfolio";
+        String coin = u.getQueryParameter("coin");
+        if (coin != null && !coin.matches(COIN_RE)) coin = null;
+        return new String[] { tab, coin };
     }
 
     /**

@@ -70,15 +70,16 @@ final class WatchBridge {
         void run(String nodeId);
     }
 
-    /** Every reachable watch that has the Revolut X watch app. No watch, no Wear OS app or no Play services: nothing happens. */
+    /**
+     * Every reachable watch that has the Revolut X watch app. No watch, no Wear OS app or no Play services: the Task fails and
+     * nothing is sent. Any node that can reach us with a hello also gets the key: the real gate is the Data Layer's rule that
+     * only an app with this same package name AND signing certificate can send to us or receive from us.
+     */
     private static void eachWatch(Context app, NodeAction action) {
-        try {
-            Wearable.getCapabilityClient(app).getCapability(CAP_WATCH, CapabilityClient.FILTER_REACHABLE)
-                .addOnSuccessListener(info -> {
-                    for (Node n : info.getNodes()) action.run(n.getId());
-                });
-        } catch (Exception ignored) {
-            // no Wearable API on this phone
-        }
+        Wearable.getCapabilityClient(app).getCapability(CAP_WATCH, CapabilityClient.FILTER_REACHABLE)
+            .addOnSuccessListener(info -> {
+                for (Node n : info.getNodes()) action.run(n.getId());
+            })
+            .addOnFailureListener(e -> { /* no watch reachable: the watch's hello asks again later */ });
     }
 }

@@ -58,8 +58,8 @@ final class Repo {
             try {
                 // W1 again at the call: only ever the pinned server
                 c = (HttpURLConnection) new URL(WatchStore.BASE + "/api/watch").openConnection();
-                c.setConnectTimeout(15000);
-                c.setReadTimeout(20000);
+                c.setConnectTimeout(10000);   // C4: <= 10 s, a CLEAR waits on this lock
+                c.setReadTimeout(10000);
                 c.setRequestMethod("GET");
                 c.setInstanceFollowRedirects(false);   // the key is never carried to another host
                 c.setUseCaches(false);

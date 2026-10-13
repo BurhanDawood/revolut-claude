@@ -79,7 +79,7 @@ final class WatchStore {
      * W1: accepts a /rx/watch/config payload only when it is exactly {"base","key"}, base is exactly BASE and the key is
      * one plain token. The new key replaces the old one (never appended). Returns false, storing nothing, otherwise.
      */
-    static boolean acceptConfig(Context ctx, byte[] payload) {
+    static synchronized boolean acceptConfig(Context ctx, byte[] payload) {
         String key;
         try {
             JSONObject o = new JSONObject(new String(payload, StandardCharsets.UTF_8));
@@ -87,10 +87,11 @@ final class WatchStore {
             if (!BASE.equals(o.get("base"))) return false;   // the key never goes to another server
             Object k = o.get("key");
             if (!(k instanceof String)) return false;
-            key = ((String) k).trim();
+            key = (String) k;   // not trimmed: the server compares the exact bytes, so both sides hold the same key
         } catch (Exception e) {
             return false;
         }
+        // one printable token: no spaces anywhere (so none around it either), at most 512 chars
         if (key.isEmpty() || key.length() > 512 || !key.matches("[\\x21-\\x7e]+")) return false;
         String old = key(ctx);
         try {
@@ -104,13 +105,19 @@ final class WatchStore {
     }
 
     /** W2: the phone's CLEAR. The key and the last values go. */
-    static void clear(Context ctx) {
+    static synchronized void clear(Context ctx) {
+        Context app = ctx.getApplicationContext();
+        boolean cleared;
         try {
-            secure(ctx).edit().clear().commit();
-        } catch (Exception ignored) {
-            ctx.getApplicationContext().deleteSharedPreferences(SECURE_FILE);
+            cleared = secure(app).edit().clear().commit();   // false on a failed write: it does not throw
+        } catch (Exception e) {
+            cleared = false;
         }
-        values(ctx).edit().clear().putString(V_STATUS, "nokey").commit();
+        if (!cleared) {
+            app.deleteSharedPreferences(SECURE_FILE);   // the file itself goes
+            secure = null;                              // reopened (empty) on the next read
+        }
+        values(app).edit().clear().putString(V_STATUS, "nokey").commit();
     }
 
     static Snapshot snapshot(Context ctx) {
