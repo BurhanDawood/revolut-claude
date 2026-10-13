@@ -8,8 +8,8 @@ import com.getcapacitor.annotation.CapacitorPlugin;
 
 /**
  * Called by the shell as Capacitor.Plugins.WidgetBridge.setConfig({ key, base }) whenever it has a
- * checked dashboard key. Stores both for the widget (and push registration), then refreshes the widget. A changed key also
- * goes to the watch app (WatchBridge). The key is never logged.
+ * checked dashboard key. Stores both for the widget (and push registration), then refreshes the widget. Its watchKey (the
+ * server's watch-only token) goes to the watch app (WatchBridge); the dashboard key never does. Keys are never logged.
  */
 @CapacitorPlugin(name = "WidgetBridge")
 public class WidgetBridgePlugin extends Plugin {
@@ -32,9 +32,14 @@ public class WidgetBridgePlugin extends Plugin {
         SecureStore.get(getContext()).edit().putString(SecureStore.KEY, key.trim()).putString(SecureStore.BASE, b).apply();
         WidgetRefreshWorker.schedule(getContext());
         WidgetRefreshWorker.refreshNow(getContext());
-        if (changed) {
-            Push.registerSavedToken(getContext());
-            WatchBridge.keyChanged(getContext());   // desk #59: the watch drops the old key and takes this one
+        if (changed) Push.registerSavedToken(getContext());
+        // desk #59 W7 / 625 C2: the watch gets only the server's watch-only token. A string: stored and sent (CLEAR then the
+        // new one when it changed). An explicit null: the server has none, the watch is cleared. Absent (the shell's read
+        // failed): the watch is left as it is.
+        com.getcapacitor.JSObject data = call.getData();
+        if (data != null && data.has("watchKey")) {
+            if (data.isNull("watchKey")) WatchBridge.noWatchKey(getContext());
+            else WatchBridge.setWatchKey(getContext(), data.optString("watchKey", null));
         }
         call.resolve();
     }
@@ -46,7 +51,7 @@ public class WidgetBridgePlugin extends Plugin {
     @PluginMethod
     public void clearConfig(PluginCall call) {
         SecureStore.get(getContext()).edit().remove(SecureStore.KEY).apply();
-        WatchBridge.cleared(getContext());
+        WatchBridge.noWatchKey(getContext());   // the watch key goes too, and the watch is cleared
         WidgetRefreshWorker.refreshNow(getContext());
         call.resolve();
     }

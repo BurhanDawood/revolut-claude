@@ -104,9 +104,10 @@ jobs:
           echo "ANDROID_KEYSTORE_FILE=$KS" >> "$GITHUB_ENV"
 
       - name: Key-free check (desk #59 W4)
-        # no APK may carry a dashboard key or token: the phone gets it from the shell, the watch from the phone at run time
+        # no APK may carry a key or token (W4/W8): the phone gets the dashboard key from the shell; the watch gets only the
+        # watch-only token, from the phone at run time
         run: |
-          if grep -rInE 'DASHBOARD_TOKEN|FAMILY_PAGE_TOKEN|x-api-token"?[[:space:]]*[:=][[:space:]]*"[^"]' mobile \
+          if grep -rInE 'DASHBOARD_TOKEN|FAMILY_PAGE_TOKEN|WATCH_TOKEN|x-api-token"?[[:space:]]*[:=][[:space:]]*"[^"]' mobile \
                --exclude-dir=node_modules --exclude-dir=build --exclude-dir=.gradle; then
             echo "::error::a key or token name/value is in mobile/ - the APKs must stay key-free"
             exit 1

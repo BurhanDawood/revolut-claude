@@ -35,8 +35,8 @@ The shell (`APP_SHELL_JS` in `server.js`) runs inside the app's WebView, and Cap
 |---|---|
 | `Capacitor.isNativePlatform()` | Capacitor |
 | `Capacitor.Plugins.BiometricAuth.authenticate({ reason, cancelTitle, allowDeviceCredential, androidTitle, androidSubtitle })`: resolves on success, rejects on cancel/fail | `BiometricAuthPlugin` (androidx.biometric). If the phone has no fingerprint and no screen lock, it resolves `{ skipped: true }` so the app never locks itself out. |
-| `Capacitor.Plugins.WidgetBridge.setConfig({ key, base })` → Promise | `WidgetBridgePlugin`. It stores both in EncryptedSharedPreferences and refreshes the widget. It accepts only `https://revolut-claude-production.up.railway.app` as `base`, so the key never goes anywhere else. The key is never logged. A changed key also goes to the watch (see The watch). |
-| `Capacitor.Plugins.WidgetBridge.clearConfig()` → Promise | `WidgetBridgePlugin`. Removes the key, tells the watch to delete its copy, and leaves the widget on "Open the app to set up". |
+| `Capacitor.Plugins.WidgetBridge.setConfig({ key, base, watchKey? })` → Promise | `WidgetBridgePlugin`. It stores `key` and `base` in EncryptedSharedPreferences and refreshes the widget. It accepts only `https://revolut-claude-production.up.railway.app` as `base`, so the key never goes anywhere else. Keys are never logged. `watchKey` is the server's watch-only token (shell 625 reads it from `GET /api/watch/key`):<br>• a string: stored and sent to the watch;<br>• `null`: the server has none, so the watch is cleared;<br>• absent (the read failed): the watch is left alone. |
+| `Capacitor.Plugins.WidgetBridge.clearConfig()` → Promise | `WidgetBridgePlugin`. Removes the key and the watch key, clears the watch, and leaves the widget on "Open the app to set up". Shell 625 calls it when it starts with no key. |
 | `window.rxApp.show('home' \| 'portfolio' \| 'agent' \| 'desk' \| 'more')` | The app calls it after the shell loads, when it was opened by the widget (`portfolio`) or by a notification (`data.tab`, default `home`). |
 | `window.rxApp.open({ tab, coin })` (shell 492+) | Called instead of `show` when a notification carries `data.coin` (validated `^[A-Z0-9]{1,15}$`): opens that coin's card. The coin is cleared once delivered; with an older shell the app falls back to `show(tab)`. |
 | `window.rxApp.open({ tab: 'inbox', id })` (shell 501+) | Called when a notification carries `data.inbox`, the message's id in the app's notifications feed (validated `^[0-9]{1,15}$`). It opens the feed on that message. A valid id wins over `tab` and `coin`; with an older shell the app falls back to `show('home')`. `inbox` is not a tab the app accepts from `data.tab`. |
@@ -108,7 +108,7 @@ android/watchface/   revolutx-watchface.apk  com.bryan.revolutx.watchface, a Wat
 - **App:** the same, plus a holdings list from `/api/watch`'s `holdings: [{coin, usd, pct}]` (batch 624, numbers only). A missing field counts as no holdings. Tapping a coin opens it on the phone.
 - **Face:** the time, the total, today's P&L (green when the day's % is ≥ 0, red otherwise), and one slot. The slot shows unread PM notes by default; long-press the face → Edit to pick another (e.g. "Revolut X: top mover").
 
-**Data.** The watch calls one path: `GET https://revolut-claude-production.up.railway.app/api/watch` with `x-api-token`. Wear OS routes the call through the phone over Bluetooth, or over Wi-Fi. It follows no redirects. When it fails (offline, 5xx), the last numbers stay with "updated HH:MM" and the reason.
+**Data.** The watch calls one path: `GET https://revolut-claude-production.up.railway.app/api/watch`, with `x-api-token` set to the **watch-only token**. The server accepts that token for this one path and nothing else (desk #59 W6, batch 625). The dashboard key never leaves the phone. Wear OS routes the call through the phone over Bluetooth, or over Wi-Fi. It follows no redirects. When it fails (offline, 5xx), the last numbers stay with "updated HH:MM" and the reason.
 
 **Refresh.**
 - **Tile:** every minute while it is on screen.
@@ -117,7 +117,9 @@ android/watchface/   revolutx-watchface.apk  com.bryan.revolutx.watchface, a Wat
 - **On tap:** at once.
 - **Surfaces stay in step:** after any fetch, the Tile and the face redraw from the new numbers.
 
-**The key handover (Fable W1-W4).**
+**The key handover (Fable W1-W8).** "The key" below is the watch-only token, never the dashboard key.
+- **Source:** the server holds the watch token as a Railway variable. The shell reads it with the dashboard key (`GET /api/watch/key`) and passes it to `setConfig` as `watchKey`. The phone refuses one that equals its dashboard key.
+- **Rotation:** change the variable in Railway and redeploy. The watch then gets a 401 and says hello; the phone re-reads `/api/watch/key` (at most once a minute) and sends the new token. Losing the watch costs one rotation.
 - **Channel:** the phone sends the key with Wearable Data Layer *messages* (MessageClient), never a DataItem, so the key is not kept in Play services' synced storage. The Data Layer delivers them only to an app with the same package name and signing key.
 - **Messages:**
 
@@ -130,10 +132,10 @@ android/watchface/   revolutx-watchface.apk  com.bryan.revolutx.watchface, a Wat
 - **The watch refuses** any payload that is not exactly those two fields. It also refuses any `base` other than `https://revolut-claude-production.up.railway.app`, and any key that is not one printable token.
 - **Storage:** a new key *replaces* the old one (commit), and the last numbers are dropped with it. The key lives only in the watch app's EncryptedSharedPreferences. It is never put in the Tile, a complication, or a log, on either side.
 - **When the phone sends:**
-  - on each app start: the key, or a CLEAR when it has none;
-  - on a key change: a CLEAR, then the new key;
-  - on `clearConfig()`: a CLEAR;
-  - in answer to the watch's hello.
+  - on each app start: the watch key; or a CLEAR when the server said it has none or the phone has no dashboard key; or nothing when it has not learned one yet (a failed read never clears the watch);
+  - on a watch-key change: a CLEAR, then the new key;
+  - on `watchKey: null` and on `clearConfig()`: a CLEAR;
+  - in answer to the watch's hello, after re-reading `/api/watch/key`.
 - **When the watch sends hello:** when it opens (at most every 10 min, so a CLEAR it missed while away still arrives), and when the server refuses its key.
 - **CLEAR on the watch** deletes the key and the last numbers.
 
@@ -149,7 +151,7 @@ android/watchface/   revolutx-watchface.apk  com.bryan.revolutx.watchface, a Wat
 4. **Install:** download `revolutx-watch.apk` and `revolutx-watchface.apk` from the same Release as the phone APK, then run:
    - `adb install -r revolutx-watch.apk`
    - `adb install -r revolutx-watchface.apk`
-5. **Connect:** open Revolut X on the phone once. It sends the key, and the watch app shows the numbers.
+5. **Connect:** the server needs the watch token first. In Railway, set it on the server service: random, at least 24 printable characters, different from every other key, never pasted in chat. Then redeploy. Open Revolut X on the phone once: it fetches the watch token and sends it, and the watch app shows the numbers.
 6. **Tile:** swipe left from the face → + → Revolut X.
 7. **Face:** long-press the face → + → Revolut X face. If a slot is empty, Edit → tap the slot → Revolut X → the matching item. Wear OS may also ask to allow the face to show Revolut X data.
 8. **Turn off Wireless debugging** afterwards; it drains the battery.
@@ -161,7 +163,7 @@ The phone APK and the watch APK must come from the same signing key. A test-sign
 **CI (the normal way).** `.github/workflows/android.yml` runs on every push to `mobile-app` and on demand (Actions → Android APK → Run workflow). It:
 1. runs `npm ci`;
 2. runs `npx cap sync android`;
-3. checks that nothing in `mobile/` names or holds a dashboard key or token;
+3. checks that nothing in `mobile/` names or holds a key or token (dashboard, family page, watch, or any 32+ character literal in the Java);
 4. runs `./gradlew :app:assembleRelease :wear:assembleRelease :watchface:assembleRelease` with `versionCode = github.run_number`;
 5. uploads `app-release.apk`, `revolutx-watch.apk` and `revolutx-watchface.apk` as an artifact;
 6. publishes them as a prerelease **Release** tagged `app-v<run>`.
