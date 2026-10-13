@@ -5,4 +5,7 @@
     <string name="c_pnl">Revolut X: today\'s P&amp;L</string>
     <string name="c_notes">Revolut X: unread PM notes</string>
     <string name="c_mover">Revolut X: top mover</string>
+    <string name="c_card">Revolut X face: total card</string>
+    <string name="c_dot">Revolut X face: live dot</string>
+    <string name="c_facetotal">Revolut X face: always-on total</string>
 </resources>

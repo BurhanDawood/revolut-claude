@@ -6,6 +6,7 @@ import android.graphics.Typeface;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.PowerManager;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
@@ -17,8 +18,9 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * Desk #59 part 1: the watch app. The Tile's numbers plus the holdings list. Fetches every
- * minute while open and on a tap of the numbers; a tap on a coin or "Open on phone" opens the phone dashboard.
+ * Desk #59 part 1: the watch app. On top the app's total card (SparkCardView: the total, the live 6-hour line with its pulsing
+ * dot, the change), then movers, notes and holdings. Fetches every 30 s while on screen (13 Oct 23:21) and on a tap of the
+ * card, and stops when the screen goes off; a tap on a coin or "Open on phone" opens the phone dashboard.
  */
 public class MainActivity extends Activity {
 
@@ -28,6 +30,7 @@ public class MainActivity extends Activity {
     private final Handler main = new Handler(Looper.getMainLooper());
     private ScrollView scroll;
     private LinearLayout list;
+    private SparkCardView card;
     private boolean resumed;
     private boolean forceNext;
     private boolean notWatch;   // installed on a phone by mistake: one line, nothing else
@@ -35,8 +38,9 @@ public class MainActivity extends Activity {
     private final Runnable tick = new Runnable() {
         @Override
         public void run() {
-            load(false);
-            main.postDelayed(this, 60_000);
+            PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+            if (pm == null || pm.isInteractive()) load(false);   // nothing while the screen is off
+            main.postDelayed(this, 30_000);
         }
     };
 
@@ -67,6 +71,7 @@ public class MainActivity extends Activity {
         list.setPadding(pad, pad, pad, pad * 2);
         scroll.addView(list);
         setContentView(scroll);
+        card = new SparkCardView(this);   // kept across renders, so its line slides and its dot keeps pulsing
         forceNext = getIntent() != null && getIntent().getBooleanExtra(EXTRA_REFRESH, false);
         render();
         PhoneLink.helloAtMost(this, PhoneLink.HELLO_START_MS);   // the phone re-confirms the key, or clears it
@@ -89,7 +94,7 @@ public class MainActivity extends Activity {
         if (forceNext) {
             forceNext = false;
             load(true);
-            main.postDelayed(tick, 60_000);
+            main.postDelayed(tick, 30_000);
         } else {
             main.post(tick);
         }
@@ -104,7 +109,7 @@ public class MainActivity extends Activity {
 
     private void load(boolean force) {
         EXEC.execute(() -> {
-            Repo.refresh(getApplicationContext(), force ? 0 : Repo.AGE_SCREEN, Repo.FROM_APP);
+            Repo.refresh(getApplicationContext(), force ? 0 : Repo.AGE_APP, Repo.FROM_APP);
             main.post(() -> {
                 if (!isFinishing() && !isDestroyed()) render();
             });
@@ -115,18 +120,22 @@ public class MainActivity extends Activity {
         list.removeAllViews();
         Snapshot s = WatchStore.snapshot(this);
         add("Revolut X", 13, Fmt.GREY, false);
+        card.set(SparkCard.model(this, s));
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        lp.topMargin = dp(4);
+        list.addView(card, lp);
         if (s == null) {
-            add(Fmt.emptyLine(this), 15, Fmt.WHITE, false).setOnClickListener(v -> load(true));
+            card.setOnClickListener(v -> load(true));
             return;
         }
         View.OnClickListener refresh = v -> {
             Toast.makeText(this, "Refreshing", Toast.LENGTH_SHORT).show();
             load(true);
         };
-        add(Fmt.money(s.total), 26, Fmt.WHITE, true).setOnClickListener(refresh);
-        if (s.pnlUsd != null) {
-            String p = Fmt.signedMoney(s.pnlUsd) + (s.pnlPct != null ? "  " + Fmt.pct(s.pnlPct) : "");
-            add(p, 16, Fmt.signColor(s.pnlUsd), true).setOnClickListener(refresh);
+        card.setOnClickListener(refresh);
+        if (s.spark != null && s.pnlUsd != null) {   // the card shows 6 h; today stays one line under it
+            String p = "Today " + Fmt.signedMoney(s.pnlUsd) + (s.pnlPct != null ? "  " + Fmt.pct(s.pnlPct) : "");
+            add(p, 13, Fmt.signColor(s.pnlUsd), true).setOnClickListener(refresh);
         }
         add(Fmt.updatedLine(this, s), 12, Fmt.GREY, false).setOnClickListener(refresh);
 

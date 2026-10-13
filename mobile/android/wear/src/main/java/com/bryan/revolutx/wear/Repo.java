@@ -15,7 +15,7 @@ import java.nio.charset.StandardCharsets;
 /**
  * Desk #59 W3: the watch's only server call, GET {BASE}/api/watch with the dashboard key in x-api-token. Read-only; the
  * watch has no write call. One fetch at a time; callers say how old the last answer may be:
- *   the app and the Tile: 50 s (they redraw every minute while on screen), a complication: 4 min (Wear OS asks every 5),
+ *   the app: 25 s (it asks every 30 s while on screen), the Tile: 50 s, a complication: 4 min (Wear OS asks every 5),
  *   a tap or a new key: 0.
  * Offline or a server error keeps the last numbers ("updated HH:MM"). After a fetch the other surfaces are told to redraw.
  */
@@ -28,6 +28,7 @@ final class Repo {
     static final int FROM_TAP = 5;
 
     static final long AGE_SCREEN = 50_000;
+    static final long AGE_APP = 25_000;   // the app re-fetches every 30 s while it is on screen (the server caches 30 s)
     static final long AGE_COMPLICATION = 240_000;
 
     /** One fetch at a time; the key handover takes it too, so an old key's answer never lands after a new key or a CLEAR. */

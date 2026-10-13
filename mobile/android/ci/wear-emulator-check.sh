@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# Desk #59, CI only (android.yml's wear-emulator job, on a booted Wear OS emulator). Installs the watch app and the faces,
+# applies each face with Wear OS's developer broadcast, and prints what happened: the logcat lines about watch faces and
+# complications, and small JPEG screenshots as base64 lines ("IMG <name> <base64>") that a reader can decode. Nothing secret
+# is used or printed: the emulator has no key; FaceRenderTest saves a sample answer instead.
+#   $1: a folder with revolutx-WATCH-adb-only.apk and revolutx-WATCHFACE-adb-only.apk (this run's release build) and,
+#       optionally, face-v17.apk (app-v17's face, the one that would not apply on Bryan's watch).
+set -u
+REL="$1"
+WEAR_DBG=mobile/android/wear/build/outputs/apk/debug/wear-debug.apk
+WEAR_TEST=mobile/android/wear/build/outputs/apk/androidTest/debug/wear-debug-androidTest.apk
+OUT="$RUNNER_TEMP/wear-shots"
+mkdir -p "$OUT"
+FACE_ID=com.bryan.revolutx.watchface
+
+shot() {   # shot <name>: a 300 px JPEG of the screen, printed as one base64 line
+  adb exec-out screencap -p > "$OUT/$1.png" 2>/dev/null
+  convert "$OUT/$1.png" -resize 300x300 -quality 70 "$OUT/$1.jpg" 2>/dev/null || cp "$OUT/$1.png" "$OUT/$1.jpg"
+  echo "IMG $1 $(base64 -w0 "$OUT/$1.jpg")"
+}
+
+logs() {   # logs <title>: what Wear OS said about faces and complications since the last clear
+  echo "::group::logcat: $1"
+  adb logcat -d -v brief 2>/dev/null \
+    | grep -iE 'watchface|watch face|wff|revolutx|complication|AndroidRuntime|FATAL|DEBUG_SURFACE|XmlPull|Parse' \
+    | grep -viE 'chatty|GnssLocation' | tail -n 150
+  echo "::endgroup::"
+}
+
+set_face() {   # set_face: Google's documented developer command for a Watch Face Format face
+  adb shell am broadcast -a com.google.android.wearable.app.DEBUG_SURFACE --es operation set-watchface --es watchFaceId "$FACE_ID"
+  sleep 15
+  echo "bound watch face services:"
+  adb shell dumpsys activity services 2>/dev/null | grep -iE 'ServiceRecord.*(watchface|wff)' | head -n 10
+}
+
+echo "== device: $(adb shell getprop ro.build.version.release) / API $(adb shell getprop ro.build.version.sdk), $(adb shell wm size)"
+adb shell settings put system screen_off_timeout 600000 >/dev/null 2>&1
+adb shell svc power stayon true >/dev/null 2>&1
+
+echo "== 1. the release watch app (R8) starts"
+adb install -r "$REL/revolutx-WATCH-adb-only.apk" || { echo "::error::the release watch app did not install"; exit 1; }
+adb logcat -c
+adb shell am start -W -n com.bryan.revolutx/com.bryan.revolutx.wear.MainActivity
+sleep 6
+shot app-release-nokey
+if adb logcat -d | grep -q "FATAL EXCEPTION"; then logs "release app crash"; echo "::error::the release watch app crashed"; fi
+adb uninstall com.bryan.revolutx >/dev/null
+
+echo "== 2. the debug watch app, with a sample answer saved (no key)"
+adb install -r "$WEAR_DBG" && adb install -r "$WEAR_TEST" || { echo "::error::the debug watch app did not install"; exit 1; }
+adb shell am instrument -w -e class com.bryan.revolutx.wear.FaceRenderTest com.bryan.revolutx.test/androidx.test.runner.AndroidJUnitRunner
+for f in card-face-up card-face-down card-face-nospark card-face-nokey card-app-down; do
+  adb exec-out run-as com.bryan.revolutx cat "files/ci/$f.png" > "$OUT/$f.png" 2>/dev/null
+  convert "$OUT/$f.png" -background black -flatten -quality 80 "$OUT/$f.jpg" 2>/dev/null || cp "$OUT/$f.png" "$OUT/$f.jpg"
+  echo "IMG $f $(base64 -w0 "$OUT/$f.jpg")"
+done
+
+if [ -f "$REL/face-v17.apk" ]; then
+  echo "== 3. app-v17's face"
+  adb install -r "$REL/face-v17.apk" && {
+    adb logcat -c
+    set_face
+    shot face-v17
+    logs "app-v17 face"
+    adb uninstall "$FACE_ID" >/dev/null
+  }
+fi
+
+echo "== 4. this build's face"
+adb install -r "$REL/revolutx-WATCHFACE-adb-only.apk" || { echo "::error::the face did not install"; exit 1; }
+adb logcat -c
+set_face
+shot face-new-a
+sleep 0.7
+shot face-new-b   # the dot's ring should have grown or faded between a and b
+logs "this build's face"
+
+echo "== 5. always-on"
+adb shell input keyevent KEYCODE_SLEEP
+sleep 5
+shot face-ambient
+adb shell input keyevent KEYCODE_WAKEUP
+sleep 2
+
+echo "== 6. the watch app's card (live: pulsing dot)"
+adb shell am start -W -n com.bryan.revolutx/com.bryan.revolutx.wear.MainActivity
+sleep 4
+shot app-card
+logs "watch app"
+exit 0

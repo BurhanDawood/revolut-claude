@@ -30,7 +30,9 @@ android {
     }
     buildTypes {
         release {
-            minifyEnabled false
+            // R8 with nothing to keep: the face is resources only, so the R class is dropped and the APK carries no classes.dex
+            // (app-v17's face still had one, with only R in it, although hasCode is false). CI fails if a dex comes back.
+            minifyEnabled true
             if (canSign) signingConfig signingConfigs.release
         }
     }

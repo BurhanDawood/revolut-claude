@@ -102,6 +102,7 @@
             </intent-filter>
             <meta-data android:name="android.support.wearable.complications.SUPPORTED_TYPES" android:value="SHORT_TEXT" />
             <meta-data android:name="android.support.wearable.complications.UPDATE_PERIOD_SECONDS" android:value="300" />
+            <meta-data android:name="android.support.wearable.complications.SAFE_WATCH_FACES" android:value="com.bryan.revolutx.watchface" />
         </service>
         <service
             android:name=".MoverComplication"
@@ -114,6 +115,51 @@
             </intent-filter>
             <meta-data android:name="android.support.wearable.complications.SUPPORTED_TYPES" android:value="SHORT_TEXT,RANGED_VALUE" />
             <meta-data android:name="android.support.wearable.complications.UPDATE_PERIOD_SECONDS" android:value="300" />
+        </service>
+
+        <!-- the Revolut X face's own sources (desk #59, 13 Oct 23:20): the card image, where its pulsing dot goes, the always-on
+             total. SAFE_WATCH_FACES names the face's package so it gets their data without a permission prompt. -->
+        <!-- the card: total, 6 h line, change -->
+        <service
+            android:name=".CardComplication"
+            android:exported="true"
+            android:icon="@drawable/ic_stat_rx"
+            android:label="@string/c_card"
+            android:permission="com.google.android.wearable.permission.BIND_COMPLICATION_PROVIDER">
+            <intent-filter>
+                <action android:name="android.support.wearable.complications.ACTION_COMPLICATION_UPDATE_REQUEST" />
+            </intent-filter>
+            <meta-data android:name="android.support.wearable.complications.SUPPORTED_TYPES" android:value="PHOTO_IMAGE" />
+            <meta-data android:name="android.support.wearable.complications.UPDATE_PERIOD_SECONDS" android:value="300" />
+            <meta-data android:name="android.support.wearable.complications.SAFE_WATCH_FACES" android:value="com.bryan.revolutx.watchface" />
+        </service>
+        <!-- the line's last point (height and direction) -->
+        <service
+            android:name=".DotComplication"
+            android:exported="true"
+            android:icon="@drawable/ic_stat_rx"
+            android:label="@string/c_dot"
+            android:permission="com.google.android.wearable.permission.BIND_COMPLICATION_PROVIDER">
+            <intent-filter>
+                <action android:name="android.support.wearable.complications.ACTION_COMPLICATION_UPDATE_REQUEST" />
+            </intent-filter>
+            <meta-data android:name="android.support.wearable.complications.SUPPORTED_TYPES" android:value="RANGED_VALUE" />
+            <meta-data android:name="android.support.wearable.complications.UPDATE_PERIOD_SECONDS" android:value="300" />
+            <meta-data android:name="android.support.wearable.complications.SAFE_WATCH_FACES" android:value="com.bryan.revolutx.watchface" />
+        </service>
+        <!-- "$4,863" + ".98" -->
+        <service
+            android:name=".FaceTotalComplication"
+            android:exported="true"
+            android:icon="@drawable/ic_stat_rx"
+            android:label="@string/c_facetotal"
+            android:permission="com.google.android.wearable.permission.BIND_COMPLICATION_PROVIDER">
+            <intent-filter>
+                <action android:name="android.support.wearable.complications.ACTION_COMPLICATION_UPDATE_REQUEST" />
+            </intent-filter>
+            <meta-data android:name="android.support.wearable.complications.SUPPORTED_TYPES" android:value="SHORT_TEXT" />
+            <meta-data android:name="android.support.wearable.complications.UPDATE_PERIOD_SECONDS" android:value="300" />
+            <meta-data android:name="android.support.wearable.complications.SAFE_WATCH_FACES" android:value="com.bryan.revolutx.watchface" />
         </service>
     </application>
 </manifest>

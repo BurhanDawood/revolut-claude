@@ -109,15 +109,17 @@ android/watchface/   revolutx-WATCHFACE-adb-only.apk  com.bryan.revolutx.watchfa
 
 **What it shows.**
 - **Tile:** the total, today's P&L in green or red, the top 3 movers (the biggest 24 h moves either way), the unread PM notes count and "updated HH:MM". Tap the numbers to refresh. "Open on phone" opens Portfolio on the phone.
-- **App:** the same, plus a holdings list from `/api/watch`'s `holdings: [{coin, usd, pct}]` (batch 624, numbers only). A missing field counts as no holdings. Tapping a coin opens it on the phone.
-- **Face:** the time, the total, today's P&L (green when the day's % is ≥ 0, red otherwise), and one slot. The slot shows unread PM notes by default; long-press the face → Edit to pick another (e.g. "Revolut X: top mover").
+- **App:** on top the app's total card (below), then today's P&L, the movers, the PM notes count and a holdings list from `/api/watch`'s `holdings: [{coin, usd, pct}]` (batch 624, numbers only). A missing field counts as no holdings. Tapping a coin opens it on the phone.
+- **Face** (13 Oct 23:20): the unread PM notes count (small), the time, then the card. Always-on: only the time and the total, in outline, no line, no pulse.
+- **The card** (face and app, drawn by one routine, `SparkCard`): the total with the cents smaller; the dashboard's live 6-hour line (#507) from `/api/watch`'s `spark` (batch 628: up to 61 values, oldest first, with `change_usd` / `change_pct`) - 90 resampled points, a 2 px line, a fill fading from 28%, green `#00ffc8` when the 6 h change is ≥ 0 and red `#ff4d6a` when down, a pulsing dot on the last point (the app's ring: 2 s, ease-out); then "6 hours −$133.89 (−2.68%)" in the line's colour and "LIVE" on the right (the last answer's time instead when it is over 15 minutes old or the last fetch failed). `spark: null` (or an older server): no line, and today's P&L instead.
+- **How the face does it:** Watch Face Format draws no lines from data, so the watch app draws the card into an image (`CardComplication`, PHOTO_IMAGE). The dot is the face's own: `DotComplication` (RANGED_VALUE) gives the last point's height and the direction, and the face pulses an ellipse there with WFF's looping animation. The always-on total is `FaceTotalComplication` ("$4,863" + ".98"). Code-based faces are deprecated on Wear OS 6, so the face stays WFF.
 
 **Data.** The watch calls one path: `GET https://revolut-claude-production.up.railway.app/api/watch`, with `x-api-token` set to the **watch-only token**. The server accepts that token for this one path and nothing else (desk #59 W6, batch 625). The dashboard key never leaves the phone. Wear OS routes the call through the phone over Bluetooth, or over Wi-Fi. It follows no redirects. When it fails (offline, 5xx), the last numbers stay with "updated HH:MM" and the reason.
 
 **Refresh.**
 - **Tile:** every minute while it is on screen.
-- **App:** every minute while it is open.
-- **Face:** every 5 min. That is the floor Wear OS sets for complications; nothing faster is possible without server push.
+- **App:** every 30 s while it is on screen (the server caches 30 s); nothing while the screen is off. A new line slides in over 0.9 s.
+- **Face:** every 5 min. That is the floor Wear OS sets for complications; nothing faster is possible without server push. The dot's pulse runs on the watch, continuously, in between.
 - **On tap:** at once.
 - **Surfaces stay in step:** after any fetch, the Tile and the face redraw from the new numbers.
 
@@ -157,7 +159,7 @@ android/watchface/   revolutx-WATCHFACE-adb-only.apk  com.bryan.revolutx.watchfa
    - `adb install -r revolutx-WATCHFACE-adb-only.apk`
 5. **Connect:** the server needs the watch token first. In Railway, set it on the server service: random, at least 24 printable characters, different from every other key, never pasted in chat. Then redeploy. Open Revolut X on the phone once: it fetches the watch token and sends it, and the watch app shows the numbers.
 6. **Tile:** swipe left from the face → + → Revolut X.
-7. **Face:** long-press the face → + → Revolut X face. If a slot is empty, Edit → tap the slot → Revolut X → the matching item. Wear OS may also ask to allow the face to show Revolut X data.
+7. **Face:** long-press the face → + → Revolut X face. If a slot is empty, Edit → tap the slot → Revolut X → the matching item: the card is "Revolut X face: total card", the dot "Revolut X face: live dot", the always-on total "Revolut X face: always-on total", the top line "Revolut X: unread PM notes". Wear OS may also ask to allow the face to show Revolut X data.
 8. **Turn off Wireless debugging** afterwards; it drains the battery.
 
 The phone APK and the watch APK must come from the same signing key. A test-signed build (Release title "(test signing)") pairs only with other APKs from that same run.
@@ -170,8 +172,10 @@ The phone APK and the watch APK must come from the same signing key. A test-sign
 3. checks that nothing in `mobile/` names or holds a key or token (dashboard, family page, watch, or any 32+ character literal in the Java);
 4. runs `./gradlew :app:assembleRelease :wear:assembleRelease :watchface:assembleRelease` with `versionCode = github.run_number`;
 5. checks the watch APK: every system-bound class is in the merged manifest, kept by name by R8 and in the dex; prints the three APK sizes in the run summary;
+   checks the face: no `classes.dex` (a WFF face carries no code; app-v17's face still had one) and `watchface.xml` valid for its format version with Google's validator (google/watchface, pinned);
 6. uploads `revolutx-PHONE.apk`, `revolutx-WATCH-adb-only.apk`, `revolutx-WATCHFACE-adb-only.apk` and the watch's R8 mapping as an artifact;
 7. on `mobile-app` only, publishes the three APKs as a prerelease **Release** tagged `app-v<run>`. A run on any other branch builds and checks but publishes nothing.
+8. on a manual run only, `wear-emulator` (Wear OS 6 and 5 emulators): installs the watch app, applies app-v17's face and the new one with Wear OS's developer broadcast, and prints logcat and small screenshots in the log (`ci/wear-emulator-check.sh`). The emulator never gets a key; a CI-only test (`wear/src/androidTest`, never in a release APK) saves a sample answer instead.
 
 To install on the phone: open the Release page in the phone's browser, download `revolutx-PHONE.apk`, and open it. Allow "install unknown apps" for the browser the first time.
 

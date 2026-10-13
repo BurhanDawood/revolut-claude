@@ -26,7 +26,8 @@ import java.util.concurrent.Executors;
  */
 public abstract class ComplicationBase extends ComplicationDataSourceService {
 
-    static final Class<?>[] ALL = { TotalComplication.class, PnlComplication.class, NotesComplication.class, MoverComplication.class };
+    static final Class<?>[] ALL = { TotalComplication.class, PnlComplication.class, NotesComplication.class, MoverComplication.class,
+        CardComplication.class, DotComplication.class, FaceTotalComplication.class };
 
     private static final ExecutorService EXEC = Executors.newSingleThreadExecutor();
 
@@ -51,7 +52,7 @@ public abstract class ComplicationBase extends ComplicationDataSourceService {
             try {
                 Repo.refresh(app, Repo.AGE_COMPLICATION, Repo.FROM_COMPLICATION);
                 Snapshot s = WatchStore.snapshot(app);
-                d = s == null ? noKeyOrEmpty(app, type) : build(type, s, tap(app));
+                d = s == null ? empty(app, type) : build(type, s, tap(app));
             } catch (Exception ignored) {
                 // the last data stays
             }
@@ -72,11 +73,16 @@ public abstract class ComplicationBase extends ComplicationDataSourceService {
         s.pnlPct = 1.2;
         s.unread = 3;
         s.movers.add(new Snapshot.Coin("SOL", 8.1, 182.4));
+        s.spark = new double[61];   // a gentle 6 h rise for the face picker's preview
+        for (int i = 0; i < s.spark.length; i++) s.spark[i] = 4770 + i * 0.9 + 14 * Math.sin(i / 6.0);
+        s.sparkChgUsd = s.spark[60] - s.spark[0];
+        s.sparkChgPct = s.sparkChgUsd / s.spark[0] * 100;
         return build(type, s, null);
     }
 
     /** Before the first answer: "--" with a hint, so the face does not look broken. */
-    private ComplicationData noKeyOrEmpty(Context app, ComplicationType type) {
+    @Nullable
+    ComplicationData empty(Context app, ComplicationType type) {
         if (type != ComplicationType.SHORT_TEXT) return null;
         String title = WatchStore.hasKey(app) ? "Rx" : "Set up";
         return shortText("--", title, "Revolut X: " + Fmt.emptyLine(app), tap(app));

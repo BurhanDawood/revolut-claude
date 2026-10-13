@@ -7,7 +7,9 @@ import org.json.JSONObject;
 
 /**
  * One /api/watch answer: { v, at, updated_ts, partial, total_usd, pnl_day_usd, pnl_day_pct, movers:[{coin,pct,price}],
- * unread_pm_notes, holdings:[{coin,usd,pct}] } (holdings: batch 624; a missing field is an empty list). Numbers and counts only.
+ * unread_pm_notes, holdings:[{coin,usd,pct}], spark } (holdings: batch 624; a missing field is an empty list). Numbers and counts only.
+ * spark (batch 628): { range:'6h', from_ts, to_ts, points:[up to 61 USD totals, oldest first], change_usd, change_pct } or null
+ * when the server has no series; then the card draws no line and shows today's P&L instead.
  */
 final class Snapshot {
 
@@ -31,6 +33,11 @@ final class Snapshot {
     int unread;
     final List<Coin> movers = new ArrayList<>();
     final List<Coin> holdings = new ArrayList<>();   // coin, pct (24 h, NaN when null), price = value in USD
+    double[] spark;          // the 6 h line, oldest first; null = no series
+    Double sparkChgUsd;
+    Double sparkChgPct;
+    long sparkFrom;          // the series' first and last time, as the server sent them
+    long sparkTo;
 
     /** Parses the server's answer, keeping only the known fields. Throws on a body without a total. */
     static Snapshot parse(String body) throws Exception {
@@ -46,6 +53,7 @@ final class Snapshot {
         s.unread = Math.max(0, o.optInt("unread_pm_notes", 0));
         readCoins(o.optJSONArray("movers"), s.movers, "price", 3);
         readCoins(o.optJSONArray("holdings"), s.holdings, "usd", 50);
+        readSpark(o.optJSONObject("spark"), s);
         return s;
     }
 
@@ -58,6 +66,24 @@ final class Snapshot {
             if (!coin.matches("[A-Za-z0-9]{1,15}")) continue;
             out.add(new Coin(coin.toUpperCase(), m.optDouble("pct", Double.NaN), m.optDouble(valueField, Double.NaN)));
         }
+    }
+
+    private static void readSpark(JSONObject sp, Snapshot s) {
+        if (sp == null) return;
+        JSONArray a = sp.optJSONArray("points");
+        if (a == null || a.length() < 2) return;
+        int n = Math.min(a.length(), 120);
+        double[] pts = new double[n];
+        for (int i = 0; i < n; i++) {
+            double d = a.optDouble(a.length() - n + i, Double.NaN);   // the newest 120 at most
+            if (Double.isNaN(d) || Double.isInfinite(d)) return;     // a broken series draws no line
+            pts[i] = d;
+        }
+        s.spark = pts;
+        s.sparkChgUsd = num(sp, "change_usd");
+        s.sparkChgPct = num(sp, "change_pct");
+        s.sparkFrom = sp.optLong("from_ts", 0);
+        s.sparkTo = sp.optLong("to_ts", 0);
     }
 
     private static Double num(JSONObject o, String k) {
@@ -77,6 +103,14 @@ final class Snapshot {
             o.put("unread_pm_notes", unread);
             o.put("movers", coins(movers, "price"));
             o.put("holdings", coins(holdings, "usd"));
+            if (spark != null) {
+                JSONArray pts = new JSONArray();
+                for (double d : spark) pts.put(d);
+                JSONObject sp = new JSONObject().put("range", "6h").put("points", pts).put("from_ts", sparkFrom).put("to_ts", sparkTo);
+                if (sparkChgUsd != null) sp.put("change_usd", sparkChgUsd);
+                if (sparkChgPct != null) sp.put("change_pct", sparkChgPct);
+                o.put("spark", sp);
+            }
             return o.toString();
         } catch (Exception e) {
             return null;

@@ -3,6 +3,7 @@ name: Android APK
 # Builds the Revolut X Android app (mobile/) and publishes it as a prerelease (revolutx-PHONE.apk), together with (desk #59)
 # the Galaxy Watch app (revolutx-WATCH-adb-only.apk, same applicationId and key) and its Watch Face Format face
 # (revolutx-WATCHFACE-adb-only.apk). Only a run on mobile-app publishes a Release; a run on any other branch builds and checks.
+# A manual run (Run workflow) also runs wear-emulator: the watch app and the face on a Wear OS emulator, with screenshots.
 # It never touches main, the server or Railway: it only reads mobile/ and writes a GitHub Release.
 #
 # Secrets (Settings -> Secrets and variables -> Actions), all optional for the build to pass:
@@ -149,7 +150,8 @@ jobs:
           MANIFEST="$("$BT"/aapt2 dump xmltree --file AndroidManifest.xml "$APK")"
           DEX="$(unzip -p "$APK" 'classes*.dex' | strings -n 8)"
           fail=0
-          for C in MainActivity OpenOnPhoneActivity KeyListener RxTileService TotalComplication PnlComplication NotesComplication MoverComplication; do
+          for C in MainActivity OpenOnPhoneActivity KeyListener RxTileService TotalComplication PnlComplication NotesComplication MoverComplication \
+                   CardComplication DotComplication FaceTotalComplication; do
             N="com.bryan.revolutx.wear.$C"
             m=no; k=no; d=no
             printf '%s\n' "$MANIFEST" | grep -qF "=\"$N\"" && m=yes
@@ -170,6 +172,38 @@ jobs:
             echo; echo "Watch dex files: $(unzip -l "$APK" | grep -c 'classes[0-9]*\.dex')"
           } | tee -a "$GITHUB_STEP_SUMMARY"
           exit $fail
+
+      - name: Watch face check (Google's WFF validator, no code in the package)
+        # desk #59 (13 Oct 23:20): app-v17's face would not apply. A WFF face must be valid XML for its format and carry no code.
+        run: |
+          set -e
+          FACE="$GITHUB_WORKSPACE/revolutx-WATCHFACE-adb-only.apk"
+          if unzip -l "$FACE" | grep -q 'classes[0-9]*\.dex'; then echo "::error::the face APK contains a classes.dex (a WFF face must have no code)"; exit 1; fi
+          echo "Face APK: no dex"
+          BT="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)"
+          "$BT"/aapt2 dump xmltree --file AndroidManifest.xml "$FACE" | grep -E 'hasCode|watchface.format|E: (application|property)' | sed 's/^ *//'
+          # Google's validator (google/watchface, third_party/wff), built from a pinned commit with its four Maven Central jars
+          V="$RUNNER_TEMP/wffv"; mkdir -p "$V/lib" "$V/out"
+          git clone -q https://github.com/google/watchface "$V/src"
+          git -C "$V/src" checkout -q b6cdda0acd3e4c5d0be5624fcdc01209380029d1
+          M=https://repo1.maven.org/maven2
+          curl -sSfLo "$V/lib/xml-apis.jar" $M/xml-apis/xml-apis/1.4.01/xml-apis-1.4.01.jar
+          curl -sSfLo "$V/lib/xerces.jar" $M/org/exist-db/thirdparty/xerces/xercesImpl/2.12.0/xercesImpl-2.12.0-xml-schema-1.1.jar
+          curl -sSfLo "$V/lib/xpath2.jar" $M/com/rackspace/eclipse/webtools/sourceediting/org.eclipse.wst.xml.xpath2.processor/2.1.100/org.eclipse.wst.xml.xpath2.processor-2.1.100.jar
+          curl -sSfLo "$V/lib/cup.jar" $M/edu/princeton/cup/java-cup/10k/java-cup-10k.jar
+          curl -sSfLo "$V/lib/icu.jar" $M/com/ibm/icu/icu4j/4.6/icu4j-4.6.jar
+          echo "a840968176645684bb01aed376e067ab39614885f9eee44abe35a5f20ebe7fad  $V/lib/xml-apis.jar
+          ddbe5a00ab903c93e5a7f2b750fe48bb1147c538ba2a7afeec3a4b535ee12dc4  $V/lib/xerces.jar
+          a7a73a0a668d0a9b9effb046d20076e33f18ae4c02d418b56721ef57b216ed79  $V/lib/xpath2.jar
+          15894fad0a81611e351b5200bbc3bd21359fc6aed53af54a48998390e4b2700d  $V/lib/cup.jar
+          b7efe223de080eb29fd9f341777cd85bfa4c770469a7fea9b0c2d27108893673  $V/lib/icu.jar" | sed 's/^ *//' | sha256sum -c --quiet
+          W="$V/src/third_party/wff/specification"
+          (cd "$W/documents" && zip -qr "$V/out/docs.zip" .)
+          javac -nowarn -cp "$V/lib/*" -d "$V/out" $(find "$W/validator/src/main/java" -name '*.java')
+          FMT=$(grep -A1 'watchface.format.version' mobile/android/watchface/src/main/AndroidManifest.xml | grep -oE 'android:value="[0-9]+"' | grep -oE '[0-9]+')
+          R=$(java -cp "$V/out:$V/lib/*" com.samsung.watchface.DWFValidationApplication "$FMT" mobile/android/watchface/src/main/res/raw/watchface.xml 2>&1)
+          echo "$R" | grep -E 'PASSED|FAILED|SEVERE'
+          echo "$R" | grep -q 'PASSED' || { echo "::error::watchface.xml is not valid Watch Face Format v$FMT"; exit 1; }
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -199,3 +233,72 @@ jobs:
             Versioncode ${{ github.run_number }}.
             **Phone: open `revolutx-PHONE.apk` on the phone. Watch: `revolutx-WATCH-adb-only.apk` and `revolutx-WATCHFACE-adb-only.apk` go on the Galaxy Watch with adb only - never open them on the phone.** (mobile/README.md "The watch")
             ${{ env.SIGNING == 'temporary' && 'Signed with a one-off test key because the release signing secrets are not set: it will NOT install over another build (uninstall the old one first).' || 'Signed with the release key: installs over the previous build.' }}
+
+  wear-emulator:
+    # Desk #59 (13 Oct 23:20): the watch app and the face on a Wear OS emulator. It installs them, applies app-v17's face and
+    # this build's with Wear OS's developer broadcast, and prints logcat plus small screenshots (base64 "IMG" lines) in the
+    # log. Manual runs only (Run workflow): it takes about 15 minutes. Nothing secret: the emulator never gets a key.
+    if: github.event_name == 'workflow_dispatch'
+    needs: apk
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        api: [36, 34]   # Wear OS 6 (the Galaxy Watch 8) and Wear OS 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+
+      - name: JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: gradle
+
+      - name: Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-36 build-tools;36.0.0'
+
+      - name: Debug watch app and its CI test
+        run: |
+          (cd mobile && npm ci && npx cap sync android)
+          cd mobile/android && chmod +x gradlew && ./gradlew :wear:assembleDebug :wear:assembleDebugAndroidTest --no-daemon
+
+      - name: This run's release APKs
+        uses: actions/download-artifact@v4
+        with:
+          name: app-release-${{ github.run_number }}
+          path: rel
+
+      - name: app-v17's face (the one that would not apply)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download app-v17 -R "$GITHUB_REPOSITORY" -p revolutx-WATCHFACE-adb-only.apk -O rel/face-v17.apk || echo "app-v17's face is not available"
+
+      - name: KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Wear OS emulator (API ${{ matrix.api }})
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ matrix.api }}
+          target: android-wear
+          arch: x86_64
+          profile: wearos_large_round
+          force-avd-creation: true
+          disable-animations: false
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -camera-back none
+          script: bash mobile/android/ci/wear-emulator-check.sh rel

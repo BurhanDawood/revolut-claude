@@ -1,8 +1,17 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Desk #59 part 3: the Revolut X face (Watch Face Format v1). Time, the portfolio total, today's P&L in green or red, and one
-  slot of the wearer's choice (default: unread PM notes). The numbers come from the Revolut X watch app's complication data
-  sources (com.bryan.revolutx); this package has no code and never sees the key.
+  Desk #59 (Bryan 13 Oct 23:20 / 23:21): the Revolut X face, like the app's total card. From the top: the unread PM-note count
+  (small), the time, then the card - the total with smaller cents, the live 6-hour line with its fill, and "6 hours -$133.89
+  (-2.68%)  LIVE" - with the line's last point pulsing like the app's (#507: an expanding ring, 2 s, ease-out).
+  Watch Face Format v1, no code: every number comes from the Revolut X watch app's complication data sources (com.bryan.revolutx).
+    slot 0  CardComplication       PHOTO_IMAGE   the card, drawn by the app's own SparkCard routine (the app's screen uses it too)
+    slot 1  DotComplication        RANGED_VALUE  the line's last point: value 0..1 = its height in the line's box, line up;
+                                                 -1..-2 = -1 - height, line down. No series: no data, no dot.
+    slot 2  NotesComplication      SHORT_TEXT    unread PM notes
+    slot 3  FaceTotalComplication  SHORT_TEXT    always-on only: "$4,863" + ".98"
+  Always-on: the time and the total only, outline text, no fill, no line, no pulse.
+  The card sits at x 45, y 206, 360 x 156; its line box is 62..118 inside it with 5 px padding (SparkCard.PLOT_*): keep the
+  dot's numbers below in step with SparkCard.java.
 -->
 <WatchFace width="450" height="450">
   <Metadata key="CLOCK_TYPE" value="DIGITAL" />
@@ -10,22 +19,82 @@
 
   <Scene backgroundColor="#ff000000">
 
-    <!-- slot 2, top: the wearer's choice; by default the unread PM notes count -->
-    <ComplicationSlot slotId="2" x="150" y="52" width="150" height="66" supportedTypes="SHORT_TEXT" isCustomizable="TRUE">
-      <DefaultProviderPolicy defaultSystemProvider="EMPTY" defaultSystemProviderType="EMPTY"
+    <!-- slot 2, top: unread PM notes, small -->
+    <ComplicationSlot slotId="2" name="notes" x="135" y="54" width="180" height="36" supportedTypes="SHORT_TEXT" isCustomizable="TRUE">
+      <Variant mode="AMBIENT" target="alpha" value="0" />
+      <DefaultProviderPolicy defaultSystemProvider="EMPTY" defaultSystemProviderType="SHORT_TEXT"
           primaryProvider="com.bryan.revolutx/com.bryan.revolutx.wear.NotesComplication" primaryProviderType="SHORT_TEXT" />
-      <BoundingBox x="0" y="0" width="150" height="66" />
+      <BoundingBox x="0" y="0" width="180" height="36" />
       <Complication type="SHORT_TEXT">
-        <PartText x="0" y="0" width="150" height="40">
+        <PartText x="0" y="0" width="180" height="36">
           <Text align="CENTER" ellipsis="TRUE">
-            <Font family="SYNC_TO_DEVICE" size="30" weight="BOLD" color="#ff00ffc8">
+            <Font family="SYNC_TO_DEVICE" size="20" weight="NORMAL" color="#ff888888">
+              <Template>%s %s<Parameter expression="[COMPLICATION.TEXT]" /><Parameter expression="[COMPLICATION.TITLE]" /></Template>
+            </Font>
+          </Text>
+        </PartText>
+      </Complication>
+    </ComplicationSlot>
+
+    <!-- the time, prominent -->
+    <Group name="time" x="0" y="92" width="450" height="112">
+      <Variant mode="AMBIENT" target="alpha" value="0" />
+      <DigitalClock x="0" y="0" width="450" height="112">
+        <TimeText format="hh:mm" hourFormat="SYNC_TO_DEVICE" align="CENTER" x="0" y="0" width="450" height="112">
+          <Font family="SYNC_TO_DEVICE" size="92" weight="NORMAL" color="#ffffffff" />
+        </TimeText>
+      </DigitalClock>
+    </Group>
+
+    <!-- always-on: the time in outline (TimeText has no outline, so a PartText from the clock's sources, 24 h or 12 h like the watch) -->
+    <Group name="timeAmbient" x="0" y="120" width="450" height="112" alpha="0">
+      <Variant mode="AMBIENT" target="alpha" value="255" />
+      <Condition>
+        <Expressions>
+          <Expression name="h24">[IS_24_HOUR_MODE]</Expression>
+        </Expressions>
+        <Compare expression="h24">
+          <PartText x="0" y="0" width="450" height="112">
+            <Text align="CENTER" ellipsis="FALSE">
+              <Font family="SYNC_TO_DEVICE" size="92" weight="NORMAL" color="#00000000">
+                <Outline color="#ffffffff" width="2" />
+                <Template>%s:%s<Parameter expression="[HOUR_0_23_Z]" /><Parameter expression="[MINUTE_Z]" /></Template>
+              </Font>
+            </Text>
+          </PartText>
+        </Compare>
+        <Default>
+          <PartText x="0" y="0" width="450" height="112">
+            <Text align="CENTER" ellipsis="FALSE">
+              <Font family="SYNC_TO_DEVICE" size="92" weight="NORMAL" color="#00000000">
+                <Outline color="#ffffffff" width="2" />
+                <Template>%s:%s<Parameter expression="[HOUR_1_12_Z]" /><Parameter expression="[MINUTE_Z]" /></Template>
+              </Font>
+            </Text>
+          </PartText>
+        </Default>
+      </Condition>
+    </Group>
+
+    <!-- slot 3, always-on only: the total, outline, the cents smaller (dollars end and cents start at x 226) -->
+    <ComplicationSlot slotId="3" name="totalAmbient" x="45" y="242" width="360" height="64" supportedTypes="SHORT_TEXT" isCustomizable="TRUE" alpha="0">
+      <Variant mode="AMBIENT" target="alpha" value="255" />
+      <DefaultProviderPolicy defaultSystemProvider="EMPTY" defaultSystemProviderType="SHORT_TEXT"
+          primaryProvider="com.bryan.revolutx/com.bryan.revolutx.wear.FaceTotalComplication" primaryProviderType="SHORT_TEXT" />
+      <BoundingBox x="0" y="0" width="360" height="64" />
+      <Complication type="SHORT_TEXT">
+        <PartText x="0" y="0" width="226" height="64">
+          <Text align="END" ellipsis="FALSE">
+            <Font family="SYNC_TO_DEVICE" size="44" weight="BOLD" color="#00000000">
+              <Outline color="#ffffffff" width="2" />
               <Template>%s<Parameter expression="[COMPLICATION.TEXT]" /></Template>
             </Font>
           </Text>
         </PartText>
-        <PartText x="0" y="40" width="150" height="24">
-          <Text align="CENTER" ellipsis="TRUE">
-            <Font family="SYNC_TO_DEVICE" size="16" weight="NORMAL" color="#ff9a9a9a">
+        <PartText x="226" y="17" width="134" height="40">
+          <Text align="START" ellipsis="FALSE">
+            <Font family="SYNC_TO_DEVICE" size="28" weight="BOLD" color="#00000000">
+              <Outline color="#ffffffff" width="1.5" />
               <Template>%s<Parameter expression="[COMPLICATION.TITLE]" /></Template>
             </Font>
           </Text>
@@ -33,67 +102,72 @@
       </Complication>
     </ComplicationSlot>
 
-    <!-- the time -->
-    <DigitalClock x="0" y="118" width="450" height="116">
-      <TimeText format="hh:mm" hourFormat="SYNC_TO_DEVICE" align="CENTER" x="0" y="0" width="450" height="116">
-        <Font family="SYNC_TO_DEVICE" size="96" weight="NORMAL" color="#ffffffff" />
-      </TimeText>
-    </DigitalClock>
-
-    <!-- slot 0: the portfolio total -->
-    <ComplicationSlot slotId="0" x="60" y="236" width="330" height="60" supportedTypes="SHORT_TEXT" isCustomizable="TRUE">
-      <DefaultProviderPolicy defaultSystemProvider="EMPTY" defaultSystemProviderType="EMPTY"
-          primaryProvider="com.bryan.revolutx/com.bryan.revolutx.wear.TotalComplication" primaryProviderType="SHORT_TEXT" />
-      <BoundingBox x="0" y="0" width="330" height="60" />
-      <Complication type="SHORT_TEXT">
-        <PartText x="0" y="0" width="330" height="60">
-          <Text align="CENTER" ellipsis="TRUE">
-            <Font family="SYNC_TO_DEVICE" size="44" weight="BOLD" color="#ffffffff">
-              <Template>%s<Parameter expression="[COMPLICATION.TEXT]" /></Template>
-            </Font>
-          </Text>
-        </PartText>
+    <!-- slot 0: the card (total, line, fill, change, LIVE) as one image from the watch app -->
+    <ComplicationSlot slotId="0" name="card" x="45" y="206" width="360" height="156" supportedTypes="PHOTO_IMAGE" isCustomizable="TRUE">
+      <Variant mode="AMBIENT" target="alpha" value="0" />
+      <DefaultProviderPolicy defaultSystemProvider="EMPTY" defaultSystemProviderType="PHOTO_IMAGE"
+          primaryProvider="com.bryan.revolutx/com.bryan.revolutx.wear.CardComplication" primaryProviderType="PHOTO_IMAGE" />
+      <BoundingBox x="0" y="0" width="360" height="156" />
+      <Complication type="PHOTO_IMAGE">
+        <PartImage x="0" y="0" width="360" height="156">
+          <Image resource="[COMPLICATION.PHOTO_IMAGE]" />
+        </PartImage>
       </Complication>
     </ComplicationSlot>
 
-    <!-- slot 1: today's P&L. As RANGED_VALUE the value is the day's %, so its sign picks green or red. -->
-    <ComplicationSlot slotId="1" x="40" y="300" width="370" height="46" supportedTypes="RANGED_VALUE SHORT_TEXT" isCustomizable="TRUE">
-      <DefaultProviderPolicy defaultSystemProvider="EMPTY" defaultSystemProviderType="EMPTY"
-          primaryProvider="com.bryan.revolutx/com.bryan.revolutx.wear.PnlComplication" primaryProviderType="RANGED_VALUE" />
-      <BoundingBox x="0" y="0" width="370" height="46" />
+    <!--
+      slot 1: the pulsing dot on the line's last point. The slot covers the line box (card y 62..118) with 20 px around it:
+      x 25, y 248 = 206 + 62 - 20. In the slot the line's inner box starts at y 25 (20 + 5 padding) and is 46 high; the last
+      point is at the card's right edge, x 405 - 25 = 380. The 30 x 30 group is centred there: x 365, y 10 + height * 46.
+      The dot is 8 px; the ring is the app's (18 px, 2 px line), scaling 0.4 -> 1.6 while fading 0.7 -> 0, ease-out, 2 s, forever.
+    -->
+    <ComplicationSlot slotId="1" name="liveDot" x="25" y="248" width="400" height="96" supportedTypes="RANGED_VALUE" isCustomizable="TRUE">
+      <Variant mode="AMBIENT" target="alpha" value="0" />
+      <DefaultProviderPolicy defaultSystemProvider="EMPTY" defaultSystemProviderType="RANGED_VALUE"
+          primaryProvider="com.bryan.revolutx/com.bryan.revolutx.wear.DotComplication" primaryProviderType="RANGED_VALUE" />
+      <BoundingBox x="0" y="0" width="400" height="96" />
       <Complication type="RANGED_VALUE">
         <Condition>
           <Expressions>
             <Expression name="up"><![CDATA[[COMPLICATION.RANGED_VALUE_VALUE] >= 0]]></Expression>
           </Expressions>
           <Compare expression="up">
-            <PartText x="0" y="0" width="370" height="46">
-              <Text align="CENTER" ellipsis="TRUE">
-                <Font family="SYNC_TO_DEVICE" size="30" weight="BOLD" color="#ff00c896">
-                  <Template>%s  %s<Parameter expression="[COMPLICATION.TEXT]" /><Parameter expression="[COMPLICATION.TITLE]" /></Template>
-                </Font>
-              </Text>
-            </PartText>
+            <Group name="dotUp" x="365" y="10" width="30" height="30">
+              <Transform target="y" value="10 + [COMPLICATION.RANGED_VALUE_VALUE] * 46" />
+              <PartDraw name="ringUp" x="6" y="6" width="18" height="18" scaleX="0.4" scaleY="0.4" alpha="179">
+                <Transform target="scaleX" value="1.6"><Animation duration="2" interpolation="EASE_OUT" repeat="-1" fps="30" /></Transform>
+                <Transform target="scaleY" value="1.6"><Animation duration="2" interpolation="EASE_OUT" repeat="-1" fps="30" /></Transform>
+                <Transform target="alpha" value="0"><Animation duration="2" interpolation="EASE_OUT" repeat="-1" fps="30" /></Transform>
+                <Ellipse x="1" y="1" width="16" height="16">
+                  <Stroke color="#ff00ffc8" thickness="2" />
+                </Ellipse>
+              </PartDraw>
+              <PartDraw name="pointUp" x="11" y="11" width="8" height="8">
+                <Ellipse x="0" y="0" width="8" height="8">
+                  <Fill color="#ff00ffc8" />
+                </Ellipse>
+              </PartDraw>
+            </Group>
           </Compare>
           <Default>
-            <PartText x="0" y="0" width="370" height="46">
-              <Text align="CENTER" ellipsis="TRUE">
-                <Font family="SYNC_TO_DEVICE" size="30" weight="BOLD" color="#ffff4d6a">
-                  <Template>%s  %s<Parameter expression="[COMPLICATION.TEXT]" /><Parameter expression="[COMPLICATION.TITLE]" /></Template>
-                </Font>
-              </Text>
-            </PartText>
+            <Group name="dotDown" x="365" y="10" width="30" height="30">
+              <Transform target="y" value="10 + (-1 - [COMPLICATION.RANGED_VALUE_VALUE]) * 46" />
+              <PartDraw name="ringDown" x="6" y="6" width="18" height="18" scaleX="0.4" scaleY="0.4" alpha="179">
+                <Transform target="scaleX" value="1.6"><Animation duration="2" interpolation="EASE_OUT" repeat="-1" fps="30" /></Transform>
+                <Transform target="scaleY" value="1.6"><Animation duration="2" interpolation="EASE_OUT" repeat="-1" fps="30" /></Transform>
+                <Transform target="alpha" value="0"><Animation duration="2" interpolation="EASE_OUT" repeat="-1" fps="30" /></Transform>
+                <Ellipse x="1" y="1" width="16" height="16">
+                  <Stroke color="#ffff4d6a" thickness="2" />
+                </Ellipse>
+              </PartDraw>
+              <PartDraw name="pointDown" x="11" y="11" width="8" height="8">
+                <Ellipse x="0" y="0" width="8" height="8">
+                  <Fill color="#ffff4d6a" />
+                </Ellipse>
+              </PartDraw>
+            </Group>
           </Default>
         </Condition>
-      </Complication>
-      <Complication type="SHORT_TEXT">
-        <PartText x="0" y="0" width="370" height="46">
-          <Text align="CENTER" ellipsis="TRUE">
-            <Font family="SYNC_TO_DEVICE" size="30" weight="BOLD" color="#ffffffff">
-              <Template>%s  %s<Parameter expression="[COMPLICATION.TEXT]" /><Parameter expression="[COMPLICATION.TITLE]" /></Template>
-            </Font>
-          </Text>
-        </PartText>
       </Complication>
     </ComplicationSlot>
 

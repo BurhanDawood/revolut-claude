@@ -15,6 +15,7 @@ android {
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode((System.getenv('VERSION_CODE') ?: '1') as Integer)
         versionName "1.0." + (System.getenv('VERSION_CODE') ?: '0')
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"   // CI's emulator job only (FaceRenderTest)
     }
     signingConfigs {
         if (canSign) {
@@ -50,4 +51,8 @@ dependencies {
     implementation "androidx.wear:wear-remote-interactions:1.0.0"
     implementation "androidx.concurrent:concurrent-futures:1.2.0"
     implementation "androidx.security:security-crypto:$androidxSecurityCryptoVersion"
+
+    androidTestImplementation "androidx.test:runner:1.7.0"
+    androidTestImplementation "androidx.test.ext:junit:$androidxJunitVersion"
+    androidTestImplementation "junit:junit:$junitVersion"
 }
