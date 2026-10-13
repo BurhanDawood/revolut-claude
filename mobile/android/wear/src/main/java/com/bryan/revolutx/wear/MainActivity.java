@@ -20,7 +20,8 @@ import java.util.concurrent.Executors;
 /**
  * Desk #59 part 1: the watch app. On top the app's total card (SparkCardView: the total, the live 6-hour line with its pulsing
  * dot, the change), then movers, notes and holdings. Fetches every 30 s while on screen (13 Oct 23:21) and on a tap of the
- * card, and stops when the screen goes off; a tap on a coin or "Open on phone" opens the phone dashboard.
+ * card, and stops when the screen goes off; a tap on a coin opens it on the watch (CoinActivity), "Open on phone" the phone
+ * dashboard, "Tile coins" the Coin Tiles' picker.
  */
 public class MainActivity extends Activity {
 
@@ -159,6 +160,12 @@ public class MainActivity extends Activity {
         phone.setBackgroundColor(0xFF1F2A28);
         ((LinearLayout.LayoutParams) phone.getLayoutParams()).topMargin = dp(14);
         phone.setOnClickListener(v -> openOnPhone("portfolio", null));
+
+        TextView tiles = add("Tile coins", 14, Fmt.WHITE, true);   // the Coin 1-3 Tiles' coins (desk #59, 13 Oct 23:45)
+        tiles.setPadding(dp(14), dp(8), dp(14), dp(8));
+        tiles.setBackgroundColor(0xFF1A1A1A);
+        ((LinearLayout.LayoutParams) tiles.getLayoutParams()).topMargin = dp(8);
+        tiles.setOnClickListener(v -> startActivity(new Intent(this, TileCoinsActivity.class)));
     }
 
     private void openOnPhone(String tab, String coin) {
@@ -182,7 +189,7 @@ public class MainActivity extends Activity {
         t.setPadding(0, dp(12), 0, dp(2));
     }
 
-    /** COIN   +8.1%   $182.40; a tap opens the coin on the phone. */
+    /** COIN   +8.1%   $182.40; a tap opens the coin on the watch (CoinActivity, with "Open on phone"). */
     private void row(String coin, String pct, int pctColor, String value) {
         LinearLayout r = new LinearLayout(this);
         r.setOrientation(LinearLayout.HORIZONTAL);
@@ -190,7 +197,7 @@ public class MainActivity extends Activity {
         r.addView(cell(coin, Fmt.WHITE, true, Gravity.START), new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
         r.addView(cell(pct, pctColor, true, Gravity.CENTER_HORIZONTAL), new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
         r.addView(cell(value, Fmt.GREY, false, Gravity.END), new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.2f));
-        r.setOnClickListener(v -> openOnPhone("portfolio", coin));
+        r.setOnClickListener(v -> startActivity(new Intent(this, CoinActivity.class).putExtra(CoinActivity.EXTRA_COIN, coin)));
         list.addView(r, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
     }
 

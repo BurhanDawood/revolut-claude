@@ -53,10 +53,12 @@
             </intent-filter>
         </service>
 
+        <!-- the Tiles (desk #59, 13 Oct 23:45): each its own, so Bryan adds, removes and orders them. Portfolio keeps the
+             first Tile's class so a placed Tile stays. -->
         <service
             android:name=".RxTileService"
             android:exported="true"
-            android:label="@string/app_name"
+            android:label="@string/t_portfolio"
             android:permission="com.google.android.wearable.permission.BIND_TILE_PROVIDER">
             <intent-filter>
                 <action android:name="androidx.wear.tiles.action.BIND_TILE_PROVIDER" />
@@ -65,6 +67,79 @@
                 android:name="androidx.wear.tiles.PREVIEW"
                 android:resource="@drawable/tile_preview" />
         </service>
+
+        <service
+            android:name=".CoinTile1"
+            android:exported="true"
+            android:label="@string/t_coin1"
+            android:permission="com.google.android.wearable.permission.BIND_TILE_PROVIDER">
+            <intent-filter>
+                <action android:name="androidx.wear.tiles.action.BIND_TILE_PROVIDER" />
+            </intent-filter>
+            <meta-data
+                android:name="androidx.wear.tiles.PREVIEW"
+                android:resource="@drawable/tile_preview" />
+        </service>
+        <service
+            android:name=".CoinTile2"
+            android:exported="true"
+            android:label="@string/t_coin2"
+            android:permission="com.google.android.wearable.permission.BIND_TILE_PROVIDER">
+            <intent-filter>
+                <action android:name="androidx.wear.tiles.action.BIND_TILE_PROVIDER" />
+            </intent-filter>
+            <meta-data
+                android:name="androidx.wear.tiles.PREVIEW"
+                android:resource="@drawable/tile_preview" />
+        </service>
+        <service
+            android:name=".CoinTile3"
+            android:exported="true"
+            android:label="@string/t_coin3"
+            android:permission="com.google.android.wearable.permission.BIND_TILE_PROVIDER">
+            <intent-filter>
+                <action android:name="androidx.wear.tiles.action.BIND_TILE_PROVIDER" />
+            </intent-filter>
+            <meta-data
+                android:name="androidx.wear.tiles.PREVIEW"
+                android:resource="@drawable/tile_preview" />
+        </service>
+        <service
+            android:name=".MoversTileService"
+            android:exported="true"
+            android:label="@string/t_movers"
+            android:permission="com.google.android.wearable.permission.BIND_TILE_PROVIDER">
+            <intent-filter>
+                <action android:name="androidx.wear.tiles.action.BIND_TILE_PROVIDER" />
+            </intent-filter>
+            <meta-data
+                android:name="androidx.wear.tiles.PREVIEW"
+                android:resource="@drawable/tile_preview" />
+        </service>
+        <service
+            android:name=".NotesTileService"
+            android:exported="true"
+            android:label="@string/t_notes"
+            android:permission="com.google.android.wearable.permission.BIND_TILE_PROVIDER">
+            <intent-filter>
+                <action android:name="androidx.wear.tiles.action.BIND_TILE_PROVIDER" />
+            </intent-filter>
+            <meta-data
+                android:name="androidx.wear.tiles.PREVIEW"
+                android:resource="@drawable/tile_preview" />
+        </service>
+
+        <!-- one coin, opened from a Coin or Top movers Tile (started by the Tile renderer, so exported); read-only -->
+        <activity
+            android:name=".CoinActivity"
+            android:exported="true"
+            android:taskAffinity="" />
+
+        <!-- "Tile coins": the Coin Tiles' picks, saved on the watch only (opened from an empty Coin Tile, so exported) -->
+        <activity
+            android:name=".TileCoinsActivity"
+            android:exported="true"
+            android:taskAffinity="" />
 
         <!-- complication data sources (numbers only). 300 s is Wear OS's floor for a complication's own updates. -->
         <service

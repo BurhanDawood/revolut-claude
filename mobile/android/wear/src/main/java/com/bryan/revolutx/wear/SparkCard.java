@@ -159,50 +159,7 @@ final class SparkCard {
         if (wc > 0) c.drawText(m.cents, x0 + wd, 44 * sc, pc);
 
         // the line and its fill
-        if (ys != null) {
-            float w = W * sc;
-            float top = (PLOT_TOP + PAD) * sc;
-            float ih = (PLOT_H - 2 * PAD) * sc;
-            float bottom = (PLOT_TOP + PLOT_H) * sc;
-            Path line = new Path();
-            float minY = bottom;
-            for (int i = 0; i < ys.length; i++) {
-                float x = w * i / (ys.length - 1);
-                float y = top + ih * ys[i];
-                minY = Math.min(minY, y);
-                if (i == 0) line.moveTo(x, y);
-                else line.lineTo(x, y);
-            }
-            Path area = new Path(line);
-            area.lineTo(w, bottom);
-            area.lineTo(0, bottom);
-            area.close();
-            Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
-            fill.setStyle(Paint.Style.FILL);
-            fill.setShader(new LinearGradient(0, minY, 0, bottom, withAlpha(m.color, 0.28f), withAlpha(m.color, 0f), Shader.TileMode.CLAMP));
-            c.drawPath(area, fill);
-            Paint stroke = new Paint(Paint.ANTI_ALIAS_FLAG);
-            stroke.setStyle(Paint.Style.STROKE);
-            stroke.setStrokeWidth(2 * sc);
-            stroke.setStrokeJoin(Paint.Join.ROUND);
-            stroke.setStrokeCap(Paint.Cap.ROUND);
-            stroke.setColor(m.color);
-            c.drawPath(line, stroke);
-
-            if (pulse >= 0) {
-                float cy = top + ih * ys[ys.length - 1];
-                Paint dot = new Paint(Paint.ANTI_ALIAS_FLAG);
-                dot.setColor(m.color);
-                float e = EASE_OUT.getInterpolation(pulse);
-                float scale = 0.4f + 1.2f * e;
-                Paint ring = new Paint(Paint.ANTI_ALIAS_FLAG);
-                ring.setStyle(Paint.Style.STROKE);
-                ring.setColor(withAlpha(m.color, 0.7f * (1 - e)));
-                ring.setStrokeWidth(2 * scale * sc);
-                c.drawCircle(w, cy, 8 * scale * sc, ring);   // the app's ring: 18 px across, a 2 px line
-                c.drawCircle(w, cy, 4 * sc, dot);
-            }
-        }
+        if (ys != null) drawLine(c, 0, PLOT_TOP * sc, W * sc, PLOT_H * sc, PAD * sc, sc, ys, m.color, pulse);
 
         // the caption: "6 hours  -$133.89 (-2.68%)" ... "LIVE"
         float base = 146 * sc;
@@ -228,6 +185,98 @@ final class SparkCard {
             live.setTextAlign(Paint.Align.RIGHT);
             c.drawText(m.right, W * sc, base, live);
         }
+    }
+
+    /**
+     * The line, its fill and (pulse >= 0) the dot with its ring, in the box left/top/w/h (pixels) with pad inside above and
+     * below; sc = pixels per unit for the 2 px line and the dot. The card, the Tiles and the coin screen all draw with this.
+     */
+    static void drawLine(Canvas c, float left, float boxTop, float w, float h, float pad, float sc, float[] ys, int color, float pulse) {
+        float top = boxTop + pad;
+        float ih = h - 2 * pad;
+        float bottom = boxTop + h;
+        Path line = new Path();
+        float minY = bottom;
+        for (int i = 0; i < ys.length; i++) {
+            float x = left + w * i / (ys.length - 1);
+            float y = top + ih * ys[i];
+            minY = Math.min(minY, y);
+            if (i == 0) line.moveTo(x, y);
+            else line.lineTo(x, y);
+        }
+        Path area = new Path(line);
+        area.lineTo(left + w, bottom);
+        area.lineTo(left, bottom);
+        area.close();
+        Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
+        fill.setStyle(Paint.Style.FILL);
+        fill.setShader(new LinearGradient(0, minY, 0, bottom, withAlpha(color, 0.28f), withAlpha(color, 0f), Shader.TileMode.CLAMP));
+        c.drawPath(area, fill);
+        Paint stroke = new Paint(Paint.ANTI_ALIAS_FLAG);
+        stroke.setStyle(Paint.Style.STROKE);
+        stroke.setStrokeWidth(2 * sc);
+        stroke.setStrokeJoin(Paint.Join.ROUND);
+        stroke.setStrokeCap(Paint.Cap.ROUND);
+        stroke.setColor(color);
+        c.drawPath(line, stroke);
+        if (pulse < 0) return;
+        float cx = left + w;
+        float cy = top + ih * ys[ys.length - 1];
+        float e = EASE_OUT.getInterpolation(pulse);
+        float scale = 0.4f + 1.2f * e;
+        Paint ring = new Paint(Paint.ANTI_ALIAS_FLAG);
+        ring.setStyle(Paint.Style.STROKE);
+        ring.setColor(withAlpha(color, 0.7f * (1 - e)));
+        ring.setStrokeWidth(2 * scale * sc);
+        c.drawCircle(cx, cy, 8 * scale * sc, ring);   // the app's ring: 18 px across, a 2 px line
+        Paint dot = new Paint(Paint.ANTI_ALIAS_FLAG);
+        dot.setColor(color);
+        c.drawCircle(cx, cy, 4 * sc, dot);
+    }
+
+    /** The phase a still picture (a Tile) shows the ring at: part-way out, so it reads as the live dot. */
+    static final float STILL_PULSE = 0.3f;
+
+    /**
+     * A Tile's line: values (oldest first) resampled like the card, drawn w x h pixels with room for the dot and its ring at
+     * the right end; null when there are fewer than 2 values.
+     */
+    static byte[] linePng(@Nullable double[] values, int color, int w, int h, float sc) {
+        if (values == null || values.length < 2) return null;
+        float[] ys = heights(resample(values));
+        Bitmap b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+        float room = 12 * sc;   // the ring at STILL_PULSE reaches about 9 units past the last point
+        drawLine(new Canvas(b), 0, 0, w - room, h, room * 0.75f, sc, ys, color, STILL_PULSE);
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        b.compress(Bitmap.CompressFormat.PNG, 100, out);
+        b.recycle();
+        return out.toByteArray();
+    }
+
+    /**
+     * The coin screen's card, in the card's own layout: the price with its cents smaller, the coin's 24 h line, "24 hours
+     * +8.10%" in its colour (green/red by the 24 h move), and LIVE.
+     */
+    static Model coinModel(Context ctx, Snapshot.Quote q) {
+        Model m = new Model();
+        String price = Double.isNaN(q.price) ? "--" : Fmt.price(q.price);
+        int dot = price.lastIndexOf('.');
+        m.dollars = dot > 0 ? price.substring(0, dot) : price;
+        m.cents = dot > 0 ? price.substring(dot) : "";
+        if (q.spark != null && q.spark.length >= 2) m.ys = heights(resample(q.spark));
+        m.up = up(q);
+        m.color = m.up ? UP : DOWN;
+        m.range = "24 hours";
+        m.change = Double.isNaN(q.pct) ? "" : (m.up ? "+" : "\u2212") + String.format(Locale.US, "%.2f", Math.abs(q.pct)) + "%";
+        m.right = right(ctx);
+        return m;
+    }
+
+    /** A coin is green when its 24 h move is >= 0; without a %, by its line (last >= first); else green. */
+    static boolean up(Snapshot.Quote q) {
+        if (!Double.isNaN(q.pct)) return q.pct >= 0;
+        if (q.spark != null && q.spark.length >= 2) return q.spark[q.spark.length - 1] >= q.spark[0];
+        return true;
     }
 
     /** The face's image: the card without a dot (the face pulses its own on top), as a PNG. */

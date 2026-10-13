@@ -151,7 +151,8 @@ jobs:
           DEX="$(unzip -p "$APK" 'classes*.dex' | strings -n 8)"
           fail=0
           for C in MainActivity OpenOnPhoneActivity KeyListener RxTileService TotalComplication PnlComplication NotesComplication MoverComplication \
-                   CardComplication DotComplication FaceTotalComplication; do
+                   CardComplication DotComplication FaceTotalComplication CoinTile1 CoinTile2 CoinTile3 MoversTileService \
+                   NotesTileService CoinActivity TileCoinsActivity; do
             N="com.bryan.revolutx.wear.$C"
             m=no; k=no; d=no
             printf '%s\n' "$MANIFEST" | grep -qF "=\"$N\"" && m=yes
@@ -245,7 +246,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        api: [36, 34]   # Wear OS 6 (the Galaxy Watch 8) and Wear OS 5
+        include:
+          - api: 34          # Wear OS 5
+            channel: stable
+          - api: 36          # Wear OS 6, the Galaxy Watch 8's (its image is not in the stable channel)
+            channel: canary
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -285,8 +290,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: gh release download app-v17 -R "$GITHUB_REPOSITORY" -p revolutx-WATCHFACE-adb-only.apk -O rel/face-v17.apk || echo "app-v17's face is not available"
 
-      - name: KVM
+      - name: KVM and ImageMagick
         run: |
+          sudo apt-get install -y -qq imagemagick >/dev/null
+          "$ANDROID_HOME"/cmdline-tools/latest/bin/sdkmanager --list --channel=3 2>/dev/null | grep -iE 'system-images;android-3[4-9];android-wear' | sort -u || true
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
@@ -295,6 +302,7 @@ jobs:
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: ${{ matrix.api }}
+          channel: ${{ matrix.channel }}
           target: android-wear
           arch: x86_64
           profile: wearos_large_round

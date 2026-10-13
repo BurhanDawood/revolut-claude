@@ -29,9 +29,20 @@ logs() {   # logs <title>: what Wear OS said about faces and complications since
 
 set_face() {   # set_face: Google's documented developer command for a Watch Face Format face
   adb shell am broadcast -a com.google.android.wearable.app.DEBUG_SURFACE --es operation set-watchface --es watchFaceId "$FACE_ID"
-  sleep 15
+  adb shell input keyevent KEYCODE_HOME
+  sleep 20
   echo "bound watch face services:"
   adb shell dumpsys activity services 2>/dev/null | grep -iE 'ServiceRecord.*(watchface|wff)' | head -n 10
+}
+
+runtime_logs() {   # what Google's WFF runtime process said, and every error line, without the system's flavour noise
+  echo "::group::WFF runtime: $1"
+  local rt
+  rt=$(adb shell pidof com.google.wear.watchface.runtime 2>/dev/null | tr -d '\r')
+  [ -n "$rt" ] && adb logcat -d --pid="$rt" 2>/dev/null | grep -vE 'ApkAssets|Background concurrent' | tail -n 80
+  echo "-- errors:"
+  adb logcat -d '*:E' 2>/dev/null | grep -viE 'fitbit|ApkAssets|IntentReceiverLeaked|unregisterReceiver|ActivityThread' | tail -n 40
+  echo "::endgroup::"
 }
 
 echo "== device: $(adb shell getprop ro.build.version.release) / API $(adb shell getprop ro.build.version.sdk), $(adb shell wm size)"
@@ -50,7 +61,7 @@ adb uninstall com.bryan.revolutx >/dev/null
 echo "== 2. the debug watch app, with a sample answer saved (no key)"
 adb install -r "$WEAR_DBG" && adb install -r "$WEAR_TEST" || { echo "::error::the debug watch app did not install"; exit 1; }
 adb shell am instrument -w -e class com.bryan.revolutx.wear.FaceRenderTest com.bryan.revolutx.test/androidx.test.runner.AndroidJUnitRunner
-for f in card-face-up card-face-down card-face-nospark card-face-nokey card-app-down; do
+for f in card-face-up card-face-down card-face-nospark card-face-nokey card-app-down tile-line-sol; do
   adb exec-out run-as com.bryan.revolutx cat "files/ci/$f.png" > "$OUT/$f.png" 2>/dev/null
   convert "$OUT/$f.png" -background black -flatten -quality 80 "$OUT/$f.jpg" 2>/dev/null || cp "$OUT/$f.png" "$OUT/$f.jpg"
   echo "IMG $f $(base64 -w0 "$OUT/$f.jpg")"
@@ -62,7 +73,20 @@ if [ -f "$REL/face-v17.apk" ]; then
     adb logcat -c
     set_face
     shot face-v17
-    logs "app-v17 face"
+    runtime_logs "app-v17 face"
+    adb uninstall "$FACE_ID" >/dev/null
+  }
+  echo "== 3b. app-v17's face with only its classes.dex removed (re-signed with the public debug key): is the dex the cause?"
+  BT="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)"
+  cp "$REL/face-v17.apk" "$OUT/v17-nodex.apk"
+  zip -q -d "$OUT/v17-nodex.apk" classes.dex 'META-INF/*'
+  "$BT"/zipalign -f 4 "$OUT/v17-nodex.apk" "$OUT/v17-nodex-al.apk"
+  "$BT"/apksigner sign --ks "$HOME/.android/debug.keystore" --ks-pass pass:android --key-pass pass:android \
+    --ks-key-alias androiddebugkey "$OUT/v17-nodex-al.apk"
+  adb install -r "$OUT/v17-nodex-al.apk" && {
+    adb logcat -c
+    set_face
+    shot face-v17-nodex
     adb uninstall "$FACE_ID" >/dev/null
   }
 fi
@@ -74,13 +98,16 @@ set_face
 shot face-new-a
 sleep 0.7
 shot face-new-b   # the dot's ring should have grown or faded between a and b
-logs "this build's face"
+runtime_logs "this build's face"
 
 echo "== 5. always-on"
+adb shell settings put global ambient_enabled 1 >/dev/null 2>&1
+adb shell svc power stayon false >/dev/null 2>&1
 adb shell input keyevent KEYCODE_SLEEP
 sleep 5
 shot face-ambient
 adb shell input keyevent KEYCODE_WAKEUP
+adb shell svc power stayon true >/dev/null 2>&1
 sleep 2
 
 echo "== 6. the watch app's card (live: pulsing dot)"
@@ -88,4 +115,30 @@ adb shell am start -W -n com.bryan.revolutx/com.bryan.revolutx.wear.MainActivity
 sleep 4
 shot app-card
 logs "watch app"
+
+echo "== 7. the Tiles (Wear OS's developer broadcast: add-tile, show-tile)"
+adb shell input keyevent KEYCODE_HOME
+adb logcat -c
+n=0
+for t in RxTileService CoinTile1 CoinTile2 CoinTile3 MoversTileService NotesTileService; do
+  r=$(adb shell am broadcast -a com.google.android.wearable.app.DEBUG_SURFACE --es operation add-tile \
+        --ecn component "com.bryan.revolutx/com.bryan.revolutx.wear.$t" 2>&1)
+  echo "add $t: $r" | tr '\n' ' '; echo
+  idx=$(echo "$r" | grep -oE 'Index=\[[0-9]+\]' | grep -oE '[0-9]+' | head -1)
+  [ -z "$idx" ] && idx=$n
+  n=$((n + 1))
+  adb shell am broadcast -a com.google.android.wearable.app.DEBUG_SURFACE --es operation show-tile --ei index "$idx" >/dev/null 2>&1
+  sleep 6
+  shot "tile-$t"
+done
+logs "tiles"
+
+echo "== 8. a Coin Tile's screen and the Tile coins picker"
+adb shell am start -W -n com.bryan.revolutx/com.bryan.revolutx.wear.CoinActivity --es coin SOL
+sleep 4
+shot app-coin
+adb shell am start -W -n com.bryan.revolutx/com.bryan.revolutx.wear.TileCoinsActivity
+sleep 3
+shot app-tilecoins
+if adb logcat -d | grep -q "FATAL EXCEPTION"; then logs "crash"; echo "::error::the watch app crashed"; fi
 exit 0

@@ -4,8 +4,10 @@ import android.app.Activity;
 import android.os.Bundle;
 import android.widget.Toast;
 
-/** The Tile's "Open on phone": opens the dashboard's Portfolio tab on the phone, then closes. */
+/** A Tile's "open on the phone": the dashboard's Portfolio tab, or the tab in EXTRA_TAB (PhoneLink checks it); then closes. */
 public class OpenOnPhoneActivity extends Activity {
+
+    static final String EXTRA_TAB = "tab";
 
     @Override
     protected void onCreate(Bundle state) {
@@ -15,7 +17,7 @@ public class OpenOnPhoneActivity extends Activity {
             finish();
             return;
         }
-        PhoneLink.openOnPhone(this, "portfolio", null);
+        PhoneLink.openOnPhone(this, getIntent() != null ? getIntent().getStringExtra(EXTRA_TAB) : null, null);
         Toast.makeText(this, "Opening on your phone", Toast.LENGTH_SHORT).show();
         finish();
     }

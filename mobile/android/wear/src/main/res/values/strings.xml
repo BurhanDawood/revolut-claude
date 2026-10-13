@@ -5,6 +5,12 @@
     <string name="c_pnl">Revolut X: today\'s P&amp;L</string>
     <string name="c_notes">Revolut X: unread PM notes</string>
     <string name="c_mover">Revolut X: top mover</string>
+    <string name="t_portfolio">Revolut X: Portfolio</string>
+    <string name="t_coin1">Revolut X: Coin 1</string>
+    <string name="t_coin2">Revolut X: Coin 2</string>
+    <string name="t_coin3">Revolut X: Coin 3</string>
+    <string name="t_movers">Revolut X: Top movers</string>
+    <string name="t_notes">Revolut X: PM notes</string>
     <string name="c_card">Revolut X face: total card</string>
     <string name="c_dot">Revolut X face: live dot</string>
     <string name="c_facetotal">Revolut X face: always-on total</string>

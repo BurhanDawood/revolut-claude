@@ -13,6 +13,9 @@ import java.util.Arrays;
  */
 final class SparkCardView extends View {
 
+    /** The card takes 95% of the width, so the dot's ring (up to 14 units past the last point) is not cut off. */
+    private static final float ROOM_SCALE = SparkCard.W / (SparkCard.W + 16f);
+
     private SparkCard.Model model;
     private float[] from;   // the line being slid from, or null
     private float[] shown;  // the line as last drawn
@@ -39,7 +42,7 @@ final class SparkCardView extends View {
     @Override
     protected void onMeasure(int widthSpec, int heightSpec) {
         int w = MeasureSpec.getSize(widthSpec);
-        setMeasuredDimension(w, Math.round(w * SparkCard.H / SparkCard.W));
+        setMeasuredDimension(w, Math.round(w * ROOM_SCALE * SparkCard.H / SparkCard.W));
     }
 
     @Override
@@ -60,7 +63,7 @@ final class SparkCardView extends View {
         }
         shown = ys;
         float pulse = ys == null ? -1f : ((now - born) % SparkCard.PULSE_MS) / (float) SparkCard.PULSE_MS;
-        SparkCard.draw(c, getWidth() / SparkCard.W, model, ys, pulse);
+        SparkCard.draw(c, getWidth() * ROOM_SCALE / SparkCard.W, model, ys, pulse);   // the ring's room on the right
         if (ys != null) postInvalidateOnAnimation();   // only runs while the screen draws: it stops when the app is off screen
     }
 }

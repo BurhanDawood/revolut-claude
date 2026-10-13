@@ -10,6 +10,8 @@ import org.json.JSONObject;
  * unread_pm_notes, holdings:[{coin,usd,pct}], spark } (holdings: batch 624; a missing field is an empty list). Numbers and counts only.
  * spark (batch 628): { range:'6h', from_ts, to_ts, points:[up to 61 USD totals, oldest first], change_usd, change_pct } or null
  * when the server has no series; then the card draws no line and shows today's P&L instead.
+ * coins (batch 630, with ?coins=A,B,C): [{ coin, price, pct_24h (null if not tracked), usd_held, spark (up to 49 prices over
+ * 24 h, oldest first, or null) }], at most 5 - the Tile coins. An older server leaves it out; quote() then falls back to holdings.
  */
 final class Snapshot {
 
@@ -38,6 +40,21 @@ final class Snapshot {
     Double sparkChgPct;
     long sparkFrom;          // the series' first and last time, as the server sent them
     long sparkTo;
+    final List<Quote> quotes = new ArrayList<>();   // coins[]
+    String asked = "";       // the ?coins= this answer was fetched with ("" = none), so a changed Tile coin is fetched at once
+
+    /** One coin for a Tile or the coin screen. NaN = unknown; spark null = no line. */
+    static final class Quote {
+        final String coin;
+        double price = Double.NaN;
+        double pct = Double.NaN;
+        double held = Double.NaN;   // USD held
+        double[] spark;
+
+        Quote(String coin) {
+            this.coin = coin;
+        }
+    }
 
     /** Parses the server's answer, keeping only the known fields. Throws on a body without a total. */
     static Snapshot parse(String body) throws Exception {
@@ -54,6 +71,8 @@ final class Snapshot {
         readCoins(o.optJSONArray("movers"), s.movers, "price", 3);
         readCoins(o.optJSONArray("holdings"), s.holdings, "usd", 50);
         readSpark(o.optJSONObject("spark"), s);
+        readQuotes(o.optJSONArray("coins"), s);
+        s.asked = o.optString("rx_asked", "");   // only in the saved copy
         return s;
     }
 
@@ -70,20 +89,69 @@ final class Snapshot {
 
     private static void readSpark(JSONObject sp, Snapshot s) {
         if (sp == null) return;
-        JSONArray a = sp.optJSONArray("points");
-        if (a == null || a.length() < 2) return;
-        int n = Math.min(a.length(), 120);
-        double[] pts = new double[n];
-        for (int i = 0; i < n; i++) {
-            double d = a.optDouble(a.length() - n + i, Double.NaN);   // the newest 120 at most
-            if (Double.isNaN(d) || Double.isInfinite(d)) return;     // a broken series draws no line
-            pts[i] = d;
-        }
+        double[] pts = series(sp.optJSONArray("points"));
+        if (pts == null) return;
         s.spark = pts;
         s.sparkChgUsd = num(sp, "change_usd");
         s.sparkChgPct = num(sp, "change_pct");
         s.sparkFrom = sp.optLong("from_ts", 0);
         s.sparkTo = sp.optLong("to_ts", 0);
+    }
+
+    private static void readQuotes(JSONArray a, Snapshot s) {
+        if (a == null) return;
+        for (int i = 0; i < a.length() && s.quotes.size() < 5; i++) {
+            JSONObject c = a.optJSONObject(i);
+            if (c == null) continue;
+            String coin = c.optString("coin", "");
+            if (!coin.matches("[A-Za-z0-9]{1,15}")) continue;
+            Quote q = new Quote(coin.toUpperCase());
+            q.price = dbl(c, "price");
+            q.pct = dbl(c, "pct_24h");
+            q.held = dbl(c, "usd_held");
+            q.spark = series(c.optJSONArray("spark"));
+            s.quotes.add(q);
+        }
+    }
+
+    /** At least 2 finite numbers (the newest 120 at most), or null: a broken series draws no line. */
+    private static double[] series(JSONArray a) {
+        if (a == null || a.length() < 2) return null;
+        int n = Math.min(a.length(), 120);
+        double[] pts = new double[n];
+        for (int i = 0; i < n; i++) {
+            double d = a.optDouble(a.length() - n + i, Double.NaN);
+            if (Double.isNaN(d) || Double.isInfinite(d)) return null;
+            pts[i] = d;
+        }
+        return pts;
+    }
+
+    private static double dbl(JSONObject o, String k) {
+        Double d = num(o, k);
+        return d == null ? Double.NaN : d;
+    }
+
+    /**
+     * The coin's numbers: coins[] when the server sent it, else what holdings[] and movers[] know (no line then); null when
+     * the coin is in none of them.
+     */
+    Quote quote(String coin) {
+        for (Quote q : quotes) if (q.coin.equals(coin)) return q;
+        Quote q = null;
+        for (Coin h : holdings) {
+            if (!h.coin.equals(coin)) continue;
+            q = new Quote(coin);
+            q.held = h.price;
+            q.pct = h.pct;
+        }
+        for (Coin m : movers) {
+            if (!m.coin.equals(coin)) continue;
+            if (q == null) q = new Quote(coin);
+            q.price = m.price;
+            if (Double.isNaN(q.pct)) q.pct = m.pct;
+        }
+        return q;
     }
 
     private static Double num(JSONObject o, String k) {
@@ -111,6 +179,23 @@ final class Snapshot {
                 if (sparkChgPct != null) sp.put("change_pct", sparkChgPct);
                 o.put("spark", sp);
             }
+            if (!quotes.isEmpty()) {
+                JSONArray qs = new JSONArray();
+                for (Quote q : quotes) {
+                    JSONObject c = new JSONObject().put("coin", q.coin);
+                    if (!Double.isNaN(q.price)) c.put("price", q.price);
+                    if (!Double.isNaN(q.pct)) c.put("pct_24h", q.pct);
+                    if (!Double.isNaN(q.held)) c.put("usd_held", q.held);
+                    if (q.spark != null) {
+                        JSONArray pts = new JSONArray();
+                        for (double d : q.spark) pts.put(d);
+                        c.put("spark", pts);
+                    }
+                    qs.put(c);
+                }
+                o.put("coins", qs);
+            }
+            o.put("rx_asked", asked);
             return o.toString();
         } catch (Exception e) {
             return null;
