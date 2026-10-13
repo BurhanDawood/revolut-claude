@@ -4,7 +4,7 @@
   then the band across the middle (y 150..400, the screen's full width): the total "$4,863" + smaller ".98" over the upper part,
   the thick red/green line with its fill, its last point pulsing like the app's (an expanding ring, 1.5 s), and under it
   "6h -$133.89 (-2.68%)" in the line's colour; at the bottom the unread PM-note count, small. Nothing else.
-  Always-on: the time and the total in outline, the line as a thin grey outline; no fill, no pulse, no colour.
+  Always-on: the time thin, the total in outline, the line as a thin grey outline; no fill, no pulse, no colour.
   Watch Face Format v1, no code: every number comes from the Revolut X watch app's complication data sources (com.bryan.revolutx).
     slot 0  CardComplication         PHOTO_IMAGE   the band, drawn by SparkCard (the top of the watch app uses it too)
     slot 1  DotComplication          RANGED_VALUE  the line's last point: 0..1 = its height in the line's box, line up;
@@ -31,34 +31,14 @@
       </DigitalClock>
     </Group>
 
-    <!-- always-on: the time in outline (TimeText has no outline, so a PartText from the clock's sources, 24 h or 12 h like the watch) -->
+    <!-- always-on: the time, thin and light (the emulator drew nothing for an outline-only PartText time) -->
     <Group name="timeAmbient" x="0" y="58" width="450" height="90" alpha="0">
       <Variant mode="AMBIENT" target="alpha" value="255" />
-      <Condition>
-        <Expressions>
-          <Expression name="h24">[IS_24_HOUR_MODE]</Expression>
-        </Expressions>
-        <Compare expression="h24">
-          <PartText x="0" y="0" width="450" height="90">
-            <Text align="CENTER" ellipsis="FALSE">
-              <Font family="SYNC_TO_DEVICE" size="72" weight="NORMAL" color="#00000000">
-                <Outline color="#ffffffff" width="1.5" />
-                <Template>%s:%s<Parameter expression="[HOUR_0_23_Z]" /><Parameter expression="[MINUTE_Z]" /></Template>
-              </Font>
-            </Text>
-          </PartText>
-        </Compare>
-        <Default>
-          <PartText x="0" y="0" width="450" height="90">
-            <Text align="CENTER" ellipsis="FALSE">
-              <Font family="SYNC_TO_DEVICE" size="72" weight="NORMAL" color="#00000000">
-                <Outline color="#ffffffff" width="1.5" />
-                <Template>%s:%s<Parameter expression="[HOUR_1_12_Z]" /><Parameter expression="[MINUTE_Z]" /></Template>
-              </Font>
-            </Text>
-          </PartText>
-        </Default>
-      </Condition>
+      <DigitalClock x="0" y="0" width="450" height="90">
+        <TimeText format="hh:mm" hourFormat="SYNC_TO_DEVICE" align="CENTER" x="0" y="0" width="450" height="90">
+          <Font family="SYNC_TO_DEVICE" size="72" weight="THIN" color="#ffdddddd" />
+        </TimeText>
+      </DigitalClock>
     </Group>
 
     <!-- slot 3, always-on only: the band in outline (total, thin grey line) -->
