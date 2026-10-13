@@ -105,7 +105,7 @@ android/watchface/   revolutx-watchface.apk  com.bryan.revolutx.watchface, a Wat
 
 **What it shows.**
 - **Tile:** the total, today's P&L in green or red, the top 3 movers (the biggest 24 h moves either way), the unread PM notes count and "updated HH:MM". Tap the numbers to refresh. "Open on phone" opens Portfolio on the phone.
-- **App:** the same, plus a holdings list. `/api/watch` has no `holdings` field yet. Until the server adds one (`holdings: [{coin, usd, pct}]`, numbers only), the app says so. Tapping a coin opens it on the phone.
+- **App:** the same, plus a holdings list from `/api/watch`'s `holdings: [{coin, usd, pct}]` (batch 624, numbers only). A missing field counts as no holdings. Tapping a coin opens it on the phone.
 - **Face:** the time, the total, today's P&L (green when the day's % is ≥ 0, red otherwise), and one slot. The slot shows unread PM notes by default; long-press the face → Edit to pick another (e.g. "Revolut X: top mover").
 
 **Data.** The watch calls one path: `GET https://revolut-claude-production.up.railway.app/api/watch` with `x-api-token`. Wear OS routes the call through the phone over Bluetooth, or over Wi-Fi. It follows no redirects. When it fails (offline, 5xx), the last numbers stay with "updated HH:MM" and the reason.

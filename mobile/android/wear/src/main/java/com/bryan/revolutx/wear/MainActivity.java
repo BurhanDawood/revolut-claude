@@ -17,7 +17,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * Desk #59 part 1: the watch app. The Tile's numbers plus the holdings list (when the server sends one). Fetches every
+ * Desk #59 part 1: the watch app. The Tile's numbers plus the holdings list. Fetches every
  * minute while open and on a tap of the numbers; a tap on a coin or "Open on phone" opens the phone dashboard.
  */
 public class MainActivity extends Activity {
@@ -123,9 +123,7 @@ public class MainActivity extends Activity {
         notes.setOnClickListener(v -> openOnPhone("home", null));
 
         header("Holdings");
-        if (s.holdings == null) {
-            add("The holdings list arrives with the next server update", 12, Fmt.GREY, false);
-        } else if (s.holdings.isEmpty()) {
+        if (s.holdings.isEmpty()) {
             add("None", 12, Fmt.GREY, false);
         } else {
             for (Snapshot.Coin h : s.holdings) row(h.coin, Fmt.pct(h.pct), Fmt.signColor(h.pct), Double.isNaN(h.price) ? "" : Fmt.money(h.price));

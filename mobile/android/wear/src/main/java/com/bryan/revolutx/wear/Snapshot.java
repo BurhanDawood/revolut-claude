@@ -7,7 +7,7 @@ import org.json.JSONObject;
 
 /**
  * One /api/watch answer: { v, at, updated_ts, partial, total_usd, pnl_day_usd, pnl_day_pct, movers:[{coin,pct,price}],
- * unread_pm_notes } and, when the server adds it, holdings:[{coin,usd,pct}]. Numbers and counts only.
+ * unread_pm_notes, holdings:[{coin,usd,pct}] } (holdings: batch 624; a missing field is an empty list). Numbers and counts only.
  */
 final class Snapshot {
 
@@ -30,7 +30,7 @@ final class Snapshot {
     long updatedMs;   // the server's updated_ts, in ms (0 = unknown)
     int unread;
     final List<Coin> movers = new ArrayList<>();
-    List<Coin> holdings;   // null: the server does not send them (yet)
+    final List<Coin> holdings = new ArrayList<>();   // coin, pct (24 h, NaN when null), price = value in USD
 
     /** Parses the server's answer, keeping only the known fields. Throws on a body without a total. */
     static Snapshot parse(String body) throws Exception {
@@ -45,11 +45,7 @@ final class Snapshot {
         s.updatedMs = ts > 0 && ts < 100000000000L ? ts * 1000 : ts;   // seconds or ms
         s.unread = Math.max(0, o.optInt("unread_pm_notes", 0));
         readCoins(o.optJSONArray("movers"), s.movers, "price", 3);
-        JSONArray h = o.optJSONArray("holdings");
-        if (h != null) {
-            s.holdings = new ArrayList<>();
-            readCoins(h, s.holdings, "usd", 50);
-        }
+        readCoins(o.optJSONArray("holdings"), s.holdings, "usd", 50);
         return s;
     }
 
@@ -80,7 +76,7 @@ final class Snapshot {
             o.put("updated_ts", updatedMs);
             o.put("unread_pm_notes", unread);
             o.put("movers", coins(movers, "price"));
-            if (holdings != null) o.put("holdings", coins(holdings, "usd"));
+            o.put("holdings", coins(holdings, "usd"));
             return o.toString();
         } catch (Exception e) {
             return null;
