@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Revolut X</string>
+    <string name="c_total">Revolut X: portfolio total</string>
+    <string name="c_pnl">Revolut X: today\'s P&amp;L</string>
+    <string name="c_notes">Revolut X: unread PM notes</string>
+    <string name="c_mover">Revolut X: top mover</string>
+</resources>

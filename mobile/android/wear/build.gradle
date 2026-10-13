@@ -1,0 +1,49 @@
+apply plugin: 'com.android.application'
+
+// Desk #59: the Revolut X watch app (Galaxy Watch 8, Wear OS). The same applicationId and signing key as the phone app,
+// so the Wearable Data Layer pairs the two (the key handover) and the watch sees one product. No key or token is in here:
+// the phone app hands the dashboard key over at run time (WatchBridge -> KeyListener).
+def keystorePath = System.getenv('ANDROID_KEYSTORE_FILE')
+def canSign = keystorePath && file(keystorePath).exists()
+
+android {
+    namespace = "com.bryan.revolutx.wear"
+    compileSdk = rootProject.ext.compileSdkVersion
+    defaultConfig {
+        applicationId "com.bryan.revolutx"
+        minSdkVersion 30   // Wear OS 3+
+        targetSdkVersion rootProject.ext.targetSdkVersion
+        versionCode((System.getenv('VERSION_CODE') ?: '1') as Integer)
+        versionName "1.0." + (System.getenv('VERSION_CODE') ?: '0')
+    }
+    signingConfigs {
+        if (canSign) {
+            release {
+                storeFile file(keystorePath)
+                storePassword System.getenv('ANDROID_KEYSTORE_PASSWORD')
+                keyAlias System.getenv('ANDROID_KEY_ALIAS')
+                keyPassword System.getenv('ANDROID_KEY_PASSWORD')
+            }
+        }
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+            if (canSign) signingConfig signingConfigs.release
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+dependencies {
+    implementation "com.google.android.gms:play-services-wearable:$playServicesWearableVersion"
+    implementation "androidx.wear.tiles:tiles:1.4.0"
+    implementation "androidx.wear.protolayout:protolayout:1.2.0"
+    implementation "androidx.wear.watchface:watchface-complications-data-source:1.2.1"
+    implementation "androidx.wear:wear-remote-interactions:1.0.0"
+    implementation "androidx.concurrent:concurrent-futures:1.2.0"
+    implementation "androidx.security:security-crypto:$androidxSecurityCryptoVersion"
+}

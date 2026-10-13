@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Desk #59 part 3: the Revolut X face (Watch Face Format v1). Time, the portfolio total, today's P&L in green or red, and one
+  slot of the wearer's choice (default: unread PM notes). The numbers come from the Revolut X watch app's complication data
+  sources (com.bryan.revolutx); this package has no code and never sees the key.
+-->
+<WatchFace width="450" height="450">
+  <Metadata key="CLOCK_TYPE" value="DIGITAL" />
+  <Metadata key="PREVIEW_TIME" value="10:08:32" />
+
+  <Scene backgroundColor="#ff000000">
+
+    <!-- slot 2, top: the wearer's choice; by default the unread PM notes count -->
+    <ComplicationSlot slotId="2" x="150" y="52" width="150" height="66" supportedTypes="SHORT_TEXT" isCustomizable="TRUE">
+      <DefaultProviderPolicy defaultSystemProvider="EMPTY" defaultSystemProviderType="EMPTY"
+          primaryProvider="com.bryan.revolutx/com.bryan.revolutx.wear.NotesComplication" primaryProviderType="SHORT_TEXT" />
+      <BoundingBox x="0" y="0" width="150" height="66" />
+      <Complication type="SHORT_TEXT">
+        <PartText x="0" y="0" width="150" height="40">
+          <Text align="CENTER" ellipsis="TRUE">
+            <Font family="SYNC_TO_DEVICE" size="30" weight="BOLD" color="#ff00ffc8">
+              <Template>%s<Parameter expression="[COMPLICATION.TEXT]" /></Template>
+            </Font>
+          </Text>
+        </PartText>
+        <PartText x="0" y="40" width="150" height="24">
+          <Text align="CENTER" ellipsis="TRUE">
+            <Font family="SYNC_TO_DEVICE" size="16" weight="NORMAL" color="#ff9a9a9a">
+              <Template>%s<Parameter expression="[COMPLICATION.TITLE]" /></Template>
+            </Font>
+          </Text>
+        </PartText>
+      </Complication>
+    </ComplicationSlot>
+
+    <!-- the time -->
+    <DigitalClock x="0" y="118" width="450" height="116">
+      <TimeText format="hh:mm" hourFormat="SYNC_TO_DEVICE" align="CENTER" x="0" y="0" width="450" height="116">
+        <Font family="SYNC_TO_DEVICE" size="96" weight="NORMAL" color="#ffffffff" />
+      </TimeText>
+    </DigitalClock>
+
+    <!-- slot 0: the portfolio total -->
+    <ComplicationSlot slotId="0" x="60" y="236" width="330" height="60" supportedTypes="SHORT_TEXT" isCustomizable="TRUE">
+      <DefaultProviderPolicy defaultSystemProvider="EMPTY" defaultSystemProviderType="EMPTY"
+          primaryProvider="com.bryan.revolutx/com.bryan.revolutx.wear.TotalComplication" primaryProviderType="SHORT_TEXT" />
+      <BoundingBox x="0" y="0" width="330" height="60" />
+      <Complication type="SHORT_TEXT">
+        <PartText x="0" y="0" width="330" height="60">
+          <Text align="CENTER" ellipsis="TRUE">
+            <Font family="SYNC_TO_DEVICE" size="44" weight="BOLD" color="#ffffffff">
+              <Template>%s<Parameter expression="[COMPLICATION.TEXT]" /></Template>
+            </Font>
+          </Text>
+        </PartText>
+      </Complication>
+    </ComplicationSlot>
+
+    <!-- slot 1: today's P&L. As RANGED_VALUE the value is the day's %, so its sign picks green or red. -->
+    <ComplicationSlot slotId="1" x="40" y="300" width="370" height="46" supportedTypes="RANGED_VALUE SHORT_TEXT" isCustomizable="TRUE">
+      <DefaultProviderPolicy defaultSystemProvider="EMPTY" defaultSystemProviderType="EMPTY"
+          primaryProvider="com.bryan.revolutx/com.bryan.revolutx.wear.PnlComplication" primaryProviderType="RANGED_VALUE" />
+      <BoundingBox x="0" y="0" width="370" height="46" />
+      <Complication type="RANGED_VALUE">
+        <Condition>
+          <Expressions>
+            <Expression name="up"><![CDATA[[COMPLICATION.RANGED_VALUE_VALUE] >= 0]]></Expression>
+          </Expressions>
+          <Compare expression="up">
+            <PartText x="0" y="0" width="370" height="46">
+              <Text align="CENTER" ellipsis="TRUE">
+                <Font family="SYNC_TO_DEVICE" size="30" weight="BOLD" color="#ff00c896">
+                  <Template>%s  %s<Parameter expression="[COMPLICATION.TEXT]" /><Parameter expression="[COMPLICATION.TITLE]" /></Template>
+                </Font>
+              </Text>
+            </PartText>
+          </Compare>
+          <Default>
+            <PartText x="0" y="0" width="370" height="46">
+              <Text align="CENTER" ellipsis="TRUE">
+                <Font family="SYNC_TO_DEVICE" size="30" weight="BOLD" color="#ffff4d6a">
+                  <Template>%s  %s<Parameter expression="[COMPLICATION.TEXT]" /><Parameter expression="[COMPLICATION.TITLE]" /></Template>
+                </Font>
+              </Text>
+            </PartText>
+          </Default>
+        </Condition>
+      </Complication>
+      <Complication type="SHORT_TEXT">
+        <PartText x="0" y="0" width="370" height="46">
+          <Text align="CENTER" ellipsis="TRUE">
+            <Font family="SYNC_TO_DEVICE" size="30" weight="BOLD" color="#ffffffff">
+              <Template>%s  %s<Parameter expression="[COMPLICATION.TEXT]" /><Parameter expression="[COMPLICATION.TITLE]" /></Template>
+            </Font>
+          </Text>
+        </PartText>
+      </Complication>
+    </ComplicationSlot>
+
+  </Scene>
+</WatchFace>

@@ -35,7 +35,8 @@ The shell (`APP_SHELL_JS` in `server.js`) runs inside the app's WebView, and Cap
 |---|---|
 | `Capacitor.isNativePlatform()` | Capacitor |
 | `Capacitor.Plugins.BiometricAuth.authenticate({ reason, cancelTitle, allowDeviceCredential, androidTitle, androidSubtitle })`: resolves on success, rejects on cancel/fail | `BiometricAuthPlugin` (androidx.biometric). If the phone has no fingerprint and no screen lock, it resolves `{ skipped: true }` so the app never locks itself out. |
-| `Capacitor.Plugins.WidgetBridge.setConfig({ key, base })` → Promise | `WidgetBridgePlugin`. It stores both in EncryptedSharedPreferences and refreshes the widget. It accepts only `https://revolut-claude-production.up.railway.app` as `base`, so the key never goes anywhere else. The key is never logged. |
+| `Capacitor.Plugins.WidgetBridge.setConfig({ key, base })` → Promise | `WidgetBridgePlugin`. It stores both in EncryptedSharedPreferences and refreshes the widget. It accepts only `https://revolut-claude-production.up.railway.app` as `base`, so the key never goes anywhere else. The key is never logged. A changed key also goes to the watch (see The watch). |
+| `Capacitor.Plugins.WidgetBridge.clearConfig()` → Promise | `WidgetBridgePlugin`. Removes the key, tells the watch to delete its copy, and leaves the widget on "Open the app to set up". |
 | `window.rxApp.show('home' \| 'portfolio' \| 'agent' \| 'desk' \| 'more')` | The app calls it after the shell loads, when it was opened by the widget (`portfolio`) or by a notification (`data.tab`, default `home`). |
 | `window.rxApp.open({ tab, coin })` (shell 492+) | Called instead of `show` when a notification carries `data.coin` (validated `^[A-Z0-9]{1,15}$`): opens that coin's card. The coin is cleared once delivered; with an older shell the app falls back to `show(tab)`. |
 | `window.rxApp.open({ tab: 'inbox', id })` (shell 501+) | Called when a notification carries `data.inbox`, the message's id in the app's notifications feed (validated `^[0-9]{1,15}$`). It opens the feed on that message. A valid id wins over `tab` and `coin`; with an older shell the app falls back to `show('home')`. `inbox` is not a tab the app accepts from `data.tab`. |
@@ -87,14 +88,83 @@ What it shows when something is wrong:
 
 To add it: long-press the home screen → Widgets → Revolut X.
 
+## The watch (desk #59)
+
+A Galaxy Watch 8 (Wear OS) companion. Two more APKs, built by the same workflow and signed with the same key:
+
+```
+android/wear/        revolutx-watch.apk      applicationId com.bryan.revolutx (the phone app's own), Java
+  KeyListener        receives the key from the phone (below)
+  WatchStore         the key in EncryptedSharedPreferences; the last numbers in plain private prefs
+  Repo               GET /api/watch, the watch's only server call
+  RxTileService      the Tile
+  *Complication      data sources: total, today's P&L, unread PM notes, top mover
+  MainActivity       the app: the Tile's numbers + holdings; a tap opens the phone dashboard
+android/watchface/   revolutx-watchface.apk  com.bryan.revolutx.watchface, a Watch Face Format v1 face (resources only)
+```
+
+**What it shows.**
+- **Tile:** the total, today's P&L in green or red, the top 3 movers (the biggest 24 h moves either way), the unread PM notes count and "updated HH:MM". Tap the numbers to refresh. "Open on phone" opens Portfolio on the phone.
+- **App:** the same, plus a holdings list. `/api/watch` has no `holdings` field yet. Until the server adds one (`holdings: [{coin, usd, pct}]`, numbers only), the app says so. Tapping a coin opens it on the phone.
+- **Face:** the time, the total, today's P&L (green when the day's % is ≥ 0, red otherwise), and one slot. The slot shows unread PM notes by default; long-press the face → Edit to pick another (e.g. "Revolut X: top mover").
+
+**Data.** The watch calls one path: `GET https://revolut-claude-production.up.railway.app/api/watch` with `x-api-token`. Wear OS routes the call through the phone over Bluetooth, or over Wi-Fi. It follows no redirects. When it fails (offline, 5xx), the last numbers stay with "updated HH:MM" and the reason.
+
+**Refresh.**
+- **Tile:** every minute while it is on screen.
+- **App:** every minute while it is open.
+- **Face:** every 5 min. That is the floor Wear OS sets for complications; nothing faster is possible without server push.
+- **On tap:** at once.
+- **Surfaces stay in step:** after any fetch, the Tile and the face redraw from the new numbers.
+
+**The key handover (Fable W1-W4).**
+- **Channel:** the phone sends the key with Wearable Data Layer *messages* (MessageClient), never a DataItem, so the key is not kept in Play services' synced storage. The Data Layer delivers them only to an app with the same package name and signing key.
+- **Messages:**
+
+  | Path | Direction | Payload |
+  |---|---|---|
+  | `/rx/watch/config` | phone → watch | exactly `{"base","key"}` |
+  | `/rx/watch/clear` | phone → watch | empty |
+  | `/rx/watch/hello` | watch → phone | empty: "send me the current one" |
+
+- **The watch refuses** any payload that is not exactly those two fields. It also refuses any `base` other than `https://revolut-claude-production.up.railway.app`, and any key that is not one printable token.
+- **Storage:** a new key *replaces* the old one (commit), and the last numbers are dropped with it. The key lives only in the watch app's EncryptedSharedPreferences. It is never put in the Tile, a complication, or a log, on either side.
+- **When the phone sends:**
+  - on each app start: the key, or a CLEAR when it has none;
+  - on a key change: a CLEAR, then the new key;
+  - on `clearConfig()`: a CLEAR;
+  - in answer to the watch's hello.
+- **When the watch sends hello:** when it opens (at most every 10 min, so a CLEAR it missed while away still arrives), and when the server refuses its key.
+- **CLEAR on the watch** deletes the key and the last numbers.
+
+**Installing on the watch (once; later builds install the same way, over the old one).**
+1. **Developer options:** on the watch, open Settings → About watch → Software information. Tap "Software version" 7 times.
+2. **Wi-Fi debugging:**
+   - Settings → Developer options → turn on ADB debugging, then Wireless debugging.
+   - The watch and the computer must be on the same Wi-Fi.
+3. **Pair:**
+   - Wireless debugging → Pair new device. It shows an IP:port and a 6-digit code.
+   - On the computer, with Android platform-tools installed, run `adb pair IP:PORT CODE`.
+   - Then run `adb connect IP:PORT`. Use the address shown on the Wireless debugging page itself, not the pairing one.
+4. **Install:** download `revolutx-watch.apk` and `revolutx-watchface.apk` from the same Release as the phone APK, then run:
+   - `adb install -r revolutx-watch.apk`
+   - `adb install -r revolutx-watchface.apk`
+5. **Connect:** open Revolut X on the phone once. It sends the key, and the watch app shows the numbers.
+6. **Tile:** swipe left from the face → + → Revolut X.
+7. **Face:** long-press the face → + → Revolut X face. If a slot is empty, Edit → tap the slot → Revolut X → the matching item. Wear OS may also ask to allow the face to show Revolut X data.
+8. **Turn off Wireless debugging** afterwards; it drains the battery.
+
+The phone APK and the watch APK must come from the same signing key. A test-signed build (Release title "(test signing)") pairs only with other APKs from that same run.
+
 ## Build
 
 **CI (the normal way).** `.github/workflows/android.yml` runs on every push to `mobile-app` and on demand (Actions → Android APK → Run workflow). It:
 1. runs `npm ci`;
 2. runs `npx cap sync android`;
-3. runs `./gradlew assembleRelease` with `versionCode = github.run_number`;
-4. uploads `app-release.apk` as an artifact;
-5. publishes it as a prerelease **Release** tagged `app-v<run>`.
+3. checks that nothing in `mobile/` names or holds a dashboard key or token;
+4. runs `./gradlew :app:assembleRelease :wear:assembleRelease :watchface:assembleRelease` with `versionCode = github.run_number`;
+5. uploads `app-release.apk`, `revolutx-watch.apk` and `revolutx-watchface.apk` as an artifact;
+6. publishes them as a prerelease **Release** tagged `app-v<run>`.
 
 To install on the phone: open the Release page in the phone's browser, download `app-release.apk`, and open it. Allow "install unknown apps" for the browser the first time.
 

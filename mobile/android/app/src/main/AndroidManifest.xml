@@ -22,6 +22,13 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- desk #59: the watch app's "open on phone" (revolutx://open/<tab>[?coin=X]); it only picks a tab, validated like the widget's -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="revolutx" android:host="open" />
+            </intent-filter>
 
         </activity>
 
@@ -52,6 +59,17 @@
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="Floating read-only price chart the user opened" />
+        </service>
+
+        <!-- desk #59: answers the Revolut X watch app's hello with the dashboard key or a clear (WatchBridge). The Data Layer
+             only delivers it from an app with this package name and signing key. -->
+        <service
+            android:name=".WatchListener"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.google.android.gms.wearable.MESSAGE_RECEIVED" />
+                <data android:scheme="wear" android:host="*" android:path="/rx/watch/hello" />
+            </intent-filter>
         </service>
 
         <provider

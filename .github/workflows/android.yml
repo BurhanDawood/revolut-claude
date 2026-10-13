@@ -1,6 +1,7 @@
 name: Android APK
 
-# Builds the Revolut X Android app (mobile/) and publishes the APK as a prerelease.
+# Builds the Revolut X Android app (mobile/) and publishes the APK as a prerelease, together with (desk #59) the Galaxy Watch
+# app (revolutx-watch.apk, same applicationId and key) and its Watch Face Format face (revolutx-watchface.apk).
 # It never touches main, the server or Railway: it only reads mobile/ and writes a GitHub Release.
 #
 # Secrets (Settings -> Secrets and variables -> Actions), all optional for the build to pass:
@@ -102,6 +103,16 @@ jobs:
           fi
           echo "ANDROID_KEYSTORE_FILE=$KS" >> "$GITHUB_ENV"
 
+      - name: Key-free check (desk #59 W4)
+        # no APK may carry a dashboard key or token: the phone gets it from the shell, the watch from the phone at run time
+        run: |
+          if grep -rInE 'DASHBOARD_TOKEN|FAMILY_PAGE_TOKEN|x-api-token"?[[:space:]]*[:=][[:space:]]*"[^"]' mobile \
+               --exclude-dir=node_modules --exclude-dir=build --exclude-dir=.gradle; then
+            echo "::error::a key or token name/value is in mobile/ - the APKs must stay key-free"
+            exit 1
+          fi
+          echo "Key-free: no dashboard key or token in mobile/"
+
       - name: Build release APK
         working-directory: mobile/android
         env:
@@ -111,17 +122,24 @@ jobs:
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD || env.TMP_KS_PASS }}
         run: |
           chmod +x gradlew
-          ./gradlew assembleRelease --no-daemon --stacktrace
-          APK=app/build/outputs/apk/release/app-release.apk
-          test -f "$APK" || { echo "::error::no signed app-release.apk was produced"; ls -R app/build/outputs/apk; exit 1; }
-          "$ANDROID_HOME"/build-tools/*/apksigner verify --print-certs "$APK" | grep -i "certificate SHA-256" | head -1
-          cp "$APK" "$GITHUB_WORKSPACE/app-release.apk"
+          ./gradlew :app:assembleRelease :wear:assembleRelease :watchface:assembleRelease --no-daemon --stacktrace
+          for pair in app/build/outputs/apk/release/app-release.apk:app-release.apk \
+                      wear/build/outputs/apk/release/wear-release.apk:revolutx-watch.apk \
+                      watchface/build/outputs/apk/release/watchface-release.apk:revolutx-watchface.apk; do
+            APK="${pair%%:*}"; OUT="${pair##*:}"
+            test -f "$APK" || { echo "::error::no signed $APK was produced"; ls -R */build/outputs/apk; exit 1; }
+            echo "$OUT: $("$ANDROID_HOME"/build-tools/*/apksigner verify --print-certs "$APK" | grep -i "certificate SHA-256" | head -1)"
+            cp "$APK" "$GITHUB_WORKSPACE/$OUT"
+          done
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: app-release-${{ github.run_number }}
-          path: app-release.apk
+          path: |
+            app-release.apk
+            revolutx-watch.apk
+            revolutx-watchface.apk
           if-no-files-found: error
 
       - name: Publish Release
@@ -131,8 +149,12 @@ jobs:
           target_commitish: ${{ github.sha }}
           name: Revolut X app v${{ github.run_number }}${{ env.SIGNING == 'temporary' && ' (test signing)' || '' }}
           prerelease: true
-          files: app-release.apk
+          files: |
+            app-release.apk
+            revolutx-watch.apk
+            revolutx-watchface.apk
           body: |
             Android app build ${{ github.run_number }} from `${{ github.ref_name }}` (${{ github.sha }}).
             Versioncode ${{ github.run_number }}. Download `app-release.apk` on the phone and open it to install.
+            Galaxy Watch: `revolutx-watch.apk` (the watch app, Tile and complications) and `revolutx-watchface.apk` (the face) install with adb over Wi-Fi - see mobile/README.md "The watch".
             ${{ env.SIGNING == 'temporary' && 'Signed with a one-off test key because the release signing secrets are not set: it will NOT install over another build (uninstall the old one first).' || 'Signed with the release key: installs over the previous build.' }}

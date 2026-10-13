@@ -64,6 +64,7 @@ dependencies {
     implementation "androidx.security:security-crypto:$androidxSecurityCryptoVersion"
     implementation "androidx.work:work-runtime:$androidxWorkVersion"
     implementation "com.google.firebase:firebase-messaging:$firebaseMessagingVersion"
+    implementation "com.google.android.gms:play-services-wearable:$playServicesWearableVersion"   // desk #59: the watch key handover
     implementation project(':capacitor-android')
     testImplementation "junit:junit:$junitVersion"
     androidTestImplementation "androidx.test.ext:junit:$androidxJunitVersion"

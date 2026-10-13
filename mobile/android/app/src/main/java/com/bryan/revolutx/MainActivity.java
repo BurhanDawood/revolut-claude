@@ -94,6 +94,7 @@ public class MainActivity extends BridgeActivity {
         });
         createChannels();
         if (BuildConfig.HAS_FCM) startPush();
+        WatchBridge.sync(this);   // desk #59: the watch gets the current key, or a clear when there is none
     }
 
     @Override
@@ -116,6 +117,11 @@ public class MainActivity extends BridgeActivity {
         if (tab == null && intent.hasExtra("google.message_id")) tab = "home";
         String coin = intent.getStringExtra(EXTRA_COIN);
         if (coin == null) coin = intent.getStringExtra("coin");   // likewise data.coin of a background notification
+        Uri link = intent.getData();   // desk #59: the watch's "open on phone", revolutx://open/<tab>[?coin=X]
+        if (link != null && "revolutx".equals(link.getScheme()) && "open".equals(link.getHost())) {
+            tab = link.getPathSegments().isEmpty() ? "home" : link.getPathSegments().get(0);
+            coin = link.getQueryParameter("coin");
+        }
         if (coin != null && !coin.matches(COIN_RE)) coin = null;   // only validated values ever reach the JS below
         String inbox = intent.getStringExtra(EXTRA_INBOX);
         if (inbox == null) inbox = intent.getStringExtra("inbox");   // likewise data.inbox of a background notification

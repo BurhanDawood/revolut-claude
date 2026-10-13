@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- desk #59: the phone app (WatchBridge) sends the key only to nodes with this capability -->
+<resources xmlns:tools="http://schemas.android.com/tools" tools:keep="@array/android_wear_capabilities">
+    <string-array name="android_wear_capabilities">
+        <item>rx_watch</item>
+    </string-array>
+</resources>

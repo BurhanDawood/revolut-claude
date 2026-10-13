@@ -8,8 +8,8 @@ import com.getcapacitor.annotation.CapacitorPlugin;
 
 /**
  * Called by the shell as Capacitor.Plugins.WidgetBridge.setConfig({ key, base }) whenever it has a
- * checked dashboard key. Stores both for the widget (and push registration), then refreshes the widget.
- * The key is never logged.
+ * checked dashboard key. Stores both for the widget (and push registration), then refreshes the widget. A changed key also
+ * goes to the watch app (WatchBridge). The key is never logged.
  */
 @CapacitorPlugin(name = "WidgetBridge")
 public class WidgetBridgePlugin extends Plugin {
@@ -32,7 +32,22 @@ public class WidgetBridgePlugin extends Plugin {
         SecureStore.get(getContext()).edit().putString(SecureStore.KEY, key.trim()).putString(SecureStore.BASE, b).apply();
         WidgetRefreshWorker.schedule(getContext());
         WidgetRefreshWorker.refreshNow(getContext());
-        if (changed) Push.registerSavedToken(getContext());
+        if (changed) {
+            Push.registerSavedToken(getContext());
+            WatchBridge.keyChanged(getContext());   // desk #59: the watch drops the old key and takes this one
+        }
+        call.resolve();
+    }
+
+    /**
+     * Desk #59 W2: Capacitor.Plugins.WidgetBridge.clearConfig() when the shell drops its key. Removes the key here, tells the
+     * watch to delete its copy, and leaves the widget on "Open the app to set up".
+     */
+    @PluginMethod
+    public void clearConfig(PluginCall call) {
+        SecureStore.get(getContext()).edit().remove(SecureStore.KEY).apply();
+        WatchBridge.cleared(getContext());
+        WidgetRefreshWorker.refreshNow(getContext());
         call.resolve();
     }
 }
