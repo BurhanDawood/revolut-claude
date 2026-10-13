@@ -204,7 +204,8 @@
             <intent-filter>
                 <action android:name="android.support.wearable.complications.ACTION_COMPLICATION_UPDATE_REQUEST" />
             </intent-filter>
-            <meta-data android:name="android.support.wearable.complications.SUPPORTED_TYPES" android:value="PHOTO_IMAGE" />
+            <!-- the manifest uses the old type names: LARGE_IMAGE is PHOTO_IMAGE -->
+            <meta-data android:name="android.support.wearable.complications.SUPPORTED_TYPES" android:value="LARGE_IMAGE" />
             <meta-data android:name="android.support.wearable.complications.UPDATE_PERIOD_SECONDS" android:value="300" />
             <meta-data android:name="android.support.wearable.complications.SAFE_WATCH_FACES" android:value="com.bryan.revolutx.watchface" />
         </service>

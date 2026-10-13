@@ -39,7 +39,9 @@ runtime_logs() {   # what Google's WFF runtime process said, and every error lin
   echo "::group::WFF runtime: $1"
   local rt
   rt=$(adb shell pidof com.google.wear.watchface.runtime 2>/dev/null | tr -d '\r')
-  [ -n "$rt" ] && adb logcat -d --pid="$rt" 2>/dev/null | grep -vE 'ApkAssets|Background concurrent' | tail -n 80
+  [ -n "$rt" ] && adb logcat -d --pid="$rt" 2>/dev/null | grep -E 'DWF|Exception|Error|  at ' | grep -vE 'ApkAssets|Model: connect|ModelTime|ModelLanguage' | head -n 160
+  echo "-- the watch app (RxWatch):"
+  adb logcat -d -s RxWatch 2>/dev/null | tail -n 40
   echo "-- errors:"
   adb logcat -d '*:E' 2>/dev/null | grep -viE 'fitbit|ApkAssets|IntentReceiverLeaked|unregisterReceiver|ActivityThread' | tail -n 40
   echo "::endgroup::"
@@ -74,19 +76,6 @@ if [ -f "$REL/face-v17.apk" ]; then
     set_face
     shot face-v17
     runtime_logs "app-v17 face"
-    adb uninstall "$FACE_ID" >/dev/null
-  }
-  echo "== 3b. app-v17's face with only its classes.dex removed (re-signed with the public debug key): is the dex the cause?"
-  BT="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)"
-  cp "$REL/face-v17.apk" "$OUT/v17-nodex.apk"
-  zip -q -d "$OUT/v17-nodex.apk" classes.dex 'META-INF/*'
-  "$BT"/zipalign -f 4 "$OUT/v17-nodex.apk" "$OUT/v17-nodex-al.apk"
-  "$BT"/apksigner sign --ks "$HOME/.android/debug.keystore" --ks-pass pass:android --key-pass pass:android \
-    --ks-key-alias androiddebugkey "$OUT/v17-nodex-al.apk"
-  adb install -r "$OUT/v17-nodex-al.apk" && {
-    adb logcat -c
-    set_face
-    shot face-v17-nodex
     adb uninstall "$FACE_ID" >/dev/null
   }
 fi
@@ -127,9 +116,13 @@ for t in RxTileService CoinTile1 CoinTile2 CoinTile3 MoversTileService NotesTile
   idx=$(echo "$r" | grep -oE 'Index=\[[0-9]+\]' | grep -oE '[0-9]+' | head -1)
   [ -z "$idx" ] && idx=$n
   n=$((n + 1))
-  adb shell am broadcast -a com.google.android.wearable.app.DEBUG_SURFACE --es operation show-tile --ei index "$idx" >/dev/null 2>&1
+  echo "show $t: $(adb shell am broadcast -a com.google.android.wearable.app.DEBUG_SURFACE --es operation show-tile --ei index "$idx" 2>&1 | tail -1)"
   sleep 6
   shot "tile-$t"
+  adb shell am broadcast -a com.google.android.wearable.app.DEBUG_SURFACE --es operation remove-tile \
+    --ecn component "com.bryan.revolutx/com.bryan.revolutx.wear.$t" >/dev/null 2>&1
+  adb shell input keyevent KEYCODE_HOME
+  sleep 1
 done
 logs "tiles"
 

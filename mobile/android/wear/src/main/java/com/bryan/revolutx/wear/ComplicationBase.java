@@ -4,6 +4,7 @@ import android.app.PendingIntent;
 import android.content.Context;
 import android.content.Intent;
 import android.os.RemoteException;
+import android.util.Log;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.wear.watchface.complications.data.ComplicationData;
@@ -53,9 +54,11 @@ public abstract class ComplicationBase extends ComplicationDataSourceService {
                 Repo.refresh(app, Repo.AGE_COMPLICATION, Repo.FROM_COMPLICATION);
                 Snapshot s = WatchStore.snapshot(app);
                 d = s == null ? empty(app, type) : build(type, s, tap(app));
-            } catch (Exception ignored) {
-                // the last data stays
+            } catch (Exception e) {
+                // the last data stays; the reason goes to the log (the class and type only, never data)
+                Log.w("RxWatch", getClass().getSimpleName() + " " + type + ": " + e.getClass().getSimpleName() + " " + e.getMessage());
             }
+            if (d == null) Log.i("RxWatch", getClass().getSimpleName() + " " + type + ": no data");
             try {
                 listener.onComplicationData(d != null ? d : new NoDataComplicationData());
             } catch (RemoteException ignored) {
