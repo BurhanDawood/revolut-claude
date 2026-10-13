@@ -38,6 +38,14 @@ public abstract class ComplicationBase extends ComplicationDataSourceService {
     public void onComplicationRequest(@NonNull ComplicationRequest request, @NonNull ComplicationDataSourceService.ComplicationRequestListener listener) {
         final Context app = getApplicationContext();
         final ComplicationType type = request.getComplicationType();
+        if (!OnWatch.is(app)) {   // not a watch: no data, no fetch
+            try {
+                listener.onComplicationData(new NoDataComplicationData());
+            } catch (RemoteException ignored) {
+                // the caller went away
+            }
+            return;
+        }
         EXEC.execute(() -> {
             ComplicationData d = null;
             try {

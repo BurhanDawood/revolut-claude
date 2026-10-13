@@ -28,7 +28,11 @@ android {
     }
     buildTypes {
         release {
-            minifyEnabled false
+            // R8: v15 was 13.0 MB (two ~6 MB dex files), too big for a reliable Wi-Fi ADB push to the watch.
+            // proguard-rules.pro keeps every class the system binds by name.
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
             if (canSign) signingConfig signingConfigs.release
         }
     }

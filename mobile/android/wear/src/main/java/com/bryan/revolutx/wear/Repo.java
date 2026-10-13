@@ -38,6 +38,7 @@ final class Repo {
     /** Fetches unless the last good answer is younger than maxAgeMs. Blocking: never on the main thread. */
     static Snapshot refresh(Context ctx, long maxAgeMs, int from) {
         Context app = ctx.getApplicationContext();
+        if (!OnWatch.is(app)) return null;   // the watch APK on a phone by mistake: no fetch, no hello
         synchronized (LOCK) {
             SharedPreferences v = WatchStore.values(app);
             String key = WatchStore.key(app);

@@ -1,7 +1,8 @@
 name: Android APK
 
-# Builds the Revolut X Android app (mobile/) and publishes the APK as a prerelease, together with (desk #59) the Galaxy Watch
-# app (revolutx-watch.apk, same applicationId and key) and its Watch Face Format face (revolutx-watchface.apk).
+# Builds the Revolut X Android app (mobile/) and publishes it as a prerelease (revolutx-PHONE.apk), together with (desk #59)
+# the Galaxy Watch app (revolutx-WATCH-adb-only.apk, same applicationId and key) and its Watch Face Format face
+# (revolutx-WATCHFACE-adb-only.apk). Only a run on mobile-app publishes a Release; a run on any other branch builds and checks.
 # It never touches main, the server or Railway: it only reads mobile/ and writes a GitHub Release.
 #
 # Secrets (Settings -> Secrets and variables -> Actions), all optional for the build to pass:
@@ -129,26 +130,60 @@ jobs:
         run: |
           chmod +x gradlew
           ./gradlew :app:assembleRelease :wear:assembleRelease :watchface:assembleRelease --no-daemon --stacktrace
-          for pair in app/build/outputs/apk/release/app-release.apk:app-release.apk \
-                      wear/build/outputs/apk/release/wear-release.apk:revolutx-watch.apk \
-                      watchface/build/outputs/apk/release/watchface-release.apk:revolutx-watchface.apk; do
+          for pair in app/build/outputs/apk/release/app-release.apk:revolutx-PHONE.apk \
+                      wear/build/outputs/apk/release/wear-release.apk:revolutx-WATCH-adb-only.apk \
+                      watchface/build/outputs/apk/release/watchface-release.apk:revolutx-WATCHFACE-adb-only.apk; do
             APK="${pair%%:*}"; OUT="${pair##*:}"
             test -f "$APK" || { echo "::error::no signed $APK was produced"; ls -R */build/outputs/apk; exit 1; }
             echo "$OUT: $("$ANDROID_HOME"/build-tools/*/apksigner verify --print-certs "$APK" | grep -i "certificate SHA-256" | head -1)"
             cp "$APK" "$GITHUB_WORKSPACE/$OUT"
           done
+          cp wear/build/outputs/mapping/release/mapping.txt "$GITHUB_WORKSPACE/watch-mapping.txt"
+
+      - name: Watch APK smoke check (R8 kept what the system binds by name)
+        working-directory: mobile/android
+        run: |
+          BT="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)"
+          APK="$GITHUB_WORKSPACE/revolutx-WATCH-adb-only.apk"
+          MAP=wear/build/outputs/mapping/release/mapping.txt
+          MANIFEST="$("$BT"/aapt2 dump xmltree --file AndroidManifest.xml "$APK")"
+          DEX="$(unzip -p "$APK" 'classes*.dex' | strings -n 8)"
+          fail=0
+          for C in MainActivity OpenOnPhoneActivity KeyListener RxTileService TotalComplication PnlComplication NotesComplication MoverComplication; do
+            N="com.bryan.revolutx.wear.$C"
+            m=no; k=no; d=no
+            printf '%s\n' "$MANIFEST" | grep -qF "=\"$N\"" && m=yes
+            grep -qxF "$N -> $N:" "$MAP" && k=yes
+            printf '%s\n' "$DEX" | grep -qF "L${N//.//};" && d=yes
+            echo "$C: manifest=$m kept-by-name=$k in-dex=$d"
+            [ "$m$k$d" = yesyesyes ] || { echo "::error::$N is missing from the watch APK (manifest=$m mapping=$k dex=$d)"; fail=1; }
+          done
+          for N in androidx.security.crypto.EncryptedSharedPreferences androidx.security.crypto.MasterKeys; do
+            if grep -qxF "$N -> $N:" "$MAP"; then echo "$N: kept-by-name=yes"; else echo "::error::$N was renamed or removed by R8"; fail=1; fi
+          done
+          {
+            echo "### APK sizes"
+            echo "| file | bytes | MB |"; echo "|---|---|---|"
+            for f in revolutx-PHONE.apk revolutx-WATCH-adb-only.apk revolutx-WATCHFACE-adb-only.apk; do
+              b=$(stat -c %s "$GITHUB_WORKSPACE/$f"); echo "| $f | $b | $(awk "BEGIN{printf \"%.2f\", $b/1048576}") |"
+            done
+            echo; echo "Watch dex files: $(unzip -l "$APK" | grep -c 'classes[0-9]*\.dex')"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          exit $fail
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: app-release-${{ github.run_number }}
           path: |
-            app-release.apk
-            revolutx-watch.apk
-            revolutx-watchface.apk
+            revolutx-PHONE.apk
+            revolutx-WATCH-adb-only.apk
+            revolutx-WATCHFACE-adb-only.apk
+            watch-mapping.txt
           if-no-files-found: error
 
       - name: Publish Release
+        if: github.ref == 'refs/heads/mobile-app'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: app-v${{ github.run_number }}
@@ -156,11 +191,11 @@ jobs:
           name: Revolut X app v${{ github.run_number }}${{ env.SIGNING == 'temporary' && ' (test signing)' || '' }}
           prerelease: true
           files: |
-            app-release.apk
-            revolutx-watch.apk
-            revolutx-watchface.apk
+            revolutx-PHONE.apk
+            revolutx-WATCH-adb-only.apk
+            revolutx-WATCHFACE-adb-only.apk
           body: |
             Android app build ${{ github.run_number }} from `${{ github.ref_name }}` (${{ github.sha }}).
-            Versioncode ${{ github.run_number }}. Download `app-release.apk` on the phone and open it to install.
-            Galaxy Watch: `revolutx-watch.apk` (the watch app, Tile and complications) and `revolutx-watchface.apk` (the face) install with adb over Wi-Fi - see mobile/README.md "The watch".
+            Versioncode ${{ github.run_number }}.
+            **Phone: open `revolutx-PHONE.apk` on the phone. Watch: `revolutx-WATCH-adb-only.apk` and `revolutx-WATCHFACE-adb-only.apk` go on the Galaxy Watch with adb only - never open them on the phone.** (mobile/README.md "The watch")
             ${{ env.SIGNING == 'temporary' && 'Signed with a one-off test key because the release signing secrets are not set: it will NOT install over another build (uninstall the old one first).' || 'Signed with the release key: installs over the previous build.' }}

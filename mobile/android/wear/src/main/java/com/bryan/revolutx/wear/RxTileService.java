@@ -32,6 +32,15 @@ public class RxTileService extends TileService {
     @Override
     protected ListenableFuture<TileBuilders.Tile> onTileRequest(@NonNull RequestBuilders.TileRequest request) {
         final Context app = getApplicationContext();
+        if (!OnWatch.is(app)) {   // not a watch: the hint only, no fetch
+            return CallbackToFutureAdapter.getFuture(completer -> {
+                completer.set(new TileBuilders.Tile.Builder()
+                    .setResourcesVersion(RES_VERSION)
+                    .setTileTimeline(TimelineBuilders.Timeline.fromLayoutElement(text(OnWatch.PHONE_HINT, 13, Fmt.WHITE, false)))
+                    .build());
+                return "rx-tile-phone";
+            });
+        }
         boolean tapped = CLICK_REFRESH.equals(request.getCurrentState().getLastClickableId());
         final long maxAge = tapped ? 0 : Repo.AGE_SCREEN;
         return CallbackToFutureAdapter.getFuture(completer -> {

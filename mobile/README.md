@@ -93,15 +93,19 @@ To add it: long-press the home screen → Widgets → Revolut X.
 A Galaxy Watch 8 (Wear OS) companion. Two more APKs, built by the same workflow and signed with the same key:
 
 ```
-android/wear/        revolutx-watch.apk      applicationId com.bryan.revolutx (the phone app's own), Java
+android/wear/        revolutx-WATCH-adb-only.apk      applicationId com.bryan.revolutx (the phone app's own), Java
   KeyListener        receives the key from the phone (below)
   WatchStore         the key in EncryptedSharedPreferences; the last numbers in plain private prefs
   Repo               GET /api/watch, the watch's only server call
   RxTileService      the Tile
   *Complication      data sources: total, today's P&L, unread PM notes, top mover
   MainActivity       the app: the Tile's numbers + holdings; a tap opens the phone dashboard
-android/watchface/   revolutx-watchface.apk  com.bryan.revolutx.watchface, a Watch Face Format v1 face (resources only)
+android/watchface/   revolutx-WATCHFACE-adb-only.apk  com.bryan.revolutx.watchface, a Watch Face Format v1 face (resources only)
 ```
+
+**Never open the watch APKs on the phone.** The watch app has the phone app's applicationId, key and versionCode, and Android does not check "watch only" on a sideload, so opening `revolutx-WATCH-adb-only.apk` on a phone *replaces* the phone app (13 Oct). Since then the watch app checks `FEATURE_WATCH`: on a phone it only shows "This is the watch app. On the phone install revolutx-PHONE.apk", and its Tile, complications, key handover and fetch do nothing. To recover: uninstall, install `revolutx-PHONE.apk`, enter the dashboard key once.
+
+**Size.** The watch app's release build is shrunk with R8 (`minifyEnabled`, `shrinkResources`); v15 without it was 13.0 MB, too big for a reliable Wi-Fi ADB push. `wear/proguard-rules.pro` keeps every class the system binds by name (the activities, the Data Layer listener, the Tile and the four complication sources) and what EncryptedSharedPreferences / Tink read by reflection. CI checks each run that those classes are in the merged manifest, kept by name in the R8 mapping and present in the dex, and it uploads the mapping (`watch-mapping.txt`) with the build artifact.
 
 **What it shows.**
 - **Tile:** the total, today's P&L in green or red, the top 3 movers (the biggest 24 h moves either way), the unread PM notes count and "updated HH:MM". Tap the numbers to refresh. "Open on phone" opens Portfolio on the phone.
@@ -148,9 +152,9 @@ android/watchface/   revolutx-watchface.apk  com.bryan.revolutx.watchface, a Wat
    - Wireless debugging → Pair new device. It shows an IP:port and a 6-digit code.
    - On the computer, with Android platform-tools installed, run `adb pair IP:PORT CODE`.
    - Then run `adb connect IP:PORT`. Use the address shown on the Wireless debugging page itself, not the pairing one.
-4. **Install:** download `revolutx-watch.apk` and `revolutx-watchface.apk` from the same Release as the phone APK, then run:
-   - `adb install -r revolutx-watch.apk`
-   - `adb install -r revolutx-watchface.apk`
+4. **Install:** download `revolutx-WATCH-adb-only.apk` and `revolutx-WATCHFACE-adb-only.apk` from the same Release as the phone APK (on the computer, not the phone), then run:
+   - `adb install -r revolutx-WATCH-adb-only.apk`
+   - `adb install -r revolutx-WATCHFACE-adb-only.apk`
 5. **Connect:** the server needs the watch token first. In Railway, set it on the server service: random, at least 24 printable characters, different from every other key, never pasted in chat. Then redeploy. Open Revolut X on the phone once: it fetches the watch token and sends it, and the watch app shows the numbers.
 6. **Tile:** swipe left from the face → + → Revolut X.
 7. **Face:** long-press the face → + → Revolut X face. If a slot is empty, Edit → tap the slot → Revolut X → the matching item. Wear OS may also ask to allow the face to show Revolut X data.
@@ -165,10 +169,11 @@ The phone APK and the watch APK must come from the same signing key. A test-sign
 2. runs `npx cap sync android`;
 3. checks that nothing in `mobile/` names or holds a key or token (dashboard, family page, watch, or any 32+ character literal in the Java);
 4. runs `./gradlew :app:assembleRelease :wear:assembleRelease :watchface:assembleRelease` with `versionCode = github.run_number`;
-5. uploads `app-release.apk`, `revolutx-watch.apk` and `revolutx-watchface.apk` as an artifact;
-6. publishes them as a prerelease **Release** tagged `app-v<run>`.
+5. checks the watch APK: every system-bound class is in the merged manifest, kept by name by R8 and in the dex; prints the three APK sizes in the run summary;
+6. uploads `revolutx-PHONE.apk`, `revolutx-WATCH-adb-only.apk`, `revolutx-WATCHFACE-adb-only.apk` and the watch's R8 mapping as an artifact;
+7. on `mobile-app` only, publishes the three APKs as a prerelease **Release** tagged `app-v<run>`. A run on any other branch builds and checks but publishes nothing.
 
-To install on the phone: open the Release page in the phone's browser, download `app-release.apk`, and open it. Allow "install unknown apps" for the browser the first time.
+To install on the phone: open the Release page in the phone's browser, download `revolutx-PHONE.apk`, and open it. Allow "install unknown apps" for the browser the first time.
 
 **Locally.** Needs Node 22, JDK 21 and the Android SDK (Android Studio).
 

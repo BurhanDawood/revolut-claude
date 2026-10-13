@@ -10,6 +10,11 @@ public class OpenOnPhoneActivity extends Activity {
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
+        if (!OnWatch.is(this)) {
+            Toast.makeText(this, OnWatch.PHONE_HINT, Toast.LENGTH_LONG).show();
+            finish();
+            return;
+        }
         PhoneLink.openOnPhone(this, "portfolio", null);
         Toast.makeText(this, "Opening on your phone", Toast.LENGTH_SHORT).show();
         finish();

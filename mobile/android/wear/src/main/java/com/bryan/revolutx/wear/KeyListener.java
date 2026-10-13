@@ -17,6 +17,7 @@ public class KeyListener extends WearableListenerService {
 
     @Override
     public void onMessageReceived(MessageEvent event) {
+        if (!OnWatch.is(this)) return;   // the watch APK on a phone by mistake: no key is taken
         String path = event.getPath();
         if (PATH_CONFIG.equals(path)) {
             byte[] data = event.getData();

@@ -30,6 +30,7 @@ public class MainActivity extends Activity {
     private LinearLayout list;
     private boolean resumed;
     private boolean forceNext;
+    private boolean notWatch;   // installed on a phone by mistake: one line, nothing else
 
     private final Runnable tick = new Runnable() {
         @Override
@@ -42,6 +43,19 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
+        if (!OnWatch.is(this)) {
+            notWatch = true;
+            TextView t = new TextView(this);
+            t.setText(OnWatch.PHONE_HINT);
+            t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
+            t.setTextColor(Fmt.WHITE);
+            t.setGravity(Gravity.CENTER);
+            int p = dp(24);
+            t.setPadding(p, p, p, p);
+            t.setBackgroundColor(0xFF000000);
+            setContentView(t);
+            return;
+        }
         int pad = Math.round(getResources().getDisplayMetrics().widthPixels * 0.12f);   // the round screen's inset
         scroll = new ScrollView(this);
         scroll.setBackgroundColor(0xFF000000);
@@ -61,12 +75,14 @@ public class MainActivity extends Activity {
     @Override
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
+        if (notWatch) return;
         if (intent != null && intent.getBooleanExtra(EXTRA_REFRESH, false)) load(true);
     }
 
     @Override
     protected void onResume() {
         super.onResume();
+        if (notWatch) return;
         resumed = true;
         scroll.requestFocus();   // the bezel / rotary input scrolls
         main.removeCallbacks(tick);
@@ -82,7 +98,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onPause() {
         resumed = false;
-        main.removeCallbacks(tick);
+        if (!notWatch) main.removeCallbacks(tick);
         super.onPause();
     }
 
