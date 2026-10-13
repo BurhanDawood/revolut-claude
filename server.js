@@ -30794,6 +30794,31 @@ app.get('/api/coin/:sym/candles', async (req, res) => { const c = coinSym(req.pa
 app.get('/api/coin/:sym/live', async (req, res) => { const c = coinSym(req.params.sym); if (!c) return res.status(400).json({ error: 'not a coin' }); try { res.set('Cache-Control', 'no-store').json(await coinLive(c)); } catch (e) { res.status(500).json({ error: e.message }); } });   // #508
 app.get('/api/portfolio/spark', async (req, res) => { try { res.set('Cache-Control', 'no-store').json(await portfolioSpark(String(req.query.range || '1d'))); } catch (e) { res.status(500).json({ error: e.message }); } });
 app.get('/api/portfolio/state', async (req, res) => { try { res.set('Cache-Control', 'no-store').json(await portfolioValueState()); } catch (e) { res.status(500).json({ error: e.message }); } });
+// #623 desk #59 W1 (Bryan 13 Oct: a Galaxy Watch companion; Fable 11:20 not money path, W3/W5): ONE read for the watch - its face,
+// Tile and app poll it every minute while on screen. Counts and numbers only: no key, no venue ids, no note text. P&L is the phone's
+// own number (portfolioSpark '1d'); unread = pm_notes.read_at IS NULL (the PM notes view's own count); movers = the held coins (>= $5,
+// from the balance cache, never her USDC - SKIP_CURRENCIES) with the biggest 24 h moves EITHER way, from the 2-minute captures. Cached
+// 30 s so a watch polling every minute never reaches the venue. Any failure answers a generic 500 (W5): never an exception's text.
+let _watchCache = { at: 0, body: null };
+async function watchSummary() {
+  if (_watchCache.body && Date.now() - _watchCache.at < 30000) return _watchCache.body;
+  const st = await portfolioValueState(), sp = await portfolioSpark('1d');
+  const [mv] = await db.execute("SELECT symbol, SUBSTRING_INDEX(GROUP_CONCAT(price ORDER BY recorded_at ASC), ',', 1) AS p0, SUBSTRING_INDEX(GROUP_CONCAT(price ORDER BY recorded_at DESC), ',', 1) AS p1 FROM price_intraday WHERE recorded_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR) GROUP BY symbol");
+  const movers = [];
+  for (const r of mv) {
+    const sym = String(r.symbol), coin = sym.replace(/-USD$/, ''), qty = Number(previousBalances.get(sym)) || 0, p0 = Number(r.p0), p1 = Number(r.p1);
+    if (SKIP_CURRENCIES.includes(coin) || !(p0 > 0) || !(p1 > 0) || qty * p1 < 5) continue;
+    movers.push({ coin, pct: Math.round((p1 / p0 - 1) * 1000) / 10, price: Number(p1.toPrecision(6)) });
+  }
+  movers.sort((a, b) => Math.abs(b.pct) - Math.abs(a.pct));
+  const [[u]] = await db.execute('SELECT COUNT(*) AS n FROM pm_notes WHERE read_at IS NULL');
+  const L = st.latest || {};
+  const body = { v: 1, at: new Date().toISOString(), updated_ts: L.ts || null, partial: !!L.partial, total_usd: L.total != null ? Math.round(L.total * 100) / 100 : null,
+    pnl_day_usd: sp.change, pnl_day_pct: sp.pct, movers: movers.slice(0, 3), unread_pm_notes: Number(u.n) || 0 };
+  _watchCache = { at: Date.now(), body };
+  return body;
+}
+app.get('/api/watch', async (req, res) => { try { res.set('Cache-Control', 'no-store').json(await watchSummary()); } catch (e) { console.error('[watch-app] #623 /api/watch:', e.message); res.set('Cache-Control', 'no-store').status(500).json({ error: 'unavailable' }); } });
 app.post('/api/desk/answer', async (req, res) => { try { const r = await deskAppAnswer(req.body); res.set('Cache-Control', 'no-store').status(r.status).json(r); } catch (e) { console.error('[desk] #580 answer:', e.message); res.status(500).json({ status: 500, error: 'not saved' }); } });   // #580
 app.get('/api/desk/state', async (req, res) => { try { res.json(await specDeskState()); } catch (e) { res.status(500).json({ error: e.message }); } });
 app.get('/api/desk/spec/:id', async (req, res) => { try { const s = await specGet(parseInt(req.params.id)); if (!s) return res.status(404).json({ error: 'no such spec' }); res.json(s); } catch (e) { res.status(500).json({ error: e.message }); } });
