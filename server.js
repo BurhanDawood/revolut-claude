@@ -30400,7 +30400,7 @@ cron.schedule('0 19 * * 0', () => { pmBossReview('sunday').then(r => console.log
 // are Phase 4); a tap is reported on Telegram like every other app write. Its spend is its own counter, pm_boss_reviews rows of kind
 // 'watch', $3 a London day inside the team's $6 (refused before the call); the boss's $1 (reviews and task runs) no longer counts
 // watch rows. C4 holds: ONE model call, NO tools - PM_BOSS_TOOLS stays [] and PM_BOSS_READS (R3) is empty until a phase needs a tool.
-const PM_WATCH = { daily_usd: 3, tokens: 3500, max_notes: 3, title_max: 100, body_max: 1200, checkpoint_max: 1500, taps_per_hour: 20, book_detail: 10, feed_hours: 30, timeout_ms: 120000, cron: '15 */4 * * *' };
+const PM_WATCH = { daily_usd: 3, tokens: 6000, max_notes: 3, title_max: 100, body_max: 1200, checkpoint_max: 1500, taps_per_hour: 20, book_detail: 10, feed_hours: 30, timeout_ms: 120000, cron: '15 */4 * * *' };
 const PM_NOTE_KINDS = ['observation', 'proposal', 'regret', 'health', 'digest'];   // pre_trade is written by Phase 2 only
 const PM_NOTE_SEVERITY = ['info', 'watch', 'act'];
 const PM_PROPOSAL_TYPES = ['approach_alert', 'remove_target', 'acknowledge'];   // R2: alert-only objects, nothing with teeth
@@ -30629,7 +30629,7 @@ async function pmWatchRun(trigger = 'scheduled') {
     }
     if (out.notes.length > PM_WATCH.max_notes) result.refused.push((out.notes.length - PM_WATCH.max_notes) + ' over the ' + PM_WATCH.max_notes + ' a run');
     await db.execute('UPDATE pm_boss_reviews SET result = ? WHERE id = ?', [JSON.stringify(result), runId]);
-    console.log('[watch] #621 run ' + runId + ' (' + trigger + '): ' + result.notes.length + ' note(s)' + (result.refused.length ? ', refused ' + result.refused.length : '') + ', $' + call.cost.toFixed(3) + (call.retried ? ', after a JSON retry' : ''));
+    console.log('[watch] #621 run ' + runId + ' (' + trigger + '): ' + result.notes.length + ' note(s)' + (result.refused.length ? ', refused ' + result.refused.length : '') + ', $' + call.cost.toFixed(3) + (call.retried ? ', after a JSON retry (stop: ' + (call.stop || '?') + '; first answer began: ' + JSON.stringify(String(call.text || '').slice(0, 160)) + ')' : ''));   // #622
     return { ok: true, run_id: runId, notes: result.notes.length, refused: result.refused.length, cost: call.cost, retried: !!call.retried };
   } finally { _pmWatchRunning = false; }
 }
@@ -30650,7 +30650,7 @@ async function pmWatchSummary() {
   const [[u]] = await db.execute('SELECT COUNT(*) AS n, SUM(read_at IS NULL) AS unread FROM pm_notes WHERE at >= ?', [Date.now() - 7 * 86400000]).catch(() => [[{ n: 0, unread: 0 }]]);
   let res = null; try { res = lr.length && lr[0].result ? JSON.parse(lr[0].result) : null; } catch (e) { res = null; }
   return { enabled: !(c.enabled === false) && !(c.watch === false), schedule: 'every 4 h at :15 London, 10 min after the paper trader', spent_today_usd: Number((await pmWatchSpentToday()).toFixed(4)), daily_cap_usd: PM_WATCH.daily_usd,
-    last_run: lr.length ? { id: lr[0].id, at: new Date(Number(lr[0].at)).toISOString(), cost_usd: Number(lr[0].cost_usd), notes: res && Array.isArray(res.notes) ? res.notes.length : null, error: res && res.error ? res.error : null } : null,
+    last_run: lr.length ? { id: lr[0].id, at: new Date(Number(lr[0].at)).toISOString(), cost_usd: Number(lr[0].cost_usd), notes: res && Array.isArray(res.notes) ? res.notes.length : null, error: res && res.error ? res.error : null, retried: res ? !!res.retried : null, stop: res && res.stop ? String(res.stop).slice(0, 60) : null } : null,   // #622 why a run needed the retry
     notes_7d: Number(u.n) || 0, unread: Number(u.unread) || 0, clean_runs: await pmCleanRuns() };
 }
 async function pmNotesView(limit, afterId) {   // the app's PM notes, get_agent view notes
