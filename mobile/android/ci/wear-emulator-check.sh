@@ -27,9 +27,16 @@ logs() {   # logs <title>: what Wear OS said about faces and complications since
   echo "::endgroup::"
 }
 
+to_face() {   # HOME goes to the face from an app, but opens the app list from the face; BACK from there is the face
+  adb shell input keyevent KEYCODE_HOME
+  sleep 2
+  adb shell input keyevent KEYCODE_BACK
+  sleep 2
+}
+
 set_face() {   # set_face: Google's documented developer command for a Watch Face Format face
   adb shell am broadcast -a com.google.android.wearable.app.DEBUG_SURFACE --es operation set-watchface --es watchFaceId "$FACE_ID"
-  adb shell input keyevent KEYCODE_HOME
+  to_face
   sleep 20
   echo "bound watch face services:"
   adb shell dumpsys activity services 2>/dev/null | grep -iE 'ServiceRecord.*(watchface|wff)' | head -n 10
@@ -85,8 +92,10 @@ adb install -r "$REL/revolutx-WATCHFACE-adb-only.apk" || { echo "::error::the fa
 adb logcat -c
 set_face
 shot face-new-a
-sleep 0.7
-shot face-new-b   # the dot's ring should have grown or faded between a and b
+sleep 0.5
+shot face-new-b   # the dot's ring grows and fades over 1.5 s: a, b and c catch it at different sizes
+sleep 0.5
+shot face-new-c
 runtime_logs "this build's face"
 
 echo "== 5. always-on"
@@ -106,7 +115,7 @@ shot app-card
 logs "watch app"
 
 echo "== 7. the Tiles (Wear OS's developer broadcast: add-tile, show-tile)"
-adb shell input keyevent KEYCODE_HOME
+to_face
 adb logcat -c
 n=0
 for t in RxTileService CoinTile1 CoinTile2 CoinTile3 MoversTileService NotesTileService; do
