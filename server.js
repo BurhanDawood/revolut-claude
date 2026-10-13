@@ -30902,7 +30902,47 @@ async function watchSummary() {
   _watchCache = { at: Date.now(), body };
   return body;
 }
-app.get('/api/watch', async (req, res) => { try { res.set('Cache-Control', 'no-store').json(await watchSummary()); } catch (e) { console.error('[watch-app] #623 /api/watch:', e.message); res.set('Cache-Control', 'no-store').status(500).json({ error: 'unavailable' }); } });
+// #630 (Bryan 13 Oct 23:45-23:48: watch Tiles for coins he chooses on the watch): ?coins=CC,HIGH (up to 5) adds coins[] - each coin's
+// price, 24 h move, his holding in $ and its own 24 h line (thinned to 48 values; only coins the system captures prices for have a line);
+// ?choices=1 adds choices[] - the coins he can pick from (the tracked list plus anything held). Read-only numbers on the same one path:
+// the watch keeps its choice on the watch and sends it with each read; nothing is written. Never USD/USDT/USDC/EUR/GBP.
+const _watchCoinCache = new Map();   // query key -> { at, body }, 30 s, at most 20 keys
+async function watchExtras(q) {
+  const out = {};
+  const raw = typeof q.coins === 'string' ? q.coins.slice(0, 100) : '';
+  const want = [...new Set(raw.split(',').map(coinSym).filter(Boolean))].filter(c => !SKIP_CURRENCIES.includes(c)).slice(0, 5);
+  if (want.length) {
+    const key = want.join(','), hit = _watchCoinCache.get(key);
+    if (hit && Date.now() - hit.at < 30000) out.coins = hit.body;
+    else {
+      const tick = await revolutTickerMap(30000).catch(() => ({}));
+      const coins = [];
+      for (const c of want) {
+        const [rows] = await db.execute('SELECT price FROM price_intraday WHERE symbol = ? AND recorded_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR) ORDER BY recorded_at', [c + '-USD']);
+        const vals = rows.map(r => Number(r.price)).filter(v => v > 0), n = vals.length, step = Math.max(1, Math.ceil(n / 48)), pts = [];
+        for (let k = 0; k < n; k += step) pts.push(Number(vals[k].toPrecision(6)));
+        if (n && pts[pts.length - 1] !== Number(vals[n - 1].toPrecision(6))) pts.push(Number(vals[n - 1].toPrecision(6)));
+        const price = tick[c] && tick[c].mid > 0 ? tick[c].mid : (n ? vals[n - 1] : null);
+        const qty = Number(previousBalances.get(c + '-USD')) || 0;
+        coins.push({ coin: c, price: price != null ? Number(price.toPrecision(6)) : null,
+          pct_24h: price != null && n && vals[0] > 0 ? Math.round((price / vals[0] - 1) * 1000) / 10 : null,
+          usd_held: price != null && qty > 0 ? Math.round(qty * price * 100) / 100 : 0,
+          spark: pts.length >= 2 ? pts.slice(-49) : null });
+      }
+      if (_watchCoinCache.size >= 20) _watchCoinCache.delete(_watchCoinCache.keys().next().value);
+      _watchCoinCache.set(key, { at: Date.now(), body: coins });
+      out.coins = coins;
+    }
+  }
+  if (q.choices === '1') {
+    const set = new Set();
+    try { const [rows] = await db.execute("SELECT symbol FROM coin_strategy WHERE symbol NOT IN ('DEAD_BAGS','EXITED','INDEX')"); for (const r of rows) { const c = coinSym(r.symbol); if (c) set.add(c); } } catch (e) { /* held coins still listed */ }
+    for (const [s, q2] of previousBalances) { const c = coinSym(s); if (c && Number(q2) > 0) set.add(c); }
+    out.choices = [...set].filter(c => !SKIP_CURRENCIES.includes(c)).sort().slice(0, 200);
+  }
+  return Object.keys(out).length ? out : null;
+}
+app.get('/api/watch', async (req, res) => { try { const body = await watchSummary(); const extra = await watchExtras(req.query || {}); res.set('Cache-Control', 'no-store').json(extra ? { ...body, ...extra } : body); } catch (e) { console.error('[watch-app] #623 /api/watch:', e.message); res.set('Cache-Control', 'no-store').status(500).json({ error: 'unavailable' }); } });
 // #625 desk #59 W7: the phone app (dashboard key) reads the watch-only token here and hands THAT to the watch - never the dashboard key.
 // A GET under the dashboard key (the watch token itself cannot reach this path: W6 opens /api/watch only). no-store; never logged.
 app.get('/api/watch/key', (req, res) => {
