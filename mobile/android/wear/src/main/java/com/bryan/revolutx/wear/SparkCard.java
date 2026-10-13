@@ -15,29 +15,32 @@ import java.io.ByteArrayOutputStream;
 import java.util.Locale;
 
 /**
- * Desk #59 (Bryan 13 Oct 23:20 / 23:21): the app's total card - the total with smaller cents, the live 6-hour line (#507) and
- * its change, "LIVE" on the right. One routine draws it for both the watch face (CardComplication's image) and the watch app's
- * screen (SparkCardView), so the two look the same. The line copies the dashboard's rxSparkDraw: the points resampled to 90
- * evenly spaced values, straight segments with round joins, 2 px, a fill fading from 28% to nothing, #00ffc8 when the 6 h
- * change is >= 0 and #ff4d6a when it is down; the pulsing dot is the app's ring (rxSparkPulse: 0.4 -> 1.6, 0.7 -> 0, 2 s).
- *
- * Sizes are in card units, which are the face's units: the face shows the card at 360 x 156 and puts its own pulsing dot on the
- * line's last point from PLOT_TOP / PLOT_H / PAD, so keep those in step with the watchface module's res/raw/watchface.xml.
+ * Desk #59 (Bryan 14 Oct 00:06): the live 6-hour line as the hero. One routine draws it for the watch face (CardComplication's
+ * image, AmbientCardComplication's outline), the top of the watch app (SparkCardView), the Tiles and the coin screen, so every
+ * graph looks the same. The band is the face's middle, 450 x 250 face units from y 150: the total ("$4,863" + smaller ".98")
+ * over the upper part, then the line - thick, smoothed, a fill fading from 28% to nothing, #00ffc8 when the 6 h change is
+ * >= 0 and #ff4d6a when down (the dashboard's colours) - from the left edge to x 392, where its last point (and the dot) sits
+ * inside the round screen at any height; then "6h -$133.89 (-2.68%)" in the line's colour. The pulsing dot is the app's ring
+ * (scale 0.4 -> 1.6, opacity 0.7 -> 0, ease-out) on a 1.5 s cycle. Keep LINE_* in step with the watchface module's
+ * res/raw/watchface.xml, which pulses its own dot there.
  */
 final class SparkCard {
 
-    static final float W = 360f;
-    static final float H = 156f;
-    static final float PLOT_TOP = 62f;   // the line's box: 56 high like the app's, 5 padding inside
-    static final float PLOT_H = 56f;
-    static final float PAD = 5f;
-    static final int N = 90;             // the app's RX_SPARK.n
+    static final float W = 450f;          // the whole face width: the line runs edge to edge
+    static final float H = 250f;
+    static final float FACE_Y = 150f;     // where the band sits on the face
+    static final float LINE_RIGHT = 392f; // the last point: inside the circle with its ring at the band's lowest point
+    static final float BOX_TOP = 62f;     // the line's box (the fill reaches its bottom)
+    static final float BOX_H = 143f;
+    static final float PAD = 10f;         // inside the box, above and below the line
+    static final float STROKE = 4f;       // a thick line
+    static final int N = 90;              // the app's RX_SPARK.n
 
     static final int UP = 0xFF00FFC8;     // the dashboard's --accent
     static final int DOWN = 0xFFFF4D6A;   // --danger
     static final int MUTED = 0xFF888888;  // --text-muted
 
-    static final long PULSE_MS = 2000;
+    static final long PULSE_MS = 1500;
     static final long SLIDE_MS = 900;     // the app's "transition: d .9s ease"
     private static final Interpolator EASE_OUT = new PathInterpolator(0f, 0f, 0.58f, 1f);
     static final Interpolator EASE = new PathInterpolator(0.25f, 0.1f, 0.25f, 1f);
@@ -48,10 +51,10 @@ final class SparkCard {
         String cents = "";
         @Nullable float[] ys;    // N heights, 0 = top of the line's inner box, 1 = bottom; null = no line
         boolean up = true;
-        String range = "";       // "6 hours", or "Today" when there is no series
+        String range = "";       // "6h", "24h", or "Today" when there is no series
         String change = "";
         int color = UP;
-        String right = "LIVE";   // or the last answer's time, HH:MM, when the numbers are old
+        @Nullable String stale;  // the last answer's time when it is over 15 minutes old or the last fetch failed
         @Nullable String message;   // instead of the caption when there are no numbers
 
         /** The line's last point, 0..1 from the top, for the face's dot; -1 without a line. */
@@ -72,7 +75,6 @@ final class SparkCard {
         Model m = new Model();
         if (s == null || s.total == null) {
             m.message = Fmt.emptyLine(ctx);
-            m.right = "";
             return m;
         }
         String total = Fmt.money(s.total);
@@ -83,7 +85,7 @@ final class SparkCard {
         Double pct;
         if (s.spark != null && s.spark.length >= 2) {
             m.ys = heights(resample(s.spark));
-            m.range = "6 hours";
+            m.range = "6h";
             chg = s.sparkChgUsd;
             pct = s.sparkChgPct;
         } else {
@@ -98,16 +100,17 @@ final class SparkCard {
             m.change = sign + Fmt.money(Math.abs(chg))
                 + (pct == null ? "" : " (" + sign + String.format(Locale.US, "%.2f", Math.abs(pct)) + "%)");
         }
-        m.right = right(ctx);
+        m.stale = stale(ctx);
         return m;
     }
 
-    /** "LIVE" while the last answer is good and under 15 minutes old; otherwise its time, so old numbers never look live. */
-    private static String right(Context ctx) {
+    /** Null while the last answer is good and under 15 minutes old; otherwise its time, so old numbers never pass as live. */
+    @Nullable
+    private static String stale(Context ctx) {
         long at = WatchStore.values(ctx).getLong(WatchStore.V_FETCHED, 0);
-        if (at <= 0) return "";
+        if (at <= 0) return null;
         boolean fresh = WatchStore.status(ctx).isEmpty() && System.currentTimeMillis() - at < 15 * 60_000L;
-        return fresh ? "LIVE" : Fmt.hhmm(at);
+        return fresh ? null : Fmt.hhmm(at);
     }
 
     /** N evenly spaced values (straight line between the server's points, which are evenly spaced in time). */
@@ -139,123 +142,139 @@ final class SparkCard {
     }
 
     /**
-     * Draws the card at sc pixels per card unit. ys: the line to draw (the app's view passes the one it is sliding between
-     * two answers), or null for m's own. pulse: the dot's phase 0..1, or < 0 for no dot (the face draws its own).
+     * The band at sc pixels per face unit. ys: the line to draw (the app's view passes the one it is sliding between two
+     * answers), or null for m's own. pulse: the dot's phase 0..1, or < 0 for no dot (the face pulses its own).
      */
     static void draw(Canvas c, float sc, Model m, @Nullable float[] ys, float pulse) {
         if (ys == null) ys = m.ys;
-        Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+        if (ys != null) {
+            drawLine(c, 0, BOX_TOP * sc, LINE_RIGHT * sc, BOX_H * sc, PAD * sc, sc, STROKE, ys, m.color, true, pulse);
+        }
+        drawTotal(c, sc, m, false);
 
-        // the total, the cents smaller, centred
-        p.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
-        p.setColor(Fmt.WHITE);
-        p.setTextSize(40 * sc);
-        float wd = p.measureText(m.dollars);
-        Paint pc = new Paint(p);
-        pc.setTextSize(24 * sc);
-        float wc = m.cents.isEmpty() ? 0 : pc.measureText(m.cents);
-        float x0 = (W * sc - wd - wc) / 2;
-        c.drawText(m.dollars, x0, 44 * sc, p);
-        if (wc > 0) c.drawText(m.cents, x0 + wd, 44 * sc, pc);
-
-        // the line and its fill
-        if (ys != null) drawLine(c, 0, PLOT_TOP * sc, W * sc, PLOT_H * sc, PAD * sc, sc, ys, m.color, pulse);
-
-        // the caption: "6 hours  -$133.89 (-2.68%)" ... "LIVE"
-        float base = 146 * sc;
-        Paint small = new Paint(Paint.ANTI_ALIAS_FLAG);
-        small.setTextSize(15 * sc);
-        small.setColor(MUTED);
+        // under the line: "6h -$133.89 (-2.68%)" in its colour (or why there are no numbers), centred in the circle
+        Paint cap = new Paint(Paint.ANTI_ALIAS_FLAG);
+        cap.setTextAlign(Paint.Align.CENTER);
+        cap.setTextSize(21 * sc);
+        float base = 238 * sc;
         if (m.message != null) {
-            small.setTextAlign(Paint.Align.CENTER);
-            c.drawText(m.message, W * sc / 2, base, small);
+            cap.setColor(MUTED);
+            cap.setTextSize(17 * sc);
+            c.drawText(m.message, W * sc / 2, base, cap);
             return;
         }
-        c.drawText(m.range, 0, base, small);
-        if (!m.change.isEmpty()) {
-            Paint chg = new Paint(small);
-            chg.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
-            chg.setColor(m.color);
-            c.drawText(m.change, small.measureText(m.range) + 10 * sc, base, chg);
-        }
-        if (!m.right.isEmpty()) {
-            Paint live = new Paint(small);
-            live.setTextSize(12 * sc);
-            live.setLetterSpacing(0.08f);
-            live.setTextAlign(Paint.Align.RIGHT);
-            c.drawText(m.right, W * sc, base, live);
+        String text = (m.range + " " + m.change).trim();
+        cap.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
+        cap.setColor(m.color);
+        if (m.stale == null) {
+            c.drawText(text, W * sc / 2, base, cap);
+        } else {   // old numbers: their time after them, grey
+            Paint grey = new Paint(cap);
+            grey.setTypeface(Typeface.DEFAULT);
+            grey.setColor(MUTED);
+            String t = "  " + m.stale;
+            float w1 = cap.measureText(text);
+            float w2 = grey.measureText(t);
+            float x = (W * sc - w1 - w2) / 2 + w1 / 2;
+            c.drawText(text, x, base, cap);
+            grey.setTextAlign(Paint.Align.LEFT);
+            c.drawText(t, x + w1 / 2, base, grey);
         }
     }
 
+    /** "$4,863" with a smaller ".98", centred over the upper part of the graph; outline only for always-on. */
+    private static void drawTotal(Canvas c, float sc, Model m, boolean outline) {
+        Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+        p.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
+        p.setColor(Fmt.WHITE);
+        if (outline) {
+            p.setStyle(Paint.Style.STROKE);
+            p.setStrokeWidth(1.6f * sc);
+        }
+        p.setTextSize(46 * sc);
+        float wd = p.measureText(m.dollars);
+        Paint pc = new Paint(p);
+        pc.setTextSize(27 * sc);
+        float wc = m.cents.isEmpty() ? 0 : pc.measureText(m.cents);
+        float x0 = (W * sc - wd - wc) / 2;
+        c.drawText(m.dollars, x0, 50 * sc, p);
+        if (wc > 0) c.drawText(m.cents, x0 + wd, 50 * sc, pc);
+    }
+
     /**
-     * The line, its fill and (pulse >= 0) the dot with its ring, in the box left/top/w/h (pixels) with pad inside above and
-     * below; sc = pixels per unit for the 2 px line and the dot. The card, the Tiles and the coin screen all draw with this.
+     * The line (smoothed), its fill (fill = true) and (pulse >= 0) the dot with its ring, in the box left/top/w/h (pixels) with
+     * pad inside above and below; sc = pixels per unit, stroke in units. The band, the Tiles and the coin screen use this.
      */
-    static void drawLine(Canvas c, float left, float boxTop, float w, float h, float pad, float sc, float[] ys, int color, float pulse) {
+    static void drawLine(Canvas c, float left, float boxTop, float w, float h, float pad, float sc, float stroke, float[] ys,
+                         int color, boolean fill, float pulse) {
         float top = boxTop + pad;
         float ih = h - 2 * pad;
         float bottom = boxTop + h;
-        Path line = new Path();
+        int n = ys.length;
+        float[] x = new float[n];
+        float[] y = new float[n];
         float minY = bottom;
-        for (int i = 0; i < ys.length; i++) {
-            float x = left + w * i / (ys.length - 1);
-            float y = top + ih * ys[i];
-            minY = Math.min(minY, y);
-            if (i == 0) line.moveTo(x, y);
-            else line.lineTo(x, y);
+        for (int i = 0; i < n; i++) {
+            x[i] = left + w * i / (n - 1);
+            y[i] = top + ih * ys[i];
+            minY = Math.min(minY, y[i]);
         }
-        Path area = new Path(line);
-        area.lineTo(left + w, bottom);
-        area.lineTo(left, bottom);
-        area.close();
-        Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
-        fill.setStyle(Paint.Style.FILL);
-        fill.setShader(new LinearGradient(0, minY, 0, bottom, withAlpha(color, 0.28f), withAlpha(color, 0f), Shader.TileMode.CLAMP));
-        c.drawPath(area, fill);
-        Paint stroke = new Paint(Paint.ANTI_ALIAS_FLAG);
-        stroke.setStyle(Paint.Style.STROKE);
-        stroke.setStrokeWidth(2 * sc);
-        stroke.setStrokeJoin(Paint.Join.ROUND);
-        stroke.setStrokeCap(Paint.Cap.ROUND);
-        stroke.setColor(color);
-        c.drawPath(line, stroke);
+        // smooth: each point is a control point, the curve passes through the midpoints, and ends on the last point
+        Path line = new Path();
+        line.moveTo(x[0], y[0]);
+        for (int i = 1; i < n - 1; i++) line.quadTo(x[i], y[i], (x[i] + x[i + 1]) / 2, (y[i] + y[i + 1]) / 2);
+        line.lineTo(x[n - 1], y[n - 1]);
+        if (fill) {
+            Path area = new Path(line);
+            area.lineTo(x[n - 1], bottom);
+            area.lineTo(x[0], bottom);
+            area.close();
+            Paint f = new Paint(Paint.ANTI_ALIAS_FLAG);
+            f.setStyle(Paint.Style.FILL);
+            f.setShader(new LinearGradient(0, minY, 0, bottom, withAlpha(color, 0.28f), withAlpha(color, 0f), Shader.TileMode.CLAMP));
+            c.drawPath(area, f);
+        }
+        Paint s = new Paint(Paint.ANTI_ALIAS_FLAG);
+        s.setStyle(Paint.Style.STROKE);
+        s.setStrokeWidth(stroke * sc);
+        s.setStrokeJoin(Paint.Join.ROUND);
+        s.setStrokeCap(Paint.Cap.ROUND);
+        s.setColor(color);
+        c.drawPath(line, s);
         if (pulse < 0) return;
-        float cx = left + w;
-        float cy = top + ih * ys[ys.length - 1];
+        float cx = x[n - 1];
+        float cy = y[n - 1];
         float e = EASE_OUT.getInterpolation(pulse);
         float scale = 0.4f + 1.2f * e;
         Paint ring = new Paint(Paint.ANTI_ALIAS_FLAG);
         ring.setStyle(Paint.Style.STROKE);
         ring.setColor(withAlpha(color, 0.7f * (1 - e)));
-        ring.setStrokeWidth(2 * scale * sc);
-        c.drawCircle(cx, cy, 8 * scale * sc, ring);   // the app's ring: 18 px across, a 2 px line
+        ring.setStrokeWidth(2.5f * scale * sc);
+        c.drawCircle(cx, cy, 10 * scale * sc, ring);
         Paint dot = new Paint(Paint.ANTI_ALIAS_FLAG);
         dot.setColor(color);
-        c.drawCircle(cx, cy, 4 * sc, dot);
+        c.drawCircle(cx, cy, 5 * sc, dot);
     }
 
     /** The phase a still picture (a Tile) shows the ring at: part-way out, so it reads as the live dot. */
     static final float STILL_PULSE = 0.3f;
 
     /**
-     * A Tile's line: values (oldest first) resampled like the card, drawn w x h pixels with room for the dot and its ring at
+     * A Tile's line: values (oldest first) resampled like the band, drawn w x h pixels with room for the dot and its ring at
      * the right end; null when there are fewer than 2 values.
      */
     static byte[] linePng(@Nullable double[] values, int color, int w, int h, float sc) {
         if (values == null || values.length < 2) return null;
         float[] ys = heights(resample(values));
         Bitmap b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
-        float room = 12 * sc;   // the ring at STILL_PULSE reaches about 9 units past the last point
-        drawLine(new Canvas(b), 0, 0, w - room, h, room * 0.75f, sc, ys, color, STILL_PULSE);
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-        b.compress(Bitmap.CompressFormat.PNG, 100, out);
-        b.recycle();
-        return out.toByteArray();
+        float room = 14 * sc;   // the ring at STILL_PULSE reaches about 11 units past the last point
+        drawLine(new Canvas(b), 0, 0, w - room, h, room * 0.75f, sc, 3f, ys, color, true, STILL_PULSE);
+        return png(b);
     }
 
     /**
-     * The coin screen's card, in the card's own layout: the price with its cents smaller, the coin's 24 h line, "24 hours
-     * +8.10%" in its colour (green/red by the 24 h move), and LIVE.
+     * The coin screen's card, in the band's layout: the price with its cents smaller, the coin's 24 h line, "24h +8.10%" in
+     * its colour (green/red by the 24 h move).
      */
     static Model coinModel(Context ctx, Snapshot.Quote q) {
         Model m = new Model();
@@ -266,9 +285,9 @@ final class SparkCard {
         if (q.spark != null && q.spark.length >= 2) m.ys = heights(resample(q.spark));
         m.up = up(q);
         m.color = m.up ? UP : DOWN;
-        m.range = "24 hours";
-        m.change = Double.isNaN(q.pct) ? "" : (m.up ? "+" : "\u2212") + String.format(Locale.US, "%.2f", Math.abs(q.pct)) + "%";
-        m.right = right(ctx);
+        m.range = "24h";
+        m.change = Double.isNaN(q.pct) ? "" : (m.up ? "+" : "−") + String.format(Locale.US, "%.2f", Math.abs(q.pct)) + "%";
+        m.stale = stale(ctx);
         return m;
     }
 
@@ -279,10 +298,23 @@ final class SparkCard {
         return true;
     }
 
-    /** The face's image: the card without a dot (the face pulses its own on top), as a PNG. */
+    /** The face's image: the band without a dot (the face pulses its own on top), as a PNG. */
     static byte[] png(Model m, float sc) {
         Bitmap b = Bitmap.createBitmap(Math.round(W * sc), Math.round(H * sc), Bitmap.Config.ARGB_8888);
         draw(new Canvas(b), sc, m, null, -1f);
+        return png(b);
+    }
+
+    /** Always-on: the total in outline and the line as a thin grey outline - no fill, no dot, no colour, no caption. */
+    static byte[] ambientPng(Model m, float sc) {
+        Bitmap b = Bitmap.createBitmap(Math.round(W * sc), Math.round(H * sc), Bitmap.Config.ARGB_8888);
+        Canvas c = new Canvas(b);
+        if (m.ys != null) drawLine(c, 0, BOX_TOP * sc, LINE_RIGHT * sc, BOX_H * sc, PAD * sc, sc, 1.6f, m.ys, 0xFFBBBBBB, false, -1f);
+        if (m.message == null) drawTotal(c, sc, m, true);
+        return png(b);
+    }
+
+    private static byte[] png(Bitmap b) {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         b.compress(Bitmap.CompressFormat.PNG, 100, out);
         b.recycle();

@@ -7,14 +7,11 @@ import android.view.View;
 import java.util.Arrays;
 
 /**
- * Desk #59 (Bryan 13 Oct 23:21): the card at the top of the watch app, live while it is on screen: the dot pulses (the app's
- * 2 s ring) and a new answer's line slides from the old one over 0.9 s, like the dashboard's. Drawn by SparkCard, the routine
- * the face's image uses, so the two look the same. It only draws; MainActivity fetches.
+ * Desk #59 (Bryan 14 Oct 00:06): the face's band at the top of the watch app, live while it is on screen: the dot pulses
+ * (1.5 s ring) and a new answer's line slides from the old one over 0.9 s, like the dashboard's. Drawn by SparkCard, the
+ * routine the face's image uses, at the screen's full width, so the two look the same. It only draws; MainActivity fetches.
  */
 final class SparkCardView extends View {
-
-    /** The card takes 95% of the width, so the dot's ring (up to 14 units past the last point) is not cut off. */
-    private static final float ROOM_SCALE = SparkCard.W / (SparkCard.W + 16f);
 
     private SparkCard.Model model;
     private float[] from;   // the line being slid from, or null
@@ -42,7 +39,7 @@ final class SparkCardView extends View {
     @Override
     protected void onMeasure(int widthSpec, int heightSpec) {
         int w = MeasureSpec.getSize(widthSpec);
-        setMeasuredDimension(w, Math.round(w * ROOM_SCALE * SparkCard.H / SparkCard.W));
+        setMeasuredDimension(w, Math.round(w * SparkCard.H / SparkCard.W));
     }
 
     @Override
@@ -63,7 +60,7 @@ final class SparkCardView extends View {
         }
         shown = ys;
         float pulse = ys == null ? -1f : ((now - born) % SparkCard.PULSE_MS) / (float) SparkCard.PULSE_MS;
-        SparkCard.draw(c, getWidth() * ROOM_SCALE / SparkCard.W, model, ys, pulse);   // the ring's room on the right
+        SparkCard.draw(c, getWidth() / SparkCard.W, model, ys, pulse);   // the screen's full width, like the face's band
         if (ys != null) postInvalidateOnAnimation();   // only runs while the screen draws: it stops when the app is off screen
     }
 }

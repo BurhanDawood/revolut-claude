@@ -28,7 +28,7 @@ import java.util.concurrent.Executors;
 public abstract class ComplicationBase extends ComplicationDataSourceService {
 
     static final Class<?>[] ALL = { TotalComplication.class, PnlComplication.class, NotesComplication.class, MoverComplication.class,
-        CardComplication.class, DotComplication.class, FaceTotalComplication.class };
+        CardComplication.class, DotComplication.class, FaceTotalComplication.class, AmbientCardComplication.class };
 
     private static final ExecutorService EXEC = Executors.newSingleThreadExecutor();
 

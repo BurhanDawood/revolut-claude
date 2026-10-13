@@ -12,6 +12,7 @@ import android.view.Gravity;
 import android.view.View;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
+import android.widget.TextClock;
 import android.widget.TextView;
 import android.widget.Toast;
 import java.util.concurrent.ExecutorService;
@@ -69,10 +70,23 @@ public class MainActivity extends Activity {
         list = new LinearLayout(this);
         list.setOrientation(LinearLayout.VERTICAL);
         list.setGravity(Gravity.CENTER_HORIZONTAL);
-        list.setPadding(pad, pad, pad, pad * 2);
-        scroll.addView(list);
-        setContentView(scroll);
+        list.setPadding(pad, dp(4), pad, pad * 2);
+        // the top is the face's: the time, then the live band at the screen's full width (desk #59, 14 Oct 00:06)
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        TextClock clock = new TextClock(this);
+        clock.setFormat24Hour("HH:mm");
+        clock.setFormat12Hour("h:mm");
+        clock.setTextSize(TypedValue.COMPLEX_UNIT_SP, 30);
+        clock.setTextColor(Fmt.WHITE);
+        clock.setGravity(Gravity.CENTER_HORIZONTAL);
+        clock.setPadding(0, Math.round(getResources().getDisplayMetrics().widthPixels * 0.13f), 0, 0);
+        root.addView(clock, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
         card = new SparkCardView(this);   // kept across renders, so its line slides and its dot keeps pulsing
+        root.addView(card, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+        root.addView(list, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+        scroll.addView(root);
+        setContentView(scroll);
         forceNext = getIntent() != null && getIntent().getBooleanExtra(EXTRA_REFRESH, false);
         render();
         PhoneLink.helloAtMost(this, PhoneLink.HELLO_START_MS);   // the phone re-confirms the key, or clears it
@@ -120,11 +134,7 @@ public class MainActivity extends Activity {
     private void render() {
         list.removeAllViews();
         Snapshot s = WatchStore.snapshot(this);
-        add("Revolut X", 13, Fmt.GREY, false);
         card.set(SparkCard.model(this, s));
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        lp.topMargin = dp(4);
-        list.addView(card, lp);
         if (s == null) {
             card.setOnClickListener(v -> load(true));
             return;

@@ -98,7 +98,7 @@ android/wear/        revolutx-WATCH-adb-only.apk      applicationId com.bryan.re
   WatchStore         the key in EncryptedSharedPreferences; the last numbers in plain private prefs
   Repo               GET /api/watch, the watch's only server call (?coins= for the Tile coins, ?choices=1 for the picker)
   *Tile*, BaseTile   the Tiles: Portfolio (RxTileService), Coin 1-3, Top movers, PM notes
-  *Complication      data sources: total, today's P&L, unread PM notes, top mover; the face's card, dot, always-on total
+  *Complication      data sources: total, today's P&L, unread PM notes, top mover; the face's band, dot, always-on band
   SparkCard          the one drawing routine for every line: the face's card, the app, the Tiles, the coin screen
   MainActivity       the app: the live card, movers, notes, holdings; a coin opens CoinActivity
   CoinActivity       one coin, live; TileCoinsActivity: the Coin Tiles' picks
@@ -117,17 +117,18 @@ android/watchface/   revolutx-WATCHFACE-adb-only.apk  com.bryan.revolutx.watchfa
   - **PM notes:** the unread count. Tap: the notes on the phone.
   - **Tile coins** (the app's last button, or an empty Coin Tile): three slots, each a list from `GET /api/watch?choices=1` (held coins first, then A-Z). Saved only in the watch app's own prefs; change them any time.
   - **Data:** one read serves every Tile: `GET /api/watch?coins=<the three Tile coins>` adds `coins[]` (batch 630: `price`, `pct_24h`, `usd_held`, a 24 h `spark` of up to 49 prices). A server without it: the coin's numbers from holdings[] / movers[], no line.
-- **App:** on top the app's total card (below), then today's P&L, the movers, the PM notes count and a holdings list from `/api/watch`'s `holdings: [{coin, usd, pct}]` (batch 624, numbers only). A missing field counts as no holdings. Tapping a coin opens it on the phone.
-- **Face** (13 Oct 23:20): the unread PM notes count (small), the time, then the card. Always-on: only the time and the total, in outline, no line, no pulse.
-- **The card** (face and app, drawn by one routine, `SparkCard`): the total with the cents smaller; the dashboard's live 6-hour line (#507) from `/api/watch`'s `spark` (batch 628: up to 61 values, oldest first, with `change_usd` / `change_pct`) - 90 resampled points, a 2 px line, a fill fading from 28%, green `#00ffc8` when the 6 h change is ≥ 0 and red `#ff4d6a` when down, a pulsing dot on the last point (the app's ring: 2 s, ease-out); then "6 hours −$133.89 (−2.68%)" in the line's colour and "LIVE" on the right (the last answer's time instead when it is over 15 minutes old or the last fetch failed). `spark: null` (or an older server): no line, and today's P&L instead.
-- **How the face does it:** Watch Face Format draws no lines from data, so the watch app draws the card into an image (`CardComplication`, PHOTO_IMAGE). The dot is the face's own: `DotComplication` (RANGED_VALUE) gives the last point's height and the direction, and the face pulses an ellipse there with WFF's looping animation. The always-on total is `FaceTotalComplication` ("$4,863" + ".98"). Code-based faces are deprecated on Wear OS 6, so the face stays WFF.
+- **Face** (14 Oct 00:06, the live line as the hero): the time (medium, white) in the top third; across the middle, edge to edge, the band - the total ("$4,863" + smaller ".98") over the upper part, the thick smoothed 6-hour line with its fill, green `#00ffc8` when the 6 h change is ≥ 0 and red `#ff4d6a` when down, the last point pulsing (an expanding ring, 1.5 s); under it "6h −$133.89 (−2.68%)" in the line's colour and, small, the unread PM notes. Nothing else (old numbers add their time in grey after the change). Always-on: the time and the total in outline, the line as a thin grey outline - no fill, no pulse. On the round screen the line ends at x 392 of 450, so the dot and its ring stay inside the circle at any height.
+- **App:** the same top - the time, then the band at the screen's full width, live (below) - then today's P&L, the movers, the PM notes count and a holdings list from `/api/watch`'s `holdings: [{coin, usd, pct}]` (batch 624, numbers only). Tapping a coin opens it on the watch.
+- **The band** (face, app, Tiles, coin screen - one routine, `SparkCard`): the line comes from `/api/watch`'s `spark` (batch 628: up to 61 values, oldest first, with `change_usd` / `change_pct`), resampled to 90 points like the dashboard's #507 line. `spark: null` (or an older server): no line, and "Today" with today's P&L instead.
+- **How the face does it:** Watch Face Format draws no lines from data, so the watch app draws the band into an image (`CardComplication`; `AmbientCardComplication` for always-on). The dot is the face's own: `DotComplication` (RANGED_VALUE) gives the last point's height and the direction, and the face pulses an ellipse there with WFF's looping animation. Code-based faces are deprecated on Wear OS 6, so the face stays WFF.
+- **Why app-v17's face would not apply:** each slot's fallback type was EMPTY; Wear OS's face runtime rejects that ("systemDataSourceFallbackDefaultType EMPTY must be in the supportedTypes list"). Each slot now falls back with its own type. (Google's XML validator does not catch it; CI's emulator job does.)
 
 **Data.** The watch calls one path: `GET https://revolut-claude-production.up.railway.app/api/watch`, with `x-api-token` set to the **watch-only token**. The server accepts that token for this one path and nothing else (desk #59 W6, batch 625). The dashboard key never leaves the phone. Wear OS routes the call through the phone over Bluetooth, or over Wi-Fi. It follows no redirects. When it fails (offline, 5xx), the last numbers stay with "updated HH:MM" and the reason.
 
 **Refresh.**
 - **Tiles:** on every swipe to a Tile (a fresh read if the last is over 30 s old - the server's cache), and Wear OS's own schedule (5 min) in between.
 - **App:** every 30 s while it is on screen (the server caches 30 s); nothing while the screen is off. A new line slides in over 0.9 s.
-- **Face:** every 5 min. That is the floor Wear OS sets for complications; nothing faster is possible without server push. The dot's pulse runs on the watch, continuously, in between.
+- **Face:** every 5 min. That is the floor Wear OS sets for complications; nothing faster is possible without server push. The dot's pulse runs on the watch, continuously (1.5 s), in between.
 - **On tap:** at once.
 - **Surfaces stay in step:** after any fetch, the Tile and the face redraw from the new numbers.
 
@@ -167,7 +168,7 @@ android/watchface/   revolutx-WATCHFACE-adb-only.apk  com.bryan.revolutx.watchfa
    - `adb install -r revolutx-WATCHFACE-adb-only.apk`
 5. **Connect:** the server needs the watch token first. In Railway, set it on the server service: random, at least 24 printable characters, different from every other key, never pasted in chat. Then redeploy. Open Revolut X on the phone once: it fetches the watch token and sends it, and the watch app shows the numbers.
 6. **Tiles:** swipe left from the face → + → the Revolut X Tile you want (Portfolio, Coin 1-3, Top movers, PM notes). Pick the coins in the app → Tile coins, or tap an empty Coin Tile.
-7. **Face:** long-press the face → + → Revolut X face. If a slot is empty, Edit → tap the slot → Revolut X → the matching item: the card is "Revolut X face: total card", the dot "Revolut X face: live dot", the always-on total "Revolut X face: always-on total", the top line "Revolut X: unread PM notes". Wear OS may also ask to allow the face to show Revolut X data.
+7. **Face:** long-press the face → + → Revolut X face. If a slot is empty, Edit → tap the slot → Revolut X → the matching item: the notes line is "Revolut X: unread PM notes" (the band, the dot and the always-on band are fixed to the Revolut X sources). Wear OS may also ask to allow the face to show Revolut X data.
 8. **Turn off Wireless debugging** afterwards; it drains the battery.
 
 The phone APK and the watch APK must come from the same signing key. A test-signed build (Release title "(test signing)") pairs only with other APKs from that same run.

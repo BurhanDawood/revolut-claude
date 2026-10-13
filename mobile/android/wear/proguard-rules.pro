@@ -22,6 +22,7 @@
 -keep class com.bryan.revolutx.wear.MoverComplication { *; }
 -keep class com.bryan.revolutx.wear.CardComplication { *; }     # the Revolut X face's card, dot and always-on total
 -keep class com.bryan.revolutx.wear.DotComplication { *; }
+-keep class com.bryan.revolutx.wear.AmbientCardComplication { *; }
 -keep class com.bryan.revolutx.wear.FaceTotalComplication { *; }
 # The Tile's LaunchAction names OpenOnPhoneActivity by its class name at run time (getName()): kept above.
 
