@@ -358,6 +358,19 @@ async function sweepToUSDT(proceedsUsd, sourceSymbol, realisedPnlUsd = null) {
     const config = JSON.parse(configRows[0].config_value);
     if (!config.enabled) return;
     if (proceedsUsd < (config.min_trade_value_usd || 50)) return; // #26 Bug3
+    // #627 (13 Oct system check, Fable pre-ship): the sweep is an automatic BUY, so it holds while auto-exec is paused (fails closed:
+    // unreadable = paused), and it only runs with a share of 1-100 % - a bad stored value never sends an order.
+    if (await isAutoExecPaused()) {
+      console.log('[sweep] held - auto-exec paused (' + sourceSymbol + ' sale $' + Number(proceedsUsd).toFixed(2) + ')');
+      await sendTelegram('💰 USDT sweep <b>held</b> after the ' + sourceSymbol.replace('-USD', '') + ' sale: auto-exec is paused. Nothing was converted.').catch(() => {});
+      return;
+    }
+    const swPct = Number(config.sweep_pct);
+    if (!(swPct >= 1 && swPct <= 100)) {
+      console.log('[sweep] skipped - stored sweep_pct ' + config.sweep_pct + ' is not 1-100');
+      await sendTelegram('⚠️ USDT sweep skipped after the ' + sourceSymbol.replace('-USD', '') + ' sale: its share (' + escTg(String(config.sweep_pct)) + ') is not 1-100%. Fix it on the dashboard.').catch(() => {});
+      return;
+    }
 
     // Check exclusions against both bare coin name (BONK) and full symbol (BONK-USD)
     if (config.excluded_symbols && config.excluded_symbols.length > 0) {
@@ -371,7 +384,7 @@ async function sweepToUSDT(proceedsUsd, sourceSymbol, realisedPnlUsd = null) {
     // #26 Bug1: use realised profit as base when available; fall back to proceeds
     const basisLabel = (realisedPnlUsd !== null && realisedPnlUsd > 0) ? 'profit' : 'proceeds';
     const sweepBase = basisLabel === 'profit' ? realisedPnlUsd : proceedsUsd;
-    const sweepAmountUsd = sweepBase * (config.sweep_pct / 100);
+    const sweepAmountUsd = Math.min(sweepBase * (swPct / 100), Number(proceedsUsd) || 0);   // #627 never more than the sale brought in
     if (sweepAmountUsd <= 0) { console.log('[sweep] Zero/negative sweep amount — skipping'); return; }
 
     // Get current USDT balance for the confirmation message
@@ -6437,6 +6450,45 @@ async function clearStandaloneTrough(symbol) {
     console.log('[trough-st] cleared: ' + symbol);
   } catch (e) { console.error('[trough-st] clear error:', e.message); }
 }
+// #627 (13 Oct system check, Fable pre-ship): the clear right BEFORE a buy-back order must reach the database. The plain clears above
+// log a DB error and carry on, so the buy went ahead while the row still said "waiting to buy back" - after a restart the boot loader
+// (sale_price IS NOT NULL / the standalone table) would arm the same buy again. These two put the tracker back in memory exactly as it
+// was and return false, so the caller skips the order and the next scan tries again. Same rule as the trail sale (removeTrailingStop).
+const _clearFailTold = new Map();   // symbol -> last Telegram, at most one per 30 min
+async function clearFailTell(kind, symbol, msg) {
+  console.error('[' + kind + '] ' + symbol + ' clear failed before the buy-back - NOT bought: ' + msg);
+  const k = kind + ':' + symbol, last = _clearFailTold.get(k) || 0;
+  if (Date.now() - last < 30 * 60000) return;
+  _clearFailTold.set(k, Date.now());
+  await sendTelegram('<b>[BUY-BACK held] ' + escTg(symbol.replace('-USD', '')) + '</b>\nThe tracker could not be cleared in the database (' + escTg(String(msg).slice(0, 80)) + '), so nothing was bought. It stays armed and is tried again on the next scan.').catch(() => {});
+}
+async function clearTroughTrackerBeforeBuy(symbol, restore) {
+  troughTrackers.delete(symbol);   // sync first: a concurrent scan cannot fire the same buy
+  try {
+    await db.execute(
+      'UPDATE pump_armed_rules SET sale_price=NULL, sale_proceeds_usd=NULL, reference_base=NULL, retrace_gate=NULL, trough_low=NULL, trough_armed=0 WHERE symbol=? AND active=1',   // same columns as clearTroughTracker
+      [symbol]
+    );
+    console.log('[trough] ' + symbol + ' tracker cleared (before buy)');
+    return true;
+  } catch (e) {
+    if (restore) troughTrackers.set(symbol, restore);
+    await clearFailTell('trough', symbol, e.message);
+    return false;
+  }
+}
+async function clearStandaloneTroughBeforeBuy(symbol, restore) {
+  standaloneTroughTrackers.delete(symbol);
+  try {
+    await db.execute('DELETE FROM standalone_trough_trackers WHERE symbol=?', [symbol]);
+    console.log('[trough-st] cleared (before buy): ' + symbol);
+    return true;
+  } catch (e) {
+    if (restore) standaloneTroughTrackers.set(symbol, restore);
+    await clearFailTell('trough-st', symbol, e.message);
+    return false;
+  }
+}
 
 function fmtPriceShort(n) {
   if (n === null || n === undefined) return '—';
@@ -12308,7 +12360,8 @@ async function runFastScan() {
           }
 
           // ALL GATES PASS -- clear tracker BEFORE placeRevolutOrder (Map.delete is sync; prevents double-fire on race/crash)
-          await clearTroughTracker(ttSymbol);
+          // #627 and the DB clear must succeed: on failure the tracker is restored and nothing is bought
+          if (!(await clearTroughTrackerBeforeBuy(ttSymbol, t))) { if (ttP0) await troughP0Mark(ttP0.decision_id, 'held_clear'); continue; }
 
           // Execute the buy
           let buyQty = null, ttOrderResp = null;   // #J1 the response outlives the try, for its order id
@@ -12432,7 +12485,7 @@ async function runFastScan() {
                   '<b>[TROUGH BLOCKED] ' + stB + '</b>\n$' + stAvailUsd.toFixed(2) + ' available, need $' + st.buyUsd + '. Cleared.', stAvailUsd);   // #413 with a Buy now button
                 await clearStandaloneTrough(stSym); continue;
               }
-              await clearStandaloneTrough(stSym);
+              if (!(await clearStandaloneTroughBeforeBuy(stSym, st))) continue;   // #627 DB clear must succeed before the order
               let stBuyQty = null, stResp = null;   // #J1 keep the response for its order id
               try {
                 stResp = await placeRevolutOrder(stSym, 'buy', 'market', null, null, st.buyUsd);
@@ -23509,11 +23562,25 @@ app.get('/api/sweep/config', async (req, res) => {
 // POST /api/sweep/config — save USDT sweep configuration
 app.post('/api/sweep/config', async (req, res) => {
   try {
-    const { enabled, sweep_pct, min_trade_value_usd, excluded_symbols } = req.body;
+    // #627 (13 Oct system check; a DASHBOARD_WRITES route, Fable pre-ship): every field is checked, a field not sent keeps its
+    // stored value (an empty body no longer switches the sweep ON), a bad value is refused with 400, and a change is reported on Telegram.
+    const b = req.body && typeof req.body === 'object' ? req.body : {};
     const [existing] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'usdt_sweep_config'");
     const current = existing.length ? JSON.parse(existing[0].config_value) : {};
-    const updated = { ...current, enabled: enabled !== false, sweep_pct: sweep_pct || 25, min_trade_value_usd: min_trade_value_usd || 10, excluded_symbols: excluded_symbols || current.excluded_symbols || [] };
+    const bad = [];
+    if (b.enabled !== undefined && typeof b.enabled !== 'boolean') bad.push('enabled must be true or false');
+    if (b.sweep_pct !== undefined && !(typeof b.sweep_pct === 'number' && b.sweep_pct >= 1 && b.sweep_pct <= 100)) bad.push('sweep_pct must be 1-100');
+    if (b.min_trade_value_usd !== undefined && !(typeof b.min_trade_value_usd === 'number' && b.min_trade_value_usd >= 0 && b.min_trade_value_usd <= 100000)) bad.push('min_trade_value_usd must be 0-100000');
+    if (b.excluded_symbols !== undefined && !(Array.isArray(b.excluded_symbols) && b.excluded_symbols.length <= 100 && b.excluded_symbols.every(s => typeof s === 'string' && /^[A-Z0-9]{1,15}(-USD)?$/.test(s)))) bad.push('excluded_symbols must be a list of coin symbols');
+    if (bad.length) return res.status(400).json({ error: bad.join('; ') });
+    const updated = { ...current,
+      enabled: b.enabled !== undefined ? b.enabled : current.enabled === true,
+      sweep_pct: b.sweep_pct !== undefined ? b.sweep_pct : (Number(current.sweep_pct) >= 1 && Number(current.sweep_pct) <= 100 ? Number(current.sweep_pct) : 25),
+      min_trade_value_usd: b.min_trade_value_usd !== undefined ? b.min_trade_value_usd : (Number(current.min_trade_value_usd) >= 0 ? Number(current.min_trade_value_usd) : 10),
+      excluded_symbols: b.excluded_symbols !== undefined ? b.excluded_symbols : (Array.isArray(current.excluded_symbols) ? current.excluded_symbols : []) };
     await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('usdt_sweep_config', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)", [JSON.stringify(updated)]);
+    if (updated.enabled !== (current.enabled === true) || updated.sweep_pct !== Number(current.sweep_pct) || updated.min_trade_value_usd !== Number(current.min_trade_value_usd))
+      await sendTelegram('💰 USDT sweep settings changed from the dashboard: ' + (updated.enabled ? '<b>ON</b>' : '<b>OFF</b>') + ', ' + updated.sweep_pct + '% of profit (or proceeds), sales of $' + updated.min_trade_value_usd + ' or more.').catch(() => {});
     res.json({ ok: true, config: updated });
   } catch (e) {
     res.status(500).json({ error: e.message });

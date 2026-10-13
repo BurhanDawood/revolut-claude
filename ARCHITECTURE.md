@@ -290,6 +290,8 @@ Starter buys of 10% on researched dip-zone coins without a dated catalyst (#584)
 
 ### 3.4 Rotations, payments and transactions (#457, #486, #537, #556, #568–#571, #605–#620)
 
+- **USDT sweep (#627):** after a qualifying sale, converts a share (1–100%) of the profit, or of the proceeds when there is no profit, to USDT; never more than the sale brought in; holds while auto-exec is paused. Its dashboard settings route validates every field and reports changes on Telegram.
+- **Buy-back clear-first (#627):** the trough and standalone-trough buy-backs clear their tracker in the database before the order; if that write fails, the tracker is restored and nothing is bought.
 - **Rotations:** trades in one 30-min window that move money out of one coin into another are tagged as one rotation (`rotation_sessions`) and reported in one message with Undo (#568–#570; the TRADE DETECTED question waits 11 min so a later buy folds in).
 - **Card payments:** the card watch records a coin card payment at the hold (#486), settles it against the raw total drop (§2.7b), and matches a settlement smaller than its hold (#571). Every payment is named with the shop from Revolut X transaction details (#605–#615).
 - **Transactions:** one queue for `GET /transactions` (1.5 s apart, 60 s pause after a 429, #556); a 30-day window reads up to 100 pages and reports an incomplete window instead of passing it (#620).
@@ -432,7 +434,7 @@ Reconstructed from git history and the dev_log. Not exhaustive — the `dev_log`
 
 The **`dev_log`** and the spec desk are the live boards. Open after the 13 Oct system check (server.js f09b564; line numbers as of then):
 
-- **Money path / standing rules:** her coin is checked only in PM proposals (`pmProposalCheck`), not in `mayAutoTrade` or spike insurance; the USDT sweep places a buy without reading the pause switch and its settings route takes unvalidated numbers; a trade during a restart is not detected (the first portfolio check after boot is skipped, then the snapshot is overwritten); the trough tracker clear swallows a DB error and the buy-back proceeds; a chase step counts a cancel on the DELETE answer, not a closed-order read; Kraken auto-sells are market-only with no fill reconciliation; Away Mode removes an up-target rung when the sale was refused; free Telegram text can attach to a pending trade as its reason (PM note #166); USDC is counted as cash in the portfolio history, the watch total and `get_portfolio_data`; the paper trader's live branch is pre-wired (for Fable).
+- **Money path / standing rules:** spike insurance covers her coin by Bryan's choice (13 Oct 22:53, whole holding), but a spike sale of her coin lands in USD, not her USDC, with no buy-back (needs a desk spec); a trade during a restart is not detected (the first portfolio check after boot is skipped, then the snapshot is overwritten); a chase step counts a cancel on the DELETE answer, not a closed-order read; Kraken auto-sells are market-only with no fill reconciliation; Away Mode removes an up-target rung when the sale was refused; free Telegram text can attach to a pending trade as its reason (PM note #166); USDC is counted as cash in the portfolio history, the watch total and `get_portfolio_data`; the paper trader's live branch is pre-wired (for Fable).
 - **Reliability:** no SIGTERM handling; no DB health check or Railway healthcheck, pool without timeouts or queue limit; no busy guard on the 30 s scan, 2-min capture, 5-min check and 60 s poller; `revolutRequest` has no timeout; the abnormal detector re-reads 14 days per coin every 2 min; `abn_config` boot load reads the wrong column; pending approvals live in memory only; ~6,000 pump-arm log lines an hour.
 - **Security:** the MCP path secret alone unlocks the autonomy switches (`configure_auto_execute`, `set_entry_price`, auto-executing trails); the in-app PM has three writes; no CSP on the shell pages; registered devices survive a key rotation; inbound Telegram text logged before the chat check; the Apply Surgical Patch and Deploy Approved Spec workflows can still write server.js without the base/after fingerprint.
 - **Data:** the nightly DB dump is built in memory and is not restorable for JSON and binary columns (never restore-tested); the 30-day prune is one unbatched DELETE without a date index; several tables grow without retention.
@@ -444,6 +446,7 @@ The **`dev_log`** and the spec desk are the live boards. Open after the 13 Oct s
 
 | Batch | Date | What changed |
 | --- | --- | --- |
+| #627 | 2026-10-13 | USDT sweep holds on `/pause`, share 1–100% and capped at the sale; sweep settings route validated and reported; buy-back clears must reach the DB before the order (Fable pre-ship). |
 | #626 | 2026-10-13 | This catch-up: §1.3–§1.7, §2.4, §3.2–§3.6, §5 doc rule, §7, §8. Docs only. |
 | #623–#625 | 2026-10-13 | Watch companion: `GET /api/watch` (+ holdings), `WATCH_TOKEN` one-path key, `GET /api/watch/key`, shell hands the watch key over. |
 | #621–#622 | 2026-10-13 | PM agent watch: notes inbox, one tap-only proposal, R4 clean-run count; 6,000-token output. |
