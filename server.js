@@ -30808,13 +30808,14 @@ async function watchSummary() {
   for (const r of mv) {
     const sym = String(r.symbol), coin = sym.replace(/-USD$/, ''), qty = Number(previousBalances.get(sym)) || 0, p0 = Number(r.p0), p1 = Number(r.p1);
     if (SKIP_CURRENCIES.includes(coin) || !(p0 > 0) || !(p1 > 0) || qty * p1 < 5) continue;
-    movers.push({ coin, pct: Math.round((p1 / p0 - 1) * 1000) / 10, price: Number(p1.toPrecision(6)) });
+    movers.push({ coin, pct: Math.round((p1 / p0 - 1) * 1000) / 10, price: Number(p1.toPrecision(6)), usd: Math.round(qty * p1 * 100) / 100 });
   }
+  const holdings = movers.slice().sort((a, b) => b.usd - a.usd).slice(0, 25).map(h => ({ coin: h.coin, usd: h.usd, pct: h.pct }));   // #624 the watch app's holdings list (W3: still this one path)
   movers.sort((a, b) => Math.abs(b.pct) - Math.abs(a.pct));
   const [[u]] = await db.execute('SELECT COUNT(*) AS n FROM pm_notes WHERE read_at IS NULL');
   const L = st.latest || {};
   const body = { v: 1, at: new Date().toISOString(), updated_ts: L.ts || null, partial: !!L.partial, total_usd: L.total != null ? Math.round(L.total * 100) / 100 : null,
-    pnl_day_usd: sp.change, pnl_day_pct: sp.pct, movers: movers.slice(0, 3), unread_pm_notes: Number(u.n) || 0 };
+    pnl_day_usd: sp.change, pnl_day_pct: sp.pct, movers: movers.slice(0, 3).map(m => ({ coin: m.coin, pct: m.pct, price: m.price })), holdings, unread_pm_notes: Number(u.n) || 0 };
   _watchCache = { at: Date.now(), body };
   return body;
 }
