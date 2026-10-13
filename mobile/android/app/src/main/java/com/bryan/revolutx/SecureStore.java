@@ -54,6 +54,16 @@ final class SecureStore {
         return get(ctx).getString(KEY, null);
     }
 
+    /**
+     * Desk #59: the last resort when a write that removes a key fails (commit() returns false, it does not throw): the whole
+     * file goes, so no old key can be read back. The shell hands the dashboard key over again on its next start.
+     */
+    static synchronized void reset(Context ctx) {
+        Context app = ctx.getApplicationContext();
+        app.deleteSharedPreferences(FILE);
+        prefs = null;
+    }
+
     static String watchKey(Context ctx) {
         return get(ctx).getString(WATCH_KEY, null);
     }

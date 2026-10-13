@@ -50,7 +50,7 @@ final class WatchBridge {
             return;
         }
         if (watchKey.equals(SecureStore.watchKey(app))) return;   // unchanged: the start-up sync covers it
-        SecureStore.get(app).edit().putString(SecureStore.WATCH_KEY, watchKey).remove(SecureStore.WATCH_NONE).commit();
+        if (!SecureStore.get(app).edit().putString(SecureStore.WATCH_KEY, watchKey).remove(SecureStore.WATCH_NONE).commit()) return;
         eachWatch(app, node ->
             Wearable.getMessageClient(app).sendMessage(node, PATH_CLEAR, new byte[0])
                 .addOnCompleteListener(t -> sendCurrent(app, node))
@@ -60,7 +60,14 @@ final class WatchBridge {
     /** An explicit "no watch key" (the server has none, or the dashboard key was removed): the watch is cleared. */
     static void noWatchKey(Context ctx) {
         Context app = ctx.getApplicationContext();
-        SecureStore.get(app).edit().remove(SecureStore.WATCH_KEY).putBoolean(SecureStore.WATCH_NONE, true).commit();
+        boolean ok;
+        try {
+            ok = SecureStore.get(app).edit().remove(SecureStore.WATCH_KEY).putBoolean(SecureStore.WATCH_NONE, true).commit();
+        } catch (Exception e) {
+            ok = false;
+        }
+        // commit() returns false on a failed write: then the file goes, so the old watch key is never re-sent on a hello
+        if (!ok) SecureStore.reset(app);
         eachWatch(app, node -> Wearable.getMessageClient(app).sendMessage(node, PATH_CLEAR, new byte[0]));
     }
 
@@ -119,7 +126,7 @@ final class WatchBridge {
                     JSONObject j = new JSONObject(read(c.getInputStream()));
                     SharedPreferences p = SecureStore.get(app);
                     if (j.has("key") && j.isNull("key")) {
-                        p.edit().remove(SecureStore.WATCH_KEY).putBoolean(SecureStore.WATCH_NONE, true).commit();
+                        if (!p.edit().remove(SecureStore.WATCH_KEY).putBoolean(SecureStore.WATCH_NONE, true).commit()) SecureStore.reset(app);
                     } else {
                         Object wk = j.opt("key");
                         if (wk instanceof String && ((String) wk).matches(WATCH_KEY_RE) && !wk.equals(key)) {
