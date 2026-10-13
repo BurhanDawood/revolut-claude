@@ -27,11 +27,19 @@ logs() {   # logs <title>: what Wear OS said about faces and complications since
   echo "::endgroup::"
 }
 
-to_face() {   # HOME goes to the face from an app, but opens the app list from the face; BACK from there is the face
-  adb shell input keyevent KEYCODE_HOME
-  sleep 2
-  adb shell input keyevent KEYCODE_BACK
-  sleep 2
+to_face() {   # the HOME intent shows the watch face (the HOME key toggles to the app list); unplugged, so no charging screen
+  adb shell dumpsys battery unplug >/dev/null 2>&1
+  adb shell dumpsys battery set status 3 >/dev/null 2>&1
+  adb shell am start -W -a android.intent.action.MAIN -c android.intent.category.HOME >/dev/null 2>&1
+  sleep 3
+  local top
+  top=$(adb shell dumpsys activity activities 2>/dev/null | grep -m1 -E 'topResumedActivity|mResumedActivity' | sed 's/^ *//')
+  if echo "$top" | grep -qi 'launcher'; then   # still the app list: the HOME key goes back to the face from there
+    adb shell input keyevent KEYCODE_HOME
+    sleep 3
+    top=$(adb shell dumpsys activity activities 2>/dev/null | grep -m1 -E 'topResumedActivity|mResumedActivity' | sed 's/^ *//')
+  fi
+  echo "on screen: $top"
 }
 
 set_face() {   # set_face: Google's documented developer command for a Watch Face Format face
