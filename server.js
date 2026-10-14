@@ -30917,6 +30917,24 @@ async function watchCoinCandles(c) {
   } catch (e) { return null; }
 }
 const _watchCoinCache = new Map();   // query key -> { at, body }, 30 s, at most 20 keys
+// #632 (Bryan 14 Oct 14:01: read the PM notes on the watch's Tile and app; Fable's W3 amendment, desk #59 msg 646, N1-N6): the newest 8
+// pm_notes ONLY (N1 - never the family page's notes, the desk, team notes or a handover), read-only. Text cleaned here before it leaves (N2):
+// control and bidi characters removed (line breaks kept in the body), title cut at 120 and body at 700, plain text. `read` comes from read_at
+// and nothing here writes (N3). One DB read per 30 s whatever the number of Tiles (N4). No proposal JSON is selected or sent.
+const _watchNotesCache = { at: 0, body: null };
+function watchNoteText(s, max, keepLines) {
+  let t = String(s == null ? '' : s).replace(/[\u0000-\u0009\u000B-\u001F\u007F\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/g, ' ');
+  t = keepLines ? t.replace(/[ \t]+/g, ' ').replace(/ *\n */g, '\n').replace(/\n{3,}/g, '\n\n') : t.replace(/\s+/g, ' ');
+  return t.trim().slice(0, max);
+}
+async function watchNotes() {
+  if (_watchNotesCache.body && Date.now() - _watchNotesCache.at < 30000) return _watchNotesCache.body;
+  const [rows] = await db.execute('SELECT id, at, kind, coin, severity, title, body, read_at FROM pm_notes ORDER BY at DESC LIMIT 8');
+  const body = rows.map(r => ({ id: Number(r.id), at: Number(r.at), kind: watchNoteText(r.kind, 24), coin: r.coin ? watchNoteText(r.coin, 15) : null,
+    severity: watchNoteText(r.severity || 'info', 12), title: watchNoteText(r.title, 120), body: watchNoteText(r.body, 700, true), read: r.read_at != null }));
+  _watchNotesCache.at = Date.now(); _watchNotesCache.body = body;
+  return body;
+}
 async function watchExtras(q) {
   const out = {};
   const raw = typeof q.coins === 'string' ? q.coins.slice(0, 100) : '';
@@ -30951,6 +30969,7 @@ async function watchExtras(q) {
     for (const [s, q2] of previousBalances) { const c = coinSym(s); if (c && Number(q2) > 0) set.add(c); }
     out.choices = [...set].filter(c => !SKIP_CURRENCIES.includes(c)).sort().slice(0, 200);
   }
+  if (q.notes === '1') out.notes = await watchNotes();   // #632
   return Object.keys(out).length ? out : null;
 }
 app.get('/api/watch', async (req, res) => { try { const body = await watchSummary(); const extra = await watchExtras(req.query || {}); res.set('Cache-Control', 'no-store').json(extra ? { ...body, ...extra } : body); } catch (e) { console.error('[watch-app] #623 /api/watch:', e.message); res.set('Cache-Control', 'no-store').status(500).json({ error: 'unavailable' }); } });
