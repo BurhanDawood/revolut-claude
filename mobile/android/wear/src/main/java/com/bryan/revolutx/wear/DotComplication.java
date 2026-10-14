@@ -21,7 +21,7 @@ public class DotComplication extends ComplicationBase {
         if (type != ComplicationType.RANGED_VALUE || s == null) return null;
         SparkCard.Model m = SparkCard.model(this, s);
         float y = m.lastY();
-        if (y < 0) return null;
+        if (y < 0 || m.stale != null) return null;   // old numbers: no live dot, so nothing pulses as if it were live
         y = Math.max(0f, Math.min(1f, y));
         float v = m.up ? y : -1f - y;
         RangedValueComplicationData.Builder b = new RangedValueComplicationData.Builder(v, -2f, 1f, text(m.describe()))

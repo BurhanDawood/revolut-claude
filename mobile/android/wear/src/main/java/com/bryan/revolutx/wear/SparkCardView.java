@@ -60,7 +60,9 @@ final class SparkCardView extends View {
             }
         }
         shown = ys;
-        float pulse = ys == null ? -1f : ((now - born) % SparkCard.PULSE_MS) / (float) SparkCard.PULSE_MS;
+        // old numbers: a still dot (SparkCard.STILL_PULSE), so nothing pulses as if it were live
+        float pulse = ys == null ? -1f : model.stale != null ? SparkCard.STILL_PULSE
+            : ((now - born) % SparkCard.PULSE_MS) / (float) SparkCard.PULSE_MS;
         // the face itself at the screen's full width, with the clock the face draws natively
         SparkCard.draw(c, getWidth() / SparkCard.W, model, ys, pulse, DateFormat.is24HourFormat(getContext()));
         if (ys == null) postInvalidateDelayed(1000);   // the clock still ticks without a line

@@ -40,7 +40,7 @@ final class SparkCard {
     static final float BOX_H = 240f;
     static final float PAD = 10f;         // inside the box: the line spans y 130..350
     static final float LINE_RIGHT = 392f; // the last point: inside the circle with its ring at the box's lowest point
-    static final float CAPTION_BASE = 392f;
+    static final float CAPTION_BASE = 380f;   // where the circle is still ~330 wide
     static final float STROKE = 4f;       // a thick line
     static final int N = 90;              // the app's RX_SPARK.n
 
@@ -62,7 +62,7 @@ final class SparkCard {
         String range = "";       // "6h", or "Today" when there is no series
         String change = "";
         int color = UP;
-        @Nullable String stale;  // the last answer's time when it is over 15 minutes old or the last fetch failed
+        @Nullable String stale;  // the last answer's time when it is over 15 minutes old or the last fetch failed: no pulse then
         @Nullable String message;   // instead of the caption when there are no numbers
 
         /** The line's last point, 0..1 from the top, for the face's dot; -1 without a line. */
@@ -157,7 +157,9 @@ final class SparkCard {
     static void draw(Canvas c, float sc, Model m, @Nullable float[] ys, float pulse, @Nullable Boolean clock) {
         if (ys == null) ys = m.ys;
         c.drawColor(0xFF000000);
-        if (ys != null) drawLine(c, 0, BOX_TOP * sc, LINE_RIGHT * sc, BOX_H * sc, PAD * sc, sc, STROKE, ys, m.color, true, pulse);
+        // old numbers on the face: a still dot here (the face's own pulsing dot is off then)
+        float dot = pulse < 0 && m.stale != null ? 0f : pulse;
+        if (ys != null) drawLine(c, 0, BOX_TOP * sc, LINE_RIGHT * sc, BOX_H * sc, PAD * sc, sc, STROKE, ys, m.color, true, dot);
         // a soft dark glow behind the time and date, so they stay readable where the line's peaks rise behind them
         Paint scrim = new Paint(Paint.ANTI_ALIAS_FLAG);
         scrim.setColor(0x73000000);
@@ -175,22 +177,12 @@ final class SparkCard {
             c.drawText(m.message, W * sc / 2, base, cap);
             return;
         }
+        // "6h -$121.01 (-2.51%)" alone, as large as fits the circle there (old numbers: the dot stops pulsing instead)
         String text = (m.range + " " + m.change).trim();
-        String tail = m.stale == null ? "" : "  " + m.stale;   // old numbers: their time after them, grey
         cap.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
-        cap.setTextSize(fit(cap, text + tail, 31 * sc, 300 * sc));   // as large as fits the circle at that height
+        cap.setTextSize(fit(cap, text, 36 * sc, 318 * sc));
         cap.setColor(m.color);
-        Paint grey = new Paint(cap);
-        grey.setTypeface(Typeface.DEFAULT);
-        grey.setColor(MUTED);
-        grey.setTextSize(cap.getTextSize() * 0.7f);
-        float w1 = cap.measureText(text);
-        float w2 = tail.isEmpty() ? 0 : grey.measureText(tail);
-        float x = (W * sc - w1 - w2) / 2;
-        cap.setTextAlign(Paint.Align.LEFT);
-        grey.setTextAlign(Paint.Align.LEFT);
-        c.drawText(text, x, base, cap);
-        if (w2 > 0) c.drawText(tail, x + w1, base, grey);
+        c.drawText(text, W * sc / 2, base, cap);
     }
 
     /** The largest size up to max at which text fits width. */
