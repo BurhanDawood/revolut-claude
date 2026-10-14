@@ -30906,6 +30906,16 @@ async function watchSummary() {
 // price, 24 h move, his holding in $ and its own 24 h line (thinned to 48 values; only coins the system captures prices for have a line);
 // ?choices=1 adds choices[] - the coins he can pick from (the tracked list plus anything held). Read-only numbers on the same one path:
 // the watch keeps its choice on the watch and sends it with each read; nothing is written. Never USD/USDT/USDC/EUR/GBP.
+// #631 (Bryan 14 Oct 14:01: coin Tiles drawn as candles with volume, like the exchange chart): the coin page's own hourly candles
+// (coinCandles '1h', cached there; Revolut X, else the system's own) cut to the last 24, as [t, o, h, l, c, v] (v null when unknown).
+async function watchCoinCandles(c) {
+  try {
+    const d = await coinCandles(c, '1h');
+    const k = (d && Array.isArray(d.candles) ? d.candles : []).filter(x => x && x.t >= Date.now() / 1000 - 86400 - 3600).slice(-24);
+    const r = (v) => (v == null || !isFinite(v) ? null : Number(Number(v).toPrecision(6)));
+    return k.length >= 2 ? k.map(x => [x.t, r(x.o), r(x.h), r(x.l), r(x.c), x.v != null ? r(x.v) : null]) : null;
+  } catch (e) { return null; }
+}
 const _watchCoinCache = new Map();   // query key -> { at, body }, 30 s, at most 20 keys
 async function watchExtras(q) {
   const out = {};
@@ -30927,7 +30937,8 @@ async function watchExtras(q) {
         coins.push({ coin: c, price: price != null ? Number(price.toPrecision(6)) : null,
           pct_24h: price != null && n && vals[0] > 0 ? Math.round((price / vals[0] - 1) * 1000) / 10 : null,
           usd_held: price != null && qty > 0 ? Math.round(qty * price * 100) / 100 : 0,
-          spark: pts.length >= 2 ? pts.slice(-49) : null });
+          spark: pts.length >= 2 ? pts.slice(-49) : null,
+          candles: await watchCoinCandles(c) });   // #631 the last 24 hourly candles with volume, for the candle chart on the coin Tiles
       }
       if (_watchCoinCache.size >= 20) _watchCoinCache.delete(_watchCoinCache.keys().next().value);
       _watchCoinCache.set(key, { at: Date.now(), body: coins });
