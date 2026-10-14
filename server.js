@@ -1807,6 +1807,7 @@ let lastMacroNewsCallTime = 0; // separate rate-limit for macro news Claude call
 let learningModelCache = ''; // updated by updateLearningModel()
 const pendingJournalState = new Map(); // chatId -> { journalId, step: 'emotion'|'followed', hasClaudeRec, claudeRec, symbol }
 let pendingJournalDelete = null; // { id, summary, expiresAt } — admin two-step delete guard
+const _pumpArmLogAt = new Map();   // #635 symbol -> last "watching" log line
 const pendingTradeContext = new Map(); // symbol -> { journalId, detectedAt, timeoutHandle, action, price, valueUsd, qty }
 const pendingRebalanceConfirm = new Map(); // chatId -> { sellSymbol, sellJournalId, sellPrice, sellValueUsd, buySymbol, buyJournalId, buyPrice, buyValueUsd }
 const previousBalances = new Map(); // symbol -> quantity (DB-backed)
@@ -3233,7 +3234,7 @@ try {
 // #50C boot-load abnormal-move tunable config from system_config
 try {
   const [abnCfgRows] = await db.execute("SELECT config_value FROM system_config WHERE config_key='abn_config'");
-  if (abnCfgRows.length) { Object.assign(abnConfig, JSON.parse(abnCfgRows[0].value)); console.log('[abn] config loaded:', JSON.stringify(abnConfig)); }
+  if (abnCfgRows.length) { Object.assign(abnConfig, JSON.parse(abnCfgRows[0].config_value)); /* #635 was .value: the saved settings never loaded at boot */ console.log('[abn] config loaded:', JSON.stringify(abnConfig)); }
 } catch (e) { console.error('[abn] config boot-load error:', e.message); }
 try {
   const [ttRows] = await db.execute(
@@ -7549,7 +7550,10 @@ async function checkPumpArm(symbol, currentPrice) {
           : `\n⚠️ Stage 1 — monitoring only, no auto-sell yet. You'll be alerted if the trail breaches.`)
       ).catch(() => {});
     } else {
-      console.log(`[pump-arm] ${symbol} watching — +${pumpPct.toFixed(1)}% of ${rule.arm_pump_pct}% needed`);
+      if (pumpPct >= Number(rule.arm_pump_pct) / 2 || Date.now() - (_pumpArmLogAt.get(symbol) || 0) > 3600000) {   // #635 only near the line, else hourly (was ~6,000 lines an hour)
+        _pumpArmLogAt.set(symbol, Date.now());
+        console.log(`[pump-arm] ${symbol} watching — +${pumpPct.toFixed(1)}% of ${rule.arm_pump_pct}% needed`);
+      }
     }
   } catch (e) {
     console.error('[pump-arm] error:', e.message);
@@ -11545,6 +11549,7 @@ async function portfolioValueSample(nowMs = Date.now()) {
     const cur = String(a.currency || '').toUpperCase(); if (!cur) continue;
     const qty = (parseFloat(a.available) || 0) + (parseFloat(a.reserved) || 0);
     if (!(qty > 0)) continue;
+    if (cur === 'USDC') continue;   // #635 (system check #9): every USDC is his wife's cash - shown on her page, never in Bryan's total
     if (PV_CASH_USD.includes(cur)) { cash += qty; continue; }
     if (cur === 'EUR' || cur === 'GBP') { const fx = px[cur + '-USD'] || await pvFx(cur, nowMs); if (fx) { _pvLastPx[cur + '-USD'] = fx; cash += qty * fx; } continue; }
     const sym = cur + '-USD';
@@ -16316,7 +16321,7 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
         `<b>⏰ REPLY NOW — auto-logs in 30 min</b>\n\n` +
         `Action: ${actionLabel} ~${formatTradeQty(absQty)} tokens at ${formatPrice(price)} ($${valueUsd.toFixed(2)})${pnlLine}${avgEntryLine}${recLine}${reentryLine}\n\n` +
         `Tap a reason below - it still works after the 30-min timer.\n` +
-        `Or reply '<b>taking profits</b>', '<b>rebalance [coin]</b>', '<b>payment</b>', '<b>transfer</b>' or '<b>skip</b>'.`;
+        `Or reply to this message with why, or send '<b>taking profits</b>', '<b>rebalance [coin]</b>', '<b>payment</b>', '<b>transfer</b>' or '<b>skip</b>'.`;   // #635
       // #337: stateless buttons bound to this journal row. If building them fails, the alert still
       // goes out without buttons and the typed replies above keep working.
       let tradeKb;
@@ -24345,11 +24350,12 @@ let rows, dailyFrom = null;
           positions.sort((a, b) => (parseFloat(b.value_usd) || 0) - (parseFloat(a.value_usd) || 0));
 
           // Surface USDT/USD cash without adding to crypto positions[]
-          var revolutUsdt = 0, revolutUsd = 0;
+          var revolutUsdt = 0, revolutUsd = 0, herUsdc = 0;
           for (var i = 0; i < balances.length; i++) {
             var cashCurrency = balances[i].currency;
             var cashAmt = parseFloat(balances[i].available || 0);
-            if (cashCurrency === 'USDT' || cashCurrency === 'USDC') revolutUsdt += cashAmt;
+            if (cashCurrency === 'USDC') herUsdc += cashAmt;   // #635 his wife's cash: reported apart, never in his cash or total
+            else if (cashCurrency === 'USDT') revolutUsdt += cashAmt;
             else if (cashCurrency === 'USD') revolutUsd += cashAmt;
           }
           var revolutCash = revolutUsdt + revolutUsd;
@@ -24360,6 +24366,7 @@ let rows, dailyFrom = null;
             usdt_balance: revolutUsdt.toFixed(2),
             usd_balance: revolutUsd.toFixed(2),
             cash_balance: revolutCash.toFixed(2),
+            her_usdc_not_counted: herUsdc.toFixed(2),   // #635
             total_with_cash_usd: (totalValue + revolutCash).toFixed(2),
             invested: cap.invested,
             pl_usd: cap.pnl.toFixed(2),
@@ -33248,6 +33255,13 @@ app.post('/telegram-webhook', async (req, res) => {
     if (pendingTradeContext.size > 0) {
       const EMOTION_WORDS = ['confident', 'uncertain', 'fomo', 'fearful', 'neutral'];
       const lowerMsg = commandText.toLowerCase();
+      // #635 (PM note #166: a copy box "remove NEAR targets 237 and 238" became the CC buy's reason): free text is a trade's reason only
+      // when it is a reply to that trade's TRADE DETECTED message, starts with "reason"/"why"/"because", or reads as trade talk. The coin
+      // is matched as a whole word (it was a substring: "cc" in "account"). Other text falls through to the normal handlers.
+      const replyTo = message.reply_to_message && typeof message.reply_to_message.text === 'string' ? message.reply_to_message.text : '';
+      const isReplyTo = (sym) => replyTo.includes('TRADE DETECTED — ' + sym);
+      const looksLikeReason = /^(reason|why|because)\b/i.test(lowerMsg.trim()) || /\b(bought|buy|buying|sold|sell|selling|profits?|dip|pump(ed|ing)?|rebalanc\w*|top(ped)? ?up|stop|loss|exit|average|dca|fomo|panic|scared|nervous|confident|hodl|rotat\w*|swap(ped)?|news|breakout|support|resistance)\b/i.test(lowerMsg);
+      const mentionsCoin = (c) => new RegExp('(^|[^a-z0-9])' + c.replace(/[^a-z0-9]/g, '') + '([^a-z0-9]|$)').test(lowerMsg);
 
       // Find which pending coins are mentioned (or referenced) in this message
       const matchedPending = [];
@@ -33260,7 +33274,7 @@ app.post('/telegram-webhook', async (req, res) => {
           (lowerMsg.trim() === 'skip' && pendingTradeContext.size === 1)
         ) {
           matchedPending.push({ symbol, pending, skip: true });
-        } else if (lowerMsg.includes(coinBase)) {
+        } else if (isReplyTo(symbol) || (mentionsCoin(coinBase) && looksLikeReason)) {   // #635
           matchedPending.push({ symbol, pending, skip: false });
         }
       }
@@ -33281,7 +33295,7 @@ app.post('/telegram-webhook', async (req, res) => {
           // #224/#227: capital commands must NEVER be swallowed as trade-context reasoning while a trade
           // is pending enrichment. Mirror the dedicated handlers' own regexes so they fall through to them.
           const isCapitalCommand = /^skip payment(?:\s+[\d.]+)?$|^(?:i )?(?:deposited?|withdrew?)\s+\$?[\d,]|^(?:total invested|invested capital)\b/i.test(commandText);
-          if (!isKnownCommand && !isCapitalCommand) {
+          if (!isKnownCommand && !isCapitalCommand && (isReplyTo(symbol) || looksLikeReason)) {   // #635 not any text
             matchedPending.push({ symbol, pending, skip: false });
           }
         }
