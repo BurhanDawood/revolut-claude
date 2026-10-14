@@ -2690,6 +2690,15 @@ await safeAddColumn('spike_events', 'sold_at', 'DATETIME NULL');
 await safeAddColumn('spike_events', 'note', 'VARCHAR(200) NULL');
 await safeAddColumn('trailing_stops', 'source', 'VARCHAR(8) NULL');   // #B23 A5: loop | manual | spike (NULL = rows from before)
 setTimeout(() => { repairAgentFills().catch(e => console.error('[agent] boot repair failed:', e.message)); }, 30 * 1000);   // #B21 a fill recorded but not applied before a restart
+setTimeout(async () => {   // #629 boot check: a ledger that says 'live' while live is switched off in code gets ONE warning line
+  try {
+    const [r] = await db.execute('SELECT mode FROM agent_ledger WHERE id = 1');
+    if (r.length && r[0].mode === 'live' && !AGENT_LIVE_ENABLED) {
+      console.error('[agent] #629 agent_ledger.mode is live but AGENT_LIVE_ENABLED is false - every decision will be dropped');
+      await sendTelegram('⚠️ <b>Agent</b>: its ledger says <b>live</b>, but live trading is switched off in code (55x not built). No real order can be placed; every decision is dropped. Stop it with /agent stop and tell the Dev thread.').catch(() => {});
+    }
+  } catch (e) { console.error('[agent] #629 boot check failed:', e.message); }
+}, 40 * 1000);
 await safeAddColumn('trailing_stops',   'auto_execute',    'TINYINT(1) NOT NULL DEFAULT 0'); // #93
 await safeAddColumn('price_targets',    'sell_pct',        'DECIMAL(5,2) NULL'); // #144 per-rung sell %% override for Away Mode up-targets
 await safeAddColumn('trailing_stops',   'sell_pct',        'DECIMAL(10,4) DEFAULT 25.0');   // #93
@@ -9422,6 +9431,7 @@ async function haltAgent(reason) {
   } catch (e) { held = ''; }
   await sendTelegram('🛑 <b>Agent HALTED</b> - ' + escTg(reason) + '. It will not trade again until you decide: <code>/agent resume confirm</code> restarts it (a halt is a failed proof, so restarting is a decision).' + held).catch(() => {});
 }
+const AGENT_LIVE_ENABLED = false;   // #629 the paper trader can never place a real order until the 55x spec (Fable pre-ship) flips this
 async function agentDrop(d, status, reason) {
   await db.execute('UPDATE agent_decisions SET status = ?, drop_reason = ? WHERE id = ?', [status, String(reason || '').slice(0, 40), d.id]).catch(e => console.error('[agent] decision update failed:', e.message));
   console.log('[agent] #' + d.id + ' ' + d.side + ' ' + d.symbol + ' ' + status + ': ' + reason);
@@ -9490,6 +9500,13 @@ async function executeAgentOrder(d) {
     return await agentFinishFill(d, coin, 'paper', fillPx, qty, fee);
   }
   if (led.mode !== 'live') return agentDrop(d, 'dropped_rail', 'mode_' + led.mode);   // belt and braces: only 'live' reaches the venue
+  // #629 (Fable ruling 13 Oct, desk #60 msg 620): the live branch below was written ahead of the 55x design and never reviewed as it.
+  // No code sets agent_ledger.mode to 'live' today, so only a direct DB edit could reach it - one accident from real orders. It is
+  // inert IN CODE until the 55x spec, cleared by Fable, flips AGENT_LIVE_ENABLED with its own rules. Nothing else here changes.
+  if (!AGENT_LIVE_ENABLED) {
+    sendTelegram('🧪 <b>Agent</b>: decision #' + d.id + ' (' + escTg(d.side) + ' ' + escTg(d.symbol) + ') was NOT sent - the ledger says live but live trading is switched off in code (55x not built). Check agent_ledger.mode.').catch(() => {});
+    return agentDrop(d, 'dropped_rail', 'live_not_enabled');
+  }
   // ── LIVE (A4 switches it on; inert in A1) ──
   const cid = 'agent-' + d.id;
   await db.execute('UPDATE agent_decisions SET client_order_id = ? WHERE id = ?', [cid, d.id]).catch(() => {});

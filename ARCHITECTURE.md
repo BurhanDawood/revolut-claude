@@ -287,7 +287,7 @@ Every automatic order path now sits behind layered controls. Preventive controls
 
 ### 3.3 The paper trader (§1.2) since #549
 
-Starter buys of 10% on researched dip-zone coins without a dated catalyst (#584); research slots go to dip-zone coins first; a position stop wakes it only if still hit 15 min later or 3% past (#572); Bryan's playbook (#617, 1,143 characters, paper only). Its `executeAgentOrder` contains a live branch for the future A4 switch that is unreachable while the ledger mode is paper (§7).
+Starter buys of 10% on researched dip-zone coins without a dated catalyst (#584); research slots go to dip-zone coins first; a position stop wakes it only if still hit 15 min later or 3% past (#572); Bryan's playbook (#617, 1,143 characters, paper only). Its `executeAgentOrder` live branch is inert in code since #629 (`AGENT_LIVE_ENABLED = false`, Fable's ruling): a ledger that says live drops every decision as `live_not_enabled` with a Telegram line, and boot warns once. The 55x spec, cleared by Fable, flips the constant.
 
 ### 3.4 Rotations, payments and transactions (#457, #486, #537, #556, #568–#571, #605–#620)
 
@@ -435,7 +435,7 @@ Reconstructed from git history and the dev_log. Not exhaustive — the `dev_log`
 
 The **`dev_log`** and the spec desk are the live boards. Open after the 13 Oct system check (server.js f09b564; line numbers as of then):
 
-- **Money path / standing rules:** spike insurance covers her coin by Bryan's choice (13 Oct 22:53, whole holding), but a spike sale of her coin lands in USD, not her USDC, with no buy-back (needs a desk spec); a trade during a restart is not detected (the first portfolio check after boot is skipped, then the snapshot is overwritten); a chase step counts a cancel on the DELETE answer, not a closed-order read; Kraken auto-sells are market-only with no fill reconciliation; Away Mode removes an up-target rung when the sale was refused; free Telegram text can attach to a pending trade as its reason (PM note #166); USDC is counted as cash in the portfolio history, the watch total and `get_portfolio_data`; the paper trader's live branch is pre-wired (for Fable).
+- **Money path / standing rules:** spike insurance covers her coin by Bryan's choice (13 Oct 22:53, whole holding), but a spike sale of her coin lands in USD, not her USDC, with no buy-back (needs a desk spec); a trade during a restart is not detected (the first portfolio check after boot is skipped, then the snapshot is overwritten); a chase step counts a cancel on the DELETE answer, not a closed-order read; Kraken auto-sells are market-only with no fill reconciliation; Away Mode removes an up-target rung when the sale was refused; free Telegram text can attach to a pending trade as its reason (PM note #166); USDC is counted as cash in the portfolio history, the watch total and `get_portfolio_data`.
 - **Reliability:** no SIGTERM handling; no DB health check or Railway healthcheck, pool without timeouts or queue limit; no busy guard on the 30 s scan, 2-min capture, 5-min check and 60 s poller; `revolutRequest` has no timeout; the abnormal detector re-reads 14 days per coin every 2 min; `abn_config` boot load reads the wrong column; pending approvals live in memory only; ~6,000 pump-arm log lines an hour.
 - **Security:** the MCP path secret alone unlocks the autonomy switches (`configure_auto_execute`, `set_entry_price`, auto-executing trails); the in-app PM has three writes; no CSP on the shell pages; registered devices survive a key rotation; inbound Telegram text logged before the chat check; the Apply Surgical Patch and Deploy Approved Spec workflows can still write server.js without the base/after fingerprint.
 - **Data:** the nightly DB dump is built in memory and is not restorable for JSON and binary columns (never restore-tested); the 30-day prune is one unbatched DELETE without a date index; several tables grow without retention.
@@ -447,6 +447,7 @@ The **`dev_log`** and the spec desk are the live boards. Open after the 13 Oct s
 
 | Batch | Date | What changed |
 | --- | --- | --- |
+| #629 | 2026-10-14 | The paper trader's pre-wired live branch made inert in code (`AGENT_LIVE_ENABLED = false`, drop `live_not_enabled`, boot warning). Fable ruling; pre-ship. |
 | #633 | 2026-10-14 | Watch coin Tiles: XRP's holding includes the Tangem wallet (`usd_held` total, `usd_tangem` part). Display only. |
 | #632 | 2026-10-14 | `GET /api/watch?notes=1`: the newest 8 PM notes (cleaned title/body, coin, read) for the watch Tile and app; read-only, cached 30 s, no proposal data. W3 amended (Fable N1-N6). |
 | #631 | 2026-10-14 | `GET /api/watch?coins=…` adds each coin's last 24 hourly candles with volume (from the coin page's candles) for candle-chart coin Tiles. Display only. |
