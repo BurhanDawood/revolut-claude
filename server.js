@@ -30951,8 +30951,13 @@ async function watchExtras(q) {
         for (let k = 0; k < n; k += step) pts.push(Number(vals[k].toPrecision(6)));
         if (n && pts[pts.length - 1] !== Number(vals[n - 1].toPrecision(6))) pts.push(Number(vals[n - 1].toPrecision(6)));
         const price = tick[c] && tick[c].mid > 0 ? tick[c].mid : (n ? vals[n - 1] : null);
-        const qty = Number(previousBalances.get(c + '-USD')) || 0;
+        // #633 (Bryan 14 Oct 15:55: XRP on Coin 2 must show all his XRP, Tangem included - Revolut X holds only dust): XRP adds the Tangem
+        // wallet's balance as the whole-book value sampler last read it (#PV1, refreshed every 30 min from the public XRP ledger; no call here).
+        const qtyRx = Number(previousBalances.get(c + '-USD')) || 0;
+        const qtyTangem = c === 'XRP' && _pvTangem.qty > 0 ? Number(_pvTangem.qty) : 0;
+        const qty = qtyRx + qtyTangem;
         coins.push({ coin: c, price: price != null ? Number(price.toPrecision(6)) : null,
+          ...(qtyTangem > 0 && price != null ? { usd_tangem: Math.round(qtyTangem * price * 100) / 100 } : {}),
           pct_24h: price != null && n && vals[0] > 0 ? Math.round((price / vals[0] - 1) * 1000) / 10 : null,
           usd_held: price != null && qty > 0 ? Math.round(qty * price * 100) / 100 : 0,
           spark: pts.length >= 2 ? pts.slice(-49) : null,
