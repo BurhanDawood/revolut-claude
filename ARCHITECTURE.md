@@ -448,6 +448,7 @@ The **`dev_log`** and the spec desk are the live boards. Open after the 13 Oct s
 | Batch | Date | What changed |
 | --- | --- | --- |
 | #629 | 2026-10-14 | The paper trader's pre-wired live branch made inert in code (`AGENT_LIVE_ENABLED = false`, drop `live_not_enabled`, boot warning). Fable ruling; pre-ship. |
+| #637 | 2026-10-14 | PM agent watch: max_tokens 6000 → 9000 after run #20 hit the limit (PM note 184). R4 clean-run count restarts (it was 0). |
 | #635 | 2026-10-14 | System check E: `abn_config` loads at boot; trade reasons only from replies/"reason:"/trade talk (PM #166); USDC out of Bryan's live total; pump-arm log only near the line or hourly. |
 | #633 | 2026-10-14 | Watch coin Tiles: XRP's holding includes the Tangem wallet (`usd_held` total, `usd_tangem` part). Display only. |
 | #632 | 2026-10-14 | `GET /api/watch?notes=1`: the newest 8 PM notes (cleaned title/body, coin, read) for the watch Tile and app; read-only, cached 30 s, no proposal data. W3 amended (Fable N1-N6). |

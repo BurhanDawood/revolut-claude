@@ -30497,7 +30497,7 @@ cron.schedule('0 19 * * 0', () => { pmBossReview('sunday').then(r => console.log
 // are Phase 4); a tap is reported on Telegram like every other app write. Its spend is its own counter, pm_boss_reviews rows of kind
 // 'watch', $3 a London day inside the team's $6 (refused before the call); the boss's $1 (reviews and task runs) no longer counts
 // watch rows. C4 holds: ONE model call, NO tools - PM_BOSS_TOOLS stays [] and PM_BOSS_READS (R3) is empty until a phase needs a tool.
-const PM_WATCH = { daily_usd: 3, tokens: 6000, max_notes: 3, title_max: 100, body_max: 1200, checkpoint_max: 1500, taps_per_hour: 20, book_detail: 10, feed_hours: 30, timeout_ms: 120000, cron: '15 */4 * * *' };
+const PM_WATCH = { daily_usd: 3, tokens: 9000,   /* #637 was 6000: run #20 (14 Oct 19:16Z) hit max_tokens and retried (PM note 184) */ max_notes: 3, title_max: 100, body_max: 1200, checkpoint_max: 1500, taps_per_hour: 20, book_detail: 10, feed_hours: 30, timeout_ms: 120000, cron: '15 */4 * * *' };
 const PM_NOTE_KINDS = ['observation', 'proposal', 'regret', 'health', 'digest'];   // pre_trade is written by Phase 2 only
 const PM_NOTE_SEVERITY = ['info', 'watch', 'act'];
 const PM_PROPOSAL_TYPES = ['approach_alert', 'remove_target', 'acknowledge'];   // R2: alert-only objects, nothing with teeth
