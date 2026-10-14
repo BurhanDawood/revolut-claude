@@ -74,6 +74,20 @@ public class FaceRenderTest {
             .commit());
     }
 
+    /** CI only: the same answer with the 6 h line rising (green), and the face and Tiles told to redraw. */
+    @Test
+    public void seedUp() {
+        Context ctx = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        Snapshot up = sample(true, true);
+        up.quotes.add(quote("SOL", 182.4, 8.1, 912.0, true));
+        assertTrue(WatchStore.values(ctx).edit()
+            .putString(WatchStore.V_SNAPSHOT, up.toJson())
+            .putLong(WatchStore.V_FETCHED, System.currentTimeMillis())
+            .putString(WatchStore.V_STATUS, "")
+            .commit());
+        Repo.notifySurfaces(ctx, Repo.FROM_APP);
+    }
+
     /** About Bryan's 23:20 screenshot: $4,863.98, 6 hours -$133.89 (-2.68%). */
     private static Snapshot sample(boolean rising, boolean withSpark) {
         Snapshot s = new Snapshot();

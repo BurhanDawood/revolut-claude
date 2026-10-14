@@ -77,7 +77,7 @@ adb uninstall com.bryan.revolutx >/dev/null
 
 echo "== 2. the debug watch app, with a sample answer saved (no key)"
 adb install -r "$WEAR_DBG" && adb install -r "$WEAR_TEST" || { echo "::error::the debug watch app did not install"; exit 1; }
-adb shell am instrument -w -e class com.bryan.revolutx.wear.FaceRenderTest com.bryan.revolutx.test/androidx.test.runner.AndroidJUnitRunner
+adb shell am instrument -w -e class com.bryan.revolutx.wear.FaceRenderTest#renderCardsAndSeed com.bryan.revolutx.test/androidx.test.runner.AndroidJUnitRunner
 for f in card-face-up card-face-down card-face-nospark card-face-nokey card-face-ambient card-app-down tile-line-sol tile-candles-sol; do
   adb exec-out run-as com.bryan.revolutx cat "files/ci/$f.png" > "$OUT/$f.png" 2>/dev/null
   convert "$OUT/$f.png" -background black -flatten -quality 80 "$OUT/$f.jpg" 2>/dev/null || cp "$OUT/$f.png" "$OUT/$f.jpg"
@@ -119,6 +119,21 @@ shot face-ambient
 adb shell input keyevent KEYCODE_WAKEUP
 adb shell svc power stayon true >/dev/null 2>&1
 sleep 2
+
+echo "== 5b. the same face with the 6 h line rising (green)"
+adb shell am instrument -w -e class com.bryan.revolutx.wear.FaceRenderTest#seedUp com.bryan.revolutx.test/androidx.test.runner.AndroidJUnitRunner
+sleep 12
+to_face
+shot face-up
+adb shell svc power stayon false >/dev/null 2>&1
+adb shell input keyevent KEYCODE_SLEEP
+sleep 5
+shot face-up-ambient
+adb shell input keyevent KEYCODE_WAKEUP
+adb shell svc power stayon true >/dev/null 2>&1
+sleep 2
+adb shell am instrument -w -e class com.bryan.revolutx.wear.FaceRenderTest#renderCardsAndSeed com.bryan.revolutx.test/androidx.test.runner.AndroidJUnitRunner >/dev/null   # back to the red sample
+sleep 5
 
 echo "== 6. the watch app's card (live: pulsing dot)"
 adb shell am start -W -n com.bryan.revolutx/com.bryan.revolutx.wear.MainActivity

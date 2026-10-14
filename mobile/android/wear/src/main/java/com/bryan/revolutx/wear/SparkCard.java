@@ -23,7 +23,8 @@ import java.util.Locale;
  * Desk #59 (Bryan 14 Oct 14:01): the whole face, drawn by one routine for the watch face (CardComplication's full-face image,
  * AmbientCardComplication's outline) and the first screen of the watch app (SparkCardView, which also draws the time and date
  * the face draws natively). Face units, 450 x 450, round:
- *   the total, smaller, at the top (baseline 70); the time, the largest, centred (the face's own clock); the date under it;
+ *   the total, smaller, at the top (baseline 70); the time, the largest, in the middle of the screen (the face's own clock) with
+ *   the date small under it as one block;
  *   the 6-hour line raised so its peaks rise behind the time and date (box y 120..360, the line in 130..350), thick, smoothed,
  *   a fill fading from 28%, #00ffc8 when the 6 h change is >= 0 and #ff4d6a when down; its last point at x 392 so the dot and
  *   its ring stay inside the circle at any height; under it "6h -$121.01 (-2.51%)", as large as fits the circle there.
@@ -164,7 +165,7 @@ final class SparkCard {
         Paint scrim = new Paint(Paint.ANTI_ALIAS_FLAG);
         scrim.setColor(0x73000000);
         scrim.setMaskFilter(new BlurMaskFilter(22 * sc, BlurMaskFilter.Blur.NORMAL));
-        c.drawRoundRect(new RectF(95 * sc, 98 * sc, 355 * sc, 222 * sc), 40 * sc, 40 * sc, scrim);
+        c.drawRoundRect(new RectF(92 * sc, 172 * sc, 358 * sc, 312 * sc), 44 * sc, 44 * sc, scrim);   // the centred time and date
         drawTotal(c, sc, m, false);
         if (clock != null) drawClock(c, sc, clock);
 
@@ -215,7 +216,7 @@ final class SparkCard {
         if (wc > 0) c.drawText(m.cents, x0 + wd, TOTAL_BASE * sc, pc);
     }
 
-    /** The app's copy of the face's clock: the time, the largest, and "Wed 14 10 26" under it, with a soft dark shadow. */
+    /** The app's copy of the face's clock: the time, the largest, in the centre, and "Wed 14 Oct" under it, with a soft dark shadow. */
     static void drawClock(Canvas c, float sc, boolean is24) {
         Date now = new Date();
         Paint t = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -224,11 +225,11 @@ final class SparkCard {
         t.setTextSize(104 * sc);
         t.setShadowLayer(6 * sc, 0, 2 * sc, 0xCC000000);
         String time = new SimpleDateFormat(is24 ? "HH:mm" : "h:mm", Locale.getDefault()).format(now);
-        c.drawText(time, W * sc / 2, 184 * sc, t);
+        c.drawText(time, W * sc / 2, 260 * sc, t);
         Paint d = new Paint(t);
-        d.setTextSize(26 * sc);
+        d.setTextSize(22 * sc);
         d.setColor(0xFFDDDDDD);
-        c.drawText(new SimpleDateFormat("EEE dd MM yy", Locale.getDefault()).format(now), W * sc / 2, 218 * sc, d);
+        c.drawText(new SimpleDateFormat("EEE d MMM", Locale.getDefault()).format(now), W * sc / 2, 300 * sc, d);
     }
 
     /**

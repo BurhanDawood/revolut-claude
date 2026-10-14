@@ -1,10 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Desk #59 (Bryan 14 Oct 14:01): the Revolut X face. From the top: the portfolio total (smaller); the time, centred and the
-  largest; the date under it ("Wed 14 10 26"); the live 6-hour line raised so its peaks rise behind the time and date, which
-  keep a soft dark shadow; its last point pulsing (an expanding ring, 1.5 s); "6h -$121.01 (-2.51%)" large at the bottom in the
-  line's colour; the unread PM-note count small under it. Always-on: the time (thin), the total in outline, the line as a thin
-  grey outline; no fill, no pulse, no date.
+  Desk #59 (Bryan 14 Oct 14:01, 14:34): the Revolut X face. The portfolio total small at the top; the time, the largest, in
+  the middle of the screen with the date small under it ("Wed 14 Oct") as one block; the live 6-hour line full width behind
+  them, its peaks rising up through the time, which keeps a soft dark shadow; its last point pulsing (an expanding ring, 1.5 s); "6h -$121.01 (-2.51%)" large at the bottom in the
+  line's colour; the unread PM-note count small under it. Always-on: the same layout - the time (thin) and date centred, the
+  total in outline, the line as a thin grey outline; no fill, no pulse.
   Watch Face Format v1, no code: every number comes from the Revolut X watch app's complication data sources (com.bryan.revolutx).
     slot 0  CardComplication         PHOTO_IMAGE   the whole face under the clock: total, line, fill, change (SparkCard.face)
     slot 1  DotComplication          RANGED_VALUE  the line's last point: 0..1 = its height in the line's box, line up;
@@ -101,8 +101,11 @@
       </Complication>
     </ComplicationSlot>
 
-    <!-- the time: centred, the largest, over the line with a soft dark shadow (24 h or 12 h like the watch) -->
-    <Group name="time" x="0" y="88" width="450" height="110">
+    <!--
+      The clock block in the middle of the screen: the time (the largest; 13:24 or 1:24 as the watch is set, the same in
+      always-on) and the date small under it ("Wed 14 Oct"), over the line and its fill with a soft dark shadow.
+    -->
+    <Group name="time" x="0" y="168" width="450" height="110">
       <Variant mode="AMBIENT" target="alpha" value="0" />
       <Condition>
         <Expressions>
@@ -131,27 +134,44 @@
       </Condition>
     </Group>
 
-    <!-- the date under the time, "Wed 14 10 26", floating over the top of the line with the same shadow -->
-    <Group name="date" x="0" y="196" width="450" height="34">
-      <Variant mode="AMBIENT" target="alpha" value="0" />
-      <PartText x="0" y="0" width="450" height="34">
+    <!-- always-on: the same clock, thin and light -->
+    <Group name="timeAmbient" x="0" y="168" width="450" height="110" alpha="0">
+      <Variant mode="AMBIENT" target="alpha" value="255" />
+      <Condition>
+        <Expressions>
+          <Expression name="h24">[IS_24_HOUR_MODE]</Expression>
+        </Expressions>
+        <Compare expression="h24">
+          <PartText x="0" y="0" width="450" height="110">
+            <Text align="CENTER" ellipsis="FALSE">
+              <Font family="SYNC_TO_DEVICE" size="104" weight="THIN" color="#ffdddddd">
+                <Template>%s:%s<Parameter expression="[HOUR_0_23_Z]" /><Parameter expression="[MINUTE_Z]" /></Template>
+              </Font>
+            </Text>
+          </PartText>
+        </Compare>
+        <Default>
+          <PartText x="0" y="0" width="450" height="110">
+            <Text align="CENTER" ellipsis="FALSE">
+              <Font family="SYNC_TO_DEVICE" size="104" weight="THIN" color="#ffdddddd">
+                <Template>%s:%s<Parameter expression="[HOUR_1_12]" /><Parameter expression="[MINUTE_Z]" /></Template>
+              </Font>
+            </Text>
+          </PartText>
+        </Default>
+      </Condition>
+    </Group>
+
+    <!-- the date, directly under the time (live and always-on) -->
+    <Group name="date" x="0" y="278" width="450" height="30">
+      <PartText x="0" y="0" width="450" height="30">
         <Text align="CENTER" ellipsis="FALSE">
-          <Font family="SYNC_TO_DEVICE" size="26" weight="NORMAL" color="#ffdddddd">
+          <Font family="SYNC_TO_DEVICE" size="22" weight="NORMAL" color="#ffdddddd">
             <Shadow color="#cc000000" offsetX="0" offsetY="1" radius="5" />
-            <Template>%s %s %s %s<Parameter expression="[DAY_OF_WEEK_S]" /><Parameter expression="[DAY_Z]" /><Parameter expression="[MONTH_Z]" /><Parameter expression="[YEAR_S]" /></Template>
+            <Template>%s %s %s<Parameter expression="[DAY_OF_WEEK_S]" /><Parameter expression="[DAY]" /><Parameter expression="[MONTH_S]" /></Template>
           </Font>
         </Text>
       </PartText>
-    </Group>
-
-    <!-- always-on: the time, thin and light -->
-    <Group name="timeAmbient" x="0" y="88" width="450" height="110" alpha="0">
-      <Variant mode="AMBIENT" target="alpha" value="255" />
-      <DigitalClock x="0" y="0" width="450" height="110">
-        <TimeText format="hh:mm" hourFormat="SYNC_TO_DEVICE" align="CENTER" x="0" y="0" width="450" height="110">
-          <Font family="SYNC_TO_DEVICE" size="104" weight="THIN" color="#ffdddddd" />
-        </TimeText>
-      </DigitalClock>
     </Group>
 
     <!-- slot 2, bottom: unread PM notes, small -->
