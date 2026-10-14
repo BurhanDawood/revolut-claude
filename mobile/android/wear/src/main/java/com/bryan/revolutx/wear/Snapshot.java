@@ -11,7 +11,10 @@ import org.json.JSONObject;
  * spark (batch 628): { range:'6h', from_ts, to_ts, points:[up to 61 USD totals, oldest first], change_usd, change_pct } or null
  * when the server has no series; then the card draws no line and shows today's P&L instead.
  * coins (batch 630, with ?coins=A,B,C): [{ coin, price, pct_24h (null if not tracked), usd_held, spark (up to 49 prices over
- * 24 h, oldest first, or null) }], at most 5 - the Tile coins. An older server leaves it out; quote() then falls back to holdings.
+ * 24 h, oldest first, or null), candles (batch 631: the last 24 hourly [t, o, h, l, c, v], v null when unknown, or null) }],
+ * at most 5 - the Tile coins. An older server leaves it out; quote() then falls back to holdings.
+ * notes (batch 632, with ?notes=1): the newest 8 PM notes { id, at, kind, coin, severity, title, body (<= 700 chars), read } -
+ * read on the watch only; the watch never marks or acts on one.
  */
 final class Snapshot {
 
@@ -41,7 +44,20 @@ final class Snapshot {
     long sparkFrom;          // the series' first and last time, as the server sent them
     long sparkTo;
     final List<Quote> quotes = new ArrayList<>();   // coins[]
+    final List<Note> notes = new ArrayList<>();
     String asked = "";       // the ?coins= this answer was fetched with ("" = none), so a changed Tile coin is fetched at once
+
+    /** One PM note, read-only. */
+    static final class Note {
+        String id = "";
+        String at = "";      // as the server sent it (ISO time or epoch)
+        String kind = "";
+        String coin = "";
+        String severity = "";
+        String title = "";
+        String body = "";
+        boolean read;
+    }
 
     /** One coin for a Tile or the coin screen. NaN = unknown; spark null = no line. */
     static final class Quote {
@@ -50,6 +66,7 @@ final class Snapshot {
         double pct = Double.NaN;
         double held = Double.NaN;   // USD held
         double[] spark;
+        double[][] candles;          // [t, o, h, l, c, v]; v NaN when unknown
 
         Quote(String coin) {
             this.coin = coin;
@@ -72,6 +89,7 @@ final class Snapshot {
         readCoins(o.optJSONArray("holdings"), s.holdings, "usd", 50);
         readSpark(o.optJSONObject("spark"), s);
         readQuotes(o.optJSONArray("coins"), s);
+        readNotes(o.optJSONArray("notes"), s);
         s.asked = o.optString("rx_asked", "");   // only in the saved copy
         return s;
     }
@@ -110,8 +128,49 @@ final class Snapshot {
             q.pct = dbl(c, "pct_24h");
             q.held = dbl(c, "usd_held");
             q.spark = series(c.optJSONArray("spark"));
+            q.candles = candles(c.optJSONArray("candles"));
             s.quotes.add(q);
         }
+    }
+
+    /** At least 2 candles [t, o, h, l, c, v] with finite o/h/l/c (the newest 48 at most), or null. */
+    private static double[][] candles(JSONArray a) {
+        if (a == null || a.length() < 2) return null;
+        int n = Math.min(a.length(), 48);
+        double[][] out = new double[n][];
+        for (int i = 0; i < n; i++) {
+            JSONArray k = a.optJSONArray(a.length() - n + i);
+            if (k == null || k.length() < 5) return null;
+            double[] x = new double[6];
+            for (int j = 0; j < 6; j++) x[j] = j < k.length() && !k.isNull(j) ? k.optDouble(j, Double.NaN) : Double.NaN;
+            for (int j = 1; j <= 4; j++) if (Double.isNaN(x[j]) || Double.isInfinite(x[j])) return null;
+            out[i] = x;
+        }
+        return out;
+    }
+
+    private static void readNotes(JSONArray a, Snapshot s) {
+        if (a == null) return;
+        for (int i = 0; i < a.length() && s.notes.size() < 8; i++) {
+            JSONObject o = a.optJSONObject(i);
+            if (o == null) continue;
+            Note n = new Note();
+            n.id = o.optString("id", "");
+            n.at = o.optString("at", "");
+            n.kind = cut(o.optString("kind", ""), 40);
+            String coin = o.optString("coin", "");
+            n.coin = coin.matches("[A-Za-z0-9]{1,15}") ? coin.toUpperCase() : "";
+            n.severity = cut(o.optString("severity", ""), 20);
+            n.title = cut(o.optString("title", ""), 200);
+            n.body = cut(o.optString("body", ""), 700);
+            n.read = o.optBoolean("read", false);
+            s.notes.add(n);
+        }
+    }
+
+    private static String cut(String v, int max) {
+        if (v == null || "null".equals(v)) return "";
+        return v.length() > max ? v.substring(0, max) : v;
     }
 
     /** At least 2 finite numbers (the newest 120 at most), or null: a broken series draws no line. */
@@ -191,9 +250,29 @@ final class Snapshot {
                         for (double d : q.spark) pts.put(d);
                         c.put("spark", pts);
                     }
+                    if (q.candles != null) {
+                        JSONArray ks = new JSONArray();
+                        for (double[] x : q.candles) {
+                            JSONArray k = new JSONArray();
+                            for (double d : x) {
+                                if (Double.isNaN(d)) k.put(JSONObject.NULL);
+                                else k.put(d);
+                            }
+                            ks.put(k);
+                        }
+                        c.put("candles", ks);
+                    }
                     qs.put(c);
                 }
                 o.put("coins", qs);
+            }
+            if (!notes.isEmpty()) {
+                JSONArray ns = new JSONArray();
+                for (Note n : notes) {
+                    ns.put(new JSONObject().put("id", n.id).put("at", n.at).put("kind", n.kind).put("coin", n.coin)
+                        .put("severity", n.severity).put("title", n.title).put("body", n.body).put("read", n.read));
+                }
+                o.put("notes", ns);
             }
             o.put("rx_asked", asked);
             return o.toString();

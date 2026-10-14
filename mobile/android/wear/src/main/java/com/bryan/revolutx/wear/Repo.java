@@ -23,8 +23,8 @@ import org.json.JSONObject;
  *   the app: 25 s (it asks every 30 s while on screen), the Tile: 50 s, a complication: 4 min (Wear OS asks every 5),
  *   a tap or a new key: 0.
  * Offline or a server error keeps the last numbers ("updated HH:MM"). After a fetch the other surfaces are told to redraw.
- * Tiles (13 Oct 23:45): the same read carries ?coins=<the Tile coins> (batch 630), so one answer serves every Tile, and a changed
- * Tile coin is fetched at once. choices() is the coin list for the Tile coins screen (?choices=1). Both are GET /api/watch.
+ * Tiles (13 Oct 23:45): the same read carries ?coins=<the Tile coins> (batch 630) and notes=1 (batch 632, 14 Oct 14:01), so one
+ * answer serves every Tile and the notes screen, and a changed Tile coin is fetched at once. choices() is the coin list for the Tile coins screen (?choices=1). Both are GET /api/watch.
  */
 final class Repo {
 
@@ -59,9 +59,9 @@ final class Repo {
             PhoneLink.helloAtMost(app, PhoneLink.HELLO_RECHECK_MS);   // the phone re-confirms the key, or clears it
             long now = System.currentTimeMillis();
             boolean ok = "".equals(v.getString(WatchStore.V_STATUS, "x"));
-            String coins = TileCoins.wanted(app);
+            String query = query(app);
             Snapshot last = WatchStore.snapshot(app);
-            boolean sameCoins = last != null && coins.equals(last.asked);
+            boolean sameCoins = last != null && query.equals(last.asked);
             if (ok && sameCoins && now - v.getLong(WatchStore.V_FETCHED, 0) < maxAgeMs) return last;
             // a failed try is not repeated for 20 s (three complications ask at once; an offline watch is not hammered)
             if (!ok && maxAgeMs > 0 && now - v.getLong(WatchStore.V_TRIED, 0) < 20_000) return WatchStore.snapshot(app);
@@ -70,7 +70,7 @@ final class Repo {
             HttpURLConnection c = null;
             try {
                 // W1 again at the call: only ever the pinned server
-                c = open(key, coins.isEmpty() ? "" : "?coins=" + coins);   // tickers only: [A-Z0-9], checked by TileCoins
+                c = open(key, query);
                 int code = c.getResponseCode();
                 if (code == 401 || code == 403) {
                     e.putString(WatchStore.V_STATUS, "badkey");
@@ -79,7 +79,7 @@ final class Repo {
                     e.putString(WatchStore.V_STATUS, "http:" + code);
                 } else {
                     Snapshot s = Snapshot.parse(read(c.getInputStream()));
-                    s.asked = coins;
+                    s.asked = query;
                     String json = s.toJson();
                     if (json == null) throw new IllegalStateException();
                     e.putString(WatchStore.V_SNAPSHOT, json).putLong(WatchStore.V_FETCHED, now).putString(WatchStore.V_STATUS, "");
@@ -95,6 +95,12 @@ final class Repo {
         }
         notifySurfaces(app, from);
         return WatchStore.snapshot(app);
+    }
+
+    /** "?coins=<the Tile coins>&notes=1": tickers only ([A-Z0-9], checked by TileCoins); notes=1 = the newest 8 PM notes (batch 632). */
+    private static String query(Context app) {
+        String coins = TileCoins.wanted(app);
+        return "?" + (coins.isEmpty() ? "" : "coins=" + coins + "&") + "notes=1";
     }
 
     /** W1 at the call: only ever the pinned server's /api/watch, GET, no redirects, the key in its header only. */

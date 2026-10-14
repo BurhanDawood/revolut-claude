@@ -78,7 +78,7 @@ adb uninstall com.bryan.revolutx >/dev/null
 echo "== 2. the debug watch app, with a sample answer saved (no key)"
 adb install -r "$WEAR_DBG" && adb install -r "$WEAR_TEST" || { echo "::error::the debug watch app did not install"; exit 1; }
 adb shell am instrument -w -e class com.bryan.revolutx.wear.FaceRenderTest com.bryan.revolutx.test/androidx.test.runner.AndroidJUnitRunner
-for f in card-face-up card-face-down card-face-nospark card-face-nokey card-face-ambient card-app-down tile-line-sol; do
+for f in card-face-up card-face-down card-face-nospark card-face-nokey card-face-ambient card-app-down tile-line-sol tile-candles-sol; do
   adb exec-out run-as com.bryan.revolutx cat "files/ci/$f.png" > "$OUT/$f.png" 2>/dev/null
   convert "$OUT/$f.png" -background black -flatten -quality 80 "$OUT/$f.jpg" 2>/dev/null || cp "$OUT/$f.png" "$OUT/$f.jpg"
   echo "IMG $f $(base64 -w0 "$OUT/$f.jpg")"
@@ -104,6 +104,10 @@ sleep 0.5
 shot face-new-b   # the dot's ring grows and fades over 1.5 s: a, b and c catch it at different sizes
 sleep 0.5
 shot face-new-c
+adb shell settings put system time_12_24 24 >/dev/null 2>&1   # the 24 h clock too
+sleep 3
+shot face-new-24h
+adb shell settings put system time_12_24 12 >/dev/null 2>&1
 runtime_logs "this build's face"
 
 echo "== 5. always-on"
@@ -150,5 +154,11 @@ shot app-coin
 adb shell am start -W -n com.bryan.revolutx/com.bryan.revolutx.wear.TileCoinsActivity
 sleep 3
 shot app-tilecoins
+adb shell am start -W -n com.bryan.revolutx/com.bryan.revolutx.wear.NotesActivity
+sleep 4
+shot app-notes
+adb shell input tap 227 150   # the newest note
+sleep 2
+shot app-note
 if adb logcat -d | grep -q "FATAL EXCEPTION"; then logs "crash"; echo "::error::the watch app crashed"; fi
 exit 0

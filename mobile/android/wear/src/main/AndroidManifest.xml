@@ -135,6 +135,12 @@
             android:exported="true"
             android:taskAffinity="" />
 
+        <!-- PM notes, read-only, opened from the PM notes Tile (started by the Tile renderer, so exported) -->
+        <activity
+            android:name=".NotesActivity"
+            android:exported="true"
+            android:taskAffinity="" />
+
         <!-- "Tile coins": the Coin Tiles' picks, saved on the watch only (opened from an empty Coin Tile, so exported) -->
         <activity
             android:name=".TileCoinsActivity"

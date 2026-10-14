@@ -12,7 +12,6 @@ import android.view.Gravity;
 import android.view.View;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
-import android.widget.TextClock;
 import android.widget.TextView;
 import android.widget.Toast;
 import java.util.concurrent.ExecutorService;
@@ -71,17 +70,9 @@ public class MainActivity extends Activity {
         list.setOrientation(LinearLayout.VERTICAL);
         list.setGravity(Gravity.CENTER_HORIZONTAL);
         list.setPadding(pad, dp(4), pad, pad * 2);
-        // the top is the face's: the time, then the live band at the screen's full width (desk #59, 14 Oct 00:06)
+        // the first screen is the face itself, live (desk #59, 14 Oct 14:01); scroll down for the rest
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        TextClock clock = new TextClock(this);
-        clock.setFormat24Hour("HH:mm");
-        clock.setFormat12Hour("h:mm");
-        clock.setTextSize(TypedValue.COMPLEX_UNIT_SP, 30);
-        clock.setTextColor(Fmt.WHITE);
-        clock.setGravity(Gravity.CENTER_HORIZONTAL);
-        clock.setPadding(0, Math.round(getResources().getDisplayMetrics().widthPixels * 0.13f), 0, 0);
-        root.addView(clock, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
         card = new SparkCardView(this);   // kept across renders, so its line slides and its dot keeps pulsing
         root.addView(card, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
         root.addView(list, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
@@ -156,7 +147,7 @@ public class MainActivity extends Activity {
         }
         TextView notes = add(s.unread == 1 ? "1 unread PM note" : s.unread + " unread PM notes", 14, s.unread > 0 ? Fmt.ACCENT : Fmt.GREY, false);
         notes.setPadding(0, dp(10), 0, 0);
-        notes.setOnClickListener(v -> openOnPhone("home", null));
+        notes.setOnClickListener(v -> startActivity(new Intent(this, NotesActivity.class)));   // read on the watch (batch 632)
 
         header("Holdings");
         if (s.holdings.isEmpty()) {

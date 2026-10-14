@@ -10,9 +10,9 @@ import androidx.wear.watchface.complications.data.ComplicationType;
 import androidx.wear.watchface.complications.data.PhotoImageComplicationData;
 
 /**
- * Desk #59 (Bryan 14 Oct 00:06): the Revolut X face's middle band - the total over the live 6-hour line and its change - as one
- * image, drawn by SparkCard like the top of the watch app. Numbers only (W2). Drawn at the screen's own pixels: the band is
- * the face's full width.
+ * Desk #59 (Bryan 14 Oct 14:01): the Revolut X face under its clock - the total at the top, the live 6-hour line raised behind the
+ * time, and its change at the bottom - as one image, drawn by SparkCard like the first screen of the watch app. Numbers only
+ * (W2). Drawn at the screen's own pixels: the image is the whole face.
  */
 public class CardComplication extends ComplicationBase {
 
@@ -33,7 +33,7 @@ public class CardComplication extends ComplicationBase {
 
     private static ComplicationData photo(Context ctx, SparkCard.Model m, @Nullable PendingIntent tap) {
         PhotoImageComplicationData.Builder b =
-            new PhotoImageComplicationData.Builder(Icon.createWithBitmap(SparkCard.band(m, scale(ctx))), text(m.describe()));
+            new PhotoImageComplicationData.Builder(Icon.createWithBitmap(SparkCard.face(m, scale(ctx))), text(m.describe()));
         if (tap != null) b.setTapAction(tap);
         return b.build();
     }

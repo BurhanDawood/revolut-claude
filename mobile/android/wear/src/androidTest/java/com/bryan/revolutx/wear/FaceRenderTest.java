@@ -37,7 +37,7 @@ public class FaceRenderTest {
         write(new File(dir, "card-face-nospark.png"), SparkCard.png(SparkCard.model(ctx, today), sc));
         write(new File(dir, "card-face-nokey.png"), SparkCard.png(SparkCard.model(ctx, null), sc));
         write(new File(dir, "card-app-down.png"), withDot(SparkCard.model(ctx, down), sc, 0.35f));
-        write(new File(dir, "card-face-ambient.png"), SparkCard.png(SparkCard.ambientBand(SparkCard.model(ctx, down), sc)));
+        write(new File(dir, "card-face-ambient.png"), SparkCard.png(SparkCard.ambientFace(SparkCard.model(ctx, down), sc)));
 
         down.movers.add(new Snapshot.Coin("SOL", 8.1, 182.4));
         down.movers.add(new Snapshot.Coin("PEPE", -11.4, 0.00000912));
@@ -51,6 +51,22 @@ public class FaceRenderTest {
         TileCoins.set(ctx, 2, "NEAR");
         TileCoins.set(ctx, 3, null);
         write(new File(dir, "tile-line-sol.png"), SparkCard.linePng(down.quotes.get(0).spark, SparkCard.UP, 300, 80, 2f));
+        write(new File(dir, "tile-candles-sol.png"), SparkCard.candlesPng(down.quotes.get(0).candles, 182.4, 380, 160, 2f));
+        for (int i = 0; i < 4; i++) {   // PM notes, the newest first (batch 632's shape)
+            Snapshot.Note n = new Snapshot.Note();
+            n.id = String.valueOf(900 - i);
+            n.at = java.time.Instant.ofEpochMilli(System.currentTimeMillis() - i * 3_600_000L).toString();
+            n.kind = i == 0 ? "signal" : "review";
+            n.coin = i == 0 ? "SOL" : i == 1 ? "NEAR" : "";
+            n.severity = i == 0 ? "high" : "info";
+            n.title = i == 0 ? "SOL broke above the 6 h range" : i == 1 ? "NEAR: trailing stop moved up" : "Daily review " + i;
+            n.body = "SOL closed the last hourly candle above 182 with rising volume. The plan says hold the core position and keep"
+                + " the trailing stop at 176. No action needed on the watch; proposals stay on the phone. "
+                + "The 24 h range is 171-186; volume picked up after 10:00. Watch the 176 stop and the 190 resistance; the next"
+                + " review is at 18:00. This text is long on purpose, to show the crown scrolling the whole body on the watch.";
+            n.read = i >= 2;
+            down.notes.add(n);
+        }
         assertTrue(WatchStore.values(ctx).edit()
             .putString(WatchStore.V_SNAPSHOT, down.toJson())
             .putLong(WatchStore.V_FETCHED, System.currentTimeMillis())
@@ -90,12 +106,20 @@ public class FaceRenderTest {
             q.spark[i] = price * (1 - pct / 100 * (1 - t)) + price * 0.012 * Math.sin(i / 3.0);
         }
         q.spark[48] = price;
+        q.candles = new double[24][];
+        for (int i = 0; i < 24; i++) {   // hourly candles following the line, with volume (the 6th value null for two of them)
+            double o = q.spark[i * 2];
+            double c = q.spark[i * 2 + 2];
+            double hi = Math.max(o, c) * (1 + 0.004 + 0.003 * Math.abs(Math.sin(i)));
+            double lo = Math.min(o, c) * (1 - 0.004 - 0.003 * Math.abs(Math.cos(i)));
+            q.candles[i] = new double[] { 0, o, hi, lo, c, i % 11 == 5 ? Double.NaN : 1000 + 800 * Math.abs(Math.sin(i * 1.3)) };
+        }
         return q;
     }
 
     private static byte[] withDot(SparkCard.Model m, float sc, float pulse) {
         Bitmap b = Bitmap.createBitmap(Math.round(SparkCard.W * sc) + 20, Math.round(SparkCard.H * sc), Bitmap.Config.ARGB_8888);
-        SparkCard.draw(new Canvas(b), sc, m, null, pulse);
+        SparkCard.draw(new Canvas(b), sc, m, null, pulse, Boolean.TRUE);
         java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
         b.compress(Bitmap.CompressFormat.PNG, 100, out);
         return out.toByteArray();

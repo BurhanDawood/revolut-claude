@@ -17,8 +17,8 @@ import java.util.concurrent.Executors;
 
 /**
  * Desk #59 Tiles (Bryan 13 Oct 23:45): one coin on the watch, opened from a Coin Tile, the Top movers Tile or the app's lists.
- * The card in the face's style (SparkCard.coinModel): the price, the coin's 24 h line with the pulsing dot, "24 hours +8.10%",
- * then the holding and "Open on phone". Live like the app: the coin rides along in the summary read (?coins=), every 30 s
+ * Its ticker and 24 h %, price, the same chart as its Coin Tile (ChartView: hourly candles with volume and the live price, or the
+ * 24 h line), then the holding and "Open on phone". Live like the app: the coin rides along in the summary read (?coins=), every 30 s
  * while the screen is on.
  */
 public class CoinActivity extends Activity {
@@ -29,7 +29,7 @@ public class CoinActivity extends Activity {
     private final Handler main = new Handler(Looper.getMainLooper());
     private String coin;
     private LinearLayout list;
-    private SparkCardView card;
+    private ChartView chart;
 
     private final Runnable tick = new Runnable() {
         @Override
@@ -61,7 +61,7 @@ public class CoinActivity extends Activity {
         list.setPadding(pad, pad, pad, pad * 2);
         scroll.addView(list);
         setContentView(scroll);
-        card = new SparkCardView(this);
+        chart = new ChartView(this);
         render();
     }
 
@@ -92,16 +92,24 @@ public class CoinActivity extends Activity {
         list.removeAllViews();
         Snapshot s = WatchStore.snapshot(this);
         Snapshot.Quote q = s == null ? null : s.quote(coin);
-        add(coin, 16, Fmt.WHITE, true);
         if (q == null) {
+            add(coin, 18, Fmt.WHITE, true);
             add(s == null ? Fmt.emptyLine(this) : "Loading…", 14, Fmt.GREY, false).setOnClickListener(v -> load(true));
             return;
         }
-        card.set(SparkCard.coinModel(this, q));
+        int color = SparkCard.up(q) ? SparkCard.UP : SparkCard.DOWN;
+        TextView head = add(coin + (Double.isNaN(q.pct) ? "" : "  " + (q.pct >= 0 ? "+" : "\u2212") + String.format(java.util.Locale.US, "%.2f", Math.abs(q.pct)) + "%"), 18, Fmt.WHITE, true);
+        if (!Double.isNaN(q.pct)) {
+            android.text.SpannableString sp = new android.text.SpannableString(head.getText());
+            sp.setSpan(new android.text.style.ForegroundColorSpan(color), coin.length(), sp.length(), 0);
+            head.setText(sp);
+        }
+        add(Double.isNaN(q.price) ? "--" : Fmt.price(q.price), 26, Fmt.WHITE, true);
+        chart.set(q);   // candles with volume and the live price (batch 631), else the 24 h line
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        lp.topMargin = dp(4);
-        list.addView(card, lp);
-        card.setOnClickListener(v -> {
+        lp.topMargin = dp(6);
+        list.addView(chart, lp);
+        chart.setOnClickListener(v -> {
             Toast.makeText(this, "Refreshing", Toast.LENGTH_SHORT).show();
             load(true);
         });

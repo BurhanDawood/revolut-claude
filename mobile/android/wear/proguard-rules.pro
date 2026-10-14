@@ -15,6 +15,7 @@
 -keep class com.bryan.revolutx.wear.NotesTileService { *; }
 -keep class com.bryan.revolutx.wear.CoinActivity { *; }         # started from Tiles by class name
 -keep class com.bryan.revolutx.wear.TileCoinsActivity { *; }
+-keep class com.bryan.revolutx.wear.NotesActivity { *; }
 -keep class com.bryan.revolutx.wear.ComplicationBase { *; }
 -keep class com.bryan.revolutx.wear.TotalComplication { *; }    # the four complication data sources
 -keep class com.bryan.revolutx.wear.PnlComplication { *; }

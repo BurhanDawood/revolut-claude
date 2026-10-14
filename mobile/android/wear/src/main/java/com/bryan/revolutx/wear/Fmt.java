@@ -1,6 +1,7 @@
 package com.bryan.revolutx.wear;
 
 import android.content.Context;
+import android.text.format.DateUtils;
 import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.Locale;
@@ -68,6 +69,23 @@ final class Fmt {
 
     static String hhmm(long ms) {
         return new SimpleDateFormat("HH:mm", Locale.getDefault()).format(new Date(ms));
+    }
+
+    /** A note's time: "14:05" today, else "13 Oct 14:05"; "" when the server's value cannot be read (ISO time or epoch s/ms). */
+    static String noteTime(String at) {
+        long ms;
+        try {
+            ms = java.time.Instant.parse(at).toEpochMilli();
+        } catch (Exception e) {
+            try {
+                long v = Long.parseLong(at.trim());
+                ms = v < 100000000000L ? v * 1000 : v;
+            } catch (Exception e2) {
+                return "";
+            }
+        }
+        boolean today = DateUtils.isToday(ms);
+        return new SimpleDateFormat(today ? "HH:mm" : "d MMM HH:mm", Locale.getDefault()).format(new Date(ms));
     }
 
     /** "updated HH:MM", plus why the numbers may be old. */

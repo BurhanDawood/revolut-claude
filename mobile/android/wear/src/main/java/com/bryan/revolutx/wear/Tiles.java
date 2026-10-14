@@ -49,6 +49,16 @@ final class Tiles {
             .build();
     }
 
+    static LayoutElementBuilders.Text text(String s, float sp, int color, boolean bold, int maxLines) {
+        return new LayoutElementBuilders.Text.Builder()
+            .setText(s)
+            .setFontStyle(font(sp, color, bold))
+            .setMaxLines(maxLines)
+            .setOverflow(LayoutElementBuilders.TEXT_OVERFLOW_ELLIPSIZE_END)
+            .setMultilineAlignment(LayoutElementBuilders.TEXT_ALIGN_CENTER)
+            .build();
+    }
+
     static LayoutElementBuilders.SpanText span(String s, float sp, int color, boolean bold) {
         return new LayoutElementBuilders.SpanText.Builder().setText(s).setFontStyle(font(sp, color, bold)).build();
     }

@@ -3,13 +3,14 @@ package com.bryan.revolutx.wear;
 import android.content.Context;
 import android.graphics.Canvas;
 import android.os.SystemClock;
+import android.text.format.DateFormat;
 import android.view.View;
 import java.util.Arrays;
 
 /**
- * Desk #59 (Bryan 14 Oct 00:06): the face's band at the top of the watch app, live while it is on screen: the dot pulses
- * (1.5 s ring) and a new answer's line slides from the old one over 0.9 s, like the dashboard's. Drawn by SparkCard, the
- * routine the face's image uses, at the screen's full width, so the two look the same. It only draws; MainActivity fetches.
+ * Desk #59 (Bryan 14 Oct 14:01): the watch app's first screen is the face itself, live while it is on screen: the clock ticks,
+ * the dot pulses (1.5 s ring) and a new answer's line slides from the old one over 0.9 s, like the dashboard's. Drawn by
+ * SparkCard, the routine the face's image uses, at the screen's full width, so the two look the same. It only draws.
  */
 final class SparkCardView extends View {
 
@@ -60,7 +61,9 @@ final class SparkCardView extends View {
         }
         shown = ys;
         float pulse = ys == null ? -1f : ((now - born) % SparkCard.PULSE_MS) / (float) SparkCard.PULSE_MS;
-        SparkCard.draw(c, getWidth() / SparkCard.W, model, ys, pulse);   // the screen's full width, like the face's band
+        // the face itself at the screen's full width, with the clock the face draws natively
+        SparkCard.draw(c, getWidth() / SparkCard.W, model, ys, pulse, DateFormat.is24HourFormat(getContext()));
+        if (ys == null) postInvalidateDelayed(1000);   // the clock still ticks without a line
         if (ys != null) postInvalidateOnAnimation();   // only runs while the screen draws: it stops when the app is off screen
     }
 }
