@@ -338,8 +338,9 @@ public class RipRing extends Service {
     }
 
     /**
-     * A side button while it rings: the watch screen turning on (a press wakes it) ends the alarm. The first 3 s are
-     * ignored: the alarm page itself turns the screen on.
+     * A side button while it rings: a press that wakes the screen (screen on), or one that leaves what is on screen - Home or
+     * a stem button, which Android announces as "close system dialogs" - ends the alarm. The first 3 s are ignored: the alarm
+     * page itself turns the screen on.
      */
     private void listenForButtons() {
         if (screen != null) return;
@@ -347,11 +348,17 @@ public class RipRing extends Service {
             @Override
             public void onReceive(Context c, Intent i) {
                 if (android.os.SystemClock.elapsedRealtime() - startedAt < 3000) return;
-                stopAll(c, "side button (screen woken)");
+                boolean wake = Intent.ACTION_SCREEN_ON.equals(i.getAction());
+                String reason = i.getStringExtra("reason");
+                Log.i(TAG, "while ringing: " + i.getAction() + (reason != null ? " (" + reason + ")" : ""));
+                stopAll(c, wake ? "side button (screen woken)" : "side button (" + (reason != null ? reason : "home") + ")");
             }
         };
+        android.content.IntentFilter f = new android.content.IntentFilter(Intent.ACTION_SCREEN_ON);
+        f.addAction(Intent.ACTION_CLOSE_SYSTEM_DIALOGS);
         try {
-            registerReceiver(screen, new android.content.IntentFilter(Intent.ACTION_SCREEN_ON));
+            if (Build.VERSION.SDK_INT >= 33) registerReceiver(screen, f, Context.RECEIVER_EXPORTED);   // sent by the system only
+            else registerReceiver(screen, f);
         } catch (Exception e) {
             screen = null;
         }

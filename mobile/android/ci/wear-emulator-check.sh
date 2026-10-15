@@ -282,7 +282,7 @@ adb shell am instrument -w -e class com.bryan.revolutx.wear.RipAlarmTest#clearRi
 
 echo "== 12. every way to stop the Rip alarm, screen on and off, and a double delivery (Bryan 15 Oct 16:22)"
 RT=com.bryan.revolutx.test/androidx.test.runner.AndroidJUnitRunner
-alarm_streams() { adb shell dumpsys audio 2>/dev/null | grep -iE "USAGE_ALARM" | grep -ic "state:started"; }
+alarm_streams() { adb shell dumpsys audio 2>/dev/null | grep -iE "USAGE_ALARM" | grep -i "state:started" | grep -oE "u/pid:[0-9/]+" | tr '\n' ' '; echo; }
 stop_case() {   # stop_case <screen on|off> <how>
   if [ "$1" = off ]; then
     adb shell cmd notification set_dnd priority; adb shell svc power stayon false >/dev/null 2>&1; adb shell input keyevent KEYCODE_SLEEP; sleep 2
@@ -308,9 +308,12 @@ button_case() {   # button_case <page|awake|off> <key>: page = asleep, the alarm
   echo "   on screen: $(adb shell dumpsys activity activities 2>/dev/null | grep -m1 -E 'topResumedActivity' | sed 's/^ *//')"
   adb shell input keyevent "$2"
   wait $B
-  echo "-- $1, button $2: $(grep -oE 'OK \(1 test\)|FAILURES!!!' "$OUT/btn.txt" | head -1) | $(adb logcat -d -s RxRipRing 2>/dev/null | grep -oE 'STOP TEST.*|stopped \(.*' | tail -2 | tr '\n' ' ') | alarm streams playing now: $(alarm_streams)"
+  echo "-- $1, button $2: $(grep -oE 'OK \(1 test\)|FAILURES!!!' "$OUT/btn.txt" | head -1) | $(adb logcat -d -s RxRipRing 2>/dev/null | grep -oE 'while ringing.*|STOP TEST.*|stopped \(.*' | tail -3 | tr '\n' ' ') | alarm streams playing now: $(alarm_streams)"
   grep -E "AssertionError" "$OUT/btn.txt" | head -n 2
 }
+# the alarm page is a full-screen alert, which Android 14+ allows a sideloaded app only once granted: granted here
+adb shell appops set com.bryan.revolutx USE_FULL_SCREEN_INTENT allow 2>/dev/null
+echo "full-screen alerts for Revolut X: $(adb shell appops get com.bryan.revolutx USE_FULL_SCREEN_INTENT 2>/dev/null | tr -d '\r')"
 for scr in on off; do
   for how in action swipe icon app; do stop_case "$scr" "$how"; done
 done
