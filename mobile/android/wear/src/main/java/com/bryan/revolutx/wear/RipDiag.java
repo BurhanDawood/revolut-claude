@@ -25,12 +25,12 @@ final class RipDiag {
     static void received(Context ctx, String coin) {
         prefs(ctx).edit().putLong("at", System.currentTimeMillis()).putString("coin", coin).remove("err").remove("err_at").commit();
         String off = notificationsOff(ctx);
-        if (off != null) error(ctx, "notification", off);
+        if (off != null) error(ctx, null, off);
     }
 
     static void error(Context ctx, String where, Object e) {
         String m = e instanceof Throwable ? why((Throwable) e) : String.valueOf(e);
-        String line = where + ": " + (m.length() > 120 ? m.substring(0, 120) : m);
+        String line = (where == null ? "" : where + ": ") + (m.length() > 120 ? m.substring(0, 120) : m);
         Log.w(TAG, "error " + line);
         prefs(ctx).edit().putString("err", line).putLong("err_at", System.currentTimeMillis()).commit();
     }
@@ -43,7 +43,7 @@ final class RipDiag {
             : "Last rip alarm: " + new SimpleDateFormat("d MMM HH:mm", Locale.UK).format(new Date(at)) + " " + p.getString("coin", "?");
         String err = p.getString("err", null);
         if (err == null) err = notificationsOff(ctx);
-        return err == null ? s : s + "\nError: " + err;
+        return err == null ? s : s + "\n\u26a0 " + err;
     }
 
     static boolean hasError(Context ctx) {
@@ -55,9 +55,9 @@ final class RipDiag {
         try {
             NotificationManager nm = ctx.getSystemService(NotificationManager.class);
             if (nm == null) return null;
-            if (!nm.areNotificationsEnabled()) return "notifications are off for Revolut X on the watch";
+            if (!nm.areNotificationsEnabled()) return "notifications off on the watch";
             NotificationChannel c = nm.getNotificationChannel(RipRing.CHANNEL);
-            if (c != null && c.getImportance() == NotificationManager.IMPORTANCE_NONE) return "the Rip alarm channel is off on the watch";
+            if (c != null && c.getImportance() == NotificationManager.IMPORTANCE_NONE) return "Rip alarm channel off on the watch";
         } catch (Exception ignored) {
             // unknown: not shown
         }

@@ -85,6 +85,7 @@ public class MainActivity extends Activity {
         ripLine = new TextView(this);
         ripLine.setGravity(Gravity.CENTER);
         ripLine.setMaxLines(2);
+        ripLine.setEllipsize(android.text.TextUtils.TruncateAt.END);
         ripLine.setTextSize(TypedValue.COMPLEX_UNIT_SP, 9);
         ripLine.setAutoSizeTextTypeUniformWithConfiguration(6, 9, 1, TypedValue.COMPLEX_UNIT_SP);
         android.widget.FrameLayout.LayoutParams lp = new android.widget.FrameLayout.LayoutParams(

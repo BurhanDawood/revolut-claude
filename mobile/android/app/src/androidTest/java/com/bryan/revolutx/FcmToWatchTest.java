@@ -14,7 +14,7 @@ import org.junit.runner.RunWith;
 /**
  * Desk #59 (Bryan 15 Oct 14:56), CI only, on a phone emulator: the server's test Rip alarm push, handed to the app's FCM
  * service through Firebase's own entry, FirebaseMessagingService.handleIntent (what Firebase's receiver calls on its
- * background thread; a plain startService is ignored by Firebase), as a com.google.firebase.MESSAGING_EVENT intent with the
+ * background thread; a plain startService is ignored by Firebase), as the com.google.android.c2dm.intent.RECEIVE intent Firebase passes on, with the
  * push's data as extras, with no app screen open (the job force-stops the app first). The service must ring and run the
  * watch forward itself; the forward's record is the card's "Watch link" line. CI has no watch paired, so the expected record
  * is "no watch found" (or Play services' reason), not "sent".
@@ -27,7 +27,7 @@ public class FcmToWatchTest {
         Context ctx = InstrumentationRegistry.getInstrumentation().getTargetContext();
         ctx.getSharedPreferences("rx_watch_link", Context.MODE_PRIVATE).edit().clear().commit();
         // exactly the data the server sends for send_test_alarm (#523, appPushSend's alarm message)
-        Intent i = new Intent("com.google.firebase.MESSAGING_EVENT").setClass(ctx, RxMessagingService.class)
+        Intent i = new Intent("com.google.android.c2dm.intent.RECEIVE").setClass(ctx, RxMessagingService.class)
             .putExtra("from", "1234567890")
             .putExtra("google.message_id", "0:ci-" + System.currentTimeMillis())
             .putExtra("google.delivered_priority", "high")
