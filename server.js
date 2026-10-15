@@ -357,8 +357,18 @@ async function placeRevolutOrder(symbol, side, orderType, baseSize, price = null
   return { ...result, client_order_id: clientOrderId, sent_base_size: sizeStr };   // #14 the size actually sent (callers journal it)
 }
 
+// #634 (Bryan 14 Oct 16:20, desk #61 Option A, Fable pre-ship C1-C8): her coin. When SPIKE INSURANCE sells a coin in this list, its
+// proceeds are converted to USDC (hers) straight away - herCoinUsdcSweep below. That is the ONLY automated USDC buy in the system: the
+// standing rule (all USDC is his wife's cash; nothing automated may use or count it) is otherwise unchanged, and nothing anywhere may sell
+// or spend USDC. Loop sales of her coin stay in USD (the loop buys her coin back from USD). Her coin never feeds Bryan's USDT sweep (C7).
+const HER_COIN_USDC_SWEEP = ['HIGH'];
+const USDC_SWEEP_MIN_USD = 1;   // C5: our own floor; the venue's refusal tells us if its minimum is higher
 async function sweepToUSDT(proceedsUsd, sourceSymbol, realisedPnlUsd = null) {
   try {
+    if (HER_COIN_USDC_SWEEP.includes(String(sourceSymbol || '').replace('-USD', '').toUpperCase())) {   // #634 C7: in code, whatever the dashboard's excluded list says
+      console.log('[sweep] ' + sourceSymbol + ' is her coin - never swept to USDT (#634)');
+      return;
+    }
     const [configRows] = await db.execute(
       "SELECT config_value FROM system_config WHERE config_key = 'usdt_sweep_config'"
     );
@@ -22300,6 +22310,83 @@ function spikeChaseText(coin, qty, ch) {
     (ch.resting_order_id ? '\n⚠️ Order ' + escTg(ch.resting_order_id) + ' could not be cancelled and may still be resting at $' + ch.resting_limit + ' (never below the line). The chase stopped there so nothing can sell twice, and any pump loop on ' + escTg(coin) + ' is switched OFF until you re-enable it. Please check Revolut X.' : '');
 }
 // After the #93 sale in spike mode: the event's bookkeeping, A8 for a partial insurance, and the message. Never throws into the caller.
+// #634 desk #61 Option A (Fable C1-C8): after spike insurance sells her coin, one USDC-USD market BUY for the sale's proceeds.
+// C4: one row per sale in her_coin_usdc_sweeps, written 'pending' BEFORE the order (INSERT IGNORE on the sale's key: a second call for the
+// same sale never buys twice); 'held' (paused), 'failed' (too small / refused), 'done', or 'check' (unconfirmed, an error, or left pending by a restart).
+// C1: size = the sale's fill value from GET /orders (minus a USD fee when the venue reports one), else sold x price; capped at the USD
+// available after the sale, so it can never draw on more than is there. C3: holds while auto-exec is paused. C5: one attempt, no retry.
+// Never throws: it returns the line for the sale's Telegram message.
+async function herCoinSweepTable() {
+  await db.execute("CREATE TABLE IF NOT EXISTS her_coin_usdc_sweeps (sell_key VARCHAR(40) NOT NULL PRIMARY KEY, event_id INT NULL, coin VARCHAR(20) NOT NULL, status VARCHAR(10) NOT NULL, basis_usd DECIMAL(16,4) NULL, usd DECIMAL(16,4) NULL, note VARCHAR(200) NULL, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)");
+}
+async function herCoinUsdcSweep(coin, ev, res, sold) {
+  if (!HER_COIN_USDC_SWEEP.includes(coin) || !(sold > 0)) return '';
+  const key = res && res.journal_id ? 'j' + res.journal_id : 'e' + (ev || 0) + ':' + Math.round(sold * 1e6);
+  const mark = (st, f = {}) => db.execute('UPDATE her_coin_usdc_sweeps SET status = ?, basis_usd = COALESCE(?, basis_usd), usd = COALESCE(?, usd), note = COALESCE(?, note) WHERE sell_key = ?',
+    [st, f.basis != null ? Number(f.basis.toFixed(4)) : null, f.usd != null ? f.usd : null, f.note ? String(f.note).slice(0, 200) : null, key]).catch(e => console.error('[her-usdc] mark ' + st + ':', e.message));
+  const byHand = ' The money is in USD - move it to USDC by hand.';
+  try {
+    await herCoinSweepTable();
+    const [ins] = await db.execute("INSERT IGNORE INTO her_coin_usdc_sweeps (sell_key, event_id, coin, status) VALUES (?, ?, ?, 'pending')", [key, ev || null, coin]);
+    if (!ins || ins.affectedRows !== 1) { console.log('[her-usdc] ' + key + ' already handled - skipped'); return ''; }
+  } catch (e) { console.error('[her-usdc] record failed:', e.message); return '\n⚠️ Not converted to her USDC: the record could not be written (' + escTg(String(e.message).slice(0, 60)) + ').' + byHand; }
+  try {
+    if (await isAutoExecPaused()) { await mark('held', { note: 'auto-exec paused' }); return '\n⏸ Not converted to her USDC: auto-exec is paused.' + byHand; }
+    let basis = null, how = 'sold x price';
+    try {
+      // Fable C1a: on the plain market branch the journal row has no venue id yet (fill enrichment stamps it 20 s+ later), so the order
+      // is found first by its client_order_id in pending_orders (placeRevolutOrder writes that row at placement), then the journal row.
+      let oid = null;
+      if (res && res.client_order_id) { const [po] = await db.execute('SELECT order_id FROM pending_orders WHERE client_order_id = ? ORDER BY id DESC LIMIT 1', [String(res.client_order_id)]); if (po.length) oid = po[0].order_id; }
+      if (!oid && res && res.journal_id) { const [j] = await db.execute('SELECT venue_order_id FROM trading_journal WHERE id = ?', [res.journal_id]); if (j.length) oid = j[0].venue_order_id; }
+      if (oid) {
+        const r = await revolutRequest('GET', '/orders/' + oid), d = (r && r.data) || r || {};
+        const avg = Number(d.average_fill_price), fq = Number(d.filled_quantity);
+        if (avg > 0 && fq > 0) {
+          basis = avg * fq; how = 'fill';
+          const fee = d.total_fee != null ? Number(d.total_fee) : 0, fc = String(d.fee_currency || '').toUpperCase();
+          if (fee > 0 && (!fc || fc === 'USD')) { basis -= fee; how = 'fill net of fee'; }
+        }
+      }
+    } catch (e) { console.error('[her-usdc] fill read:', e.message); }
+    if (!(basis > 0)) basis = sold * (Number(res && res.price) || 0);
+    let avail = 0;
+    try { avail = await getAvailableUSD('revolut'); } catch (e) { avail = 0; }
+    const size = Math.floor(Math.min(basis, avail) * 100) / 100;
+    if (!(size >= USDC_SWEEP_MIN_USD)) {
+      await mark('failed', { basis, note: 'size $' + size + ' below $' + USDC_SWEEP_MIN_USD + ' (basis $' + basis.toFixed(2) + ', USD available $' + Number(avail).toFixed(2) + ')' });
+      return '\n⚠️ Not converted to her USDC: $' + size.toFixed(2) + ' is below the $' + USDC_SWEEP_MIN_USD + ' minimum (USD available $' + Number(avail).toFixed(2) + ').' + byHand;
+    }
+    let resp;
+    try { resp = await placeRevolutOrder('USDC-USD', 'buy', 'market', null, null, size); }
+    catch (e) {   // senior pass (desk #61 msg 650): only a clear refusal is 'failed'; an unconfirmed fill or a lost answer may have converted
+      if (e.venue_refused || (Number(e.venue_status) >= 400 && Number(e.venue_status) < 500)) { await mark('failed', { basis, note: 'venue: ' + e.message }); return '\n⚠️ Not converted to her USDC: Revolut X refused the order (' + escTg(String(e.message).slice(0, 80)) + ').' + byHand; }
+      await mark('check', { basis, note: 'unconfirmed: ' + e.message });
+      return '\n⚠️ Her USDC conversion could not be confirmed (' + escTg(String(e.message).slice(0, 80)) + '). It may or may not have gone through: check USD and USDC on Revolut X before moving anything by hand.';
+    }
+    const jr = await db.execute("INSERT INTO trading_journal (symbol, action, price, quantity, value_usd, reasoning, emotion, tool_key) VALUES (?, ?, ?, ?, ?, ?, ?, 'her_coin_usdc')",
+      ['USDC', 'buy', 1, size, size, 'Her coin (#634): spike insurance sold ' + coin + (ev ? ' (event ' + ev + ')' : '') + '; proceeds converted to her USDC', 'neutral']).catch(e => { console.error('[her-usdc] journal:', e.message); return null; });
+    await stampVenueOrderId(jr && jr[0] && jr[0].insertId, resp);
+    await mark('done', { basis, usd: size, note: how });
+    console.log('[her-usdc] ' + coin + ' ' + key + ': $' + size + ' -> USDC (' + how + ')');
+    return '\n💵 <b>$' + size.toFixed(2) + ' converted to USDC (hers).</b>' + (size < basis - 0.01 ? ' Capped at the USD available; the sale brought about $' + basis.toFixed(2) + '.' : '');
+  } catch (e) {
+    console.error('[her-usdc] ' + key + ':', e.message);
+    await mark('check', { note: 'error: ' + e.message });   // may or may not have converted - never retried
+    return '\n⚠️ Her USDC conversion stopped with an error (' + escTg(String(e.message).slice(0, 80)) + '). Check Revolut X: it may or may not have converted.';
+  }
+}
+// C4 at boot: a sale whose conversion was left 'pending' by a restart gets ONE line and is marked 'check'. No automatic retry.
+setTimeout(async () => {
+  try {
+    await herCoinSweepTable();
+    const [p] = await db.execute("SELECT sell_key, event_id, coin FROM her_coin_usdc_sweeps WHERE status = 'pending' AND created_at < FROM_UNIXTIME(?)", [Math.floor(Date.now() / 1000 - process.uptime())]);   // only rows from before this start
+    for (const r of p) {
+      await db.execute("UPDATE her_coin_usdc_sweeps SET status = 'check', note = 'left pending by a restart' WHERE sell_key = ? AND status = 'pending'", [r.sell_key]);
+      await sendTelegram('⚠️ <b>Her USDC</b>: the conversion after the ' + escTg(r.coin) + ' spike sale' + (r.event_id ? ' (event ' + r.event_id + ')' : '') + ' may not have run - the server restarted in the middle. Check USD and USDC on Revolut X and move it by hand if needed. Nothing is retried automatically.').catch(() => {});
+    }
+  } catch (e) { console.error('[her-usdc] boot check failed:', e.message); }
+}, 50 * 1000);
 async function spikeAfterSale(symbol, ctx, res) {
   const coin = ctx.coin, ev = ctx.event_id;
   const sold = res && res.executed === true ? Number(res.qty) || 0 : 0;
@@ -22324,7 +22411,10 @@ async function spikeAfterSale(symbol, ctx, res) {
         }
       } catch (e) { rearm = '\n⚠️ A fresh trail on what is still held could not be set (' + escTg(e.message) + ').'; }
     }
-    await sendTelegram('🛡️ <b>Spike insurance sold ' + escTg(coin) + '</b>: ' + Number(sold.toPrecision(8)) + ' at an average $' + Number(Number(res.price).toPrecision(6)) + '. The cash is now available to the loops (no buy-back).' + rearm).catch(() => {});
+    // #634 C2 / Fable C6': AFTER the A8 re-arm (it protects what is still held), her coin's proceeds go to her USDC (never after a
+    // resting/ambiguous chase - S2-1), then the one message.
+    const herLine = !HER_COIN_USDC_SWEEP.includes(coin) ? '' : unsafe ? '\n⚠️ Not converted to her USDC: an order may still be resting. Check Revolut X, then move the money to USDC by hand.' : await herCoinUsdcSweep(coin, ev, res, sold);
+    await sendTelegram('🛡️ <b>Spike insurance sold ' + escTg(coin) + '</b>: ' + Number(sold.toPrecision(8)) + ' at an average $' + Number(Number(res.price).toPrecision(6)) + (herLine ? '.' + herLine : '. The cash is now available to the loops (no buy-back).') + rearm).catch(() => {});
   }
 }
 // A7 at boot: cancel any sx- order still open (a restart mid-chase), then put the insurance trail back for an event that was chasing,
