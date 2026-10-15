@@ -32,5 +32,7 @@ wait $T
 grep -E "OK \(|FAIL|Assertion|Error|Exception" "$OUT/test.txt" | head -n 8
 echo "-- the app's log (RxWatchAlarm):"
 adb logcat -d -s RxWatchAlarm:* 2>/dev/null | tail -n 20
+echo "-- Firebase and the app's FCM service:"
+adb logcat -d 2>/dev/null | grep -iE "FirebaseMessaging|FCM|RxMessaging|RipAlarm|revolutx" | grep -viE "chatty" | tail -n 25
 if adb logcat -d | grep -q "FATAL EXCEPTION"; then adb logcat -d | grep -A20 "FATAL EXCEPTION" | head -n 40; echo "::error::the phone app crashed"; fi
 exit 0

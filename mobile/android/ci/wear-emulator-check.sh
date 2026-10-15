@@ -268,7 +268,11 @@ shot app-rip-line
 adb shell pm revoke com.bryan.revolutx android.permission.POST_NOTIFICATIONS 2>/dev/null   # what the line says when the watch blocks it
 adb shell am instrument -w -e class com.bryan.revolutx.wear.RipAlarmTest#viaDataLayer com.bryan.revolutx.test/androidx.test.runner.AndroidJUnitRunner >/dev/null 2>&1
 adb shell am start -W -n com.bryan.revolutx/.wear.MainActivity >/dev/null 2>&1
-sleep 4
+sleep 3
+adb shell input keyevent KEYCODE_BACK   # the app asks for notifications again: declined, as a watch that blocks them
+sleep 2
+adb shell am start -W -n com.bryan.revolutx/.wear.MainActivity >/dev/null 2>&1
+sleep 3
 shot app-rip-line-error
 adb shell pm grant com.bryan.revolutx android.permission.POST_NOTIFICATIONS 2>/dev/null
 adb shell am instrument -w -e class com.bryan.revolutx.wear.RipAlarmTest#clearRip com.bryan.revolutx.test/androidx.test.runner.AndroidJUnitRunner >/dev/null
