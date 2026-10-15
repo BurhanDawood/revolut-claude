@@ -30,6 +30,8 @@ logs() {   # logs <title>: what Wear OS said about faces and complications since
 to_face() {   # the HOME intent shows the watch face (the HOME key toggles to the app list); unplugged, so no charging screen
   adb shell dumpsys battery unplug >/dev/null 2>&1
   adb shell dumpsys battery set status 3 >/dev/null 2>&1
+  adb shell cmd statusbar collapse >/dev/null 2>&1   # an open notification list stays over the face otherwise
+  adb shell input keyevent KEYCODE_BACK
   adb shell am start -W -a android.intent.action.MAIN -c android.intent.category.HOME >/dev/null 2>&1
   sleep 3
   local top
@@ -214,8 +216,17 @@ shot rip-after
 adb shell cmd notification set_dnd off
 
 echo "== 10. the face's flashing Rip alarm icon (15 Oct 13:20)"
-adb shell input keyevent KEYCODE_WAKEUP
-to_face
+face_awake() {   # a screen-off/on round closes any notification list or alarm page and wakes on the face
+  to_face
+  adb shell svc power stayon false >/dev/null 2>&1
+  adb shell input keyevent KEYCODE_SLEEP
+  sleep 3
+  adb shell input keyevent KEYCODE_WAKEUP
+  adb shell svc power stayon true >/dev/null 2>&1
+  sleep 2
+  echo "-- on screen: $(adb shell dumpsys activity activities 2>/dev/null | grep -m1 -E 'topResumedActivity' | sed 's/^ *//')"
+}
+face_awake
 sleep 3
 shot rip-face-test-a     # the TEST alarm above: the ticker in a green circle, flashing
 sleep 0.5
@@ -223,8 +234,8 @@ shot rip-face-test-b
 adb shell am instrument -w -e class com.bryan.revolutx.wear.RipAlarmTest#ripIconWithLogo com.bryan.revolutx.test/androidx.test.runner.AndroidJUnitRunner > "$OUT/rip-icon.txt" 2>&1 &
 ICON=$!
 sleep 6
-to_face
-sleep 3
+face_awake
+sleep 1
 shot rip-face-logo-a     # a real coin: its logo from the phone, flashing
 sleep 0.5
 shot rip-face-logo-b
