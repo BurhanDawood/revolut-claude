@@ -7,7 +7,7 @@ import android.graphics.drawable.Icon;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.wear.watchface.complications.data.ComplicationData;
-import androidx.wear.watchface.complications.data.ComplicationRequest;
+import androidx.wear.watchface.complications.datasource.ComplicationRequest;
 import androidx.wear.watchface.complications.data.ComplicationType;
 import androidx.wear.watchface.complications.data.NoDataComplicationData;
 import androidx.wear.watchface.complications.data.ShortTextComplicationData;
