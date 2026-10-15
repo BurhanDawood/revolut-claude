@@ -1,6 +1,8 @@
 package com.bryan.revolutx.wear;
 
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertTrue;
 
 import android.content.Context;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
@@ -32,6 +34,11 @@ public class RipAlarmTest {
         RipRing.Alarm a = RipRing.Alarm.parse(payload);
         assertNotNull(a);
         RipRing.ring(ctx, a);
+        // the app's process ends with the test, so the test stays while the CI job looks at the ringing watch
+        Thread.sleep(6_000);
+        assertTrue("ringing", RipRing.isRinging());
+        Thread.sleep(30_000);
+        assertFalse("silent after 30 s", RipRing.isRinging());
     }
 
     /** 1.2 s of two-tone beeps, 16-bit mono WAV. */
