@@ -131,15 +131,24 @@ jobs:
         run: |
           chmod +x gradlew
           ./gradlew :app:assembleRelease :wear:assembleRelease :watchface:assembleRelease --no-daemon --stacktrace
+          BT="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)"
+          cert() { "$BT"/apksigner verify --print-certs "$1" 2>/dev/null | grep -m1 -i "certificate SHA-256 digest" | sed 's/.*: //'; }
+          pkg() { "$BT"/aapt2 dump packagename "$1" 2>/dev/null; }
           for pair in app/build/outputs/apk/release/app-release.apk:revolutx-PHONE.apk \
                       wear/build/outputs/apk/release/wear-release.apk:revolutx-WATCH-adb-only.apk \
                       watchface/build/outputs/apk/release/watchface-release.apk:revolutx-WATCHFACE-adb-only.apk; do
             APK="${pair%%:*}"; OUT="${pair##*:}"
             test -f "$APK" || { echo "::error::no signed $APK was produced"; ls -R */build/outputs/apk; exit 1; }
-            echo "$OUT: $("$ANDROID_HOME"/build-tools/*/apksigner verify --print-certs "$APK" | grep -i "certificate SHA-256" | head -1)"
+            echo "$OUT: $(pkg "$APK"), signer SHA-256 $(cert "$APK")"
             cp "$APK" "$GITHUB_WORKSPACE/$OUT"
           done
           cp wear/build/outputs/mapping/release/mapping.txt "$GITHUB_WORKSPACE/watch-mapping.txt"
+          # desk #59 (15 Oct 14:56 (c)): the Data Layer delivers only between the same applicationId AND the same signing key
+          P="$GITHUB_WORKSPACE/revolutx-PHONE.apk"; W="$GITHUB_WORKSPACE/revolutx-WATCH-adb-only.apk"
+          if [ "$(pkg "$P")" != "$(pkg "$W")" ] || [ -z "$(cert "$P")" ] || [ "$(cert "$P")" != "$(cert "$W")" ]; then
+            echo "::error::the phone and watch APKs differ in applicationId or signing key: the watch would never get a message"; exit 1
+          fi
+          echo "Phone and watch: the same applicationId ($(pkg "$P")) and the same signing key"
 
       - name: Phone unit test (desk #59, what the phone forwards to the watch)
         working-directory: mobile/android
@@ -318,3 +327,56 @@ jobs:
           disable-animations: false
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -camera-back none
           script: bash mobile/android/ci/wear-emulator-check.sh rel
+
+  phone-emulator:
+    # Desk #59 (Bryan 15 Oct 14:56): the server's test Rip alarm push through the phone app's FCM service, with the app not
+    # running, on a phone emulator with Play services; it prints the watch forward's record (the "Watch link" line) and the
+    # app's log. Manual runs only. No key and no server: the emulator never signs in, and no watch is paired here.
+    if: github.event_name == 'workflow_dispatch'
+    needs: apk
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+
+      - name: JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: gradle
+
+      - name: Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-36 build-tools;36.0.0'
+
+      - name: Debug phone app and its CI test
+        run: |
+          (cd mobile && npm ci && npx cap sync android)
+          cd mobile/android && chmod +x gradlew && ./gradlew :app:assembleDebug :app:assembleDebugAndroidTest --no-daemon
+
+      - name: KVM and ImageMagick
+        run: |
+          sudo apt-get install -y -qq imagemagick >/dev/null
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Phone emulator (API 34, Play services)
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          force-avd-creation: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot -camera-back none
+          script: bash mobile/android/ci/phone-emulator-check.sh

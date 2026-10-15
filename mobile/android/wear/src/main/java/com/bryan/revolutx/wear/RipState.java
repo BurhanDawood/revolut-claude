@@ -71,8 +71,8 @@ final class RipState {
     private static void update(Context app) {
         try {
             ComplicationDataSourceUpdateRequester.Companion.create(app, new ComponentName(app, RipComplication.class)).requestUpdateAll();
-        } catch (Exception ignored) {
-            // not on the face
+        } catch (Exception e) {
+            RipDiag.error(app, "complication", e);
         }
     }
 

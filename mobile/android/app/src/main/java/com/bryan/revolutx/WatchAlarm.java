@@ -16,12 +16,15 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import org.json.JSONArray;
 import org.json.JSONObject;
 
 /**
@@ -41,6 +44,7 @@ final class WatchAlarm {
     static final String PATH_SOUND = "/rx/watch/sound/";
     private static final String TAG = "RxWatchAlarm";
     private static final String PREFS = "rx_watch_alarm";   // node -> the sound id that watch already has
+    private static final String DIAG = "rx_watch_link";     // the last forward, for the Rip alarm card's "Watch link" line
     private static final long MAX_SOUND = 3 * 1024 * 1024;
     private static final Pattern PCT = Pattern.compile("\\+\\s*([0-9]+(?:\\.[0-9]+)?)\\s*%");
     private static final Pattern TEST = Pattern.compile("RIP ALARM\\s*[-\u2013\u2014]?\\s*TEST\\b");
@@ -49,24 +53,25 @@ final class WatchAlarm {
     private WatchAlarm() {}
 
     /**
-     * The Rip alarm for each reachable watch: its tone first when that watch does not have it yet, then the alarm. The numbers
-     * come from the push's own title and body ("🚨 RIP ALARM - SOL +34% in 24 h", "Now $182.40 - you hold ..."); a part that
-     * cannot be read is left out, never guessed. Blocking (at most ~25 s): call it off the main thread.
+     * The Rip alarm for each watch: the alarm first (so it rings at once, with the tone it has, else its own alarm sound), then
+     * the tone when that watch does not have it yet. The numbers come from the push's own title and body ("🚨 RIP ALARM - SOL
+     * +34% in 24 h", "Now $182.40 - you hold ..."); a part that cannot be read is left out, never guessed. Blocking (at most
+     * ~25 s): call it off the main thread (FCM's onMessageReceived is). Each forward is recorded for the "Watch link" line
+     * (15 Oct 14:56: Bryan cannot read the watch's log). Returns that record's one-line result.
      */
-    static void send(Context ctx, Map<String, String> data) {
+    static String send(Context ctx, Map<String, String> data) {
         Context app = ctx.getApplicationContext();
         JSONObject o = payload(data);
         if (o == null) {
             Log.i(TAG, "not forwarded to the watch: no coin and not a test");
-            return;
+            return record(app, false, "not forwarded: the push has no coin and is not a test", "");
         }
+        String sent = "";
         try {
-            Set<Node> nodes = Tasks.await(
-                Wearable.getCapabilityClient(app).getCapability(CAP_WATCH, CapabilityClient.FILTER_REACHABLE), 5, TimeUnit.SECONDS
-            ).getNodes();
+            List<Node> nodes = watches(app);
             if (nodes.isEmpty()) {
-                Log.i(TAG, "not forwarded: no watch with the Revolut X watch app is reachable");   // the phone rings as before
-                return;
+                Log.i(TAG, "not forwarded: no watch connected");   // the phone rings as before
+                return record(app, false, "no watch found (no connected Wear OS node)", "");
             }
             Uri tone = tone(app);
             String sound = tone == null ? "" : soundId(tone);
@@ -76,14 +81,93 @@ final class WatchAlarm {
                 if (logo != null) o.put("logo", logo);
             }
             byte[] payload = o.toString().getBytes(StandardCharsets.UTF_8);
+            StringBuilder failed = new StringBuilder();
             for (Node n : nodes) {
-                if (!sound.isEmpty()) sendSound(app, n.getId(), tone, sound);   // a new tone first, so the watch rings with it
-                Tasks.await(Wearable.getMessageClient(app).sendMessage(n.getId(), PATH_ALARM, payload), 5, TimeUnit.SECONDS);
-                Log.i(TAG, "forwarded to the watch: " + o.optString("coin") + " (sound " + (sound.isEmpty() ? "default" : sound) + ")");
+                try {
+                    Tasks.await(Wearable.getMessageClient(app).sendMessage(n.getId(), PATH_ALARM, payload), 8, TimeUnit.SECONDS);
+                    sent += (sent.isEmpty() ? "" : ", ") + label(n);
+                    Log.i(TAG, "forwarded to the watch: " + o.optString("coin") + " -> " + label(n) + " (sound " + (sound.isEmpty() ? "default" : sound) + ")");
+                } catch (Exception e) {
+                    failed.append(failed.length() == 0 ? "" : "; ").append(label(n)).append(": ").append(why(e));
+                    Log.w(TAG, "not forwarded to " + label(n) + ": " + why(e));
+                }
             }
+            for (Node n : nodes) if (!sound.isEmpty()) sendSound(app, n.getId(), tone, sound);   // after the alarm: it never waits on a tone
+            if (sent.isEmpty()) return record(app, false, "send failed: " + failed, "");
+            return record(app, true, "sent " + o.optString("coin") + (failed.length() > 0 ? "; failed: " + failed : ""), sent);
         } catch (Exception e) {
-            Log.w(TAG, "watch alarm not sent: " + e.getClass().getSimpleName());   // no watch: the phone rings as before
+            Log.w(TAG, "watch alarm not sent: " + why(e));   // no watch: the phone rings as before
+            return record(app, false, "error: " + why(e), sent);
         }
+    }
+
+    /**
+     * Where the alarm goes: every watch with the Revolut X watch app (capability rx_watch), and every other connected node
+     * too (15 Oct 14:56 (d): a watch whose capability is not seen yet is not filtered out; a node without the app ignores it).
+     * The message carries no key, so it may go to any connected node.
+     */
+    static List<Node> watches(Context app) throws Exception {
+        Map<String, Node> all = new LinkedHashMap<>();
+        try {
+            for (Node n : Tasks.await(Wearable.getCapabilityClient(app).getCapability(CAP_WATCH, CapabilityClient.FILTER_REACHABLE), 5, TimeUnit.SECONDS).getNodes()) all.put(n.getId(), n);
+        } catch (Exception e) {
+            Log.w(TAG, "capability lookup failed: " + why(e));
+        }
+        for (Node n : Tasks.await(Wearable.getNodeClient(app).getConnectedNodes(), 5, TimeUnit.SECONDS)) all.putIfAbsent(n.getId(), n);
+        return new ArrayList<>(all.values());
+    }
+
+    /** The "Watch link" line's nodes: each connected node's name and id, and whether it has the watch app. */
+    static JSONArray nodesJson(Context app) throws Exception {
+        java.util.Set<String> withApp = new java.util.HashSet<>();
+        try {
+            for (Node n : Tasks.await(Wearable.getCapabilityClient(app).getCapability(CAP_WATCH, CapabilityClient.FILTER_ALL), 5, TimeUnit.SECONDS).getNodes()) withApp.add(n.getId());
+        } catch (Exception ignored) {
+            // shown as "app: not seen"
+        }
+        JSONArray out = new JSONArray();
+        for (Node n : Tasks.await(Wearable.getNodeClient(app).getConnectedNodes(), 5, TimeUnit.SECONDS)) {
+            out.put(new JSONObject().put("name", n.getDisplayName()).put("id", n.getId()).put("nearby", n.isNearby()).put("app", withApp.contains(n.getId())));
+        }
+        return out;
+    }
+
+    /** The last forward, for the "Watch link" line: {at, path, ok, result, to}. */
+    static JSONObject last(Context app) {
+        try {
+            String j = app.getSharedPreferences(DIAG, Context.MODE_PRIVATE).getString("last", null);
+            return j == null ? null : new JSONObject(j);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static String record(Context app, boolean ok, String result, String to) {
+        try {
+            JSONObject j = new JSONObject().put("at", System.currentTimeMillis()).put("path", PATH_ALARM).put("ok", ok)
+                .put("result", result.length() > 300 ? result.substring(0, 300) : result).put("to", to);
+            app.getSharedPreferences(DIAG, Context.MODE_PRIVATE).edit().putString("last", j.toString()).commit();
+        } catch (Exception ignored) {
+            // the line shows the previous one
+        }
+        return result;
+    }
+
+    private static String label(Node n) {
+        return n.getDisplayName() + " (" + n.getId() + ")";
+    }
+
+    /** An error as one short line: Play services' status code and name when it has one (e.g. 4000 TARGET_NODE_NOT_CONNECTED). */
+    static String why(Throwable e) {
+        Throwable c = e;
+        while ((c instanceof java.util.concurrent.ExecutionException) && c.getCause() != null) c = c.getCause();
+        if (c instanceof com.google.android.gms.common.api.ApiException) {
+            int code = ((com.google.android.gms.common.api.ApiException) c).getStatusCode();
+            return "ApiException " + code + " " + com.google.android.gms.wearable.WearableStatusCodes.getStatusCodeString(code);
+        }
+        if (c instanceof java.util.concurrent.TimeoutException) return "timed out";
+        String m = c.getMessage();
+        return c.getClass().getSimpleName() + (m == null ? "" : ": " + (m.length() > 120 ? m.substring(0, 120) : m));
     }
 
     /**
@@ -126,10 +210,7 @@ final class WatchAlarm {
                 Uri tone = tone(app);
                 if (tone == null) return;
                 String sound = soundId(tone);
-                Set<Node> nodes = Tasks.await(
-                    Wearable.getCapabilityClient(app).getCapability(CAP_WATCH, CapabilityClient.FILTER_REACHABLE), 5, TimeUnit.SECONDS
-                ).getNodes();
-                for (Node n : nodes) sendSound(app, n.getId(), tone, sound);
+                for (Node n : watches(app)) sendSound(app, n.getId(), tone, sound);
             } catch (Exception ignored) {
                 // no watch: nothing to do
             }

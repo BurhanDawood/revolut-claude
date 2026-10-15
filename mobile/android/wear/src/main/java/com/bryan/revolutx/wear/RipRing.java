@@ -132,9 +132,14 @@ public class RipRing extends Service {
             // not allowed to start from the background here: the notification's full-screen RipAlarmActivity starts the
             // ringing instead (an activity on screen may)
             Log.w(TAG, "ring service not started from the background, the alarm screen will: " + e.getClass().getSimpleName());
-            NotificationManager nm = app.getSystemService(NotificationManager.class);
-            if (nm != null) nm.notify(NOTIFICATION_ID, notification(app, a));
-            Log.i(TAG, "posted the Rip alarm notification (full-screen alarm to ring): " + a.coin);
+            RipDiag.error(app, "ring service", e);
+            try {
+                NotificationManager nm = app.getSystemService(NotificationManager.class);
+                if (nm != null) nm.notify(NOTIFICATION_ID, notification(app, a));
+                Log.i(TAG, "posted the Rip alarm notification (full-screen alarm to ring): " + a.coin);
+            } catch (Exception e2) {
+                RipDiag.error(app, "notification", e2);
+            }
         }
     }
 
@@ -225,6 +230,7 @@ public class RipRing extends Service {
             Log.i(TAG, "posted the Rip alarm notification: " + a.coin);
         } catch (Exception e) {
             Log.w(TAG, "not foreground: " + e.getClass().getSimpleName());
+            RipDiag.error(this, "notification", e);
         }
         if (running != null && running != this) running.silence();
         running = this;

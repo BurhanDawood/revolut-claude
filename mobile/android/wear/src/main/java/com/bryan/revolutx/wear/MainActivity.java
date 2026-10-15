@@ -34,6 +34,7 @@ public class MainActivity extends Activity {
     private ScrollView scroll;
     private LinearLayout list;
     private SparkCardView card;
+    private TextView ripLine;   // 15 Oct 14:56: "Last rip alarm: ..." small at the bottom of the first screen
     private boolean resumed;
     private boolean forceNext;
     private boolean notWatch;   // installed on a phone by mistake: one line, nothing else
@@ -76,7 +77,21 @@ public class MainActivity extends Activity {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         card = new SparkCardView(this);   // kept across renders, so its line slides and its dot keeps pulsing
-        root.addView(card, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+        android.widget.FrameLayout first = new android.widget.FrameLayout(this);
+        first.addView(card, new android.widget.FrameLayout.LayoutParams(
+            android.widget.FrameLayout.LayoutParams.MATCH_PARENT, android.widget.FrameLayout.LayoutParams.WRAP_CONTENT));
+        // desk #59 (Bryan 15 Oct 14:56): the Rip alarm's last arrival and last error, under the card's caption, inside the circle
+        int w = getResources().getDisplayMetrics().widthPixels;
+        ripLine = new TextView(this);
+        ripLine.setGravity(Gravity.CENTER);
+        ripLine.setMaxLines(2);
+        ripLine.setTextSize(TypedValue.COMPLEX_UNIT_SP, 9);
+        ripLine.setAutoSizeTextTypeUniformWithConfiguration(6, 9, 1, TypedValue.COMPLEX_UNIT_SP);
+        android.widget.FrameLayout.LayoutParams lp = new android.widget.FrameLayout.LayoutParams(
+            Math.round(w * 0.5f), Math.round(w * 0.08f), Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
+        lp.bottomMargin = Math.round(w * 0.045f);
+        first.addView(ripLine, lp);
+        root.addView(first, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
         root.addView(list, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
         scroll.addView(root);
         setContentView(scroll);
@@ -131,6 +146,8 @@ public class MainActivity extends Activity {
 
     private void render() {
         list.removeAllViews();
+        ripLine.setText(RipDiag.line(this));
+        ripLine.setTextColor(RipDiag.hasError(this) ? 0xFFFF4D6A : Fmt.GREY);
         Snapshot s = WatchStore.snapshot(this);
         card.set(SparkCard.model(this, s));
         if (s == null) {

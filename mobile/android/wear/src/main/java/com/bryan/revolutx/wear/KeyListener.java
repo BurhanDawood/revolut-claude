@@ -49,8 +49,16 @@ public class KeyListener extends WearableListenerService {
     static void onAlarm(android.content.Context ctx, byte[] data) {
         RipRing.Alarm a = data == null ? null : RipRing.Alarm.parse(data);
         Log.i("RxRipRing", "received the Rip alarm from the phone: " + (a == null ? "unreadable, ignored" : a.coin));
-        if (a == null) return;
-        RipState.start(ctx, a);   // the face flashes the coin's icon for 60 min (RipComplication)
+        RipDiag.received(ctx, a == null ? "(unreadable)" : a.coin);   // the app's first screen says so (15 Oct 14:56)
+        if (a == null) {
+            RipDiag.error(ctx, "alarm", "unreadable message from the phone (" + (data == null ? 0 : data.length) + " bytes)");
+            return;
+        }
+        try {
+            RipState.start(ctx, a);   // the face flashes the coin's icon for 60 min (RipComplication)
+        } catch (Exception e) {
+            RipDiag.error(ctx, "face icon", e);
+        }
         RipRing.ring(ctx, a);
     }
 

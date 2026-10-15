@@ -257,5 +257,21 @@ grep -E "OK \(|FAIL" "$OUT/rip-icon.txt" | head -n 3
 adb logcat -d -s RxRipRing 2>/dev/null | grep -iE "flashes|cleared" | tail -n 4
 adb shell am instrument -w -e class com.bryan.revolutx.wear.RipAlarmTest#clearRip com.bryan.revolutx.test/androidx.test.runner.AndroidJUnitRunner >/dev/null
 
+echo "== 11. the TEST alarm over the real Data Layer, and the app's 'Last rip alarm' line (15 Oct 14:56)"
+adb logcat -c
+adb shell am instrument -w -e class com.bryan.revolutx.wear.RipAlarmTest#viaDataLayer com.bryan.revolutx.test/androidx.test.runner.AndroidJUnitRunner > "$OUT/rip-dl.txt" 2>&1
+grep -E "OK \(|FAIL|Assertion|Exception" "$OUT/rip-dl.txt" | head -n 5
+adb logcat -d -s RxRipRing 2>/dev/null | tail -n 8
+adb shell am start -W -n com.bryan.revolutx/.wear.MainActivity >/dev/null 2>&1
+sleep 4
+shot app-rip-line
+adb shell pm revoke com.bryan.revolutx android.permission.POST_NOTIFICATIONS 2>/dev/null   # what the line says when the watch blocks it
+adb shell am instrument -w -e class com.bryan.revolutx.wear.RipAlarmTest#viaDataLayer com.bryan.revolutx.test/androidx.test.runner.AndroidJUnitRunner >/dev/null 2>&1
+adb shell am start -W -n com.bryan.revolutx/.wear.MainActivity >/dev/null 2>&1
+sleep 4
+shot app-rip-line-error
+adb shell pm grant com.bryan.revolutx android.permission.POST_NOTIFICATIONS 2>/dev/null
+adb shell am instrument -w -e class com.bryan.revolutx.wear.RipAlarmTest#clearRip com.bryan.revolutx.test/androidx.test.runner.AndroidJUnitRunner >/dev/null
+
 if adb logcat -d | grep -q "FATAL EXCEPTION"; then logs "crash"; echo "::error::the watch app crashed"; fi
 exit 0

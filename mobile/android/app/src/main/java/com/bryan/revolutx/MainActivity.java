@@ -66,6 +66,7 @@ public class MainActivity extends BridgeActivity {
         registerPlugin(WidgetBridgePlugin.class);
         registerPlugin(RxNotifyPlugin.class);
         registerPlugin(RxFloatPlugin.class);
+        registerPlugin(RxWatchPlugin.class);   // desk #59 (15 Oct 14:56): the Rip alarm card's "Watch link"
         bridgeBuilder.addWebViewListener(new WebViewListener() {
             @Override
             public void onPageStarted(WebView webView) {
@@ -79,6 +80,7 @@ public class MainActivity extends BridgeActivity {
                 if (shellLoaded) {
                     webView.clearHistory();   // Back never returns to an offline page or an earlier load
                     deliverPendingTab();
+                    WatchLinkCard.install(MainActivity.this, webView);   // the Rip alarm card's "Watch link" block
                 }
                 darkBars();
             }

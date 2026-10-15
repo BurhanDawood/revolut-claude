@@ -63,6 +63,29 @@ public class RipAlarmTest {
         Thread.sleep(25_000);       // the CI job takes the face's screenshots meanwhile
     }
 
+    /**
+     * 15 Oct 14:56: the same TEST alarm through the real Data Layer: MessageClient.sendMessage to this watch's own node on
+     * /rx/watch/alarm, so Play services has to find KeyListener by its manifest filter and start it (the app is not asked).
+     * Passes when the listener recorded the arrival (RipDiag, the line on the app's first screen). Silenced at once.
+     */
+    @Test
+    public void viaDataLayer() throws Exception {
+        Context ctx = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        android.content.SharedPreferences p = ctx.getSharedPreferences("rx_watch_rip_diag", Context.MODE_PRIVATE);
+        long before = p.getLong("at", 0);
+        com.google.android.gms.wearable.Node local = com.google.android.gms.tasks.Tasks.await(
+            com.google.android.gms.wearable.Wearable.getNodeClient(ctx).getLocalNode(), 15, java.util.concurrent.TimeUnit.SECONDS);
+        byte[] payload = "{\"coin\":\"TEST\",\"test\":true,\"id\":\"4713\",\"sound\":\"\"}".getBytes(StandardCharsets.UTF_8);
+        com.google.android.gms.tasks.Tasks.await(com.google.android.gms.wearable.Wearable.getMessageClient(ctx)
+            .sendMessage(local.getId(), KeyListener.PATH_ALARM, payload), 15, java.util.concurrent.TimeUnit.SECONDS);
+        long until = System.currentTimeMillis() + 20_000;
+        while (p.getLong("at", 0) == before && System.currentTimeMillis() < until) Thread.sleep(250);
+        android.util.Log.i("RxRipRing", "Data Layer test: " + (p.getLong("at", 0) != before ? "delivered to KeyListener" : "NOT delivered") + " (local node " + local.getId() + ")");
+        Thread.sleep(1500);
+        RipRing.stopRinging(ctx);
+        assertTrue("delivered over the Data Layer to KeyListener", p.getLong("at", 0) != before);
+    }
+
     @Test
     public void clearRip() {
         RipState.clear(InstrumentationRegistry.getInstrumentation().getTargetContext());
