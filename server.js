@@ -259,7 +259,12 @@ function rxOrdersHeld(orders) {   // what this account's active orders hold, per
   return { held, uncapped };
 }
 
+// #636 (system check batch B, Fable pre-ship): restart safety. From the moment Railway sends SIGTERM (globalThis.__rxShutdown), no NEW order
+// is sent - a clean refusal: nothing placed, venue_refused, so callers restore their trail/tracker as for any refusal - and the shutdown
+// waits while an order POST is on its way and 5 s after the last answer, max 25 s (globalThis.__rxOrdersInFlight / __rxLastOrderAt). Railway gives 0 s between SIGTERM and SIGKILL unless
+// RAILWAY_DEPLOYMENT_DRAINING_SECONDS is set (30). Flags on globalThis so this function still runs on its own in the test suite.
 async function placeRevolutOrder(symbol, side, orderType, baseSize, price = null, valueUsd = null, callerClientOrderId = null, pipelinedQty = 0) {
+  if (globalThis.__rxShutdown) { const se = new Error('server is shutting down for a deploy - order not sent'); se.venue_refused = true; se.not_sent = 'shutdown'; throw se; }   // #636
   // #388 pipelinedQty: record this order as already journaled up to that quantity, so the limit-fill poller
   // (#47 B2b) does not journal a fill the caller records itself. Default 0 = unchanged for every existing caller.
   // #359: a caller may supply the id, so it can record 'about to place order X' BEFORE placing it (crash recovery).
@@ -288,14 +293,18 @@ async function placeRevolutOrder(symbol, side, orderType, baseSize, price = null
   // #K1 withStatus: the thrown error carries the HTTP status (venue_status), so the #93 sale can tell a rate limit (429,
   // nothing placed) from an ambiguous failure. A non-2xx answer now always throws (it used to count as placed when the
   // body had no message field); an unreadable body throws as before (JSON.parse used to throw).
-  let rs = await revolutRequest('POST', '/orders', body, null, { withStatus: true });
+  let rs;
+  globalThis.__rxOrdersInFlight = (globalThis.__rxOrdersInFlight || 0) + 1;   // #636
+  try { rs = await revolutRequest('POST', '/orders', body, null, { withStatus: true }); } finally { globalThis.__rxOrdersInFlight--; globalThis.__rxLastOrderAt = Date.now(); }
   { // #14 one retry when the venue names the precision it wants: a 400 refusal places nothing, so re-sending is safe
     const pm = sizeStr != null && rs && rs.status === 400 && /base_size precision must not exceed (\d{1,2}) decimal/i.exec(String((rs.body && (rs.body.message || JSON.stringify(rs.body))) || ''));
     if (pm) {
       const cut = truncDecimals(sizeStr, Number(pm[1]));
       if (cut !== sizeStr && Number(cut) > 0) {
         console.log('[revolut] #14 ' + revolutSymbol + ' size ' + sizeStr + ' -> ' + cut + ' (venue allows ' + pm[1] + ' decimals) - retrying once');
-        sizeStr = cut; body = mkBody(); rs = await revolutRequest('POST', '/orders', body, null, { withStatus: true });
+        sizeStr = cut; body = mkBody();
+        globalThis.__rxOrdersInFlight = (globalThis.__rxOrdersInFlight || 0) + 1;   // #636
+        try { rs = await revolutRequest('POST', '/orders', body, null, { withStatus: true }); } finally { globalThis.__rxOrdersInFlight--; globalThis.__rxLastOrderAt = Date.now(); }
       }
     }
   }
@@ -1373,6 +1382,7 @@ async function sendTelegram(message, replyMarkup) {
 
 // #125 Away Mode gate helper — fresh DB read (live-DB-is-truth + instant kill switch). Called by NOTHING in Phase 1 (inert).
 // #125 Phase 2b — Away Mode auto-sell on up-target. Double-gated: master enabled AND isAwayActionable. Returns true if handled (caller skips menu + returns).
+const _awayRungRetryAt = new Map();   // #636 symbol:target -> no new attempt before this time
 async function tryAwayAutoSellUpTarget(symbol, coinBase, currentPrice, changePct, target, assetQty, priceStr) {
   try {
     const [aeRows] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'ai_auto_execute'");
@@ -1393,12 +1403,26 @@ async function tryAwayAutoSellUpTarget(symbol, coinBase, currentPrice, changePct
     // #125 B / #144: no pre-notice — autoExecuteSell sends the single 'AI EXECUTED' notice.
     const awayAnalysis = `REASON: AWAY MODE auto-sell — ${coinBase} hit pre-set up-target ${target.targetPrice} (${pct}% of position, now ${priceStr}, +${changePct.toFixed(1)}%).`;
     const conf = ae.require_confidence || 'High';
+    const rk = symbol + ':' + target.targetPrice;
+    if ((_awayRungRetryAt.get(rk) || 0) > Date.now()) return true;   // #636 a refused sale waits 30 min before this rung tries again
+    let awayRes;
     if (KRAKEN_MONITORED_COINS.includes(symbol)) {
-      await autoExecuteKrakenSell(symbol, pct, awayAnalysis, conf, { tool_key: 'away_sell' });   // #L1
+      awayRes = await autoExecuteKrakenSell(symbol, pct, awayAnalysis, conf, { tool_key: 'away_sell' });   // #L1
     } else {
-      await autoExecuteSell(symbol, pct, awayAnalysis, conf, { tool_key: 'away_sell' });   // #L1
+      awayRes = await autoExecuteSell(symbol, pct, awayAnalysis, conf, { tool_key: 'away_sell' });   // #L1
     }
-    am.session_sold_usd = sold + estValue;
+    // #636 (system check #7): the rung is removed and the session cap charged ONLY when the sale happened. A refusal (floor, pause, venue)
+    // keeps the rung and retries in 30 min; a sale that may be resting keeps it too, with one line - never a second order on top.
+    if (!(awayRes && awayRes.executed === true)) {
+      _awayRungRetryAt.set(rk, Date.now() + 30 * 60000);
+      const maybeResting = !!(awayRes && awayRes.order_sent && !isVenueRefusal(KRAKEN_MONITORED_COINS.includes(symbol) ? 'kraken' : 'revolut', awayRes));
+      console.log('[away] #636 ' + coinBase + ' rung ' + target.targetPrice + ' kept - sale ' + (awayRes ? (awayRes.reason || 'not executed') : 'no result') + (maybeResting ? ' (may be resting)' : '') + '; next try in 30 min');
+      if (maybeResting) await sendTelegram('⚠️ AWAY — ' + escTg(coinBase) + ': the up-target sale may still be resting on the venue. The rung is kept and nothing more is sent for 30 min; check Revolut X.').catch(() => {});
+      return true;
+    }
+    _awayRungRetryAt.delete(rk);
+    const soldUsd = Number(awayRes.qty) > 0 && Number(awayRes.price) > 0 ? Number(awayRes.qty) * Number(awayRes.price) : estValue;   // #636 what actually sold
+    am.session_sold_usd = sold + soldUsd;
     await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('away_mode', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)", [JSON.stringify(am)]).catch(() => {});
     console.log(`[away] auto-sold ${pct}% ${coinBase} on up-target; session $${am.session_sold_usd.toFixed(2)}/$${cap}`);
     await db.execute('DELETE FROM price_targets WHERE symbol = ? AND target_price = ?', [symbol, target.targetPrice]).catch(() => {});
@@ -1811,6 +1835,7 @@ const _pumpArmLogAt = new Map();   // #635 symbol -> last "watching" log line
 const pendingTradeContext = new Map(); // symbol -> { journalId, detectedAt, timeoutHandle, action, price, valueUsd, qty }
 const pendingRebalanceConfirm = new Map(); // chatId -> { sellSymbol, sellJournalId, sellPrice, sellValueUsd, buySymbol, buyJournalId, buyPrice, buyValueUsd }
 const previousBalances = new Map(); // symbol -> quantity (DB-backed)
+let _bootBaselineOk = false;   // #636 the saved balances are recent enough (< 24 h) to detect trades made while the server was down
 let portfolioCheckCount = 0; // skip trade detection on first check (baseline establishment)
 let monitoringInterval = null;
 const conversationHistory = new Map(); // chatId -> [{role, content}]
@@ -1846,6 +1871,22 @@ let pendingRevolutTrade = null;             // { symbol, side, orderType, baseSi
 let pendingKrakenTradeReminder = null;      // setInterval handle for Kraken approval reminders
 let pendingMcpTradeQueue = [];              // #44: FIFO queue for MCP-submitted trades
 let pendingRevolutTradeReminder = null;     // setInterval handle for Revolut X approval reminders
+// #636 approvals waiting on Bryan are memory only, so a restart dropped them silently ("No pending trade"). They are saved (on change,
+// checked every 15 s) and after a restart Bryan gets ONE line listing what was waiting. They are NOT made approvable again:
+// the price has moved and an approval places an order, so he asks again if he still wants it.
+let _pendingApprovalsSig = null;
+function pendingApprovalsList() {
+  const out = [], add = (t, ex) => { if (t && t.symbol) out.push({ ex: ex || '?', symbol: String(t.symbol), side: String(t.side || ''), value_usd: Number(t.valueUSD || t.valueUsd) || null, source: t.source || null, at: t.timestamp || null }); };
+  add(pendingRevolutTrade, 'revolut'); add(pendingKrakenTrade, 'kraken');
+  for (const q of pendingMcpTradeQueue) add(q, q && q._exchange);
+  return out;
+}
+async function savePendingApprovals(force) {
+  const list = pendingApprovalsList(), sig = JSON.stringify(list);
+  if (!force && sig === _pendingApprovalsSig) return;
+  await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('pending_approvals', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)", [JSON.stringify({ at: Date.now(), list })]);
+  _pendingApprovalsSig = sig;
+}
 let totalInvestedCapital = 20600; // loaded from DB on startup
 
 async function setThreshold(symbol, threshold) {
@@ -3163,10 +3204,13 @@ for (const row of epRows) {
 }
 console.log(`Loaded ${epRows.length} entry prices from database`);
 
-const [snapRows] = await db.execute('SELECT symbol, quantity FROM balance_snapshots');
+const [snapRows] = await db.execute('SELECT symbol, quantity, TIMESTAMPDIFF(SECOND, recorded_at, NOW()) AS age_s FROM balance_snapshots');
 for (const row of snapRows) {
   previousBalances.set(row.symbol, parseFloat(row.quantity));
 }
+{ const newest = snapRows.reduce((m, r) => Math.min(m, Number(r.age_s) >= 0 ? Number(r.age_s) : Infinity), Infinity);
+  _bootBaselineOk = snapRows.length > 0 && newest < 86400;   // #636
+  console.log('[detect] #636 boot baseline: ' + snapRows.length + ' saved balances, newest ' + (isFinite(newest) ? Math.round(newest / 60) + ' min' : 'none') + ' old - ' + (_bootBaselineOk ? 'trades made while down WILL be detected' : 'too old, first check only sets the baseline')); }
 console.log(`Loaded ${snapRows.length} balance snapshots from database`);
 
 // Load USDT/USD baseline — DB first (survives redeployments), live balance as fallback
@@ -3231,6 +3275,17 @@ try {
 } catch (e) {
   console.error('Failed to load MSS states:', e.message);
 }
+// #636 approvals that were waiting when the server last stopped: one line, then cleared; only then does the 15 s save start.
+try {
+  const [paR] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'pending_approvals'");
+  const pa = paR.length ? JSON.parse(paR[0].config_value) : null, list = pa && Array.isArray(pa.list) ? pa.list : [];
+  if (list.length && Date.now() - Number(pa.at) < 6 * 3600000) {
+    const lines = list.slice(0, 10).map(t => '• ' + escTg(String(t.side).toUpperCase()) + ' ' + escTg(String(t.symbol).replace('-USD', '')) + (t.value_usd ? ' ≈ $' + Number(t.value_usd).toFixed(2) : '') + (t.ex === 'kraken' ? ' (Kraken)' : ''));
+    setTimeout(() => sendTelegram('🔄 <b>The server restarted</b> while ' + list.length + ' trade' + (list.length > 1 ? 's were' : ' was') + ' waiting for your approval:\n' + lines.join('\n') + '\nNothing was placed. Prices have moved, so ask again if you still want ' + (list.length > 1 ? 'them' : 'it') + '.').catch(() => {}), 15000);
+  }
+  if (list.length) await db.execute("UPDATE system_config SET config_value = ? WHERE config_key = 'pending_approvals'", [JSON.stringify({ at: Date.now(), list: [] })]);
+} catch (e) { console.error('[approve] #636 boot read of saved approvals failed:', e.message); }
+setInterval(() => { if (!globalThis.__rxShutdown) savePendingApprovals().catch(e => console.error('[approve] #636 save failed:', e.message)); }, 15000);
 // #50C boot-load abnormal-move tunable config from system_config
 try {
   const [abnCfgRows] = await db.execute("SELECT config_value FROM system_config WHERE config_key='abn_config'");
@@ -5376,6 +5431,7 @@ async function getKrakenBalances() {
 }
 
 async function executeKrakenTrade(symbol, side, orderType, volume, price = null) {
+  if (globalThis.__rxShutdown) { const se = new Error('server is shutting down for a deploy - order not sent'); se.venue_refused = true; se.not_sent = 'shutdown'; throw se; }   // #636
   const standard    = symbol.replace('-USD', '');
   const krakenBase  = standard === 'BTC' ? 'XBT' : standard;
   const pair        = `${krakenBase}USD`;
@@ -5392,7 +5448,9 @@ async function executeKrakenTrade(symbol, side, orderType, volume, price = null)
   };
   if (orderType === 'limit' && price) orderData.price = price.toString();
 
-  const result = await krakenRequest('/0/private/AddOrder', orderData);
+  let result;
+  globalThis.__rxOrdersInFlight = (globalThis.__rxOrdersInFlight || 0) + 1;   // #636
+  try { result = await krakenRequest('/0/private/AddOrder', orderData); } finally { globalThis.__rxOrdersInFlight--; globalThis.__rxLastOrderAt = Date.now(); }
   return result && typeof result === 'object' && !Array.isArray(result) ? { ...result, sent_volume: volStr } : result;   // K3 the size actually sent
 }
 // K3 lot_decimals per Kraken pair from the public AssetPairs call, cached 6 h per pair. null = unknown (never blocks an order).
@@ -9230,6 +9288,7 @@ async function runLadderLiveTick(nowMs) {
         await tell(coin, ['HALTED - ' + (act.leg === 'sell' ? 'too little ' + coin + ' is available to sell (the rest is reserved)' : 'too little USD cash for the buy-back') + '.']);
         continue;
       }
+      if (globalThis.__rxShutdown) { report.push({ symbol: sym, skipped: 'deploy in progress - next copy' }); continue; }   // #636 S3 audit: a failed leg HALTS the ladder, so never start one during a deploy
       const [iw] = await db.execute('UPDATE ladder_live SET intent = ? WHERE symbol = ? AND intent IS NULL AND active = 1', [JSON.stringify(intentObj), sym]);
       if (!(iw && iw.affectedRows === 1)) { report.push({ symbol: sym, skipped: 'intent not recorded - no order placed' }); continue; }
       let placed = null, err = null, floorBlocked = false;
@@ -12383,6 +12442,7 @@ async function runFastScan() {
 
           // ALL GATES PASS -- clear tracker BEFORE placeRevolutOrder (Map.delete is sync; prevents double-fire on race/crash)
           // #627 and the DB clear must succeed: on failure the tracker is restored and nothing is bought
+          if (globalThis.__rxShutdown) continue;   // #636 Fable S3: never clear the tracker during a deploy - the next copy buys back
           if (!(await clearTroughTrackerBeforeBuy(ttSymbol, t))) { if (ttP0) await troughP0Mark(ttP0.decision_id, 'held_clear'); continue; }
 
           // Execute the buy
@@ -12507,6 +12567,7 @@ async function runFastScan() {
                   '<b>[TROUGH BLOCKED] ' + stB + '</b>\n$' + stAvailUsd.toFixed(2) + ' available, need $' + st.buyUsd + '. Cleared.', stAvailUsd);   // #413 with a Buy now button
                 await clearStandaloneTrough(stSym); continue;
               }
+              if (globalThis.__rxShutdown) continue;   // #636 Fable S3: tracker kept for the next copy
               if (!(await clearStandaloneTroughBeforeBuy(stSym, st))) continue;   // #627 DB clear must succeed before the order
               let stBuyQty = null, stResp = null;   // #J1 keep the response for its order id
               try {
@@ -15798,6 +15859,19 @@ async function backfillR1() {
   return out;
 }
 
+// #636 the first portfolio check after boot detects against the saved balances: a change already in the journal in the last 30 min
+// (the old copy logged it during the deploy overlap, or the system's own order) is not logged again; an unreadable journal = not logged.
+async function bootSafeAutoLog(symbol, action, price, qtyChange, currentQty) {
+  if (portfolioCheckCount === 1) {
+    try {
+      const coin = symbol.replace('-USD', ''), q = Math.abs(qtyChange);
+      const [r] = await db.execute('SELECT id FROM trading_journal WHERE symbol IN (?, ?) AND action = ? AND created_at > DATE_SUB(NOW(), INTERVAL 30 MINUTE) AND ABS(ABS(quantity) - ?) <= ? * 0.02 LIMIT 1', [symbol, coin, action, q, q]);
+      if (r.length) { console.log('[detect] #636 boot: ' + symbol + ' ' + action + ' already in the journal (id ' + r[0].id + ') - not logged again'); return; }
+    } catch (e) { console.error('[detect] #636 boot dedupe read failed - not logged:', e.message); return; }
+    console.log('[detect] #636 boot: ' + symbol + ' ' + action + ' happened while the server was restarting');
+  }
+  return autoLogTrade(symbol, action, price, qtyChange, currentQty);
+}
 async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
   try {
     const coinBase = symbol.replace('-USD', '');
@@ -18816,7 +18890,7 @@ async function autoExecuteSell(symbol, maxPct, analysis, confidence, opts = {}) 
         // (slippage protection on a thin book: #511 venue_refused = state cancelled/rejected, zero filled). On a #93 trail sale
         // (opts.refusedFallback) fall straight to the reviewed spike chase: limits from the BID at this moment, the bid re-read
         // every step, never under max(cost floor, give-up line). Any other error - or the 'retry' setting - is today's path.
-        if (!(mkErr && mkErr.venue_refused) || !opts.refusedFallback || (await refusedMarketFallback()) !== 'chase') throw mkErr;
+        if (!(mkErr && mkErr.venue_refused) || mkErr.not_sent === 'shutdown' || !opts.refusedFallback || (await refusedMarketFallback()) !== 'chase') throw mkErr;   // #636 Fable S1: our deploy gate is not a venue refusal - no chase
         // #573 (senior first pass on 558, desk #33 msg 382; Bryan 6 Oct): (A) #511 confirmed zero fill and a dead order, so nothing
         // is on the book: aeOrderSent goes back to false and onSend sets it again just before the chase's first order - a throw
         // before that (no cost floor, a DB error) now restores the trail (K1) instead of leaving the position unprotected.
@@ -18911,7 +18985,7 @@ async function autoExecuteSell(symbol, maxPct, analysis, confidence, opts = {}) 
     if (e.venue_refused) { const lastR = _aeRefusedTold.get(coinBase) || 0; if (Date.now() - lastR > 10 * 60000) { _aeRefusedTold.set(coinBase, Date.now()); await sendTelegram('⚠️ AUTO-EXEC: ' + coinBase + ' sale not placed - ' + String(e.message || '').slice(0, 300) + ' The trailing stop is put back and it retries; nothing was sold.').catch(() => {}); } }   // #511 a venue refusal: no 'manual review', one line per coin per 10 min
     else if (aeOrderSent) await sendTelegram(`❌ AUTO-EXEC FAILED — ${coinBase}\nError: ${e.message}\nManual review needed`);
     else await sendTelegram(`⚠️ AUTO-EXEC: ${coinBase} sale not placed - the error came before any order was sent (${String(e.message || '').slice(0, 120)}). Nothing was sold.`).catch(() => {});   // #K1
-    return { executed: false, reason: 'error', message: e.message, order_sent: aeOrderSent, venue_status: e.venue_status || null, venue_refused: !!e.venue_refused }; // #309 #K1 #511
+    return { executed: false, reason: 'error', message: e.message, order_sent: aeOrderSent, venue_status: e.venue_status || null, venue_refused: !!e.venue_refused, not_sent: e.not_sent || undefined }; // #309 #K1 #511 #636
   }
 }
 
@@ -18955,6 +19029,7 @@ function isDefinitiveVenueRejection(venue, r) {   // a refusal that locks the wh
   return Number(r.venue_status) === 429;   // Revolut X: rate limited - the order was not accepted
 }
 function isVenueRefusal(venue, r) {   // the venue answered and refused: nothing was placed, so the trail can be restored
+  if (r && r.not_sent === 'shutdown') return true;   // #636 Fable S2: refused by our own deploy gate before any request - nothing placed
   if (isDefinitiveVenueRejection(venue, r)) return true;
   if (r && r.venue_refused) return true;   // #511 placement answered with state cancelled/rejected: nothing on the book, nothing filled
   const st = Number(r && r.venue_status);
@@ -19303,7 +19378,7 @@ async function autoExecuteKrakenSell(symbol, maxPct, analysis, confidence, opts 
     console.error('[auto-exec] Kraken sell error:', e.message);
     if (akOrderSent) await sendTelegram(`❌ AUTO-EXEC FAILED — Kraken ${coinBase}\nError: ${e.message}`);
     else await sendTelegram(`⚠️ AUTO-EXEC: Kraken ${coinBase} sale not placed - the error came before any order was sent (${String(e.message || '').slice(0, 120)}). Nothing was sold.`).catch(() => {});   // #K1
-    return { executed: false, reason: 'error', message: e.message, order_sent: akOrderSent };   // #K1
+    return { executed: false, reason: 'error', message: e.message, order_sent: akOrderSent, venue_refused: !!e.venue_refused || undefined, not_sent: e.not_sent || undefined };   // #K1 #636 S2: the deploy gate reads as nothing placed
   }
 }
 
@@ -20095,7 +20170,7 @@ async function checkPortfolio() {
       lastBalances[symbol] = available;
 
       // ── Auto trade detection ──────────────────────────────────────────────
-      if (portfolioCheckCount > 1) { // skip first check (baseline establishment)
+      if (portfolioCheckCount > 1 || (portfolioCheckCount === 1 && _bootBaselineOk)) { // #636 the first check detects too, against the saved balances
         const prevQty = previousBalances.get(symbol);
         if (prevQty !== undefined) {
           const qtyChange = available - prevQty;
@@ -20116,7 +20191,7 @@ async function checkPortfolio() {
                 if (card > 0) { logQty = qtyChange + card; console.log(`[card] #486 ${symbol}: ${card} of the ${-qtyChange} drop is card spending already recorded - ${Math.abs(logQty) > 0.0001 ? 'the rest is logged as a sale' : 'no sale logged'}`); }
               }
               if (Math.abs(logQty) * currentPrice >= 0.10) {
-                autoLogTrade(symbol, action, currentPrice, logQty, available).catch(e => console.error('autoLogTrade failed:', e.message));
+                bootSafeAutoLog(symbol, action, currentPrice, logQty, available).catch(e => console.error('autoLogTrade failed:', e.message));   // #636
                 if (Math.abs(logQty) * currentPrice >= 5) scheduleTradeResync(symbol);   // #480 costs from the venue record within minutes, not at 02:40
               }
               // #347: lots follow the sale regardless of whether autoLogTrade logs it (debounce / dedupe / limit suppression)
@@ -20129,14 +20204,14 @@ async function checkPortfolio() {
             const valueUsd = available * currentPrice;
             if (valueUsd >= 0.10) {
               console.log(`[detect] ${symbol} buy (re-entry): 0 → ${available} ($${valueUsd.toFixed(2)})`);
-              autoLogTrade(symbol, 'buy', currentPrice, available, available).catch(e => console.error('autoLogTrade failed:', e.message));
+              bootSafeAutoLog(symbol, 'buy', currentPrice, available, available).catch(e => console.error('autoLogTrade failed:', e.message));
               if (valueUsd >= 5) scheduleTradeResync(symbol);   // #480
             }
           }
         } else if (prevQty === undefined && available > 0) {
           // New coin appearing for the first time this session
           console.log(`[detect] ${symbol} buy (new position): 0 → ${available}`);
-          autoLogTrade(symbol, 'buy', currentPrice, available, available).catch(e => console.error('autoLogTrade failed:', e.message));
+          bootSafeAutoLog(symbol, 'buy', currentPrice, available, available).catch(e => console.error('autoLogTrade failed:', e.message));
         }
       }
       // Update snapshot
@@ -20364,7 +20439,7 @@ async function checkPortfolio() {
     }
 
     // Detect full exits (coin was in previousBalances but not in current balances)
-    if (portfolioCheckCount > 1) {
+    if (portfolioCheckCount > 1 || (portfolioCheckCount === 1 && _bootBaselineOk)) {   // #636
       const currentSymbols = new Set(
         balances
           .filter(a => a.currency && !SKIP_CURRENCIES.includes(a.currency) && (parseFloat(a.available || 0) + parseFloat(a.reserved || 0)) > 0) // #253: total holdings (available + reserved), not available-only; a card-auth or resting-limit reserve on a whole position otherwise fakes a full exit
@@ -20375,7 +20450,7 @@ async function checkPortfolio() {
           const exitPrice = priceMap[sym];
           if (exitPrice) {
             console.log(`Balance change detected: ${sym} from ${prevQty} to 0 action: sell (full exit)`);
-            autoLogTrade(sym, 'sell', exitPrice, -prevQty, 0).catch(e => console.error('autoLogTrade failed:', e.message));
+            bootSafeAutoLog(sym, 'sell', exitPrice, -prevQty, 0).catch(e => console.error('autoLogTrade failed:', e.message));   // #636
             syncRevolutLotsDownToBalance(sym).catch(() => {});   // #347
           }
           previousBalances.delete(sym);
@@ -35590,6 +35665,23 @@ app.patch('/api/activity/:id', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
+// #636 SIGTERM (a deploy or a restart): no new orders, wait for orders in flight and 5 s after the last answer (max 25 s), close.
+process.on('SIGTERM', async () => {
+  if (globalThis.__rxShutdown) return;
+  globalThis.__rxShutdown = true;
+  const inFlight = () => globalThis.__rxOrdersInFlight || 0;
+  console.log('[shutdown] #636 SIGTERM - no new orders; ' + inFlight() + ' in flight');
+  // (no approvals save here: Railway starts the new copy before it signals this one, so the new copy has already read the 15 s save)
+  const t0 = Date.now();
+  // Senior pass (desk #62 msg 661): the caller journals AFTER the venue answers, so the wait also covers 5 s after the last order came
+  // back (journal row, pending_orders, loop state) - never longer than 25 s in all, inside Railway's 30 s draining window.
+  const settled = () => inFlight() === 0 && Date.now() - (globalThis.__rxLastOrderAt || 0) >= 5000;
+  while (!settled() && Date.now() - t0 < 25000) await new Promise(r => setTimeout(r, 200));
+  console.log('[shutdown] #636 ' + (settled() ? 'no order in flight or just answered' : inFlight() + ' order(s) in flight / just answered after 25 s - exiting anyway') + ' - closing');
+  try { httpServer.close(); } catch (e) {}
+  try { await Promise.race([db.end(), new Promise(r => setTimeout(r, 3000))]); } catch (e) {}
+  process.exit(0);
+});
+const httpServer = app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
