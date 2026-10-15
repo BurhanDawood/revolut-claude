@@ -97,7 +97,8 @@ public class MainActivity extends Activity {
         scroll.addView(root);
         setContentView(scroll);
         forceNext = getIntent() != null && getIntent().getBooleanExtra(EXTRA_REFRESH, false);
-        if (getIntent() != null && getIntent().getBooleanExtra(RipComplication.EXTRA_CLEAR, false)) RipState.clear(this);   // the face's Rip icon (a test)
+        if (getIntent() != null && getIntent().getBooleanExtra(RipComplication.EXTRA_CLEAR, false)) RipRing.stopAll(this, "the face's Rip icon");   // a test
+        else if (RipRing.isRinging()) RipRing.stopAll(this, "opened the watch app");   // Bryan 15 Oct 16:22
         render();
         PhoneLink.helloAtMost(this, PhoneLink.HELLO_START_MS);   // the phone re-confirms the key, or clears it
         // desk #59 (15 Oct): the Rip alarm posts its own notification on the watch, which Android 13+ lets it do only once allowed
@@ -117,6 +118,7 @@ public class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         if (notWatch) return;
+        if (RipRing.isRinging()) RipRing.stopAll(this, "opened the watch app");
         resumed = true;
         scroll.requestFocus();   // the bezel / rotary input scrolls
         main.removeCallbacks(tick);

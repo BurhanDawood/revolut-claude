@@ -49,7 +49,11 @@ public class KeyListener extends WearableListenerService {
     static void onAlarm(android.content.Context ctx, byte[] data) {
         RipRing.Alarm a = data == null ? null : RipRing.Alarm.parse(data);
         Log.i("RxRipRing", "received the Rip alarm from the phone: " + (a == null ? "unreadable, ignored" : a.coin));
-        RipDiag.received(ctx, a == null ? "(unreadable)" : a.coin);   // the app's first screen says so (15 Oct 14:56)
+        if (a != null && RipDiag.duplicate(ctx, a.coin)) {   // 15 Oct 16:22: a second copy within 2 min - one sound only
+            Log.i("RxRipRing", "ignored a duplicate " + a.coin + " alarm (same coin within 2 min)");
+            return;
+        }
+        if (a == null) RipDiag.received(ctx, "(unreadable)");   // the app's first screen says so (15 Oct 14:56)
         if (a == null) {
             RipDiag.error(ctx, "alarm", "unreadable message from the phone (" + (data == null ? 0 : data.length) + " bytes)");
             return;

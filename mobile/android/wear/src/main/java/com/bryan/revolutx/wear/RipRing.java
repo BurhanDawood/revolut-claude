@@ -32,8 +32,9 @@ import org.json.JSONObject;
  * the tone's audio on /rx/watch/sound/<id> (KeyListener). This service plays it on the ALARM stream (it rings through the
  * watch's Do Not Disturb, like a clock alarm) with the phone's alarm vibration, for at most 30 s; its notification on
  * "Rip alarm" (high importance, alarm category, full-screen RipAlarmActivity) reads "🚨 COIN +X% in 24 h · $price".
- * Stop, a swipe of the notification, or opening it stops the sound. Without the tone (not received yet), the watch's
- * default alarm sound. Nothing is sent anywhere.
+ * Stop, a swipe of the notification, a side button, the face's icon or opening the watch app stops it all (stopAll), and
+ * the sound never lasts more than 30 s. Without the tone (not received yet), the watch's default alarm sound. Nothing is
+ * sent anywhere.
  */
 public class RipRing extends Service {
 
@@ -41,6 +42,7 @@ public class RipRing extends Service {
     static final String ACTION_RING = "com.bryan.revolutx.wear.RIP_RING";
     static final String ACTION_STOP = "com.bryan.revolutx.wear.RIP_STOP";
     static final String EXTRA_JSON = "rx_rip_json";
+    static final String EXTRA_SWIPE = "rx_rip_swipe";
     static final int NOTIFICATION_ID = 5930;
     static final long RING_MS = 30_000;
     /** The phone's alarm vibration (MainActivity.ALARM_VIBRATION): three quick taps then a long buzz, twice. */
@@ -53,8 +55,6 @@ public class RipRing extends Service {
 
     private static RipRing running;
     private final Handler main = new Handler(Looper.getMainLooper());
-    private MediaPlayer player;
-    private Vibrator vibrator;
 
     /** One alarm, checked: the coin as a ticker, numbers as numbers, the ids as plain tokens. Null when it is not one. */
     static final class Alarm {
@@ -121,7 +121,10 @@ public class RipRing extends Service {
 
     // ── from KeyListener ──
 
-    /** Rings this alarm (the listener's background thread). */
+    /**
+     * Rings this alarm (the listener's background thread). A second copy of the same coin's alarm within 2 min (the phone's
+     * forward and a retry can both arrive) is dropped by KeyListener first, so only one sound ever plays.
+     */
     static void ring(Context ctx, Alarm a) {
         Context app = ctx.getApplicationContext();
         ensureChannel(app);
@@ -130,17 +133,31 @@ public class RipRing extends Service {
             app.startForegroundService(i);
         } catch (Exception e) {
             // not allowed to start from the background here: the notification's full-screen RipAlarmActivity starts the
-            // ringing instead (an activity on screen may)
+            // ringing instead (an activity on screen may) - once, for this alarm only (pending)
             Log.w(TAG, "ring service not started from the background, the alarm screen will: " + e.getClass().getSimpleName());
             RipDiag.error(app, "ring service", e);
+            prefs(app).edit().putString("pending", a.toJson()).putLong("pending_at", System.currentTimeMillis()).commit();
             try {
                 NotificationManager nm = app.getSystemService(NotificationManager.class);
-                if (nm != null) nm.notify(NOTIFICATION_ID, notification(app, a));
+                if (nm != null) nm.notify(NOTIFICATION_ID, notification(app, a, true));
                 Log.i(TAG, "posted the Rip alarm notification (full-screen alarm to ring): " + a.coin);
             } catch (Exception e2) {
                 RipDiag.error(app, "notification", e2);
             }
         }
+    }
+
+    /** For RipAlarmActivity: true once, when the listener could not start the ring for exactly this alarm (within 60 s). */
+    static boolean takePending(Context ctx, String json) {
+        android.content.SharedPreferences p = prefs(ctx);
+        String pend = p.getString("pending", null);
+        boolean mine = pend != null && pend.equals(json) && System.currentTimeMillis() - p.getLong("pending_at", 0) < 60_000;
+        p.edit().remove("pending").remove("pending_at").commit();
+        return mine;
+    }
+
+    private static android.content.SharedPreferences prefs(Context ctx) {
+        return ctx.getApplicationContext().getSharedPreferences("rx_watch_ring", Context.MODE_PRIVATE);
     }
 
     /** /rx/watch/sound/<id>: the tone's file. Only the newest tone is kept. */
@@ -184,7 +201,11 @@ public class RipRing extends Service {
         nm.createNotificationChannel(c);
     }
 
-    static Notification notification(Context ctx, Alarm a) {
+    /**
+     * The alarm's notification. While it rings: alarm category with the full-screen alarm page. Once stopped by the 30 s
+     * cap: the same text, quiet, with no full-screen page, so a later wake of the screen never brings the alarm back.
+     */
+    static Notification notification(Context ctx, Alarm a, boolean ringing) {
         PendingIntent open = PendingIntent.getActivity(ctx, 1,
             new Intent(ctx, RipAlarmActivity.class).putExtra(EXTRA_JSON, a.toJson()).putExtra(RipAlarmActivity.EXTRA_OPEN_COIN, true)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
@@ -194,22 +215,35 @@ public class RipRing extends Service {
             PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
         PendingIntent stop = PendingIntent.getBroadcast(ctx, 3, new Intent(ctx, Stop.class).setAction(ACTION_STOP),
             PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
-        return new Notification.Builder(ctx, CHANNEL)
+        PendingIntent swipe = PendingIntent.getBroadcast(ctx, 4, new Intent(ctx, Stop.class).setAction(ACTION_STOP).putExtra(EXTRA_SWIPE, true),
+            PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+        Notification.Builder b = new Notification.Builder(ctx, CHANNEL)
             .setSmallIcon(R.drawable.ic_stat_rx)
             .setColor(0xFFFF4D6A)
             .setContentTitle(a.text())
             .setContentText(a.test ? "A test - nothing moved, nothing trades" : "Rip alarm - tap to open " + a.coin)
-            .setCategory(Notification.CATEGORY_ALARM)
             .setVisibility(Notification.VISIBILITY_PUBLIC)
             .setContentIntent(open)
-            .setFullScreenIntent(full, true)
-            .setDeleteIntent(stop)
-            .addAction(new Notification.Action.Builder(null, "Stop", stop).build())
-            .setAutoCancel(true)
-            .build();
+            .setDeleteIntent(swipe)
+            .setOnlyAlertOnce(true)
+            .setAutoCancel(true);
+        if (ringing) {
+            b.setCategory(Notification.CATEGORY_ALARM).setFullScreenIntent(full, true)
+                .addAction(new Notification.Action.Builder(null, "Stop", stop).build());
+        }
+        return b.build();
     }
 
     // ── the service ──
+    // One player and one vibration for the whole app (static): a second start never adds a second sound.
+
+    private static MediaPlayer player;
+    private static Vibrator vibrator;
+    private static Alarm ringingAlarm;
+    private static long startedAt;
+    static volatile String lastStop = "";   // why the last ring ended (CI reads it)
+    static volatile int starts;              // rings started (CI's duplicate test)
+    private BroadcastReceiver screen;
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
@@ -223,7 +257,7 @@ public class RipRing extends Service {
             stopSelf();
             return START_NOT_STICKY;
         }
-        Notification n = notification(this, a);
+        Notification n = notification(this, a, true);
         try {
             if (Build.VERSION.SDK_INT >= 34) startForeground(NOTIFICATION_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SHORT_SERVICE);
             else startForeground(NOTIFICATION_ID, n);
@@ -232,13 +266,24 @@ public class RipRing extends Service {
             Log.w(TAG, "not foreground: " + e.getClass().getSimpleName());
             RipDiag.error(this, "notification", e);
         }
-        if (running != null && running != this) running.silence();
-        running = this;
-        silence();
-        play(a.sound);
-        vibrate();
+        synchronized (RipRing.class) {
+            if (running != null && running != this) running.quit(false);
+            running = this;
+            ringingAlarm = a;
+            startedAt = android.os.SystemClock.elapsedRealtime();
+            lastStop = "";
+            starts++;
+            silence();   // never two sounds
+            play(a.sound);
+            vibrate(this);
+        }
+        listenForButtons();
         main.removeCallbacksAndMessages(null);
-        main.postDelayed(this::finishRinging, RING_MS);   // at most 30 s
+        main.postDelayed(() -> {   // the hard cap: at most 30 s of sound, whatever is (not) pressed
+            lastStop = "30 s cap";
+            Log.i(TAG, "stopped by the 30 s cap");
+            quit(true);
+        }, RING_MS);
         return START_NOT_STICKY;
     }
 
@@ -268,8 +313,8 @@ public class RipRing extends Service {
         Log.w(TAG, "no tone could be played; vibrating only");
     }
 
-    private void vibrate() {
-        vibrator = getSystemService(Vibrator.class);
+    private static void vibrate(Context ctx) {
+        vibrator = ctx.getSystemService(Vibrator.class);
         if (vibrator == null || !vibrator.hasVibrator()) return;
         try {
             vibrator.vibrate(VibrationEffect.createWaveform(VIBRATION, 0), ALARM);   // repeats until stopped; alarm usage passes DND
@@ -278,7 +323,8 @@ public class RipRing extends Service {
         }
     }
 
-    private void silence() {
+    /** The sound and the vibration stop (the one player, the one vibration). */
+    private static synchronized void silence() {
         if (player != null) {
             try {
                 player.stop();
@@ -291,37 +337,126 @@ public class RipRing extends Service {
         if (vibrator != null) vibrator.cancel();
     }
 
-    /** 30 s are up: the sound and vibration stop; the notification stays until read or swiped. */
-    private void finishRinging() {
-        silence();
+    /**
+     * A side button while it rings: the watch screen turning on (a press wakes it) ends the alarm. The first 3 s are
+     * ignored: the alarm page itself turns the screen on.
+     */
+    private void listenForButtons() {
+        if (screen != null) return;
+        screen = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context c, Intent i) {
+                if (android.os.SystemClock.elapsedRealtime() - startedAt < 3000) return;
+                stopAll(c, "side button (screen woken)");
+            }
+        };
         try {
-            stopForeground(STOP_FOREGROUND_DETACH);
+            registerReceiver(screen, new android.content.IntentFilter(Intent.ACTION_SCREEN_ON));
+        } catch (Exception e) {
+            screen = null;
+        }
+    }
+
+    /**
+     * This ring ends: no sound, no vibration, no repeat, not foreground. capped: the 30 s cap, so the notification stays,
+     * quiet and without its full-screen page; otherwise it goes too.
+     */
+    private void quit(boolean capped) {
+        main.removeCallbacksAndMessages(null);
+        Alarm a;
+        synchronized (RipRing.class) {
+            silence();
+            a = ringingAlarm;
+            if (running == this) {
+                running = null;
+                ringingAlarm = null;
+            }
+        }
+        if (screen != null) {
+            try {
+                unregisterReceiver(screen);
+            } catch (Exception ignored) {
+                // not registered
+            }
+            screen = null;
+        }
+        try {
+            stopForeground(STOP_FOREGROUND_REMOVE);
         } catch (Exception ignored) {
             // not foreground
         }
-        if (running == this) running = null;
+        NotificationManager nm = getSystemService(NotificationManager.class);
+        if (nm != null) {
+            if (capped && a != null) nm.notify(NOTIFICATION_ID, notification(this, a, false));
+            else nm.cancel(NOTIFICATION_ID);
+        }
+        RipAlarmActivity.closeAll();
         stopSelf();
     }
 
     static boolean isRinging() {
-        return running != null;
+        synchronized (RipRing.class) {
+            return running != null || player != null;
+        }
     }
 
-    /** Stop, a swipe or opening it: the sound stops at once. */
+    /**
+     * Desk #59 (Bryan 15 Oct 16:22): every way to stop the Rip alarm ends here - Stop, a swipe of the notification, a side
+     * button, the face's flashing icon, opening the watch app. The sound and vibration stop, the ring service ends, its
+     * notification and the alarm page go, a pending start is dropped, and the face's flashing icon is cleared.
+     */
+    static void stopAll(Context ctx, String why) {
+        Context app = ctx.getApplicationContext();
+        boolean was = isRinging();
+        lastStop = why;
+        prefs(app).edit().remove("pending").remove("pending_at").commit();
+        RipRing r;
+        synchronized (RipRing.class) {
+            r = running;
+            silence();
+        }
+        if (r != null) {
+            if (Looper.myLooper() == Looper.getMainLooper()) r.quit(false);
+            else r.main.post(() -> r.quit(false));
+        }
+        NotificationManager nm = app.getSystemService(NotificationManager.class);
+        if (nm != null) nm.cancel(NOTIFICATION_ID);
+        RipAlarmActivity.closeAll();
+        RipState.clear(app);
+        Log.i(TAG, "stopped (" + why + ")" + (was ? "" : ", it was not ringing"));
+    }
+
+    /** The sound only (CI's screenshots of the icon): the face keeps flashing. */
     static void stopRinging(Context ctx) {
-        RipRing r = running;
-        if (r != null) r.main.post(r::finishRinging);
+        RipRing r;
+        synchronized (RipRing.class) {
+            r = running;
+            silence();
+        }
+        if (r != null) r.main.post(() -> r.quit(true));
     }
 
     @Override
     public void onTimeout(int startId, int fgsType) {   // Android 15's limit for a short service; 30 s never gets there
-        finishRinging();
+        quit(true);
     }
 
     @Override
     public void onDestroy() {
-        silence();
-        if (running == this) running = null;
+        main.removeCallbacksAndMessages(null);
+        synchronized (RipRing.class) {
+            if (running == this) {
+                silence();
+                running = null;
+            }
+        }
+        if (screen != null) {
+            try {
+                unregisterReceiver(screen);
+            } catch (Exception ignored) {
+                // not registered
+            }
+        }
         super.onDestroy();
     }
 
@@ -335,10 +470,7 @@ public class RipRing extends Service {
         @Override
         public void onReceive(Context ctx, Intent intent) {
             if (intent == null || !ACTION_STOP.equals(intent.getAction())) return;
-            stopRinging(ctx);
-            RipState.clear(ctx);   // Stop or a swipe also ends the face's flashing icon
-            NotificationManager nm = ctx.getSystemService(NotificationManager.class);
-            if (nm != null) nm.cancel(NOTIFICATION_ID);
+            stopAll(ctx, intent.getBooleanExtra(EXTRA_SWIPE, false) ? "notification swiped away" : "Stop");
         }
     }
 }

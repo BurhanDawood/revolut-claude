@@ -50,7 +50,7 @@ public class CoinActivity extends Activity {
             return;
         }
         TileCoins.viewing(this, coin);   // the next read brings this coin's numbers
-        if (getIntent().getBooleanExtra(RipComplication.EXTRA_CLEAR, false)) RipState.clear(this);   // opened from the face's Rip icon
+        if (getIntent().getBooleanExtra(RipComplication.EXTRA_CLEAR, false)) RipRing.stopAll(this, "the face's Rip icon");   // stops the alarm, clears the icon
         int pad = Math.round(getResources().getDisplayMetrics().widthPixels * 0.12f);
         ScrollView scroll = new ScrollView(this);
         scroll.setBackgroundColor(0xFF000000);

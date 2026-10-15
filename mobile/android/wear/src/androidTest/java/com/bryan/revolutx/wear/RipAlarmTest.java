@@ -29,6 +29,7 @@ public class RipAlarmTest {
     public void ring() throws Exception {
         Context ctx = InstrumentationRegistry.getInstrumentation().getTargetContext();
         RipRing.keepSound(ctx, SOUND, new ByteArrayInputStream(beeps()));
+        freshAlarm(ctx);
         // what the phone sends for the server's test alarm (#523; WatchAlarmTest checks the phone builds exactly this),
         // through the watch listener's own alarm method
         byte[] payload = ("{\"coin\":\"TEST\",\"test\":true,\"id\":\"4711\",\"sound\":\"" + SOUND + "\"}")
@@ -40,6 +41,11 @@ public class RipAlarmTest {
         assertTrue("ringing", RipRing.isRinging());
         Thread.sleep(30_000);
         assertFalse("silent after 30 s", RipRing.isRinging());
+        android.app.Notification n = active(ctx);
+        android.util.Log.i("RxRipRing", "after the 30 s cap: stop=" + RipRing.lastStop + ", notification " + (n == null ? "gone"
+            : (n.fullScreenIntent == null ? "kept, quiet, no full-screen page" : "STILL WITH ITS FULL-SCREEN PAGE")) + ", face icon " + (RipState.active(ctx) ? "kept" : "cleared"));
+        assertTrue("the notification no longer brings the alarm page back", n == null || n.fullScreenIntent == null);
+        assertTrue("the face icon stays for its 60 min", RipState.active(ctx));
     }
 
     /** A real coin's alarm with the logo the phone sends (a stand-in picture made here): the face flashes it. Silenced at once. */
@@ -54,6 +60,7 @@ public class RipAlarmTest {
         ByteArrayOutputStream png = new ByteArrayOutputStream();
         b.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, png);
         String logo = android.util.Base64.encodeToString(png.toByteArray(), android.util.Base64.NO_WRAP);
+        freshAlarm(ctx);
         byte[] payload = ("{\"coin\":\"SOL\",\"pct\":34.2,\"price\":182.4,\"id\":\"4712\",\"sound\":\"" + SOUND
             + "\",\"logo\":\"" + logo + "\"}").getBytes(StandardCharsets.UTF_8);
         KeyListener.onAlarm(ctx, payload);
@@ -72,6 +79,7 @@ public class RipAlarmTest {
     public void viaDataLayer() throws Exception {
         Context ctx = InstrumentationRegistry.getInstrumentation().getTargetContext();
         android.content.SharedPreferences p = ctx.getSharedPreferences("rx_watch_rip_diag", Context.MODE_PRIVATE);
+        freshAlarm(ctx);
         long before = p.getLong("at", 0);
         com.google.android.gms.wearable.Node local = com.google.android.gms.tasks.Tasks.await(
             com.google.android.gms.wearable.Wearable.getNodeClient(ctx).getLocalNode(), 15, java.util.concurrent.TimeUnit.SECONDS);
@@ -84,6 +92,93 @@ public class RipAlarmTest {
         Thread.sleep(1500);
         RipRing.stopRinging(ctx);
         assertTrue("delivered over the Data Layer to KeyListener", p.getLong("at", 0) != before);
+    }
+
+
+    // ── Bryan 15 Oct 16:22: every way to stop it ──
+
+    /** A fresh TEST alarm (the 2-min duplicate guard reset first), ringing within 5 s. */
+    private static void ringTest(Context ctx, String id) throws Exception {
+        freshAlarm(ctx);
+        KeyListener.onAlarm(ctx, ("{\"coin\":\"TEST\",\"test\":true,\"id\":\"" + id + "\",\"sound\":\"" + SOUND + "\"}").getBytes(StandardCharsets.UTF_8));
+        long until = System.currentTimeMillis() + 5000;
+        while (!RipRing.isRinging() && System.currentTimeMillis() < until) Thread.sleep(100);
+        assertTrue("ringing", RipRing.isRinging());
+        Thread.sleep(2500);   // ringing for a while, as when Bryan reaches for it
+    }
+
+    private static void freshAlarm(Context ctx) {
+        ctx.getSharedPreferences("rx_watch_rip_diag", Context.MODE_PRIVATE).edit().remove("at").remove("coin").commit();
+    }
+
+    private static android.app.Notification active(Context ctx) {
+        android.app.NotificationManager nm = ctx.getSystemService(android.app.NotificationManager.class);
+        for (android.service.notification.StatusBarNotification sb : nm.getActiveNotifications()) {
+            if (sb.getId() == RipRing.NOTIFICATION_ID) return sb.getNotification();
+        }
+        return null;
+    }
+
+    /** Waits up to ms for silence; logs and checks the whole stop: no sound, no notification, no face icon. */
+    private static void expectStopped(Context ctx, String how, long ms) throws Exception {
+        long t0 = System.currentTimeMillis();
+        while (RipRing.isRinging() && System.currentTimeMillis() - t0 < ms) Thread.sleep(50);
+        Thread.sleep(500);
+        long took = System.currentTimeMillis() - t0;
+        boolean silent = !RipRing.isRinging();
+        boolean noNotif = active(ctx) == null;
+        boolean noIcon = !RipState.active(ctx);
+        android.util.Log.i("RxRipRing", "STOP TEST " + how + ": " + (silent ? "silent" : "STILL RINGING") + " after " + took + " ms, reason \""
+            + RipRing.lastStop + "\", notification " + (noNotif ? "gone" : "STILL THERE") + ", face icon " + (noIcon ? "cleared" : "STILL ON"));
+        assertTrue(how + ": silent", silent);
+        assertTrue(how + ": notification gone", noNotif);
+        assertTrue(how + ": face icon cleared", noIcon);
+    }
+
+    /** -e how action | swipe | icon | app: the notification's Stop, a swipe, the face's icon, opening the watch app. */
+    @Test
+    public void stopBy() throws Exception {
+        Context ctx = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        String how = InstrumentationRegistry.getArguments().getString("how", "action");
+        ringTest(ctx, "4720");
+        android.app.Notification n = active(ctx);
+        assertNotNull("the alarm's notification", n);
+        switch (how) {
+            case "action": n.actions[0].actionIntent.send(); break;   // its Stop button
+            case "swipe": n.deleteIntent.send(); break;               // swiped away
+            case "icon": RipComplication.tap(ctx).send(); break;      // the face's flashing icon
+            default: ctx.startActivity(new android.content.Intent(ctx, MainActivity.class).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)); break;
+        }
+        expectStopped(ctx, how, 5000);
+    }
+
+    /** Rings and waits: the CI job presses a side button meanwhile (Back or Home on the alarm page, or wakes the screen). */
+    @Test
+    public void stopByButton() throws Exception {
+        Context ctx = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        ringTest(ctx, "4721");
+        android.util.Log.i("RxRipRing", "STOP TEST button: ringing, press now");
+        expectStopped(ctx, "button", 20_000);
+        assertTrue("stopped by a side button", RipRing.lastStop.startsWith("side button"));
+    }
+
+    /** The same alarm delivered twice (and a third time over the Data Layer): one ring, one sound. */
+    @Test
+    public void duplicate() throws Exception {
+        Context ctx = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        int before = RipRing.starts;
+        ringTest(ctx, "4722");
+        byte[] again = ("{\"coin\":\"TEST\",\"test\":true,\"id\":\"4722\",\"sound\":\"" + SOUND + "\"}").getBytes(StandardCharsets.UTF_8);
+        KeyListener.onAlarm(ctx, again);
+        com.google.android.gms.wearable.Node local = com.google.android.gms.tasks.Tasks.await(
+            com.google.android.gms.wearable.Wearable.getNodeClient(ctx).getLocalNode(), 15, java.util.concurrent.TimeUnit.SECONDS);
+        com.google.android.gms.tasks.Tasks.await(com.google.android.gms.wearable.Wearable.getMessageClient(ctx)
+            .sendMessage(local.getId(), KeyListener.PATH_ALARM, again), 15, java.util.concurrent.TimeUnit.SECONDS);
+        Thread.sleep(4000);
+        int rings = RipRing.starts - before;
+        android.util.Log.i("RxRipRing", "DUPLICATE TEST: 3 deliveries -> " + rings + " ring(s)");
+        assertTrue("one ring for three deliveries", rings == 1);
+        RipRing.stopAll(ctx, "test end");
     }
 
     @Test

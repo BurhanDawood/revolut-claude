@@ -21,6 +21,21 @@ final class RipDiag {
 
     private RipDiag() {}
 
+    static final long DUPLICATE_MS = 2 * 60_000L;
+
+    /**
+     * Bryan 15 Oct 16:22: the same coin's alarm again within 2 min of the last one (the phone's forward and a retry can both
+     * arrive) is a duplicate: it is dropped, so only one sound ever plays. Atomic, so two copies at once cannot both pass.
+     */
+    static synchronized boolean duplicate(Context ctx, String coin) {
+        SharedPreferences p = prefs(ctx);
+        long at = p.getLong("at", 0);
+        long now = System.currentTimeMillis();
+        boolean dup = coin != null && coin.equals(p.getString("coin", null)) && now >= at && now - at < DUPLICATE_MS;
+        if (!dup) received(ctx, coin);
+        return dup;
+    }
+
     /** An alarm arrived from the phone (before anything else is done with it). */
     static void received(Context ctx, String coin) {
         prefs(ctx).edit().putLong("at", System.currentTimeMillis()).putString("coin", coin).remove("err").remove("err_at").commit();

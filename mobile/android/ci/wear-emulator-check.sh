@@ -200,6 +200,10 @@ echo "-- our notification:"
 adb shell dumpsys notification --noredact 2>/dev/null | grep -iE "NotificationRecord.*revolutx|android.title=" | head -n 6
 echo "-- vibrating:"
 adb shell dumpsys vibrator_manager 2>/dev/null | grep -iE "alarm" | head -n 4
+wait $TEST   # the screen stays off while it rings (waking it is now a side-button stop: 16:22)
+echo "-- the test (rings at 6 s, silent after 36 s: the 30 s cap; the notification stays quiet, the icon stays):"
+grep -E "OK \(|FAIL|Assertion|Error" "$OUT/rip-test.txt" | head -n 5
+adb logcat -d -s RxRipRing 2>/dev/null | grep -E "30 s cap|after the 30 s cap" | tail -n 2
 adb shell svc power stayon true >/dev/null 2>&1
 adb shell input keyevent KEYCODE_WAKEUP
 adb shell input keyevent KEYCODE_BACK
@@ -207,9 +211,6 @@ sleep 1
 adb shell input swipe 227 420 227 80 300   # the notification list
 sleep 2
 shot rip-notification
-wait $TEST
-echo "-- the test (rings at 6 s, silent after 36 s):"
-grep -E "OK \(|FAIL|Assertion|Error" "$OUT/rip-test.txt" | head -n 5
 echo "-- audio on the alarm stream now (expect none started):"
 adb shell dumpsys audio 2>/dev/null | grep -iE "USAGE_ALARM" | grep -i started | head -n 3
 shot rip-after
@@ -278,6 +279,52 @@ shot app-rip-line-error
 adb shell pm clear-permission-flags com.bryan.revolutx android.permission.POST_NOTIFICATIONS user-fixed 2>/dev/null
 adb shell pm grant com.bryan.revolutx android.permission.POST_NOTIFICATIONS 2>/dev/null
 adb shell am instrument -w -e class com.bryan.revolutx.wear.RipAlarmTest#clearRip com.bryan.revolutx.test/androidx.test.runner.AndroidJUnitRunner >/dev/null
+
+echo "== 12. every way to stop the Rip alarm, screen on and off, and a double delivery (Bryan 15 Oct 16:22)"
+RT=com.bryan.revolutx.test/androidx.test.runner.AndroidJUnitRunner
+alarm_streams() { adb shell dumpsys audio 2>/dev/null | grep -iE "USAGE_ALARM" | grep -ic "state:started"; }
+stop_case() {   # stop_case <screen on|off> <how>
+  if [ "$1" = off ]; then
+    adb shell cmd notification set_dnd priority; adb shell svc power stayon false >/dev/null 2>&1; adb shell input keyevent KEYCODE_SLEEP; sleep 2
+  else
+    adb shell cmd notification set_dnd off; adb shell svc power stayon true >/dev/null 2>&1; adb shell input keyevent KEYCODE_WAKEUP; sleep 1
+  fi
+  adb logcat -c
+  adb shell am instrument -w -e class com.bryan.revolutx.wear.RipAlarmTest#stopBy -e how "$2" $RT > "$OUT/stop.txt" 2>&1
+  echo "-- screen $1, $2: $(grep -oE 'OK \(1 test\)|FAILURES!!!' "$OUT/stop.txt" | head -1) | $(adb logcat -d -s RxRipRing 2>/dev/null | grep -oE 'STOP TEST.*' | tail -1) | alarm streams playing now: $(alarm_streams)"
+  grep -E "AssertionError" "$OUT/stop.txt" | head -n 2
+}
+button_case() {   # button_case <page|awake|off> <key>: page = asleep, the alarm page wakes it; awake = screen on already; off = stays off (DND)
+  case "$1" in
+    off) adb shell cmd notification set_dnd priority; adb shell svc power stayon false >/dev/null 2>&1; adb shell input keyevent KEYCODE_SLEEP; sleep 2 ;;
+    page) adb shell cmd notification set_dnd off; adb shell svc power stayon false >/dev/null 2>&1; adb shell input keyevent KEYCODE_SLEEP; sleep 2 ;;
+    *) adb shell cmd notification set_dnd off; adb shell svc power stayon true >/dev/null 2>&1; adb shell input keyevent KEYCODE_WAKEUP; sleep 1; to_face ;;
+  esac
+  adb logcat -c
+  adb shell am instrument -w -e class com.bryan.revolutx.wear.RipAlarmTest#stopByButton $RT > "$OUT/btn.txt" 2>&1 &
+  local B=$!
+  sleep 8
+  [ "$1" = off ] || shot "rip-$1-before-$2"
+  echo "   on screen: $(adb shell dumpsys activity activities 2>/dev/null | grep -m1 -E 'topResumedActivity' | sed 's/^ *//')"
+  adb shell input keyevent "$2"
+  wait $B
+  echo "-- $1, button $2: $(grep -oE 'OK \(1 test\)|FAILURES!!!' "$OUT/btn.txt" | head -1) | $(adb logcat -d -s RxRipRing 2>/dev/null | grep -oE 'STOP TEST.*|stopped \(.*' | tail -2 | tr '\n' ' ') | alarm streams playing now: $(alarm_streams)"
+  grep -E "AssertionError" "$OUT/btn.txt" | head -n 2
+}
+for scr in on off; do
+  for how in action swipe icon app; do stop_case "$scr" "$how"; done
+done
+button_case page KEYCODE_BACK
+button_case page KEYCODE_HOME
+button_case awake KEYCODE_HOME
+button_case awake KEYCODE_STEM_1
+button_case off KEYCODE_WAKEUP
+adb shell cmd notification set_dnd off; adb shell svc power stayon true >/dev/null 2>&1; adb shell input keyevent KEYCODE_WAKEUP
+adb logcat -c
+adb shell am instrument -w -e class com.bryan.revolutx.wear.RipAlarmTest#duplicate $RT > "$OUT/dup.txt" 2>&1
+echo "-- double delivery: $(grep -oE 'OK \(1 test\)|FAILURES!!!' "$OUT/dup.txt" | head -1)"
+adb logcat -d -s RxRipRing 2>/dev/null | grep -E "DUPLICATE TEST|ignored a duplicate|received the Rip" | tail -n 6
+grep -E "AssertionError" "$OUT/dup.txt" | head -n 2
 
 if adb logcat -d | grep -q "FATAL EXCEPTION"; then logs "crash"; echo "::error::the watch app crashed"; fi
 exit 0
