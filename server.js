@@ -29121,13 +29121,42 @@ function familyCashRows(txs, since, fx, cashPx) {
 // her card payments show the shop's name. Descriptions are read once per payment (at most 6 per 5-minute refresh) and kept for the
 // life of the process; a journal 'payment' row takes the name of the card send with the same coin and quantity (within 0.5%) and
 // time (within 36 h). Read-only.
-const _famMerchant = new Map();   // transaction id -> description ('' = none)
+// #639 (Bryan 15 Oct 21:48 "Why did we lose the card payment details?"): the names lived only in memory, so every restart (five on 15 Oct)
+// emptied them and they came back 6 per 5-minute refresh while her page was open; and a refused read (a rate limit) was kept as 'no
+// name' until the next restart. Now every name read is also kept in tx_merchant and loaded at boot; only a read the venue answered
+// (HTTP 2xx) counts - a refused one is tried again on the next refresh - and a blank answer is asked again after an hour (HIGH card
+// payments are recorded while still a pending hold, when Revolut may not have the shop's name yet). Read-only towards Revolut X; display only.
+await db.execute("CREATE TABLE IF NOT EXISTS tx_merchant (tx_id VARCHAR(64) NOT NULL PRIMARY KEY, description VARCHAR(60) NOT NULL DEFAULT '', fetched_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP)").catch(e => console.error('[family] #639 tx_merchant table:', e.message));
+const _famMerchant = new (class extends Map {
+  constructor() { super(); this.blankAt = new Map(); }
+  // a blank ('' = Revolut gave no name yet, e.g. a HIGH card payment still a pending hold) is asked again after an hour, never kept for good
+  has(k) { const id = String(k); if (super.get(id) === '' && Date.now() - (this.blankAt.get(id) || 0) > 3600000) return false; return super.has(id); }
+  set(k, v) {
+    const id = String(k), m = String(v || '').slice(0, 60), had = super.has(id) ? super.get(id) : undefined;
+    super.set(id, m);
+    if (!m) { this.blankAt.set(id, Date.now()); return this; }
+    this.blankAt.delete(id);
+    if (had !== m) db.execute('INSERT INTO tx_merchant (tx_id, description) VALUES (?, ?) ON DUPLICATE KEY UPDATE description = VALUES(description), fetched_at = CURRENT_TIMESTAMP', [id.slice(0, 64), m]).catch(e => console.error('[family] #639 keep name:', e.message));
+    return this;
+  }
+})();   // transaction id -> description ('' = none)
+try {
+  const [kept] = await db.execute('SELECT tx_id, description FROM tx_merchant');
+  for (const r of kept) Map.prototype.set.call(_famMerchant, String(r.tx_id), r.description || '');
+  console.log('[family] #639 ' + kept.length + ' card payment name(s) loaded');
+} catch (e) { console.error('[family] #639 load names:', e.message); }
+async function famTxDescription(id) {   // #639 null = the venue did not answer (try again later); '' = it answered with no name
+  const r = await revolutRequest('GET', '/transactions/' + encodeURIComponent(id), null, null, { withStatus: true });
+  if (!r || !r.ok) return null;
+  const d = (r.body && r.body.data) || r.body || {};
+  return typeof d.description === 'string' ? d.description.trim().slice(0, 60) : '';
+}
 async function familyMerchantFetch(cards) {
   let n = 0;
   for (const t of cards || []) {
     if (!t || !t.id || _famMerchant.has(t.id) || n >= 6) continue;
     n++;
-    try { const r = await revolutRequest('GET', '/transactions/' + encodeURIComponent(t.id)); const d = (r && r.data) || r || {}; _famMerchant.set(t.id, typeof d.description === 'string' ? d.description.trim().slice(0, 60) : ''); }
+    try { const m = await famTxDescription(t.id); if (m !== null) _famMerchant.set(t.id, m); }   // #639 a refused read is not kept
     catch (e) { /* try again next refresh */ }
   }
 }
@@ -29212,8 +29241,8 @@ async function cardMerchantName(id) {
   id = String(id || ''); if (!id) return null;
   if (_famMerchant.has(id)) return _famMerchant.get(id) || null;
   try {
-    const r = await Promise.race([revolutRequest('GET', '/transactions/' + encodeURIComponent(id)), new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 5000))]);
-    const d = (r && r.data) || r || {}, m = typeof d.description === 'string' ? d.description.trim().slice(0, 60) : '';
+    const m = await Promise.race([famTxDescription(id), new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 5000))]);
+    if (m === null) return null;   // #639 refused: not kept, tried again next time
     _famMerchant.set(id, m); return m || null;
   } catch (e) { return null; }
 }

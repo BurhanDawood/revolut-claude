@@ -449,6 +449,7 @@ The **`dev_log`** and the spec desk are the live boards. Open after the 13 Oct s
 | --- | --- | --- |
 | #629 | 2026-10-14 | The paper trader's pre-wired live branch made inert in code (`AGENT_LIVE_ENABLED = false`, drop `live_not_enabled`, boot warning). Fable ruling; pre-ship. |
 | #637 | 2026-10-14 | PM agent watch: max_tokens 6000 → 9000 after run #20 hit the limit (PM note 184). R4 clean-run count restarts (it was 0). |
+| #639 | 2026-10-15 | Card payment shop names (her page, Activity, alerts) are kept in `tx_merchant` and loaded at boot, so a restart no longer blanks them; a refused read (rate limit) is retried, and a blank answer (a pending hold) is asked again after an hour, instead of being kept as "no name". |
 | #638 | 2026-10-15 | System check (data): the nightly DB dump carries the table definitions, keeps JSON, binary, BIGINT and dates exact, streams into gzip and ends with a totals footer; restore-tested (178/178). The 30-day intraday and 180-day exec_decisions prunes delete by id in batches. |
 | #634 | 2026-10-15 | Her coin: a spike-insurance sale of HIGH converts its proceeds to her USDC (the one automated USDC buy); HIGH never feeds the USDT sweep. Desk #61 A; Fable pre-ship (C1-C8, C1a, C6'). |
 | #636 | 2026-10-14 | System check B (restart safety): SIGTERM handler + order gate; boot detection from saved balances; approvals reported after a restart; Away rung only on a real sale. Fable pre-ship. |
