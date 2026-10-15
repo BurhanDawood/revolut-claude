@@ -266,6 +266,7 @@ adb shell am start -W -n com.bryan.revolutx/.wear.MainActivity >/dev/null 2>&1
 sleep 4
 shot app-rip-line
 adb shell pm revoke com.bryan.revolutx android.permission.POST_NOTIFICATIONS 2>/dev/null   # what the line says when the watch blocks it
+adb shell pm set-permission-flags com.bryan.revolutx android.permission.POST_NOTIFICATIONS user-fixed 2>/dev/null   # no prompt
 adb shell am instrument -w -e class com.bryan.revolutx.wear.RipAlarmTest#viaDataLayer com.bryan.revolutx.test/androidx.test.runner.AndroidJUnitRunner >/dev/null 2>&1
 adb shell am start -W -n com.bryan.revolutx/.wear.MainActivity >/dev/null 2>&1
 sleep 3
@@ -274,6 +275,7 @@ sleep 2
 adb shell am start -W -n com.bryan.revolutx/.wear.MainActivity >/dev/null 2>&1
 sleep 3
 shot app-rip-line-error
+adb shell pm clear-permission-flags com.bryan.revolutx android.permission.POST_NOTIFICATIONS user-fixed 2>/dev/null
 adb shell pm grant com.bryan.revolutx android.permission.POST_NOTIFICATIONS 2>/dev/null
 adb shell am instrument -w -e class com.bryan.revolutx.wear.RipAlarmTest#clearRip com.bryan.revolutx.test/androidx.test.runner.AndroidJUnitRunner >/dev/null
 
