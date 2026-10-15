@@ -13,7 +13,7 @@ import { dirname, join } from 'path';
 import mysql from 'mysql2/promise';
 import Anthropic from '@anthropic-ai/sdk';
 import cron from 'node-cron';
-import { gzipSync, gzip } from 'zlib';
+import { gzipSync, gzip, createGzip } from 'zlib';   // createGzip: #638 streamed DB dump
 
 // #209: transport-tolerant schema wrapper -- MCP client may serialize arrays/booleans/objects as JSON strings.
 // Mirrors the inline JSON.parse preprocess pattern already used on dnd_coins/coin_tags/sell_floors/per_coin_enabled/resolutions (#152).
@@ -12639,32 +12639,76 @@ async function getGoogleAccessToken() {
   return data.access_token;
 }
 
+// #638 (13 Oct system check, data: the nightly dump). It was built as one string in memory, had no table definitions (a restore into
+// an empty database had nothing to insert into), wrote JSON columns as `key` = 'value' lists, binary as garbled text, BIGINT through a
+// JS number and dates through the server's clock. Now: one connection in a consistent snapshot at time_zone +00:00; per table DROP +
+// SHOW CREATE TABLE; every value as the server's own text (field.string()), binary columns as X'hex'; multi-row INSERTs; streamed row
+// by row into gzip, so only the compressed file is held. The footer line '-- END OF BACKUP' with the totals is how a cut-off file is
+// told from a whole one. Restore: gunzip -c FILE | mysql DBNAME (tested against MySQL 8, 15 Oct: every table's CHECKSUM matched).
+const DUMP_STMT_BYTES = 256 * 1024;
+// typeCast does not say which columns are binary (mysql2 gives no charset there), so each table's column types are read first:
+// binary/blob/bit/geometry -> X'hex'; JSON as UTF-8 text (MySQL sends it as charset binary); everything else as the server's own text.
+const DUMP_BINARY_TYPES = new Set(['binary', 'varbinary', 'tinyblob', 'blob', 'mediumblob', 'longblob', 'bit', 'geometry', 'point', 'linestring', 'polygon', 'multipoint', 'multilinestring', 'multipolygon', 'geometrycollection', 'geomcollection']);
+function dumpCellFor(kinds) {
+  return (field) => {
+    const k = kinds.get(field.name);
+    if (k === 'bin') { const b = field.buffer(); return b === null ? null : { hex: b.toString('hex') }; }
+    if (k === 'json') return field.string('utf8');
+    return field.string();
+  };
+}
+function dumpVal(v) {
+  if (v === null || v === undefined) return 'NULL';
+  if (typeof v === 'object' && typeof v.hex === 'string') return "X'" + v.hex + "'";
+  return mysql.escape(String(v));
+}
 async function dumpDatabase() {
   const dbName = process.env.DB_NAME;
-  const [tables] = await db.execute(
-    'SELECT TABLE_NAME as t FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = ?',
-    [dbName, 'BASE TABLE']
-  );
-  let out = `-- Revolut X DB backup\n-- Generated: ${new Date().toISOString()}\n-- Database: ${dbName}\n-- Tables: ${tables.length}\n\nSET FOREIGN_KEY_CHECKS=0;\n\n`;
-  for (const { t } of tables) {
-    const [rows] = await db.query('SELECT * FROM `' + t + '`');
-    out += `\n-- ${t}: ${rows.length} rows\n`;
-    if (!rows.length) continue;
-    const cols = Object.keys(rows[0]);
-    const colList = cols.map(c => '`' + c + '`').join(', ');
-    for (const row of rows) {
-      const vals = cols.map(c => {
-        const v = row[c];
-        if (v === null || v === undefined) return 'NULL';
-        if (v instanceof Date) return mysql.escape(v.toISOString().slice(0, 19).replace('T', ' '));
-        if (Buffer.isBuffer(v)) return mysql.escape(v.toString());
-        return mysql.escape(v);
-      });
-      out += `INSERT INTO \`${t}\` (${colList}) VALUES (${vals.join(', ')});\n`;
+  const conn = await db.getConnection();
+  const chunks = [];
+  const gz = createGzip({ level: 9 });
+  gz.on('data', c => chunks.push(c));
+  const done = new Promise((ok, bad) => { gz.on('end', ok); gz.on('error', bad); });
+  const put = s => new Promise(ok => { if (gz.write(s, 'utf8')) ok(); else gz.once('drain', ok); });
+  const stats = [];
+  let broken = false;
+  try {
+    await conn.query("SET SESSION time_zone = '+00:00'");
+    await conn.query('SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ');
+    await conn.query('START TRANSACTION WITH CONSISTENT SNAPSHOT');
+    const [tables] = await conn.query('SELECT TABLE_NAME AS t FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = ? ORDER BY TABLE_NAME', [dbName, 'BASE TABLE']);
+    await put('-- Revolut X DB backup (#638 format: schema + data)\n-- Generated: ' + new Date().toISOString() + '\n-- Database: ' + dbName + '\n-- Tables: ' + tables.length +
+      '\n-- Restore into an EMPTY database: gunzip -c FILE | mysql DBNAME\n\nSET NAMES utf8mb4;\nSET time_zone = \'+00:00\';\nSET FOREIGN_KEY_CHECKS=0;\nSET UNIQUE_CHECKS=0;\nSET SQL_MODE=\'NO_AUTO_VALUE_ON_ZERO\';\n');
+    let total = 0;
+    for (const { t } of tables) {
+      const [[cr]] = await conn.query('SHOW CREATE TABLE `' + t + '`');
+      await put('\n-- ' + t + '\nDROP TABLE IF EXISTS `' + t + '`;\n' + cr['Create Table'] + ';\n');
+      const [cols] = await conn.query('SELECT COLUMN_NAME AS c, DATA_TYPE AS d FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?', [dbName, t]);
+      const kinds = new Map(cols.map(r => [r.c, DUMP_BINARY_TYPES.has(String(r.d).toLowerCase()) ? 'bin' : String(r.d).toLowerCase() === 'json' ? 'json' : 'text']));
+      let n = 0, head = null, stmt = '';
+      const rows = conn.connection.query({ sql: 'SELECT * FROM `' + t + '`', typeCast: dumpCellFor(kinds) }).stream({ highWaterMark: 200 });
+      for await (const row of rows) {
+        if (head === null) head = 'INSERT INTO `' + t + '` (' + Object.keys(row).map(c => '`' + c + '`').join(', ') + ') VALUES\n';
+        const tuple = '(' + Object.values(row).map(dumpVal).join(', ') + ')';
+        if (stmt && stmt.length + tuple.length > DUMP_STMT_BYTES) { await put(stmt + ';\n'); stmt = ''; }
+        stmt = stmt ? stmt + ',\n' + tuple : head + tuple;
+        n++;
+      }
+      if (stmt) await put(stmt + ';\n');
+      stats.push({ t, n }); total += n;
     }
+    await put('\nSET FOREIGN_KEY_CHECKS=1;\nSET UNIQUE_CHECKS=1;\n-- END OF BACKUP tables=' + tables.length + ' rows=' + total + '\n');
+    await conn.query('COMMIT').catch(() => {});
+    gz.end();
+    await done;
+    return { gz: Buffer.concat(chunks), tables: tables.length, rows: total, stats };
+  } catch (e) {
+    broken = true;   // a stream cut mid-table can leave the connection mid-result: it is closed, never handed back to the pool
+    gz.destroy();
+    throw e;
+  } finally {
+    if (broken) conn.destroy(); else conn.release();
   }
-  out += `\nSET FOREIGN_KEY_CHECKS=1;\n`;
-  return out;
 }
 
 
@@ -12737,8 +12781,9 @@ async function backupDatabaseToDrive() {
   const folderId = process.env.GDRIVE_BACKUP_FOLDER_ID;
   try {
     console.log('[backup] starting DB dump...');
-    const sqlText = await dumpDatabase();
-    const gz = gzipSync(Buffer.from(sqlText, 'utf8'));
+    const dump = await dumpDatabase();   // #638: schema + data, streamed into gzip; only the compressed file is held
+    const gz = dump.gz;
+    console.log('[backup] #638 ' + dump.tables + ' tables, ' + dump.rows + ' rows; largest: ' + dump.stats.slice().sort((x, y) => y.n - x.n).slice(0, 15).map(s => s.t + ' ' + s.n).join(', '));
     const now = new Date();
     const stamp = now.toISOString().slice(0, 16).replace('T', '-').replace(/:/g, '');
     const filename = `revolut-db-${stamp}.sql.gz`;
@@ -12773,7 +12818,7 @@ async function backupDatabaseToDrive() {
       if (old.length) console.log(`[backup] pruned ${old.length} old backup(s)`);
     }
 
-    await sendTelegram(`✅ <b>DB backup complete</b>\n${filename} (${(gz.length / 1024).toFixed(1)} KB) → Google Drive`).catch(() => {});
+    await sendTelegram(`✅ <b>DB backup complete</b>\n${filename} (${(gz.length / 1024).toFixed(1)} KB, ${dump.tables} tables, ${dump.rows} rows, restorable) → Google Drive`).catch(() => {});
   } catch (e) {
     console.error('[backup] FAILED:', e.message);
     await sendTelegram(`⚠️ <b>DB backup FAILED</b>\n${e.message}`).catch(() => {});
@@ -22748,19 +22793,44 @@ setInterval(() => { rotationTick().catch(e => console.error('[rotation] tick fai
 setInterval(() => { shareTradesTick().catch(() => {}); }, 3 * 60 * 1000);   // #S1 trades of substantial size to the share group
 cron.schedule('45 18 * * 0', () => { shareWeeklyRun().catch(e => console.error('[share] weekly failed:', e.message)); }, { timezone: 'Europe/London' });   // #S1 Sunday 18:45 London   // #8 closes sessions on time (DB-backed: survives a restart)
 
-// #50: prune intraday prices older than 30 days
+// #638 (13 Oct system check, data: the prunes). 'DELETE ... WHERE recorded_at < 30 days ago' had no index starting with the date, so it
+// scanned the whole table and deleted everything in one statement (one long lock on the table the 30 s scan writes to). Rows get their
+// time from the insert (DEFAULT CURRENT_TIMESTAMP), so the id grows with time: the last old id is found by a binary search on the
+// primary key, then rows are deleted by id in batches of 5000 with a short pause, still checking the time on every row. No new index.
+async function pruneByIdTime(table, timeCol, days, tag) {
+  const [[{ cut }]] = await db.query("SELECT DATE_FORMAT(DATE_SUB(NOW(), INTERVAL ? DAY), '%Y-%m-%d %H:%i:%s') AS cut", [days]);
+  const [[mm]] = await db.query('SELECT MIN(id) AS lo, MAX(id) AS hi FROM `' + table + '`');
+  if (mm.lo == null) return 0;
+  const isOld = async (id) => {
+    const [r] = await db.query('SELECT `' + timeCol + '` < ? AS o FROM `' + table + '` WHERE id >= ? ORDER BY id LIMIT 1', [cut, id]);
+    return r.length > 0 && Number(r[0].o) === 1;
+  };
+  let lo = Number(mm.lo), hi = Number(mm.hi);
+  if (!(await isOld(lo))) return 0;
+  while (lo < hi) { const mid = Math.floor((lo + hi + 1) / 2); if (await isOld(mid)) lo = mid; else hi = mid - 1; }
+  let total = 0;
+  const until = Date.now() + 10 * 60 * 1000;
+  for (;;) {
+    const [r] = await db.query('DELETE FROM `' + table + '` WHERE id <= ? AND `' + timeCol + '` < ? ORDER BY id LIMIT 5000', [lo, cut]);
+    total += r.affectedRows;
+    if (r.affectedRows < 5000 || Date.now() > until || globalThis.__rxShutdown) break;
+    await new Promise(ok => setTimeout(ok, 200));
+  }
+  if (total > 0) console.log('[' + tag + '] #638 pruned ' + total + ' row(s) older than ' + days + 'd (by id, batches of 5000)');
+  return total;
+}
+
+// #50: prune intraday prices older than 30 days (#638: by id, in batches)
 cron.schedule('15 2 * * *', async () => {
   try {
-    const [r] = await db.execute('DELETE FROM price_intraday WHERE recorded_at < DATE_SUB(NOW(), INTERVAL 30 DAY)');
-    if (r.affectedRows > 0) console.log(`[intraday] Pruned ${r.affectedRows} row(s) older than 30d`);
+    await pruneByIdTime('price_intraday', 'recorded_at', 30, 'intraday');
   } catch (e) { console.error('[intraday] prune error:', e.message); }
 }, { timezone: 'Europe/London' });
 
 // #P0 prune exec_decisions older than 180 days
 cron.schedule('20 2 * * *', async () => {
   try {
-    const [r] = await db.execute('DELETE FROM exec_decisions WHERE created_at < DATE_SUB(NOW(), INTERVAL 180 DAY)');
-    if (r.affectedRows > 0) console.log(`[P0] Pruned ${r.affectedRows} exec_decisions row(s) older than 180d`);
+    await pruneByIdTime('exec_decisions', 'created_at', 180, 'P0');   // #638: by id, in batches
   } catch (e) { console.error('[P0] exec_decisions prune error:', e.message); }
 }, { timezone: 'Europe/London' });
 
