@@ -176,8 +176,8 @@
     </Group>
 
     <!--
-      slot 4 (Bryan 15 Oct 13:20): after a Rip alarm, for 60 min, the coin's icon just above the total, flashing (WFF's looping
-      animation, like the dot: fully on, fading out over 1 s, again). Always-on: the icon still. No alarm: no data, nothing drawn.
+      slot 4 (Bryan 15 Oct 13:20): after a Rip alarm, for 60 min, the coin's icon just above the total, flashing (on for a second,
+      off for a second, from the clock's seconds: the face redraws once a second while it shows). Always-on: the icon still. No alarm: no data, nothing drawn.
       A tap opens the coin and ends it. 36 px at y 8: inside the circle, clear of the total and the time.
     -->
     <ComplicationSlot slotId="4" name="ripIcon" x="207" y="8" width="36" height="36" supportedTypes="SMALL_IMAGE" isCustomizable="FALSE">
@@ -188,7 +188,7 @@
         <Group name="ripFlash" x="0" y="0" width="36" height="36">
           <Variant mode="AMBIENT" target="alpha" value="0" />
           <PartImage x="0" y="0" width="36" height="36" alpha="255">
-            <Transform target="alpha" value="0"><Animation duration="1" interpolation="EASE_IN" repeat="-1" fps="30" /></Transform>
+            <Transform target="alpha" value="255 * (1 - [SECOND] % 2)" />
             <Image resource="[COMPLICATION.SMALL_IMAGE]" />
           </PartImage>
         </Group>

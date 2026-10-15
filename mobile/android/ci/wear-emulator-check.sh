@@ -216,6 +216,11 @@ shot rip-after
 adb shell cmd notification set_dnd off
 
 echo "== 10. the face's flashing Rip alarm icon (15 Oct 13:20)"
+on_second() {   # wait until the watch clock's second is even (0, icon on) or odd (1, icon off): the face blinks on [SECOND] % 2
+  local i=0
+  while [ $(( 10#$(adb shell date +%S | tr -d '\r') % 2 )) -ne "$1" ] && [ $i -lt 20 ]; do sleep 0.2; i=$((i+1)); done
+  sleep 0.3
+}
 face_awake() {   # a screen-off/on round closes any notification list or alarm page and wakes on the face
   to_face
   adb shell svc power stayon false >/dev/null 2>&1
@@ -228,16 +233,18 @@ face_awake() {   # a screen-off/on round closes any notification list or alarm p
 }
 face_awake
 sleep 3
+on_second 0
 shot rip-face-test-a     # the TEST alarm above: the ticker in a green circle, flashing
-sleep 0.5
+on_second 1
 shot rip-face-test-b
 adb shell am instrument -w -e class com.bryan.revolutx.wear.RipAlarmTest#ripIconWithLogo com.bryan.revolutx.test/androidx.test.runner.AndroidJUnitRunner > "$OUT/rip-icon.txt" 2>&1 &
 ICON=$!
 sleep 6
 face_awake
 sleep 1
+on_second 0
 shot rip-face-logo-a     # a real coin: its logo from the phone, flashing
-sleep 0.5
+on_second 1
 shot rip-face-logo-b
 adb shell svc power stayon false >/dev/null 2>&1
 adb shell input keyevent KEYCODE_SLEEP
