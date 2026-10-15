@@ -146,6 +146,8 @@ final class RipAlarm {
             .setStyle(new NotificationCompat.BigTextStyle().bigText(body))
             .setCategory(NotificationCompat.CATEGORY_ALARM)
             .setPriority(NotificationCompat.PRIORITY_MAX)
+            // desk #59 (15 Oct): not mirrored to the watch, which rings its own copy with the same tone (WatchAlarm)
+            .setLocalOnly(true)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .setContentIntent(open)
             .setFullScreenIntent(full, true)

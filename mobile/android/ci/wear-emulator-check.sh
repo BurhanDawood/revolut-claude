@@ -175,5 +175,29 @@ shot app-notes
 adb shell input tap 227 150   # the newest note
 sleep 2
 shot app-note
+
+echo "== 9. the Rip alarm on the watch, with Do Not Disturb on (desk #59, 15 Oct)"
+adb shell pm grant com.bryan.revolutx android.permission.POST_NOTIFICATIONS >/dev/null 2>&1
+adb shell cmd notification set_dnd priority
+echo "zen_mode (1 = DND on): $(adb shell settings get global zen_mode)"
+to_face
+adb logcat -c
+adb shell am instrument -w -e class com.bryan.revolutx.wear.RipAlarmTest#ring com.bryan.revolutx.test/androidx.test.runner.AndroidJUnitRunner
+sleep 4
+shot rip-alarm
+echo "-- playing now (alarm stream):"
+adb shell dumpsys audio 2>/dev/null | grep -E "AudioPlaybackConfiguration" | grep -iE "state:started|usage=USAGE_ALARM" | grep -i "alarm" | head -n 5
+echo "-- our notification:"
+adb shell dumpsys notification --noredact 2>/dev/null | grep -E "rx_rip_alarm|RIP|SOL \+34" | head -n 8
+echo "-- vibrating:"
+adb shell dumpsys vibrator_manager 2>/dev/null | grep -iE "usage: ?ALARM|mCurrentVibration|currentVibration" | head -n 4
+adb shell input keyevent KEYCODE_WAKEUP
+sleep 30
+echo "-- after 34 s (should be silent):"
+adb shell dumpsys audio 2>/dev/null | grep -E "AudioPlaybackConfiguration" | grep -i "usage=USAGE_ALARM" | grep -i "state:started" | head -n 3 || true
+adb logcat -d -s RxRipRing 2>/dev/null | tail -n 10
+shot rip-after
+adb shell cmd notification set_dnd off
+
 if adb logcat -d | grep -q "FATAL EXCEPTION"; then logs "crash"; echo "::error::the watch app crashed"; fi
 exit 0

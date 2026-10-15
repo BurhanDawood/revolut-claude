@@ -2,6 +2,8 @@ package com.bryan.revolutx.wear;
 
 import android.app.Activity;
 import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.os.Build;
 import android.graphics.Typeface;
 import android.os.Bundle;
 import android.os.Handler;
@@ -81,6 +83,10 @@ public class MainActivity extends Activity {
         forceNext = getIntent() != null && getIntent().getBooleanExtra(EXTRA_REFRESH, false);
         render();
         PhoneLink.helloAtMost(this, PhoneLink.HELLO_START_MS);   // the phone re-confirms the key, or clears it
+        // desk #59 (15 Oct): the Rip alarm posts its own notification on the watch, which Android 13+ lets it do only once allowed
+        if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[] { android.Manifest.permission.POST_NOTIFICATIONS }, 59);
+        }
     }
 
     @Override

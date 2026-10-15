@@ -97,6 +97,7 @@ public class MainActivity extends BridgeActivity {
         if (BuildConfig.HAS_FCM) startPush();
         if (getIntent() != handledIntent) onNewIntent(getIntent());   // C2: a cold launch (e.g. from the watch) keeps its tab and coin
         WatchBridge.sync(this);   // desk #59: the watch gets the current key, or a clear when there is none
+        WatchAlarm.syncSound(this);   // desk #59 (15 Oct): the Rip alarm's tone, so the watch rings the same one
     }
 
     @Override
