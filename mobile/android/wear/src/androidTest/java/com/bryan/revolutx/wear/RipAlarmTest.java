@@ -42,6 +42,32 @@ public class RipAlarmTest {
         assertFalse("silent after 30 s", RipRing.isRinging());
     }
 
+    /** A real coin's alarm with the logo the phone sends (a stand-in picture made here): the face flashes it. Silenced at once. */
+    @Test
+    public void ripIconWithLogo() throws Exception {
+        Context ctx = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        android.graphics.Bitmap b = android.graphics.Bitmap.createBitmap(48, 48, android.graphics.Bitmap.Config.ARGB_8888);
+        android.graphics.Canvas c = new android.graphics.Canvas(b);
+        android.graphics.Paint p = new android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG);
+        p.setShader(new android.graphics.LinearGradient(0, 0, 48, 48, 0xFF9945FF, 0xFF14F195, android.graphics.Shader.TileMode.CLAMP));
+        c.drawCircle(24, 24, 24, p);   // a SOL-like disc
+        ByteArrayOutputStream png = new ByteArrayOutputStream();
+        b.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, png);
+        String logo = android.util.Base64.encodeToString(png.toByteArray(), android.util.Base64.NO_WRAP);
+        byte[] payload = ("{\"coin\":\"SOL\",\"pct\":34.2,\"price\":182.4,\"id\":\"4712\",\"sound\":\"" + SOUND
+            + "\",\"logo\":\"" + logo + "\"}").getBytes(StandardCharsets.UTF_8);
+        KeyListener.onAlarm(ctx, payload);
+        Thread.sleep(1500);
+        RipRing.stopRinging(ctx);   // quiet for the screenshots; the icon stays (RipState)
+        assertTrue("ripping", RipState.active(ctx));
+        Thread.sleep(25_000);       // the CI job takes the face's screenshots meanwhile
+    }
+
+    @Test
+    public void clearRip() {
+        RipState.clear(InstrumentationRegistry.getInstrumentation().getTargetContext());
+    }
+
     /** 1.2 s of two-tone beeps, 16-bit mono WAV. */
     private static byte[] beeps() {
         int rate = 22050;

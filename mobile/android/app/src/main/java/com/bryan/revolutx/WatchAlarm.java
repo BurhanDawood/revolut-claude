@@ -71,6 +71,10 @@ final class WatchAlarm {
             Uri tone = tone(app);
             String sound = tone == null ? "" : soundId(tone);
             o.put("sound", sound);
+            if (!o.optBoolean("test")) {   // 15 Oct 13:20: the coin's small logo, which the watch face flashes
+                String logo = logo(app, o.optString("coin"));
+                if (logo != null) o.put("logo", logo);
+            }
             byte[] payload = o.toString().getBytes(StandardCharsets.UTF_8);
             for (Node n : nodes) {
                 if (!sound.isEmpty()) sendSound(app, n.getId(), tone, sound);   // a new tone first, so the watch rings with it
@@ -162,6 +166,45 @@ final class WatchAlarm {
                     // closed by the other side
                 }
             }
+        }
+    }
+
+    /**
+     * The coin's logo as the app shows it (GET /api/coins/logo/COIN, the dashboard's own picture, with the phone's key as for any
+     * dashboard read), shrunk to a 48 px PNG, base64; null when there is none or it does not decode (then the watch shows the
+     * ticker). At most ~4 s.
+     */
+    static String logo(Context app, String coin) {
+        String key = SecureStore.key(app);
+        if (key == null || coin == null || !coin.matches(MainActivity.COIN_RE)) return null;
+        java.net.HttpURLConnection c = null;
+        try {
+            c = (java.net.HttpURLConnection) new java.net.URL(Config.BASE + "/api/coins/logo/" + coin).openConnection();
+            c.setConnectTimeout(3000);
+            c.setReadTimeout(3000);
+            c.setInstanceFollowRedirects(false);
+            c.setRequestProperty("x-api-token", key);
+            if (c.getResponseCode() != 200) return null;
+            java.io.ByteArrayOutputStream buf = new java.io.ByteArrayOutputStream();
+            try (InputStream in = c.getInputStream()) {
+                byte[] b = new byte[8192];
+                for (int r; (r = in.read(b)) > 0; ) {
+                    buf.write(b, 0, r);
+                    if (buf.size() > 512 * 1024) return null;
+                }
+            }
+            byte[] raw = buf.toByteArray();
+            android.graphics.Bitmap bmp = android.graphics.BitmapFactory.decodeByteArray(raw, 0, raw.length);   // PNG, JPEG, WebP (an SVG does not decode: ticker)
+            if (bmp == null) return null;
+            android.graphics.Bitmap small = android.graphics.Bitmap.createScaledBitmap(bmp, 48, 48, true);
+            java.io.ByteArrayOutputStream png = new java.io.ByteArrayOutputStream();
+            small.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, png);
+            return android.util.Base64.encodeToString(png.toByteArray(), android.util.Base64.NO_WRAP);
+        } catch (Exception e) {
+            Log.w(TAG, "no logo for the watch: " + e.getClass().getSimpleName());
+            return null;
+        } finally {
+            if (c != null) c.disconnect();
         }
     }
 

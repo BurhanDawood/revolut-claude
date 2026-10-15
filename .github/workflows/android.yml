@@ -160,7 +160,7 @@ jobs:
           fail=0
           for C in MainActivity OpenOnPhoneActivity KeyListener RxTileService TotalComplication PnlComplication NotesComplication MoverComplication \
                    CardComplication DotComplication FaceTotalComplication AmbientCardComplication CoinTile1 CoinTile2 CoinTile3 MoversTileService \
-                   NotesTileService CoinActivity TileCoinsActivity NotesActivity RipRing RipAlarmActivity; do
+                   NotesTileService CoinActivity TileCoinsActivity NotesActivity RipRing RipAlarmActivity RipComplication; do
             N="com.bryan.revolutx.wear.$C"
             m=no; k=no; d=no
             printf '%s\n' "$MANIFEST" | grep -qF "=\"$N\"" && m=yes

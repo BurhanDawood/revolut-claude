@@ -11,6 +11,7 @@
                                                    -1..-2 = -1 - height, line down. No series: no data, no dot.
     slot 2  NotesComplication        SHORT_TEXT    unread PM notes
     slot 3  AmbientCardComplication  PHOTO_IMAGE   always-on only: the total in outline and the thin line
+    slot 4  RipComplication          SMALL_IMAGE   60 min after a Rip alarm: the coin's icon, flashing; else nothing
   Round screen: the line ends at x 392 so its dot and ring stay inside the circle at any height; the line spans y 130..350
   (SparkCard BOX_TOP 120, BOX_H 240, PAD 10); keep the dot's numbers below in step with SparkCard.java.
 -->
@@ -173,6 +174,32 @@
         </Text>
       </PartText>
     </Group>
+
+    <!--
+      slot 4 (Bryan 15 Oct 13:20): after a Rip alarm, for 60 min, the coin's icon just above the total, flashing (WFF's looping
+      animation, like the dot: fully on, fading out over 1 s, again). Always-on: the icon still. No alarm: no data, nothing drawn.
+      A tap opens the coin and ends it. 36 px at y 8: inside the circle, clear of the total and the time.
+    -->
+    <ComplicationSlot slotId="4" name="ripIcon" x="207" y="8" width="36" height="36" supportedTypes="SMALL_IMAGE" isCustomizable="FALSE">
+      <DefaultProviderPolicy defaultSystemProvider="EMPTY" defaultSystemProviderType="SMALL_IMAGE"
+          primaryProvider="com.bryan.revolutx/com.bryan.revolutx.wear.RipComplication" primaryProviderType="SMALL_IMAGE" />
+      <BoundingOval x="0" y="0" width="36" height="36" />
+      <Complication type="SMALL_IMAGE">
+        <Group name="ripFlash" x="0" y="0" width="36" height="36">
+          <Variant mode="AMBIENT" target="alpha" value="0" />
+          <PartImage x="0" y="0" width="36" height="36" alpha="255">
+            <Transform target="alpha" value="0"><Animation duration="1" interpolation="EASE_IN" repeat="-1" fps="30" /></Transform>
+            <Image resource="[COMPLICATION.SMALL_IMAGE]" />
+          </PartImage>
+        </Group>
+        <Group name="ripStill" x="0" y="0" width="36" height="36" alpha="0">
+          <Variant mode="AMBIENT" target="alpha" value="255" />
+          <PartImage x="0" y="0" width="36" height="36">
+            <Image resource="[COMPLICATION.SMALL_IMAGE]" />
+          </PartImage>
+        </Group>
+      </Complication>
+    </ComplicationSlot>
 
     <!-- slot 2, bottom: unread PM notes, small -->
     <ComplicationSlot slotId="2" name="notes" x="140" y="404" width="170" height="28" supportedTypes="SHORT_TEXT" isCustomizable="TRUE">

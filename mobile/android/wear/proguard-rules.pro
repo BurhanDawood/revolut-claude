@@ -19,6 +19,8 @@
 -keep class com.bryan.revolutx.wear.RipRing { *; }                # the Rip alarm
 -keep class com.bryan.revolutx.wear.RipRing$Stop { *; }
 -keep class com.bryan.revolutx.wear.RipAlarmActivity { *; }
+-keep class com.bryan.revolutx.wear.RipComplication { *; }
+-keep class com.bryan.revolutx.wear.RipState$Expire { *; }
 -keep class com.bryan.revolutx.wear.ComplicationBase { *; }
 -keep class com.bryan.revolutx.wear.TotalComplication { *; }    # the four complication data sources
 -keep class com.bryan.revolutx.wear.PnlComplication { *; }

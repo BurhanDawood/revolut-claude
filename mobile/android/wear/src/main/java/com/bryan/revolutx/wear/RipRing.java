@@ -64,6 +64,7 @@ public class RipRing extends Service {
         String id = "";
         String sound = "";
         boolean test;   // the server's test alarm (#523): coin "TEST", no numbers
+        byte[] logo;    // the coin's small logo (PNG, ~48 px) from the phone, or null: the face flashes it (RipState)
 
         static Alarm parse(byte[] payload) {
             try {
@@ -78,6 +79,18 @@ public class RipRing extends Service {
                 String sound = o.optString("sound", "");
                 a.sound = sound.matches("[0-9a-f]{16}") ? sound : "";
                 a.test = o.optBoolean("test", false) && "TEST".equals(a.coin);
+                String logo = o.optString("logo", "");
+                if (!logo.isEmpty() && logo.length() <= 80_000) {
+                    try {
+                        byte[] png = android.util.Base64.decode(logo, android.util.Base64.DEFAULT);
+                        android.graphics.BitmapFactory.Options b = new android.graphics.BitmapFactory.Options();
+                        b.inJustDecodeBounds = true;
+                        android.graphics.BitmapFactory.decodeByteArray(png, 0, png.length, b);
+                        if (b.outWidth > 0 && b.outWidth <= 256 && b.outHeight > 0 && b.outHeight <= 256) a.logo = png;   // a small picture only
+                    } catch (IllegalArgumentException ignored) {
+                        // not base64: no logo, the ticker instead
+                    }
+                }
                 return a;
             } catch (Exception e) {
                 return null;
@@ -317,6 +330,7 @@ public class RipRing extends Service {
         public void onReceive(Context ctx, Intent intent) {
             if (intent == null || !ACTION_STOP.equals(intent.getAction())) return;
             stopRinging(ctx);
+            RipState.clear(ctx);   // Stop or a swipe also ends the face's flashing icon
             NotificationManager nm = ctx.getSystemService(NotificationManager.class);
             if (nm != null) nm.cancel(NOTIFICATION_ID);
         }

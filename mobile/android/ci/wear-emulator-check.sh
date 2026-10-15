@@ -213,5 +213,31 @@ adb shell dumpsys audio 2>/dev/null | grep -iE "USAGE_ALARM" | grep -i started |
 shot rip-after
 adb shell cmd notification set_dnd off
 
+echo "== 10. the face's flashing Rip alarm icon (15 Oct 13:20)"
+adb shell input keyevent KEYCODE_WAKEUP
+to_face
+sleep 3
+shot rip-face-test-a     # the TEST alarm above: the ticker in a green circle, flashing
+sleep 0.5
+shot rip-face-test-b
+adb shell am instrument -w -e class com.bryan.revolutx.wear.RipAlarmTest#ripIconWithLogo com.bryan.revolutx.test/androidx.test.runner.AndroidJUnitRunner > "$OUT/rip-icon.txt" 2>&1 &
+ICON=$!
+sleep 6
+to_face
+sleep 3
+shot rip-face-logo-a     # a real coin: its logo from the phone, flashing
+sleep 0.5
+shot rip-face-logo-b
+adb shell svc power stayon false >/dev/null 2>&1
+adb shell input keyevent KEYCODE_SLEEP
+sleep 5
+shot rip-face-logo-ambient
+adb shell input keyevent KEYCODE_WAKEUP
+adb shell svc power stayon true >/dev/null 2>&1
+wait $ICON
+grep -E "OK \(|FAIL" "$OUT/rip-icon.txt" | head -n 3
+adb logcat -d -s RxRipRing 2>/dev/null | grep -iE "flashes|cleared" | tail -n 4
+adb shell am instrument -w -e class com.bryan.revolutx.wear.RipAlarmTest#clearRip com.bryan.revolutx.test/androidx.test.runner.AndroidJUnitRunner >/dev/null
+
 if adb logcat -d | grep -q "FATAL EXCEPTION"; then logs "crash"; echo "::error::the watch app crashed"; fi
 exit 0

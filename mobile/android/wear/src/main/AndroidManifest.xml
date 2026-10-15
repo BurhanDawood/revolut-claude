@@ -64,6 +64,24 @@
             </intent-filter>
         </service>
 
+        <!-- desk #59 (15 Oct 13:20): the face's flashing Rip alarm icon, 60 min after an alarm; no data otherwise -->
+        <service
+            android:name=".RipComplication"
+            android:exported="true"
+            android:icon="@drawable/ic_stat_rx"
+            android:label="@string/c_rip"
+            android:permission="com.google.android.wearable.permission.BIND_COMPLICATION_PROVIDER">
+            <intent-filter>
+                <action android:name="android.support.wearable.complications.ACTION_COMPLICATION_UPDATE_REQUEST" />
+            </intent-filter>
+            <meta-data android:name="android.support.wearable.complications.SUPPORTED_TYPES" android:value="SMALL_IMAGE,SHORT_TEXT" />
+            <meta-data android:name="android.support.wearable.complications.UPDATE_PERIOD_SECONDS" android:value="0" />
+            <meta-data android:name="android.support.wearable.complications.SAFE_WATCH_FACES" android:value="com.bryan.revolutx.watchface" />
+        </service>
+        <receiver
+            android:name=".RipState$Expire"
+            android:exported="false" />
+
         <!-- desk #59 (15 Oct): the Rip alarm rung on the watch - at most 30 s, so a short foreground service -->
         <service
             android:name=".RipRing"

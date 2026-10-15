@@ -49,7 +49,9 @@ public class KeyListener extends WearableListenerService {
     static void onAlarm(android.content.Context ctx, byte[] data) {
         RipRing.Alarm a = data == null ? null : RipRing.Alarm.parse(data);
         Log.i("RxRipRing", "received the Rip alarm from the phone: " + (a == null ? "unreadable, ignored" : a.coin));
-        if (a != null) RipRing.ring(ctx, a);
+        if (a == null) return;
+        RipState.start(ctx, a);   // the face flashes the coin's icon for 60 min (RipComplication)
+        RipRing.ring(ctx, a);
     }
 
     /** The phone's Rip alarm tone (WatchAlarm), on its own channel: kept for RipRing. */
