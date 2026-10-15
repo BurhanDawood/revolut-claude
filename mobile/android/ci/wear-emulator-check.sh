@@ -191,11 +191,11 @@ sleep 5
 shot rip-alarm
 echo "-- on screen: $(adb shell dumpsys activity activities 2>/dev/null | grep -m1 -E 'topResumedActivity' | sed 's/^ *//')"
 echo "-- the watch app's ring log:"
-adb logcat -d -s RxRipRing 2>/dev/null | tail -n 5
+adb logcat -d -s RxRipRing 2>/dev/null | tail -n 8
 echo "-- audio playing on the alarm stream:"
 adb shell dumpsys audio 2>/dev/null | grep -iE "USAGE_ALARM" | head -n 6
 echo "-- our notification:"
-adb shell dumpsys notification --noredact 2>/dev/null | grep -iE "NotificationRecord.*revolutx|android.title=.*SOL" | head -n 6
+adb shell dumpsys notification --noredact 2>/dev/null | grep -iE "NotificationRecord.*revolutx|android.title=" | head -n 6
 echo "-- vibrating:"
 adb shell dumpsys vibrator_manager 2>/dev/null | grep -iE "alarm" | head -n 4
 adb shell svc power stayon true >/dev/null 2>&1

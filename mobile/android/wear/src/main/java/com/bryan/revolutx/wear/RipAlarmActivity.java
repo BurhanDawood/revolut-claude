@@ -60,7 +60,7 @@ public class RipAlarmActivity extends Activity {
             finish();
         });
         box.addView(stop);
-        TextView open = text("Open " + a.coin, 14, Fmt.ACCENT, true);
+        TextView open = text(a.test ? "A test - nothing moved" : "Open " + a.coin, 14, Fmt.ACCENT, true);
         open.setPadding(0, dp(12), 0, 0);
         open.setOnClickListener(v -> openCoin(a));
         box.addView(open);
@@ -69,7 +69,8 @@ public class RipAlarmActivity extends Activity {
 
     private void openCoin(RipRing.Alarm a) {
         RipRing.stopRinging(this);
-        startActivity(new Intent(this, CoinActivity.class).putExtra(CoinActivity.EXTRA_COIN, a.coin));
+        startActivity(a.test ? new Intent(this, MainActivity.class)   // a test has no coin: the app
+            : new Intent(this, CoinActivity.class).putExtra(CoinActivity.EXTRA_COIN, a.coin));
         finish();
     }
 

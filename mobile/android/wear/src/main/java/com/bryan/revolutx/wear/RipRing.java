@@ -63,6 +63,7 @@ public class RipRing extends Service {
         double price = Double.NaN;
         String id = "";
         String sound = "";
+        boolean test;   // the server's test alarm (#523): coin "TEST", no numbers
 
         static Alarm parse(byte[] payload) {
             try {
@@ -76,6 +77,7 @@ public class RipRing extends Service {
                 a.id = id.matches("[A-Za-z0-9_-]{1,40}") ? id : "";
                 String sound = o.optString("sound", "");
                 a.sound = sound.matches("[0-9a-f]{16}") ? sound : "";
+                a.test = o.optBoolean("test", false) && "TEST".equals(a.coin);
                 return a;
             } catch (Exception e) {
                 return null;
@@ -84,7 +86,7 @@ public class RipRing extends Service {
 
         String toJson() {
             try {
-                JSONObject o = new JSONObject().put("coin", coin).put("id", id).put("sound", sound);
+                JSONObject o = new JSONObject().put("coin", coin).put("id", id).put("sound", sound).put("test", test);
                 if (!Double.isNaN(pct)) o.put("pct", pct);
                 if (!Double.isNaN(price)) o.put("price", price);
                 return o.toString();
@@ -95,6 +97,7 @@ public class RipRing extends Service {
 
         /** "🚨 SOL +34% in 24 h · $182.40" */
         String text() {
+            if (test) return "\uD83D\uDEA8 RIP ALARM TEST";
             StringBuilder b = new StringBuilder("🚨 ").append(coin);
             if (!Double.isNaN(pct)) b.append(" +").append(Math.abs(pct) >= 10 ? String.format(Locale.US, "%.0f", pct) : String.format(Locale.US, "%.1f", pct)).append('%');
             b.append(" in 24 h");
@@ -118,6 +121,7 @@ public class RipRing extends Service {
             Log.w(TAG, "ring service not started from the background, the alarm screen will: " + e.getClass().getSimpleName());
             NotificationManager nm = app.getSystemService(NotificationManager.class);
             if (nm != null) nm.notify(NOTIFICATION_ID, notification(app, a));
+            Log.i(TAG, "posted the Rip alarm notification (full-screen alarm to ring): " + a.coin);
         }
     }
 
@@ -176,7 +180,7 @@ public class RipRing extends Service {
             .setSmallIcon(R.drawable.ic_stat_rx)
             .setColor(0xFFFF4D6A)
             .setContentTitle(a.text())
-            .setContentText("Rip alarm - tap to open " + a.coin)
+            .setContentText(a.test ? "A test - nothing moved, nothing trades" : "Rip alarm - tap to open " + a.coin)
             .setCategory(Notification.CATEGORY_ALARM)
             .setVisibility(Notification.VISIBILITY_PUBLIC)
             .setContentIntent(open)
@@ -205,6 +209,7 @@ public class RipRing extends Service {
         try {
             if (Build.VERSION.SDK_INT >= 34) startForeground(NOTIFICATION_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SHORT_SERVICE);
             else startForeground(NOTIFICATION_ID, n);
+            Log.i(TAG, "posted the Rip alarm notification: " + a.coin);
         } catch (Exception e) {
             Log.w(TAG, "not foreground: " + e.getClass().getSimpleName());
         }

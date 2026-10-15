@@ -36,14 +36,20 @@ public class KeyListener extends WearableListenerService {
             }
             Repo.refresh(this, 0, Repo.FROM_KEY);   // runs on the listener's own background thread
         } else if (PATH_ALARM.equals(path)) {
-            RipRing.Alarm a = event.getData() == null ? null : RipRing.Alarm.parse(event.getData());
-            if (a != null) RipRing.ring(this, a);
+            onAlarm(this, event.getData());
         } else if (PATH_CLEAR.equals(path)) {
             synchronized (Repo.LOCK) {
                 WatchStore.clear(this);
             }
             Repo.notifySurfaces(this, Repo.FROM_KEY);
         }
+    }
+
+    /** /rx/watch/alarm from the phone (WatchAlarm): read, logged, rung. CI's RipAlarmTest calls this with the phone's bytes. */
+    static void onAlarm(android.content.Context ctx, byte[] data) {
+        RipRing.Alarm a = data == null ? null : RipRing.Alarm.parse(data);
+        Log.i("RxRipRing", "received the Rip alarm from the phone: " + (a == null ? "unreadable, ignored" : a.coin));
+        if (a != null) RipRing.ring(ctx, a);
     }
 
     /** The phone's Rip alarm tone (WatchAlarm), on its own channel: kept for RipRing. */

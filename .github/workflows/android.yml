@@ -141,6 +141,14 @@ jobs:
           done
           cp wear/build/outputs/mapping/release/mapping.txt "$GITHUB_WORKSPACE/watch-mapping.txt"
 
+      - name: Phone unit test (desk #59, what the phone forwards to the watch)
+        working-directory: mobile/android
+        run: |
+          ./gradlew :app:testDebugUnitTest --tests 'com.bryan.revolutx.WatchAlarmTest' --no-daemon -q
+          R=app/build/test-results/testDebugUnitTest/TEST-com.bryan.revolutx.WatchAlarmTest.xml
+          grep -oE 'tests="[0-9]+" skipped="[0-9]+" failures="[0-9]+" errors="[0-9]+"' "$R"
+          grep -E 'push -> watch' "$R" || true
+
       - name: Watch APK smoke check (R8 kept what the system binds by name)
         working-directory: mobile/android
         run: |
@@ -161,6 +169,8 @@ jobs:
             echo "$C: manifest=$m kept-by-name=$k in-dex=$d"
             [ "$m$k$d" = yesyesyes ] || { echo "::error::$N is missing from the watch APK (manifest=$m mapping=$k dex=$d)"; fail=1; }
           done
+          # desk #59 (15 Oct): the Data Layer listener is in the manifest with its filters, so messages arrive with the app closed
+          printf '%s\n' "$MANIFEST" | grep -A12 'com.bryan.revolutx.wear.KeyListener' | grep -E 'MESSAGE_RECEIVED|CHANNEL_EVENT|pathPrefix' | sed 's/^ */KeyListener: /'
           for N in androidx.security.crypto.EncryptedSharedPreferences androidx.security.crypto.MasterKeys; do
             if grep -qxF "$N -> $N:" "$MAP"; then echo "$N: kept-by-name=yes"; else echo "::error::$N was renamed or removed by R8"; fail=1; fi
           done

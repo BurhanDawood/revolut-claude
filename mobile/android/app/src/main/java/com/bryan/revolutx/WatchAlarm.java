@@ -17,6 +17,7 @@ import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
@@ -42,6 +43,7 @@ final class WatchAlarm {
     private static final String PREFS = "rx_watch_alarm";   // node -> the sound id that watch already has
     private static final long MAX_SOUND = 3 * 1024 * 1024;
     private static final Pattern PCT = Pattern.compile("\\+\\s*([0-9]+(?:\\.[0-9]+)?)\\s*%");
+    private static final Pattern TEST = Pattern.compile("RIP ALARM\\s*[-\u2013\u2014]?\\s*TEST\\b");
     private static final Pattern PRICE = Pattern.compile("(?i)\\bnow\\s+\\$\\s*([0-9][0-9,]*(?:\\.[0-9]+)?)");
 
     private WatchAlarm() {}
@@ -51,30 +53,64 @@ final class WatchAlarm {
      * come from the push's own title and body ("🚨 RIP ALARM - SOL +34% in 24 h", "Now $182.40 - you hold ..."); a part that
      * cannot be read is left out, never guessed. Blocking (at most ~25 s): call it off the main thread.
      */
-    static void send(Context ctx, String coin, String title, String body, String id) {
+    static void send(Context ctx, Map<String, String> data) {
         Context app = ctx.getApplicationContext();
-        if (coin == null || !coin.matches(MainActivity.COIN_RE)) return;
+        JSONObject o = payload(data);
+        if (o == null) {
+            Log.i(TAG, "not forwarded to the watch: no coin and not a test");
+            return;
+        }
         try {
             Set<Node> nodes = Tasks.await(
                 Wearable.getCapabilityClient(app).getCapability(CAP_WATCH, CapabilityClient.FILTER_REACHABLE), 5, TimeUnit.SECONDS
             ).getNodes();
-            if (nodes.isEmpty()) return;
+            if (nodes.isEmpty()) {
+                Log.i(TAG, "not forwarded: no watch with the Revolut X watch app is reachable");   // the phone rings as before
+                return;
+            }
             Uri tone = tone(app);
             String sound = tone == null ? "" : soundId(tone);
-            JSONObject o = new JSONObject().put("coin", coin).put("sound", sound);
-            Double pct = number(PCT, title);
-            if (pct == null) pct = number(PCT, body);
-            Double price = number(PRICE, body);
-            if (pct != null) o.put("pct", pct);
-            if (price != null) o.put("price", price);
-            if (id != null && id.matches(MainActivity.INBOX_RE)) o.put("id", id);
+            o.put("sound", sound);
             byte[] payload = o.toString().getBytes(StandardCharsets.UTF_8);
             for (Node n : nodes) {
                 if (!sound.isEmpty()) sendSound(app, n.getId(), tone, sound);   // a new tone first, so the watch rings with it
                 Tasks.await(Wearable.getMessageClient(app).sendMessage(n.getId(), PATH_ALARM, payload), 5, TimeUnit.SECONDS);
+                Log.i(TAG, "forwarded to the watch: " + o.optString("coin") + " (sound " + (sound.isEmpty() ? "default" : sound) + ")");
             }
         } catch (Exception e) {
             Log.w(TAG, "watch alarm not sent: " + e.getClass().getSimpleName());   // no watch: the phone rings as before
+        }
+    }
+
+    /**
+     * What goes to the watch for this alarm push, without the sound id; null when it is not one to forward. A real Rip alarm
+     * has its coin; the server's test alarm (#523, "🚨 RIP ALARM - TEST (not a real move)") has none and goes as coin "TEST"
+     * with no numbers, so the watch's sound can be tested any time.
+     */
+    static JSONObject payload(Map<String, String> data) {
+        if (data == null) return null;
+        String coin = data.get("coin");
+        String title = data.get("title");
+        String body = data.get("body");
+        boolean test = TEST.matcher(title == null ? "" : title).find();
+        try {
+            JSONObject o = new JSONObject();
+            if (test) {
+                o.put("coin", "TEST").put("test", true);
+            } else {
+                if (coin == null || !coin.matches(MainActivity.COIN_RE)) return null;
+                o.put("coin", coin);
+                Double pct = number(PCT, title);
+                if (pct == null) pct = number(PCT, body);
+                Double price = number(PRICE, body);
+                if (pct != null) o.put("pct", pct);
+                if (price != null) o.put("price", price);
+            }
+            String id = data.get("inbox");
+            if (id != null && id.matches(MainActivity.INBOX_RE)) o.put("id", id);
+            return o;
+        } catch (Exception e) {
+            return null;
         }
     }
 

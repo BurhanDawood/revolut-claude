@@ -31,7 +31,7 @@ public class RxMessagingService extends MessagingService {
         if ("1".equals(data.get("alarm"))) {   // v11: the rip alarm (data-only, high priority), before anything else
             RipAlarm.show(this, data);
             // desk #59 (15 Oct): the watch rings it too, with the same tone (its own notification; the phone's is local-only)
-            WatchAlarm.send(this, data.get("coin"), data.get("title"), data.get("body"), data.get("inbox"));
+            WatchAlarm.send(this, data);   // the server's test alarm too (as coin "TEST"), so the watch can be tested any time
             return;
         }
         super.onMessageReceived(msg);

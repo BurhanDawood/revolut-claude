@@ -67,6 +67,7 @@ dependencies {
     implementation "com.google.android.gms:play-services-wearable:$playServicesWearableVersion"   // desk #59: the watch key handover
     implementation project(':capacitor-android')
     testImplementation "junit:junit:$junitVersion"
+    testImplementation "org.json:json:20231013"   // desk #59: WatchAlarmTest runs org.json for real (Android's copy is stubbed in unit tests)
     androidTestImplementation "androidx.test.ext:junit:$androidxJunitVersion"
     androidTestImplementation "androidx.test.espresso:espresso-core:$androidxEspressoCoreVersion"
     implementation project(':capacitor-cordova-android-plugins')

@@ -17,8 +17,8 @@ import org.junit.runner.RunWith;
 
 /**
  * Desk #59 (15 Oct), CI only: what the watch does with the phone's Rip alarm, without a phone. A test tone (beeps, made here)
- * is kept as if the phone had sent it on /rx/watch/sound/<id>, then the /rx/watch/alarm payload goes through the same parse
- * and ring as KeyListener's. The job checks that the alarm stream plays and the notification is up, with Do Not Disturb on.
+ * is kept as if the phone had sent it on /rx/watch/sound/<id>, then the phone's /rx/watch/alarm bytes for the server's test alarm
+ * go through KeyListener.onAlarm, the listener's own handling (CI has no paired phone to deliver them). The job checks that the alarm stream plays and the notification is up, with Do Not Disturb on.
  */
 @RunWith(AndroidJUnit4.class)
 public class RipAlarmTest {
@@ -29,11 +29,12 @@ public class RipAlarmTest {
     public void ring() throws Exception {
         Context ctx = InstrumentationRegistry.getInstrumentation().getTargetContext();
         RipRing.keepSound(ctx, SOUND, new ByteArrayInputStream(beeps()));
-        byte[] payload = ("{\"coin\":\"SOL\",\"pct\":34.2,\"price\":182.4,\"id\":\"9001\",\"sound\":\"" + SOUND + "\"}")
+        // what the phone sends for the server's test alarm (#523; WatchAlarmTest checks the phone builds exactly this),
+        // through the watch listener's own alarm method
+        byte[] payload = ("{\"coin\":\"TEST\",\"test\":true,\"id\":\"4711\",\"sound\":\"" + SOUND + "\"}")
             .getBytes(StandardCharsets.UTF_8);
-        RipRing.Alarm a = RipRing.Alarm.parse(payload);
-        assertNotNull(a);
-        RipRing.ring(ctx, a);
+        assertNotNull(RipRing.Alarm.parse(payload));
+        KeyListener.onAlarm(ctx, payload);
         // the app's process ends with the test, so the test stays while the CI job looks at the ringing watch
         Thread.sleep(6_000);
         assertTrue("ringing", RipRing.isRinging());
