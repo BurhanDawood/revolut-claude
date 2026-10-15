@@ -182,10 +182,14 @@ adb shell cmd notification set_dnd priority
 echo "zen_mode (1 = DND on): $(adb shell settings get global zen_mode)"
 to_face
 adb logcat -c
+adb shell svc power stayon false >/dev/null 2>&1
+adb shell input keyevent KEYCODE_SLEEP   # wrist down, as an alarm usually finds the watch: the alarm opens full screen
+sleep 3
 adb shell am instrument -w -e class com.bryan.revolutx.wear.RipAlarmTest#ring com.bryan.revolutx.test/androidx.test.runner.AndroidJUnitRunner > "$OUT/rip-test.txt" 2>&1 &
 TEST=$!
-sleep 4
+sleep 5
 shot rip-alarm
+echo "-- on screen: $(adb shell dumpsys activity activities 2>/dev/null | grep -m1 -E 'topResumedActivity' | sed 's/^ *//')"
 echo "-- the watch app's ring log:"
 adb logcat -d -s RxRipRing 2>/dev/null | tail -n 5
 echo "-- audio playing on the alarm stream:"
@@ -194,6 +198,13 @@ echo "-- our notification:"
 adb shell dumpsys notification --noredact 2>/dev/null | grep -iE "NotificationRecord.*revolutx|android.title=.*SOL" | head -n 6
 echo "-- vibrating:"
 adb shell dumpsys vibrator_manager 2>/dev/null | grep -iE "alarm" | head -n 4
+adb shell svc power stayon true >/dev/null 2>&1
+adb shell input keyevent KEYCODE_WAKEUP
+adb shell input keyevent KEYCODE_BACK
+sleep 1
+adb shell input swipe 227 420 227 80 300   # the notification list
+sleep 2
+shot rip-notification
 wait $TEST
 echo "-- the test (rings at 6 s, silent after 36 s):"
 grep -E "OK \(|FAIL|Assertion|Error" "$OUT/rip-test.txt" | head -n 5
