@@ -61,6 +61,10 @@ const CHECK_INTERVAL_MS = 5 * 60 * 1000;
 const CAPTURE_INTERVAL_MS = 2 * 60 * 1000;   // #50: intraday price capture cadence (decoupled from alert loop)
 const FAST_SCAN_INTERVAL_MS = 30 * 1000;      // #94: fast-cadence trailing-stop scan for volatile meme/lotto coins (30s)
 const ORDER_POLL_INTERVAL_MS = 60 * 1000;     // #47 Phase B1 (hash47b): poll resting pending_orders for fills (detection-only)
+// #641 (13 Oct system check, reliability): a Revolut X request that never answers no longer hangs its caller for ever. A GET gives up
+// after 20 s; a POST/DELETE after 30 s with an error that says it may still have been carried out - it has no venue status, so the
+// order paths treat it exactly like a network drop today (not a refusal: the trail is not restored, as Kraken's #K2a timeout).
+const REVX_GET_TIMEOUT_MS = 20 * 1000, REVX_SEND_TIMEOUT_MS = 30 * 1000;
 const ALERT_INTERVAL_MS = 3 * 60 * 1000; // 3 min between reminders (#150)
 const PUMP_THRESHOLD = 0.20;
 const SKIP_CURRENCIES = ['USD', 'USDT', 'USDC', 'EUR', 'GBP'];
@@ -151,8 +155,20 @@ async function revolutRequest(method, path, body = null, signPathOverride = null
     console.log('[revolut] Request URL:', `${BASE_URL}${path}`);
     console.log('[revolut] Signature message (first 120):', message.substring(0, 120));
   }
-  const response = await fetch(`${BASE_URL}${path}`, fetchOptions);
-  const text = await response.text();
+  const toMs = method === 'GET' ? REVX_GET_TIMEOUT_MS : REVX_SEND_TIMEOUT_MS;   // #641
+  let response, text;
+  try {
+    response = await fetch(`${BASE_URL}${path}`, { ...fetchOptions, signal: AbortSignal.timeout(toMs) });
+    text = await response.text();
+  } catch (e) {
+    if (e && (e.name === 'TimeoutError' || e.name === 'AbortError')) {
+      const te = new Error('Revolut X ' + method + ' ' + String(path).split('?')[0] + ' timed out after ' + (toMs / 1000) + ' s' + (method === 'GET' ? '' : ' - it may still have been carried out'));
+      te.timedOut = true;
+      console.error('[revolut] #641 ' + te.message);
+      throw te;
+    }
+    throw e;
+  }
   if (method === 'POST') {
     console.log('[revolut] Response status:', response.status);
     console.log('[revolut] Response body:', text);
@@ -294,8 +310,25 @@ async function placeRevolutOrder(symbol, side, orderType, baseSize, price = null
   // nothing placed) from an ambiguous failure. A non-2xx answer now always throws (it used to count as placed when the
   // body had no message field); an unreadable body throws as before (JSON.parse used to throw).
   let rs;
-  globalThis.__rxOrdersInFlight = (globalThis.__rxOrdersInFlight || 0) + 1;   // #636
-  try { rs = await revolutRequest('POST', '/orders', body, null, { withStatus: true }); } finally { globalThis.__rxOrdersInFlight--; globalThis.__rxLastOrderAt = Date.now(); }
+  // #641 Fable A2: a POST that times out (no answer in 30 s) may still have been carried out. Before the error goes up, the order is
+  // recorded in pending_orders as 'timeout' (key 'timeout:<client_order_id>', with symbol, side, size) and the error carries
+  // order_sent = true, so every sell path keeps the "may be resting" branch. The poller then asks Revolut X what became of it
+  // (resolveTimedOutOrder). Nothing re-sends the order.
+  const postOrder = async () => {
+    globalThis.__rxOrdersInFlight = (globalThis.__rxOrdersInFlight || 0) + 1;   // #636
+    try { return await revolutRequest('POST', '/orders', body, null, { withStatus: true }); }
+    catch (pe) {
+      if (pe && pe.timedOut) {
+        pe.order_sent = true;
+        await db.execute("INSERT INTO pending_orders (order_id, client_order_id, symbol, side, order_type, quantity, limit_price, status, last_pipeline_qty) VALUES (?, ?, ?, ?, ?, ?, ?, 'timeout', ?) ON DUPLICATE KEY UPDATE status = 'timeout'",
+          ['timeout:' + clientOrderId, clientOrderId, revolutSymbol, side.toUpperCase(), orderType, (sizeStr != null ? Number(sizeStr) : (baseSize != null ? baseSize : null)), (price != null ? price : null), Number(pipelinedQty) || 0])
+          .catch(de => console.error('[orders] #641 timeout record failed:', de.message));
+        console.error('[orders] #641 ' + revolutSymbol + ' ' + side + ' order ' + clientOrderId + ' timed out - recorded as "timeout"; the poller will ask Revolut X what became of it');
+      }
+      throw pe;
+    } finally { globalThis.__rxOrdersInFlight--; globalThis.__rxLastOrderAt = Date.now(); }
+  };
+  rs = await postOrder();
   { // #14 one retry when the venue names the precision it wants: a 400 refusal places nothing, so re-sending is safe
     const pm = sizeStr != null && rs && rs.status === 400 && /base_size precision must not exceed (\d{1,2}) decimal/i.exec(String((rs.body && (rs.body.message || JSON.stringify(rs.body))) || ''));
     if (pm) {
@@ -303,8 +336,7 @@ async function placeRevolutOrder(symbol, side, orderType, baseSize, price = null
       if (cut !== sizeStr && Number(cut) > 0) {
         console.log('[revolut] #14 ' + revolutSymbol + ' size ' + sizeStr + ' -> ' + cut + ' (venue allows ' + pm[1] + ' decimals) - retrying once');
         sizeStr = cut; body = mkBody();
-        globalThis.__rxOrdersInFlight = (globalThis.__rxOrdersInFlight || 0) + 1;   // #636
-        try { rs = await revolutRequest('POST', '/orders', body, null, { withStatus: true }); } finally { globalThis.__rxOrdersInFlight--; globalThis.__rxLastOrderAt = Date.now(); }
+        rs = await postOrder();   // #636 counter + #641 A2 timeout record inside
       }
     }
   }
@@ -1961,7 +1993,10 @@ const db = mysql.createPool({
   connectionLimit: 10,
   waitForConnections: true,
   enableKeepAlive: true,
-  keepAliveInitialDelay: 10000
+  keepAliveInitialDelay: 10000,
+  connectTimeout: 10000,   // #641 a new connection gives up after 10 s instead of hanging
+  maxIdle: 10, idleTimeout: 60000   // #641 idle connections are closed after a minute (the DB side can drop them first). The wait queue stays unlimited on
+                                    // purpose: a query refused on an order path would be worse than a wait.
 });
 
 await db.execute(`CREATE TABLE IF NOT EXISTS baselines (
@@ -7078,11 +7113,12 @@ async function runLimitFillPipeline(order, filledQty, avgPrice) {
 async function pollPendingOrders() {
   try {
     const [rows] = await db.execute(
-      "SELECT order_id, symbol, side, order_type, quantity, limit_price, status, filled_quantity, avg_fill_price, linked_journal_id, last_pipeline_qty FROM pending_orders WHERE status NOT IN ('filled','cancelled','rejected','replaced') LIMIT 50"
+      "SELECT order_id, client_order_id, created_at, symbol, side, order_type, quantity, limit_price, status, filled_quantity, avg_fill_price, linked_journal_id, last_pipeline_qty FROM pending_orders WHERE status NOT IN ('filled','cancelled','rejected','replaced','check') LIMIT 50"
     );
     if (!rows || rows.length === 0) return;
     for (const o of rows) {
       try {
+        if (String(o.status) === 'timeout') { await resolveTimedOutOrder(o); continue; }   // #641 A2
         const respRaw = await revolutRequest('GET', '/orders/' + o.order_id);
         // First-fill visibility: log the full raw response.
         console.log('[orders] poll ' + o.order_id + ' (' + o.symbol + ') raw: ' + JSON.stringify(respRaw));
@@ -7134,6 +7170,42 @@ async function pollPendingOrders() {
     }
   } catch (e) {
     console.error('[orders] pollPendingOrders error: ' + e.message);
+  }
+}
+
+// #641 Fable A2: an order whose POST timed out. Revolut X's active and recent-history lists are searched for its client_order_id. Found:
+// the row takes the venue's order id and state, so the normal poll carries on (a limit fill runs the fill pipeline as usual; a market
+// fill is picked up by the trade detection like any trade the system did not journal), and one Telegram line says what happened. Not
+// found after 10 minutes: status 'check' (no longer polled) and one line asking Bryan to look. Nothing is ever re-sent.
+async function resolveTimedOutOrder(o) {
+  const cid = String(o.client_order_id || ''), coin = String(o.symbol || '').replace('-USD', ''), sentMs = new Date(o.created_at).getTime() || Date.now();
+  const listOf = (r) => Array.isArray(r) ? r : (r && (r.data || r.orders || r.items)) || [];
+  let found = null;
+  try {
+    found = listOf(await revolutRequest('GET', '/orders/active')).find(x => String(x.client_order_id || '') === cid) || null;
+    if (!found) {
+      const qs = new URLSearchParams({ start_date: String(sentMs - 120000), end_date: String(Date.now()), limit: '200' });
+      found = listOf(await revolutRequest('GET', '/orders/historical?' + qs.toString())).find(x => String(x.client_order_id || '') === cid) || null;
+    }
+  } catch (e) { console.error('[orders] #641 timed-out order ' + cid + ': lists not read (' + e.message + ') - tried again next poll'); return; }
+  const at = new Date(sentMs).toISOString().slice(11, 16) + ' UTC';
+  if (found) {
+    const vid = String(found.id || found.venue_order_id || found.order_id || '');
+    const st = String(found.state || found.status || 'pending_new').toLowerCase();
+    const fq = Number(found.filled_quantity) || 0, ap = Number(found.average_fill_price) > 0 ? Number(found.average_fill_price) : null;
+    if (vid) await db.execute('UPDATE pending_orders SET order_id = ?, status = ?, filled_quantity = ?, avg_fill_price = ?, last_checked = NOW() WHERE order_id = ?', [vid, st, fq, ap, o.order_id]);
+    else await db.execute("UPDATE pending_orders SET status = 'check', last_checked = NOW() WHERE order_id = ?", [o.order_id]);
+    console.log('[orders] #641 timed-out order ' + cid + ' found at Revolut X: ' + (vid || '?') + ' ' + st + ' filled ' + fq);
+    await sendTelegram('🔎 <b>' + escTg(coin) + ' ' + escTg(String(o.side).toLowerCase()) + ' order</b> sent at ' + at + ' got no answer in time, but it DID reach Revolut X: ' + escTg(st) +
+      (fq > 0 ? ', filled ' + Number(fq.toPrecision(8)) + (ap ? ' at ' + Number(ap.toPrecision(6)) : '') + '. It is recorded from here (it was not at the time).' : ', nothing filled yet.') + (vid ? '' : ' Its order id was not readable - please check Revolut X.')).catch(() => {});
+    return;
+  }
+  if (Date.now() - sentMs >= 10 * 60000) {
+    await db.execute("UPDATE pending_orders SET status = 'check', last_checked = NOW() WHERE order_id = ?", [o.order_id]);
+    console.error('[orders] #641 timed-out order ' + cid + ' not found at Revolut X after 10 min - marked check');
+    await sendTelegram('⚠️ <b>Check Revolut X for ' + escTg(coin) + '</b>: a ' + escTg(String(o.side).toLowerCase()) + ' order sent at ' + at + ' got no answer and is not in its order lists 10 minutes later - most likely it never arrived. Nothing was re-sent.').catch(() => {});
+  } else {
+    await db.execute('UPDATE pending_orders SET last_checked = NOW() WHERE order_id = ?', [o.order_id]);
   }
 }
 
@@ -7228,6 +7300,34 @@ function abnAnalyze(rows) {
 
 // Compute abnormal-move state for all captured coins (held + watch, minus DEAD_BAGS/EXITED meta rows).
 // Phase A: returns the map; fires NOTHING.
+// #641 (13 Oct system check): the detector re-read 14 days of 2-minute prices for every coin every 2 minutes (~10k rows a coin). It now
+// keeps each coin's window in memory as two number arrays, reads only the rows newer than the last one it has (by id), drops rows that
+// fall out of the window, and re-reads the whole window every 6 h (and on any gap) to stay in line with the table. abnAnalyze sees the
+// same rows as before; alert/nudge only, never an order path.
+const _abnWin = new Map();   // symbol -> { id: last id, p: prices, t: ms times, full: ms of last full read }
+async function abnWindowRows(symbol) {
+  const now = Date.now(), cut = now - ABN_LOOKBACK_DAYS * 86400000;
+  let w = _abnWin.get(symbol);
+  if (!w || now - w.full > 6 * 3600000) {
+    const [rows] = await db.execute('SELECT id, price, recorded_at FROM price_intraday WHERE symbol = ? AND recorded_at > DATE_SUB(NOW(), INTERVAL ? DAY) ORDER BY recorded_at ASC, id ASC', [symbol, ABN_LOOKBACK_DAYS]);
+    w = { id: 0, p: [], t: [], full: now };
+    for (const r of rows) { w.p.push(parseFloat(r.price)); w.t.push(new Date(r.recorded_at).getTime()); if (Number(r.id) > w.id) w.id = Number(r.id); }
+    _abnWin.set(symbol, w);
+  } else {
+    const [rows] = await db.execute('SELECT id, price, recorded_at FROM price_intraday WHERE symbol = ? AND id > ? ORDER BY id ASC LIMIT 2000', [symbol, w.id]);
+    for (const r of rows) {
+      const tm = new Date(r.recorded_at).getTime();
+      if (w.t.length && tm < w.t[w.t.length - 1]) { w.full = 0; return abnWindowRows(symbol); }   // out of order: re-read the window
+      w.p.push(parseFloat(r.price)); w.t.push(tm); w.id = Number(r.id);
+    }
+    if (rows.length === 2000) { w.full = 0; return abnWindowRows(symbol); }
+    let drop = 0; while (drop < w.t.length && w.t[drop] <= cut) drop++;
+    if (drop) { w.p.splice(0, drop); w.t.splice(0, drop); }
+  }
+  const out = new Array(w.p.length);
+  for (let i = 0; i < w.p.length; i++) out[i] = { price: w.p[i], recorded_at: new Date(w.t[i]) };
+  return out;
+}
 async function computeAbnormalMoves() {
   const out = {};
   try {
@@ -7236,10 +7336,7 @@ async function computeAbnormalMoves() {
       const symbol = r.symbol + '-USD';
       let rows;
       try {
-        [rows] = await db.execute(
-          'SELECT price, recorded_at FROM price_intraday WHERE symbol = ? AND recorded_at > DATE_SUB(NOW(), INTERVAL ? DAY) ORDER BY recorded_at ASC',
-          [symbol, ABN_LOOKBACK_DAYS]
-        );
+        rows = await abnWindowRows(symbol);   // #641 kept in memory, only new rows read
       } catch (e) { continue; }
       if (!rows || rows.length < 12) continue;
       const res = abnAnalyze(rows);
@@ -19110,6 +19207,12 @@ function venueBackoffClear(venue) { if (_venueBackoff.delete(venue)) console.log
 
 async function handleTrailingStopAlert(symbol, currentPrice, ts, exchange = 'revolut') {
   const coinBase = symbol.replace('-USD', '');
+  // #641 Fable A3: one handling per coin at a time. The 30 s scan, a second scan (#641 allows one overlap) and the 5-min check could all
+  // reach a breach for the same coin across the awaits before removeTrailingStop; the second one now skips (the first one decides).
+  const tsBusyKey = exchange + ':' + symbol, tsBusy = globalThis.__rxTrailBusy || (globalThis.__rxTrailBusy = new Set());
+  if (tsBusy.has(tsBusyKey)) { console.log('[trailing] #641 ' + symbol + ' is already being handled - this pass skips it'); return; }
+  tsBusy.add(tsBusyKey);
+  try {
 
   // #93 Phase B: auto-exec trailing stop -- bypass Claude analysis entirely.
   // Fires when ts.autoExecute=true (set via manage_alerts set_trailing auto_execute:true).
@@ -19325,6 +19428,7 @@ async function handleTrailingStopAlert(symbol, currentPrice, ts, exchange = 'rev
     analyseTrailingStopAlert(symbol, currentPrice, ts.peakPrice, ts.trailPct, ts.stopPrice, exchange)
       .catch(e => console.error('[analysis] trailing stop:', e.message));
   }
+  } finally { tsBusy.delete(tsBusyKey); }   // #641 A3
 }
 
 async function autoExecuteKrakenSell(symbol, maxPct, analysis, confidence, opts = {}) {   // #L1 opts.tool_key (additive; 4-arg callers unchanged)
@@ -21170,19 +21274,57 @@ async function checkPortfolio() {
   }
 }
 
+// #641 (13 Oct system check, reliability): the four repeating jobs had no busy guard, so a slow run (a hung request, a busy DB) piled
+// more copies on top. Now a tick is skipped while the last run is still going. For the fast scan only, after two intervals ONE extra run
+// may start alongside it (a chasing sale can legitimately hold the 30 s scan, and other coins' stops must not wait behind it); never
+// more than two. At five intervals one Telegram warning; one line when it clears. During a
+// shutdown (#636) no new run starts. Last-run times are shown on GET /api/health.
+// Fable A1: the overlap is per job - ONLY the fast scan may run a second copy (maxRuns 2). The portfolio check, the price capture and
+// the order poller are strictly one at a time (two pollers would run the fill pipeline twice for one fill; two portfolio checks can
+// both walk the buy paths and overwrite an alert interval handle).
+const _rxTicks = new Map();   // name -> { running, starts (the runs going now), startedAt (the oldest of them), lastEndAt, lastMs, skipped, warned }
+function rxGuardTick(name, fn, everyMs, maxRuns = 1) {
+  return async () => {
+    if (globalThis.__rxShutdown) return;
+    let s = _rxTicks.get(name);
+    if (!s) { s = { running: 0, starts: [], startedAt: 0, lastEndAt: 0, lastMs: 0, skipped: 0, warned: false }; _rxTicks.set(name, s); }
+    const forMs = Date.now() - s.startedAt;
+    if (s.running > 0) {
+      if (forMs > 5 * everyMs && !s.warned) {
+        s.warned = true;
+        console.error('[tick] #641 ' + name + ' still running after ' + Math.round(forMs / 1000) + ' s');
+        sendTelegram('⚠️ <b>' + name + '</b> has been running for ' + Math.round(forMs / 60000) + ' min. Its next runs are skipped until it finishes; if it does not, a redeploy restarts it.').catch(() => {});
+      }
+      if (s.running >= maxRuns || forMs < 2 * everyMs) { s.skipped++; return; }
+    }
+    const mine = Date.now();
+    s.running++; s.starts.push(mine); s.startedAt = s.starts[0];
+    try { await fn(); }
+    catch (e) { console.error('[tick] #641 ' + name + ':', e && e.message); }
+    finally {
+      s.running--; s.starts.splice(s.starts.indexOf(mine), 1); s.startedAt = s.starts.length ? s.starts[0] : 0;
+      s.lastEndAt = Date.now(); s.lastMs = s.lastEndAt - mine;
+      if (s.running === 0 && s.warned) { s.warned = false; console.log('[tick] #641 ' + name + ' finished (' + Math.round(s.lastMs / 1000) + ' s)'); sendTelegram('✅ <b>' + name + '</b> finished after ' + Math.round(s.lastMs / 60000) + ' min.').catch(() => {}); }
+    }
+  };
+}
+const tickPortfolio = rxGuardTick('portfolio check (5 min)', checkPortfolio, CHECK_INTERVAL_MS);
+const tickCapture = rxGuardTick('price capture (2 min)', captureIntradayPrices, CAPTURE_INTERVAL_MS);
+const tickFastScan = rxGuardTick('fast scan (30 s)', runFastScan, FAST_SCAN_INTERVAL_MS, 2);   // A1: the only job allowed one overlap
+const tickOrderPoll = rxGuardTick('order poller (60 s)', pollPendingOrders, ORDER_POLL_INTERVAL_MS);
 // Start monitoring loop
 setTimeout(async () => {
   await sendTelegram('🤖 Revolut X monitor started! Checking your portfolio every 5 minutes.');
-  await checkPortfolio();
-  monitoringInterval = setInterval(checkPortfolio, CHECK_INTERVAL_MS);
-  captureIntradayPrices();
-  setInterval(captureIntradayPrices, CAPTURE_INTERVAL_MS);
+  await tickPortfolio();
+  monitoringInterval = setInterval(tickPortfolio, CHECK_INTERVAL_MS);
+  tickCapture();
+  setInterval(tickCapture, CAPTURE_INTERVAL_MS);
   setTimeout(computeMssStructure, 120000); // #49 initial MSS compute ~2min after boot
   setInterval(computeMssStructure, 15 * 60 * 1000); // #49 recompute every 15min
-  runFastScan();
-  setInterval(runFastScan, FAST_SCAN_INTERVAL_MS);
-  pollPendingOrders();
-  setInterval(pollPendingOrders, ORDER_POLL_INTERVAL_MS);   // #47 Phase B1 (hash47b) fill-detection poller (detection-only)
+  tickFastScan();
+  setInterval(tickFastScan, FAST_SCAN_INTERVAL_MS);
+  tickOrderPoll();
+  setInterval(tickOrderPoll, ORDER_POLL_INTERVAL_MS);   // #47 Phase B1 (hash47b) fill-detection poller (detection-only); #641 guarded
 }, 5000);
 
 // Record prices at midnight every day (UK time)
@@ -23112,9 +23254,15 @@ app.use((req, res, next) => {
   next();
 });
 
-// GET /api/health — lightweight liveness check (no DB, no external calls)
-app.get('/api/health', (req, res) => {
-  res.json({ ok: true, time: new Date().toISOString(), uptime: Math.round(process.uptime()) });
+// GET /api/health — liveness check. #641: it also pings the database (SELECT 1, 3 s at most) and answers 503 when that fails, so
+// Railway's deploy healthcheck (healthcheckPath /api/health) keeps the old server running if a new one cannot reach the DB. It shows
+// only how long ago each repeating job last finished - no balances, prices or names. Still open (no key), as before.
+app.get('/api/health', async (req, res) => {
+  const t0 = Date.now(); let dbOk = false;
+  try { await Promise.race([db.query('SELECT 1'), new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 3000))]); dbOk = true; } catch (e) { /* 503 below */ }
+  const jobs = {};
+  for (const [n, s] of _rxTicks) jobs[n] = { last_finished_s_ago: s.lastEndAt ? Math.round((Date.now() - s.lastEndAt) / 1000) : null, running: s.running > 0, last_run_s: Math.round(s.lastMs / 1000), skipped: s.skipped };
+  res.status(dbOk ? 200 : 503).json({ ok: dbOk, db_ms: dbOk ? Date.now() - t0 : null, time: new Date().toISOString(), uptime: Math.round(process.uptime()), shutting_down: !!globalThis.__rxShutdown, jobs });
 });
 
 // GET /api/status — monitoring status, active alerts, baseline prices
