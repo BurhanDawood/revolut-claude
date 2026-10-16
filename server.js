@@ -30193,7 +30193,7 @@ async function agentScoreFlip(sc) {   // a team note for the Claude PM thread wh
 // 1,500 output tokens for a memo of up to 1,500 characters, a playbook of up to 1,200 and the changes as JSON, so a review that wrote a
 // playbook ran out of room mid-JSON (the deep reviews, with 3,000, all read). Now 4,000 / 6,000 / 4,000; the stop reason is kept; a
 // retry after running out of room asks for a SHORTER answer instead of the same one again.
-const PM_BOSS = { daily_usd: 1, max_changes: 2, field_days: 3, undo_hours: 24, weekday_tokens: 4000, deep_tokens: 6000, playbook_max: 1200, quiet_days: 3, timeout_ms: 120000 };
+const PM_BOSS = { daily_usd: 1, max_changes: 2, field_days: 3, undo_hours: 24, weekday_tokens: 8000, deep_tokens: 9000,   /* #640 were 4000 / 6000: weekday review #28 (15 Oct 20:06Z) ran out of room and its retry could not be read, as #8 did */ playbook_max: 1200, quiet_days: 3, timeout_ms: 120000 };
 const PM_BOSS_FIELDS = {   // C2: the paper bounds
   per_trade_pct: { min: 10, max: 25, label: 'per-trade size (% of equity)' },
   max_positions: { min: 2, max: 5, int: true, label: 'positions at once' },
