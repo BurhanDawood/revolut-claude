@@ -654,7 +654,12 @@ async function appPushSend(note, onlyToken = null) {
   if (!sa || !note) return { sent: 0, skipped: 'off' };
   let devices;
   if (onlyToken) devices = [{ token_hash: createHash('sha256').update(onlyToken).digest('hex'), token: onlyToken, caps: '' }];
-  else { const [rows] = await db.execute('SELECT token_hash, token, caps FROM app_devices WHERE disabled = 0 ORDER BY last_seen DESC LIMIT ' + APP_PUSH.max_devices); devices = rows; }
+  else {   // #642 only phones registered under a live key
+    const fps = appLiveKeyFps();
+    if (!fps.length) return { sent: 0, skipped: 'no live key' };
+    const [rows] = await db.execute('SELECT token_hash, token, caps FROM app_devices WHERE disabled = 0 AND key_fp IN (' + fps.map(() => '?').join(', ') + ') ORDER BY last_seen DESC LIMIT ' + APP_PUSH.max_devices, fps);
+    devices = rows;
+  }
   if (!devices.length) return { sent: 0, skipped: 'no devices' };
   let access = await appPushAccessToken(sa);
   let sent = 0;
@@ -1173,7 +1178,7 @@ async function telegramButtonDispatch(cbData, cbReply, ackCb) {
   // New Trade Detected buttons use 'tj'; numeric 'td' keeps already-sent ones working.
   const cbIsTradeJournal = cbMoneyType === 'tj' || (cbMoneyType === 'td' && /^\d+$/.test(cbCoin));
   if (cbMoneyType === 'np' || cbMoneyType === 'ip' || cbMoneyType === 'cc' || cbIsTradeJournal || cbMoneyType === 'ta' || cbMoneyType === 'mu' ||
-      cbMoneyType === 'sd' || cbMoneyType === 'sp' || cbMoneyType === 'rp' || cbMoneyType === 'db' || cbMoneyType === 'sk' || cbMoneyType === 'ro' || cbMoneyType === 'rq' || cbMoneyType === 'ru' || cbMoneyType === 'sx' || cbMoneyType === 'au' || cbMoneyType === 'pf') {
+      cbMoneyType === 'sd' || cbMoneyType === 'sp' || cbMoneyType === 'rp' || cbMoneyType === 'db' || cbMoneyType === 'sk' || cbMoneyType === 'ro' || cbMoneyType === 'rq' || cbMoneyType === 'ru' || cbMoneyType === 'sx' || cbMoneyType === 'au' || cbMoneyType === 'pf' || cbMoneyType === 'mc') {
     await ackCb('Working...');
     try {
       if (cbMoneyType === 'ta') await handleTradeApprovalButton(cbCoin, cbChoice, cbReply);
@@ -1181,6 +1186,7 @@ async function telegramButtonDispatch(cbData, cbReply, ackCb) {
       else if (cbMoneyType === 'sd' || cbMoneyType === 'sp') await handleSwingButton(cbCoin, cbChoice, cbMoneyType, cbReply);
       else if (cbMoneyType === 'rp') await handleRebalanceConfirmButton(cbCoin, cbChoice, cbReply);
       else if (cbMoneyType === 'sk') await handleSpecButton(cbCoin, cbChoice, cbReply);   // #D2 spec desk status buttons (never money)
+      else if (cbMoneyType === 'mc') await handleMcpConfirmButton(cbCoin, cbChoice, cbReply);   // #642 confirm a held connector change (Telegram only: not on APP_ANSWER_ALLOW)
       else if (cbMoneyType === 'au') await handleBossUndoButton(cbCoin, cbReply);   // #548 C3 Undo a PM agent change (paper settings; Telegram only)
       else if (cbMoneyType === 'pf') await handlePmFollowButton(cbCoin, cbChoice, cbReply);   // #559 followed the PM? records only
       else if (cbMoneyType === 'ro') await handleRotationUntagButton(cbCoin, cbReply);   // #8 records only
@@ -1343,13 +1349,19 @@ function appDeviceBody(b) {
   const caps = typeof b.caps === 'string' ? b.caps.toLowerCase().replace(/[^a-z0-9,]/g, '').slice(0, 32) : '';   // #498
   return { token, platform, app_version, caps };
 }
-async function appDeviceRegister(body, nowMs = Date.now()) {
+// #642 (13 Oct system check, security): a phone is registered under the key it used (a 16-character fingerprint, never the key), and
+// pushes go only to phones whose key is still one of the live keys - after a key change an old phone gets nothing until the app is
+// opened with the new key. Phones registered before #642 take the dashboard key's fingerprint once at start-up.
+const appKeyFp = (k) => (typeof k === 'string' && k.length >= 24) ? createHash('sha256').update(k).digest('hex').slice(0, 16) : null;
+const appLiveKeyFps = () => [appKeyFp(process.env.DASHBOARD_TOKEN), appKeyFp(process.env.API_TOKEN)].filter(Boolean);
+async function appDeviceRegister(body, nowMs = Date.now(), keyUsed = null) {
   const d = appDeviceBody(body);
   if (!d) return { ok: false, error: 'bad device' };
+  const keyFp = appKeyFp(keyUsed);
   const hash = createHash('sha256').update(d.token).digest('hex'), now = Math.floor(nowMs / 1000);
   const [had] = await db.execute('SELECT disabled FROM app_devices WHERE token_hash = ?', [hash]);
-  await db.execute('INSERT INTO app_devices (token_hash, token, platform, app_version, caps, created_at, last_seen, fails, disabled) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0) ' +
-    'ON DUPLICATE KEY UPDATE app_version = VALUES(app_version), caps = VALUES(caps), last_seen = VALUES(last_seen), disabled = 0, fails = 0', [hash, d.token, d.platform, d.app_version, d.caps, now, now]);   // #498 caps
+  await db.execute('INSERT INTO app_devices (token_hash, token, platform, app_version, caps, created_at, last_seen, fails, disabled, key_fp) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?) ' +
+    'ON DUPLICATE KEY UPDATE app_version = VALUES(app_version), caps = VALUES(caps), last_seen = VALUES(last_seen), disabled = 0, fails = 0, key_fp = VALUES(key_fp)', [hash, d.token, d.platform, d.app_version, d.caps, now, now, keyFp]);   // #498 caps; #642 key_fp
   // at most max_devices active: the least recently seen beyond that are switched off
   const [act] = await db.execute('SELECT token_hash FROM app_devices WHERE disabled = 0 ORDER BY last_seen DESC, created_at DESC');
   const evicted = act.slice(APP_PUSH.max_devices);
@@ -2724,6 +2736,14 @@ try {   // #498 what the app supports ('ch2' = one Android channel per sound/vib
   const [cc] = await db.execute("SELECT COUNT(*) AS c FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'app_devices' AND COLUMN_NAME = 'caps'");
   if (Number(cc[0].c) === 0) { await db.execute("ALTER TABLE app_devices ADD COLUMN caps VARCHAR(32) NOT NULL DEFAULT ''"); console.log('[migrate] #498 added app_devices.caps'); }
 } catch (e) { console.warn('[migrate] #498 app_devices.caps:', e.message); }
+try {   // #642 the key a phone registered under (fingerprint); phones from before take the dashboard key's, once
+  await safeAddColumn('app_devices', 'key_fp', 'CHAR(16) NULL');
+  const dfp = process.env.DASHBOARD_TOKEN && process.env.DASHBOARD_TOKEN.length >= 24 ? createHash('sha256').update(process.env.DASHBOARD_TOKEN).digest('hex').slice(0, 16) : null;
+  if (dfp) { const [u] = await db.execute('UPDATE app_devices SET key_fp = ? WHERE key_fp IS NULL', [dfp]); if (u.affectedRows) console.log('[migrate] #642 ' + u.affectedRows + ' phone(s) given the dashboard key fingerprint'); }
+  else console.error('[migrate] #642 DASHBOARD_TOKEN missing or short - no phone can get a push until a live key is set');   // Fable B6
+  const [nk] = await db.execute('SELECT COUNT(*) AS n FROM app_devices WHERE disabled = 0 AND key_fp IS NULL');
+  if (Number(nk[0].n) > 0) console.error('[migrate] #642 ' + nk[0].n + ' active phone(s) have no key fingerprint and get no pushes until the app is reopened');
+} catch (e) { console.warn('[migrate] #642 app_devices.key_fp:', e.message); }
 await db.execute('CREATE TABLE IF NOT EXISTS app_inbox (id BIGINT AUTO_INCREMENT PRIMARY KEY, ts INT UNSIGNED NOT NULL, cat VARCHAR(12) NOT NULL, text MEDIUMTEXT NOT NULL, kb TEXT NULL, tab VARCHAR(12) NOT NULL DEFAULT \'home\', coin VARCHAR(16) NOT NULL DEFAULT \'\', push VARCHAR(32) NOT NULL DEFAULT \'\', INDEX idx_ts (ts), INDEX idx_cat (cat, id))').catch(e => console.error('[migration] app_inbox:', e.message));   // #500 the app's notifications feed
 await db.execute('CREATE TABLE IF NOT EXISTS app_inbox_answers (id BIGINT AUTO_INCREMENT PRIMARY KEY, inbox_id BIGINT NOT NULL, r TINYINT NOT NULL, c TINYINT NOT NULL, label VARCHAR(40) NOT NULL DEFAULT \'\', result VARCHAR(64) NOT NULL DEFAULT \'\', at INT UNSIGNED NOT NULL, UNIQUE KEY uq_inbox (inbox_id), INDEX idx_at (at))').catch(e => console.error('[migration] app_inbox_answers:', e.message));   // #502 one answer per feed message (Fable C2)
 await safeAddColumn('app_inbox', 'fam', "VARCHAR(16) NOT NULL DEFAULT ''").catch(e => console.error('[migration] app_inbox.fam:', e.message));   // #512 the alert family (the evening digest reads it)
@@ -23068,6 +23088,14 @@ console.log('Cron jobs scheduled: midnight price recording + 9 AM morning briefi
 const app = express();
 app.use(cors());
 app.use(express.json());
+// #642 (13 Oct system check, security): every page may be framed only by our own pages (the /app shell frames its tabs; the Android
+// app opens /app at the top level), carries no <base> from elsewhere and no plugins, and sends no referrer to other sites. Scripts are
+// not restricted here (the pages are inline-script); a page that sets its own Content-Security-Policy (her page, logos) replaces this.
+app.use((req, res, next) => {
+  res.setHeader('Content-Security-Policy', "frame-ancestors 'self'; base-uri 'self'; object-src 'none'");
+  res.setHeader('Referrer-Policy', 'same-origin');
+  next();
+});
 
 // #349 AUTH GATE ON EVERY DATA ROUTE (replaces #43). #43 guarded only NON-GET /api/ requests, so every read - balances,
 // capital, journal, tax export - was public, and pause / resume / sweep writes needed no key at all (#341).
@@ -24155,8 +24183,161 @@ app.get('/api/tradehistory', async (req, res) => {
   res.json(results);
 });
 
+// #642 (13 Oct system check, security; Bryan 17 Oct 09:07 "Let's do telegram tap"). The MCP path secret alone could switch autonomous
+// trading on or loosen it. Now any connector call that turns selling/buying on, or loosens a limit, is HELD: it is stored in
+// mcp_confirms and Bryan gets a Telegram Confirm / Cancel. Only Confirm (Telegram only - never the app, 'mc' is not on
+// APP_ANSWER_ALLOW; within 24 h; once) runs the tool, with the exact arguments that were held. Turning things OFF and tightening
+// stay instant. Rules (mcpConfirmNeed): configure_auto_execute when it enables, raises max_sell_pct, adds a trigger, lowers the
+// confidence or cooldown, drops a coin from hodl/manual-only, lowers or removes a sell floor, or opts a coin in; configure_sweep
+// unless it switches the sweep off; configure_away_mode unless status/deactivate; set_entry_price always (it moves the sell floor
+// AND the buy-back base); a trailing stop that sells by itself; a trough tracker that buys; loop_enable / ladder_live_start /
+// ladder_live_switch; set_pump_armed_rule unless it only switches the loop off. If the current settings cannot be read, the call is
+// held (fails closed).
+const _mcpToolHandlers = new Map();   // tool name -> its own handler (refilled whenever createMcpServer runs)
+await db.execute("CREATE TABLE IF NOT EXISTS mcp_confirms (id INT AUTO_INCREMENT PRIMARY KEY, tool VARCHAR(64) NOT NULL, args MEDIUMTEXT NOT NULL, summary VARCHAR(600) NOT NULL, status VARCHAR(12) NOT NULL DEFAULT 'waiting', result VARCHAR(600) NULL, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, decided_at DATETIME NULL)").catch(e => console.error('[mcp] #642 mcp_confirms table:', e.message));
+const MCP_CONF_RANK = { low: 1, medium: 2, high: 3 };
+const mcpOn = (v) => v === true || v === 'true' || v === 1 || v === '1';
+const mcpOff = (v) => v === false || v === 'false' || v === 0 || v === '0';
+async function mcpConfirmNeed(tool, a) {
+  a = a || {};
+  const sym = (s) => String(s || '').toUpperCase().replace(/-USD$/, '');
+  if (tool === 'manage_trading') {
+    if (a.action === 'configure_auto_execute') {
+      const [r] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'ai_auto_execute'");
+      const cur = r.length ? JSON.parse(r[0].config_value) : {};
+      const loose = [];
+      if (mcpOn(a.enabled) && cur.enabled !== true) loose.push('switch auto-execute ON');
+      if (a.max_sell_pct != null && Number(a.max_sell_pct) > Number(cur.max_sell_pct || 25)) loose.push('max sell per trade ' + (cur.max_sell_pct || 25) + '% -> ' + a.max_sell_pct + '%');
+      if (Array.isArray(a.allowed_triggers)) { const add = a.allowed_triggers.filter(t => !(cur.allowed_triggers || ['trailing_stop']).includes(t)); if (add.length) loose.push('new sale triggers: ' + add.join(', ')); }
+      if (a.require_confidence && (MCP_CONF_RANK[String(a.require_confidence).toLowerCase()] || 0) < (MCP_CONF_RANK[String(cur.require_confidence || 'High').toLowerCase()] || 3)) loose.push('confidence ' + (cur.require_confidence || 'High') + ' -> ' + a.require_confidence);
+      if (a.cooldown_minutes != null && Number(a.cooldown_minutes) < Number(cur.cooldown_minutes || 60)) loose.push('cooldown ' + (cur.cooldown_minutes || 60) + ' -> ' + a.cooldown_minutes + ' min');
+      for (const k of ['hodl_symbols', 'manual_only_symbols']) if (Array.isArray(a[k])) {
+        const keep = new Set(a[k].map(sym)), gone = (cur[k] || []).map(sym).filter(c => !keep.has(c));
+        if (gone.length) loose.push((k === 'hodl_symbols' ? 'HODL' : 'manual-only') + ' list drops ' + gone.join(', '));
+      }
+      if (a.sell_floors && typeof a.sell_floors === 'object') for (const [k, v] of Object.entries(a.sell_floors)) {
+        const c = sym(k), old = (cur.sell_floors || {})[c];
+        if ((v === null || Number(v) === 0) ? old != null : (old != null && Number(v) < Number(old))) loose.push(c + ' sell floor ' + old + ' -> ' + (v === null || Number(v) === 0 ? 'none' : v));
+      }
+      if (a.per_coin_enabled && typeof a.per_coin_enabled === 'object') for (const [k, v] of Object.entries(a.per_coin_enabled)) if (mcpOn(v) && (cur.per_coin_enabled || {})[sym(k)] !== true) loose.push(sym(k) + ' opted in to auto-sell');
+      return loose.length ? 'Auto-execute settings: ' + loose.join('; ') : null;
+    }
+    if (a.action === 'configure_dnd') {   // Fable B5: DND lets a trail fire on a hodl coin, so widening it loosens protection
+      const x = a.dnd_action || 'status';
+      if (x === 'status' || x === 'deactivate') return null;
+      if (x === 'activate') return 'Do-Not-Disturb ON' + (Array.isArray(a.dnd_coins) && a.dnd_coins.length ? ' for ' + a.dnd_coins.map(sym).join(', ') : ' for its eligible coins') + ' (switches their pump loops on)';
+      const [r] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'dnd_mode'");
+      const cur = r.length ? JSON.parse(r[0].config_value) : {};
+      if (x === 'set_eligible') { const had = new Set((cur.eligible_coins || []).map(sym)), add = (a.dnd_coins || []).map(sym).filter(c => !had.has(c)); return add.length ? 'Do-Not-Disturb: adds ' + add.join(', ') + ' to the eligible coins' : null; }
+      if (x === 'set_params') {
+        const p = cur.default_params || {}, loose = [];
+        const up = (k, ak, dflt, label) => { if (a[ak] != null && Number(a[ak]) > Number(p[k] ?? dflt)) loose.push(label + ' ' + (p[k] ?? dflt) + ' -> ' + a[ak]); };
+        const down = (k, ak, dflt, label) => { if (a[ak] != null && Number(a[ak]) < Number(p[k] ?? dflt)) loose.push(label + ' ' + (p[k] ?? dflt) + ' -> ' + a[ak]); };
+        up('sell_pct', 'dnd_sell_pct', 100, 'sell %'); up('trail_pct', 'dnd_trail_pct', 8, 'trail %'); down('arm_pump_pct', 'dnd_arm_pct', 30, 'arm %');
+        down('retrace_pct', 'dnd_retrace_pct', 50, 'retrace %'); down('bounce_pct', 'dnd_bounce_pct', 8, 'bounce %');
+        return loose.length ? 'Do-Not-Disturb settings: ' + loose.join('; ') : null;
+      }
+      return 'Do-Not-Disturb: ' + x;
+    }
+    if (a.action === 'configure_sweep') return mcpOff(a.enabled) ? null : 'Switch the USDT sweep ON (' + (a.sweep_pct || 20) + '% of sale proceeds bought into USDT automatically)';
+    if (a.action === 'configure_away_mode') { const x = a.away_action || 'status'; return (x === 'status' || x === 'deactivate') ? null : 'Away Mode: ' + x + (Array.isArray(a.away_coins) && a.away_coins.length ? ' (' + a.away_coins.map(sym).join(', ') + ')' : '') + (a.away_sell_pct != null ? ', sell ' + a.away_sell_pct + '%' : '') + (a.away_buy_usd != null ? ', buy $' + a.away_buy_usd : ''); }
+    return null;
+  }
+  if (tool === 'set_entry_price') return 'Set ' + sym(a.symbol) + "'s cost to $" + a.entry_price + ' (moves its sell floor and its loop / buy-back base)';
+  if (tool === 'manage_alerts') {
+    if (a.action === 'set_trailing' && mcpOn(a.auto_execute)) return 'A trailing stop on ' + sym(a.symbol) + ' that SELLS by itself' + (a.trail_pct ? ' (' + a.trail_pct + '% trail)' : '');
+    if (a.action === 'set_trough' && Number(a.buy_usd) > 0) return 'A trough tracker on ' + sym(a.symbol) + ' that BUYS $' + a.buy_usd + ' by itself';
+    return null;
+  }
+  if (tool === 'manage_auto_rules') return ['loop_enable', 'ladder_live_start', 'ladder_live_switch'].includes(a.action) ? a.action.replace(/_/g, ' ') + ' for ' + sym(a.symbol) : null;
+  if (tool === 'set_pump_armed_rule') {
+    const keys = Object.keys(a).filter(k => a[k] !== undefined && k !== 'symbol');
+    if (keys.length && keys.every(k => (k === 'loop_enabled' || k === 'enabled' || k === 'armed') && mcpOff(a[k]))) return null;
+    return 'Pump-loop settings for ' + sym(a.symbol) + ': ' + keys.slice(0, 10).map(k => k + '=' + JSON.stringify(a[k])).join(', ').slice(0, 400);
+  }
+  return null;
+}
+async function mcpConfirmHold(tool, args, summary) {
+  const [ins] = await db.execute('INSERT INTO mcp_confirms (tool, args, summary) VALUES (?, ?, ?)', [tool, JSON.stringify(args || {}), String(summary).slice(0, 600)]);
+  const id = Number(ins.insertId);
+  console.log('[mcp] #642 held #' + id + ' ' + tool + ': ' + String(summary).slice(0, 160));
+  await sendTelegram('🔐 <b>Confirm a change from Claude</b> (#' + id + ')\n' + escTg(summary) + '\n\nNothing has changed. It happens only if you tap Confirm here (within 24 h).',
+    { inline_keyboard: [[{ text: '✅ Confirm', callback_data: 'a:' + id + ':1:mc' }, { text: '✖ Cancel', callback_data: 'a:' + id + ':2:mc' }]] }).catch(e => console.error('[mcp] #642 message:', e.message));
+  return { content: [{ type: 'text', text: JSON.stringify({ ok: false, held: true, confirm_id: id, summary, note: '#642: this switches autonomous trading on or loosens it, so it waits for Bryan to tap Confirm in Telegram. Nothing has changed yet. Do not repeat the call. If no Telegram message arrived, Bryan can send /confirms to get it again.' }) }] };
+}
+// Fable B2: sendTelegram never throws (and on a refused keyboard it sends the text without buttons), so a held change could have no
+// button. /confirms re-sends every change still waiting (under 24 h) with its own buttons - same ids, same one-time claim.
+async function mcpConfirmsResend() {
+  const [w] = await db.execute("SELECT id, summary FROM mcp_confirms WHERE status = 'waiting' AND created_at > DATE_SUB(NOW(), INTERVAL 24 HOUR) ORDER BY id");
+  for (const r of w) await sendTelegram('🔐 <b>Still waiting for you</b> (#' + r.id + ')\n' + escTg(r.summary) + '\n\nNothing has changed. Tap Confirm to apply it.',
+    { inline_keyboard: [[{ text: '✅ Confirm', callback_data: 'a:' + r.id + ':1:mc' }, { text: '✖ Cancel', callback_data: 'a:' + r.id + ':2:mc' }]] });
+  return w.length;
+}
+// Fable B3: a restart between the claim and the result leaves the row 'running'. At boot such rows become 'unknown' with one line each
+// (the change may or may not have applied - check the setting). Nothing is retried.
+setTimeout(async () => {
+  try {
+    const [st] = await db.execute("SELECT id, summary FROM mcp_confirms WHERE status = 'running' AND decided_at < FROM_UNIXTIME(?)", [Math.floor(PROCESS_STARTED_AT / 1000)]);
+    for (const r of st) {
+      await db.execute("UPDATE mcp_confirms SET status = 'unknown' WHERE id = ? AND status = 'running'", [r.id]);
+      await sendTelegram('⚠️ <b>Change #' + r.id + '</b> (' + escTg(r.summary) + ') was being applied when the server restarted. It may or may not have applied - please check that setting. Nothing is retried.').catch(() => {});
+    }
+  } catch (e) { console.error('[mcp] #642 boot sweep:', e.message); }
+}, 45 * 1000);
+// Fable B4: every tool must reach the gate through server.tool. At boot the registered tool count is compared with the handlers the
+// wrapper saw; a difference (a future registerTool) is reported loudly.
+setTimeout(() => {
+  try {
+    const s = createMcpServer(), reg = s && s._registeredTools ? Object.keys(s._registeredTools).length : null;
+    if (reg == null) console.log('[mcp] #642 gate coverage: registered-tool list not readable on this SDK - ' + _mcpToolHandlers.size + ' tools wrapped');
+    else if (reg !== _mcpToolHandlers.size) { console.error('[mcp] #642 GATE COVERAGE: ' + reg + ' tools registered but ' + _mcpToolHandlers.size + ' went through the gate'); sendTelegram('🚨 <b>Connector gate</b>: ' + (reg - _mcpToolHandlers.size) + ' tool(s) registered outside the confirm gate. Tell the Dev thread.').catch(() => {}); }
+    else console.log('[mcp] #642 gate coverage: all ' + reg + ' tools go through the confirm gate');
+  } catch (e) { console.error('[mcp] #642 gate coverage check:', e.message); }
+}, 50 * 1000);
+async function handleMcpConfirmButton(idStr, choice, reply) {
+  const id = parseInt(idStr, 10);
+  if (!(id > 0)) { await reply('⚠️ That button has no valid reference.'); return; }
+  if (choice === 2) {
+    const [u] = await db.execute("UPDATE mcp_confirms SET status = 'cancelled', decided_at = NOW() WHERE id = ? AND status = 'waiting'", [id]);
+    await reply(u.affectedRows ? '✖ Cancelled #' + id + ' - nothing changed.' : 'That one was already handled.');
+    return;
+  }
+  if (choice !== 1) return;
+  const [u] = await db.execute("UPDATE mcp_confirms SET status = 'running', decided_at = NOW() WHERE id = ? AND status = 'waiting' AND created_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)", [id]);
+  if (!u.affectedRows) { await reply('That confirmation was already used, cancelled or is over 24 h old - nothing changed.'); return; }
+  const [rows] = await db.execute('SELECT tool, args, summary FROM mcp_confirms WHERE id = ?', [id]);
+  const row = rows[0];
+  if (!_mcpToolHandlers.size) createMcpServer();   // after a restart the handlers are registered on first use
+  const h = _mcpToolHandlers.get(row.tool);
+  let status = 'failed', out = '';
+  try {
+    if (!h) throw new Error('tool ' + row.tool + ' not found');
+    const r = await h(JSON.parse(row.args), {});
+    out = r && Array.isArray(r.content) ? r.content.map(c => (c && c.text) || '').join(' ') : JSON.stringify(r);
+    status = 'done';
+  } catch (e) { out = 'error: ' + e.message; }
+  await db.execute('UPDATE mcp_confirms SET status = ?, result = ? WHERE id = ?', [status, String(out).slice(0, 600), id]).catch(() => {});
+  console.log('[mcp] #642 #' + id + ' ' + row.tool + ' confirmed by Bryan: ' + status);
+  await reply((status === 'done' ? '✅ Done (#' + id + '): ' : '⚠️ Failed (#' + id + '): ') + escTg(row.summary) + '\n' + escTg(String(out).slice(0, 300)));
+}
 function createMcpServer() {
   const server = new McpServer({ name: 'revolut-x', version: '1.0.0' });
+  {   // #642 every tool is registered through this wrapper: its own handler is kept for a confirmed run, and a call that turns
+      // trading on or loosens it is held for Bryan's Telegram Confirm (mcpConfirmNeed; an error reading the settings holds it)
+    const toolRaw = server.tool.bind(server);
+    server.tool = (...ta) => {
+      const name = ta[0], h = ta[ta.length - 1];
+      if (typeof name === 'string' && typeof h === 'function') {
+        _mcpToolHandlers.set(name, h);
+        ta[ta.length - 1] = async (args, extra) => {
+          let need = null;
+          try { need = await mcpConfirmNeed(name, args); } catch (e) { need = name + ': the current settings could not be read (' + String(e.message).slice(0, 80) + '), so this waits for you'; }
+          return need ? mcpConfirmHold(name, args, need) : h(args, extra);
+        };
+      }
+      return toolRaw(...ta);
+    };
+  }
 
   // ── Tool: research_asset (#72) ──────────────────────────────────────────────
   server.tool('research_asset', 'Deep web research on one asset evaluated against its saved plan — fundamentals, catalysts, news, price-vs-thesis, and a plan-drift verdict. Recommends only, never executes. On-demand (costs an API web-search call).',
@@ -31292,7 +31473,7 @@ async function portfolioSpark(range, nowMs = Date.now()) {
   return { range: key, step: r.step, points, first, last, change, pct };
 }
 // #491 the app registers its push token here (dashboard key); GET shows the devices and push stats (never the tokens)
-app.post('/api/app/devices', async (req, res) => { try { const r = await appDeviceRegister(req.body); res.status(r.ok ? 200 : 400).json(r); } catch (e) { res.status(500).json({ error: 'register failed' }); } });
+app.post('/api/app/devices', async (req, res) => { try { const r = await appDeviceRegister(req.body, Date.now(), req.headers['x-api-token']); res.status(r.ok ? 200 : 400).json(r); } catch (e) { res.status(500).json({ error: 'register failed' }); } });
 app.post('/api/app/inbox/answer', async (req, res) => { try { const r = await appInboxAnswer(req.body); res.set('Cache-Control', 'no-store').status(r.status).json(r); } catch (e) { res.status(500).json({ status: 500, error: 'not answered - use Telegram' }); } });   // #502
 app.get('/api/app/inbox', async (req, res) => { try { res.set('Cache-Control', 'no-store').json(await appInboxList(req.query || {})); } catch (e) { res.status(500).json({ error: 'feed unavailable' }); } });   // #500 read-only
 app.get('/api/app/notify', async (req, res) => { try { res.set('Cache-Control', 'no-store').json(await appPushSettingsView()); } catch (e) { res.status(500).json({ error: 'settings unavailable' }); } });   // #498
@@ -33158,7 +33339,7 @@ app.post('/telegram-webhook', async (req, res) => {
 
     const chatId = message.chat.id;
     const rawText = message.text.trim();
-    console.log('WEBHOOK: message received:', rawText.substring(0, 50));
+    // #642 (system check, security): the text is logged only once the chat is Bryan's (below), never a stranger's
     // Normalise: strip leading slash, lowercase
     const commandText = rawText.startsWith('/') ? rawText.slice(1).toLowerCase() : rawText.toLowerCase();
 
@@ -33188,6 +33369,7 @@ app.post('/telegram-webhook', async (req, res) => {
       console.warn('[security] /telegram-webhook ignoring message from unauthorized chat ' + chatId);
       return res.status(200).json({ ok: true });
     }
+    console.log('WEBHOOK: message received:', rawText.substring(0, 50));   // #642 moved after the chat check
 
     // Step 4: implicit cancel — if a delete is armed and this message is NOT the
     // confirmation, cancel it BEFORE normal routing so other commands still work.
@@ -33465,6 +33647,11 @@ app.post('/telegram-webhook', async (req, res) => {
     }
     if (/^share(\s|$)/.test(commandText)) {   // #S1 share feed controls
       await handleShareCommand(commandText.replace(/^share\s*/, '').trim(), rawText.replace(/^\/?share\s*/i, '').trim(), sendReply).catch(async (e) => { await sendReply('\u274c Share: ' + escTg(e.message)); });
+      return res.status(200).json({ ok: true });
+    }
+    if (commandText === 'confirms') {   // #642 Fable B2: re-send every connector change still waiting for Confirm, with its buttons
+      const n = await mcpConfirmsResend().catch(e => { console.error('[mcp] #642 /confirms:', e.message); return -1; });
+      await sendReply(n > 0 ? '🔐 ' + n + ' change(s) waiting - sent again above, each with its Confirm button.' : n === 0 ? 'Nothing is waiting for your Confirm.' : '⚠️ The waiting changes could not be read.');
       return res.status(200).json({ ok: true });
     }
     if (commandText === 'brief') {
