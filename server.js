@@ -20687,7 +20687,9 @@ async function checkPortfolio() {
         ).catch(() => [[]]);
         if (recentTargetRows.length > 0) {
           console.log(`[target] ${symbol} — alert sent/acked within 24h, skipping`);
-          alertState.acknowledged.add(symbol); // restore in-memory ack silently
+          // #644 (PM #241, health #237/#244): this used to add the whole COIN to acknowledged, so a coin sitting near a target
+          // that fired in the last 24 h was re-muted on every pass (AST at its 0.0050 floor, 17 Oct, straight after Bryan unmuted
+          // it) - every other alert silenced while its loop could still sell. Only this target is skipped now (#566).
           continue;
         }
 
@@ -20818,8 +20820,7 @@ async function checkPortfolio() {
         ).catch(() => [[]]);
         if (recentTargetRowsDown.length > 0) {
           console.log(`[target] ${symbol} — floor alert sent/acked within 24h, skipping`);
-          alertState.acknowledged.add(symbol);
-          continue;
+          continue;   // #644 this target only - the coin is no longer muted as a whole
         }
 
         // #150: after 3 reminders go QUIET only -- never delete the target, never 24h-mute. Rung stays live.
@@ -26191,7 +26192,7 @@ let rows, dailyFrom = null;
   server.tool('manage_alerts',
     'Set or manage all alert types — fixed price targets, daily thresholds, trailing stops, acknowledge, ignore or unignore coins',
     {
-      action:        z.enum(['set_target','set_threshold','set_trailing','acknowledge','ignore','unignore','remove_trailing','remove_target','remove_threshold','clear_cooldown','set_trough','remove_trough','list_pending','batch_resolve','restore_targets']).describe('What alert action to perform. restore_targets (#565): put back targets this tool deleted (the last 30 per coin, 30 days) - all of the coin\'s, or only the one at target_price'),
+      action:        z.enum(['set_target','set_threshold','set_trailing','acknowledge','ignore','unignore','remove_trailing','remove_target','remove_threshold','clear_cooldown','set_trough','remove_trough','list_pending','batch_resolve','restore_targets','unacknowledge']).describe('What alert action to perform. unacknowledge (#644) = unignore: clears a session mute and a permanent ignore. restore_targets (#565): put back targets this tool deleted (the last 30 per coin, 30 days) - all of the coin\'s, or only the one at target_price'),
       symbol:        z.string().optional().describe('Trading pair e.g. NEAR-USD or NEAR (omit for list_pending and batch_resolve)'),
       direction:     z.enum(['up', 'down']).optional().describe('Alert direction for set_target'),
       threshold_pct: z.coerce.number().optional().describe('Percentage for set_target or set_threshold'),
@@ -26300,7 +26301,7 @@ let rows, dailyFrom = null;
         await ignoreCoin(sym);
         result = { ok: true, action: 'ignore', symbol: sym, message: `${coinBase} permanently ignored` };
 
-      } else if (action === 'unignore') {
+      } else if (action === 'unignore' || action === 'unacknowledge') {   // #644 unacknowledge is the same: clears both kinds of mute
         await resumeAlerts(sym);
         result = { ok: true, action: 'unignore', symbol: sym, message: `${coinBase} alerts re-enabled — removed from ignored list` };
 
