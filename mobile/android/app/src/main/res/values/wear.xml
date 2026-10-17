@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- desk #59: the watch app finds this phone app by this capability to ask for the key (WatchListener) -->
+<resources xmlns:tools="http://schemas.android.com/tools" tools:keep="@array/android_wear_capabilities">
+    <string-array name="android_wear_capabilities">
+        <item>rx_phone</item>
+    </string-array>
+</resources>

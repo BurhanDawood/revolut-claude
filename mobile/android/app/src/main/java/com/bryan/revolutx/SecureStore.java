@@ -14,6 +14,8 @@ final class SecureStore {
     static final String KEY = "key";
     static final String BASE = "base";
     static final String PUSH_TOKEN = "push_token";
+    static final String WATCH_KEY = "watch_key";     // desk #59 W7: the server's watch-only token, for the watch (never the dashboard key)
+    static final String WATCH_NONE = "watch_none";   // true: the server said it has no watch token (the watch is cleared)
 
     private static final String FILE = "rx_secure";
     private static SharedPreferences prefs;
@@ -50,6 +52,20 @@ final class SecureStore {
 
     static String key(Context ctx) {
         return get(ctx).getString(KEY, null);
+    }
+
+    /**
+     * Desk #59: the last resort when a write that removes a key fails (commit() returns false, it does not throw): the whole
+     * file goes, so no old key can be read back. The shell hands the dashboard key over again on its next start.
+     */
+    static synchronized void reset(Context ctx) {
+        Context app = ctx.getApplicationContext();
+        app.deleteSharedPreferences(FILE);
+        prefs = null;
+    }
+
+    static String watchKey(Context ctx) {
+        return get(ctx).getString(WATCH_KEY, null);
     }
 
     /** The saved base, or the app's own server. Only https on the app's own host is accepted. */

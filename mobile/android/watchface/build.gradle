@@ -1,0 +1,39 @@
+apply plugin: 'com.android.application'
+
+// Desk #59 part 3: the Revolut X watch face, Watch Face Format v1. A WFF face must be a package with no code, so it is its own
+// small APK (com.bryan.revolutx.watchface) next to the watch app; it is signed with the same key. Nothing secret is in it.
+def keystorePath = System.getenv('ANDROID_KEYSTORE_FILE')
+def canSign = keystorePath && file(keystorePath).exists()
+
+android {
+    namespace = "com.bryan.revolutx.watchface"
+    compileSdk = rootProject.ext.compileSdkVersion
+    defaultConfig {
+        applicationId "com.bryan.revolutx.watchface"
+        minSdkVersion 33   // WFF v1: Wear OS 4+
+        targetSdkVersion rootProject.ext.targetSdkVersion
+        versionCode((System.getenv('VERSION_CODE') ?: '1') as Integer)
+        versionName "1.0." + (System.getenv('VERSION_CODE') ?: '0')
+    }
+    buildFeatures {
+        buildConfig false
+    }
+    signingConfigs {
+        if (canSign) {
+            release {
+                storeFile file(keystorePath)
+                storePassword System.getenv('ANDROID_KEYSTORE_PASSWORD')
+                keyAlias System.getenv('ANDROID_KEY_ALIAS')
+                keyPassword System.getenv('ANDROID_KEY_PASSWORD')
+            }
+        }
+    }
+    buildTypes {
+        release {
+            // R8 with nothing to keep: the face is resources only, so the R class is dropped and the APK carries no classes.dex
+            // (app-v17's face still had one, with only R in it, although hasCode is false). CI fails if a dex comes back.
+            minifyEnabled true
+            if (canSign) signingConfig signingConfigs.release
+        }
+    }
+}
