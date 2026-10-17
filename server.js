@@ -24318,7 +24318,12 @@ async function handleMcpConfirmButton(idStr, choice, reply) {
   } catch (e) { out = 'error: ' + e.message; }
   await db.execute('UPDATE mcp_confirms SET status = ?, result = ? WHERE id = ?', [status, String(out).slice(0, 600), id]).catch(() => {});
   console.log('[mcp] #642 #' + id + ' ' + row.tool + ' confirmed by Bryan: ' + status);
-  await reply((status === 'done' ? '✅ Done (#' + id + '): ' : '⚠️ Failed (#' + id + '): ') + escTg(row.summary) + '\n' + escTg(String(out).slice(0, 300)));
+  // #643 (Bryan 17 Oct 13:34 "Dont need to see the code in Telegram reply"): one plain line. The tool's own Telegram message (e.g. LOOP
+  // ENABLED) already says what changed; the raw result stays in mcp_confirms.result. A failure gives only the error's message.
+  let why = '';
+  if (status !== 'done') { why = String(out).replace(/^error:\s*/, ''); try { const j = JSON.parse(why); why = j.error || j.message || why; } catch (e) { /* plain text */ } }
+  else { try { const j = JSON.parse(out); if (j && (j.error || j.ok === false)) { status = 'failed'; why = String(j.error || j.message || 'not applied'); await db.execute('UPDATE mcp_confirms SET status = ? WHERE id = ?', ['failed', id]).catch(() => {}); } } catch (e) { /* not JSON */ } }
+  await reply(status === 'done' ? '✅ Done (#' + id + '): ' + escTg(row.summary) + '.' : '⚠️ Not applied (#' + id + '): ' + escTg(row.summary) + ' - ' + escTg(String(why).slice(0, 160)));
 }
 function createMcpServer() {
   const server = new McpServer({ name: 'revolut-x', version: '1.0.0' });
