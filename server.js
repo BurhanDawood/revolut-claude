@@ -22990,6 +22990,36 @@ cron.schedule('15 2 * * *', async () => {
   } catch (e) { console.error('[intraday] prune error:', e.message); }
 }, { timezone: 'Europe/London' });
 
+// #645 (13 Oct system check, data; Bryan 19 Oct 21:10 "Yes to the limits"): the two tables that grew with no limit.
+// price_intraday_hourly keeps 365 days (Revolut's own hourly candles go back about a year, so a backfill never re-adds older
+// rows; daily candles stay in price_daily_ohlc for the long view). Its rows are not written in time order (the 02:05 rollup
+// and the candle backfills insert old hours with new ids), so it is trimmed per coin on its (symbol, hour_bucket) index,
+// 5000 rows at a time, not by id. abnormal_events keeps 90 days; its rows are written as they happen, so the by-id prune fits.
+// portfolio_value_1m already had a limit (PV_KEEP_1M_DAYS, 35 days, in the rollup) and is left as it is.
+const HOURLY_KEEP_DAYS = 365, ABN_KEEP_DAYS = 90;
+async function pruneHourlyBySymbol(days) {
+  const [syms] = await db.query('SELECT DISTINCT symbol FROM price_intraday_hourly');
+  const until = Date.now() + 10 * 60 * 1000;
+  let total = 0, coins = 0;
+  for (const { symbol } of syms) {
+    let n = 0;
+    for (;;) {
+      const [r] = await db.query('DELETE FROM price_intraday_hourly WHERE symbol = ? AND hour_bucket < DATE_SUB(NOW(), INTERVAL ? DAY) LIMIT 5000', [symbol, days]);
+      n += r.affectedRows;
+      if (r.affectedRows < 5000 || Date.now() > until || globalThis.__rxShutdown) break;
+      await new Promise(ok => setTimeout(ok, 200));
+    }
+    if (n) { total += n; coins++; }
+    if (Date.now() > until || globalThis.__rxShutdown) break;
+  }
+  if (total > 0) console.log('[hourly] #645 pruned ' + total + ' row(s) older than ' + days + 'd across ' + coins + ' coin(s)');
+  return total;
+}
+cron.schedule('25 2 * * *', async () => {
+  try { await pruneHourlyBySymbol(HOURLY_KEEP_DAYS); } catch (e) { console.error('[hourly] #645 prune error:', e.message); }
+  try { await pruneByIdTime('abnormal_events', 'event_at', ABN_KEEP_DAYS, 'abnormal'); } catch (e) { console.error('[abnormal] #645 prune error:', e.message); }
+}, { timezone: 'Europe/London' });
+
 // #P0 prune exec_decisions older than 180 days
 cron.schedule('20 2 * * *', async () => {
   try {
@@ -23084,7 +23114,7 @@ cron.schedule('10 9 * * 1', async () => {
 }, { timezone: 'Europe/London' });
 
 
-console.log('Cron jobs scheduled: midnight price recording + 9 AM morning briefing + every-2h macro news + Monday 9:05 rebalancing check + 9:15 AM research sweep + 10 AM intention outcomes + 10:05 AM rebalance checks + 10:10 AM trade outcome grading (#48) (Europe/London)');
+console.log('Cron jobs scheduled: midnight price recording + 9:15 AM daily brief + Monday 9:05 rebalancing check + 10 AM intention outcomes + 10:05 AM rebalance checks + 10:10 AM trade outcome grading (#48) (Europe/London)');   // #645 the old 9 AM briefing, 2-hourly macro news and 9:15 research sweep are off
 
 const app = express();
 app.use(cors());
