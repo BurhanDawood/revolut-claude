@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- the Tile picker's preview: a dark round card with the total line and the P&L line -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="192dp"
+    android:height="192dp"
+    android:viewportWidth="192"
+    android:viewportHeight="192">
+    <path android:fillColor="#FF000000" android:pathData="M96,0a96,96 0,1 1,0 192a96,96 0,1 1,0 -192z" />
+    <path android:fillColor="#FF9A9A9A" android:pathData="M76,44h40v6h-40z" />
+    <path android:fillColor="#FFFFFFFF" android:pathData="M46,62h100v16h-100z" />
+    <path android:fillColor="#FF00C896" android:pathData="M60,86h72v10h-72z" />
+    <path android:fillColor="#FF00C896" android:pathData="M44,106h30v8h-30z" />
+    <path android:fillColor="#FFFF4D6A" android:pathData="M81,106h30v8h-30z" />
+    <path android:fillColor="#FF00C896" android:pathData="M118,106h30v8h-30z" />
+    <path android:fillColor="#FF00FFC8" android:pathData="M66,124h60v6h-60z" />
+    <path android:fillColor="#FF1F2A28" android:pathData="M58,146h76v20h-76z" />
+</vector>

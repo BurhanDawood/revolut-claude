@@ -1,0 +1,306 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Desk #59: the Revolut X watch app. Read-only: its one server call is GET /api/watch (Repo). -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-feature android:name="android.hardware.type.watch" />
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- desk #59 (15 Oct): the Rip alarm, rung on the watch -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <application
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@android:style/Theme.DeviceDefault">
+
+        <uses-library
+            android:name="com.google.android.wearable"
+            android:required="false" />
+        <!-- needs the phone app: the key comes from it -->
+        <meta-data
+            android:name="com.google.android.wearable.standalone"
+            android:value="false" />
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:taskAffinity="">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- the Tile's "Open on phone" (started by the Tile renderer, so exported); it only opens the phone app -->
+        <activity
+            android:name=".OpenOnPhoneActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+        <!-- W1/W2: the phone app's key handover. The Data Layer only delivers it from this package with this signing key. -->
+        <service
+            android:name=".KeyListener"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.google.android.gms.wearable.MESSAGE_RECEIVED" />
+                <data android:scheme="wear" android:host="*" android:pathPrefix="/rx/watch" />
+            </intent-filter>
+            <!-- desk #59 (15 Oct): the phone's Rip alarm tone arrives on a channel -->
+            <intent-filter>
+                <action android:name="com.google.android.gms.wearable.CHANNEL_EVENT" />
+                <data android:scheme="wear" android:host="*" android:pathPrefix="/rx/watch/sound" />
+            </intent-filter>
+        </service>
+
+        <!-- desk #59 (15 Oct 13:20): the face's flashing Rip alarm icon, 60 min after an alarm; no data otherwise -->
+        <service
+            android:name=".RipComplication"
+            android:exported="true"
+            android:icon="@drawable/ic_stat_rx"
+            android:label="@string/c_rip"
+            android:permission="com.google.android.wearable.permission.BIND_COMPLICATION_PROVIDER">
+            <intent-filter>
+                <action android:name="android.support.wearable.complications.ACTION_COMPLICATION_UPDATE_REQUEST" />
+            </intent-filter>
+            <meta-data android:name="android.support.wearable.complications.SUPPORTED_TYPES" android:value="SMALL_IMAGE,SHORT_TEXT" />
+            <meta-data android:name="android.support.wearable.complications.UPDATE_PERIOD_SECONDS" android:value="0" />
+            <meta-data android:name="android.support.wearable.complications.SAFE_WATCH_FACES" android:value="com.bryan.revolutx.watchface" />
+        </service>
+        <receiver
+            android:name=".RipState$Expire"
+            android:exported="false" />
+
+        <!-- desk #59 (15 Oct): the Rip alarm rung on the watch - at most 30 s, so a short foreground service -->
+        <service
+            android:name=".RipRing"
+            android:exported="false"
+            android:foregroundServiceType="shortService" />
+        <receiver
+            android:name=".RipRing$Stop"
+            android:exported="false" />
+        <activity
+            android:name=".RipAlarmActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:showWhenLocked="true"
+            android:turnScreenOn="true"
+            android:taskAffinity="" />
+
+        <!-- the Tiles (desk #59, 13 Oct 23:45): each its own, so Bryan adds, removes and orders them. Portfolio keeps the
+             first Tile's class so a placed Tile stays. -->
+        <service
+            android:name=".RxTileService"
+            android:exported="true"
+            android:label="@string/t_portfolio"
+            android:permission="com.google.android.wearable.permission.BIND_TILE_PROVIDER">
+            <intent-filter>
+                <action android:name="androidx.wear.tiles.action.BIND_TILE_PROVIDER" />
+            </intent-filter>
+            <meta-data
+                android:name="androidx.wear.tiles.PREVIEW"
+                android:resource="@drawable/tile_preview" />
+        </service>
+
+        <service
+            android:name=".CoinTile1"
+            android:exported="true"
+            android:label="@string/t_coin1"
+            android:permission="com.google.android.wearable.permission.BIND_TILE_PROVIDER">
+            <intent-filter>
+                <action android:name="androidx.wear.tiles.action.BIND_TILE_PROVIDER" />
+            </intent-filter>
+            <meta-data
+                android:name="androidx.wear.tiles.PREVIEW"
+                android:resource="@drawable/tile_preview" />
+        </service>
+        <service
+            android:name=".CoinTile2"
+            android:exported="true"
+            android:label="@string/t_coin2"
+            android:permission="com.google.android.wearable.permission.BIND_TILE_PROVIDER">
+            <intent-filter>
+                <action android:name="androidx.wear.tiles.action.BIND_TILE_PROVIDER" />
+            </intent-filter>
+            <meta-data
+                android:name="androidx.wear.tiles.PREVIEW"
+                android:resource="@drawable/tile_preview" />
+        </service>
+        <service
+            android:name=".CoinTile3"
+            android:exported="true"
+            android:label="@string/t_coin3"
+            android:permission="com.google.android.wearable.permission.BIND_TILE_PROVIDER">
+            <intent-filter>
+                <action android:name="androidx.wear.tiles.action.BIND_TILE_PROVIDER" />
+            </intent-filter>
+            <meta-data
+                android:name="androidx.wear.tiles.PREVIEW"
+                android:resource="@drawable/tile_preview" />
+        </service>
+        <service
+            android:name=".MoversTileService"
+            android:exported="true"
+            android:label="@string/t_movers"
+            android:permission="com.google.android.wearable.permission.BIND_TILE_PROVIDER">
+            <intent-filter>
+                <action android:name="androidx.wear.tiles.action.BIND_TILE_PROVIDER" />
+            </intent-filter>
+            <meta-data
+                android:name="androidx.wear.tiles.PREVIEW"
+                android:resource="@drawable/tile_preview" />
+        </service>
+        <service
+            android:name=".NotesTileService"
+            android:exported="true"
+            android:label="@string/t_notes"
+            android:permission="com.google.android.wearable.permission.BIND_TILE_PROVIDER">
+            <intent-filter>
+                <action android:name="androidx.wear.tiles.action.BIND_TILE_PROVIDER" />
+            </intent-filter>
+            <meta-data
+                android:name="androidx.wear.tiles.PREVIEW"
+                android:resource="@drawable/tile_preview" />
+        </service>
+
+        <!-- one coin, opened from a Coin or Top movers Tile (started by the Tile renderer, so exported); read-only -->
+        <activity
+            android:name=".CoinActivity"
+            android:exported="true"
+            android:taskAffinity="" />
+
+        <!-- PM notes, read-only, opened from the PM notes Tile (started by the Tile renderer, so exported) -->
+        <activity
+            android:name=".NotesActivity"
+            android:exported="true"
+            android:taskAffinity="" />
+
+        <!-- "Tile coins": the Coin Tiles' picks, saved on the watch only (opened from an empty Coin Tile, so exported) -->
+        <activity
+            android:name=".TileCoinsActivity"
+            android:exported="true"
+            android:taskAffinity="" />
+
+        <!-- complication data sources (numbers only). 300 s is Wear OS's floor for a complication's own updates. -->
+        <service
+            android:name=".TotalComplication"
+            android:exported="true"
+            android:icon="@drawable/ic_stat_rx"
+            android:label="@string/c_total"
+            android:permission="com.google.android.wearable.permission.BIND_COMPLICATION_PROVIDER">
+            <intent-filter>
+                <action android:name="android.support.wearable.complications.ACTION_COMPLICATION_UPDATE_REQUEST" />
+            </intent-filter>
+            <meta-data android:name="android.support.wearable.complications.SUPPORTED_TYPES" android:value="SHORT_TEXT" />
+            <meta-data android:name="android.support.wearable.complications.UPDATE_PERIOD_SECONDS" android:value="300" />
+        </service>
+        <service
+            android:name=".PnlComplication"
+            android:exported="true"
+            android:icon="@drawable/ic_stat_rx"
+            android:label="@string/c_pnl"
+            android:permission="com.google.android.wearable.permission.BIND_COMPLICATION_PROVIDER">
+            <intent-filter>
+                <action android:name="android.support.wearable.complications.ACTION_COMPLICATION_UPDATE_REQUEST" />
+            </intent-filter>
+            <meta-data android:name="android.support.wearable.complications.SUPPORTED_TYPES" android:value="RANGED_VALUE,SHORT_TEXT" />
+            <meta-data android:name="android.support.wearable.complications.UPDATE_PERIOD_SECONDS" android:value="300" />
+        </service>
+        <service
+            android:name=".NotesComplication"
+            android:exported="true"
+            android:icon="@drawable/ic_stat_rx"
+            android:label="@string/c_notes"
+            android:permission="com.google.android.wearable.permission.BIND_COMPLICATION_PROVIDER">
+            <intent-filter>
+                <action android:name="android.support.wearable.complications.ACTION_COMPLICATION_UPDATE_REQUEST" />
+            </intent-filter>
+            <meta-data android:name="android.support.wearable.complications.SUPPORTED_TYPES" android:value="SHORT_TEXT" />
+            <meta-data android:name="android.support.wearable.complications.UPDATE_PERIOD_SECONDS" android:value="300" />
+            <meta-data android:name="android.support.wearable.complications.SAFE_WATCH_FACES" android:value="com.bryan.revolutx.watchface" />
+        </service>
+        <service
+            android:name=".MoverComplication"
+            android:exported="true"
+            android:icon="@drawable/ic_stat_rx"
+            android:label="@string/c_mover"
+            android:permission="com.google.android.wearable.permission.BIND_COMPLICATION_PROVIDER">
+            <intent-filter>
+                <action android:name="android.support.wearable.complications.ACTION_COMPLICATION_UPDATE_REQUEST" />
+            </intent-filter>
+            <meta-data android:name="android.support.wearable.complications.SUPPORTED_TYPES" android:value="SHORT_TEXT,RANGED_VALUE" />
+            <meta-data android:name="android.support.wearable.complications.UPDATE_PERIOD_SECONDS" android:value="300" />
+        </service>
+
+        <!-- the Revolut X face's own sources (desk #59, 13 Oct 23:20): the card image, where its pulsing dot goes, the always-on
+             total. SAFE_WATCH_FACES names the face's package so it gets their data without a permission prompt. -->
+        <!-- the card: total, 6 h line, change -->
+        <service
+            android:name=".CardComplication"
+            android:exported="true"
+            android:icon="@drawable/ic_stat_rx"
+            android:label="@string/c_card"
+            android:permission="com.google.android.wearable.permission.BIND_COMPLICATION_PROVIDER">
+            <intent-filter>
+                <action android:name="android.support.wearable.complications.ACTION_COMPLICATION_UPDATE_REQUEST" />
+            </intent-filter>
+            <!-- the manifest uses the old type names: LARGE_IMAGE is PHOTO_IMAGE -->
+            <meta-data android:name="android.support.wearable.complications.SUPPORTED_TYPES" android:value="LARGE_IMAGE" />
+            <meta-data android:name="android.support.wearable.complications.UPDATE_PERIOD_SECONDS" android:value="300" />
+            <meta-data android:name="android.support.wearable.complications.SAFE_WATCH_FACES" android:value="com.bryan.revolutx.watchface" />
+        </service>
+        <!-- the band in outline for always-on -->
+        <service
+            android:name=".AmbientCardComplication"
+            android:exported="true"
+            android:icon="@drawable/ic_stat_rx"
+            android:label="@string/c_cardambient"
+            android:permission="com.google.android.wearable.permission.BIND_COMPLICATION_PROVIDER">
+            <intent-filter>
+                <action android:name="android.support.wearable.complications.ACTION_COMPLICATION_UPDATE_REQUEST" />
+            </intent-filter>
+            <meta-data android:name="android.support.wearable.complications.SUPPORTED_TYPES" android:value="LARGE_IMAGE" />
+            <meta-data android:name="android.support.wearable.complications.UPDATE_PERIOD_SECONDS" android:value="300" />
+            <meta-data android:name="android.support.wearable.complications.SAFE_WATCH_FACES" android:value="com.bryan.revolutx.watchface" />
+        </service>
+        <!-- the line's last point (height and direction) -->
+        <service
+            android:name=".DotComplication"
+            android:exported="true"
+            android:icon="@drawable/ic_stat_rx"
+            android:label="@string/c_dot"
+            android:permission="com.google.android.wearable.permission.BIND_COMPLICATION_PROVIDER">
+            <intent-filter>
+                <action android:name="android.support.wearable.complications.ACTION_COMPLICATION_UPDATE_REQUEST" />
+            </intent-filter>
+            <meta-data android:name="android.support.wearable.complications.SUPPORTED_TYPES" android:value="RANGED_VALUE" />
+            <meta-data android:name="android.support.wearable.complications.UPDATE_PERIOD_SECONDS" android:value="300" />
+            <meta-data android:name="android.support.wearable.complications.SAFE_WATCH_FACES" android:value="com.bryan.revolutx.watchface" />
+        </service>
+        <!-- "$4,863" + ".98" -->
+        <service
+            android:name=".FaceTotalComplication"
+            android:exported="true"
+            android:icon="@drawable/ic_stat_rx"
+            android:label="@string/c_facetotal"
+            android:permission="com.google.android.wearable.permission.BIND_COMPLICATION_PROVIDER">
+            <intent-filter>
+                <action android:name="android.support.wearable.complications.ACTION_COMPLICATION_UPDATE_REQUEST" />
+            </intent-filter>
+            <meta-data android:name="android.support.wearable.complications.SUPPORTED_TYPES" android:value="SHORT_TEXT" />
+            <meta-data android:name="android.support.wearable.complications.UPDATE_PERIOD_SECONDS" android:value="300" />
+            <meta-data android:name="android.support.wearable.complications.SAFE_WATCH_FACES" android:value="com.bryan.revolutx.watchface" />
+        </service>
+    </application>
+</manifest>

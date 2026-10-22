@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Desk #59 part 3: a Watch Face Format face. Resources only (no code, no permissions): the watch's own WFF renderer draws
+     res/raw/watchface.xml and fills its slots from the Revolut X watch app's complication data sources. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-feature android:name="android.hardware.type.watch" />
+
+    <application
+        android:hasCode="false"
+        android:label="@string/app_name">
+        <property
+            android:name="com.google.wear.watchface.format.version"
+            android:value="1" />
+        <property
+            android:name="com.google.wear.watchface.format.publisher"
+            android:value="Revolut X" />
+    </application>
+</manifest>

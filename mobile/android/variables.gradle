@@ -17,4 +17,5 @@ ext {
     androidxSecurityCryptoVersion = '1.0.0'
     androidxWorkVersion = '2.10.0'
     firebaseMessagingVersion = '25.0.1'
+    playServicesWearableVersion = '18.2.0'
 }
