@@ -22874,6 +22874,263 @@ function parseFredCsv(text, sinceDay = '') {
   }
   return out;
 }
+// #648 (desk #74, Bryan 28 Oct 22:40 "I want canton tool"): Canton network tracker. RECORDS ONLY - nothing reads it to trade,
+// and no loop, alert, rule or order uses it. Source: Canton's public Scan API (no key, no cost), asked of up to 3 Super Validator
+// scans and cross-checked. Each snapshot stores the CC total supply and every validator's CUMULATIVE CC spent on traffic (that CC
+// is burned). Daily figures come from the change between two snapshots, scaled to 24 h:
+//   burned = change in total traffic CC; net = change in supply; minted = net + burned; burn/mint % = burned / minted.
+// Caveats (shown by the tool): holding fees on expired coins also burn a little and are not in "burned"; the validator list is the top
+// CANTON.top_limit by traffic, so the long tail is missing. A DTCC-named validator's purchase count going up between snapshots = a top-up.
+const CANTON = { seed: 'https://scan.sv-1.global.canton.network.sync.global/api/scan', scans_max: 3, timeout_ms: 15000, top_limit: 1000,
+  match: /dtc/i, min_gap_h: 12, alert: { cross_pct: 100, cadence_x: 2, burn7_vs30: 0.5, min_days_7v30: 14, min_events_cadence: 3 } };
+let _cantonTables = null, _cantonRunning = false;
+function cantonTables() {
+  if (!_cantonTables) _cantonTables = (async () => {
+    await db.execute(`CREATE TABLE IF NOT EXISTS canton_daily (
+      d DATE NOT NULL PRIMARY KEY,
+      taken_at DATETIME NOT NULL,
+      round_no BIGINT NULL,
+      total_supply DECIMAL(28,6) NULL,
+      traffic_cc_total DECIMAL(28,6) NULL,
+      traffic_purchases BIGINT NULL,
+      validators INT NULL,
+      hours_since_prev DECIMAL(8,2) NULL,
+      minted_cc DECIMAL(28,6) NULL,
+      burned_cc DECIMAL(28,6) NULL,
+      net_cc DECIMAL(28,6) NULL,
+      burn_mint_pct DECIMAL(10,2) NULL,
+      dtcc JSON NULL,
+      top JSON NULL,
+      sources JSON NULL
+    )`);
+    await db.execute(`CREATE TABLE IF NOT EXISTS canton_validator_events (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      validator VARCHAR(255) NOT NULL,
+      d DATE NOT NULL,
+      seen_at DATETIME NOT NULL,
+      purchases INT NOT NULL,
+      cc_burned DECIMAL(28,6) NOT NULL,
+      traffic_bytes BIGINT NULL,
+      last_round BIGINT NULL,
+      days_since_prev DECIMAL(8,2) NULL,
+      UNIQUE KEY uq_canton_ev (validator, d)
+    )`);
+  })().catch(e => { _cantonTables = null; throw e; });
+  return _cantonTables;
+}
+async function cantonFetch(base, path, body) {
+  const r = await fetch(base + path, { method: body ? 'POST' : 'GET', signal: AbortSignal.timeout(CANTON.timeout_ms),
+    headers: { Accept: 'application/json', 'User-Agent': 'revx-canton/1', ...(body ? { 'Content-Type': 'application/json' } : {}) },
+    ...(body ? { body: JSON.stringify(body) } : {}) });
+  const t = await r.text();
+  if (!r.ok) throw new Error('HTTP ' + r.status + ' ' + t.slice(0, 160));
+  try { return JSON.parse(t); } catch (e) { throw new Error('not JSON: ' + t.slice(0, 120)); }
+}
+function cantonBase(u) {   // a scan's publicUrl may or may not carry /api/scan
+  const s = String(u || '').trim().replace(/\/+$/, '');
+  if (!/^https:\/\/[a-z0-9.-]+(\/|$)/i.test(s)) return null;
+  return /\/api\/scan$/.test(s) ? s : s + '/api/scan';
+}
+function cantonNum(x) { const n = Number(x); return Number.isFinite(n) ? n : null; }
+// Parsers are pure so the tests can feed them recorded answers.
+function cantonParseScans(j) {
+  const out = [];
+  for (const g of (j && j.scans) || []) for (const s of (g && g.scans) || []) { const b = cantonBase(s && s.publicUrl); if (b) out.push({ base: b, sv: String((s && s.svName) || '').slice(0, 60) }); }
+  return out;
+}
+function cantonParseRounds(j) {   // the newest round number anywhere in the open/issuing answer, or the aggregated range end
+  if (j && j.end != null && cantonNum(j.end) != null) return cantonNum(j.end);
+  let best = null; const re = /"number"\s*:\s*"?(\d+)"?/g, t = JSON.stringify(j || {}); let m;
+  while ((m = re.exec(t))) { const n = Number(m[1]); if (best == null || n > best) best = n; }
+  return best;
+}
+function cantonParseTop(j) {
+  const list = (j && (j.validatorsByPurchasedTraffic || j.validators_by_purchased_traffic)) || null;
+  if (!Array.isArray(list)) throw new Error('no validatorsByPurchasedTraffic in the answer');
+  return list.map(v => ({ validator: String(v.validator || '').slice(0, 255), purchases: cantonNum(v.numPurchases) || 0,
+    bytes: cantonNum(v.totalTrafficPurchased), cc: cantonNum(v.totalCcSpent) || 0, last_round: cantonNum(v.lastPurchasedInRound) })).filter(v => v.validator);
+}
+function cantonParseSupply(j) {
+  const one = (x) => (x && (x.totalSupply != null ? cantonNum(x.totalSupply) : null));
+  if (one(j) != null) return one(j);
+  const list = (j && (j.instruments || j.items)) || [];
+  for (const x of list) if (/^(amulet|cc)$/i.test(String((x && (x.id || x.instrumentId)) || '')) && one(x) != null) return one(x);
+  return null;
+}
+function cantonAgree(vals) {   // values from several scans: the one most of them gave (within 0.01%), else the median; and whether they agreed
+  const v = vals.filter(x => x != null);
+  if (!v.length) return { value: null, agreed: 0, of: 0 };
+  let best = null, bestN = 0;
+  for (const a of v) { const n = v.filter(b => Math.abs(a - b) <= Math.abs(a) * 1e-4).length; if (n > bestN) { best = a; bestN = n; } }
+  if (bestN * 2 > v.length) return { value: best, agreed: bestN, of: v.length };
+  const s = v.slice().sort((a, b) => a - b); return { value: s[Math.floor(s.length / 2)], agreed: bestN, of: v.length };
+}
+// Daily figures between two snapshots, scaled to 24 h. Pure.
+function cantonDerive(prev, cur) {
+  if (!prev || !cur) return null;
+  const h = (new Date(cur.taken_at).getTime() - new Date(prev.taken_at).getTime()) / 3600000;
+  if (!(h >= CANTON.min_gap_h)) return null;
+  const k = 24 / h, out = { hours_since_prev: Number(h.toFixed(2)), burned_cc: null, net_cc: null, minted_cc: null, burn_mint_pct: null };
+  if (cur.traffic_cc_total != null && prev.traffic_cc_total != null) out.burned_cc = (cur.traffic_cc_total - prev.traffic_cc_total) * k;
+  if (cur.total_supply != null && prev.total_supply != null) out.net_cc = (cur.total_supply - prev.total_supply) * k;
+  if (out.burned_cc != null && out.net_cc != null) out.minted_cc = out.net_cc + out.burned_cc;
+  if (out.minted_cc > 0 && out.burned_cc != null) out.burn_mint_pct = Number((out.burned_cc / out.minted_cc * 100).toFixed(2));
+  if (out.burned_cc != null && out.burned_cc < 0) out.burned_cc = null;   // a scan that lists fewer validators than last time: unknown, not negative
+  return out;
+}
+function cantonDtccEvents(prevDtcc, curDtcc) {   // top-ups between two snapshots for DTCC-named validators. Pure.
+  const before = new Map((prevDtcc || []).map(v => [v.validator, v])), ev = [];
+  for (const v of curDtcc || []) {
+    const p = before.get(v.validator);
+    if (!p) continue;   // first sighting: a baseline, not a top-up
+    if (v.purchases > p.purchases && v.cc >= p.cc) ev.push({ validator: v.validator, purchases: v.purchases - p.purchases, cc_burned: v.cc - p.cc,
+      traffic_bytes: v.bytes != null && p.bytes != null ? v.bytes - p.bytes : null, last_round: v.last_round });
+  }
+  return ev;
+}
+// Material-change checks over stored rows (oldest first). Returns lines to report; state stops repeats. Pure.
+function cantonChecks(rows, events, state) {
+  const st = { ...(state || {}) }, lines = [], A = CANTON.alert;
+  const sum = (a, f) => a.reduce((s, r) => s + (Number(r[f]) || 0), 0);
+  const withRates = rows.filter(r => r.burned_cc != null && r.minted_cc != null);
+  if (withRates.length >= 7) {
+    const w = withRates.slice(-7), b = sum(w, 'burned_cc'), m = sum(w, 'minted_cc'), pct = m > 0 ? b / m * 100 : null;
+    if (pct != null) {
+      const side = pct >= A.cross_pct ? 'above' : 'below';
+      if (st.bm_side && st.bm_side !== side) lines.push('7-day burn/mint is now ' + pct.toFixed(0) + '% (' + (side === 'above' ? 'burning MORE CC than is minted - supply shrinking' : 'back under 100% - supply growing again') + ').');
+      st.bm_side = side;
+    }
+  }
+  const burns = rows.filter(r => r.burned_cc != null);
+  if (burns.length >= A.min_days_7v30) {
+    const b7 = sum(burns.slice(-7), 'burned_cc') / Math.min(7, burns.length), b30 = sum(burns.slice(-30), 'burned_cc') / Math.min(30, burns.length);
+    const band = b30 > 0 ? (b7 >= b30 * (1 + A.burn7_vs30) ? 'high' : b7 <= b30 * (1 - A.burn7_vs30) ? 'low' : 'normal') : 'normal';
+    if (band !== 'normal' && st.burn_band !== band) lines.push('7-day average burn ' + Math.round(b7).toLocaleString('en-GB') + ' CC/day is ' + (band === 'high' ? 'more than 50% above' : 'more than 50% below') + ' the 30-day average (' + Math.round(b30).toLocaleString('en-GB') + ').');
+    st.burn_band = band;
+  }
+  const byV = new Map();
+  for (const e of events || []) { if (!byV.has(e.validator)) byV.set(e.validator, []); byV.get(e.validator).push(e); }
+  st.cadence = { ...(st.cadence || {}) };
+  for (const [v, list] of byV) {
+    const gaps = list.map(e => Number(e.days_since_prev)).filter(g => g > 0);
+    if (gaps.length < A.min_events_cadence) continue;
+    const last = gaps[gaps.length - 1], prior = gaps.slice(0, -1).sort((a, b) => a - b), med = prior[Math.floor(prior.length / 2)];
+    const tag = med > 0 ? (last <= med / A.cadence_x ? 'faster' : last >= med * A.cadence_x ? 'slower' : 'normal') : 'normal';
+    const key = v + '|' + list[list.length - 1].d;
+    if (tag !== 'normal' && st.cadence[v] !== key) { lines.push(v.split('::')[0] + ' topped up after ' + last.toFixed(1) + ' days vs a usual ' + med.toFixed(1) + ' (' + tag + ').'); st.cadence[v] = key; }
+  }
+  return { lines, state: st };
+}
+async function cantonSnapshot({ reason = 'cron', force = false } = {}) {
+  if (_cantonRunning) return { ok: false, error: 'a snapshot is already running' };
+  _cantonRunning = true;
+  try {
+    await cantonTables();
+    const d = new Date().toLocaleDateString('en-CA', { timeZone: 'Europe/London' });
+    const [[have]] = await db.execute('SELECT d FROM canton_daily WHERE d = ?', [d]);
+    if (have && !force) return { ok: true, skipped: 'today (' + d + ') already has a snapshot' };
+    let bases = [{ base: CANTON.seed, sv: 'seed' }];
+    try { const more = cantonParseScans(await cantonFetch(CANTON.seed, '/v0/scans')).filter(s => s.base !== CANTON.seed); bases = bases.concat(more.slice(0, CANTON.scans_max - 1)); }
+    catch (e) { console.error('[canton] #648 scan list:', e.message); }
+    const per = [];
+    for (const s of bases) {
+      const r = { sv: s.sv, base: s.base };
+      try {
+        let round = null;
+        try { round = cantonParseRounds(await cantonFetch(s.base, '/v0/aggregated-rounds')); } catch (e) { r.agg_error = e.message.slice(0, 120); }
+        if (round == null) round = cantonParseRounds(await cantonFetch(s.base, '/v0/open-and-issuing-mining-rounds', { cached_open_mining_round_contract_ids: [], cached_issuing_round_contract_ids: [] }));
+        r.round = round;
+        if (round != null) {
+          let top = null;
+          for (const back of [0, 3, 10, 50]) { try { top = cantonParseTop(await cantonFetch(s.base, '/v0/top-validators-by-purchased-traffic?round=' + Math.max(0, round - back) + '&limit=' + CANTON.top_limit)); r.round_used = round - back; break; } catch (e) { r.top_error = e.message.slice(0, 120); } }
+          if (top) { r.top = top; r.traffic_cc_total = top.reduce((a, v) => a + v.cc, 0); r.purchases = top.reduce((a, v) => a + v.purchases, 0); delete r.top_error; }
+        }
+      } catch (e) { r.error = e.message.slice(0, 160); }
+      for (const p of ['/registry/metadata/v1/instruments/Amulet', '/registry/metadata/v1/instruments']) {
+        try { const v = cantonParseSupply(await cantonFetch(s.base, p)); if (v != null) { r.total_supply = v; break; } } catch (e) { r.supply_error = e.message.slice(0, 120); }
+      }
+      if (r.total_supply != null) delete r.supply_error;
+      per.push(r);
+    }
+    const sup = cantonAgree(per.map(p => p.total_supply)), traf = cantonAgree(per.map(p => p.traffic_cc_total));
+    const pick = per.find(p => p.top && p.traffic_cc_total != null && traf.value != null && Math.abs(p.traffic_cc_total - traf.value) <= Math.abs(traf.value) * 1e-4) || per.find(p => p.top);
+    if (sup.value == null && !pick) {
+      await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('canton_last_error', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)", [JSON.stringify({ at: new Date().toISOString(), reason, per: per.map(p => ({ sv: p.sv, error: p.error, agg_error: p.agg_error, top_error: p.top_error, supply_error: p.supply_error })) })]).catch(() => {});
+      console.error('[canton] #648 snapshot failed: no scan answered with supply or traffic');
+      return { ok: false, error: 'no scan answered', per: per.map(p => ({ sv: p.sv, error: p.error || p.top_error || p.supply_error })) };
+    }
+    const top = pick ? pick.top : [], dtcc = top.filter(v => CANTON.match.test(v.validator));
+    const cur = { taken_at: new Date(), total_supply: sup.value, traffic_cc_total: pick ? pick.traffic_cc_total : null };
+    const [[prev]] = await db.execute('SELECT d, taken_at, total_supply, traffic_cc_total, dtcc FROM canton_daily WHERE d < ? ORDER BY d DESC LIMIT 1', [d]);
+    const pv = prev ? { taken_at: prev.taken_at, total_supply: cantonNum(prev.total_supply), traffic_cc_total: cantonNum(prev.traffic_cc_total) } : null;
+    const der = cantonDerive(pv, cur) || {};
+    const sources = { reason, supply: sup, traffic: traf, scans: per.map(p => ({ sv: p.sv, round: p.round, round_used: p.round_used, supply: p.total_supply, traffic_cc_total: p.traffic_cc_total, validators: p.top ? p.top.length : null, error: p.error || p.top_error || p.supply_error || p.agg_error || undefined })) };
+    await db.execute('INSERT INTO canton_daily (d, taken_at, round_no, total_supply, traffic_cc_total, traffic_purchases, validators, hours_since_prev, minted_cc, burned_cc, net_cc, burn_mint_pct, dtcc, top, sources) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ' +
+      'ON DUPLICATE KEY UPDATE taken_at = VALUES(taken_at), round_no = VALUES(round_no), total_supply = VALUES(total_supply), traffic_cc_total = VALUES(traffic_cc_total), traffic_purchases = VALUES(traffic_purchases), validators = VALUES(validators), hours_since_prev = VALUES(hours_since_prev), minted_cc = VALUES(minted_cc), burned_cc = VALUES(burned_cc), net_cc = VALUES(net_cc), burn_mint_pct = VALUES(burn_mint_pct), dtcc = VALUES(dtcc), top = VALUES(top), sources = VALUES(sources)',
+      [d, cur.taken_at, pick ? (pick.round_used != null ? pick.round_used : pick.round) : null, sup.value, cur.traffic_cc_total, pick ? pick.purchases : null, top.length || null, der.hours_since_prev != null ? der.hours_since_prev : null,
+       der.minted_cc != null ? der.minted_cc : null, der.burned_cc != null ? der.burned_cc : null, der.net_cc != null ? der.net_cc : null, der.burn_mint_pct != null ? der.burn_mint_pct : null,
+       JSON.stringify(dtcc), JSON.stringify(top.slice(0, 10)), JSON.stringify(sources)]);
+    let prevD = []; try { prevD = prev && prev.dtcc ? (typeof prev.dtcc === 'string' ? JSON.parse(prev.dtcc) : prev.dtcc) : []; } catch (e) { prevD = []; }
+    const evs = cantonDtccEvents(prevD, dtcc);
+    for (const e of evs) {
+      const [[lastE]] = await db.execute('SELECT seen_at FROM canton_validator_events WHERE validator = ? AND d < ? ORDER BY d DESC LIMIT 1', [e.validator, d]);
+      const gap = lastE ? (cur.taken_at.getTime() - new Date(lastE.seen_at).getTime()) / 86400000 : null;
+      await db.execute('INSERT INTO canton_validator_events (validator, d, seen_at, purchases, cc_burned, traffic_bytes, last_round, days_since_prev) VALUES (?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE purchases = VALUES(purchases), cc_burned = VALUES(cc_burned), traffic_bytes = VALUES(traffic_bytes), last_round = VALUES(last_round)',
+        [e.validator, d, cur.taken_at, e.purchases, e.cc_burned, e.traffic_bytes, e.last_round, gap != null ? Number(gap.toFixed(2)) : null]);
+    }
+    // material changes only (desk #74): burn/mint crosses 100%, a DTCC top-up pace change of 2x+, 7-day burn ±50% vs 30-day
+    const [rows] = await db.execute('SELECT d, burned_cc, minted_cc FROM canton_daily WHERE d >= DATE_SUB(?, INTERVAL 40 DAY) ORDER BY d', [d]);
+    const [evRows] = await db.execute("SELECT validator, DATE_FORMAT(d, '%Y-%m-%d') AS d, days_since_prev FROM canton_validator_events WHERE d >= DATE_SUB(?, INTERVAL 180 DAY) ORDER BY d", [d]);
+    const [[stRow]] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'canton_state'");
+    let st0 = {}; try { st0 = stRow ? JSON.parse(stRow.config_value) : {}; } catch (e) { st0 = {}; }
+    const chk = cantonChecks(rows.map(r => ({ burned_cc: cantonNum(r.burned_cc), minted_cc: cantonNum(r.minted_cc) })), evRows, st0);
+    await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('canton_state', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)", [JSON.stringify(chk.state)]);
+    if (chk.lines.length) {
+      const body = chk.lines.map(l => '• ' + l).join('\n');
+      await teamWrite({ as: 'system', to: 'all', title: 'CANTON ' + d + ' — ' + chk.lines[0].slice(0, 90), note: body + '\n\nFrom the Canton tracker (#648; public Scan API, daily 00:20 London). Records only: nothing trades on it. get_canton_stats shows the detail.', coins: ['CC'] }).catch(e => console.error('[canton] #648 note:', e.message));
+      await sendTelegram('🌐 <b>Canton network</b> (#648)\n' + chk.lines.map(l => '• ' + escTg(l)).join('\n') + '\n<i>Records only - nothing trades on it.</i>').catch(() => {});
+    }
+    console.log('[canton] #648 snapshot ' + d + ' (' + reason + '): supply ' + (sup.value != null ? Math.round(sup.value) : '?') + ' (' + sup.agreed + '/' + sup.of + ' scans agree), traffic CC ' + (cur.traffic_cc_total != null ? Math.round(cur.traffic_cc_total) : '?') + ', ' + top.length + ' validators, ' + dtcc.length + ' DTCC-named, ' + evs.length + ' top-up(s)' + (der.burn_mint_pct != null ? ', burn/mint ' + der.burn_mint_pct + '%' : ''));
+    return { ok: true, d, supply: sup, traffic: traf, validators: top.length, dtcc: dtcc.length, topups: evs.length, derived: der, alerts: chk.lines };
+  } finally { _cantonRunning = false; }
+}
+async function cantonStats({ view = 'summary', days = 30 } = {}) {
+  await cantonTables();
+  const n = Math.max(1, Math.min(400, Math.round(Number(days) || 30)));
+  const method = 'Public Canton Scan API (no key, no cost), up to ' + CANTON.scans_max + ' Super Validator scans cross-checked, one snapshot a day at 00:20 London. burned = change in the validators\' cumulative CC spent on traffic; net = change in total CC supply; minted = net + burned; all scaled to 24 h. Not included: holding fees on expired coins (small) and validators outside the top ' + CANTON.top_limit + '. Records only: nothing trades on it.';
+  if (view === 'refresh') return cantonSnapshot({ reason: 'tool', force: false });
+  if (view === 'probe') {   // what the API actually answers, trimmed - for checking the parsers
+    const out = { seed: CANTON.seed }, cut = (x) => JSON.stringify(x).slice(0, 2500);
+    const tryIt = async (k, p, b) => { try { out[k] = cut(await cantonFetch(CANTON.seed, p, b)); } catch (e) { out[k] = 'ERROR ' + e.message; } };
+    await tryIt('scans', '/v0/scans');
+    await tryIt('aggregated_rounds', '/v0/aggregated-rounds');
+    await tryIt('open_rounds', '/v0/open-and-issuing-mining-rounds', { cached_open_mining_round_contract_ids: [], cached_issuing_round_contract_ids: [] });
+    let round = null; try { round = cantonParseRounds(await cantonFetch(CANTON.seed, '/v0/aggregated-rounds')); } catch (e) { /* shown above */ }
+    out.round_parsed = round;
+    if (round != null) await tryIt('top_validators', '/v0/top-validators-by-purchased-traffic?round=' + round + '&limit=5');
+    await tryIt('supply_amulet', '/registry/metadata/v1/instruments/Amulet');
+    const [[le]] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'canton_last_error'");
+    out.last_error = le ? le.config_value : null;
+    return out;
+  }
+  const [rows] = await db.execute("SELECT DATE_FORMAT(d, '%Y-%m-%d') AS d, taken_at, round_no, total_supply, traffic_cc_total, validators, hours_since_prev, minted_cc, burned_cc, net_cc, burn_mint_pct, dtcc" + (view === 'history' ? '' : ', sources') + ' FROM canton_daily ORDER BY d DESC LIMIT ?', [String(n)]);
+  const [evs] = await db.execute("SELECT validator, DATE_FORMAT(d, '%Y-%m-%d') AS d, purchases, cc_burned, traffic_bytes, days_since_prev FROM canton_validator_events ORDER BY d DESC LIMIT 50");
+  const num = (x, dp = 0) => (x == null ? null : Number(Number(x).toFixed(dp)));
+  const clean = rows.map(r => ({ d: r.d, supply: num(r.total_supply), burned_cc: num(r.burned_cc), minted_cc: num(r.minted_cc), net_cc: num(r.net_cc), burn_mint_pct: num(r.burn_mint_pct, 1), hours: num(r.hours_since_prev, 1), validators: r.validators }));
+  const events = evs.map(e => ({ validator: e.validator.split('::')[0], party: e.validator, d: e.d, purchases: e.purchases, cc_burned: num(e.cc_burned), traffic_mb: e.traffic_bytes != null ? num(e.traffic_bytes / 1e6, 1) : null, days_since_prev: num(e.days_since_prev, 1) }));
+  if (view === 'history') return { method, days: clean.reverse() };
+  if (view === 'events') return { method, dtcc_topups: events };
+  const rated = clean.filter(r => r.burned_cc != null && r.minted_cc != null);
+  const roll = (k) => { const w = rated.slice(0, k); if (!w.length) return null; const b = w.reduce((s, r) => s + r.burned_cc, 0), m = w.reduce((s, r) => s + r.minted_cc, 0);
+    return { days: w.length, burned_per_day: Math.round(b / w.length), minted_per_day: Math.round(m / w.length), burn_mint_pct: m > 0 ? Number((b / m * 100).toFixed(1)) : null }; };
+  const last = rows[0] || null; let dt = []; try { dt = last && last.dtcc ? (typeof last.dtcc === 'string' ? JSON.parse(last.dtcc) : last.dtcc) : []; } catch (e) { dt = []; }
+  return { method, latest: clean[0] || null, snapshots: rows.length, rolling_7d: roll(7), rolling_30d: roll(30),
+    dtcc_validators: dt.map(v => ({ validator: v.validator.split('::')[0], purchases: v.purchases, cc_spent_total: num(v.cc), traffic_mb_total: v.bytes != null ? num(v.bytes / 1e6, 1) : null, last_round: v.last_round })),
+    dtcc_topups_recent: events.slice(0, 10), sources: last ? last.sources : null,
+    note: rows.length < 2 ? 'Daily figures start after the second snapshot (one a day at 00:20 London).' : undefined };
+}
+cron.schedule('20 0 * * *', () => { cantonSnapshot({ reason: 'cron' }).catch(e => console.error('[canton] #648 snapshot error:', e.message)); }, { timezone: 'Europe/London' });
+setTimeout(() => { cantonSnapshot({ reason: 'boot' }).catch(e => console.error('[canton] #648 boot snapshot error:', e.message)); }, 120000);   // first snapshot on deploy; skips if today already has one
 async function refreshMacroDaily() {
   const since = new Date(Date.now() - 800 * 86400000).toISOString().slice(0, 10), status = { at: new Date().toISOString() };
   for (const [series, s] of Object.entries(MACRO_SOURCES)) {
@@ -24489,6 +24746,19 @@ function createMcpServer() {
           picture: h ? (h.buf ? { ok: true, bytes: h.buf.length, type: h.type, at: new Date(h.at).toISOString() } : { ok: false, why: h.why, at: new Date(h.at).toISOString() }) : 'not requested since the last restart' };
       }
       return { content: [{ type: 'text', text: JSON.stringify({ coins: out, lookup_fail_streak: coinMetaFails }) }] };
+    }
+  );
+
+  // ── Tool: get_canton_stats (#648, desk #74) — the Canton network's own numbers for the CC thesis. Read-only (refresh only takes today's snapshot if missing). ──
+  server.tool('get_canton_stats',
+    'Canton network tracker (#648): CC minted vs burned per day, net supply change, burn/mint % (7-day and 30-day), and traffic top-ups by DTCC-named validators, from Canton\'s public Scan API (one snapshot a day at 00:20 London; daily figures start after the second snapshot). view: summary (default) | history (one row a day, days = how many) | events (DTCC top-ups) | probe (what the API answers right now, trimmed - for checking) | refresh (take today\'s snapshot now if it is missing). Records only: nothing trades on it.',
+    {
+      view: z.enum(['summary', 'history', 'events', 'probe', 'refresh']).optional().describe('Default summary'),
+      days: z.number().optional().describe('history: how many days (1-400, default 30)'),
+    },
+    async ({ view, days } = {}) => {
+      try { return { content: [{ type: 'text', text: JSON.stringify(await cantonStats({ view: view || 'summary', days })) }] }; }
+      catch (e) { return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: e.message }) }] }; }
     }
   );
 
