@@ -452,6 +452,7 @@ The **`dev_log`** and the spec desk are the live boards. Open after the 13 Oct s
 
 | Batch | Date | What changed |
 | --- | --- | --- |
+| #649 | 2026-10-28 | `get_canton_stats` probe also shows the public Lighthouse explorer's raw answers (stats, rounds, validators, DTCC search, prices): the Super Validator scans answer 403 to non-validators. Diagnostics only. |
 | #648 | 2026-10-28 | Canton network tracker (desk #74, Bryan 28 Oct 22:40): a daily snapshot from Canton's public Scan API of the CC supply and validators' traffic spend; CC minted vs burned per day, burn/mint %, DTCC-validator top-ups; `get_canton_stats`; a team note and a Telegram line only on a material change. Records only. Part 2 (CC coin page card, PM-agent line) to follow. |
 | #647 | 2026-10-22 | Her page's About tab: a plain-words explanation of NEAR (what it is, who is behind it, what it does, where its value comes from, the risks) under a "Read more" that expands (Bryan 22 Oct 14:50); any other coin made hers gets the same written once by a model with web search and sent to Bryan on Telegram, `/family about redo` (14:52 "per coin"). Display only. |
 | #646 | 2026-10-21 | Her page and the dashboard's Her coin tab stuck on "Loading..." after the switch to NEAR (Bryan 21 Oct 18:57): each view rebuilt from the venue for 2-20 s and every open started its own build. One shared build per view, the last view (up to 10 min old) served at once while it refreshes, no waiting on a logo, slow builds logged by step. Display only. |

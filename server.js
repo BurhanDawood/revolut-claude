@@ -23099,7 +23099,7 @@ async function cantonStats({ view = 'summary', days = 30 } = {}) {
   const n = Math.max(1, Math.min(400, Math.round(Number(days) || 30)));
   const method = 'Public Canton Scan API (no key, no cost), up to ' + CANTON.scans_max + ' Super Validator scans cross-checked, one snapshot a day at 00:20 London. burned = change in the validators\' cumulative CC spent on traffic; net = change in total CC supply; minted = net + burned; all scaled to 24 h. Not included: holding fees on expired coins (small) and validators outside the top ' + CANTON.top_limit + '. Records only: nothing trades on it.';
   if (view === 'refresh') return cantonSnapshot({ reason: 'tool', force: false });
-  if (view === 'probe') {   // what the API actually answers, trimmed - for checking the parsers
+  if (view === 'probe') {   // #649 also probes the Lighthouse explorer   // what the API actually answers, trimmed - for checking the parsers
     const out = { seed: CANTON.seed }, cut = (x) => JSON.stringify(x).slice(0, 2500);
     const tryIt = async (k, p, b) => { try { out[k] = cut(await cantonFetch(CANTON.seed, p, b)); } catch (e) { out[k] = 'ERROR ' + e.message; } };
     await tryIt('scans', '/v0/scans');
@@ -23109,6 +23109,15 @@ async function cantonStats({ view = 'summary', days = 30 } = {}) {
     out.round_parsed = round;
     if (round != null) await tryIt('top_validators', '/v0/top-validators-by-purchased-traffic?round=' + round + '&limit=5');
     await tryIt('supply_amulet', '/registry/metadata/v1/instruments/Amulet');
+    // #649: the Super Validator scans answer 403 to non-validators (28 Oct 22:51), so look at a public explorer too: Lighthouse
+    // (CantonLoop, no key). Raw answers only - the parsers come once the shapes are known.
+    const LH = 'https://lighthouse.cantonloop.com/api';
+    const lh = async (k, p) => { try { out[k] = cut(await cantonFetch(LH, p)); } catch (e) { out[k] = 'ERROR ' + e.message; } };
+    await lh('lh_stats', '/stats');
+    await lh('lh_rounds', '/rounds?limit=2');
+    await lh('lh_validators', '/validators?limit=3');
+    await lh('lh_search_dtcc', '/search?q=DTCC');
+    await lh('lh_prices', '/prices');
     const [[le]] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'canton_last_error'");
     out.last_error = le ? le.config_value : null;
     return out;
