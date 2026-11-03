@@ -9986,10 +9986,10 @@ HOW TO THINK
 ANSWER with ONE JSON object and nothing else:
 {"actions":[{"symbol":"XXX","side":"buy|sell","usd":123.45,"qty":null,"thesis":"why, max 350 chars","tool_key":"agent_discretion","uses":["dip","research"],"horizon":"hours|days|weeks","invalidation":"what proves this wrong, max 150 chars","stop_price":null,"confidence":"low|medium|high"}],
  "alerts":[{"symbol":"XXX","when":"price_below|price_above|drop_from_high_pct|rise_from_low_pct","value":123.4,"hours":24,"why":"what you will do when it fires, max 150 chars"}],
- "sit_reason":"when actions is empty: why (max 350 chars)","notes_for_self":"what to remember next run (max 1,500 chars)","watch_next":["up to 5 symbols to research next run"],
+ "sit_reason":"when actions is empty: why (max 350 chars)","notes_for_self":"what to remember next run (max 1,500 chars)","watch_next":["SYM", {"symbol":"SYM","entry_low":1.2,"entry_high":1.3,"invalidation":1.1,"breakout_above":null,"thesis":"max 150 chars","hours":24}],
  "requests":[{"title":"a tool or data you need","why":"","evidence":"the coin / decision it blocked","how_to_measure":""}],
  "pm_stances":[{"id":12,"stance":"agree|decline|wait","line":"why, max 150 chars"}]}
-A buy gives usd (dollars to spend) and should give stop_price (the price that proves it wrong - you are woken there). A sell gives qty (coin quantity) or "qty":"all". At most 3 requests. drop_from_high_pct / rise_from_low_pct count from the highest / lowest price seen after the alert is set (value = percent, e.g. 8).`;
+watch_next: up to 5 coins to research next run, each a symbol or an object with an entry zone. A zone arms a watch-list wake: the price falling to entry_high (or rising past breakout_above) wakes you for that coin, at most once per coin per 4 h, counted in wakes_per_day; your own alerts work as before. A buy gives usd (dollars to spend) and should give stop_price (the price that proves it wrong - you are woken there). A sell gives qty (coin quantity) or "qty":"all". At most 3 requests. drop_from_high_pct / rise_from_low_pct count from the highest / lowest price seen after the alert is set (value = percent, e.g. 8).`;
 const AGENT_STARTER = { pct: 10 };   // #584 Bryan 7 Oct "Yes, 10% starters"
 const _starterSeen = new Map();   // #585 coin -> when a starter setup last went to the decision model (12 h, so one stuck coin cannot buy Sonnet every run)
 function agentStarterFresh(shortlist, nowMs = Date.now()) {
@@ -10039,9 +10039,10 @@ function agentParseDecision(text) {
   }
   const requests = (Array.isArray(v.requests) ? v.requests : []).filter(r => r && typeof r.title === 'string').slice(0, 3)
     .map(r => ({ title: r.title.slice(0, 200), why: str(r.why, 600) || '', evidence: str(r.evidence, 400) || '', how_to_measure: str(r.how_to_measure, 400) || '' }));   // #483 evidence
-  const watch = (Array.isArray(v.watch_next) ? v.watch_next : []).map(x => String(x || '').toUpperCase().replace(/[\/-]USD$/, '')).filter(x => /^[A-Z0-9]{1,15}$/.test(x)).slice(0, 5);
+  const watch = (Array.isArray(v.watch_next) ? v.watch_next : []).map(x => String((x && typeof x === 'object' ? (x.symbol || x.coin) : x) || '').toUpperCase().replace(/[\/-]USD$/, '')).filter(x => /^[A-Z0-9]{1,15}$/.test(x)).slice(0, 5);
+  const watch_zones = watchParseZones(v.watch_next);   // #654 items with an entry zone arm a watch-list wake
   const pm_stances = (Array.isArray(v.pm_stances) ? v.pm_stances : []).filter(x => x && Number.isInteger(Number(x.id)) && ['agree', 'decline', 'wait'].includes(x.stance)).slice(0, 6).map(x => ({ id: Number(x.id), stance: x.stance, line: str(x.line, 200) || '' }));   // #652 invalid stances dropped one by one
-  return { ok: true, value: { actions, sit_reason: str(v.sit_reason, 400), notes_for_self: str(v.notes_for_self, 1500), requests, watch_next: watch, alerts, pm_stances } };
+  return { ok: true, value: { actions, sit_reason: str(v.sit_reason, 400), notes_for_self: str(v.notes_for_self, 1500), requests, watch_next: watch, alerts, pm_stances, watch_zones } };
 }
 async function agentSettingsVer() {   // #549 (PM, note 7): the agent_changes id in force - 0 before the first change; null when unreadable
   try { const [v] = await db.execute("SELECT COALESCE(MAX(id), 0) AS v FROM agent_changes WHERE status <> 'failed'"); return Number(v[0].v) || 0; } catch (e) { return null; }
@@ -10236,6 +10237,7 @@ async function runAgent(trigger = 'scheduled', wake = [], pmWake = null) {   // 
     }
     if (newReqs.length) await specImportAgentRequests().catch(e => console.error('[desk] agent request import failed:', e.message));   // #D1 requests land in the desk inbox too
     const armedN = await agentArmAlerts(runId, dv.alerts, scr.tick, cfg).catch(e => { console.error('[agent] #A2e arming alerts failed:', e.message); return null; });
+    await watchArmTrader(runId, dv.watch_zones, scr.tick).catch(e => console.error('[agent] #654 watch zones:', e.message));
     const fills = done.filter(d => d.status === 'filled').length, drops = done.filter(d => d.status !== 'filled');
     const after = await agentEquity(await readAgentLedger()).catch(() => null);
     await sendTelegram('🤖 <b>Agent run</b> (' + (woken ? (kind === 'alert_stop' ? '🛑 ' : '') + 'woken: ' + escTg((wake || []).map(agentAlertText).join('; ')) : kind) + ') - ' + (dv.actions.length ? fills + ' filled' + (drops.length ? ', ' + drops.length + ' dropped (' + escTg(drops.map(d => d.a.coin + ' ' + d.reason).join(', ')) + ')' : '') : 'sat out: ' + escTg(String(dv.sit_reason || '').slice(0, 400))) +
@@ -10669,7 +10671,7 @@ async function agentApiState() {
   const [wk] = await db.execute("SELECT COUNT(DISTINCT run_id) AS n FROM agent_decisions WHERE trigger_kind = 'alert' AND at >= ?", [new Date(agentLondonDayStart())]).catch(() => [[{ n: 0 }]]);
   return { mode: led.mode, stopped: led.stopped, frozen_until: led.frozen_until, halt_reason: led.halt_reason, budget_usd: led.budget_usd, equity: eq.equity, cash: led.cash_usd, realised: led.realised_usd, fees: led.fees_usd, costs: led.model_cost_usd,
     day_start_equity: led.day_start_equity_usd, high_water: led.high_water_usd, positions, benchmarks: bm, runs_today: Number(runs[0].n), last_activity: last[0].at, model: cfg.model,
-    alerts: al.map(a => ({ symbol: a.symbol, kind: a.kind, value: Number(a.value), source: a.source, why: a.why, expires: a.expires, text: agentAlertText(a) })), wakes_today: Number(wk[0].n), wakes_per_day: cfg.wakes_per_day,
+    alerts: al.map(a => ({ type: agentAlertLabel(a.source), symbol: a.symbol, kind: a.kind, value: Number(a.value), source: a.source, why: a.why, expires: a.expires, text: agentAlertText(a) })), wakes_today: Number(wk[0].n), wakes_per_day: cfg.wakes_per_day,
     rails: { per_trade_pct: cfg.per_trade_pct, max_positions: cfg.max_positions, min_trade_usd: cfg.min_trade_usd, daily_loss_pct: cfg.daily_loss_pct, drawdown_halt_pct: cfg.drawdown_halt_pct, runs_per_day: cfg.runs_per_day, orders_per_run: cfg.orders_per_run } };
 }
 
@@ -10755,14 +10757,17 @@ async function pmCoachWrite({ as, ideas, avoid, close, playbook_patch, pm_brief 
     if (!lo || !hi || lo > hi) { errors.push(coin + ': entry_low and entry_high must be prices with low <= high'); continue; }
     if (!inv || inv >= lo) { errors.push(coin + ': invalidation must be a price below the entry zone'); continue; }
     if (targets.some(t => t <= hi)) { errors.push(coin + ': targets must be above the entry zone'); continue; }
+    const bo = pmCoachNum(x.breakout_above) > hi ? pmCoachNum(x.breakout_above) : null;   // #654 optional breakout level
     const why = String(x.why || '').trim().slice(0, PM_COACH.why_max); if (!why) { errors.push(coin + ': why is required'); continue; }
     const [[dup]] = await db.execute("SELECT id FROM pm_coach_items WHERE status = 'open' AND kind = 'idea' AND coin = ?", [coin]);
     if (!dup && room <= 0) { errors.push(coin + ': ' + PM_COACH.ideas_max + ' ideas are already open - close one first'); continue; }
     if (dup) await db.execute("UPDATE pm_coach_items SET status = 'closed', closed_at = ?, close_reason = ? WHERE id = ?", [at, 'replaced in v' + v, dup.id]);
     else room--;
     const [ins] = await db.execute('INSERT INTO pm_coach_items (v, at, author, kind, coin, body, created_price, created_btc, expires_at) VALUES (?,?,?,?,?,?,?,?,?)',
-      [v, at, as, 'idea', coin, JSON.stringify({ entry_low: lo, entry_high: hi, invalidation: inv, targets, why }), tm[coin].mid, btc, new Date(nowMs + days(x.expires_days) * 86400000)]);
-    done.added.push({ id: ins.insertId, coin });
+      [v, at, as, 'idea', coin, JSON.stringify({ entry_low: lo, entry_high: hi, invalidation: inv, targets, why, breakout_above: bo }), tm[coin].mid, btc, new Date(nowMs + days(x.expires_days) * 86400000)]);
+    const exp = new Date(nowMs + days(x.expires_days) * 86400000);
+    const armed = await watchArmCoach({ id: ins.insertId, coin, entry_low: lo, entry_high: hi, invalidation: inv, why, breakout_above: bo, expires_at: exp }, tm).catch(e => { console.error('[coach] #654 watch wake:', e.message); return 0; });
+    done.added.push({ id: ins.insertId, coin, watch_wake: armed ? 'armed' : 'not armed (price already at or in the zone)' });
   }
   for (const x of (Array.isArray(avoid) ? avoid : []).slice(0, PM_COACH.avoid_max)) {
     const coin = String((x && x.coin) || '').toUpperCase().replace(/[\/-]USD$/, '');
@@ -10775,10 +10780,11 @@ async function pmCoachWrite({ as, ideas, avoid, close, playbook_patch, pm_brief 
   }
   const clean = (s, n, label) => { if (s == null) return undefined; const t = handoverClean(String(s), 100000); if (/https?:\/\/|www\.|<\/?[a-z!]/i.test(t)) { errors.push(label + ': plain text only, no links or markup'); return undefined; } if (t.length > n) { errors.push(label + ': at most ' + n + ' characters (got ' + t.length + ')'); return undefined; } return t; };
   const patch = clean(playbook_patch, PM_COACH.patch_max, 'playbook_patch'), brief = clean(pm_brief, PM_COACH.brief_max, 'pm_brief');
+  await db.execute("UPDATE agent_alerts SET status = 'replaced' WHERE status = 'armed' AND source = 'watch' AND run_id LIKE 'coach:%' AND CAST(SUBSTRING(run_id, 7) AS UNSIGNED) IN (SELECT id FROM pm_coach_items WHERE status <> 'open')").catch(e => console.error('[coach] #654 watch cleanup:', e.message));   // closed, replaced or expired ideas stop waking
   const changed = done.added.length || done.avoided.length || done.closed.length || patch !== undefined || brief !== undefined;
   if (!changed) return { ok: false, error: errors.length ? errors.join('; ') : 'nothing to write', errors };
   const txt = { ...txt0, v, at: at.toISOString(), author: as };
-  if (patch !== undefined) { txt.patch = patch || null; txt.patch_v = v; }
+  if (patch !== undefined) { txt.patch = patch || null; txt.patch_v = v; if ((patch || null) !== (txt0.patch || null)) await db.execute('INSERT INTO agent_changes (at, by_role, field, before_v, after_v, reason, status) VALUES (?, ?, ?, ?, ?, ?, ?)', [nowMs, 'pm', 'pm_patch', JSON.stringify(txt0.patch || ''), JSON.stringify(patch || ''), 'coach_trader v' + v, 'applied']).catch(e => console.error('[coach] #654 patch log:', e.message)); }   // #654 versioned in agent_changes as 'pm' (no Undo: not a bounded setting)
   if (brief !== undefined) { txt.brief = brief || null; txt.brief_v = v; txt.brief_at = at.toISOString(); }
   await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('pm_coach', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)", [JSON.stringify(txt)]);
   console.log('[coach] #652 v' + v + ': +' + done.added.length + ' ideas, +' + done.avoided.length + ' avoid, ' + done.closed.length + ' closed' + (patch !== undefined ? ', patch' : '') + (brief !== undefined ? ', brief' : ''));
@@ -10930,6 +10936,54 @@ function agentAlertText(a) {
   if (a.kind === 'drop_from_high_pct') return a.symbol + ' ' + v + '% off its high';
   return a.symbol + ' ' + v + '% up from its low';
 }
+// #654 (desk #76 addition, Bryan 3 Nov 21:56 via the PM: "VVV dipped into 20.5-21.2 ... and recovered +7% within hours" while the trader slept
+// up to 8 h). WATCH-LIST WAKES, paper only: a watch item with an entry zone - a coach_trader idea, or one the trader itself returns in
+// watch_next with a zone - arms an agent_alerts row with source 'watch': price_below the zone top (and price_above for a breakout level).
+// It is armed only while the price is ABOVE the zone top (an item already in its zone is in the next run's input anyway; arming it would
+// spend a wake at once). A fire wakes ONE run like the trader's own discretionary alerts: confirmed on a second check, counted in
+// wakes_per_day, held by the wake cooldown, never on a paused or stopped trader - and at most one watch wake per coin per WATCH_WAKE.per_coin_h.
+// The alert's why carries the item's thesis and invalidation into the woken run. Position alerts (stop, drop) are untouched.
+const WATCH_WAKE = { per_coin_h: 4, hours_default: 24, hours_max: 72, max_trader: 5 };
+function watchWhy(prefix, thesis, inv) { return (prefix + ': ' + String(thesis || '').replace(/\s+/g, ' ').trim()).slice(0, 150) + (inv ? ' | wrong below ' + fmtPriceShort(Number(inv)) : ''); }
+async function watchArm(runId, coin, zoneTop, breakout, why, expiresAt, tick) {   // returns how many rows it armed
+  const t = tick && tick[coin]; if (!t || !(t.mid > 0)) return 0;
+  const rows = [];
+  if (zoneTop > 0 && t.mid > zoneTop) rows.push([runId, coin, 'price_below', zoneTop, 'watch', String(why).slice(0, 200), t.mid, t.mid, t.mid, expiresAt]);
+  if (breakout > 0 && t.mid < breakout) rows.push([runId, coin, 'price_above', breakout, 'watch', String(why).slice(0, 200), t.mid, t.mid, t.mid, expiresAt]);
+  for (const r of rows) await db.execute('INSERT INTO agent_alerts (run_id, symbol, kind, value, source, why, ref_price, ref_high, ref_low, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', r);
+  return rows.length;
+}
+async function watchArmCoach(item, tick) {   // a coach_trader idea (run_id 'coach:<id>'); a replaced or closed idea's alerts are dropped by watchDropCoach
+  return watchArm('coach:' + item.id, item.coin, item.entry_high, item.breakout_above || null, watchWhy('PM idea #' + item.id + ' (zone ' + fmtPriceShort(item.entry_low) + '-' + fmtPriceShort(item.entry_high) + ')', item.why, item.invalidation), item.expires_at, tick);
+}
+async function watchDropCoach(ids) { for (const id of ids) await db.execute("UPDATE agent_alerts SET status = 'replaced' WHERE status = 'armed' AND source = 'watch' AND run_id = ?", ['coach:' + id]); }
+async function watchArmTrader(runId, zones, tick) {   // the trader's own zones replace its previous ones every full run (coach alerts stay)
+  await db.execute("UPDATE agent_alerts SET status = 'replaced' WHERE status = 'armed' AND source = 'watch' AND run_id NOT LIKE 'coach:%'");
+  let n = 0;
+  for (const z of (zones || []).slice(0, WATCH_WAKE.max_trader)) {
+    const no = await pmCoachRefused(z.coin).catch(() => 'unreadable'); if (no) continue;
+    n += await watchArm(runId, z.coin, z.entry_high, z.breakout_above || null, watchWhy('your watch zone ' + fmtPriceShort(z.entry_low) + '-' + fmtPriceShort(z.entry_high), z.thesis, z.invalidation), new Date(Date.now() + z.hours * 3600000), tick);
+  }
+  return n;
+}
+async function watchRecentWake(coin, nowMs = Date.now()) {   // one watch wake per coin per per_coin_h
+  const [r] = await db.execute("SELECT COUNT(*) AS n FROM agent_alerts WHERE source = 'watch' AND symbol = ? AND status = 'fired' AND fired_at >= ?", [coin, new Date(nowMs - WATCH_WAKE.per_coin_h * 3600000)]);
+  return Number(r[0].n) > 0;
+}
+function watchParseZones(list) {   // watch_next items that are objects with a zone (pure)
+  const out = [];
+  for (const x of Array.isArray(list) ? list : []) {
+    if (!x || typeof x !== 'object') continue;
+    const coin = String(x.symbol || x.coin || '').toUpperCase().replace(/[\/-]USD$/, ''), lo = Number(x.entry_low), hi = Number(x.entry_high), inv = Number(x.invalidation), bo = Number(x.breakout_above);
+    if (!/^[A-Z0-9]{1,15}$/.test(coin) || !(lo > 0 && hi >= lo)) continue;
+    const hrs = Number(x.hours);
+    out.push({ coin, entry_low: lo, entry_high: hi, invalidation: inv > 0 && inv < lo ? inv : null, breakout_above: bo > hi ? bo : null,
+      thesis: typeof x.thesis === 'string' ? x.thesis.slice(0, 150) : '', hours: Math.min(WATCH_WAKE.hours_max, Math.max(1, isFinite(hrs) && hrs > 0 ? hrs : WATCH_WAKE.hours_default)) });
+    if (out.length >= WATCH_WAKE.max_trader) break;
+  }
+  return out;
+}
+function agentAlertLabel(source) { return source === 'watch' ? 'watch-list' : source === 'agent' ? 'trader' : 'position'; }   // #654 get_agent status
 async function agentArmAlerts(runId, alerts, tick, cfg) {   // replaces every armed alert with this run's set + the automatic position alerts
   await db.execute("UPDATE agent_alerts SET status = 'replaced' WHERE status = 'armed' AND source = 'agent'");
   const rows = [];
@@ -10941,7 +10995,7 @@ async function agentArmAlerts(runId, alerts, tick, cfg) {   // replaces every ar
   return rows.length + await agentArmPositionAlerts(runId, tick, cfg);
 }
 async function agentArmPositionAlerts(runId, tick, cfg) {   // #549 the automatic position alerts (stop_price, the drop), re-armed every run - including a screened run that held
-  await db.execute("UPDATE agent_alerts SET status = 'replaced' WHERE status = 'armed' AND source <> 'agent'");
+  await db.execute("UPDATE agent_alerts SET status = 'replaced' WHERE status = 'armed' AND source NOT IN ('agent', 'watch')");
   const led = await readAgentLedger(), rows = [];
   for (const [coin, pos] of Object.entries(led.positions || {})) {
     const t = tick[coin]; if (!t || !(Number(pos.qty) > 0)) continue;
@@ -10965,7 +11019,7 @@ async function agentAlertTick() {
     const now = Date.now(), live = [];
     for (const a of rows) {
       if (new Date(a.expires_at).getTime() <= now) { await db.execute("UPDATE agent_alerts SET status = 'expired' WHERE id = ? AND status = 'armed'", [a.id]); continue; }
-      if (a.source !== 'agent' && !(Number((led.positions[a.symbol] || {}).qty) > 0)) { await db.execute("UPDATE agent_alerts SET status = 'expired' WHERE id = ? AND status = 'armed'", [a.id]); continue; }   // position sold
+      if (a.source !== 'agent' && a.source !== 'watch' && !(Number((led.positions[a.symbol] || {}).qty) > 0)) { await db.execute("UPDATE agent_alerts SET status = 'expired' WHERE id = ? AND status = 'armed'", [a.id]); continue; }   // position sold
       live.push(a);
     }
     if (!live.length) return { armed: 0 };
@@ -10978,14 +11032,14 @@ async function agentAlertTick() {
       const hi = Math.max(Number(a.ref_high) || 0, t.mid), lo = Math.min(Number(a.ref_low) || Infinity, t.mid);
       if (hi !== Number(a.ref_high) || lo !== Number(a.ref_low)) { a.ref_high = hi; a.ref_low = lo; await db.execute('UPDATE agent_alerts SET ref_high = ?, ref_low = ? WHERE id = ?', [hi, lo, a.id]); }
       const hit = agentAlertHit(a, t.mid);
-      if (hit && a.source === 'agent' && !(a.hit_at && now - new Date(a.hit_at).getTime() >= 90000)) {   // #A2f confirm on a second check
+      if (hit && (a.source === 'agent' || a.source === 'watch') && !(a.hit_at && now - new Date(a.hit_at).getTime() >= 90000)) {   // #A2f confirm on a second check
         if (!a.hit_at) await db.execute('UPDATE agent_alerts SET hit_at = NOW() WHERE id = ?', [a.id]);
         continue;
       }
       // #572 (desk #51, Fable 6 Oct): a position stop counts only if still hit on a check >= stop_confirm_min after the first touch -
       // GRT, EDGE and BCH were each sold on one mid touch and bounced. Far enough past (stop_breach_pct below the level) wakes at once:
       // the flash-crash fail-safe. A confirmed stop still ALWAYS wakes (#A2f) - only the touch rule changes.
-      if (hit && a.source !== 'agent' && confirmMs > 0) {
+      if (hit && a.source !== 'agent' && a.source !== 'watch' && confirmMs > 0) {
         const deep = a.kind === 'price_below' && breachPct > 0 && t.mid <= Number(a.value) * (1 - breachPct / 100);
         const held = a.hit_at && now - new Date(a.hit_at).getTime() >= confirmMs;
         if (!deep && !held) { if (!a.hit_at) { await db.execute('UPDATE agent_alerts SET hit_at = NOW() WHERE id = ?', [a.id]); console.log('[agent] #572 ' + agentAlertText(a) + ' touched at ' + t.mid + ' - confirming for ' + (confirmMs / 60000) + ' min'); } continue; }
@@ -10999,7 +11053,11 @@ async function agentAlertTick() {
     const [w] = await db.execute("SELECT COUNT(DISTINCT run_id) AS n, MAX(at) AS last FROM agent_decisions WHERE trigger_kind = 'alert' AND at >= ?", [new Date(agentLondonDayStart())]);
     // #A2f (Fable 26 Sep 00:15) a position alert (its stop_price, the 8% drop) ALWAYS wakes - a stop missed because the day's
     // wakes are spent is the live failure mode; the cap and the cooldown apply to the model's own (discretionary) alerts only.
-    const pos = fired.filter(f => f.source !== 'agent'), disc = fired.filter(f => f.source === 'agent');
+    const pos = fired.filter(f => f.source !== 'agent' && f.source !== 'watch'), disc = fired.filter(f => f.source === 'agent');
+    for (const f of fired.filter(x => x.source === 'watch')) {   // #654 a watch-list wake: like the trader's own alerts, plus one per coin per WATCH_WAKE.per_coin_h
+      if (disc.some(d => d.source === 'watch' && d.symbol === f.symbol) || await watchRecentWake(f.symbol)) { await db.execute("UPDATE agent_alerts SET status = 'replaced' WHERE id = ? AND status = 'armed'", [f.id]); console.log('[agent] #654 watch wake ' + agentAlertText(f) + ' dropped: ' + f.symbol + ' woke in the last ' + WATCH_WAKE.per_coin_h + ' h'); continue; }
+      disc.push(f);
+    }
     const cooling = !!(w[0].last && now - new Date(w[0].last).getTime() < cfg.wake_cooldown_min * 60000), capped = Number(w[0].n) >= cfg.wakes_per_day;
     const discWake = !cooling && !capped ? disc : [];
     if (capped) for (const f of disc) await db.execute("UPDATE agent_alerts SET status = 'missed', fired_at = NOW(), fired_price = ? WHERE id = ? AND status = 'armed'", [f.price_now, f.id]);
@@ -25142,7 +25200,7 @@ function createMcpServer() {
     '#652 The Claude PM thread coaches the PAPER trader (as must be claude_pm). In one call: ideas (up to 6 open: coin, entry_low, entry_high, invalidation below the zone, up to 3 targets above it, why, expires_days 1-14 default 7) - each joins the trader\'s shortlist with full indicators and research and is scored at +7d/+30d vs BTC whether taken or not; avoid (coin + reason + expires_days); close (idea ids or coins); playbook_patch (<= 400 chars, plain text; "" clears) and pm_brief (<= 600 chars; "" clears). Every write is a new version. The trader reads it every run and gives a stance per idea (agree / decline / wait); a buy on an idea is tool_key pm_idea. Advice only: never sizes, places or cancels anything; stablecoins and her coin (current or past) are refused. Read it back with get_agent view coach.',
     {
       as: z.enum(['claude_pm']).describe('who is writing - the Claude PM thread only'),
-      ideas: zLoose(z.array(z.object({ coin: z.string(), entry_low: z.number(), entry_high: z.number(), invalidation: z.number(), targets: zLoose(z.array(z.number())).optional(), why: z.string(), expires_days: z.number().optional() }))).optional(),
+      ideas: zLoose(z.array(z.object({ coin: z.string(), entry_low: z.number(), entry_high: z.number(), invalidation: z.number(), targets: zLoose(z.array(z.number())).optional(), why: z.string(), expires_days: z.number().optional(), breakout_above: z.number().optional() }))).optional(),
       avoid: zLoose(z.array(z.object({ coin: z.string(), reason: z.string(), expires_days: z.number().optional() }))).optional(),
       close: zLoose(z.array(z.union([z.number(), z.string()]))).optional().describe('idea/avoid ids or coins to close'),
       playbook_patch: z.string().optional().describe('<= 400 chars added to the trader\'s guidance; "" clears it'),
@@ -31099,6 +31157,7 @@ async function agentScorecard() {
   const trades = await agentClosedTrades(winStart).catch(e => { console.error('[agent] #549 closed trades:', e.message); return []; });
   const scored = trades.filter(t => t.vs_btc_pts != null), avgVs = scored.length ? scored.reduce((a, t) => a + t.vs_btc_pts, 0) / scored.length : null;
   const vers = {}; for (const t of trades) { const k = t.exit_ver == null ? 'before 549' : String(t.exit_ver); (vers[k] = vers[k] || { settings_ver: k, trades: 0, sum: 0 }).trades++; vers[k].sum += t.return_pct || 0; }
+  const bySrc = ['pm_idea', 'trader'].map(k => { const ts = trades.filter(t => t.source === k), sc2 = ts.filter(t => t.vs_btc_pts != null); return { source: k === 'pm_idea' ? 'PM idea' : "trader's own", trades: ts.length, avg_return_pct: ts.length ? f1(ts.reduce((a, t) => a + (t.return_pct || 0), 0) / ts.length) : null, avg_vs_btc_pts: sc2.length ? f1(sc2.reduce((a, t) => a + t.vs_btc_pts, 0) / sc2.length) : null }; });   // #654
   const routing = await agentRouteStats(winStart).catch(e => { console.error('[agent] #549 routing stats:', e.message); return null; });
   return {
     mode: led.mode, window: { from: new Date(winStart).toISOString(), days: f1((now - winStart) / 86400000) }, days_running: f1(daysRunning),
@@ -31112,7 +31171,7 @@ async function agentScorecard() {
     changes_in_window: chg.filter(c => c.status !== 'failed').map(c => ({ id: c.id, at: new Date(Number(c.at)).toISOString(), by: c.by_role, field: c.field, before: jv(c.field, c.before_v), after: jv(c.field, c.after_v), status: c.status })),
     per_trade_vs_btc: { closed: trades.length, scored: scored.length, beat_btc: scored.filter(t => t.vs_btc_pts > 0).length, avg_vs_btc_pts: f1(avgVs),
       verdict: scored.length < 5 ? 'insufficient (' + scored.length + ' of 5 trades scored)' : 'beat BTC in ' + scored.filter(t => t.vs_btc_pts > 0).length + ' of ' + scored.length + ', on average ' + (avgVs >= 0 ? '+' : '') + avgVs.toFixed(2) + ' pts over the same hold' },
-    trades, by_settings_version: Object.values(vers).map(v => ({ settings_ver: v.settings_ver, trades: v.trades, avg_return_pct: f1(v.sum / v.trades) })),
+    trades, by_source: bySrc, by_settings_version: Object.values(vers).map(v => ({ settings_ver: v.settings_ver, trades: v.trades, avg_return_pct: f1(v.sum / v.trades) })),
     routing,
     team_cost_today: await teamSpendToday().then(async (t) => ({ total: t.total, parts: t.parts, cap: (await teamCfg()).daily_cap_usd })).catch(() => null),   // #577 desk #52 D2
     bar, met, of: bar.length, ready: met === bar.length,
@@ -31123,7 +31182,7 @@ async function agentClosedTrades(fromMs) {   // #549 each filled sell in the win
   const [sells] = await db.execute("SELECT id, symbol FROM agent_decisions WHERE side = 'sell' AND status = 'filled' AND at >= ? ORDER BY id", [new Date(fromMs)]);
   const want = new Set(sells.map(s => Number(s.id))), out = [], f2 = x => (x == null || !isFinite(x) ? null : Math.round(x * 100) / 100), iso = x => (x ? new Date(x).toISOString() : null);
   for (const sym of [...new Set(sells.map(s => s.symbol))]) {
-    const [rows] = await db.execute("SELECT id, side, at, fill_price, fill_qty, btc_mid, settings_ver FROM agent_decisions WHERE symbol = ? AND status = 'filled' AND side IN ('buy', 'sell') ORDER BY id", [sym]);
+    const [rows] = await db.execute("SELECT id, side, at, fill_price, fill_qty, btc_mid, settings_ver, tool_key FROM agent_decisions WHERE symbol = ? AND status = 'filled' AND side IN ('buy', 'sell') ORDER BY id", [sym]);
     let qty = 0, cost = 0, first = null;
     for (const r of rows) {
       const q = Number(r.fill_qty), p = Number(r.fill_price);
@@ -31132,7 +31191,7 @@ async function agentClosedTrades(fromMs) {   // #549 each filled sell in the win
       if (want.has(Number(r.id)) && qty > 0 && first) {
         const ret = (p / (cost / qty) - 1) * 100, b0 = Number(first.btc_mid), b1 = Number(r.btc_mid), btc = b0 > 0 && b1 > 0 ? (b1 / b0 - 1) * 100 : null;
         out.push({ id: Number(r.id), symbol: String(sym).replace(/-USD$/, ''), entry_at: iso(first.at), exit_at: iso(r.at), return_pct: f2(ret), btc_pct: f2(btc), vs_btc_pts: btc == null ? null : f2(ret - btc),
-          entry_ver: first.settings_ver == null ? null : Number(first.settings_ver), exit_ver: r.settings_ver == null ? null : Number(r.settings_ver) });
+          entry_ver: first.settings_ver == null ? null : Number(first.settings_ver), exit_ver: r.settings_ver == null ? null : Number(r.settings_ver), source: first.tool_key === 'pm_idea' ? 'pm_idea' : 'trader' });   // #654
       }
       const sold = Math.min(q, qty); if (qty > 0) cost -= cost * sold / qty; qty -= sold;
       if (!(qty > 1e-9 * q)) { qty = 0; cost = 0; first = null; }
