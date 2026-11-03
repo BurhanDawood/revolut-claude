@@ -10075,6 +10075,7 @@ async function runAgent(trigger = 'scheduled', wake = [], pmWake = null) {   // 
   const sit = async (reason, extra = {}) => { await agentInsertDecision({ run_id: runId, trigger_kind: kind, status: 'sit', drop_reason: reason, route: tag.route, ...extra }).catch(e => console.error('[agent] sit row failed:', e.message)); return { ok: true, run_id: runId, sat: reason }; };
   try {
     const cfg = { ...AGENT_A2_DEFAULTS, ...(await readAgentConfig()) };
+    cfg.max_tokens = Math.max(Number(cfg.max_tokens) || 0, 12000);   // #653 review 6: a stored 9000 cannot undo #652
     let led = await readAgentLedger();
     if (await isAutoExecPaused()) return await sit('paused');
     if (led.mode === 'halted') return await sit('halted');
@@ -10730,6 +10731,7 @@ async function pmCoachWrite({ as, ideas, avoid, close, playbook_patch, pm_brief 
   const led = await readAgentLedger();
   if (led.mode !== 'paper') return { ok: false, error: 'the trader is not on paper (' + led.mode + ') - coaching is paper only' };
   const tm = await revolutTickerMap(20000).catch(() => ({})), btc = tm.BTC ? tm.BTC.mid : null, errors = [], done = { added: [], avoided: [], closed: [] };
+  const inU = await agentUniverseFilter(led).catch(() => null), maxSp = Number((await readAgentConfig()).max_spread_pct) || 2;   // #653 an idea agentScreen would drop never reaches the trader
   const days = (d) => Math.min(PM_COACH.days_max, Math.max(1, Math.round(Number(d) || PM_COACH.days_default)));
   const txt0 = await pmCoachText(), v = (Number(txt0.v) || 0) + 1, at = new Date(nowMs);
   for (const c of (Array.isArray(close) ? close : []).slice(0, 20)) {
@@ -10746,6 +10748,8 @@ async function pmCoachWrite({ as, ideas, avoid, close, playbook_patch, pm_brief 
     const coin = String((x && x.coin) || '').toUpperCase().replace(/[\/-]USD$/, '');
     const no = await pmCoachRefused(coin); if (no) { errors.push(coin + ': ' + no); continue; }
     if (!tm[coin]) { errors.push(coin + ': no Revolut X USD price right now'); continue; }
+    if (tm[coin].spread_pct != null && tm[coin].spread_pct > maxSp) { errors.push(coin + ': spread ' + tm[coin].spread_pct.toFixed(2) + '% is over the trader\'s ' + maxSp + '% limit - it would never reach its shortlist'); continue; }
+    if (inU && !inU(coin, tm[coin].mid)) { errors.push(coin + ': outside the trader\'s universe - it would never reach its shortlist'); continue; }
     const lo = pmCoachNum(x.entry_low), hi = pmCoachNum(x.entry_high), inv = pmCoachNum(x.invalidation);
     const targets = (Array.isArray(x.targets) ? x.targets : []).map(pmCoachNum).filter(Boolean).slice(0, 3);
     if (!lo || !hi || lo > hi) { errors.push(coin + ': entry_low and entry_high must be prices with low <= high'); continue; }
@@ -10826,6 +10830,7 @@ async function pmWakeTrader({ as, reason, coins } = {}, nowMs = Date.now()) {
   const led = await readAgentLedger();
   if (led.mode !== 'paper') return { ok: false, error: 'the trader is not on paper (' + led.mode + ')' };
   if (led.stopped || led.mode === 'halted') return { ok: false, error: 'the trader is stopped or halted' };
+  if (await isAutoExecPaused()) return { ok: false, error: 'trading is paused (/pause) - the run would only sit; not counted' };   // #653 review 1
   if (_agentRunning) return { ok: false, error: 'a run is going now - try again in a few minutes' };
   const [[d]] = await db.execute('SELECT COUNT(*) AS n, MAX(at) AS last FROM pm_wakes WHERE at >= ?', [new Date(agentLondonDayStart(nowMs))]);
   if (Number(d.n) >= PM_COACH.wakes_per_day) return { ok: false, error: PM_COACH.wakes_per_day + ' wakes already today (London day)' };
@@ -10833,8 +10838,10 @@ async function pmWakeTrader({ as, reason, coins } = {}, nowMs = Date.now()) {
   if (l && l.last && nowMs - new Date(l.last).getTime() < PM_COACH.wake_cooldown_min * 60000) return { ok: false, error: 'the last wake was under ' + PM_COACH.wake_cooldown_min + ' minutes ago' };
   const [ins] = await db.execute('INSERT INTO pm_wakes (at, author, reason, coins) VALUES (?, ?, ?, ?)', [new Date(nowMs), as, why, list.join(',') || null]);
   const id = ins.insertId, nth = Number(d.n) + 1;
-  await sendTelegram('⏰ <b>PM woke the paper trader</b> (' + nth + ' of ' + PM_COACH.wakes_per_day + ' today): ' + escTg(why) + (list.length ? ' · ' + escTg(list.join(', ')) : '') + '\n<i>Paper only - the trader decides.</i>').catch(() => {});
-  runAgent('pm', [], { reason: why, coins: list, wake_id: id }).then(async (r) => {
+  if (_agentRunning) { await db.execute('DELETE FROM pm_wakes WHERE id = ?', [id]).catch(() => {}); return { ok: false, error: 'a run started just now - try again in a few minutes; not counted' }; }   // #653 review 4: re-check after the await
+  const started = runAgent('pm', [], { reason: why, coins: list, wake_id: id });   // runAgent sets _agentRunning before its first await
+  sendTelegram('⏰ <b>PM woke the paper trader</b> (' + nth + ' of ' + PM_COACH.wakes_per_day + ' today): ' + escTg(why) + (list.length ? ' · ' + escTg(list.join(', ')) : '') + '\n<i>Paper only - the trader decides.</i>').catch(() => {});
+  started.then(async (r) => {
     await db.execute('UPDATE pm_wakes SET run_id = ?, outcome = ? WHERE id = ?', [r && r.run_id || null, String(r ? (r.sat ? 'sat: ' + r.sat : r.route ? 'route ' + r.route : 'ran') : 'no result').slice(0, 300), id]).catch(() => {});
   }).catch(async (e) => { await db.execute('UPDATE pm_wakes SET outcome = ? WHERE id = ?', [('failed: ' + e.message).slice(0, 300), id]).catch(() => {}); });
   return { ok: true, wake_id: id, wakes_today: nth, note: 'The run started; it takes a minute or two. get_agent view runs (since now) shows it.' };
