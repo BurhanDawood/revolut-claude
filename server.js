@@ -10090,6 +10090,15 @@ async function runAgent(trigger = 'scheduled', wake = []) {   // #A2e wake = the
     let watch = [];
     try { const inp = ln.length && ln[0].inputs ? (typeof ln[0].inputs === 'string' ? JSON.parse(ln[0].inputs) : ln[0].inputs) : null; watch = (inp && Array.isArray(inp.watch_next) ? inp.watch_next : []).slice(0, 5); } catch (e) { watch = []; }
     const scr = await agentScreen(cfg, led, woken ? [] : watch, woken ? [...new Set((wake || []).map(a => String(a.symbol).toUpperCase()))] : null);   // #A2f
+    if (!woken) {   // #651 (desk #76 item 4) the "nothing changed" screen - before any research, headline or model call
+      const [ms] = await db.execute("SELECT COUNT(*) AS n FROM agent_alerts WHERE status = 'missed'").catch(() => [[{ n: 0 }]]);
+      const fp = agentFingerprint(eq, scr, cfg, { missed: Number(ms[0] && ms[0].n) || 0, coach: null });
+      if (kind === 'scheduled' && cfg.skip_unchanged !== false) {
+        const why = agentSkipWhy(await agentLastFp(), fp, cfg);
+        if (why === null) { console.log('[agent] #651 scheduled run skipped: nothing changed since the last full run'); return await sit('unchanged'); }
+      }
+      await agentSaveFp(fp);
+    }
     // mentions (videos + headlines) and research for the shortlist
     let headlines = [];
     try { headlines = (await fetchNewsHeadlines(72, 15, 150)).items || []; } catch (e) { headlines = []; }
@@ -10672,12 +10681,16 @@ function agentRunDigest(rows) {   // rows of one run, oldest first
     notes_for_self: first.notes_for_self || null, watch_next: inp.watch_next || null, requests: (inp.requests || []).map(q => q.title),
     screen: input.screen || null, shortlist: short, shortlist_note: watchedIn, model_raw_on_bad_json: inp.model_raw ? String(inp.model_raw).slice(0, 2000) : undefined };
 }
-async function agentMcpView({ view, run_id, coin, limit } = {}) {
+async function agentMcpView({ view, run_id, coin, limit, since } = {}) {
   const v = view || 'status', lim = Math.min(20, Math.max(1, parseInt(limit) || 6));
   if (v === 'status') return { view: v, ...(await agentApiState()), shortlist_rule: AGENT_SHORTLIST_RULE };
   if (v === 'runs' || v === 'run') {
     let ids;
     if (v === 'run' && run_id) ids = [String(run_id)];
+    else if (v === 'runs' && since) {   // #651 (desk #76 item 5) only the runs since a time, for the PM check-ins (up to 20, newest first)
+      const t = Date.parse(String(since)); if (!isFinite(t)) return { view: v, error: 'since must be a date-time, e.g. 2026-11-03T08:30:00Z' };
+      const [r] = await db.execute('SELECT run_id, MAX(id) AS m FROM agent_decisions GROUP BY run_id HAVING MAX(at) >= ? ORDER BY m DESC LIMIT 20', [new Date(t)]); ids = r.map(x => x.run_id);
+    }
     else { const [r] = await db.execute('SELECT run_id, MAX(id) AS m FROM agent_decisions GROUP BY run_id ORDER BY m DESC LIMIT ' + (v === 'run' ? 1 : lim)); ids = r.map(x => x.run_id); }
     const out = [];
     for (const id of ids) {
@@ -24950,6 +24963,7 @@ function createMcpServer() {
       run_id: z.string().optional().describe('For view run'),
       coin: z.string().optional().describe('For view coin, e.g. GRT'),
       limit: z.number().optional().describe('Runs to return / scan (1-20, default 6)'),
+      since: z.string().optional().describe('#651 view runs: only runs since this date-time (ISO, e.g. 2026-11-03T08:30:00Z), up to 20'),
     },
     async (args = {}) => {
       try { return { content: [{ type: 'text', text: JSON.stringify(await agentMcpView(args)) }] }; }
@@ -30834,7 +30848,7 @@ async function agentScorecard() {
   // #552 (Bryan 2 Oct 14:02, pm #52): the clock starts when 549 (cheap routing) ships - system_config 'agent_clock' {start_ms}, set by
   // 549 - and the bar is "30 days AND 10 closed trades, whichever takes longer": everything is measured from the clock start to now,
   // not over a rolling 30 days. Until the clock starts, the figures run from the agent's start and the days test is not met.
-  let clock = null; try { const [ck] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'agent_clock'"); const c = ck.length ? JSON.parse(ck[0].config_value) : null; if (c && Number(c.start_ms) > 0) clock = { start_ms: Number(c.start_ms), note: c.note || null }; } catch (e) { clock = null; }
+  let clock = null; try { const [ck] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'agent_clock'"); const c = ck.length ? JSON.parse(ck[0].config_value) : null; if (c && Number(c.start_ms) > 0) clock = { start_ms: Number(c.start_ms), note: c.note || null, window: c.window || null, restart: Number(c.restart) || null, history: Array.isArray(c.history) ? c.history : [] }; } catch (e) { clock = null; }
   const winStart = clock ? Math.max(started, clock.start_ms) : started, daysRunning = Math.max(0, (now - winStart) / 86400000);
   const budget = Number(led.budget_usd);
   const [daily] = await db.execute("SELECT DATE_FORMAT(d, '%Y-%m-%d') AS d, equity_usd, bench_btc_usd, model_cost_usd FROM agent_equity_daily ORDER BY d");
@@ -30882,6 +30896,7 @@ async function agentScorecard() {
     max_drawdown_pct: f1(dd), closed_trades: closed, model_cost_per_day_usd: costDay == null ? null : Math.round(costDay * 1000) / 1000,
     cost_on_100_pct_per_month: costDay == null ? null : f1(costDay * 30),   // the same bill on a $100 budget, as % of it per month
     hurdle_pct_per_month: costDay == null || !(budget > 0) ? null : f1(costDay * 30 / budget * 100),   // #552 (PM): what the trader must earn a month on its book just to pay for its thinking
+    window_label: clock && clock.window ? 'window ' + clock.window + ' (restart ' + clock.restart + ' of N)' : null, previous_windows: clock && clock.history ? clock.history : [],   // #651 Fable 19 Oct (4): the restart count in his face
     clock: clock ? { started: new Date(clock.start_ms).toISOString(), note: clock.note } : { started: null, note: 'The 30-day clock starts when 549 (cheap model routing) ships (Bryan 2 Oct). Until then these figures run from the agent\'s start.' },
     pm_agent_cost_per_day_usd: bossDays ? Math.round(Number(bc[0].c) / bossDays * 1000) / 1000 : 0,   // #548 the boss's own bill (its budget, not in the paper equity)
     changes_in_window: chg.filter(c => c.status !== 'failed').map(c => ({ id: c.id, at: new Date(Number(c.at)).toISOString(), by: c.by_role, field: c.field, before: jv(c.field, c.before_v), after: jv(c.field, c.after_v), status: c.status })),
@@ -30916,7 +30931,7 @@ async function agentClosedTrades(fromMs) {   // #549 each filled sell in the win
   return out.sort((a, b) => a.id - b.id);
 }
 function agentScoreLine(sc) {
-  return '🎯 Go-live bar: ' + sc.met + ' of ' + sc.of + ' met - ' + sc.bar.map(b => (b.met ? '✓ ' : '✗ ') + b.now).join(' · ') + (sc.hurdle_pct_per_month != null ? ' · cost hurdle ' + sc.hurdle_pct_per_month.toFixed(2) + '%/month' : '') + (sc.per_trade_vs_btc ? ' · per trade: ' + sc.per_trade_vs_btc.verdict : '') + (sc.routing && sc.routing.compared ? ' · screen agrees on entries ' + sc.routing.entry_agreement_pct + '% (' + sc.routing.compared + ')' : '') + (sc.changes_in_window && sc.changes_in_window.length ? ' · ' + sc.changes_in_window.length + ' setting change(s) in the window' : '') + (sc.team_cost_today ? ' · team cost today $' + sc.team_cost_today.total.toFixed(2) + ' of $' + sc.team_cost_today.cap : '');   // #548 #577
+  return '🎯 Go-live bar' + (sc.window_label ? ' (' + sc.window_label + ')' : '') + ': ' + sc.met + ' of ' + sc.of + ' met - ' + sc.bar.map(b => (b.met ? '✓ ' : '✗ ') + b.now).join(' · ') + (sc.hurdle_pct_per_month != null ? ' · cost hurdle ' + sc.hurdle_pct_per_month.toFixed(2) + '%/month' : '') + (sc.per_trade_vs_btc ? ' · per trade: ' + sc.per_trade_vs_btc.verdict : '') + (sc.routing && sc.routing.compared ? ' · screen agrees on entries ' + sc.routing.entry_agreement_pct + '% (' + sc.routing.compared + ')' : '') + (sc.changes_in_window && sc.changes_in_window.length ? ' · ' + sc.changes_in_window.length + ' setting change(s) in the window' : '') + (sc.team_cost_today ? ' · team cost today $' + sc.team_cost_today.total.toFixed(2) + ' of $' + sc.team_cost_today.cap : '');   // #548 #577
 }
 async function agentScoreFlip(sc) {   // a team note for the Claude PM thread when the bar is first met, or lost again
   let was = null;
@@ -31199,6 +31214,70 @@ async function agentPlaybookBryan617() {
   await sendTelegram('🧭 <b>Paper trader playbook replaced</b> as you asked (change ' + ins.insertId + '): borderline setups now get a 10% STARTER buy instead of a pass; full size (up to 25%) stays for clean signals; no self-imposed cap below max_positions; the 2x cost hurdle applies to full size only. Paper only. <code>/agent boss reset playbook</code> clears it.').catch(() => {});
   console.log('[agent] #617 playbook applied for Bryan (change ' + ins.insertId + ')');
 }
+// #651 (desk #72, Bryan 19 Oct 08:44 "Yes restart paper trader"; desk #76 item 1, Bryan 3 Nov) THE V3 WINDOW, once, on paper only.
+// Reset option A (#72 default): the paper positions and cash stay; the go-live clock and the ledger's high-water restart now. The old
+// window's result is kept in agent_clock.history (Fable 19 Oct precision 4: "window v3 (restart 2 of N)", v2 stays visible). Settings at the
+// start: per_trade_pct 10, max_positions 3 (#72), runs_per_day 3 = every 8 h (#76 item 4), route_shadow_every 0 (the shadow Sonnet checks
+// re-count from the clock, so a restart would buy 14 more days of them; #549's measurement is done). Every change is an agent_changes row
+// by 'bryan'. The playbook is #72's v3 text, as Bryan's change (like #617). Nothing here touches AGENT_LIVE_ENABLED or a real order.
+const PB_V3 = "v3 rules (19 Oct). Evidence: starter trades were the only edge (10 trades, 60% beat BTC); trough-catching and full-size bets lost $89, and losers (-9 to -14%) were bigger than winners (+5 to +9%).\n1) STARTER SIZE ONLY (10%). No full-size, no standalone trough entries.\n2) MAX 3 POSITIONS. While drawdown is above 6%, 2 positions and no new entries until a position closes green.\n3) CUT LOSERS: exit on a confirmed hourly close 6-7% below entry, or below the 72h low if that comes first. A wick is not a close.\n4) TIME STOP: not green after 72 h -> exit.\n5) PREFER calm + trending coins with a dated catalyst (PM ideas in watch_next, bz1 >= 60, with calm and trend the main parts) over the biggest 7-day movers. Never chase ROCKET/MIXED with RSI 4h >= 70.\n6) Take profit into strength: trail 8-10% once +8%.\n7) Costs: the round trip is about 1.6%; skip setups whose first target is under +5%.";
+const AGENT_V3 = { per_trade_pct: 10, max_positions: 3, runs_per_day: 3, route_shadow_every: 0 };
+async function agentV3Restart() {
+  const [done] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'agent_v3'");
+  if (done.length) return;
+  const mark = (v) => db.execute("INSERT IGNORE INTO system_config (config_key, config_value) VALUES ('agent_v3', ?)", [String(v).slice(0, 500)]);
+  const led = await readAgentLedger();
+  if (led.mode !== 'paper') { await mark('skipped: ' + led.mode); return; }
+  const p = pmPlaybookClean(PB_V3); if (!p.ok) throw new Error(p.error);
+  const sc = await agentScorecard().catch(() => null), eq = await agentEquity(led), now = Date.now();
+  let old = null; try { const [ck] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'agent_clock'"); old = ck.length ? JSON.parse(ck[0].config_value) : null; } catch (e) { old = null; }
+  const history = (old && Array.isArray(old.history) ? old.history : []).concat([{ window: (old && old.window) || 'v2', from: sc ? sc.window.from : (old && old.start_ms ? new Date(Number(old.start_ms)).toISOString() : null), to: new Date(now).toISOString(),
+    met: sc ? sc.met : null, of: sc ? sc.of : null, return_pct: sc ? sc.return_pct : null, btc_return_pct: sc ? sc.btc_return_pct : null, max_drawdown_pct: sc ? sc.max_drawdown_pct : null, closed_trades: sc ? sc.closed_trades : null, why_ended: 'Bryan restarted it (19 Oct "Yes restart paper trader", #72; built 3 Nov, #76)' }]);
+  const clock = { start_ms: now, window: 'v3', restart: old && Number(old.restart) > 0 ? Number(old.restart) + 1 : 2,   // v1 = the agent's start (25 Sep), v2 = the #549 clock (2 Oct)
+    note: 'v3 (#72): fresh 30-day clock and high-water, reset option A (positions kept). Bryan is the only restart authority.', history };
+  await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('agent_clock', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)", [JSON.stringify(clock)]);
+  await db.execute('UPDATE agent_ledger SET high_water_usd = ? WHERE id = 1', [Number(eq.equity.toFixed(6))]);
+  const stored = await agentConfigStored(), cfgNow = await readAgentConfig(), ids = [];
+  const log = async (field, before, after) => {
+    const [ins] = await db.execute('INSERT INTO agent_changes (at, by_role, field, before_v, after_v, reason, review_id, equity_at, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [Date.now(), 'bryan', field, JSON.stringify(before), JSON.stringify(after), 'Bryan: paper trader v3 (#72, 19 Oct) / v4 cadence (#76, 3 Nov)', null, Number(eq.equity.toFixed(6)), 'applied']);
+    ids.push(ins.insertId);
+  };
+  for (const [f, v] of Object.entries(AGENT_V3)) { if (Number(cfgNow[f]) !== v) { await log(f, Number(cfgNow[f]), v); stored[f] = v; } }
+  const before = String((stored.pm_playbook && stored.pm_playbook.text) || '');
+  if (before !== p.text) { await log('playbook', before, p.text); stored.pm_playbook = { text: p.text, at: new Date().toISOString(), review_id: null }; }
+  try { await agentConfigStore(stored); } catch (e) { if (ids.length) await db.execute('UPDATE agent_changes SET status = \'failed\' WHERE id IN (' + ids.map(() => '?').join(',') + ')', ids).catch(() => {}); throw e; }
+  await mark(JSON.stringify({ at: new Date(now).toISOString(), changes: ids }));
+  const h = history[history.length - 1];
+  await sendTelegram('🔁 <b>Paper trader: window v3 started</b> (restart ' + clock.restart + ', as you asked on 19 Oct).\nOld window ' + escTg(h.window) + ': ' + (h.met == null ? '?' : h.met) + ' of ' + (h.of || 5) + ' met, ' + (h.return_pct == null ? '?' : (h.return_pct >= 0 ? '+' : '') + h.return_pct + '%') + ' vs BTC ' + (h.btc_return_pct == null ? '?' : (h.btc_return_pct >= 0 ? '+' : '') + h.btc_return_pct + '%') + ', worst drop ' + (h.max_drawdown_pct == null ? '?' : h.max_drawdown_pct + '%') + '.\nNew: 30-day clock and high-water from now (positions kept), starter 10% only, max 3 positions, a run every 8 h, v3 playbook. Paper only.').catch(() => {});
+  console.log('[agent] #651 window v3 started (changes ' + ids.join(', ') + ')');
+}
+{ const tv3 = setTimeout(() => { agentV3Restart().catch(e => console.error('[agent] #651 v3 restart:', e.message)); }, 60000); if (tv3.unref) tv3.unref(); }
+// #651 (desk #76 item 4): "nothing changed -> skip". A scheduled run compares the world with the last full run BEFORE any research,
+// headline or model call. It sits ('unchanged', no cost) when: the same coins are held and each is within move_pct of its last-run price,
+// at most new_max coins are new on the shortlist, no alert fired unseen, the PM's playbook/coaching is unchanged, and a full run happened
+// in the last max_gap_h hours. Woken, Telegram and PM-woken runs never skip; held coins keep their own price alerts (agent_alerts).
+const AGENT_UNCHANGED = { move_pct: 3, new_max: 2, max_gap_h: 24 };
+function agentFingerprint(eq, scr, cfg, extra = {}) {
+  const held = {}; for (const [c, m] of Object.entries((eq && eq.marks) || {})) held[c] = Number(m.price) || null;
+  return { at: Date.now(), held, short: ((scr && scr.shortlist) || []).map(r => r.coin).sort(), pb: (cfg && cfg.pm_playbook && cfg.pm_playbook.at) || null, ...extra };
+}
+function agentSkipWhy(last, fp, cfg, nowMs = Date.now()) {   // null = skip; otherwise why it must run (pure, tested)
+  const S = { ...AGENT_UNCHANGED, ...((cfg && cfg.skip) || {}) };
+  if (!last || !last.at) return 'first';
+  if (nowMs - Number(last.at) > S.max_gap_h * 3600000) return 'max_gap';
+  if ((fp.missed || 0) > 0) return 'missed_alerts';
+  if ((fp.pb || null) !== (last.pb || null)) return 'playbook';
+  if ((fp.coach || null) !== (last.coach || null)) return 'coaching';
+  const a = Object.keys(fp.held || {}).sort(), b = Object.keys(last.held || {}).sort();
+  if (a.join(',') !== b.join(',')) return 'holdings';
+  for (const c of a) { const p0 = Number(last.held[c]), p1 = Number(fp.held[c]); if (!(p0 > 0 && p1 > 0) || Math.abs(p1 / p0 - 1) * 100 > S.move_pct) return 'moved:' + c; }
+  const before = new Set(last.short || []), fresh = (fp.short || []).filter(c => !before.has(c));
+  if (fresh.length > S.new_max) return 'shortlist:' + fresh.slice(0, 5).join(',');
+  return null;
+}
+async function agentLastFp() { try { const [r] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'agent_last_fp'"); return r.length ? JSON.parse(r[0].config_value) : null; } catch (e) { return null; } }
+async function agentSaveFp(fp) { await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('agent_last_fp', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)", [JSON.stringify(fp)]).catch(e => console.error('[agent] #651 fingerprint:', e.message)); }
 { const t617 = setTimeout(() => { agentPlaybookBryan617().catch(e => console.error('[agent] #617 playbook:', e.message)); }, 45000); if (t617.unref) t617.unref(); }
 async function pmBossReview(kind = 'weekday') {   // weekday (21:05, only when something changed) | sunday (19:00, deep) | manual (/agent boss run, deep)
   if (_pmBossRunning) return { ok: false, reason: 'a review is already running' };
