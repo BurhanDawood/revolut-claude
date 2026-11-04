@@ -10237,7 +10237,8 @@ async function runAgent(trigger = 'scheduled', wake = [], pmWake = null) {   // 
     }
     if (newReqs.length) await specImportAgentRequests().catch(e => console.error('[desk] agent request import failed:', e.message));   // #D1 requests land in the desk inbox too
     const armedN = await agentArmAlerts(runId, dv.alerts, scr.tick, cfg).catch(e => { console.error('[agent] #A2e arming alerts failed:', e.message); return null; });
-    await watchArmTrader(runId, dv.watch_zones, scr.tick).catch(e => console.error('[agent] #654 watch zones:', e.message));
+    await watchArmTrader(runId, dv.watch_zones, scr.tick, cfg).catch(e => console.error('[agent] #654 watch zones:', e.message));
+    if (coach && coach.input) await watchRearmCoach(scr.tick).catch(e => console.error('[agent] #655 coach re-arm:', e.message));
     const fills = done.filter(d => d.status === 'filled').length, drops = done.filter(d => d.status !== 'filled');
     const after = await agentEquity(await readAgentLedger()).catch(() => null);
     await sendTelegram('🤖 <b>Agent run</b> (' + (woken ? (kind === 'alert_stop' ? '🛑 ' : '') + 'woken: ' + escTg((wake || []).map(agentAlertText).join('; ')) : kind) + ') - ' + (dv.actions.length ? fills + ' filled' + (drops.length ? ', ' + drops.length + ' dropped (' + escTg(drops.map(d => d.a.coin + ' ' + d.reason).join(', ')) + ')' : '') : 'sat out: ' + escTg(String(dv.sit_reason || '').slice(0, 400))) +
@@ -10957,11 +10958,24 @@ async function watchArmCoach(item, tick) {   // a coach_trader idea (run_id 'coa
   return watchArm('coach:' + item.id, item.coin, item.entry_high, item.breakout_above || null, watchWhy('PM idea #' + item.id + ' (zone ' + fmtPriceShort(item.entry_low) + '-' + fmtPriceShort(item.entry_high) + ')', item.why, item.invalidation), item.expires_at, tick);
 }
 async function watchDropCoach(ids) { for (const id of ids) await db.execute("UPDATE agent_alerts SET status = 'replaced' WHERE status = 'armed' AND source = 'watch' AND run_id = ?", ['coach:' + id]); }
-async function watchArmTrader(runId, zones, tick) {   // the trader's own zones replace its previous ones every full run (coach alerts stay)
+async function watchReachable(coin, tick, cfg) {   // #655 review 797 (1): a wake on a coin agentScreen would drop is a wasted wake
+  const t = tick && tick[coin]; if (!t) return false;
+  if (t.spread_pct != null && t.spread_pct > (Number(cfg && cfg.max_spread_pct) || 2)) return false;
+  const inU = await agentUniverseFilter(await readAgentLedger()).catch(() => null);
+  return !inU || !!inU(coin, t.mid);
+}
+async function watchRearmCoach(tick) {   // #655 review 797 (2): an open coach idea whose wake fired (or was never armed because the price sat in the zone) re-arms once the price is back above the zone and 4 h have passed
+  const [rows] = await db.execute("SELECT i.id, i.coin, i.body, i.expires_at FROM pm_coach_items i WHERE i.kind = 'idea' AND i.status = 'open' AND i.expires_at > NOW() AND NOT EXISTS (SELECT 1 FROM agent_alerts a WHERE a.source = 'watch' AND a.status = 'armed' AND a.run_id = CONCAT('coach:', i.id))");
+  let n = 0;
+  for (const r of rows) { if (await watchRecentWake(r.coin)) continue; const b = agentJ(r.body) || {}; n += await watchArmCoach({ id: r.id, coin: r.coin, entry_low: b.entry_low, entry_high: b.entry_high, invalidation: b.invalidation, why: b.why, breakout_above: b.breakout_above || null, expires_at: r.expires_at }, tick); }
+  return n;
+}
+async function watchArmTrader(runId, zones, tick, cfg) {   // the trader's own zones replace its previous ones every full run (coach alerts stay)
   await db.execute("UPDATE agent_alerts SET status = 'replaced' WHERE status = 'armed' AND source = 'watch' AND run_id NOT LIKE 'coach:%'");
   let n = 0;
   for (const z of (zones || []).slice(0, WATCH_WAKE.max_trader)) {
     const no = await pmCoachRefused(z.coin).catch(() => 'unreadable'); if (no) continue;
+    if (!(await watchReachable(z.coin, tick, cfg))) { console.log('[agent] #655 watch zone ' + z.coin + ' not armed: spread or universe keeps it off the shortlist'); continue; }
     n += await watchArm(runId, z.coin, z.entry_high, z.breakout_above || null, watchWhy('your watch zone ' + fmtPriceShort(z.entry_low) + '-' + fmtPriceShort(z.entry_high), z.thesis, z.invalidation), new Date(Date.now() + z.hours * 3600000), tick);
   }
   return n;
