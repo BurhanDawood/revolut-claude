@@ -10669,7 +10669,7 @@ async function agentApiState() {
   try { coinMetaWant(positions.map(p => p.coin)); } catch (e) { /* names and logos fill in on a later load */ }
   const bm = await agentBenchmarks(led).catch(() => null);
   const [al] = await db.execute("SELECT symbol, kind, value, source, why, DATE_FORMAT(expires_at, '%Y-%m-%d %H:%i') AS expires FROM agent_alerts WHERE status = 'armed' ORDER BY id").catch(() => [[]]);   // #A2e
-  const [wk] = await db.execute("SELECT COUNT(DISTINCT run_id) AS n FROM agent_decisions WHERE trigger_kind = 'alert' AND at >= ?", [new Date(agentLondonDayStart())]).catch(() => [[{ n: 0 }]]);
+  const [wk] = await db.execute("SELECT COUNT(DISTINCT run_id) AS n FROM agent_decisions WHERE trigger_kind IN ('alert', 'pm') AND at >= ?", [new Date(agentLondonDayStart())]).catch(() => [[{ n: 0 }]]);
   return { mode: led.mode, stopped: led.stopped, frozen_until: led.frozen_until, halt_reason: led.halt_reason, budget_usd: led.budget_usd, equity: eq.equity, cash: led.cash_usd, realised: led.realised_usd, fees: led.fees_usd, costs: led.model_cost_usd,
     day_start_equity: led.day_start_equity_usd, high_water: led.high_water_usd, positions, benchmarks: bm, runs_today: Number(runs[0].n), last_activity: last[0].at, model: cfg.model,
     alerts: al.map(a => ({ type: agentAlertLabel(a.source), symbol: a.symbol, kind: a.kind, value: Number(a.value), source: a.source, why: a.why, expires: a.expires, text: agentAlertText(a) })), wakes_today: Number(wk[0].n), wakes_per_day: cfg.wakes_per_day,
@@ -10839,19 +10839,22 @@ async function pmWakeTrader({ as, reason, coins } = {}, nowMs = Date.now()) {
   if (led.stopped || led.mode === 'halted') return { ok: false, error: 'the trader is stopped or halted' };
   if (await isAutoExecPaused()) return { ok: false, error: 'trading is paused (/pause) - the run would only sit; not counted' };   // #653 review 1
   if (_agentRunning) return { ok: false, error: 'a run is going now - try again in a few minutes' };
-  const [[d]] = await db.execute('SELECT COUNT(*) AS n, MAX(at) AS last FROM pm_wakes WHERE at >= ?', [new Date(agentLondonDayStart(nowMs))]);
-  if (Number(d.n) >= PM_COACH.wakes_per_day) return { ok: false, error: PM_COACH.wakes_per_day + ' wakes already today (London day)' };
+  const day0 = new Date(agentLondonDayStart(nowMs)), wcfg = { ...AGENT_A2_DEFAULTS, ...(await readAgentConfig()) }, cap = Math.max(0, Math.round(Number(wcfg.wakes_per_day) || 0));   // #656 Bryan 4 Nov: one budget, shared with its own and watch-list wakes
+  const [[dw]] = await db.execute("SELECT COUNT(DISTINCT run_id) AS n FROM agent_decisions WHERE trigger_kind IN ('alert', 'pm') AND at >= ?", [day0]);
+  const [[pw]] = await db.execute('SELECT COUNT(*) AS n FROM pm_wakes WHERE at >= ? AND run_id IS NULL', [day0]);   // a wake still starting has no decision row yet
+  const d = { n: Number(dw.n) + Number(pw.n) };
+  if (d.n >= cap) return { ok: false, error: 'all ' + cap + ' wakes for today are used (shared with the trader\'s own and watch-list wakes)' };
   const [[l]] = await db.execute('SELECT MAX(at) AS last FROM pm_wakes');
   if (l && l.last && nowMs - new Date(l.last).getTime() < PM_COACH.wake_cooldown_min * 60000) return { ok: false, error: 'the last wake was under ' + PM_COACH.wake_cooldown_min + ' minutes ago' };
   const [ins] = await db.execute('INSERT INTO pm_wakes (at, author, reason, coins) VALUES (?, ?, ?, ?)', [new Date(nowMs), as, why, list.join(',') || null]);
   const id = ins.insertId, nth = Number(d.n) + 1;
   if (_agentRunning) { await db.execute('DELETE FROM pm_wakes WHERE id = ?', [id]).catch(() => {}); return { ok: false, error: 'a run started just now - try again in a few minutes; not counted' }; }   // #653 review 4: re-check after the await
   const started = runAgent('pm', [], { reason: why, coins: list, wake_id: id });   // runAgent sets _agentRunning before its first await
-  sendTelegram('⏰ <b>PM woke the paper trader</b> (' + nth + ' of ' + PM_COACH.wakes_per_day + ' today): ' + escTg(why) + (list.length ? ' · ' + escTg(list.join(', ')) : '') + '\n<i>Paper only - the trader decides.</i>').catch(() => {});
+  sendTelegram('⏰ <b>PM woke the paper trader</b> (wake ' + nth + ' of ' + cap + ' today, shared): ' + escTg(why) + (list.length ? ' · ' + escTg(list.join(', ')) : '') + '\n<i>Paper only - the trader decides.</i>').catch(() => {});
   started.then(async (r) => {
     await db.execute('UPDATE pm_wakes SET run_id = ?, outcome = ? WHERE id = ?', [r && r.run_id || null, String(r ? (r.sat ? 'sat: ' + r.sat : r.route ? 'route ' + r.route : 'ran') : 'no result').slice(0, 300), id]).catch(() => {});
   }).catch(async (e) => { await db.execute('UPDATE pm_wakes SET outcome = ? WHERE id = ?', [('failed: ' + e.message).slice(0, 300), id]).catch(() => {}); });
-  return { ok: true, wake_id: id, wakes_today: nth, note: 'The run started; it takes a minute or two. get_agent view runs (since now) shows it.' };
+  return { ok: true, wake_id: id, wakes_today: nth, wakes_per_day: cap, note: 'The run started; it takes a minute or two. get_agent view runs (since now) shows it.' };
 }
 async function pmCoachView() {
   await pmCoachTables();
@@ -11064,7 +11067,7 @@ async function agentAlertTick() {
     }
     if (!fired.length) return { armed: live.length, fired: 0 };
     const cfg = { ...AGENT_A2_DEFAULTS, ...(await readAgentConfig()) };
-    const [w] = await db.execute("SELECT COUNT(DISTINCT run_id) AS n, MAX(at) AS last FROM agent_decisions WHERE trigger_kind = 'alert' AND at >= ?", [new Date(agentLondonDayStart())]);
+    const [w] = await db.execute("SELECT COUNT(DISTINCT run_id) AS n, MAX(at) AS last FROM agent_decisions WHERE trigger_kind IN ('alert', 'pm') AND at >= ?", [new Date(agentLondonDayStart())]);   // #656 PM wakes share the budget and the cooldown
     // #A2f (Fable 26 Sep 00:15) a position alert (its stop_price, the 8% drop) ALWAYS wakes - a stop missed because the day's
     // wakes are spent is the live failure mode; the cap and the cooldown apply to the model's own (discretionary) alerts only.
     const pos = fired.filter(f => f.source !== 'agent' && f.source !== 'watch'), disc = fired.filter(f => f.source === 'agent');
@@ -25226,7 +25229,7 @@ function createMcpServer() {
     }
   );
   server.tool('wake_trader',
-    '#652 The Claude PM thread wakes the PAPER trader for ONE run now (as must be claude_pm), with a reason (<= 300 chars) and up to 5 coins to look at. Use only for: a held paper position at or through its invalidation, a market shock, or a coach_trader idea entering its zone with confirmation. Server limits: 2 a London day, 30 minutes apart, not while a run is going, paper only. Bryan gets a Telegram line. The trader decides; the run is a full Sonnet run (a few cents).',
+    '#652 The Claude PM thread wakes the PAPER trader for ONE run now (as must be claude_pm), with a reason (<= 300 chars) and up to 5 coins to look at. Use only for: a held paper position at or through its invalidation, a market shock, or a coach_trader idea entering its zone with confirmation. Server limits: counted in the trader\'s wakes_per_day (6 a London day), shared with its own and watch-list wakes; 30 minutes apart, not while a run is going, paper only. Bryan gets a Telegram line. The trader decides; the run is a full Sonnet run (a few cents).',
     {
       as: z.enum(['claude_pm']).describe('who is waking it - the Claude PM thread only'),
       reason: z.string().describe('why now (<= 300 chars)'),
