@@ -2133,8 +2133,7 @@ await db.execute(`CREATE TABLE IF NOT EXISTS price_intraday_hourly (
   low_px DECIMAL(20,10) NOT NULL,
   close_px DECIMAL(20,10) NOT NULL,
   sample_count INT NOT NULL,
-  UNIQUE KEY uq_hourly_symbol_hour (symbol, hour_bucket),
-  INDEX idx_hourly_symbol_time (symbol, hour_bucket)
+  UNIQUE KEY uq_hourly_symbol_hour (symbol, hour_bucket)
 )`);
 // #373 DAILY candles from Revolut. Hourly/4h candles are kept ~1 year; daily go back 2.5+ years (probe #372: BTC daily
 // from May 2024) - so the 2024-25 bull run is available at daily resolution. Keyed by the LONDON date, because
@@ -2188,7 +2187,6 @@ await db.execute(`CREATE TABLE IF NOT EXISTS abnormal_events (
   would_alert TINYINT(1) DEFAULT 0,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   UNIQUE KEY uq_abn_symbol_time (symbol, event_at),
-  INDEX idx_abn_symbol_time (symbol, event_at),
   INDEX idx_abn_time (event_at)
 )`);
 // #312 Build 1 (Parts A+B) — DATA ONLY. Catalogue of market regimes and of the mechanisms
@@ -2367,7 +2365,27 @@ await db.execute(`CREATE TABLE IF NOT EXISTS coin_cash_flows (
   journal_id INT NULL,
   UNIQUE KEY unique_journal (journal_id, flow_type)
 )`);
-await db.execute(`CREATE INDEX IF NOT EXISTS idx_cash_flows_symbol ON coin_cash_flows(symbol)`).catch(() => {});
+// #659 (13 Oct system check, data: "CREATE INDEX IF NOT EXISTS is not valid MySQL, so that index never exists"): indexes are added and
+// dropped only after information_schema says whether they exist. Each helper logs and never throws (a boot must not stop on an index).
+async function dbIndexExists(table, name) {
+  const [r] = await db.execute('SELECT 1 FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ? LIMIT 1', [table, name]);
+  return r.length > 0;
+}
+async function safeAddIndex(table, name, cols) {
+  try {
+    if (await dbIndexExists(table, name)) return false;
+    await db.execute('CREATE INDEX `' + name + '` ON `' + table + '` (' + cols + ')');
+    console.log('[migration] #659 index ' + table + '.' + name + ' added'); return true;
+  } catch (e) { console.error('[migration] #659 index ' + table + '.' + name + ':', e.message); return false; }
+}
+async function safeDropDupIndex(table, name, keep) {   // only when the index that covers the same columns (keep) exists
+  try {
+    if (!(await dbIndexExists(table, name)) || !(await dbIndexExists(table, keep))) return false;
+    await db.execute('ALTER TABLE `' + table + '` DROP INDEX `' + name + '`');
+    console.log('[migration] #659 duplicate index ' + table + '.' + name + ' dropped (' + keep + ' covers the same columns)'); return true;
+  } catch (e) { console.error('[migration] #659 drop ' + table + '.' + name + ':', e.message); return false; }
+}
+await safeAddIndex('coin_cash_flows', 'idx_cash_flows_symbol', 'symbol');
 
 await db.execute(`CREATE TABLE IF NOT EXISTS session_state (
   id INT PRIMARY KEY AUTO_INCREMENT,
@@ -3089,6 +3107,12 @@ await db.execute(`CREATE TABLE IF NOT EXISTS claude_api_calls (
   estimated_cost DECIMAL(10,6) DEFAULT 0,
   created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )`).catch(e => console.error('[migration] claude_api_calls:', e.message));
+
+// #659 the system check's other index items: claude_api_calls had none (the team spend reads it by reason and day); two tables carry a
+// plain index on exactly the columns of their own UNIQUE key, which only slows every insert.
+await safeAddIndex('claude_api_calls', 'idx_api_calls_reason_time', 'reason, created_at');
+await safeDropDupIndex('price_intraday_hourly', 'idx_hourly_symbol_time', 'uq_hourly_symbol_hour');
+await safeDropDupIndex('abnormal_events', 'idx_abn_symbol_time', 'uq_abn_symbol_time');
 
 // #657 one model-spend ledger (every Anthropic and Gemini call); kept 400 days (02:25 prune)
 await db.execute(`CREATE TABLE IF NOT EXISTS ai_spend (
@@ -23759,6 +23783,22 @@ cron.schedule('10 9 * * 1', async () => {
 console.log('Cron jobs scheduled: midnight price recording + 9:15 AM daily brief + Monday 9:05 rebalancing check + 10 AM intention outcomes + 10:05 AM rebalance checks + 10:10 AM trade outcome grading (#48) (Europe/London)');   // #645 the old 9 AM briefing, 2-hourly macro news and 9:15 research sweep are off
 
 const app = express();
+// #659 (13 Oct system check, reliability: "routes that call the database have no try/catch, and there is no error middleware"). Express 4
+// does not catch a rejected promise from an async handler: today it becomes an unhandled rejection, which ends the process (Node 15+).
+// Every handler registered through app.METHOD / app.use is wrapped so a rejection goes to next(err) and the error handler at the end
+// answers 500 and logs it. Handlers with 4 arguments (error handlers), sub-apps and routers mounted as apps are left exactly as they are.
+{
+  const wrapH = (h) => {
+    if (typeof h !== 'function' || h.length >= 4 || typeof h.handle === 'function' || typeof h.set === 'function') return h;
+    const w = function (req, res, next) { let r; try { r = h.call(this, req, res, next); } catch (e) { return next(e); } if (r && typeof r.then === 'function') r.then(null, next); return r; };
+    return w;
+  };
+  const wrapArgs = (args) => args.map(a => Array.isArray(a) ? a.map(wrapH) : wrapH(a));
+  for (const m of ['get', 'post', 'put', 'patch', 'delete', 'all', 'use']) {
+    const orig = app[m].bind(app);
+    app[m] = (...args) => (m === 'get' && args.length === 1 && typeof args[0] === 'string') ? orig(...args) : orig(...wrapArgs(args));   // app.get('setting') reads a setting
+  }
+}
 app.use(cors());
 app.use(express.json());
 // #642 (13 Oct system check, security): every page may be framed only by our own pages (the /app shell frames its tabs; the Android
@@ -29918,7 +29958,10 @@ const mcpHandler = async (req, res) => {
   await transport.handleRequest(req, res, req.body);
   await server.close();
 };
-if (MCP_PATH_SECRET) {
+if (MCP_PATH_SECRET && MCP_PATH_SECRET.length < 32) {   // #659 (13 Oct system check, security #1): a short secret is refused, fail closed
+  console.error('[mcp] #659 MCP_PATH_SECRET is ' + MCP_PATH_SECRET.length + ' characters - at least 32 needed. The connector endpoint is DISABLED.');
+  setTimeout(() => sendTelegram('🔐 The Claude connector is switched off: its secret in Railway is shorter than 32 characters. Set a longer MCP_PATH_SECRET in Railway and update the connector URL.').catch(() => {}), 30000);
+} else if (MCP_PATH_SECRET) {
   app.post('/mcp-' + MCP_PATH_SECRET, mcpHandler);
   console.log('[mcp] endpoint registered (secret path only, len=' + MCP_PATH_SECRET.length + '; legacy /mcp removed -- #186 sealed)');
 } else {
@@ -37121,6 +37164,25 @@ process.on('SIGTERM', async () => {
   try { httpServer.close(); } catch (e) {}
   try { await Promise.race([db.end(), new Promise(r => setTimeout(r, 3000))]); } catch (e) {}
   process.exit(0);
+});
+// #659 the one error handler: a route that throws or rejects is logged with its path and answered 500 (once a reply has started, the
+// connection is left to Express). The message goes in the log, not to the caller.
+let _routeErrN = 0;
+app.use((err, req, res, next) => {
+  _routeErrN++;
+  console.error('[route] #659 ' + req.method + ' ' + String(req.path || '').replace(/^\/(mcp-|h\/)[^/]+/, '/$1***') + ' failed (' + _routeErrN + ' since boot):', err && err.message ? err.message : err);
+  if (res.headersSent) return next(err);
+  res.status(500).json({ error: 'server error' });
+});
+// #659 a promise that rejects with nobody waiting no longer ends the process (Node's default since 15): it is logged and reported once per
+// 10 min on Telegram. 20 or more in 10 minutes means something is stuck in a loop, so the process exits and Railway restarts it, as before.
+const _unhandled = { times: [], told: 0 };
+process.on('unhandledRejection', (reason) => {
+  const now = Date.now(), msg = String((reason && reason.stack) || reason).split('\n').slice(0, 3).join(' | ').slice(0, 300);
+  _unhandled.times = _unhandled.times.filter(t => now - t < 600000); _unhandled.times.push(now);
+  console.error('[process] #659 unhandled rejection (' + _unhandled.times.length + ' in 10 min):', msg);
+  if (now - _unhandled.told > 600000) { _unhandled.told = now; sendTelegram('⚠️ Server: an error went unhandled (logged, server still running): ' + escTg(msg.slice(0, 160))).catch(() => {}); }
+  if (_unhandled.times.length >= 20) { console.error('[process] #659 20 unhandled rejections in 10 min - exiting so Railway restarts the server'); setTimeout(() => process.exit(1), 2000); }
 });
 const httpServer = app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
