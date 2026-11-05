@@ -104,18 +104,18 @@
 
     <!--
       The clock block in the middle of the screen: the time (the largest; 13:24 or 1:24 as the watch is set, the same in
-      always-on) and the date small under it ("Wed 14 Oct"), over the line and its fill with a soft dark shadow.
+      always-on; Bryan 5 Nov 16:52: thicker and wider - BOLD 124, always-on NORMAL 124, was NORMAL/THIN 104) and the date small under it ("Wed 14 Oct"), over the line and its fill with a soft dark shadow.
     -->
-    <Group name="time" x="0" y="168" width="450" height="110">
+    <Group name="time" x="0" y="146" width="450" height="132">
       <Variant mode="AMBIENT" target="alpha" value="0" />
       <Condition>
         <Expressions>
           <Expression name="h24">[IS_24_HOUR_MODE]</Expression>
         </Expressions>
         <Compare expression="h24">
-          <PartText x="0" y="0" width="450" height="110">
+          <PartText x="0" y="0" width="450" height="132">
             <Text align="CENTER" ellipsis="FALSE">
-              <Font family="SYNC_TO_DEVICE" size="104" weight="NORMAL" color="#ffffffff">
+              <Font family="SYNC_TO_DEVICE" size="124" weight="BOLD" color="#ffffffff">
                 <Shadow color="#cc000000" offsetX="0" offsetY="2" radius="7" />
                 <Template>%s:%s<Parameter expression="[HOUR_0_23_Z]" /><Parameter expression="[MINUTE_Z]" /></Template>
               </Font>
@@ -123,9 +123,9 @@
           </PartText>
         </Compare>
         <Default>
-          <PartText x="0" y="0" width="450" height="110">
+          <PartText x="0" y="0" width="450" height="132">
             <Text align="CENTER" ellipsis="FALSE">
-              <Font family="SYNC_TO_DEVICE" size="104" weight="NORMAL" color="#ffffffff">
+              <Font family="SYNC_TO_DEVICE" size="124" weight="BOLD" color="#ffffffff">
                 <Shadow color="#cc000000" offsetX="0" offsetY="2" radius="7" />
                 <Template>%s:%s<Parameter expression="[HOUR_1_12]" /><Parameter expression="[MINUTE_Z]" /></Template>
               </Font>
@@ -135,26 +135,26 @@
       </Condition>
     </Group>
 
-    <!-- always-on: the same clock, thin and light -->
-    <Group name="timeAmbient" x="0" y="168" width="450" height="110" alpha="0">
+    <!-- always-on: the same clock, regular weight and light grey (was thin until 5 Nov) -->
+    <Group name="timeAmbient" x="0" y="146" width="450" height="132" alpha="0">
       <Variant mode="AMBIENT" target="alpha" value="255" />
       <Condition>
         <Expressions>
           <Expression name="h24">[IS_24_HOUR_MODE]</Expression>
         </Expressions>
         <Compare expression="h24">
-          <PartText x="0" y="0" width="450" height="110">
+          <PartText x="0" y="0" width="450" height="132">
             <Text align="CENTER" ellipsis="FALSE">
-              <Font family="SYNC_TO_DEVICE" size="104" weight="THIN" color="#ffdddddd">
+              <Font family="SYNC_TO_DEVICE" size="124" weight="NORMAL" color="#ffdddddd">
                 <Template>%s:%s<Parameter expression="[HOUR_0_23_Z]" /><Parameter expression="[MINUTE_Z]" /></Template>
               </Font>
             </Text>
           </PartText>
         </Compare>
         <Default>
-          <PartText x="0" y="0" width="450" height="110">
+          <PartText x="0" y="0" width="450" height="132">
             <Text align="CENTER" ellipsis="FALSE">
-              <Font family="SYNC_TO_DEVICE" size="104" weight="THIN" color="#ffdddddd">
+              <Font family="SYNC_TO_DEVICE" size="124" weight="NORMAL" color="#ffdddddd">
                 <Template>%s:%s<Parameter expression="[HOUR_1_12]" /><Parameter expression="[MINUTE_Z]" /></Template>
               </Font>
             </Text>
