@@ -61,16 +61,21 @@ function aiSpendUsd(model, u) {   // (pure, tested)
   const usd = (x('in') * p[0] + x('out') * p[1] + x('cache_read') * p[0] * 0.1 + x('cache_write') * p[0] * 1.25) / 1e6 + x('searches') * 0.01;
   return { usd: Number(usd.toFixed(6)), priced };
 }
-function aiSpendJob(stack) {   // the first stack frame outside the wrappers: its function name, else its line (pure, tested)
+// #658 (Bryan's first /spend, 5 Nov 12:19: "once $0.23 ... call $0.02"): a small inner helper (pmBossCall's `once`, agentGeminiResearch's
+// `call`) or an unnamed callback is not the job - the first NAMED, non-helper frame further out is. The helper or line stays the fallback.
+const AI_JOB_HELPER = /^(once|call|run|attempt|go|fn|ask|send|exec|step|retry|inner|request|doCall|tryOnce|callModel|callOnce)$/;
+function aiSpendJob(stack) {   // the first named frame outside the wrappers that is not a small helper; else the first helper name or line (pure, tested)
   const lines = String(stack || '').split('\n').slice(1).map(s => s.trim()).filter(s => s.startsWith('at '));
+  let fallback = null;
   for (const l of lines) {
     if (/anthropic\.messages\.create|globalThis\.fetch|aiFetch|node:internal|node_modules/.test(l)) continue;
     const fn = l.match(/^at (?:async )?([\w$.<>\[\] ]+?) \(/), ln = l.match(/:(\d+):\d+\)?$/);
     const name = fn ? fn[1].replace(/^Object\.|^Timeout\./, '') : null;
-    if (name && !/^(new Promise|Promise|<anonymous>|process\.processTicksAndRejections)$/.test(name)) return name.slice(0, 60);
-    return ln ? 'line ' + ln[1] : 'unknown';
+    const named = name && !/^(new Promise|Promise|<anonymous>|process\.processTicksAndRejections)$/.test(name);
+    if (named && !AI_JOB_HELPER.test(name)) return name.slice(0, 60);
+    if (!fallback) fallback = named ? name.slice(0, 60) : (ln ? 'line ' + ln[1] : null);
   }
-  return 'unknown';
+  return fallback || 'unknown';
 }
 let _aiSpendFails = 0;
 function aiSpendNote(provider, model, job, raw) {   // never throws, never awaited by the call it measures
