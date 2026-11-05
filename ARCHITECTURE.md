@@ -315,7 +315,7 @@ Alert families and a separate BROAD MARKET MOVE cooldown (#512, #513); fixed tar
 
 ### 3.6 Model and cost controls
 
-Capped before every call: PM watch $3/day, PM boss $1/day, team tasks $6/day, PM chat $2/day, desk $3/day ($1.50/spec), senior $2/day. Paper trader: run and wake counts (no $ cap). Alert analyses (Sonnet 4.6) are limited per coin per hour in memory only, and Telegram free-text chat has no cap (§7). Spend is recorded in several tables (`claude_api_calls`, `agent_decisions`, `pm_boss_reviews`, `pm_chat`, `spec_messages`, …); there is no single daily total yet (desk #55).
+Capped before every call: PM watch $3/day, PM boss $1/day, team tasks $6/day, PM chat $2/day, desk $3/day ($1.50/spec), senior $2/day. Paper trader: run and wake counts (no $ cap). Alert analyses (Sonnet 4.6) are limited per coin per hour in memory only, and Telegram free-text chat has no cap (§7). Spend is recorded in several tables (`claude_api_calls`, `agent_decisions`, `pm_boss_reviews`, `pm_chat`, `spec_messages`, …). **Since #657 there is one ledger, `ai_spend`** (system check G1, desk #55 first step): the Anthropic client wrapper (the #572 credit watcher) and a `fetch` wrapper for Gemini `:generateContent` write one row per call - provider, model, job (the calling function's name from the stack, else its line), input/output/cache tokens, web searches, estimated $ at `AI_PRICES` (cache read 0.1x, write 1.25x input, search $0.01; an unknown model is guessed and flagged `priced = 0`). The write is never awaited by the call and a failure is only logged. Read it with `/spend` (Telegram), `GET /api/spend?days=` and the `get_spend` connector tool (today by provider/model/job, daily totals, 7/30-day average, a month at the 7-day rate, and `older_tables_today` from `teamSpendToday` for comparison). Kept 400 days (02:25 prune). Records only: the daily caps for alert analyses, Telegram chat and the paper trader, and one models list, are G2.
 
 ## 4. Key Design Decisions (and why)
 
@@ -459,6 +459,7 @@ The **`dev_log`** and the spec desk are the live boards. Open after the 13 Oct s
 
 | Batch | Date | What changed |
 | --- | --- | --- |
+| #657 | 2026-11-05 | One model-spend ledger (13 Oct system check G1, desk #55 first step; Bryan 5 Nov 08:39): every Anthropic and Gemini call writes an `ai_spend` row (model, job, tokens, searches, estimated $); `/spend`, `GET /api/spend` and `get_spend` show today by job, daily totals and a month at the current rate. Records only. |
 | #656 | 2026-11-04 | PM wakes share the trader's wakes_per_day (6) with its own and watch-list wakes, instead of their own 2 a day (Bryan 4 Nov 19:31, the PM's recommendation); get_agent status counts them. Paper only. |
 | #655 | 2026-11-04 | Senior-review fixes to 654: the trader's watch zones are armed only for coins its screen can reach (spread, universe); open PM ideas re-arm their watch wake after each full run once the price is back above the zone (4 h per coin). Paper only. |
 | #654 | 2026-11-03 | Watch-list wakes (desk #76 addition): coach ideas and the trader's own watch zones arm paper wake alerts (zone top, optional breakout), counted in wakes_per_day, one per coin per 4 h; alerts labelled position / trader / watch-list in get_agent status; scorecard by_source (PM idea vs trader's own); playbook patch versioned in agent_changes as `pm`. Paper only. |

@@ -28,6 +28,8 @@ let _anthCreditOut = null;
   const _anthCreate = anthropic.messages.create.bind(anthropic.messages);
   anthropic.messages.create = function (...args) {
     const p = _anthCreate(...args);
+    const job = aiSpendJob(new Error().stack), m0 = args[0] && args[0].model;   // #657 who asked (the calling function), taken now while it is on the stack
+    p.then((msg) => { aiSpendNote('anthropic', (msg && msg.model) || m0, job, msg && msg.usage); }, () => {});
     p.then(() => {
       if (_anthCreditOut) { const mins = Math.round((Date.now() - _anthCreditOut) / 60000); _anthCreditOut = null; console.log('[anthropic] #572 credit back after ' + mins + ' min'); sendTelegram('\u2705 Anthropic API credit is working again (out for about ' + mins + ' min).').catch(() => {}); }
     }, (e) => {
@@ -40,6 +42,50 @@ let _anthCreditOut = null;
   };
 }
 
+// #657 (13 Oct system check, Costs #1 / batch G1; desk #55 first step; Bryan 5 Nov 08:39 "Let's do one now"): ONE ledger of model spend.
+// Every Anthropic call (the wrapper above) and every Gemini call (one line after each of the 7 call sites parses its answer) writes one ai_spend row: provider, model,
+// job (the function that made the call), tokens, web searches and an estimated $ at the prices in AI_PRICES. Records only: it caps
+// nothing yet (G2), and the older per-feature cost columns stay as they are. A failed write never touches the call it measures.
+const AI_PRICES = {   // $ per million tokens [input, output]; cache read = 0.1 x input, cache write = 1.25 x input; web search $0.01 each
+  'claude-haiku-4-5': [1, 5], 'claude-sonnet-4-6': [3, 15], 'claude-sonnet-5': [3, 15], 'claude-fable-5-1': [10, 50], 'gemini-3.8-flash': [0.5, 3] };
+function aiPrice(model) {   // exact name, then the name without a date suffix, then the longest known prefix
+  const m = String(model || '').toLowerCase().replace(/^models\//, '');
+  if (AI_PRICES[m]) return { p: AI_PRICES[m], priced: true };
+  const b = m.replace(/-\d{8}$/, ''); if (AI_PRICES[b]) return { p: AI_PRICES[b], priced: true };
+  const k = Object.keys(AI_PRICES).filter(x => m.startsWith(x)).sort((a, c) => c.length - a.length)[0];
+  if (k) return { p: AI_PRICES[k], priced: true };
+  return { p: /gemini/.test(m) ? [0.5, 3] : [3, 15], priced: false };   // unknown: a middle guess, flagged
+}
+function aiSpendUsd(model, u) {   // (pure, tested)
+  const { p, priced } = aiPrice(model), x = (k) => Math.max(0, Number(u && u[k]) || 0);
+  const usd = (x('in') * p[0] + x('out') * p[1] + x('cache_read') * p[0] * 0.1 + x('cache_write') * p[0] * 1.25) / 1e6 + x('searches') * 0.01;
+  return { usd: Number(usd.toFixed(6)), priced };
+}
+function aiSpendJob(stack) {   // the first stack frame outside the wrappers: its function name, else its line (pure, tested)
+  const lines = String(stack || '').split('\n').slice(1).map(s => s.trim()).filter(s => s.startsWith('at '));
+  for (const l of lines) {
+    if (/anthropic\.messages\.create|globalThis\.fetch|aiFetch|node:internal|node_modules/.test(l)) continue;
+    const fn = l.match(/^at (?:async )?([\w$.<>\[\] ]+?) \(/), ln = l.match(/:(\d+):\d+\)?$/);
+    const name = fn ? fn[1].replace(/^Object\.|^Timeout\./, '') : null;
+    if (name && !/^(new Promise|Promise|<anonymous>|process\.processTicksAndRejections)$/.test(name)) return name.slice(0, 60);
+    return ln ? 'line ' + ln[1] : 'unknown';
+  }
+  return 'unknown';
+}
+let _aiSpendFails = 0;
+function aiSpendNote(provider, model, job, raw) {   // never throws, never awaited by the call it measures
+  try {
+    if (!raw) return;
+    const u = provider === 'gemini'
+      ? { in: raw.promptTokenCount, out: (Number(raw.candidatesTokenCount) || 0) + (Number(raw.thoughtsTokenCount) || 0), cache_read: raw.cachedContentTokenCount }
+      : { in: raw.input_tokens, out: raw.output_tokens, cache_read: raw.cache_read_input_tokens, cache_write: raw.cache_creation_input_tokens, searches: raw.server_tool_use && raw.server_tool_use.web_search_requests };
+    if (provider === 'gemini' && u.cache_read) u.in = Math.max(0, (Number(u.in) || 0) - Number(u.cache_read));   // Gemini counts cached tokens inside the prompt
+    const c = aiSpendUsd(model, u), n = (k) => Math.round(Math.max(0, Number(u[k]) || 0));
+    db.execute('INSERT INTO ai_spend (at, provider, model, job, in_tok, out_tok, cache_read_tok, cache_write_tok, searches, usd, priced) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [new Date(), provider, String(model || '?').slice(0, 60), String(job || 'unknown').slice(0, 60), n('in'), n('out'), n('cache_read'), n('cache_write'), n('searches'), c.usd, c.priced ? 1 : 0])
+      .catch(e => { if (_aiSpendFails++ % 50 === 0) console.error('[spend] #657 ledger write failed (' + _aiSpendFails + '):', e.message); });
+  } catch (e) { if (_aiSpendFails++ % 50 === 0) console.error('[spend] #657 ledger note failed:', e.message); }   // e.g. a call before the pool exists
+}
 // FIX 3: Verify API key present at startup
 if (!process.env.ANTHROPIC_API_KEY) {
   console.error('[startup] WARNING: ANTHROPIC_API_KEY not set — Claude analysis will fail silently');
@@ -3038,6 +3084,13 @@ await db.execute(`CREATE TABLE IF NOT EXISTS claude_api_calls (
   estimated_cost DECIMAL(10,6) DEFAULT 0,
   created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )`).catch(e => console.error('[migration] claude_api_calls:', e.message));
+
+// #657 one model-spend ledger (every Anthropic and Gemini call); kept 400 days (02:25 prune)
+await db.execute(`CREATE TABLE IF NOT EXISTS ai_spend (
+  id BIGINT AUTO_INCREMENT PRIMARY KEY, at DATETIME NOT NULL, provider VARCHAR(12) NOT NULL, model VARCHAR(60) NOT NULL, job VARCHAR(60) NOT NULL,
+  in_tok INT NOT NULL DEFAULT 0, out_tok INT NOT NULL DEFAULT 0, cache_read_tok INT NOT NULL DEFAULT 0, cache_write_tok INT NOT NULL DEFAULT 0,
+  searches INT NOT NULL DEFAULT 0, usd DECIMAL(10,6) NOT NULL DEFAULT 0, priced TINYINT NOT NULL DEFAULT 1, INDEX idx_ai_spend_at (at)
+)`).catch(e => console.error('[migration] #657 ai_spend:', e.message));
 
 // Track manually deleted auto-rules so seeding logic never recreates them
 await db.execute(`CREATE TABLE IF NOT EXISTS deleted_rules_log (
@@ -9906,6 +9959,7 @@ async function agentGeminiResearch(coin, feedNotes) {
     try { r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent', { method: 'POST', signal: ctl.signal, headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key }, body: JSON.stringify(body) }); raw = await r.text(); }
     finally { clearTimeout(to); }
     let j = null; try { j = JSON.parse(raw); } catch (e) { j = null; }
+    aiSpendNote('gemini', (j && j.modelVersion) || model, aiSpendJob(new Error().stack), j && j.usageMetadata);   // #657 the spend ledger
     if (!r.ok) { const err = new Error('Gemini HTTP ' + r.status + ': ' + String((j && j.error && j.error.message) || raw || '').slice(0, 140)); err.status = r.status; throw err; }
     const cand = j && Array.isArray(j.candidates) ? j.candidates[0] : null;
     const text = (cand && cand.content && Array.isArray(cand.content.parts) ? cand.content.parts : []).filter(p => p && typeof p.text === 'string' && !p.thought).map(p => p.text).join('').trim();
@@ -11347,6 +11401,7 @@ async function specGeminiCall(system, user, cfg) {
   try { r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent', { method: 'POST', signal: ctl.signal, headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key }, body: JSON.stringify(body) }); raw = await r.text(); }
   finally { clearTimeout(to); }
   let j = null; try { j = JSON.parse(raw); } catch (e) {}
+  aiSpendNote('gemini', (j && j.modelVersion) || model, aiSpendJob(new Error().stack), j && j.usageMetadata);   // #657 the spend ledger
   if (!r.ok) throw new Error('Gemini HTTP ' + r.status + ': ' + String((j && j.error && j.error.message) || raw || '').slice(0, 160));
   const cand = j && Array.isArray(j.candidates) ? j.candidates[0] : null;
   const text = (cand && cand.content && Array.isArray(cand.content.parts) ? cand.content.parts : []).filter(p => p && typeof p.text === 'string' && !p.thought).map(p => p.text).join('').trim();
@@ -14883,6 +14938,7 @@ FORMAT (exactly this layout)
     throw new Error(e && e.name === 'AbortError' ? 'Gemini timed out after 60 s' : 'Gemini request failed: ' + (e && e.message));
   } finally { clearTimeout(to); }
   let j = null; try { j = JSON.parse(raw); } catch (e) { j = null; }
+  aiSpendNote('gemini', (j && j.modelVersion) || model, aiSpendJob(new Error().stack), j && j.usageMetadata);   // #657 the spend ledger
   if (!r.ok) throw new Error('Gemini HTTP ' + r.status + (r.status === 429 ? ' (rate limit or quota)' : '') + ': ' + String((j && j.error && j.error.message) || raw || '').slice(0, 200));
   const cand = j && Array.isArray(j.candidates) ? j.candidates[0] : null;
   const parts = cand && cand.content && Array.isArray(cand.content.parts) ? cand.content.parts : [];
@@ -21908,6 +21964,7 @@ async function geminiVideoNotes(videoId) {
     throw new Error(e && e.name === 'AbortError' ? 'Gemini timed out after 180 s' : 'Gemini request failed: ' + (e && e.message));
   } finally { clearTimeout(to); }
   let j = null; try { j = JSON.parse(raw); } catch (e) { j = null; }
+  aiSpendNote('gemini', (j && j.modelVersion) || model, aiSpendJob(new Error().stack), j && j.usageMetadata);   // #657 the spend ledger
   if (!r.ok) throw new Error('Gemini HTTP ' + r.status + (r.status === 429 ? ' (rate limit or quota)' : '') + ': ' + String((j && j.error && j.error.message) || raw || '').slice(0, 160));
   const cand = j && Array.isArray(j.candidates) ? j.candidates[0] : null;
   const parts = cand && cand.content && Array.isArray(cand.content.parts) ? cand.content.parts : [];
@@ -22012,6 +22069,7 @@ async function geminiVideoTranscript(videoId) {
     throw new Error(e && e.name === 'AbortError' ? 'Gemini timed out after 300 s' : 'Gemini request failed: ' + (e && e.message));
   } finally { clearTimeout(to); }
   let j = null; try { j = JSON.parse(raw); } catch (e) { j = null; }
+  aiSpendNote('gemini', (j && j.modelVersion) || model, aiSpendJob(new Error().stack), j && j.usageMetadata);   // #657 the spend ledger
   if (!r.ok) throw new Error('Gemini HTTP ' + r.status + (r.status === 429 ? ' (rate limit or quota)' : '') + ': ' + String((j && j.error && j.error.message) || raw || '').slice(0, 160));
   const cand = j && Array.isArray(j.candidates) ? j.candidates[0] : null;
   const parts = cand && cand.content && Array.isArray(cand.content.parts) ? cand.content.parts : [];
@@ -22133,6 +22191,7 @@ async function geminiFindMoment(videoId, label) {
   } catch (e) { throw new Error(e && e.name === 'AbortError' ? 'Gemini timed out after 180 s' : 'Gemini request failed: ' + (e && e.message)); }
   finally { clearTimeout(to); }
   let j = null; try { j = JSON.parse(raw); } catch (e) { j = null; }
+  aiSpendNote('gemini', (j && j.modelVersion) || model, aiSpendJob(new Error().stack), j && j.usageMetadata);   // #657 the spend ledger
   if (!r.ok) throw new Error('Gemini HTTP ' + r.status + (r.status === 429 ? ' (rate limit or quota)' : '') + ': ' + String((j && j.error && j.error.message) || raw || '').slice(0, 160));
   const cand = j && Array.isArray(j.candidates) ? j.candidates[0] : null;
   const text = (cand && cand.content && Array.isArray(cand.content.parts) ? cand.content.parts : []).filter(p => p && typeof p.text === 'string' && !p.thought).map(p => p.text).join('').trim();
@@ -22205,6 +22264,7 @@ async function geminiGenerateText(prompt, opts = {}) {
     throw new Error(e && e.name === 'AbortError' ? 'Gemini timed out after ' + Math.round(ms / 1000) + ' s' : 'Gemini request failed: ' + (e && e.message));
   } finally { clearTimeout(to); }
   let j = null; try { j = JSON.parse(raw); } catch (e) { j = null; }
+  aiSpendNote('gemini', (j && j.modelVersion) || model, aiSpendJob(new Error().stack), j && j.usageMetadata);   // #657 the spend ledger
   if (!r.ok) throw new Error('Gemini HTTP ' + r.status + (r.status === 429 ? ' (rate limit or quota)' : '') + ': ' + String((j && j.error && j.error.message) || raw || '').slice(0, 160));
   const cand = j && Array.isArray(j.candidates) ? j.candidates[0] : null;
   const parts = cand && cand.content && Array.isArray(cand.content.parts) ? cand.content.parts : [];
@@ -23553,7 +23613,49 @@ async function pruneHourlyBySymbol(days) {
 cron.schedule('25 2 * * *', async () => {
   try { await pruneHourlyBySymbol(HOURLY_KEEP_DAYS); } catch (e) { console.error('[hourly] #645 prune error:', e.message); }
   try { await pruneByIdTime('abnormal_events', 'event_at', ABN_KEEP_DAYS, 'abnormal'); } catch (e) { console.error('[abnormal] #645 prune error:', e.message); }
+  try { await pruneByIdTime('ai_spend', 'at', 400, 'spend'); } catch (e) { console.error('[spend] #657 prune error:', e.message); }
 }, { timezone: 'Europe/London' });
+
+// #657 the spend summary: today (London day) by provider, model and job; one total a day; 7- and 30-day averages; a month at that rate.
+// `older_tables_today` is teamSpendToday's figure from the per-feature tables, so the two can be compared while G2 is built.
+async function aiSpendSummary(daysIn) {
+  const days = Math.min(90, Math.max(1, Math.round(Number(daysIn) || 14))), day0 = new Date(agentLondonDayStart());
+  const [[t]] = await db.execute('SELECT COALESCE(SUM(usd), 0) AS usd, COUNT(*) AS calls, COALESCE(SUM(priced = 0), 0) AS unpriced FROM ai_spend WHERE at >= ?', [day0]);
+  const [byP] = await db.execute('SELECT provider, COUNT(*) AS calls, SUM(usd) AS usd FROM ai_spend WHERE at >= ? GROUP BY provider ORDER BY usd DESC', [day0]);
+  const [byM] = await db.execute('SELECT model, COUNT(*) AS calls, SUM(usd) AS usd, MIN(priced) AS priced FROM ai_spend WHERE at >= ? GROUP BY model ORDER BY usd DESC', [day0]);
+  const [byJ] = await db.execute('SELECT job, COUNT(*) AS calls, SUM(usd) AS usd FROM ai_spend WHERE at >= ? GROUP BY job ORDER BY usd DESC LIMIT 15', [day0]);
+  const [hours] = await db.execute("SELECT MIN(at) AS t, COUNT(*) AS calls, SUM(usd) AS usd FROM ai_spend WHERE at >= ? GROUP BY DATE_FORMAT(at, '%Y-%m-%d %H')", [new Date(agentLondonDayStart(day0.getTime() - (days - 1) * 86400000))]);
+  const perDay = aiSpendDays(hours);   // London offsets are whole hours, so hourly groups fall in one London day each
+  const [[first]] = await db.execute('SELECT MIN(at) AS at FROM ai_spend');
+  const full = perDay.filter(r => r.day < new Date().toLocaleDateString('en-CA', { timeZone: 'Europe/London' }));   // whole days only
+  const avg = (n) => { const r = full.slice(-n); return r.length ? Number((r.reduce((a, x) => a + Number(x.usd), 0) / r.length).toFixed(2)) : null; };
+  const a7 = avg(7), a30 = avg(30), r2 = (x) => Number(Number(x || 0).toFixed(4));
+  const older = await teamSpendToday().catch(() => null);
+  return { today_usd: r2(t.usd), today_calls: Number(t.calls), unpriced_calls_today: Number(t.unpriced),
+    by_provider: byP.map(r => ({ provider: r.provider, calls: Number(r.calls), usd: r2(r.usd) })),
+    by_model: byM.map(r => ({ model: r.model, calls: Number(r.calls), usd: r2(r.usd), priced: Number(r.priced) === 1 })),
+    by_job: byJ.map(r => ({ job: r.job, calls: Number(r.calls), usd: r2(r.usd) })),
+    per_day: perDay.map(r => ({ day: r.day, calls: Number(r.calls), usd: r2(r.usd) })),
+    avg_per_day_7d: a7, avg_per_day_30d: a30, month_at_7d_rate: a7 == null ? null : Number((a7 * 30).toFixed(0)),
+    full_days_recorded: full.length, recording_since: first && first.at ? new Date(first.at).toISOString() : null,
+    older_tables_today: older ? older.total : null,
+    note: 'Estimates at the prices in AI_PRICES (cache read 0.1x, cache write 1.25x input; web search $0.01). Every Anthropic and Gemini call since #657. Records only: nothing is capped by this yet.' };
+}
+function aiSpendDays(hours) {   // hourly groups -> one row per London day (pure, tested)
+  const m = new Map();
+  for (const h of hours || []) { const day = new Date(h.t).toLocaleDateString('en-CA', { timeZone: 'Europe/London' }), r = m.get(day) || { day, calls: 0, usd: 0 }; r.calls += Number(h.calls) || 0; r.usd += Number(h.usd) || 0; m.set(day, r); }
+  return [...m.values()].sort((a, b) => a.day < b.day ? -1 : 1);
+}
+function aiSpendText(s) {   // the /spend reply (pure, tested)
+  const $ = (x) => '$' + Number(x || 0).toFixed(2);
+  const lines = ['💸 <b>Model spend today</b>: ' + $(s.today_usd) + ' in ' + s.today_calls + ' call' + (s.today_calls === 1 ? '' : 's') +
+    (s.by_provider.length ? ' (' + s.by_provider.map(p => (p.provider === 'anthropic' ? 'Claude ' : 'Gemini ') + $(p.usd)).join(', ') + ')' : '')];
+  if (s.by_job.length) lines.push('Top: ' + s.by_job.slice(0, 5).map(j => escTg(j.job) + ' ' + $(j.usd)).join(' · '));
+  if (s.avg_per_day_7d != null) lines.push('Average ' + $(s.avg_per_day_7d) + ' a day over ' + Math.min(7, s.full_days_recorded) + ' full day' + (Math.min(7, s.full_days_recorded) === 1 ? '' : 's') + ' → about $' + s.month_at_7d_rate + ' a month.');
+  else lines.push('No full day recorded yet - averages start tomorrow.');
+  if (s.unpriced_calls_today) lines.push('⚠️ ' + s.unpriced_calls_today + ' call(s) used a model with no price on file (guessed).');
+  return lines.join('\n');
+}
 
 // #P0 prune exec_decisions older than 180 days
 cron.schedule('20 2 * * *', async () => {
@@ -23860,6 +23962,9 @@ app.get('/api/health', async (req, res) => {
 });
 
 // GET /api/status — monitoring status, active alerts, baseline prices
+app.get('/api/spend', async (req, res) => {   // #657 the model-spend ledger summary (read-only)
+  try { res.json(await aiSpendSummary(req.query.days)); } catch (e) { res.status(500).json({ error: e.message }); }
+});
 app.get('/api/status', async (req, res) => {   // #F1 async: reports the real pause
   // #112 Fix #3 / #75: emit a real ARRAY of configured alerts (with direction) so the dashboard can render up/down arrows.
   const alerts = [];
@@ -25036,6 +25141,16 @@ function createMcpServer() {
     },
     async ({ view, days } = {}) => {
       try { return { content: [{ type: 'text', text: JSON.stringify(await cantonStats({ view: view || 'summary', days })) }] }; }
+      catch (e) { return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: e.message }) }] }; }
+    }
+  );
+
+  // ── Tool: get_spend (#657) — what every model call cost, from the one ledger. Read-only. ──
+  server.tool('get_spend',
+    "Model spend (#657): every Anthropic (Claude) and Gemini call the server makes is recorded with its model, the job that made it, tokens, web searches and an estimated $. Returns today's total (London day) by provider, model and job, one total per day, 7- and 30-day averages and a month at the 7-day rate. days = how many days of daily totals (1-90, default 14). Estimates at the server's price list; records only - it caps nothing.",
+    { days: z.number().optional().describe('Daily totals for this many days (1-90, default 14)') },
+    async ({ days } = {}) => {
+      try { return { content: [{ type: 'text', text: JSON.stringify(await aiSpendSummary(days)) }] }; }
       catch (e) { return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: e.message }) }] }; }
     }
   );
@@ -34439,6 +34554,10 @@ app.post('/telegram-webhook', async (req, res) => {
     }
     if (/^share(\s|$)/.test(commandText)) {   // #S1 share feed controls
       await handleShareCommand(commandText.replace(/^share\s*/, '').trim(), rawText.replace(/^\/?share\s*/i, '').trim(), sendReply).catch(async (e) => { await sendReply('\u274c Share: ' + escTg(e.message)); });
+      return res.status(200).json({ ok: true });
+    }
+    if (commandText === 'spend') {   // #657 model spend today, by job, and a month at the current rate
+      try { await sendReply(aiSpendText(await aiSpendSummary(14))); } catch (e) { await sendReply('⚠️ Spend could not be read: ' + escTg(e.message)); }
       return res.status(200).json({ ok: true });
     }
     if (commandText === 'confirms') {   // #642 Fable B2: re-send every connector change still waiting for Confirm, with its buttons
