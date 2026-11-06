@@ -11234,7 +11234,7 @@ async function lessonDistil(nowMs = Date.now()) {   // daily 06:20 London: recom
         const ask = groups.filter(g => !isOff.has(g.scope + '|' + g.key)).slice(0, 40).map(g => ({ scope: g.scope, key: g.key, n: g.n, wins: g.wins, avg: g.avg, lessons: g.samples }));
         const msg = await anthropic.messages.create({ model: LESSON_RULES.model, max_tokens: LESSON_RULES.max_out, system: LESSON_RULE_PROMPT, messages: [{ role: 'user', content: JSON.stringify({ GROUPS: ask }) }] }, { maxRetries: 1 });
         let s = (msg.content || []).map(b => b.text || '').join(''); const f = /```(?:json)?\s*([\s\S]*?)```/.exec(s); if (f) s = f[1];
-        const v = JSON.parse(s.slice(s.indexOf('{'), s.lastIndexOf('}') + 1));
+        const v = lessonRulesParse(s);   /* #661: one bad rule no longer loses all of them (6 Nov 06:20: a JSON error at position 2920) */
         for (const r of (v && Array.isArray(v.rules) ? v.rules : [])) if (r && typeof r.rule === 'string' && r.rule.trim()) worded[r.scope + '|' + r.key] = r.rule.replace(/\s+/g, ' ').trim().slice(0, 220);
       } catch (e) { console.error('[lessons] #660 distil wording:', e.message); worded = null; }
     }
@@ -11250,6 +11250,12 @@ async function lessonDistil(nowMs = Date.now()) {   // daily 06:20 London: recom
     if (n) console.log('[lessons] #660 ' + n + ' rule(s) refreshed' + (worded && Object.keys(worded).length ? ', ' + Object.keys(worded).length + ' reworded' : ''));
     return { groups: groups.length, refreshed: n };
   } finally { _distilBusy = false; }
+}
+function lessonRulesParse(s) {   // #661 the whole answer, else each {...} that names a key and a rule on its own (pure, tested)
+  try { const v = JSON.parse(s.slice(s.indexOf('{'), s.lastIndexOf('}') + 1)); if (v && Array.isArray(v.rules)) return v; } catch (e) { /* fall through */ }
+  const rules = [];
+  for (const m of String(s).match(/\{[^{}]*"key"[^{}]*\}/g) || []) { try { const r = JSON.parse(m); if (r && r.key && r.rule) rules.push(r); } catch (e) { /* skip this one */ } }
+  return { rules };
 }
 function lessonRuleLine(r) { return '[' + r.wins + ' of ' + r.n + ' beat BTC, avg ' + (Number(r.avg_vs_btc) >= 0 ? '+' : '') + Number(r.avg_vs_btc).toFixed(1) + ' pts] ' + r.rule_text; }   // (pure)
 function lessonTrim(mem, max = LESSON_RULES.memory_chars) {   // drop the least useful parts until the block fits (pure, tested)
@@ -25373,7 +25379,7 @@ async function handleMcpConfirmButton(idStr, choice, reply) {
   // ENABLED) already says what changed; the raw result stays in mcp_confirms.result. A failure gives only the error's message.
   let why = '';
   if (status !== 'done') { why = String(out).replace(/^error:\s*/, ''); try { const j = JSON.parse(why); why = j.error || j.message || why; } catch (e) { /* plain text */ } }
-  else { try { const j = JSON.parse(out); if (j && (j.error || j.ok === false)) { status = 'failed'; why = String(j.error || j.message || 'not applied'); await db.execute('UPDATE mcp_confirms SET status = ? WHERE id = ?', ['failed', id]).catch(() => {}); } } catch (e) { /* not JSON */ } }
+  else { try { const j = JSON.parse(out); if (j && (j.error || j.ok === false)) { status = 'failed'; why = String(j.error || j.reason || j.message || 'not applied'); /* #661 PM task 522: the tool's refusal reason */ await db.execute('UPDATE mcp_confirms SET status = ? WHERE id = ?', ['failed', id]).catch(() => {}); } } catch (e) { /* not JSON */ } }
   await reply(status === 'done' ? '✅ Done (#' + id + '): ' + escTg(row.summary) + '.' : '⚠️ Not applied (#' + id + '): ' + escTg(row.summary) + ' - ' + escTg(String(why).slice(0, 160)));
 }
 function createMcpServer() {
