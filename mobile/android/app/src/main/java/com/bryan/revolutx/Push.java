@@ -18,6 +18,51 @@ final class Push {
 
     static final String CHANNEL_ALERTS = "alerts";
     static final String CHANNEL_INFO = "info";
+    // v8 (batch 498): one channel per sound/vibrate choice; the server sends these only to devices registered with caps "ch2"
+    static final String CHANNEL_LOUD = "rx_loud";
+    static final String CHANNEL_SOUND = "rx_sound";
+    static final String CHANNEL_BUZZ = "rx_buzz";
+    static final String CHANNEL_QUIET = "rx_quiet";
+    // v10 (batch 503): one channel per alert category, rx_c_<cat>; the server sends these only to devices with caps "ch3"
+    static final String CHANNEL_CAT_PREFIX = "rx_c_";
+    /** The alert categories, in the order the app and RxNotify.channels() list them. One list: CAT_RE must match it. */
+    static final String[] CATS = { "needs", "money", "price", "loops", "agent", "reports", "system" };
+    static final String CAT_RE = "needs|money|price|loops|agent|reports|system";
+    // v11 (batch 514): the rip alarm. Its own channel, sent only as a data-only message with data.alarm = "1"
+    static final String CHANNEL_ALARM = "rx_alarm";
+    /**
+     * v12: the silent channel RipAlarmService's notification is posted on (the service plays rx_alarm's tone itself, on
+     * the alarm stream, so it rings through silent mode). Never sent by the server; rx_alarm stays the tone picker.
+     */
+    static final String CHANNEL_ALARM_RING = "rx_alarm_ring";
+    /** RxNotify's name for the rip alarm row; openChannel accepts it besides the categories. */
+    static final String ALARM_CAT = "alarm";
+    /**
+     * What this app can show; the server stores it with the token. "ch2" = the four rx_* channels, "ch3" = the rx_c_*
+     * ones, "alarm" = the rip alarm (data-only, data.alarm = "1", shown on rx_alarm).
+     */
+    static final String CAPS = "ch2,ch3,alarm";
+
+    static boolean isCatChannel(String ch) {
+        return ch != null && ch.startsWith(CHANNEL_CAT_PREFIX) && ch.substring(CHANNEL_CAT_PREFIX.length()).matches(CAT_RE);
+    }
+
+    /** A channel id from the server, or alerts for anything this app does not have. */
+    static String knownChannel(String ch) {
+        if (ch == null) return CHANNEL_ALERTS;
+        if (isCatChannel(ch)) return ch;
+        switch (ch) {
+            case CHANNEL_ALERTS:
+            case CHANNEL_INFO:
+            case CHANNEL_LOUD:
+            case CHANNEL_SOUND:
+            case CHANNEL_BUZZ:
+            case CHANNEL_QUIET:
+                return ch;
+            default:
+                return CHANNEL_ALERTS;
+        }
+    }
 
     private static final ExecutorService IO = Executors.newSingleThreadExecutor();
 
@@ -53,7 +98,8 @@ final class Push {
                 JSONObject body = new JSONObject()
                     .put("token", token)
                     .put("platform", "android")
-                    .put("app_version", BuildConfig.VERSION_NAME);
+                    .put("app_version", BuildConfig.VERSION_NAME)
+                    .put("caps", CAPS);
                 HttpURLConnection c = (HttpURLConnection) new URL(SecureStore.base(app) + "/api/app/devices").openConnection();
                 c.setRequestMethod("POST");
                 c.setConnectTimeout(15000);
