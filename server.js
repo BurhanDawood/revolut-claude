@@ -46,6 +46,8 @@ let _anthCreditOut = null;
 // Every Anthropic call (the wrapper above) and every Gemini call (one line after each of the 7 call sites parses its answer) writes one ai_spend row: provider, model,
 // job (the function that made the call), tokens, web searches and an estimated $ at the prices in AI_PRICES. Records only: it caps
 // nothing yet (G2), and the older per-feature cost columns stay as they are. A failed write never touches the call it measures.
+// #662 (system check Costs #5, G2): the model the alert analyses, research and chat paths use, named once - a switch is one edit here.
+const AI_MODELS = { analysis: 'claude-sonnet-4-6' };
 const AI_PRICES = {   // $ per million tokens [input, output]; cache read = 0.1 x input, cache write = 1.25 x input; web search $0.01 each
   'claude-haiku-4-5': [1, 5], 'claude-sonnet-4-6': [3, 15], 'claude-sonnet-5': [3, 15], 'claude-fable-5-1': [10, 50], 'gemini-3.8-flash': [0.5, 3] };
 function aiPrice(model) {   // exact name, then the name without a date suffix, then the longest known prefix
@@ -77,6 +79,51 @@ function aiSpendJob(stack) {   // the first named frame outside the wrappers tha
   }
   return fallback || 'unknown';
 }
+// #662 (system check Costs #2-#4, G2; scheduled check-in 7 Nov, after 2 full days of the ledger: $2.60 / $4.27 / $2.86 so far, about
+// $103 a month at that rate). DAILY CAPS on the optional model jobs, from the ledger. Groups by the job that made the call: trader
+// (runAgent / agent*), videos (Gemini video notes, transcripts, moments), lessons (#660). A capped group that is used up stops for the
+// rest of the London day: a SCHEDULED paper-trader run sits ('cost_cap'; alert, stop, PM and Telegram runs still go), a video is filed
+// from its title and description as "not watched", no new post-mortems are written, the rule refresh keeps the last wording. Nothing on
+// a real-money path is capped: alert analyses, research, chat, the PM agent and the desk keep their own limits and are only counted.
+// Telegram warns once a day when the total passes each warn level. /spend shows the groups; /spend cap <group> <usd|off> changes one.
+const AI_CAPS_DEFAULT = { trader: 1.5, videos: 0.75, lessons: 0.5, warn: [4, 6] };
+function aiGroupOf(job) {   // (pure, tested)
+  const j = String(job || '');
+  if (/^(runAgent|agent)/.test(j)) return 'trader';
+  if (/^(geminiVideo|geminiFindMoment)/.test(j)) return 'videos';
+  if (/^lesson/.test(j)) return 'lessons';
+  if (/^pm/.test(j)) return 'pm_agent';
+  if (/^(spec|senior|dev|desk|team)/i.test(j)) return 'desk';
+  return 'other';
+}
+const _aiToday = { day: null, total: 0, groups: {}, warned: [], caps: { ...AI_CAPS_DEFAULT } };
+const aiLondonDay = (ms = Date.now()) => new Date(ms).toLocaleDateString('en-CA', { timeZone: 'Europe/London' });
+function aiTodayAdd(group, usd, nowMs = Date.now()) {   // (pure on _aiToday; returns a warn level crossed, or null)
+  const day = aiLondonDay(nowMs);
+  if (_aiToday.day !== day) { _aiToday.day = day; _aiToday.total = 0; _aiToday.groups = {}; _aiToday.warned = []; }
+  _aiToday.total += Number(usd) || 0; _aiToday.groups[group] = (_aiToday.groups[group] || 0) + (Number(usd) || 0);
+  for (const w of (_aiToday.caps.warn || [])) if (_aiToday.total >= w && !_aiToday.warned.includes(w)) { _aiToday.warned.push(w); return w; }
+  return null;
+}
+function aiCapOver(group, nowMs = Date.now()) {   // true = this group's cap for today is used up
+  const cap = Number(_aiToday.caps[group]);
+  if (!(cap >= 0) || _aiToday.caps[group] == null) return false;
+  if (_aiToday.day !== aiLondonDay(nowMs)) return false;
+  return (_aiToday.groups[group] || 0) >= cap;
+}
+async function aiTodayReload() {   // boot and every 15 min: the in-memory totals from the ledger, and the stored caps
+  try {
+    const [cr] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'ai_caps'");
+    const stored = cr.length ? JSON.parse(cr[0].config_value) : {};
+    _aiToday.caps = { ...AI_CAPS_DEFAULT, ...(stored && typeof stored === 'object' ? stored : {}) };
+    const [rows] = await db.execute('SELECT job, SUM(usd) AS usd FROM ai_spend WHERE at >= ? GROUP BY job', [new Date(agentLondonDayStart())]);
+    const day = aiLondonDay(), groups = {}; let total = 0;
+    for (const r of rows) { const g = aiGroupOf(r.job); groups[g] = (groups[g] || 0) + Number(r.usd); total += Number(r.usd); }
+    if (_aiToday.day !== day) _aiToday.warned = (_aiToday.caps.warn || []).filter(w => total >= w);   // a restart does not re-warn
+    _aiToday.day = day; _aiToday.groups = groups; _aiToday.total = total;
+  } catch (e) { console.error('[spend] #662 reload:', e.message); }
+}
+setTimeout(() => { aiTodayReload(); }, 20000); setInterval(() => { aiTodayReload(); }, 15 * 60000);
 let _aiSpendFails = 0;
 function aiSpendNote(provider, model, job, raw) {   // never throws, never awaited by the call it measures
   try {
@@ -86,6 +133,8 @@ function aiSpendNote(provider, model, job, raw) {   // never throws, never await
       : { in: raw.input_tokens, out: raw.output_tokens, cache_read: raw.cache_read_input_tokens, cache_write: raw.cache_creation_input_tokens, searches: raw.server_tool_use && raw.server_tool_use.web_search_requests };
     if (provider === 'gemini' && u.cache_read) u.in = Math.max(0, (Number(u.in) || 0) - Number(u.cache_read));   // Gemini counts cached tokens inside the prompt
     const c = aiSpendUsd(model, u), n = (k) => Math.round(Math.max(0, Number(u[k]) || 0));
+    const warn = aiTodayAdd(aiGroupOf(job), c.usd);   // #662
+    if (warn != null) sendTelegram('💸 Model spend today has passed $' + warn + ' (now $' + _aiToday.total.toFixed(2) + '). /spend for the jobs; the optional ones stop at their caps.').catch(() => {});
     db.execute('INSERT INTO ai_spend (at, provider, model, job, in_tok, out_tok, cache_read_tok, cache_write_tok, searches, usd, priced) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       [new Date(), provider, String(model || '?').slice(0, 60), String(job || 'unknown').slice(0, 60), n('in'), n('out'), n('cache_read'), n('cache_write'), n('searches'), c.usd, c.priced ? 1 : 0])
       .catch(e => { if (_aiSpendFails++ % 50 === 0) console.error('[spend] #657 ledger write failed (' + _aiSpendFails + '):', e.message); });
@@ -1719,14 +1768,14 @@ async function tryAwayAnalyseBuyDownTarget(symbol, coinBase, currentPrice, chang
     let analysis = null;
     try {
       const claudeCall = anthropic.messages.create({
-        model: 'claude-sonnet-4-6',
+        model: AI_MODELS.analysis,
         max_tokens: 250,
         system: [{ type: 'text', text: awayBuySystemPrompt, cache_control: { type: 'ephemeral' } }],
         messages: [{ role: 'user', content: awayBuyUserMsg }]
       });
       const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('away-buy analysis timeout 30s')), 30000));
       const msg = await Promise.race([claudeCall, timeoutPromise]);
-      await logClaudeCall('away-buy analysis (' + coinBase + ')', msg.model || 'claude-sonnet-4-6', msg.usage).catch(() => {});
+      await logClaudeCall('away-buy analysis (' + coinBase + ')', msg.model || AI_MODELS.analysis, msg.usage).catch(() => {});
       analysis = msg.content?.[0]?.text || null;
     } catch (e) {
       console.error('[away-buy] analysis call failed for ' + coinBase + ': ' + e.message);
@@ -5241,7 +5290,7 @@ async function runSwingAction(swSymbol, swCoinBase, swCtx, swAction, sendReply) 
             try {
               if (swAction === 'sell') {
                 const r = await anthropic.messages.create({
-                  model: 'claude-sonnet-4-6',
+                  model: AI_MODELS.analysis,
                   max_tokens: 600,
                   tools: [{ type: 'web_search_20250305', name: 'web_search' }],
                   messages: [{ role: 'user', content: `Sell advice for ${swSymbol}. Current price: ${fmtPriceShort(currentPrice)}. Extreme pump signal — ${((swCtx.price > 0 ? (currentPrice - swCtx.price) / swCtx.price * 100 : 0)).toFixed(1)}% above baseline. Take profits now or wait? Give specific sell price levels and a buy-back level for re-entry after retrace. Under 250 words.` }]
@@ -5259,7 +5308,7 @@ async function runSwingAction(swSymbol, swCoinBase, swCtx, swAction, sendReply) 
 
               } else { // buy
                 const r = await anthropic.messages.create({
-                  model: 'claude-sonnet-4-6',
+                  model: AI_MODELS.analysis,
                   max_tokens: 600,
                   tools: [{ type: 'web_search_20250305', name: 'web_search' }],
                   messages: [{ role: 'user', content: `Buy advice for ${swSymbol}. Current price: ${fmtPriceShort(currentPrice)}. Extreme dip signal — ${((swCtx.price > 0 ? (swCtx.price - currentPrice) / swCtx.price * 100 : 0)).toFixed(1)}% below baseline. Good buy opportunity? Give specific entry levels and a profit-taking target. Under 250 words.` }]
@@ -5892,14 +5941,14 @@ async function getQuickAiRecommendation(symbol, changePct, currentPrice, directi
     }
     const roleClause = roleInstruction ? ` ${roleInstruction}` : '';
     const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
+      model: AI_MODELS.analysis,
       max_tokens: 220,
       messages: [{
         role: 'user',
         content: `In 2-3 sentences max, give a quick trading recommendation for ${projectLabel} which is ${dirText}. Consider current market conditions.${roleClause}${planClause} Never invent or guess product names, partnerships, or technical specifics — only reference facts present in the saved plan. ${startInstruction}`
       }]
     });
-    await logClaudeCall(reason, response.model || 'claude-sonnet-4-6', response.usage);
+    await logClaudeCall(reason, response.model || AI_MODELS.analysis, response.usage);
     const textBlock = response.content.find(b => b.type === 'text');
     return textBlock ? textBlock.text : 'HOLD - Monitor the situation closely.';
   } catch (e) {
@@ -6007,7 +6056,7 @@ async function batchGetRecommendations(alerts) {
     }).join('\n');
     const format = alerts.map(a => `${a.coinBase}: [recommendation]`).join('\n');
     const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
+      model: AI_MODELS.analysis,
       max_tokens: Math.min(100 * alerts.length, 600),
       system: [{
         type: 'text',
@@ -6016,7 +6065,7 @@ async function batchGetRecommendations(alerts) {
       }],
       messages: [{ role: 'user', content: `Quick trading recommendations for these alerts:\n${lines}\n\nFormat exactly:\n${format}` }]
     });
-    await logClaudeCall(`batch alert recommendations (${alerts.length} coins)`, response.model || 'claude-sonnet-4-6', response.usage);
+    await logClaudeCall(`batch alert recommendations (${alerts.length} coins)`, response.model || AI_MODELS.analysis, response.usage);
     const text = response.content.find(b => b.type === 'text')?.text || '';
     for (const a of alerts) {
       const match = text.match(new RegExp(`${a.coinBase}:\\s*([^\\n]+)`, 'i'));
@@ -10184,6 +10233,7 @@ async function runAgent(trigger = 'scheduled', wake = [], pmWake = null) {   // 
     cfg.max_tokens = Math.max(Number(cfg.max_tokens) || 0, 12000);   // #653 review 6: a stored 9000 cannot undo #652
     let led = await readAgentLedger();
     if (await isAutoExecPaused()) return await sit('paused');
+    if (kind === 'scheduled' && aiCapOver('trader')) return await sit('cost_cap');   // #662 its daily model cap is used: scheduled runs wait for tomorrow, wakes still run
     if (led.mode === 'halted') return await sit('halted');
     if (led.stopped) return await sit('stopped');
     if (led.mode !== 'paper') return await sit('mode_' + led.mode);   // A2 is paper only - live is A4's decision
@@ -11093,6 +11143,7 @@ async function lessonTick() {   // every 2 h: up to per_tick new post-mortems, n
   try {
     const [[d]] = await db.execute('SELECT COUNT(*) AS n FROM trade_lessons WHERE at >= ?', [new Date(agentLondonDayStart())]);
     let room = Math.min(LESSONS.per_tick, LESSONS.per_day - Number(d.n)), n = 0;
+    if (aiCapOver('lessons')) room = 0;   // #662
     if (room <= 0) return 0;
     const done = async (who) => { const [r] = await db.execute('SELECT ref_id FROM trade_lessons WHERE who = ?', [who]); return new Set(r.map(x => Number(x.ref_id))); };
     const tDone = await done('trader');
@@ -11192,7 +11243,7 @@ cron.schedule('40 10 * * *', () => { missedTick().catch(e => console.error('[mis
 // memory block the trader (every full run) and the PM agent (boss review, watch) get: the current market (BTC's 7 days), the rules
 // with their evidence, per coin its last post-mortems and how it moved after each kind of news, and lessons from the same kind of
 // market on other coins - capped at memory_chars. Model-written text stays labelled as data.
-const LESSON_RULES = { min_n: 5, retire_days: 90, model: 'claude-sonnet-5', max_out: 2500, rules_in_recall: 6, memory_chars: 1800, coins_in_recall: 8 };
+const LESSON_RULES = { min_n: 5, retire_days: 90, model: 'claude-sonnet-5', max_out: 6000, rules_in_recall: 6, memory_chars: 1800, coins_in_recall: 8 };
 function lessonSrc(who, source) { return who === 'bryan' ? (/^system/.test(String(source || '')) ? 'system' : 'manual') : (source === 'pm_idea' ? 'pm_idea' : 'own'); }   // (pure)
 function lessonGroups(rows, minN = LESSON_RULES.min_n) {   // post-mortems -> groups with evidence (pure, tested)
   const m = new Map();
@@ -11229,7 +11280,7 @@ async function lessonDistil(nowMs = Date.now()) {   // daily 06:20 London: recom
     const [off] = await db.execute("SELECT scope, rule_key FROM lesson_rules WHERE status = 'off'");
     const isOff = new Set(off.map(o => o.scope + '|' + o.rule_key));
     let worded = {};
-    if (groups.length && prev.v !== sig) {
+    if (groups.length && prev.v !== sig && !aiCapOver('lessons')) {   // #662 over the cap: the last wording stays, numbers still refresh
       try {
         const ask = groups.filter(g => !isOff.has(g.scope + '|' + g.key)).slice(0, 40).map(g => ({ scope: g.scope, key: g.key, n: g.n, wins: g.wins, avg: g.avg, lessons: g.samples }));
         const msg = await anthropic.messages.create({ model: LESSON_RULES.model, max_tokens: LESSON_RULES.max_out, system: LESSON_RULE_PROMPT, messages: [{ role: 'user', content: JSON.stringify({ GROUPS: ask }) }] }, { maxRetries: 1 });
@@ -13718,12 +13769,12 @@ async function researchAsset(symbol, triggeredBy = 'manual') {
   const prompt = `You are a crypto research analyst for Bryan, a disciplined swing trader in portfolio-recovery mode (no leverage, never sell below entry on anchors, ladder out on MSS, 25% moon bags). Research ${base} and evaluate reality AGAINST his saved plan below.\n\n${planBlock}\n\n${priceBlock}\n\nSearch the web for CURRENT information and produce a concise structured report:\n\n1) FUNDAMENTALS / THESIS — is the original thesis intact, strengthening, or broken?\n2) CATALYSTS — upcoming dated events (give DATE + expected impact + priced-in / sell-the-news risk). Flag any that already hit/missed/delayed.\n3) MATERIAL NEWS — only genuinely material items from the last ~2 weeks.\n4) PRICE vs THESIS — does current price action align with or diverge from the plan?\n5) PLAN-DRIFT VERDICT — has anything shifted enough to warrant a strategy adjustment? If yes, state the specific suggested adjustment (re-ladder / role change / cap change / exit-or-add thesis change). If no, say "plan intact".\n\nRULES: cite SOURCE + DATE for every factual claim. TAG any promotional/affiliate/leverage/influencer-pumped content and discount it. Reality-check every price/figure against the live price above — never relay a stale number as fact. You RECOMMEND only — never suggest auto-execution.\n\nFORMAT REQUIREMENT (critical): the VERY FIRST line of your reply must be exactly, on its own line with NO preamble before it:\nPLAN-DRIFT VERDICT: <either \"plan intact\" or the single specific suggested adjustment, 25 words max>\nThen produce the full structured report (sections 1-5) below it; section 5 may elaborate on that verdict. Be concise; this is a notify/decision aid, not an essay.`;
 
   const response = await anthropic.messages.create({
-    model: 'claude-sonnet-4-6',
+    model: AI_MODELS.analysis,
     max_tokens: 1500,
     tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 5 }],
     messages: [{ role: 'user', content: prompt }],
   });
-  await logClaudeCall(`research_asset ${base}`, 'claude-sonnet-4-6', response.usage);
+  await logClaudeCall(`research_asset ${base}`, AI_MODELS.analysis, response.usage);
 
   const textOut = (response.content || [])
     .filter(b => b.type === 'text')
@@ -17705,7 +17756,7 @@ Consider Bryan's existing winners (CC, HYPE, LINK) and overall balance.
 Be honest, direct and actionable.`;
 
     const claudeResponse = await anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
+      model: AI_MODELS.analysis,
       max_tokens: isSingleCoin ? 1500 : 3500,
       tools: [{ type: "web_search_20250305", name: "web_search" }],
       messages: [{ role: 'user', content: prompt }]
@@ -18439,7 +18490,7 @@ ${tsPlanContext}`;
 
     // 30-second timeout via Promise.race
     const claudeCall = anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
+      model: AI_MODELS.analysis,
       max_tokens: 400,
       system: [{ type: 'text', text: tsSystemPrompt, cache_control: { type: 'ephemeral' } }],
       messages: [{ role: 'user', content: dynamicUserMessage }]
@@ -18451,7 +18502,7 @@ ${tsPlanContext}`;
 
     console.log(`[analysis] Claude API responded — usage: in=${msg.usage?.input_tokens} out=${msg.usage?.output_tokens} cache_read=${msg.usage?.cache_read_input_tokens || 0} cache_write=${msg.usage?.cache_creation_input_tokens || 0}`);
     console.log(`[cache] trailing stop (${coinBase}): read=${msg.usage?.cache_read_input_tokens || 0} write=${msg.usage?.cache_creation_input_tokens || 0} uncached=${msg.usage?.input_tokens || 0}`);
-    await logClaudeCall(`trailing stop analysis (${coinBase})`, msg.model || 'claude-sonnet-4-6', msg.usage);
+    await logClaudeCall(`trailing stop analysis (${coinBase})`, msg.model || AI_MODELS.analysis, msg.usage);
 
     const analysis = msg.content?.[0]?.text;
     if (!analysis) throw new Error(`Claude returned empty content: ${JSON.stringify(msg.content)}`);
@@ -18683,7 +18734,7 @@ ${journalContext}`;
 
     console.log(`[analysis] Calling Claude API (30s timeout)...`);
     const claudeCall = anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
+      model: AI_MODELS.analysis,
       max_tokens: 300,
       system: [{ type: 'text', text: staticTargetSystemPrompt, cache_control: { type: 'ephemeral' } }],
       messages: [{ role: 'user', content: dynamicTargetMessage }]
@@ -18695,7 +18746,7 @@ ${journalContext}`;
 
     console.log(`[analysis] Claude API responded — usage: in=${msg.usage?.input_tokens} out=${msg.usage?.output_tokens} cache_read=${msg.usage?.cache_read_input_tokens || 0} cache_write=${msg.usage?.cache_creation_input_tokens || 0}`);
     console.log(`[cache] fixed target (${coinBase}): read=${msg.usage?.cache_read_input_tokens || 0} write=${msg.usage?.cache_creation_input_tokens || 0} uncached=${msg.usage?.input_tokens || 0}`);
-    await logClaudeCall(`fixed target analysis (${coinBase})`, msg.model || 'claude-sonnet-4-6', msg.usage);
+    await logClaudeCall(`fixed target analysis (${coinBase})`, msg.model || AI_MODELS.analysis, msg.usage);
 
     const analysis = msg.content?.[0]?.text;
     if (!analysis) throw new Error(`Claude returned empty content: ${JSON.stringify(msg.content)}`);
@@ -22318,6 +22369,7 @@ async function youtubeVideoDetails(ids) {
   return out;
 }
 async function geminiVideoNotes(videoId) {
+  if (aiCapOver('videos')) throw new Error('the daily video budget ($' + _aiToday.caps.videos + ') is used - tomorrow');   // #662
   const key = process.env.GEMINI_API_KEY;
   if (!key) throw new Error('GEMINI_API_KEY is not set on Railway');
   const model = String(process.env.GEMINI_VIDEO_MODEL || process.env.GEMINI_MODEL || 'gemini-3.8-flash').trim().replace(/^models\//, '');
@@ -22423,6 +22475,7 @@ async function videoScanSummary(since, errors) {
 }
 // #419 on-demand VERBATIM transcript of one public video (PM's transcribe). Only the public URL goes to Gemini.
 async function geminiVideoTranscript(videoId) {
+  if (aiCapOver('videos')) throw new Error('the daily video budget ($' + _aiToday.caps.videos + ') is used - tomorrow');   // #662
   const key = process.env.GEMINI_API_KEY;
   if (!key) throw new Error('GEMINI_API_KEY is not set on Railway');
   const model = String(process.env.GEMINI_VIDEO_MODEL || process.env.GEMINI_MODEL || 'gemini-3.8-flash').trim().replace(/^models\//, '');
@@ -22548,6 +22601,7 @@ function coinAltName(line, coin) {
   return name;
 }
 async function geminiFindMoment(videoId, label) {
+  if (aiCapOver('videos')) throw new Error('the daily video budget ($' + _aiToday.caps.videos + ') is used - tomorrow');   // #662
   const key = process.env.GEMINI_API_KEY;
   if (!key) throw new Error('GEMINI_API_KEY is not set on Railway');
   const model = String(process.env.GEMINI_VIDEO_MODEL || process.env.GEMINI_MODEL || 'gemini-3.8-flash').trim().replace(/^models\//, '');
@@ -24009,6 +24063,8 @@ async function aiSpendSummary(daysIn) {
     avg_per_day_7d: a7, avg_per_day_30d: a30, month_at_7d_rate: a7 == null ? null : Number((a7 * 30).toFixed(0)),
     full_days_recorded: full.length, recording_since: first && first.at ? new Date(first.at).toISOString() : null,
     older_tables_today: older ? older.total : null,
+    groups: (() => { const g = {}; for (const [k, v] of Object.entries(_aiToday.groups)) g[k] = { usd: Math.round(v * 10000) / 10000 }; for (const [k, cap] of Object.entries(_aiToday.caps)) if (k !== 'warn' && cap != null) { g[k] = g[k] || { usd: 0 }; g[k].cap = cap; g[k].over = aiCapOver(k); } return g; })(),   // #662 today by group (the live totals)
+    caps: _aiToday.caps, warn_levels: _aiToday.caps.warn,
     note: 'Estimates at the prices in AI_PRICES (cache read 0.1x, cache write 1.25x input; web search $0.01). Every Anthropic and Gemini call since #657. Records only: nothing is capped by this yet.' };
 }
 function aiSpendDays(hours) {   // hourly groups -> one row per London day (pure, tested)
@@ -24024,6 +24080,7 @@ function aiSpendText(s) {   // the /spend reply (pure, tested)
   if (s.avg_per_day_7d != null) lines.push('Average ' + $(s.avg_per_day_7d) + ' a day over ' + Math.min(7, s.full_days_recorded) + ' full day' + (Math.min(7, s.full_days_recorded) === 1 ? '' : 's') + ' → about $' + s.month_at_7d_rate + ' a month.');
   else lines.push('No full day recorded yet - averages start tomorrow.');
   if (s.unpriced_calls_today) lines.push('⚠️ ' + s.unpriced_calls_today + ' call(s) used a model with no price on file (guessed).');
+  if (s.groups) lines.push('By group (cap): ' + Object.entries(s.groups).sort((a, b) => b[1].usd - a[1].usd).map(([g, x]) => g + ' ' + $(x.usd) + (x.cap != null ? ' (' + $(x.cap) + (x.over ? ', used up' : '') + ')' : '')).join(' · '));   // #662
   return lines.join('\n');
 }
 
@@ -30918,8 +30975,8 @@ async function familyAboutEnsure(coin, force = false) {
       '"more":[{"h":"Who is behind it.","t":"..."},{"h":"What it does today.","t":"..."},{"h":"Where its value comes from.","t":"..."},{"h":"Signs it is taken seriously.","t":"..."},' +
       '{"h":"The risks.","t":"<the honest risks, ending with: That is why this page shows when it is a good time to spend.>"}],"link":"<the project\'s official website, https>"}\n' +
       'Each "t" is at most 3 sentences.';
-    const r = await anthropic.messages.create({ model: 'claude-sonnet-4-6', max_tokens: 2000, tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 4 }], messages: [{ role: 'user', content: prompt }] }, { maxRetries: 1 });
-    await logClaudeCall('family about ' + c, 'claude-sonnet-4-6', r.usage).catch(() => {});
+    const r = await anthropic.messages.create({ model: AI_MODELS.analysis, max_tokens: 2000, tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 4 }], messages: [{ role: 'user', content: prompt }] }, { maxRetries: 1 });
+    await logClaudeCall('family about ' + c, AI_MODELS.analysis, r.usage).catch(() => {});
     const txt = (r.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n');
     const i = txt.indexOf('{'), j = txt.lastIndexOf('}');
     let o = null; try { o = i >= 0 && j > i ? familyAboutClean(JSON.parse(txt.slice(i, j + 1))) : null; } catch (e) { o = null; }
@@ -33740,7 +33797,7 @@ app.post('/api/research-dust', async (req, res) => {
       const price = await getCurrentPrice(`${coin}-USD`).catch(() => null);
       const priceStr = price ? `current price $${price.toFixed(8)}` : 'price not available';
       const response = await anthropic.messages.create({
-        model: 'claude-sonnet-4-6',
+        model: AI_MODELS.analysis,
         max_tokens: 600,
         tools: [{ type: 'web_search_20250305', name: 'web_search' }],
         messages: [{ role: 'user', content: `Research ${coin} crypto (${priceStr}). Bryan holds a small dust position. Search for: current project status, recent news, team activity, any upcoming catalysts. Give a clear verdict: ACCUMULATE / HOLD / DUMP. Under 400 words.` }]
@@ -34955,6 +35012,17 @@ app.post('/telegram-webhook', async (req, res) => {
       const [, act, id] = commandText.match(/^rule (off|on) (\d+)$/);
       const [u] = await db.execute("UPDATE lesson_rules SET status = ? WHERE id = ? AND status <> ?", [act === 'off' ? 'off' : 'active', Number(id), act === 'off' ? 'off' : 'active']).catch(() => [{ affectedRows: 0 }]);
       await sendReply(u.affectedRows ? (act === 'off' ? '🧠 Rule #' + id + ' is off: no model sees it again and the daily refresh leaves it off.' : '🧠 Rule #' + id + ' is on again.') : 'No change: rule #' + id + ' was not found or is already ' + act + '.');
+      return res.status(200).json({ ok: true });
+    }
+    if (/^spend cap (trader|videos|lessons) (off|\d{1,3}(\.\d{1,2})?)$/.test(commandText)) {   // #662 Bryan sets or removes a group's daily cap
+      const [, g, v] = commandText.match(/^spend cap (\w+) (\S+)$/);
+      try {
+        const [cr] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'ai_caps'"); const stored = cr.length ? JSON.parse(cr[0].config_value) : {};
+        stored[g] = v === 'off' ? null : Number(v);
+        await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('ai_caps', ?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)", [JSON.stringify(stored)]);
+        await aiTodayReload();
+        await sendReply('💸 ' + g + ' daily cap: ' + (v === 'off' ? 'off (counted only)' : '$' + Number(v).toFixed(2)) + '. Spent today: $' + (_aiToday.groups[g] || 0).toFixed(2) + '.');
+      } catch (e) { await sendReply('⚠️ Cap not saved: ' + escTg(e.message)); }
       return res.status(200).json({ ok: true });
     }
     if (commandText === 'spend') {   // #657 model spend today, by job, and a month at the current rate
@@ -36275,7 +36343,7 @@ app.post('/telegram-webhook', async (req, res) => {
       (async () => {
         try {
           const response = await anthropic.messages.create({
-            model: 'claude-sonnet-4-6',
+            model: AI_MODELS.analysis,
             max_tokens: 600,
             tools: [{ type: "web_search_20250305", name: "web_search" }],
             messages: [{ role: 'user', content: `Give specific, actionable sell advice for ${symbol}. Search for current price and market conditions. Should I sell now or wait? Give a clear recommendation with 1-2 price levels to target. Under 300 words.` }]
@@ -36311,7 +36379,7 @@ app.post('/telegram-webhook', async (req, res) => {
       (async () => {
         try {
           const response = await anthropic.messages.create({
-            model: 'claude-sonnet-4-6',
+            model: AI_MODELS.analysis,
             max_tokens: 600,
             tools: [{ type: "web_search_20250305", name: "web_search" }],
             messages: [{ role: 'user', content: `Give specific, actionable advice on buying more ${symbol}. Search for current price and market conditions. Is now a good DCA entry? What's the risk/reward? Under 300 words.` }]
@@ -36628,7 +36696,7 @@ app.post('/telegram-webhook', async (req, res) => {
           const price = await getCurrentPrice(symbol).catch(() => null);
           const priceStr = price ? `current price $${price < 0.001 ? price.toFixed(8) : price.toFixed(4)}` : '';
           const response = await anthropic.messages.create({
-            model: 'claude-sonnet-4-6',
+            model: AI_MODELS.analysis,
             max_tokens: 700,
             tools: [{ type: 'web_search_20250305', name: 'web_search' }],
             messages: [{ role: 'user', content: `Research ${coinBase} crypto ${priceStr}. Bryan may hold a dust position. Search for: project fundamentals, team, recent news, tokenomics, upcoming catalysts, any red flags. Give a clear verdict: ACCUMULATE / HOLD / DUMP with reasoning. Under 450 words.` }]
@@ -36998,7 +37066,7 @@ app.post('/telegram-webhook', async (req, res) => {
         ];
 
         const claudePromise = anthropic.messages.create({
-          model: 'claude-sonnet-4-6',
+          model: AI_MODELS.analysis,
           max_tokens: 4000,
           tools: [{
             type: "web_search_20250305",
@@ -37199,7 +37267,7 @@ Active alerts (coins currently above threshold): ${[...alertState.active.keys()]
           // FIX 3: Fallback simpler Claude call — no web search, max 30s, max_tokens 500
           try {
             const fallbackPromise = anthropic.messages.create({
-              model: 'claude-sonnet-4-6',
+              model: AI_MODELS.analysis,
               max_tokens: 500,
               system: `You are a crypto advisor. Here are the user's current holdings:\n${holdingsList || 'Portfolio data unavailable'}\nAnswer the user's question briefly in 2-3 sentences. Be direct and actionable.`,
               messages: [{ role: 'user', content: userMessage }],
