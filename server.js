@@ -338,7 +338,7 @@ async function rxNormaliseBalances(parsed) {
       return raw > 0 && !uncapped.has(c) && raw - Math.min(raw, held[c] || 0) > Math.max(1e-12, raw * 1e-9) && !_rxLockedNow.has(c); });
     if (newLock && _rxOrdersReads === n0) { rxActiveOrdersBust(); orders = await rxActiveOrdersFresh(); }   // Fable C2: fresh read before a first lock
   }
-  catch (e) { const k = '_fail'; if (!_rxLockLogAt[k] || Date.now() - _rxLockLogAt[k] > 600000) { _rxLockLogAt[k] = Date.now(); console.warn('[balances] #537 ' + e.message + ' - reserved counted as before'); } return parsed; }
+  catch (e) { const k = '_fail'; if (!_rxLockLogAt[k] || Date.now() - _rxLockLogAt[k] > 600000) { _rxLockLogAt[k] = Date.now(); console.warn('[balances] #537 ' + e.message + ' - reserved counted as before'); } try { parsed._rxRaw = true; } catch (e2) {} return parsed; }   // #663 marked: reserved is raw
   const { held, uncapped } = rxOrdersHeld(orders);
   const lockedNow = new Set();
   for (const r of rows) {
@@ -353,8 +353,18 @@ async function rxNormaliseBalances(parsed) {
     if (!_rxLockLogAt[c] || Date.now() - _rxLockLogAt[c] > 3600000) { _rxLockLogAt[c] = Date.now(); console.log('[balances] #537 ' + c + ' ' + locked + ' reserved outside any open order (card payment or other hold) - counted as locked, not held'); }
   }
   _rxLockedNow.clear(); for (const c of lockedNow) _rxLockedNow.add(c);
+  if (uncapped.size) { try { parsed._rxUncapped = [...uncapped]; } catch (e) {} }   // #663 currencies whose reserved stayed raw
   return parsed;
 }
+// #663 (Bryan 7 Nov 20:26-20:28: two limit buys he placed in the app - AST $102.89, MOG $66.92 - were logged as card PAYMENTS and cut
+// his invested capital until he tapped Not a payment; "When the order fills or is cancelled I dont want my capital invested to be
+// confused... Build the fix"). A resting limit BUY moves its USD/USDT from `available` to `reserved`; the payment and withdrawal checks
+// read `available` only, and their #127 guard knows only orders the system placed itself. Every GET /balances is normalised (#537):
+// `reserved` keeps only what this account's open orders hold (from GET /orders/active, any order, app-placed included) and a card hold
+// moves to `locked`. So cash = available + reserved: placing, filling or cancelling an order does not move it; a card payment (locked)
+// and a real withdrawal still do. If the open orders cannot be read, #537 leaves reserved as it was: a card hold is then seen when it
+// settles instead of when it is authorised (later, never false).
+function rxCash(a) { return (parseFloat(a && a.available) || 0) + (parseFloat(a && a.reserved) || 0); }   // (pure, tested)
 function rxOrdersHeld(orders) {   // what this account's active orders hold, per currency
   const held = {}, uncapped = new Set();
   for (const o of orders) {
@@ -2000,6 +2010,7 @@ const autoSkipAlerted = new Map();           // symbol -> timestamp — throttle
 const lowCashAlerted = new Map();            // exchange -> date string — throttles low-cash warnings to once per day per exchange
 const alertContextBySymbol = new Map();      // coinBase.toLowerCase() -> { symbol, coinBase, alertType, timestamp } — powers numbered reply shortcuts
 let lastAlertCoin = null;                    // most recently fired alert coin (lowercase) — used for plain number replies
+let _cashBasis663 = false;   // #663 the stored USD/USDT figures are on the cash basis (free + own open-order holds)
 let lastKnownUSDT  = null;                   // USDT at start of current cycle — set once on startup from live balance
 let lastKnownUSD   = null;                   // USD at start of current cycle — used to detect USDT→USD conversions
 let pendingFiatWithdrawal = null;             // #136: USD drop parked 1 cycle to detect USD→USDT timing gap (Revolut API eventual consistency)
@@ -3441,8 +3452,8 @@ try {
   }
   if (lastKnownUSDT === null || lastKnownUSD === null) {
     const startupBals = await revolutRequest('GET', '/balances');
-    if (lastKnownUSDT === null) { const a = startupBals.find(b => b.currency === 'USDT'); lastKnownUSDT = parseFloat(a?.available || 0); console.log(`[usdt] USDT baseline from live: ${lastKnownUSDT}`); }
-    if (lastKnownUSD  === null) { const a = startupBals.find(b => b.currency === 'USD');  lastKnownUSD  = parseFloat(a?.available || 0); console.log(`[usdt] USD baseline from live: ${lastKnownUSD}`); }
+    if (lastKnownUSDT === null) { const a = startupBals.find(b => b.currency === 'USDT'); lastKnownUSDT = rxCash(a);   /* #663 */ console.log(`[usdt] USDT baseline from live: ${lastKnownUSDT}`); }
+    if (lastKnownUSD  === null) { const a = startupBals.find(b => b.currency === 'USD');  lastKnownUSD  = rxCash(a);   /* #663 */ console.log(`[usdt] USD baseline from live: ${lastKnownUSD}`); }
   }
 } catch (e) {
   console.error('[usdt] Baseline load error:', e.message);
@@ -17235,8 +17246,8 @@ async function autoLogTrade(symbol, action, price, qtyChange, currentQty) {
         const freshBalances = await revolutRequest('GET', '/balances').catch(() => []);
         const usdtAsset = freshBalances.find(b => b.currency === 'USDT');
         const usdAsset  = freshBalances.find(b => b.currency === 'USD');
-        const currentUSDT = parseFloat(usdtAsset?.available || 0);
-        const currentUSD  = parseFloat(usdAsset?.available  || 0);
+        const currentUSDT = rxCash(usdtAsset);   // #663 same basis as lastKnownUSDT
+        const currentUSD  = rxCash(usdAsset);
         // Use lastKnownUSDT (set at start of cycle) so the delta is correct
         const prevUSDT    = lastKnownUSDT ?? currentUSDT;
         const prevUSD     = previousBalances.get('USD-USD') ?? currentUSD;
@@ -20621,8 +20632,25 @@ async function checkPortfolio() {
     try {
       const usdtAsset   = balances.find(b => b.currency === 'USDT');
       const usdAsset    = balances.find(b => b.currency === 'USD');
-      const currentUSDT = parseFloat(usdtAsset?.available || 0);
-      const currentUSD  = parseFloat(usdAsset?.available  || 0);
+      const currentUSDT = rxCash(usdtAsset);   // #663 free + held by our own open orders (a limit buy is not a payment)
+      const currentUSD  = rxCash(usdAsset);
+      // #663 senior A1: when #537 could not read the open orders (or an order has no price), reserved is RAW and may hold a card
+      // payment; comparing or saving that figure would flip the hold out and back in and log a FALSE payment next cycle. So this cycle
+      // compares nothing and keeps the last figures.
+      const rawCash663 = (a) => !!a && (balances._rxRaw === true || (balances._rxUncapped || []).includes(String(a.currency || '').toUpperCase())) && (parseFloat(a.reserved) || 0) > 0;
+      cash663: {
+      if (rawCash663(usdtAsset) || rawCash663(usdAsset)) { console.log('[usdt] #663 USD/USDT is reserved but the open orders could not be read - this cycle compares nothing'); break cash663; }
+      if (!_cashBasis663 && lastKnownUSDT !== null) {   // #663 once: the stored figures were free-only - re-base, compare nothing this cycle
+        try {
+          const [bz] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'last_known_basis'");
+          if (!bz.length || bz[0].config_value !== 'cash663') {
+            console.log('[usdt] #663 re-based to cash incl. open-order holds: USDT ' + lastKnownUSDT + ' -> ' + currentUSDT + ' | USD ' + lastKnownUSD + ' -> ' + currentUSD);
+            lastKnownUSDT = currentUSDT; lastKnownUSD = currentUSD; pendingFiatWithdrawal = null;
+            await db.execute("INSERT INTO system_config (config_key, config_value) VALUES ('last_known_usdt', ?), ('last_known_usd', ?), ('last_known_basis', 'cash663') ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)", [currentUSDT.toString(), currentUSD.toString()]);
+          }
+          _cashBasis663 = true;
+        } catch (e) { console.error('[usdt] #663 basis check:', e.message); }
+      }
 
       console.log(`[usdt] Check: USDT ${lastKnownUSDT ?? 'unset'}→${currentUSDT} | USD ${lastKnownUSD ?? 'unset'}→${currentUSD}`);
 
@@ -20964,6 +20992,7 @@ async function checkPortfolio() {
           [currentUSDT.toString(), currentUSD.toString()]
         ).catch(() => {});
       }
+      } // end cash663 (#663)
     } catch (e) {
       console.error('[usdt] Detection error:', e.message);
     }
@@ -25099,7 +25128,7 @@ app.get('/api/sweep/config', async (req, res) => {
     const [rows] = await db.execute("SELECT config_value FROM system_config WHERE config_key = 'usdt_sweep_config'");
     const cfg = rows.length ? JSON.parse(rows[0].config_value) : { enabled: false, sweep_pct: 25, min_trade_value_usd: 10 };
     // Add current USDT balance as usdt_reserve so dashboard can show it
-    const usdtBal = lastKnownUSDT || 0;
+    const usdtBal = lastKnownUSDT || 0;   // #663 display only: since #663 this includes USDT held by open orders (spendable cash reads use available)
     res.json({ ...cfg, usdt_reserve: usdtBal });
   } catch (e) {
     res.status(500).json({ error: e.message });
