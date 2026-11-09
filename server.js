@@ -5823,8 +5823,10 @@ async function checkPreTrade(coinBase, side, valueUsd, livePrice) {
         if (diff > 8) { lines.push(`\u26a0\ufe0f Chasing \u2014 buying ${diff.toFixed(0)}% above entry ($${ep.toFixed(4)})`); warn++; }
         else { lines.push(`\u2705 Entry \u2014 ${diff >= 0 ? '+' : ''}${diff.toFixed(0)}% vs entry ($${ep.toFixed(4)})`); pass++; }
       } else {
-        if (diff < -10) { lines.push(`\u26a0\ufe0f Floor \u2014 selling ${Math.abs(diff).toFixed(0)}% below entry ($${ep.toFixed(4)})`); warn++; }
-        else { lines.push(`\u2705 Floor OK \u2014 ${diff >= 0 ? '+' : ''}${diff.toFixed(0)}% vs entry`); pass++; }
+        const fl = await computeDerivedFloor(`${coinBase}-USD`, coinBase).catch(() => null);   // #665 (system check money #11): the real sell floor, not "within 10% of entry"
+        if (fl && fl.floor > 0 && livePrice <= fl.floor) { lines.push(`\u26a0\ufe0f Floor \u2014 $${livePrice} is at or below the sell floor $${Number(fl.floor.toPrecision(6))} (${fl.source}); ${diff >= 0 ? '+' : ''}${diff.toFixed(1)}% vs entry. Automatic sales refuse this`); warn++; }
+        else if (!(fl && fl.floor > 0) && diff < -10) { lines.push(`\u26a0\ufe0f Floor \u2014 selling ${Math.abs(diff).toFixed(0)}% below entry ($${ep.toFixed(4)})`); warn++; }
+        else { lines.push(`\u2705 Floor OK \u2014 ${diff >= 0 ? '+' : ''}${diff.toFixed(1)}% vs entry${fl && fl.floor > 0 ? ', above the sell floor' : ''}`); pass++; }
       }
     }
 
@@ -19677,11 +19679,19 @@ async function floorCappedLimitSell(symbol, qty, floor, refPrice, clientOrderId,
     if (done(s) || /cancel|reject|expire/.test(s)) break;
   }
   let cancelled = false, cancelError = null;
-  if (!done(s)) {
+  const dead = (x) => /cancel|reject|expire/.test(x);
+  if (!done(s) && !dead(s)) {
     try { const c = await revolutRequest('DELETE', '/orders/' + oid, null, null, { withStatus: true }); cancelled = !!(c && c.ok); if (!cancelled) cancelError = 'HTTP ' + (c && c.status) + ' ' + JSON.stringify(c && c.body).slice(0, 120); }
     catch (e) { cancelError = e.message; }
-    await sleep(Math.min(wait, 1000));
-    try { st = await read(); s = String(st.state || st.status || '').toLowerCase(); } catch (e) { /* keep last */ }
+    // #665 (13 Oct system check, money path #5): the DELETE answer is not the order being dead. Re-read up to 4 times; a cancel counts only
+    // when the order reads cancelled/rejected/expired (or filled). Still open after that = "may be resting": the caller stops the chase
+    // (remainder_resting) instead of offering the next step while the old order can still fill.
+    for (let k = 0; k < 4; k++) {
+      await sleep(Math.min(wait, 1000));
+      try { st = await read(); s = String(st.state || st.status || '').toLowerCase(); } catch (e) { /* keep last */ }
+      if (done(s) || dead(s)) break;
+    }
+    if (cancelled && !(done(s) || dead(s))) { cancelled = false; cancelError = 'cancel accepted but the order still reads ' + (s || 'unknown') + ' after 4 checks'; }
   }
   const filled = st && st.filled_quantity != null ? Number(st.filled_quantity) : 0;
   const avg = st && st.average_fill_price != null && Number(st.average_fill_price) > 0 ? Number(st.average_fill_price) : null;
@@ -35833,7 +35843,18 @@ app.post('/telegram-webhook', async (req, res) => {
       const [sym, undo] = recent;
       pendingUndo.delete(sym);
       const coinBase = sym.replace('-USD', '');
-      if (undo.action === 'sell') {
+      if (undo.action === 'sell' && undo.exchange === 'kraken') {   // #665 (system check money #10): a Kraken auto-sale is bought back on Kraken, never on Revolut X
+        const kt = stampTrade({ symbol: sym, side: 'buy', orderType: 'market', volume: undo.qty, price: undo.price, valueUSD: undo.qty * undo.price, timestamp: Date.now(), source: 'undo' });
+        const kQueued = !!pendingKrakenTrade;
+        if (kQueued) pendingMcpTradeQueue.push({ _exchange: 'kraken', ...kt }); else pendingKrakenTrade = kt;   // a waiting Kraken approval is never overwritten
+        await sendTelegram(
+          `⏪ <b>UNDO — ${coinBase} (Kraken)</b>\n\n` +
+          `Buying back ${undo.qty.toFixed(4)} ${coinBase} on Kraken\n` +
+          (kQueued ? `Another Kraken trade is waiting for you, so this one is queued: use the buttons here (typing "approve trade" would approve the other one).\n` : '') +   // senior note 3
+          `Tap <b>Approve</b> to buy back, or <b>Reject</b> to keep as is`,
+          tradeApprovalKeyboard(kt)
+        );
+      } else if (undo.action === 'sell') {
         pendingRevolutTrade = stampTrade({
           symbol: sym, side: 'buy', orderType: 'market',
           baseSize: undo.qty, price: undo.price,
