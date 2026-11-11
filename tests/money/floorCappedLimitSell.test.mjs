@@ -75,8 +75,8 @@ await test('FL5', 'unfilled, cancel confirmed (HTTP ok) -> cancelled true, remai
   const e = env({ states: ['new'], cancel: 'ok', stateAfterCancel: 'cancelled' });
   const r = await e.run(1.2, 0.01);
   assert.equal(r.cancelled, true); assert.equal(r.remainder_resting, false); assert.equal(r.filled_qty, 0);
-  const e2 = env({ states: ['new'], cancel: 'ok' });   // the venue still says 'new' after an OK cancel: the cancel confirmed, so not resting
-  assert.equal((await e2.run(1.2, 0.01)).remainder_resting, false);
+  const e2 = env({ states: ['new'], cancel: 'ok' });   // #665: an OK cancel while the venue still says 'new' after 4 re-reads is NOT confirmed - may be resting, the chase stops
+  assert.equal((await e2.run(1.2, 0.01)).remainder_resting, true);
 });
 await test('FL6', 'unfilled, cancel NOT confirmed (HTTP error / thrown) -> remainder_resting true, cancel_error set', async () => {
   for (const cancel of ['fail', 'throw']) {
