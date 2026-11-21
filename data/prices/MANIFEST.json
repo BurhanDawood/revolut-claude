@@ -1,0 +1,30 @@
+{
+  "format": 1,
+  "exported_at": "2026-11-21T12:44:33.600Z",
+  "server_sha": "d14bec76",
+  "workflow_run_id": "44905184101",
+  "tables": {
+    "hourly": {
+      "file": "hourly.ndjson.gz",
+      "source_table": "price_intraday_hourly",
+      "rows": 607377,
+      "symbols": 76,
+      "first": "2025-11-21T03:00:00.000Z",
+      "last": "2026-11-21T03:00:00.000Z",
+      "first_t": 1763694000,
+      "last_t": 1795230000,
+      "bytes": 7733685,
+      "sha256": "f2e463c7271f1dc6aca9388cdb50d32c3ea2a1c244a808d0273159ef86317c80"
+    },
+    "daily": {
+      "file": "daily.ndjson.gz",
+      "source_table": "price_daily_ohlc",
+      "rows": 77343,
+      "symbols": 340,
+      "first": "2023-08-20",
+      "last": "2026-11-20",
+      "bytes": 1145805,
+      "sha256": "6f24b2965dc46440399f4ee4a414b34c55eb1628d050193c51be2fb1d568e9c9"
+    }
+  }
+}
